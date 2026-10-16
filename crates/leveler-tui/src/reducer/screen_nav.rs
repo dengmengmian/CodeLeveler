@@ -163,9 +163,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Activity => match key.code {
-            KeyCode::Esc => {
-                crate::activity::close(state);
-            }
+            KeyCode::Esc => return back(state),
             // `x` stops exactly the open activity; its parent turn keeps
             // running. Esc backs out without stopping anything. Both cases go
             // through the runtime's own cancellation path — never a PID.
@@ -219,14 +217,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         Screen::ActivityList => {
             use crate::activity::BackgroundPane;
             match key.code {
-                KeyCode::Esc => {
-                    // Two levels of back: leave the log first, then the page.
-                    if state.background_list_focus == BackgroundPane::Output {
-                        crate::activity::focus_background_list(state);
-                    } else {
-                        crate::activity::close_background_list(state);
-                    }
-                }
+                KeyCode::Esc => return back(state),
                 KeyCode::Tab | KeyCode::BackTab => crate::activity::toggle_background_focus(state),
                 KeyCode::Up | KeyCode::Char('k') => match state.background_list_focus {
                     BackgroundPane::List => crate::activity::move_list_selection(state, -1),
@@ -256,13 +247,15 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Issue => match key.code {
-            KeyCode::Esc => close_screen(state),
+            // One level per press: an open row collapses first, and only the
+            // next Esc leaves the page.
+            KeyCode::Esc => return back(state),
             KeyCode::Up | KeyCode::Char('k') => crate::issue::move_selection(state, -1),
             KeyCode::Down | KeyCode::Char('j') => crate::issue::move_selection(state, 1),
-            // Enter reaches the selected issue's REAL detail: a failed task's
-            // output page, or the conversation where a failed turn's block
-            // and its disclosure live.
-            KeyCode::Enter => return open_selected_issue(state),
+            // Enter is the same interaction as clicking the row: select and
+            // expand/collapse in place. The task's own page stays behind the
+            // expanded row's explicit detail entry, so Enter never jumps.
+            KeyCode::Enter => crate::issue::toggle_expanded(state),
             _ => {
                 scroll_screen_key(state, &key, false);
             }
@@ -396,27 +389,35 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
     Vec::new()
 }
 
-/// Enter on the Issue page: the selected issue's own detail.
+/// One level back — the single rule Esc and the header's `←` glyph share.
 ///
-/// A failed background task opens the existing task page (`Screen::Activity`)
-/// where its command, exit code, output and stop control already live. A
-/// failed turn has no separate page of its own — its failure block, with the
-/// disclosure holding the typed machine facts, is in the conversation — so
-/// Enter returns there at the live edge.
-fn open_selected_issue(state: &mut AppState) -> Vec<Effect> {
-    let Some(issue) = crate::issue::selected_issue(state) else {
-        return Vec::new();
-    };
-    match issue.kind {
-        crate::issue::IssueKind::BackgroundFailure => {
-            crate::activity::open(state, crate::activity::ActivityId::Background(issue.key))
+/// Each page owns exactly one level of "back" and the pages chain through the
+/// opener's [`crate::state::AppState::detail_return`], never by each page
+/// hardcoding its parent: a detail opened from the issue page returns there,
+/// a detail opened from the jobs list returns to the list. A future detail
+/// page inherits the rule by publishing its `←` hit and reading the same
+/// field — there is no second navigation system.
+pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
+    match state.active_screen {
+        // An open issue row is the page's innermost level; the detail page
+        // returns to whatever opened it.
+        Screen::Issue => {
+            if !crate::issue::collapse_selected(state) {
+                close_screen(state);
+            }
         }
-        crate::issue::IssueKind::TurnFailure => {
-            close_screen(state);
-            state.jump_to_bottom = true;
-            Vec::new()
+        Screen::Activity => crate::activity::close(state),
+        Screen::ActivityList => {
+            // Two levels of back: leave the log first, then the page.
+            if state.background_list_focus == crate::activity::BackgroundPane::Output {
+                crate::activity::focus_background_list(state);
+            } else {
+                crate::activity::close_background_list(state);
+            }
         }
+        _ => close_screen(state),
     }
+    Vec::new()
 }
 
 /// Keyboard and mouse share the same live-state check and runtime command.
@@ -435,14 +436,21 @@ pub(super) fn cancel_background_task(state: &AppState, task_id: &str) -> Vec<Eff
     })]
 }
 
-/// Open the Issue page with its first active issue selected. Observational:
-/// nothing on this page cancels work, and closing it clears nothing — a
-/// failure stays active until its own source fact changes.
+/// Open the Issue page with its first active issue selected, acknowledging the
+/// failures this visit actually shows.
+///
+/// The acknowledgement is a snapshot taken here, before the page is painted:
+/// a failure that arrives while the page is open was not part of what the user
+/// came to see and stays unread (it still reminds when the page is left). The
+/// failed turn is never acknowledged — it is a persistent fault, and only the
+/// runtime's own status leaving `Error` clears it. Closing the page clears
+/// nothing: records, exit codes and output all stay.
 pub(super) fn open_issue_screen(state: &mut AppState) {
     if crate::issue::issue_summary(state).is_empty() {
         return;
     }
     crate::issue::ensure_selection(state);
+    crate::activity::acknowledge_failures(state);
     state.active_screen = crate::screen::Screen::Issue;
     state.screen_scroll = 0;
 }
@@ -490,11 +498,14 @@ fn selected_child(state: &AppState) -> Option<&crate::multi_agent::ChildAgentVie
 
 /// Open the selected child's Activity detail. Enter is observational: the work
 /// keeps running and Esc comes back.
+/// Open the selected child's Activity detail. Enter is observational: the work
+/// keeps running and Esc comes back — to the Team page that opened it.
 fn open_selected_child(state: &mut AppState) {
     let Some(id) = selected_child(state).map(|child| child.id.clone()) else {
         return;
     };
     state.activity_open = Some(crate::activity::ActivityId::Child(id));
+    state.detail_return = Some(Screen::Team);
     state.active_screen = crate::screen::Screen::Activity;
 }
 

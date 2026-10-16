@@ -86,15 +86,17 @@ pub(crate) fn layout(area: Rect, composer_rows: u16) -> SecondaryLayout {
 }
 
 /// Draw the identity header, its right-aligned parent status, and the rule
-/// below it.
+/// below it. Returns the painted `← title` nav region — the page's clickable
+/// back glyph — so a page can publish it as a hit target; clicking it runs the
+/// same one-level back as Esc.
 pub(crate) fn draw_header(
     frame: &mut Frame,
     l: &SecondaryLayout,
     page: &SecondaryPage,
     theme: &Theme,
-) {
+) -> Option<Rect> {
     if l.header.height == 0 {
-        return;
+        return None;
     }
     // The navigation row owns the full width: the back glyph anchors the left
     // edge, the parent status the right. Unlike the body it is not inset, so
@@ -102,7 +104,7 @@ pub(crate) fn draw_header(
     let inner = l.header;
     if inner.width == 0 {
         draw_rule(frame, l.rule_top, theme);
-        return;
+        return None;
     }
     let left_text = format!("← {}", page.title);
     // A status line can carry trailing padding; measure only what is visible so
@@ -147,6 +149,19 @@ pub(crate) fn draw_header(
         );
     }
     draw_rule(frame, l.rule_top, theme);
+    // The hit is the glyph + title as painted (truncation included), never the
+    // whole row: the right half belongs to the status.
+    let painted = crate::render::truncate_display(
+        &left_text,
+        left_room.min(inner.width as usize),
+    );
+    let nav_w = UnicodeWidthStr::width(painted.as_str()) as u16;
+    (nav_w > 0).then_some(Rect {
+        x: inner.x,
+        y: inner.y,
+        width: nav_w,
+        height: 1,
+    })
 }
 
 /// Draw the rule above the footer and the interaction hint below it.

@@ -396,11 +396,11 @@ pub(crate) fn selected_list_task(state: &AppState) -> Option<String> {
     state.background_list_selected.clone()
 }
 
-/// Open the background-jobs list. Opening marks the current failures as seen
-/// (the issue page's "new" marker clears); the issues themselves stay active
-/// while their task records do, and nothing here cancels or deletes work.
+/// Open the background-jobs list. Observational, and NOT an acknowledgement:
+/// the list is an index, and seeing a row is not seeing the task — the
+/// reminder clears when that task's own detail opens ([`open`]), which is the
+/// same rule as the issue page. Nothing here cancels or deletes work.
 pub(crate) fn open_background_list(state: &mut AppState) {
-    acknowledge_failures(state);
     ensure_list_selection(state);
     state.background_list_focus = BackgroundPane::List;
     state.active_screen = crate::screen::Screen::ActivityList;
@@ -496,6 +496,7 @@ pub(crate) fn open_selected(state: &mut AppState) -> Vec<crate::action::Effect> 
 pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::Effect> {
     state.activity_open = Some(id.clone());
     state.activity_selected = Some(id.clone());
+    state.detail_return = None;
     state.active_screen = crate::screen::Screen::Activity;
     state.screen_scroll = 0;
     // Opening starts at the newest output, following it.
@@ -532,11 +533,23 @@ pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::E
     }
 }
 
+/// Close the detail and return to the page that opened it.
+///
+/// The opener's [`crate::state::AppState::detail_return`] is the single source
+/// of the parent — the detail never guesses. Returning to the conversation
+/// drops the view's scroll offset; returning to another page keeps that page's
+/// own selection, expansion and scroll exactly as they were.
 pub(crate) fn close(state: &mut AppState) {
     state.activity_open = None;
-    state.active_screen = crate::screen::Screen::Conversation;
-    state.screen_scroll = 0;
     state.activity_view = ActivityView::default();
+    let back = state
+        .detail_return
+        .take()
+        .unwrap_or(crate::screen::Screen::Conversation);
+    state.active_screen = back;
+    if back == crate::screen::Screen::Conversation {
+        state.screen_scroll = 0;
+    }
 }
 
 /// Which pane owns ↑/↓ on the Background Tasks page. A page-local focus, not
@@ -745,14 +758,21 @@ pub(crate) fn bottom_selected_output(state: &mut AppState) {
 
 /// Move the page focus between the task list and the selected task's output.
 pub(crate) fn toggle_background_focus(state: &mut AppState) {
-    state.background_list_focus = match state.background_list_focus {
-        BackgroundPane::List => BackgroundPane::Output,
-        BackgroundPane::Output => BackgroundPane::List,
-    };
+    match state.background_list_focus {
+        BackgroundPane::List => focus_background_output(state),
+        BackgroundPane::Output => focus_background_list(state),
+    }
 }
 
+/// Focus the selected task's own detail pane on the jobs page — its command,
+/// runtime facts and retained output. That pane IS the task's detail here, so
+/// focusing it is viewing that one failure: its reminder clears, and no other
+/// task's does. A running task has no failure to acknowledge.
 pub(crate) fn focus_background_output(state: &mut AppState) {
     state.background_list_focus = BackgroundPane::Output;
+    if let Some(id) = state.background_list_selected.clone() {
+        acknowledge_failure(state, &id);
+    }
 }
 
 pub(crate) fn focus_background_list(state: &mut AppState) {

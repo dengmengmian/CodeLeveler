@@ -917,12 +917,16 @@ pub struct UiText {
     pub background_failed_only: &'static str,
     /// Issue page title.
     pub issue_page_title: &'static str,
-    /// Issue page footer: select, open a task's detail, back.
+    /// Issue page footer: select, expand/collapse, open a task's detail, back.
     pub issue_page_hint: &'static str,
     /// Issue page with nothing active.
     pub issue_page_empty: &'static str,
     /// Marker on an issue the user has not looked at yet. Seen is not solved.
     pub issue_row_new: &'static str,
+    /// Section label separating viewed failures (history) from unread ones.
+    pub issue_page_viewed: &'static str,
+    /// The expanded task row's entry into its existing task detail page.
+    pub issue_task_detail: &'static str,
     /// Background-jobs list page title.
     pub background_list_title: &'static str,
     /// List section: still-running tasks.
@@ -1872,9 +1876,11 @@ static ZH: UiText = UiText {
     background_running_count: "后台 {}",
     background_failed_only: "后台失败 {}",
     issue_page_title: "问题",
-    issue_page_hint: "↑↓ 选择 · Enter 打开任务详情 · Esc 返回",
+    issue_page_hint: "↑↓ 选择 · Enter 展开/收起 · Esc 返回",
     issue_page_empty: "当前没有需要关注的问题",
     issue_row_new: "新",
+    issue_page_viewed: "已查看",
+    issue_task_detail: "查看任务详情 ↗",
     background_list_title: "后台任务",
     background_list_running: "运行中",
     background_list_finished: "最近结束",
@@ -2673,9 +2679,11 @@ static EN: UiText = UiText {
     background_running_count: "{} jobs",
     background_failed_only: "background failed {}",
     issue_page_title: "Issues",
-    issue_page_hint: "↑↓ select · Enter open task detail · Esc back",
+    issue_page_hint: "↑↓ select · Enter expand/collapse · Esc back",
     issue_page_empty: "Nothing needs attention right now",
     issue_row_new: "new",
+    issue_page_viewed: "Viewed",
+    issue_task_detail: "task detail ↗",
     background_list_title: "Background tasks",
     background_list_running: "Running",
     background_list_finished: "Recently finished",

@@ -1773,10 +1773,12 @@ fn apply_session_with(
         // Another session's children are not this session's.
         state.team = crate::multi_agent::TaskTeamView::default();
         // Nor is its open Activity: a detail page must not survive into a
-        // session that never had that task.
+        // session that never had that task — and neither does the page a
+        // detail would return to.
         state.activity_open = None;
         state.activity_selected = None;
         state.activity_view = crate::activity::ActivityView::default();
+        state.detail_return = None;
         // A side thread is scoped to the run it observed: leaving it behind
         // would let a follow-up reference a conversation this session never
         // had. Return to Main and drop it (the main draft is swapped back in).

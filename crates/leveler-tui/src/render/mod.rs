@@ -243,15 +243,19 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
     let lines = activity_screen_lines(state, &id, &summary, body.width as usize, &state.theme, t);
     let height = body.height as usize;
     crate::activity::sync_view(state, lines.len(), height);
-    let theme = &state.theme;
     let hint = activity_footer_hint(state, &id, &summary, t);
     let page = crate::secondary::SecondaryPage {
         title: detail_title,
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: &hint,
     };
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let back = {
+        let theme = &state.theme;
+        let back = crate::secondary::draw_header(frame, &layout, &page, theme);
+        crate::secondary::draw_footer(frame, &layout, &page, theme);
+        back
+    };
+    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
     let offset = state
         .activity_view
         .scroll
@@ -265,7 +269,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
 
 /// A closed / retired activity: still inside the shared shell, so the chrome
 /// never flickers between two layouts.
-fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
     let theme = &state.theme;
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
@@ -274,13 +278,17 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         hint: t.activity_esc,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
-    let lines = vec![Line::from(Span::styled(
-        t.activity_stale.to_string(),
-        Style::default().fg(theme.text.muted),
-    ))];
-    frame.render_widget(Paragraph::new(lines), layout.content);
+    let back = crate::secondary::draw_header(frame, &layout, &page, theme);
+    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    {
+        let theme = &state.theme;
+        crate::secondary::draw_footer(frame, &layout, &page, theme);
+        let lines = vec![Line::from(Span::styled(
+            t.activity_stale.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+        frame.render_widget(Paragraph::new(lines), layout.content);
+    }
 }
 
 /// The Background Tasks page: a master/detail console.
@@ -445,7 +453,9 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         hint: &hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
+    let back = crate::secondary::draw_header(frame, &layout, &page, &state.theme);
+    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    let theme = &state.theme;
     crate::secondary::draw_footer(frame, &layout, &page, theme);
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
@@ -1458,12 +1468,15 @@ fn goal_detail_lines(
     lines
 }
 
-/// The Issue page: the active issues the strip's issue cell counts, each with
-/// its own real detail behind it. Read-only; Enter on a task issue opens that
-/// task's page, Enter on a failed turn returns to the conversation where its
-/// failure block lives.
+/// The Issue page: every active issue with its own real detail behind it.
+///
+/// A row is one interaction: clicking it (or Enter) selects it and toggles its
+/// expansion, `▸`/`▾`. Expanded, a failed task shows its command, its runtime
+/// facts and an explicit entry into the task's existing page (`Screen::Activity`,
+/// whose Esc comes back here); a failed turn shows its typed machine detail in
+/// place. Read-only otherwise. Every painted row and entry publishes its hit,
+/// so the mouse acts on exactly what is on screen.
 fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
         title: t.issue_page_title,
@@ -1471,48 +1484,126 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hint: t.issue_page_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let back = {
+        let theme = &state.theme;
+        let back = crate::secondary::draw_header(frame, &layout, &page, theme);
+        crate::secondary::draw_footer(frame, &layout, &page, theme);
+        back
+    };
+    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
     let body = layout.content;
+    state.issue_row_hits.clear();
+    state.issue_detail_hits.clear();
     if body.width == 0 || body.height == 0 {
         return;
     }
     let issues = crate::issue::active_issues(state);
-    let selected = state.issue_selected.as_deref();
-    let lines = issue_page_lines(&issues, selected, body.width as usize, theme, t);
-    render_scrolled(frame, body, state, lines);
+    let view = issue_page_view(state, &issues, body.width as usize);
+    // Publish exactly the painted rows: a row scrolled out of the viewport owns
+    // no hit, and a resize republishes against the new geometry on the next
+    // frame.
+    let max = view.lines.len().saturating_sub(body.height as usize);
+    let scroll = state.screen_scroll.min(max) as u16;
+    for (line, key) in &view.rows {
+        let y = body.y + (*line as u16).wrapping_sub(scroll);
+        if !(body.y..body.y + body.height).contains(&y) || *line < scroll as usize {
+            continue;
+        }
+        state
+            .issue_row_hits
+            .push((y, body.x, body.x + body.width, key.clone()));
+    }
+    for (line, x0, x1, key) in &view.details {
+        if *line < scroll as usize {
+            continue;
+        }
+        let y = body.y + (*line as u16) - scroll;
+        if !(body.y..body.y + body.height).contains(&y) {
+            continue;
+        }
+        state.issue_detail_hits.push((
+            y,
+            body.x + *x0 as u16,
+            body.x + *x1 as u16,
+            key.clone(),
+        ));
+    }
+    render_scrolled(frame, body, state, view.lines);
 }
 
-fn issue_page_lines(
+/// The Issue page's body: its lines plus the hit geometry of what is painted
+/// (row headers and expanded detail entries), in content-line coordinates.
+struct IssuePageView {
+    lines: Vec<Line<'static>>,
+    rows: Vec<(usize, String)>,
+    /// (line, x_start, x_end, key) of each expanded row's detail entry.
+    details: Vec<(usize, usize, usize, String)>,
+}
+
+fn issue_page_view(
+    state: &AppState,
     issues: &[crate::issue::Issue],
-    selected: Option<&str>,
     width: usize,
-    theme: &Theme,
-    t: &crate::i18n::UiText,
-) -> Vec<Line<'static>> {
+) -> IssuePageView {
+    let theme = &state.theme;
+    let t = state.t();
+    let mut view = IssuePageView {
+        lines: Vec::new(),
+        rows: Vec::new(),
+        details: Vec::new(),
+    };
     if issues.is_empty() {
-        return vec![Line::from(Span::styled(
+        view.lines.push(Line::from(Span::styled(
             t.issue_page_empty.to_string(),
             Style::default().fg(theme.text.muted),
-        ))];
+        )));
+        return view;
     }
     let error = Style::default().fg(theme.status.error);
     let warning = Style::default().fg(theme.status.warning);
-    let mut lines = Vec::new();
+    let selected = state.issue_selected.as_deref();
+    let indent = crate::layout::DETAIL_BODY_INDENT;
+    let indent_w = indent.len();
+    let mut history_header = false;
     for issue in issues {
+        // The viewed history is labeled once, where it starts: unread failures
+        // lead, so a bare list of failed rows never reads as "all new".
+        if !issue.unread
+            && issue.kind == crate::issue::IssueKind::BackgroundFailure
+            && !history_header
+            && !view.rows.is_empty()
+        {
+            view.lines.push(Line::from(Span::styled(
+                t.issue_page_viewed.to_string(),
+                Style::default().fg(theme.text.muted),
+            )));
+            view.lines.push(Line::from(""));
+            history_header = true;
+        }
+        let expanded = crate::issue::is_expanded(state, &issue.key);
         let (glyph, ink) = match issue.kind {
             crate::issue::IssueKind::TurnFailure => ("✕", error),
             crate::issue::IssueKind::BackgroundFailure => ("⚠", warning),
         };
-        let marker = if selected == Some(issue.key.as_str()) {
-            Span::styled("▸ ", Style::default().fg(theme.text.secondary))
+        let cursor = if selected == Some(issue.key.as_str()) {
+            Span::styled("→ ", Style::default().fg(theme.text.secondary))
         } else {
             Span::raw("  ")
         };
+        let chevron = if expanded {
+            Span::styled("▾ ", Style::default().fg(theme.text.secondary))
+        } else {
+            Span::styled("▸ ", Style::default().fg(theme.text.secondary))
+        };
+        let marker_w = 4; // cursor + chevron
         let mut spans = vec![
-            marker,
+            cursor,
+            chevron,
             Span::styled(
-                format!("{glyph} {}  ", truncate_display(&issue.label, width.saturating_sub(4))),
+                format!(
+                    "{glyph} {}  ",
+                    truncate_display(&issue.label, width.saturating_sub(marker_w + 2))
+                ),
                 ink,
             ),
         ];
@@ -1522,25 +1613,64 @@ fn issue_page_lines(
                 Style::default().fg(theme.accent.primary),
             ));
         }
-        if let Some(meta) = &issue.meta {
-            spans.push(Span::styled(
-                meta.clone(),
-                Style::default().fg(theme.text.muted),
-            ));
+        view.rows.push((view.lines.len(), issue.key.clone()));
+        view.lines.push(Line::from(spans));
+        if !expanded {
+            view.lines.push(Line::from(""));
+            continue;
         }
-        lines.push(Line::from(spans));
-        if let Some(detail) = &issue.detail {
-            // The failure block's own safe technical detail, line for line.
-            for row in detail.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {row}"),
-                    Style::default().fg(theme.text.muted),
-                )));
+        match issue.kind {
+            crate::issue::IssueKind::BackgroundFailure => {
+                if issue.label != truncate_display(&issue.label, width.saturating_sub(marker_w + 2))
+                {
+                    for row in crate::render::wrap(&issue.label, width.saturating_sub(indent_w + 1))
+                    {
+                        view.lines.push(Line::from(Span::styled(
+                            format!("{indent}{row}"),
+                            Style::default().fg(theme.text.primary),
+                        )));
+                    }
+                }
+                if let Some(meta) = &issue.meta {
+                    view.lines.push(Line::from(Span::styled(
+                        format!("{indent}{meta}"),
+                        Style::default().fg(theme.text.muted),
+                    )));
+                }
+                let entry = t.issue_task_detail;
+                let x0 = indent_w;
+                let x1 = indent_w + unicode_width::UnicodeWidthStr::width(entry);
+                let line = view.lines.len();
+                view.lines.push(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(
+                        entry.to_string(),
+                        Style::default().fg(theme.accent.primary),
+                    ),
+                ]));
+                view.details.push((line, x0, x1, issue.key.clone()));
+            }
+            crate::issue::IssueKind::TurnFailure => {
+                if let Some(meta) = &issue.meta {
+                    view.lines.push(Line::from(Span::styled(
+                        format!("{indent}{meta}"),
+                        Style::default().fg(theme.text.muted),
+                    )));
+                }
+                if let Some(detail) = &issue.detail {
+                    // The failure block's own safe technical detail, line for line.
+                    for row in detail.lines() {
+                        view.lines.push(Line::from(Span::styled(
+                            format!("{indent}{row}"),
+                            Style::default().fg(theme.text.muted),
+                        )));
+                    }
+                }
             }
         }
-        lines.push(Line::from(""));
+        view.lines.push(Line::from(""));
     }
-    lines
+    view
 }
 
 /// Full Plan page opened from the workbench's one-line summary. It reads the
