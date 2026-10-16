@@ -443,6 +443,11 @@ fn git_response(script: &mut Script, spec: &CommandSpec) -> Result<ProcessOut, c
             Ok(text(""))
         }
         "fetch" => {
+            if spec.args.iter().any(|arg| arg == "--tags") {
+                // The release-comparison tag fetch: it does not put the
+                // candidate into the lab, so it must not satisfy the lab probe.
+                return Ok(text(""));
+            }
             script.project_fetched = true;
             Ok(text(""))
         }

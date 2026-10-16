@@ -171,15 +171,35 @@ fn git(host: &dyn Host, repo: &Path, args: &[&str]) -> Result<String, Fail> {
 struct Changes {
     commits: Vec<String>,
     files: Vec<String>,
+    /// Why the change set is unavailable, when it is.
+    note: Option<String>,
 }
 
 fn collect_changes(context: &Context, transaction: &Transaction) -> Changes {
-    let Some(previous) = &transaction.previous_release else {
-        return Changes {
-            commits: Vec::new(),
-            files: Vec::new(),
-        };
+    let empty = |note: String| Changes {
+        commits: Vec::new(),
+        files: Vec::new(),
+        note: Some(note),
     };
+    let Some(previous) = &transaction.previous_release else {
+        return empty("no previous release is recorded for this transaction".to_string());
+    };
+    // The tag for a release is created on origin by the release workflow, so a
+    // checkout that has not fetched it cannot name the previous release. That is
+    // a fact about this checkout, and the report says so instead of showing an
+    // empty comparison as if the release had no changes.
+    if git(
+        context.host,
+        &context.repo,
+        &["rev-parse", "--verify", &format!("{previous}^{{commit}}")],
+    )
+    .is_err()
+    {
+        return empty(format!(
+            "{previous} is not in this checkout, so the change set could not be \
+             computed (run `git fetch --tags` and re-open the report)"
+        ));
+    }
     let range = format!("{previous}..{}", transaction.candidate_sha);
     let commits = git(
         context.host,
@@ -199,7 +219,11 @@ fn collect_changes(context: &Context, transaction: &Transaction) -> Changes {
     .lines()
     .map(str::to_string)
     .collect();
-    Changes { commits, files }
+    Changes {
+        commits,
+        files,
+        note: None,
+    }
 }
 
 fn changes(context: &Context, transaction: &Transaction) -> Json {
@@ -269,6 +293,7 @@ fn changes(context: &Context, transaction: &Transaction) -> Json {
             "owners_touched",
             Json::Arr(risky.iter().map(Json::str).collect()),
         ),
+        ("note", optional(collected.note.as_deref())),
     ])
 }
 
@@ -502,6 +527,9 @@ fn build_markdown(context: &Context, transaction: &Transaction, data: &Json) -> 
         changes.at("commit_count").as_f64().unwrap_or(0.0) as i64,
         changes.at("changed_files").as_f64().unwrap_or(0.0) as i64
     ));
+    if let Some(note) = changes.at("note").as_str() {
+        out.push_str(&format!("> 变更集不可用：{note}\n\n"));
+    }
     out.push_str(&format!("### 新增功能（{}）\n\n", features.len()));
     push_list(
         &mut out,
