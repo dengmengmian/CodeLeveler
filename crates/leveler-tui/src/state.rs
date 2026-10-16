@@ -482,6 +482,11 @@ pub struct AppState {
     /// issue page, the background list); `None` means the conversation. The
     /// detail page itself never guesses its parent — it reads this.
     pub detail_return: Option<Screen>,
+    /// The Issue page's selection as the last frame painted it: the content
+    /// line the selected row sat on. The page follows the cursor when this
+    /// changes, and only then — a wheel scroll the user asked for is not undone
+    /// on the next frame.
+    pub issue_selected_line: Option<usize>,
     /// The rows the active page painted this frame: (rect, the page's own row
     /// key). Republished every frame, so a click resolves against exactly what
     /// is on screen — after a scroll, a resize or a data update — and a row
@@ -718,6 +723,7 @@ impl AppState {
             issue_detail_hits: Vec::new(),
             back_hit: None,
             detail_return: None,
+            issue_selected_line: None,
             screen_rows: Vec::new(),
             background_list_hits: Vec::new(),
             background_list_rect: None,
