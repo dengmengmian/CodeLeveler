@@ -21,18 +21,20 @@ pub enum Screen {
     /// First-class Activity Detail (background task or child agent).
     /// Observational: Esc closes the viewer without cancelling the work.
     Activity,
-    /// The background-jobs list: running and recently finished tasks. Opened by
-    /// Enter on the input footer's background summary; Enter on a row opens its
-    /// [`Screen::Activity`] detail, `x` stops the selected running task.
+    /// The background-jobs list: running and recently finished tasks. Opened
+    /// from the state strip's background cell. Enter moves between the list and
+    /// the selected task's live log — the page never leaves itself — and `x`
+    /// stops the selected running task.
     ActivityList,
     /// Every child agent of the current session, opened from the roster's
     /// overflow row. Enter on a row opens its [`Screen::Activity`] detail.
     /// Observational like the roster itself: nothing here cancels work.
     Team,
     /// Active issues, opened from the state strip's issue cell: a failed turn
-    /// and the failed background tasks the projection still holds. Read-only —
-    /// Enter on a task issue opens its [`Screen::Activity`] detail, and nothing
-    /// here cancels work or clears a failure.
+    /// and the failed background tasks the projection still holds. A row is one
+    /// interaction — Enter or a click selects it and toggles its expansion, and
+    /// the expanded row's detail entry (or `→`) opens its [`Screen::Activity`]
+    /// page. Nothing here cancels work or clears a failure record.
     Issue,
     /// Full active plan, opened from the workbench's one-line plan summary.
     Plan,
