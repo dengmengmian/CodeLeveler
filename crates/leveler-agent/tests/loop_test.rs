@@ -6572,6 +6572,69 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The all-refused rule covers `spawn_agent` guard rejections too: a round
+/// whose only spawn call is refused (here an empty task) made no progress,
+/// so repeated rounds must feed the no-progress streak and hard-stop rather
+/// than spin until the step budget runs out.
+#[tokio::test]
+async fn refused_spawn_rounds_count_as_no_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-spawn-refused-{}",
+        std::process::id() as u64 * 89 + 21
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Every round re-issues a spawn the guard refuses before any agent
+    // starts, so no round can make progress.
+    let refused = || assistant_tool_call("c1", "spawn_agent", serde_json::json!({"task": ""}));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        refused(),
+        refused(),
+        refused(),
+        refused(),
+        refused(),
+        refused(),
+        assistant_text("should not reach"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    );
+
+    let outcome = executor
+        .run(
+            "delegate the work",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Incomplete,
+        "all-refused spawn rounds must hard-stop as no progress: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .stop_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("no-progress")),
+        "expected the no-progress stop detail, got {:?}",
+        outcome.stop_detail
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Gateways that never report streaming usage must not disable the token
 /// budget: spend falls back to the transcript estimate, so `max_model_tokens`
 /// still binds instead of silently never tripping.

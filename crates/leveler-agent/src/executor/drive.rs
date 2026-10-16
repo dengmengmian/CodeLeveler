@@ -3637,6 +3637,7 @@ impl AgentHarness for Drive<'_> {
                             is_error: true,
                         },
                     });
+                    denied_calls_this_round += 1;
                     continue;
                 }
 
@@ -3684,6 +3685,7 @@ impl AgentHarness for Drive<'_> {
                         });
                         self.progress.children_spawned_total =
                             self.progress.children_spawned_total.saturating_sub(1);
+                        denied_calls_this_round += 1;
                         continue;
                     }
                 }
