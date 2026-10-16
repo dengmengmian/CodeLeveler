@@ -82,6 +82,10 @@ struct Script {
     /// The version's tag exists on origin but not in the local clone, which is
     /// what a release workflow-created tag looks like before a fetch.
     origin_tags_only: bool,
+    /// The lab clone does not have the candidate until it is fetched.
+    candidate_missing_from_lab: bool,
+    /// Set once the candidate has been fetched into the lab clone.
+    project_fetched: bool,
     /// Layers this run refuses to write, to model a gate that named a run but
     /// produced no evidence for one of its layers.
     omit_layers: Vec<String>,
@@ -118,6 +122,8 @@ impl Script {
             dead_owner: false,
             dirty: String::new(),
             origin_tags_only: false,
+            candidate_missing_from_lab: false,
+            project_fetched: false,
             omit_layers: Vec::new(),
         }
     }
@@ -419,7 +425,27 @@ fn git_response(script: &mut Script, spec: &CommandSpec) -> Result<ProcessOut, c
             Ok(text(""))
         }
         "diff" | "log" => Ok(text("")),
-        "cat-file" => Ok(text("")),
+        "cat-file" => {
+            // `git cat-file -e <sha>^{commit}` probing the lab clone.
+            if script.candidate_missing_from_lab
+                && !script.project_fetched
+                && spec
+                    .args
+                    .iter()
+                    .any(|arg| arg.starts_with(&CANDIDATE[..12]))
+            {
+                return Ok(ProcessOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "fatal: Not a valid object name\n".to_string(),
+                });
+            }
+            Ok(text(""))
+        }
+        "fetch" => {
+            script.project_fetched = true;
+            Ok(text(""))
+        }
         "push" => {
             if script.push_fails {
                 return Ok(ProcessOut {
@@ -1104,6 +1130,28 @@ fn a_tag_that_only_origin_has_still_counts_as_released() {
     let (code, rendered, _) = world.run(&["publish", "--dry-run"]);
     assert_eq!(code, 0, "{rendered}");
     assert!(rendered.contains("next:       1.0.9"), "{rendered}");
+}
+
+#[test]
+fn a_stage_fetches_the_frozen_commit_into_the_lab_before_the_gate_runs() {
+    // The lab reads the candidate out of its own clone and a version commit is
+    // new by definition, so the pipeline must put it there. Without this the
+    // gate stops with "candidate sha not found in repos/codeleveler" before
+    // doing any work.
+    let world = World::new();
+    world.set(|script| script.candidate_missing_from_lab = true);
+    let (code, rendered, log) = world.run(&["publish", "--stop-after", "1"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(rendered.contains("fetched"), "{rendered}");
+    let fetched = log.iter().position(|spec| {
+        spec.program == "git" && spec.args.first().map(String::as_str) == Some("fetch")
+    });
+    let gate = log.iter().position(|spec| spec.program == "python3");
+    assert!(fetched.is_some(), "the candidate is fetched into the lab");
+    assert!(
+        fetched.expect("fetch") < gate.expect("gate"),
+        "the fetch must happen before the gate is asked to qualify the candidate"
+    );
 }
 
 #[test]
