@@ -526,7 +526,17 @@ fn plan(host: &dyn Host, repo: &Path, env: &Env, opts: &PublishOpts) -> Result<P
     let current = version::require_local(&local)?;
     let next = version::bump(current, opts.level)?;
     let tag = format!("v{next}");
-    let tags = exec::ok_stdout(host, exec::git(repo, &["tag", "--list"]), "GIT_FAILED")?;
+    // Local tags plus the ones origin has: the release workflow creates the tag
+    // remotely, so a clone that has not fetched it would otherwise read the
+    // version it just released as "not yet released".
+    let local_tags = exec::ok_stdout(host, exec::git(repo, &["tag", "--list"]), "GIT_FAILED")?;
+    let remote_tags = exec::ok_stdout(
+        host,
+        exec::git(repo, &["ls-remote", "--tags", "origin"]),
+        "GIT_FAILED",
+    )?;
+    let remote = version::remote_tag_names(&remote_tags);
+    let tags = format!("{local_tags}\n{}", remote.join("\n"));
     if version::tag_listed(&tags, &tag) {
         return Err(Fail::new(
             "TAG_EXISTS",

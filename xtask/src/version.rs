@@ -283,6 +283,28 @@ pub fn parse_tag_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Tag names out of `git ls-remote --tags` output.
+///
+/// A release tag is created by the release workflow *remotely*: until the local
+/// clone fetches it, `git tag --list` does not know the version that was just
+/// published, and a guard that only reads local tags refuses the next release
+/// with `VERSION_MISMATCH`. The guard therefore reads both, and this is the
+/// shape the remote side arrives in: `<sha>\trefs/tags/<name>`, with an
+/// annotated tag appearing twice (its peeled `^{}` line included).
+pub fn remote_tag_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let Some((_, reference)) = line.split_once("refs/tags/") else {
+            continue;
+        };
+        let name = reference.trim().trim_end_matches("^{}").trim();
+        if !name.is_empty() && !names.iter().any(|seen: &String| seen == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 pub fn parse_stable_tags(text: &str) -> Vec<SemVer> {
     parse_tag_lines(text)
         .iter()
@@ -433,6 +455,21 @@ tokio = { version = \"1.0.8\" }
         let next = bump_heading(text, parse_stable("1.0.9").unwrap(), "docs/RELEASE.md").unwrap();
         assert!(next.starts_with("# CodeLeveler 1.0.9\n"));
         assert!(next.contains("Still mentions 1.0.8"));
+    }
+
+    #[test]
+    fn remote_tag_names_read_the_tags_out_of_ls_remote() {
+        let text = "fbcb610948020537b921753cec60544b9e4d921f\trefs/tags/v1.0.17\n\
+                    4140c2b9e58d3917f6770a043d8dbeeaa20fba4f\trefs/tags/v1.0.17^{}\n\
+                    4be0f8c0c5d638d632e2204186fe24bd73c164ad\trefs/tags/v1.0.16\n";
+        let names = remote_tag_names(text);
+        assert_eq!(names, vec!["v1.0.17".to_string(), "v1.0.16".to_string()]);
+        // The names feed the same guard as local tags.
+        assert_eq!(
+            highest_stable(&names.join("\n")).unwrap().to_string(),
+            "1.0.17"
+        );
+        assert!(remote_tag_names("").is_empty());
     }
 
     #[test]
