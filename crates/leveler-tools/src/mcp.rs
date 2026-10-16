@@ -208,7 +208,12 @@ impl McpClient {
                 serde_json::json!({ "name": name, "arguments": args }),
             )
             .await?;
-        Ok(format_tool_result(&result))
+        let content = format_tool_result(&result);
+        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+            Err(content)
+        } else {
+            Ok(content)
+        }
     }
 }
 
