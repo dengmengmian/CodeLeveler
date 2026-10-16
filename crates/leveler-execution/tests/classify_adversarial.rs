@@ -399,3 +399,43 @@ fn assisted_still_auto_runs_ordinary_commands() {
         );
     }
 }
+
+#[test]
+fn unreadable_relocation_value_asks_for_remote_subcommands() {
+    // `-C` / `--git-dir` / `--work-tree` name the repository a remote-side
+    // subcommand talks to. When that value is unreadable the repository — and
+    // so the destination of any stored credential — is unknown, the same
+    // reason an unreadable remote word asks. The call must never be laxer
+    // than its literal form.
+    assert_eq!(
+        sh_c(r#"git -C "$DIR" fetch origin"#),
+        CommandClass::Dangerous
+    );
+    assert_eq!(
+        sh_c(r#"git -C "$DIR" push origin main"#),
+        CommandClass::Dangerous
+    );
+    assert_eq!(
+        sh_c(r#"git -C "$DIR" pull origin main"#),
+        CommandClass::Dangerous
+    );
+    assert_eq!(
+        sh_c(r#"git --git-dir "$D" fetch origin"#),
+        CommandClass::Dangerous
+    );
+    assert_eq!(
+        sh_c(r#"git --work-tree "$D" fetch origin"#),
+        CommandClass::Dangerous
+    );
+    // The literal relocation forms they must match.
+    assert_eq!(
+        sh_c("git -C /tmp/elsewhere fetch origin"),
+        CommandClass::Dangerous
+    );
+    // A relocated *read* keeps its verdict: an arguments-ignoring subcommand
+    // is a read whatever repository it names.
+    assert_eq!(
+        sh_c(r#"git -C "$dir" status --porcelain"#),
+        CommandClass::Safe
+    );
+}
