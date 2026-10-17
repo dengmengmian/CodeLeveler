@@ -446,7 +446,21 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
                     );
                     std::fs::write(run_dir.join("rc_evidence.json"), reference).unwrap();
                 }
-                return Ok(process(script.rc_exit, &format!("written: {rc_id}/\n")));
+                // The real rc_check names the run reuse came from, in the same
+                // output as the run it wrote. This is what made the stage die
+                // with RC_RUN_AMBIGUOUS after a successful reuse.
+                let reuse_line = if script.reuse_suites.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  reuse: {} from {rc_id} (identity verified)\n",
+                        script.reuse_suites.join(", ")
+                    )
+                };
+                return Ok(process(
+                    script.rc_exit,
+                    &format!("{reuse_line}written: {rc_id}/\n"),
+                ));
             }
             if line.contains("--from-artifacts") {
                 // The real gate names the coverage phase it was asked for; a
@@ -1531,6 +1545,33 @@ fn the_pipeline_offers_prior_rc_evidence_in_the_shape_the_lab_documents() {
         world.read(|script| script.reuse_from.clone()),
         Some(expected),
         "the lab-relative directory is the shape rc_check resolves"
+    );
+}
+
+#[test]
+fn a_reused_rc_run_still_names_its_own_run() {
+    // A qualification that reuses suites prints the run it reused *and* the run
+    // it wrote. Naming them both is correct; picking the run to adopt from "the
+    // one eval/rc path in the output" was not.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    world.crash_stage(3);
+    world.set(|script| script.reuse_suites = vec!["RC1".into(), "RC2".into()]);
+    let (code, rendered, _) = world.run(&["publish", "--resume", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("RC_RUN_AMBIGUOUS"),
+        "the run it wrote decides, not every run ever mentioned: {rendered}"
+    );
+    assert!(
+        rendered.contains("RC suites reused: RC1, RC2"),
+        "{rendered}"
+    );
+    assert_eq!(
+        world.state().path_str("rc_run_id"),
+        Some("20260101-000000-bbbbbbbbbbbb"),
+        "the transaction adopts the run this qualification produced"
     );
 }
 

@@ -2134,9 +2134,19 @@ fn reuse_line(doc: &Json, reuse_from: Option<&str>) -> String {
     )
 }
 
+/// The RC run directories a qualification's output names.
+///
+/// The tool's own terminal contract line (`written: eval/rc/<run>/`) is the one
+/// fact that names the run it produced, so that line decides. Scanning the whole
+/// output for `eval/rc/` markers instead made a *mention* of another run look
+/// like a second answer to "which run did this produce": the reuse line names the
+/// run reuse came from, and the stage died with RC_RUN_AMBIGUOUS *after* a
+/// complete qualification that had successfully reused its suites. The global
+/// scan survives only as a fallback for output that names no written run.
 fn rc_runs(text: &str) -> Vec<String> {
     let marker = "eval/rc/";
-    let mut out = Vec::new();
+    let mut written = Vec::new();
+    let mut mentioned = Vec::new();
     for (index, _) in text.match_indices(marker) {
         let rest = &text[index + marker.len()..];
         let id: String = rest
@@ -2147,11 +2157,21 @@ fn rc_runs(text: &str) -> Vec<String> {
             continue;
         }
         let full = format!("eval/rc/{id}");
-        if !out.contains(&full) {
-            out.push(full);
+        let line = text[..index].rsplit('\n').next().unwrap_or("");
+        let target = if line.trim_start().starts_with("written:") {
+            &mut written
+        } else {
+            &mut mentioned
+        };
+        if !target.contains(&full) {
+            target.push(full);
         }
     }
-    out
+    if written.is_empty() {
+        mentioned
+    } else {
+        written
+    }
 }
 
 /// The newest completed RC run for this candidate, as the lab-relative directory
