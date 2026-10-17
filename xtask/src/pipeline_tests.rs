@@ -98,6 +98,12 @@ struct Script {
     /// Layers this run refuses to write, to model a gate that named a run but
     /// produced no evidence for one of its layers.
     omit_layers: Vec<String>,
+    /// The fake RC writes no `rc_evidence.json` into the release run: the
+    /// defect this round fixes, kept reachable so the guard is testable.
+    skip_rc_registration: bool,
+    /// The fake gate answers the final coverage audit with this phase instead
+    /// of the one it was asked for, to prove the pipeline notices.
+    coverage_phase_override: Option<String>,
 }
 
 impl Script {
@@ -137,6 +143,8 @@ impl Script {
             candidate_missing_from_lab: false,
             project_fetched: false,
             omit_layers: Vec::new(),
+            skip_rc_registration: false,
+            coverage_phase_override: None,
         }
     }
 
@@ -318,21 +326,57 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
             if line.contains("rc_check.py") {
                 let dir = lab.join(&rc_id);
                 std::fs::create_dir_all(&dir).unwrap();
-                std::fs::write(
-                    dir.join("rc.json"),
-                    format!(
-                        "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"blockers\":[]}},\"reuse\":[]}}",
-                        script.rc_decision, script.rc_exit
-                    ),
-                )
-                .unwrap();
+                let verdict = format!(
+                    "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"blockers\":[]}},\"reuse\":[]}}",
+                    script.rc_decision, script.rc_exit
+                );
+                std::fs::write(dir.join("rc.json"), &verdict).unwrap();
+                // The real rc_check registers a *reference* to its verdict in
+                // the release run it consumed; the pipeline refuses a stage
+                // that ran RC and registered nothing.
+                if !script.skip_rc_registration {
+                    let rc_run_id = rc_id.trim_start_matches("eval/rc/").to_string();
+                    let release_run_id = run_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let reference = format!(
+                        "{{\"kind\":\"rc_release_evidence\",\"release_run_id\":\"{release_run_id}\",\"rc_run_id\":\"{rc_run_id}\",\"rc_json\":\"{rc_id}/rc.json\",\"rc_json_sha256\":\"{}\",\"decision\":\"{}\",\"exit_code\":{}}}\n",
+                        "9".repeat(64),
+                        script.rc_decision,
+                        script.rc_exit,
+                    );
+                    std::fs::write(run_dir.join("rc_evidence.json"), reference).unwrap();
+                }
                 return Ok(process(script.rc_exit, &format!("written: {rc_id}/\n")));
             }
             if line.contains("--from-artifacts") {
+                // The real gate names the coverage phase it was asked for; a
+                // final verdict that came back as the pre-RC audit is not a
+                // final verdict, and the pipeline checks exactly that.
+                let asked = spec
+                    .args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--coverage-phase")
+                    .map(|pair| pair[1].clone())
+                    .unwrap_or_else(|| "final".to_string());
+                let phase = script.coverage_phase_override.clone().unwrap_or(asked);
+                let rc_state = if run_dir.join("rc_evidence.json").is_file() {
+                    "valid"
+                } else {
+                    "absent"
+                };
+                let coverage = format!(
+                    "{{\"phase\":\"{phase}\",\"status\":\"PASS\",\"summary\":{{\"total\":1,\"covered\":1,\"core_total\":1,\"core_covered\":1}},\"rc_evidence\":{{\"status\":\"{rc_state}\",\"detail\":\"the referenced rc.json matches this run's identity\",\"rc_run_id\":\"20260101-000000-{short}\",\"rc_json_sha256\":\"{sha}\"}},\"blockers\":[],\"warnings\":[]}}",
+                    short = &CANDIDATE[..12],
+                    sha = "a".repeat(64),
+                );
+                std::fs::write(run_dir.join("feature_coverage.json"), &coverage).unwrap();
                 std::fs::write(
                     run_dir.join("release.json"),
                     format!(
-                        "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"qualification_complete\":{},\"blockers\":[]}},\"layers\":{{}}}}",
+                        "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"qualification_complete\":{},\"blockers\":[]}},\"layers\":{{}},\"feature_coverage\":{coverage}}}",
                         script.gate_decision,
                         script.gate_exit,
                         script.gate_exit == 0 || script.gate_exit == 2
@@ -1317,6 +1361,131 @@ fn rc_runs_before_the_final_verdict_and_after_the_pre_rc_one() {
     assert!(
         rc < last_verdict,
         "the final verdict comes after RC: {order:?}"
+    );
+}
+
+#[test]
+fn the_report_shows_which_phase_judged_coverage_and_whether_rc_was_bound() {
+    // The delivered report is where an operator reads the coverage verdict. It
+    // has to say which phase judged it and whether the run's RC evidence was
+    // accepted; otherwise "104/107" cannot be told apart from a pre-RC audit.
+    let world = World::new();
+    let (code, rendered, _) = world.run(&["publish", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    let report = world.report();
+    assert!(
+        report.contains("## 三之补、FEATURE COVERAGE REPORT"),
+        "{report}"
+    );
+    assert!(report.contains("审计阶段：**final**"), "{report}");
+    assert!(report.contains("RC 证据引用：**valid**"), "{report}");
+    assert!(report.contains("RC run："), "{report}");
+    assert!(report.contains("rc.json sha256："), "{report}");
+}
+
+#[test]
+fn the_final_verdict_is_taken_at_the_final_coverage_phase() {
+    // The defect: the stage re-decided at the "final" point while the coverage
+    // audit silently ran as pre-RC, so the RC-dependent core features were
+    // pending and the pre-RC policy had no rule that could block them.
+    let world = World::new();
+    let (code, rendered, log) = world.run(&["publish", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    let phases: Vec<String> = log
+        .iter()
+        .filter(|spec| spec.args.join(" ").contains("--from-artifacts"))
+        .map(|spec| {
+            spec.args
+                .windows(2)
+                .find(|pair| pair[0] == "--coverage-phase")
+                .map(|pair| pair[1].clone())
+                .unwrap_or_else(|| "unstated".to_string())
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["pre_rc".to_string(), "final".to_string()],
+        "the verdicts must name their phases, in order: {phases:?}"
+    );
+    assert!(
+        rendered.contains("coverage=final"),
+        "the final verdict reports the phase it was taken at: {rendered}"
+    );
+    assert!(
+        rendered.contains("rc=valid"),
+        "the final verdict consumed the registered RC evidence: {rendered}"
+    );
+}
+
+#[test]
+fn a_final_verdict_that_came_back_as_the_wrong_phase_is_refused() {
+    // Case 10: RC completed and the evidence exists, but the coverage audit the
+    // pipeline accepted was not the final one. Stage 3 must not report PASS.
+    let world = World::new();
+    world.set(|script| script.coverage_phase_override = Some("pre_rc".into()));
+    let (code, rendered, _) = world.run(&["publish", "--stop-after", "3"]);
+    assert_ne!(code, 0);
+    assert!(
+        rendered.contains("COVERAGE_PHASE_MISMATCH"),
+        "a verdict taken at the wrong phase is not a verdict: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stage 3 real-dogfood: PASS"),
+        "stage 3 must not pass on a non-final coverage verdict: {rendered}"
+    );
+}
+
+#[test]
+fn rc_that_registered_no_evidence_stops_the_stage() {
+    // RC ran and said PASS, but the release run holds no reference to it. The
+    // final audit would see no RC evidence; the stage names the cause instead of
+    // reporting the resulting coverage gap as a product failure.
+    let world = World::new();
+    world.set(|script| script.skip_rc_registration = true);
+    let (code, rendered, _) = world.run(&["publish", "--stop-after", "3"]);
+    assert_ne!(code, 0);
+    assert!(
+        rendered.contains("RC_EVIDENCE_NOT_REGISTERED"),
+        "the missing registration is named: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stage 3 real-dogfood: PASS"),
+        "a stage that cannot bind its RC verdict must not pass: {rendered}"
+    );
+}
+
+#[test]
+fn a_resumed_stage_3_re_registers_the_rc_evidence_it_reuses() {
+    // A resume that re-earns stage 3 runs RC again. The RC suites may be reused
+    // (their identity matches), and the reference is written again for whatever
+    // RC run this attempt produced, so the resumed final verdict consumes it.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let reference = world.lab.join(RELEASE_RUN).join("rc_evidence.json");
+    let first = std::fs::read_to_string(&reference).unwrap();
+    assert!(first.contains("20260101-000000-"), "{first}");
+
+    // A changed lab definition is exactly what makes the qualification have to
+    // be re-earned, so this is a resume that really does run stage 3 again.
+    std::fs::create_dir_all(world.lab.join("eval/scripts")).unwrap();
+    std::fs::write(
+        world.lab.join("eval/scripts/feature_coverage.py"),
+        "# changed coverage audit\n",
+    )
+    .unwrap();
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("rc=valid"),
+        "the resumed final verdict consumes the re-registered evidence: {rendered}"
+    );
+    let second = std::fs::read_to_string(&reference).unwrap();
+    assert!(second.contains("rc_run_id"), "{second}");
+    let state = world.state();
+    assert_eq!(
+        state.path_str("rc_run_id"),
+        Some("20260101-000000-bbbbbbbbbbbb")
     );
 }
 
