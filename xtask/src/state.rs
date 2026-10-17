@@ -85,15 +85,45 @@ impl Status {
 
 /// Case-level roll-up of the model-driven stage. Counts only, never a verdict:
 /// L3's own gate decides, this records what it decided.
+///
+/// The fields are the ones the L3 case rows actually carry (`eval/scripts/
+/// release_check.py -> collect_cases`): `passed`, `attempts`, `completed`,
+/// `expect_passed`, `reused`. Reading a `status` string reported `0 passed` for
+/// a 19/19 run, and reading `unstable_case_ids` from the top level found nothing
+/// because the layer writes it under `metrics`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cases {
+    /// Unique cases the layer judged.
     pub total: u64,
+    /// Sum of every case's attempts. Greater than `total` means a retry ran.
+    pub attempted: u64,
+    /// Cases whose final verdict is a pass.
     pub passed: u64,
+    /// Cases that finished but whose own acceptance did not hold.
     pub failed: u64,
-    pub warn: u64,
-    pub reused: u64,
-    pub unproven: u64,
+    /// Cases that did not finish (the run ended before the task did).
+    pub incomplete: u64,
+    /// Cases that needed more than one attempt.
+    pub retried: u64,
+    /// The layer's own flaky list.
     pub unstable: u64,
+    /// Cases restored from this candidate's earlier L3 results.
+    pub reused: u64,
+}
+
+/// The product's own pass rule, from the L3 case row.
+///
+/// `leveler-eval` defines `CaseResult::passed()` as `completed && expect_passed`,
+/// and the lab publishes that as the row's `passed` field. A document that
+/// predates the field gets the same derivation from its two ingredients — never
+/// `expect_passed` alone, which would report a case that never finished as a
+/// pass, and never a missing field as a failure.
+pub fn case_passed(case: &Json) -> bool {
+    if let Some(passed) = case.at("passed").as_bool() {
+        return passed;
+    }
+    case.at("completed").as_bool().unwrap_or(false)
+        && case.at("expect_passed").as_bool().unwrap_or(false)
 }
 
 impl Cases {
@@ -104,31 +134,41 @@ impl Cases {
             ..Cases::default()
         };
         for case in cases {
-            match case.at("status").as_str().unwrap_or("") {
-                "PASS" => summary.passed += 1,
-                "FAIL" => summary.failed += 1,
-                "WARN" => summary.warn += 1,
-                "UNPROVEN" | "UNKNOWN" => summary.unproven += 1,
-                _ => {}
+            if case_passed(case) {
+                summary.passed += 1;
+            } else if case.at("completed").as_bool().unwrap_or(false) {
+                summary.failed += 1;
+            } else {
+                summary.incomplete += 1;
+            }
+            let attempts = case.at("attempts").as_f64().unwrap_or(1.0).max(0.0) as u64;
+            summary.attempted += attempts;
+            if attempts > 1 {
+                summary.retried += 1;
+            }
+            if case.at("reused").as_bool().unwrap_or(false) {
+                summary.reused += 1;
             }
         }
-        for id in layer.at("unstable_case_ids").as_arr().unwrap_or(&[]) {
-            if id.as_str().is_some() {
-                summary.unstable += 1;
-            }
-        }
+        summary.unstable = layer
+            .at("metrics")
+            .at("unstable_case_ids")
+            .as_arr()
+            .map(|ids| ids.len() as u64)
+            .unwrap_or(0);
         Some(summary)
     }
 
     pub fn to_json(&self) -> Json {
         Json::obj(vec![
             ("total", Json::num(self.total as f64)),
+            ("attempted", Json::num(self.attempted as f64)),
             ("passed", Json::num(self.passed as f64)),
             ("failed", Json::num(self.failed as f64)),
-            ("warn", Json::num(self.warn as f64)),
-            ("reused", Json::num(self.reused as f64)),
-            ("unproven", Json::num(self.unproven as f64)),
+            ("incomplete", Json::num(self.incomplete as f64)),
+            ("retried", Json::num(self.retried as f64)),
             ("unstable", Json::num(self.unstable as f64)),
+            ("reused", Json::num(self.reused as f64)),
         ])
     }
 
@@ -136,13 +176,30 @@ impl Cases {
         let count = |key: &str| value.at(key).as_f64().unwrap_or(0.0).max(0.0) as u64;
         Cases {
             total: count("total"),
+            attempted: count("attempted"),
             passed: count("passed"),
             failed: count("failed"),
-            warn: count("warn"),
-            reused: count("reused"),
-            unproven: count("unproven"),
+            incomplete: count("incomplete"),
+            retried: count("retried"),
             unstable: count("unstable"),
+            reused: count("reused"),
         }
+    }
+
+    /// One line an operator can read without knowing the schema.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "{} case(s), {} attempt(s), {} passed, {} failed, {} incomplete, \
+             {} retried, {} unstable, {} reused",
+            self.total,
+            self.attempted,
+            self.passed,
+            self.failed,
+            self.incomplete,
+            self.retried,
+            self.unstable,
+            self.reused
+        )
     }
 }
 
@@ -481,6 +538,53 @@ impl Transaction {
             Some(finished) => (finished - self.started_at).max(0.0),
             None => (crate::clock::now() - self.started_at).max(0.0),
         }
+    }
+
+    /// The stage this transaction is actually at.
+    ///
+    /// `stage` records where the last attempt stopped, which is not the same
+    /// fact once a later attempt succeeded: a run that failed at stage 3 and
+    /// then passed it still said "current stage: 3" while the only work left was
+    /// stage 4. While something is running, that is the stage; otherwise it is
+    /// the first stage still undecided.
+    pub fn current_stage(&self) -> u8 {
+        if self.status == Status::Running {
+            return self.stage;
+        }
+        for stage in STAGES {
+            if !self.stage_record(stage).status.is_decided_pass() {
+                return stage;
+            }
+        }
+        STAGE_PUBLISH
+    }
+
+    /// The failure the CURRENT status reports, if any.
+    ///
+    /// `failure_reason` is the reason this transaction is not OK. It is written
+    /// when a stage fails and cleared when a later attempt of that stage
+    /// succeeds (`clear_current_failure`), so it is never a stale failure read
+    /// back from an attempt that has since been superseded. History lives in
+    /// `attempts`, which is never rewritten.
+    pub fn current_failure(&self) -> Option<&str> {
+        match self.status {
+            Status::Fail | Status::Blocked => self.failure_reason.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The last failure in the attempt history, whatever the current status is.
+    pub fn last_failure(&self) -> Option<&Attempt> {
+        self.attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.status == Status::Fail)
+    }
+
+    /// A stage succeeded: whatever failed before it is no longer current.
+    /// The attempt history keeps the failure; the current-state field does not.
+    pub fn clear_current_failure(&mut self) {
+        self.failure_reason = None;
     }
 
     pub fn stage_record(&self, stage: u8) -> &StageRecord {

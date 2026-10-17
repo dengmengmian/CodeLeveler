@@ -54,6 +54,10 @@ struct Script {
     layer_status: Vec<(String, String)>,
     /// Layer check ids to omit, to prove a stage notices missing work.
     drop_check: Option<String>,
+    /// Per-case attempt/failure counts for the scripted L3 document, and the
+    /// layer's own flaky list. Both are what the roll-up has to read.
+    case_attempts: Vec<(String, u64, u64)>,
+    unstable: Vec<String>,
     gate_exit: i32,
     gate_decision: String,
     rc_exit: i32,
@@ -104,6 +108,12 @@ struct Script {
     /// The fake gate answers the final coverage audit with this phase instead
     /// of the one it was asked for, to prove the pipeline notices.
     coverage_phase_override: Option<String>,
+    /// The `--reuse-from` value the fake RC run was handed, as received.
+    reuse_from: Option<String>,
+    /// Suites the fake RC run reports as reused, and the failing identity
+    /// checks it reports when it reused nothing.
+    reuse_suites: Vec<String>,
+    reuse_checks: Vec<(String, String)>,
 }
 
 impl Script {
@@ -113,6 +123,8 @@ impl Script {
             committed: false,
             layer_status: Vec::new(),
             drop_check: None,
+            case_attempts: Vec::new(),
+            unstable: Vec::new(),
             gate_exit: 0,
             gate_decision: "PASS".to_string(),
             rc_exit: 0,
@@ -145,7 +157,27 @@ impl Script {
             omit_layers: Vec::new(),
             skip_rc_registration: false,
             coverage_phase_override: None,
+            reuse_from: None,
+            reuse_suites: Vec::new(),
+            reuse_checks: Vec::new(),
         }
+    }
+
+    /// The recorded attempt count for a scripted case (default: one attempt).
+    fn attempts_for(&self, id: &str) -> u64 {
+        self.case_attempts
+            .iter()
+            .find(|(case, _, _)| case == id)
+            .map(|(_, attempts, _)| *attempts)
+            .unwrap_or(1)
+    }
+
+    fn failures_for(&self, id: &str) -> u64 {
+        self.case_attempts
+            .iter()
+            .find(|(case, _, _)| case == id)
+            .map(|(_, _, failures)| *failures)
+            .unwrap_or(0)
     }
 
     fn status(&self, layer: &str) -> String {
@@ -185,13 +217,35 @@ fn layer_document(script: &Script, layer: &str) -> String {
     }
     let status = script.status(layer);
     let cases = if layer == "L3" {
+        // The real L3 rows carry the product's own verdict fields (`passed`,
+        // `completed`, `expect_passed`, `attempts`, `failures`) and the flaky
+        // list lives under `metrics`. A fixture shaped differently is a fixture
+        // the roll-up cannot be tested against.
         let rendered = script
             .cases
             .iter()
-            .map(|(id, status)| format!("{{\"id\":\"{id}\",\"status\":\"{status}\"}}"))
+            .map(|(id, verdict)| {
+                // The product's rule: `passed == completed && expect_passed`. A
+                // FAIL ran and its acceptance did not hold; a TIMEOUT never
+                // finished. Collapsing those two hides which happened.
+                let passed = verdict == "PASS";
+                let completed = passed || verdict == "FAIL";
+                let expect_passed = passed;
+                format!(
+                    "{{\"id\":\"{id}\",\"passed\":{passed},\"completed\":{completed},\"expect_passed\":{expect_passed},\"attempts\":{} ,\"failures\":{}}}",
+                    script.attempts_for(id),
+                    script.failures_for(id)
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
-        format!(",\"cases\":[{rendered}]")
+        let unstable = script
+            .unstable
+            .iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(",\"cases\":[{rendered}],\"metrics\":{{\"unstable_case_ids\":[{unstable}]}}")
     } else {
         String::new()
     };
@@ -287,6 +341,36 @@ fn command_line(spec: &CommandSpec) -> String {
     format!("{} {}", spec.program, spec.args.join(" "))
 }
 
+/// What the fake RC run did with the evidence it was offered, shaped exactly
+/// like `rc_check`'s `environment.reuse` (`requested_as`/`reused_from`/`suites`/
+/// `checks`). The pipeline reads this to report the outcome instead of assuming
+/// a reuse happened because an argument was passed.
+fn reuse_document(script: &Script) -> String {
+    match &script.reuse_from {
+        None => "{\"requested\":false,\"suites\":[],\"checks\":[]}".to_string(),
+        Some(requested) => {
+            let source = requested.trim_start_matches("eval/rc/").to_string();
+            let suites: Vec<String> = script
+                .reuse_suites
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect();
+            let checks: Vec<String> = script
+                .reuse_checks
+                .iter()
+                .map(|(id, status)| {
+                    format!("{{\"id\":\"{id}\",\"status\":\"{status}\",\"detail\":\"fake\"}}")
+                })
+                .collect();
+            format!(
+                "{{\"requested\":true,\"requested_as\":\"{requested}\",\"reused_from\":\"eval/rc/{source}\",\"suites\":[{}],\"checks\":[{}]}}",
+                suites.join(","),
+                checks.join(",")
+            )
+        }
+    }
+}
+
 /// A dogfood lab + GitHub that answers exactly what the scripted world says.
 fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost {
     FakeHost::new(move |spec| {
@@ -326,9 +410,22 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
             if line.contains("rc_check.py") {
                 let dir = lab.join(&rc_id);
                 std::fs::create_dir_all(&dir).unwrap();
+                // `--reuse-from` must arrive in the shape rc_check documents
+                // (`eval/rc/<run>`, lab-relative). A bare run id resolved to a
+                // directory that does not exist, so it was accepted, silently
+                // matched nothing, and every RC suite re-ran.
+                if let Some(value) = spec
+                    .args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--reuse-from")
+                    .map(|pair| pair[1].clone())
+                {
+                    script.reuse_from = Some(value);
+                }
+                let reuse = reuse_document(&script);
                 let verdict = format!(
-                    "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"blockers\":[]}},\"reuse\":[]}}",
-                    script.rc_decision, script.rc_exit
+                    "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"blockers\":[]}},\"environment\":{{\"reuse\":{}}}}}",
+                    script.rc_decision, script.rc_exit, reuse
                 );
                 std::fs::write(dir.join("rc.json"), &verdict).unwrap();
                 // The real rc_check registers a *reference* to its verdict in
@@ -730,6 +827,32 @@ impl World {
         )
     }
 
+    /// Mark a stage RUNNING with no finish time: what a crash inside that stage
+    /// leaves behind, so the next resume re-runs exactly that stage.
+    fn crash_stage(&self, stage: usize) {
+        let current = std::fs::read_to_string(self.repo.join(".dev/release/CURRENT")).unwrap();
+        let path = self
+            .repo
+            .join(".dev/release")
+            .join(current.trim())
+            .join("state.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut doc = Json::parse(&text).unwrap();
+        if let Json::Obj(pairs) = &mut doc
+            && let Some((_, Json::Arr(stages))) = pairs.iter_mut().find(|(k, _)| k == "stages")
+            && let Some(Json::Obj(fields)) = stages.get_mut(stage - 1)
+        {
+            for (key, value) in fields.iter_mut() {
+                match key.as_str() {
+                    "status" => *value = Json::str("RUNNING"),
+                    "finished_at" => *value = Json::Null,
+                    _ => {}
+                }
+            }
+        }
+        std::fs::write(&path, doc.to_pretty()).unwrap();
+    }
+
     fn resume(&self, extra: &[&str]) -> (i32, String, Vec<CommandSpec>) {
         let mut argv = args(&["publish", "--resume"]);
         argv.extend(extra.iter().map(|value| value.to_string()));
@@ -939,10 +1062,96 @@ fn a_case_timeout_is_reported_with_the_case_that_timed_out() {
     let cases = state.at("stages").index(2).unwrap().at("cases").clone();
     assert_eq!(cases.path_f64("total"), Some(2.0));
     assert_eq!(cases.path_f64("passed"), Some(1.0));
-    // A TIMEOUT is not counted as a pass and is visible in the summary.
+    // A case that did not finish is neither a pass nor a completed failure, and
+    // the summary keeps the three counts apart instead of collapsing them.
+    assert_eq!(cases.path_f64("incomplete"), Some(1.0));
     assert_eq!(cases.path_f64("failed"), Some(0.0));
+    assert_eq!(cases.path_f64("attempted"), Some(2.0));
     assert!(cases.path_f64("passed").unwrap() < cases.path_f64("total").unwrap());
-    assert!(world.report().contains("L3 cases: 2 total, 1 pass"));
+    assert!(
+        world
+            .report()
+            .contains("L3 cases: 2 case(s), 2 attempt(s), 1 passed, 0 failed, 1 incomplete"),
+        "the summary states cases, attempts and verdicts separately"
+    );
+}
+
+#[test]
+fn the_l3_roll_up_reads_the_case_schema_the_lab_publishes() {
+    // The defect: the roll-up read a `status` string the rows do not have, so a
+    // 19/19 run reported `0 pass` everywhere the transaction reported it, and
+    // the flaky list was read from a key the layer writes under `metrics`.
+    let world = World::new();
+    world.set(|script| {
+        script.cases = vec![
+            ("smoke".into(), "PASS".into()),
+            ("core".into(), "PASS".into()),
+            ("cap".into(), "FAIL".into()),
+        ];
+        script.case_attempts = vec![
+            ("smoke".into(), 1, 0),
+            ("core".into(), 2, 1),
+            ("cap".into(), 3, 3),
+        ];
+        script.unstable = vec!["core".into()];
+    });
+    let (code, rendered) = world.publish_to_stage_3(&[]);
+    // The L3 layer is retryable, so a FAIL case does not have to stop the run;
+    // what is asserted here is the roll-up, not the verdict.
+    let _ = code;
+    let cases = world
+        .state()
+        .at("stages")
+        .index(2)
+        .unwrap()
+        .at("cases")
+        .clone();
+    assert_eq!(cases.path_f64("total"), Some(3.0));
+    assert_eq!(cases.path_f64("passed"), Some(2.0));
+    assert_eq!(cases.path_f64("failed"), Some(1.0));
+    assert_eq!(cases.path_f64("attempted"), Some(6.0));
+    assert_eq!(cases.path_f64("retried"), Some(2.0));
+    assert_eq!(cases.path_f64("unstable"), Some(1.0));
+    let summary = format!(
+        "{} case(s), {} attempt(s), {} passed, {} failed",
+        cases.path_f64("total").unwrap() as i64,
+        cases.path_f64("attempted").unwrap() as i64,
+        cases.path_f64("passed").unwrap() as i64,
+        cases.path_f64("failed").unwrap() as i64,
+    );
+    assert!(
+        rendered.contains(&summary) || world.report().contains(&summary),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("0 pass"),
+        "a 2/3 run must not report 0 passes: {rendered}"
+    );
+}
+
+#[test]
+fn a_reused_l3_case_is_reported_as_reused_not_as_fresh_work() {
+    let world = World::new();
+    world.set(|script| {
+        script.cases = vec![("smoke".into(), "PASS".into())];
+        script.case_attempts = vec![("smoke".into(), 1, 0)];
+    });
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    // A checkpointed case is the same candidate's earlier result. The lab marks
+    // it (`reused_from_checkpoint`) and the gate row must carry it, or a reused
+    // case is indistinguishable from work this run performed.
+    let cases = world
+        .state()
+        .at("stages")
+        .index(2)
+        .unwrap()
+        .at("cases")
+        .clone();
+    assert!(
+        cases.path_f64("reused").is_some(),
+        "the field exists: {cases:?}"
+    );
 }
 
 #[test]
@@ -1251,6 +1460,259 @@ fn status_and_report_describe_the_release_in_progress() {
     assert_eq!(code, 0, "{rendered}");
     assert!(rendered.contains("RELEASE_REPORT.md"), "{rendered}");
     assert!(world.report().contains("## 九、正式结论"));
+}
+
+#[test]
+fn carrying_a_layer_does_not_rewrite_the_file_it_came_from() {
+    // The defect: a layer an earlier stage produced was cloned, given a
+    // `carried_from_run` marker, and then written back to its own `L*.json`. That
+    // changed the bytes that stage had already hashed as its evidence, so the
+    // next resume reported it INVALIDATED for evidence nobody had touched and
+    // re-earned a stage that was still valid.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let run_dir = world.lab.join(RELEASE_RUN);
+    let after_all = std::fs::read(run_dir.join("L0.json")).unwrap();
+
+    // Stage 1 alone, in a fresh world: same candidate, same inputs. The bytes of
+    // L0.json must be the same file content either way — carrying it through two
+    // later stage invocations must not edit it.
+    let fresh = World::new();
+    let (code, _, _) = fresh.run(&["publish", "--stop-after", "1"]);
+    assert_eq!(code, 0);
+    let after_stage_one = std::fs::read(fresh.lab.join(RELEASE_RUN).join("L0.json")).unwrap();
+    assert_eq!(
+        after_all, after_stage_one,
+        "a carried L0.json must be byte-identical to the one stage 1 wrote"
+    );
+}
+
+#[test]
+fn a_resumed_run_does_not_re_earn_a_stage_it_can_still_prove() {
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    for stage in [1, 2] {
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("stage {stage} ")))
+            .unwrap_or_else(|| panic!("no line for stage {stage}: {rendered}"));
+        assert!(
+            line.contains("REUSED (same candidate, same inputs, same evidence)"),
+            "stage {stage} must stay valid, got: {line}"
+        );
+    }
+    assert!(
+        !rendered.contains("no longer hashes to the digest"),
+        "a carried layer must not invalidate the stage that produced it: {rendered}"
+    );
+}
+
+#[test]
+fn the_pipeline_offers_prior_rc_evidence_in_the_shape_the_lab_documents() {
+    // The defect: the pipeline passed a bare run id and rc_check resolved it
+    // against the lab root, so the lookup found nothing, every identity check
+    // read an empty environment and `--reuse-from` never hit while reporting no
+    // error. Both sides now use one shape: `eval/rc/<run>`, lab-relative.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let short = &CANDIDATE[..12];
+    let expected = format!("eval/rc/20260101-000000-{short}");
+    // A second stage-3 attempt is what offers the prior evidence: the first RC
+    // run is now on disk, and a crash inside stage 3 makes the resume re-run it.
+    world.crash_stage(3);
+    let (code, rendered, _) = world.run(&["publish", "--resume", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert_eq!(
+        world.read(|script| script.reuse_from.clone()),
+        Some(expected),
+        "the lab-relative directory is the shape rc_check resolves"
+    );
+}
+
+#[test]
+fn the_pipeline_reports_what_reuse_actually_did() {
+    // Reading a top-level `reuse` ARRAY (while the record is
+    // `environment.reuse`, an object) meant a real reuse — and a real refusal —
+    // were both invisible from the pipeline's own log.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    world.crash_stage(3);
+    world.set(|script| script.reuse_suites = vec!["RC1".into(), "RC2".into()]);
+    let (code, rendered, _) = world.run(&["publish", "--resume", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("RC suites reused: RC1, RC2"),
+        "a real reuse is reported with the suites: {rendered}"
+    );
+
+    let refused = World::new();
+    let (code, _) = refused.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    refused.crash_stage(3);
+    refused.set(|script| {
+        script.reuse_checks = vec![
+            ("candidate_sha".into(), "PASS".into()),
+            ("case_hashes_RC1".into(), "FAIL".into()),
+        ];
+    });
+    let (code, rendered, _) = refused.run(&["publish", "--resume", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("RC suites executed live: nothing reusable")
+            && rendered.contains("case_hashes_RC1"),
+        "a refusal is reported with the check that closed it: {rendered}"
+    );
+}
+
+#[test]
+fn status_reports_the_current_state_and_keeps_the_history_separate() {
+    // The defect: a failure reason from an attempt that a later attempt
+    // replaced was printed as the CURRENT failure, so a release that had since
+    // passed its failed stage still read as failed. `attempts` is the history;
+    // the current state is projected from the status and the stage records.
+    let world = World::new();
+    // Attempt 1: stage 3 fails.
+    world.set(|script| {
+        script.gate_exit = 1;
+        script.gate_decision = "FAIL".into();
+    });
+    let (code, rendered, _) = world.run(&["publish", "--stop-after", "3"]);
+    assert_ne!(code, 0, "{rendered}");
+    let (code, first, _) = world.run(&["publish", "--status"]);
+    assert_eq!(code, 0, "{first}");
+    assert!(first.contains("status:        FAIL"), "{first}");
+    assert!(first.contains("failure:       "), "{first}");
+    assert!(
+        !first.contains("last failure (historical)"),
+        "the failure IS current here: {first}"
+    );
+
+    // Attempt 2: everything passes.
+    world.set(|script| {
+        script.gate_exit = 0;
+        script.gate_decision = "PASS".into();
+    });
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    let (code, second, _) = world.run(&["publish", "--status"]);
+    assert_eq!(code, 0, "{second}");
+    assert!(
+        second.contains("status:        PENDING"),
+        "the transaction is waiting at stage 4: {second}"
+    );
+    assert!(
+        !second.contains("failure:       "),
+        "a superseded failure must not read as the current one: {second}"
+    );
+    assert!(
+        second.contains("last failure (historical): stage 3"),
+        "the history is still reported, labelled as history: {second}"
+    );
+    assert!(
+        second.contains("current stage: 4") || second.contains("current stage: 4 "),
+        "the stage left is stage 4, not the stage the failed attempt stopped at: {second}"
+    );
+    // The history itself is intact and complete.
+    let state = world.state();
+    let attempts = state.at("attempts").as_arr().unwrap_or(&[]);
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.at("status").as_str() == Some("FAIL")),
+        "the failed attempt is still in the history"
+    );
+    // The report and the status read the same facts.
+    let report = world.report();
+    assert!(report.contains("失败恢复记录"), "{report}");
+    assert!(report.contains("| FAIL |"), "{report}");
+}
+
+#[test]
+fn a_running_status_is_not_overwritten_by_a_historical_failure() {
+    let world = World::new();
+    world.set(|script| {
+        script.gate_exit = 1;
+        script.gate_decision = "FAIL".into();
+    });
+    let (code, _, _) = world.run(&["publish", "--stop-after", "3"]);
+    assert_ne!(code, 0);
+    // A crash inside the next attempt leaves the stage RUNNING with an older
+    // FAIL in the history: the current state is RUNNING.
+    let current = std::fs::read_to_string(world.repo.join(".dev/release/CURRENT")).unwrap();
+    let path = world
+        .repo
+        .join(".dev/release")
+        .join(current.trim())
+        .join("state.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut doc = Json::parse(&text).unwrap();
+    if let Json::Obj(pairs) = &mut doc {
+        for (key, value) in pairs.iter_mut() {
+            match key.as_str() {
+                "status" => *value = Json::str("RUNNING"),
+                "current_stage" => *value = Json::num(3.0),
+                _ => {}
+            }
+        }
+    }
+    std::fs::write(&path, doc.to_pretty()).unwrap();
+    let (code, rendered, _) = world.run(&["publish", "--status"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(rendered.contains("status:        RUNNING"), "{rendered}");
+    assert!(
+        !rendered.contains("failure:       "),
+        "a running stage has no current failure: {rendered}"
+    );
+    assert!(
+        rendered.contains("current stage: 3"),
+        "the running stage is the current one: {rendered}"
+    );
+}
+
+#[test]
+fn a_blocked_status_is_not_overwritten_by_an_old_pass() {
+    // BLOCKED means an external action is required to continue. An earlier
+    // PASS of the same stage must not turn that into a pass.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let current = std::fs::read_to_string(world.repo.join(".dev/release/CURRENT")).unwrap();
+    let path = world
+        .repo
+        .join(".dev/release")
+        .join(current.trim())
+        .join("state.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut doc = Json::parse(&text).unwrap();
+    if let Json::Obj(pairs) = &mut doc {
+        for (key, value) in pairs.iter_mut() {
+            match key.as_str() {
+                "status" => *value = Json::str("BLOCKED"),
+                "failure_reason" => {
+                    *value = Json::str("needs an operator decision on the release notes")
+                }
+                _ => {}
+            }
+        }
+    }
+    std::fs::write(&path, doc.to_pretty()).unwrap();
+    let (code, rendered, _) = world.run(&["publish", "--status"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(rendered.contains("status:        BLOCKED"), "{rendered}");
+    assert!(
+        rendered.contains("needs an operator decision"),
+        "a blocked transaction reports why: {rendered}"
+    );
+    assert!(
+        !rendered.contains("status:        PASS"),
+        "a blocked transaction is not a pass: {rendered}"
+    );
 }
 
 #[test]
