@@ -909,7 +909,18 @@ fn definition_hash(lab: &Path) -> Result<String, Fail> {
         }
         digest.update(b"\n");
     }
-    for relative in ["eval/pty", "eval/release_cases", "eval/scripts"] {
+    // `eval/rc_cases` is the RC suite's own case set and authored fixture
+    // material. Stage 3 runs the RC, so a changed RC case (or its baseline) is
+    // a changed test and must invalidate the stage fingerprint — the same rule
+    // the Release case tree already follows. `rc_evidence` hashes these bytes
+    // into the RC definition too; leaving them out here let a stage be REUSED
+    // for a definition the lab would no longer accept.
+    for relative in [
+        "eval/pty",
+        "eval/release_cases",
+        "eval/rc_cases",
+        "eval/scripts",
+    ] {
         digest.update(relative.as_bytes());
         digest.update(b"=");
         hash_tree(&mut digest, &lab.join(relative));
