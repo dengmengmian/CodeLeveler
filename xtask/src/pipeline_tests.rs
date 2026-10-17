@@ -1380,6 +1380,30 @@ fn a_changed_lab_input_off_the_nine_file_list_invalidates_every_stage() {
         "{rendered}"
     );
 
+    // The RC case set is stage 3's own test definition: a changed RC case (or
+    // its authored baseline) must invalidate the stages that run it. Before
+    // this tree was hashed, only a change to `rc_check.py` moved the digest, so
+    // an edited case could be REUSED against a definition the lab no longer
+    // accepted.
+    std::fs::create_dir_all(world.lab.join("eval/rc_cases/context")).unwrap();
+    std::fs::write(
+        world
+            .lab
+            .join("eval/rc_cases/context/rc-context-compaction-continuity.yaml"),
+        "# changed RC case\n",
+    )
+    .unwrap();
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("stage 1 build-static: REUSED"),
+        "a changed RC case must invalidate stage 1: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stage 3 real-dogfood: REUSED"),
+        "{rendered}"
+    );
+
     // Same for the lab config: it is the `config_hash` field of every layer
     // reuse key. The previous resume re-earned stages 1/2, so a REUSED here
     // would mean the config change went unseen.
@@ -1522,6 +1546,65 @@ fn a_resumed_run_does_not_re_earn_a_stage_it_can_still_prove() {
     assert!(
         !rendered.contains("no longer hashes to the digest"),
         "a carried layer must not invalidate the stage that produced it: {rendered}"
+    );
+}
+
+#[test]
+fn a_tampered_layer_artifact_invalidates_the_stage_that_recorded_it() {
+    // The other half of "a carried layer is not rewritten": bytes that really
+    // changed must still be caught. A trailing newline keeps the JSON valid, so
+    // this can only be detected by the recorded digest.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let path = world.lab.join(RELEASE_RUN).join("L1.json");
+    let mut tampered = std::fs::read(&path).unwrap();
+    tampered.push(b'\n');
+    std::fs::write(&path, tampered).unwrap();
+
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("stage 2 automated-tests: INVALIDATED"),
+        "changed bytes must re-earn the stage: {rendered}"
+    );
+    assert!(
+        rendered.contains("no longer hashes to the digest recorded with the verdict"),
+        "the refusal names the digest that no longer matches: {rendered}"
+    );
+}
+
+#[test]
+fn a_crash_between_stages_leaves_earlier_evidence_bytes_untouched() {
+    // A crash is exactly when a resume carries evidence it did not just write.
+    // Carrying must be read-only: if it rewrote the layer files, the next resume
+    // would invalidate a stage nobody touched.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let before: Vec<(&str, Vec<u8>)> = ["L0.json", "L1.json", "L2.json"]
+        .iter()
+        .map(|name| {
+            (
+                *name,
+                std::fs::read(world.lab.join(RELEASE_RUN).join(name)).unwrap(),
+            )
+        })
+        .collect();
+    world.crash_stage(3);
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    for (name, bytes) in before {
+        assert_eq!(
+            std::fs::read(world.lab.join(RELEASE_RUN).join(name)).unwrap(),
+            bytes,
+            "a crash resume must not rewrite {name}"
+        );
+    }
+    assert!(
+        rendered.contains("stage 1 build-static: REUSED")
+            && rendered.contains("stage 2 automated-tests: REUSED"),
+        "the stages whose evidence survived are reused, not re-earned: {rendered}"
     );
 }
 
