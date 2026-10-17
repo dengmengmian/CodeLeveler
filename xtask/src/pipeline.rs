@@ -313,6 +313,7 @@ fn status(host: &dyn Host, repo: &Path) -> Result<Report, Fail> {
             ),
         ));
     };
+    let current_stage = transaction.current_stage();
     let mut lines = vec![
         format!("release:       {}", transaction.release_id),
         format!("version:       {}", transaction.version),
@@ -320,8 +321,8 @@ fn status(host: &dyn Host, repo: &Path) -> Result<Report, Fail> {
         format!("status:        {}", transaction.status.label()),
         format!(
             "current stage: {} {}",
-            transaction.stage,
-            state::stage_name(transaction.stage)
+            current_stage,
+            state::stage_name(current_stage)
         ),
         format!(
             "started:       {}",
@@ -341,8 +342,31 @@ fn status(host: &dyn Host, repo: &Path) -> Result<Report, Fail> {
             }
         ),
     ];
-    if let Some(reason) = &transaction.failure_reason {
+    // The failure this status reports, then the history that is NOT it. A
+    // sticky reason from an attempt that a later attempt replaced used to print
+    // as the current failure, so a release that had since passed its failed
+    // stage still read as failed.
+    if let Some(reason) = transaction.current_failure() {
         lines.push(format!("failure:       {reason}"));
+    }
+    if let Some(attempt) = transaction.last_failure() {
+        // Current means "the newest attempt is the one that failed". Comparing
+        // the recorded reason text would be fragile: the transaction prefixes
+        // the stage, the attempt records the raw cause.
+        let last_attempt_failed = transaction
+            .attempts
+            .last()
+            .is_some_and(|newest| newest.status == Status::Fail);
+        let current = transaction.current_failure().is_some() && last_attempt_failed;
+        if !current {
+            lines.push(format!(
+                "last failure (historical): stage {} ({}) at {} — {}",
+                attempt.stage,
+                state::stage_name(attempt.stage),
+                crate::clock::iso8601(attempt.at),
+                attempt.reason.as_deref().unwrap_or("no reason recorded")
+            ));
+        }
     }
     if transaction.candidate_history.len() > 1 {
         lines.push(format!(
@@ -368,10 +392,7 @@ fn status(host: &dyn Host, repo: &Path) -> Result<Report, Fail> {
             lines.push(format!("      reason: {reason}"));
         }
         if let Some(cases) = &record.cases {
-            lines.push(format!(
-                "      cases: {} total, {} pass, {} fail, {} warn, {} reused, {} unproven, {} unstable",
-                cases.total, cases.passed, cases.failed, cases.warn, cases.reused, cases.unproven, cases.unstable
-            ));
+            lines.push(format!("      cases: {}", cases.summary_line()));
         }
         if let Some(run_id) = &record.run_id {
             lines.push(format!("      run: {run_id}"));
@@ -1213,6 +1234,10 @@ fn drive(
             record.input_fingerprint = Some(fingerprint);
             record.detail = detail;
         }
+        // The stage succeeded, so whatever failed before it is no longer the
+        // current state. `attempts` keeps the failure for the report and the
+        // audit trail; the current-state field must not keep reporting it.
+        transaction.clear_current_failure();
         transaction.note_attempt(stage, status, None, finished);
         state::save_state(repo, &transaction)?;
         let record = transaction.stage_record(stage);
@@ -1246,6 +1271,11 @@ fn drive(
 
     if let Some(reason) = stop_reason {
         transaction.status = Status::Pending;
+        // A paused transaction is not a finished one: `duration()` counts to now
+        // while it is still in progress, and nothing failed *in this attempt*.
+        // The attempt history keeps every earlier failure.
+        transaction.finished_at = None;
+        transaction.clear_current_failure();
         state::save_state(repo, &transaction)?;
         let paths = report::write(context, &transaction)?;
         let mut lines = vec![
@@ -1342,12 +1372,9 @@ fn failure_text(
 }
 
 fn first_undecided(transaction: &Transaction) -> u8 {
-    for stage in state::STAGES {
-        if !transaction.stage_record(stage).status.is_decided_pass() {
-            return stage;
-        }
-    }
-    STAGE_PUBLISH
+    // One owner for "which stage is this transaction at": the projection and the
+    // resume hint must never disagree about it.
+    transaction.current_stage()
 }
 
 /// A recorded pass is only reusable while the evidence it was computed from is
@@ -1753,10 +1780,7 @@ fn stage_dogfood(context: &Context, transaction: &mut Transaction) -> Result<Vec
         && let Some(cases) = Cases::from_json_l3(&l3)
     {
         transaction.stage_record_mut(STAGE_DOGFOOD).cases = Some(cases.clone());
-        out.push(format!(
-            "L3 cases: {} total, {} pass, {} fail, {} warn, {} unproven, {} unstable",
-            cases.total, cases.passed, cases.failed, cases.warn, cases.unproven, cases.unstable
-        ));
+        out.push(format!("L3 cases: {}", cases.summary_line()));
     }
     // Order matters and is the whole point of the RC phase: the gate may not
     // refuse to start RC for a reason RC is about to fix (several core features
@@ -2054,20 +2078,60 @@ fn run_rc(
         ));
     }
     let mut lines = vec![format!("RC qualification: {verdict} (exit {exit})")];
-    if let Some(reuse) = doc.at("reuse").as_arr()
-        && !reuse.is_empty()
-    {
-        lines.push(format!(
-            "RC suites reused: {}{}",
-            reuse.len(),
-            if reuse_from.is_some() {
-                " (from a prior run whose identity matched)"
-            } else {
-                ""
-            }
-        ));
-    }
+    lines.push(reuse_line(&doc, reuse_from.as_deref()));
     Ok(lines)
+}
+
+/// What the RC run did with the evidence it was offered.
+///
+/// The reader used to look for a top-level `reuse` ARRAY, while the record is
+/// `environment.reuse` (an object), so a real reuse — or a real refusal — was
+/// invisible from the pipeline log.
+fn reuse_line(doc: &Json, reuse_from: Option<&str>) -> String {
+    let reuse = doc.at("environment").at("reuse");
+    if reuse.at("requested").as_bool() != Some(true) {
+        return "RC suites executed live: no prior evidence offered".to_string();
+    }
+    let suites: Vec<String> = reuse
+        .at("suites")
+        .as_arr()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect();
+    let source = reuse
+        .at("reused_from")
+        .as_str()
+        .or(reuse_from)
+        .unwrap_or("an unrecorded prior run");
+    if !suites.is_empty() {
+        return format!(
+            "RC suites reused: {} (from {source}; identity verified)",
+            suites.join(", ")
+        );
+    }
+    let failed: Vec<String> = reuse
+        .at("checks")
+        .as_arr()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|check| check.at("status").as_str() == Some("FAIL"))
+        .map(|check| {
+            format!(
+                "{}: {}",
+                check.at("id").as_str().unwrap_or("?"),
+                check.at("detail").as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    format!(
+        "RC suites executed live: nothing reusable from {source} ({})",
+        if failed.is_empty() {
+            "no reusable suite".to_string()
+        } else {
+            failed.join("; ")
+        }
+    )
 }
 
 fn rc_runs(text: &str) -> Vec<String> {
@@ -2090,9 +2154,16 @@ fn rc_runs(text: &str) -> Vec<String> {
     out
 }
 
-/// The newest completed RC run for this candidate. `rc_check` re-checks every
-/// identity field before it reuses anything, so *finding* a candidate run is not
-/// the same as accepting its evidence.
+/// The newest completed RC run for this candidate, as the lab-relative directory
+/// `rc_check` documents (`eval/rc/<run>`).
+///
+/// The bare run id was passed here before, and `rc_check` resolved it against
+/// the lab root — a directory that does not exist — so every identity check read
+/// an empty environment and `--reuse-from` never hit while reporting no error.
+/// The two sides now agree on one shape, and `rc_check` accepts a bare id too.
+///
+/// `rc_check` re-checks every identity field before it reuses anything, so
+/// *finding* a candidate run is not the same as accepting its evidence.
 fn find_prior_rc_run(context: &Context, sha: &str) -> Option<String> {
     let root = context.lab.root.join("eval/rc");
     let short = state::short_sha(sha);
@@ -2108,9 +2179,13 @@ fn find_prior_rc_run(context: &Context, sha: &str) -> Option<String> {
         })
         .collect();
     candidates.sort();
-    candidates
-        .pop()
-        .map(|path| state::bare_run_id(&path.display().to_string()))
+    candidates.pop().map(|path| {
+        format!(
+            "{}/{}",
+            state::RC_RUN_KIND,
+            state::bare_run_id(&path.display().to_string())
+        )
+    })
 }
 
 struct Layout {

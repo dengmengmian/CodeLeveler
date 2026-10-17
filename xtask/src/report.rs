@@ -562,15 +562,12 @@ fn build_markdown(context: &Context, transaction: &Transaction, data: &Json) -> 
                 .or_else(|| case.at("lane").as_str())
                 .unwrap_or("unspecified")
                 .to_string();
-            // L3 cases carry `passed` (the run's own verdict). `expect_passed`
-            // is the case's declared expectation, which is not the same thing:
-            // reading a field the document does not have reported 0 PASS for a
-            // 19/19 run.
-            let passed = case
-                .at("passed")
-                .as_bool()
-                .or_else(|| case.at("expect_passed").as_bool())
-                .unwrap_or(false);
+            // The product's own pass rule (`CaseResult::passed`), from the one
+            // implementation in `state`: `passed` when the row carries it, else
+            // `completed && expect_passed`. Reading `expect_passed` alone would
+            // count a case that never finished as a pass, and reading a field
+            // the document does not have reported 0 PASS for a 19/19 run.
+            let passed = state::case_passed(case);
             match suites.iter_mut().find(|(name, _, _)| name == &suite) {
                 Some((_, total, ok)) => {
                     *total += 1;
@@ -772,13 +769,16 @@ fn write_performance(out: &mut String, context: &Context, transaction: &Transact
     let cases = lab_json(context, transaction, "L3.json")
         .map(|doc| doc.at("cases").as_arr().unwrap_or(&[]).len())
         .unwrap_or(0);
+    // The same rule and the same field the case rows actually carry: this site
+    // was still reading a `status` string the L3 rows do not have, so the
+    // official report said "0/19 = 0.0%" for a 19/19 run.
     let passed = lab_json(context, transaction, "L3.json")
         .map(|doc| {
             doc.at("cases")
                 .as_arr()
                 .unwrap_or(&[])
                 .iter()
-                .filter(|case| case.at("status").as_str() == Some("PASS"))
+                .filter(|case| state::case_passed(case))
                 .count()
         })
         .unwrap_or(0);
@@ -1088,6 +1088,9 @@ pub fn conclusion(transaction: &Transaction) -> (String, String) {
     }
     (
         "PENDING".to_string(),
-        format!("发布仍在进行中：当前 stage {}。", transaction.stage),
+        format!(
+            "发布仍在进行中：下一次 resume 将从 stage {} 继续。",
+            transaction.current_stage()
+        ),
     )
 }
