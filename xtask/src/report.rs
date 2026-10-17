@@ -631,15 +631,34 @@ fn write_feature_coverage(out: &mut String, context: &Context, transaction: &Tra
         return;
     };
     let summary = coverage.at("summary");
+    let rc = coverage.at("rc_evidence");
     let number = |key: &str| summary.at(key).as_f64().unwrap_or(0.0) as i64;
     out.push_str(&format!(
-        "- 报告来源：`{}`\n- 覆盖判定：**{}**\n\n",
+        "- 报告来源：`{}`\n- 覆盖判定：**{}**\n- 审计阶段：**{}**\n- RC 证据引用：**{}**\n\n",
         coverage
             .at("report_path")
             .as_str()
             .unwrap_or("eval/release/<run>/feature_coverage.json"),
-        coverage.at("status").as_str().unwrap_or("UNKNOWN")
+        coverage.at("status").as_str().unwrap_or("UNKNOWN"),
+        // `final` is the only phase that may report a feature as covered on RC
+        // evidence; a final verdict taken at `pre_rc` is the defect this field
+        // exists to make visible.
+        coverage.at("phase").as_str().unwrap_or("UNKNOWN"),
+        rc.at("status").as_str().unwrap_or("absent"),
     ));
+    if let Some(reason) = rc.at("detail").as_str()
+        && !reason.is_empty()
+    {
+        out.push_str(&format!("- RC 引用说明：{reason}\n"));
+        if let Some(run) = rc.at("rc_run_id").as_str() {
+            out.push_str(&format!("- RC run：`{run}`\n"));
+        }
+        if let Some(digest) = rc.at("rc_json_sha256").as_str() {
+            let short: String = digest.chars().take(16).collect();
+            out.push_str(&format!("- rc.json sha256：`{short}`\n"));
+        }
+        out.push('\n');
+    }
     out.push_str("| 指标 | 数量 |\n| --- | --- |\n");
     for (label, key) in [
         ("正式功能总数", "total"),

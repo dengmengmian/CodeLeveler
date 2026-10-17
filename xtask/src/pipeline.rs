@@ -1765,6 +1765,12 @@ fn stage_dogfood(context: &Context, transaction: &mut Transaction) -> Result<Vec
     // final verdict is taken over the complete run.
     out.extend(dogfood_verdict(context, &run_id, "pre-RC")?.lines);
     out.extend(run_rc(context, transaction, &run_id)?);
+    // The RC verdict is only release evidence once it is registered with the
+    // release run. Nothing used to do that, so the final coverage audit saw no
+    // RC evidence at all and the three core features it is the only proof for
+    // stayed pending. A stage that ran RC but holds no reference to it must not
+    // report success.
+    out.push(require_rc_registration(context, transaction, &run_id)?);
     out.extend(dogfood_verdict(context, &run_id, "final")?.lines);
     let layout = evidence_layout(context, transaction, "L3,L4", true)?;
     transaction.stage_record_mut(STAGE_DOGFOOD).evidence_hash = Some(layout.hash);
@@ -1776,17 +1782,77 @@ struct Verdict {
     lines: Vec<String>,
 }
 
+/// The phase a verdict is taken at, as the coverage audit names it.
+///
+/// The audit used to guess: "an `rc.json` exists in the run directory, so this
+/// must be the final verdict". Nothing ever wrote one, so the final verdict was
+/// silently the pre-RC one, which blocks on nothing that RC owes. The caller
+/// knows which verdict it is taking, so it says so.
+fn coverage_phase(when: &str) -> &'static str {
+    if when == "final" { "final" } else { "pre_rc" }
+}
+
+/// Prove the release run holds a reference to the RC run this stage just took.
+fn require_rc_registration(
+    context: &Context,
+    transaction: &Transaction,
+    release_run: &str,
+) -> Result<String, Fail> {
+    let rc_run = transaction.rc_run_id.clone().ok_or_else(|| {
+        Fail::new(
+            "RC_EVIDENCE_NOT_REGISTERED",
+            "stage 3 finished its RC step without recording an RC run id",
+        )
+    })?;
+    let run_dir = state::lab_run_dir(&context.lab.root, state::RELEASE_RUN_KIND, release_run);
+    let reference = std::fs::read_to_string(run_dir.join("rc_evidence.json"))
+        .ok()
+        .and_then(|text| Json::parse(&text).ok())
+        .ok_or_else(|| {
+            Fail::new(
+                "RC_EVIDENCE_NOT_REGISTERED",
+                format!(
+                    "{release_run}/rc_evidence.json is missing: RC {rc_run} ran but the \
+                     release run holds no reference to its verdict, so the final audit \
+                     cannot consume it"
+                ),
+            )
+        })?;
+    let registered = reference.at("rc_run_id").as_str().unwrap_or("");
+    if registered != rc_run {
+        return Err(Fail::new(
+            "RC_EVIDENCE_MISMATCH",
+            format!(
+                "the release run's RC reference names {registered}, but this stage ran {rc_run}"
+            ),
+        ));
+    }
+    let digest = reference.at("rc_json_sha256").as_str().unwrap_or("");
+    let digest: String = digest.chars().take(16).collect();
+    Ok(format!(
+        "rc evidence registered: {registered} (rc.json sha256={})",
+        if digest.is_empty() {
+            "MISSING"
+        } else {
+            &digest
+        }
+    ))
+}
+
 /// Re-decide the run from its artifacts. `when` names the point in the run the
 /// verdict is taken, which is what decides how the coverage audit reads it:
 /// before RC, evidence RC will produce is pending; after RC, it is final.
 fn dogfood_verdict(context: &Context, run_id: &str, when: &str) -> Result<Verdict, Fail> {
     let run_dir = state::lab_run_dir(&context.lab.root, state::RELEASE_RUN_KIND, run_id);
+    let phase = coverage_phase(when);
     let out = context.host.run(&CommandSpec::new(
         "python3",
         [
             "eval/scripts/release_check.py",
             "--from-artifacts",
             &format!("{}/{run_id}", state::RELEASE_RUN_KIND),
+            "--coverage-phase",
+            phase,
             "--force",
         ],
         &context.lab.root,
@@ -1811,6 +1877,26 @@ fn dogfood_verdict(context: &Context, run_id: &str, when: &str) -> Result<Verdic
         .as_bool()
         .unwrap_or(false);
     let exit = decision.at("exit_code").as_f64().unwrap_or(1.0) as i32;
+    // The verdict this stage accepts must be the one it asked for. A final
+    // verdict that came back as the pre-RC audit is not a verdict at all:
+    // it is the run judged against the policy of a phase that has no RC
+    // evidence to be missing yet.
+    let coverage = doc.at("feature_coverage");
+    let taken = coverage.at("phase").as_str().unwrap_or("");
+    if taken != phase {
+        return Err(Fail::new(
+            "COVERAGE_PHASE_MISMATCH",
+            format!(
+                "the {when} verdict asked for the {phase} coverage audit and got {}",
+                if taken.is_empty() { "none" } else { taken }
+            ),
+        ));
+    }
+    let rc_state = coverage
+        .at("rc_evidence")
+        .at("status")
+        .as_str()
+        .unwrap_or("absent");
     if exit != 0 && exit != 2 {
         let reason = decision
             .at("partial_reason")
@@ -1853,7 +1939,7 @@ fn dogfood_verdict(context: &Context, run_id: &str, when: &str) -> Result<Verdic
         return Err(Fail::new("RELEASE_GATE_FAILED", detail));
     }
     let mut lines = vec![format!(
-        "release gate ({when}): {verdict} (exit {exit}, complete={complete})"
+        "release gate ({when}): {verdict} (exit {exit}, complete={complete}, coverage={phase}, rc={rc_state})"
     )];
     if exit == 2 {
         lines.push(
