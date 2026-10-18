@@ -787,7 +787,7 @@ pub fn lab_run_dir(lab: &Path, kind: &str, id: &str) -> PathBuf {
 }
 
 pub fn bare_run_id(full: &str) -> String {
-    full.rsplit('/').next().unwrap_or(full).to_string()
+    full.rsplit(['/', '\\']).next().unwrap_or(full).to_string()
 }
 
 pub fn short_sha(sha: &str) -> String {
@@ -905,4 +905,24 @@ pub fn read_current(repo: &Path) -> Option<String> {
 
 pub fn write_current(repo: &Path, release_id: &str) -> Result<(), Fail> {
     write_atomic(&current_path(repo), &format!("{release_id}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bare_run_id;
+
+    #[test]
+    fn a_run_id_is_the_last_component_of_either_path_shape() {
+        // The RC reference is built from a path's display form. Windows renders
+        // separators as `\`; reading only `/` returned the whole absolute path,
+        // which then reached `--reuse-from` and made the run unresolvable.
+        assert_eq!(
+            bare_run_id("eval/rc/20260101-000000-bbbbbbbbbbbb"),
+            "20260101-000000-bbbbbbbbbbbb"
+        );
+        assert_eq!(
+            bare_run_id(r"C:\lab\eval\rc\20260101-000000-bbbbbbbbbbbb"),
+            "20260101-000000-bbbbbbbbbbbb"
+        );
+    }
 }

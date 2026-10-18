@@ -1366,10 +1366,15 @@ fn failure_text(
         ));
     }
     lines.push(String::new());
-    lines.push(format!(
-        "the version commit {} exists locally and was NOT tagged, pushed, or reset",
-        transaction.candidate_sha
-    ));
+    match transaction.remote.pushed_sha.as_deref() {
+        Some(sha) => lines.push(format!(
+            "the version commit {sha} was pushed to origin; no tag or release was created"
+        )),
+        None => lines.push(format!(
+            "the version commit {} exists locally and was NOT tagged, pushed, or reset",
+            transaction.candidate_sha
+        )),
+    }
     lines.push(format!(
         "report: {}\nstate:  {}",
         paths.markdown.display(),
