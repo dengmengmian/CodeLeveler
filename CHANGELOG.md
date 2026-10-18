@@ -4,6 +4,25 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [1.0.19] - 2026-10-19
+
+Web search becomes a capability independent of the conversation model.
+
+### Added
+
+- `[web.search]` selects a search backend — the DeepSeek official Search API or Tavily — independently of `[providers.*]` and `[models.*]`. Switching the conversation model, including to another vendor, does not change it, and a model provider's `base_url` is never used as the search endpoint
+- `web_search` reads its credential only from the configured `api_key_env`; the variable is scrubbed from child processes and its value never reaches logs or tool output
+
+### Changed
+
+- Only `[web.search]` enables search. The legacy `LEVELER_SEARCH_API_KEY` fallback is removed
+- A configured search whose credential variable is unset is logged at warn level, naming the variable, instead of a debug line the default filter never wrote
+
+### Fixed
+
+- The TUI shows the first search result instead of the external-data marker
+- Dogfood coverage persists this run's layer artifacts before taking the pre-RC verdict, so a passed L1 test is no longer reported as "L1 did not run for this candidate"; evidence that declares another candidate is refused
+
 ## [Unreleased]
 
 ### Changed
