@@ -42,10 +42,11 @@ pub struct Capabilities {
     /// fact as `CapabilityPacks::browser == false`: no browser is drivable
     /// here, so the tools are not built.
     pub browser: Option<Arc<leveler_browser::Browser>>,
-    /// The search provider key `web_search` is constructed with. `None` is the
-    /// same mechanical fact as `CapabilityPacks::web_search == false`; the host
-    /// answers it once and both follow from that answer.
-    pub search_api_key: Option<String>,
+    /// The search backend `web_search` is constructed with. `None` is the same
+    /// mechanical fact as `CapabilityPacks::web_search == false`; the host
+    /// answers "is a provider configured" once and both follow from that
+    /// answer. The provider owns its credential, endpoint and request shape.
+    pub search_provider: Option<Arc<dyn crate::search::SearchProvider>>,
 }
 
 impl Capabilities {
@@ -62,7 +63,7 @@ impl Capabilities {
             artifact_store: None,
             memory_root: None,
             browser: None,
-            search_api_key: None,
+            search_provider: None,
         }
     }
 
@@ -78,11 +79,35 @@ impl Capabilities {
         self
     }
 
-    /// The search provider key `web_search` is built with. A blank value is
-    /// not a configuration: it is normalised to `None` here so availability and
+    /// The search backend `web_search` is built with. A `web_search` tool
+    /// without a provider could only fail, so availability and construction
+    /// come from this one handle.
+    pub fn with_search_provider(
+        mut self,
+        provider: Option<Arc<dyn crate::search::SearchProvider>>,
+    ) -> Self {
+        self.search_provider = provider;
+        self
+    }
+
+    /// Legacy convenience: a Tavily backend over `key`. A blank value is not a
+    /// configuration: it is normalised to `None` here so availability and
     /// construction cannot disagree.
     pub fn with_search_api_key(mut self, key: Option<String>) -> Self {
-        self.search_api_key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        self.search_provider = key.map(|key| {
+            Arc::new(
+                crate::search::TavilySearchProvider::new(
+                    key,
+                    None,
+                    // The tool's own count bound; the provider cap never
+                    // narrows a request the model is allowed to make.
+                    10,
+                    std::time::Duration::from_secs(10),
+                )
+                .expect("a non-empty key is the only precondition"),
+            ) as Arc<dyn crate::search::SearchProvider>
+        });
         self
     }
 

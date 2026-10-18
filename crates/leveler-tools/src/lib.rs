@@ -12,6 +12,7 @@ pub mod mcp;
 pub(crate) mod network;
 pub mod recoverable;
 pub mod registry;
+pub mod search;
 pub mod tool;
 pub mod tools;
 pub(crate) mod workspace;

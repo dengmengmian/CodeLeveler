@@ -257,7 +257,18 @@ TUI 中点击底部的后台任务摘要（`↗`）打开列表，点击任务�
 
 - **Chrome、Edge 或 Chromium：** CodeLeveler 会启动独立的自动化会话。`browser_tab`、`browser_act` 和 `browser_inspect` 可以导航、交互，并读取 console、页面错误和网络记录。
 - **Safari：** 在 `~/.leveler/config.toml` 的 `[browser]` 下配置 `default = "safari"`，并打开 Safari Remote Automation。Safari 支持标签页和交互，但 WebDriver 后端不能提供 console、页面错误或网络检查。
-- **网页搜索：** 把 Tavily key 放入环境变量 `LEVELER_SEARCH_API_KEY`。`web_search` 只发起一次 HTTP 请求，十秒超时，不重试，也不会改走浏览器自动化。
+- **网页搜索：** 搜索后端在 `~/.leveler/config.toml` 中独立于对话模型配置：
+
+  ```toml
+  [web.search]
+  provider = "deepseek"          # deepseek | tavily
+  api_key_env = "DEEPSEEK_API_KEY"
+  max_results = 5
+  timeout_ms = 15000
+  # base_url = "https://api.deepseek.com/v1/tools"
+  ```
+
+  DeepSeek 搜索每次工具调用只请求一次 `POST https://api.deepseek.com/v1/tools/search`，不产生辅助模型请求。任意已配置模型都可以使用它，切换模型不会改变搜索后端。模型 Provider 的 `base_url` 不会被当作搜索端点。没有该配置段时保持旧行为：把 Tavily key 放入环境变量 `LEVELER_SEARCH_API_KEY`。`web_search` 只发起一次 HTTP 请求，遵守配置的超时，不重试，也不会改走浏览器自动化。只有模型 key 不会自动开启搜索：`[web.search]`（或旧环境变量）才是显式启用。
 
 TUI 的 `/web` 和界面中打开的链接仍然使用操作系统默认浏览器。
 
