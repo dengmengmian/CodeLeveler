@@ -124,6 +124,7 @@ pub struct MockServer {
     addr: SocketAddr,
     request_count: Arc<AtomicUsize>,
     request_bodies: Arc<Mutex<Vec<String>>>,
+    request_heads: Arc<Mutex<Vec<String>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -142,9 +143,11 @@ impl MockServer {
         let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_bodies = Arc::new(Mutex::new(Vec::new()));
+        let request_heads = Arc::new(Mutex::new(Vec::new()));
 
         let count = request_count.clone();
         let bodies = request_bodies.clone();
+        let heads = request_heads.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -153,10 +156,11 @@ impl MockServer {
                 let queue = queue.clone();
                 let count = count.clone();
                 let bodies = bodies.clone();
+                let heads = heads.clone();
                 tokio::spawn(async move {
                     let mut stream = stream;
-                    let body = drain_request(&mut stream).await;
-                    if let Some(body) = body {
+                    if let Some((head, body)) = drain_request(&mut stream).await {
+                        heads.lock().await.push(head);
                         bodies.lock().await.push(body);
                     }
                     let response = {
@@ -179,6 +183,7 @@ impl MockServer {
             addr,
             request_count,
             request_bodies,
+            request_heads,
             handle,
         }
     }
@@ -199,6 +204,13 @@ impl MockServer {
     /// hard gates).
     pub async fn request_bodies(&self) -> Vec<String> {
         self.request_bodies.lock().await.clone()
+    }
+
+    /// Raw request heads (request line + headers) received so far, in arrival
+    /// order. Lets a test assert the path, method and authorization header a
+    /// client actually sent; the head never includes a body.
+    pub async fn request_heads(&self) -> Vec<String> {
+        self.request_heads.lock().await.clone()
     }
 
     pub fn request_count(&self) -> usize {
@@ -322,7 +334,7 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
 /// body". Small requests fit in the first TCP segments and happened to pass,
 /// making the bug size-dependent and flaky. Reading the declared body length
 /// first lets the client finish writing before we close.
-async fn drain_request(stream: &mut TcpStream) -> Option<String> {
+async fn drain_request(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut buf = [0u8; 4096];
     let mut seen = Vec::new();
     let mut header_end = None;
@@ -356,7 +368,10 @@ async fn drain_request(stream: &mut TcpStream) -> Option<String> {
             _ => break,
         }
     }
-    Some(String::from_utf8_lossy(&seen[header_end..]).into_owned())
+    Some((
+        String::from_utf8_lossy(&seen[..header_end]).into_owned(),
+        String::from_utf8_lossy(&seen[header_end..]).into_owned(),
+    ))
 }
 
 /// Parse a `Content-Length` header value (case-insensitive) from raw header

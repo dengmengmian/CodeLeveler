@@ -505,14 +505,16 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
         registry.register(Arc::new(tools::WebFetchTool));
     }
     // The search pack needs BOTH halves and there is no stand-in for the
-    // missing one: the flag says the product asked for search, the key is what
-    // a search actually takes. A key-less `WebSearchTool` would be a tool whose
-    // every call is a 401, so it is not built — and because it is never built,
-    // `execute` has no "am I configured" branch to carry.
+    // missing one: the flag says the product asked for search, the provider is
+    // what a search actually takes. A provider-less `WebSearchTool` would be a
+    // tool whose every call fails, so it is not built — and because it is never
+    // built, `execute` has no "am I configured" branch to carry.
     if packs.web_search
-        && let Some(key) = &capabilities.search_api_key
+        && let Some(provider) = &capabilities.search_provider
     {
-        registry.register(Arc::new(tools::WebSearchTool::new(key.clone())));
+        registry.register(Arc::new(tools::WebSearchTool::with_provider(
+            provider.clone(),
+        )));
     }
     if packs.media {
         registry.register(Arc::new(tools::ViewImageTool));
@@ -545,10 +547,10 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
 /// use; production composes packs from what the host was asked for and can
 /// actually do, and hands over the services it owns (see `leveler-app`).
 ///
-/// One pack cannot be composed here: `web_search` takes a provider key, and a
-/// constructor that needs nothing from a host has nowhere honest to get one.
+/// One pack cannot be composed here: `web_search` takes a search provider, and
+/// a constructor that needs nothing from a host has nowhere honest to get one.
 /// It is therefore absent from this registry — see
-/// [`model_surface`] with a keyed [`Capabilities`] for the full surface.
+/// [`model_surface`] with a provider-bearing [`Capabilities`] for the full surface.
 pub fn default_registry() -> ToolRegistry {
     model_surface(
         CapabilityPacks::ALL,

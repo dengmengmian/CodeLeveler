@@ -20,6 +20,13 @@
 //! default = "chrome"           # optional: safari | chrome | edge | chromium.
 //!                              # Unset prefers installed CDP browsers.
 //!
+//! [web.search]                 # optional; search backend, independent of models
+//! provider = "deepseek"        # deepseek | tavily
+//! api_key_env = "DEEPSEEK_API_KEY"
+//! max_results = 5              # 1–50; the tool's own count is still capped at 10
+//! timeout_ms = 15000
+//! # base_url = "https://api.deepseek.com/v1/tools"
+//!
 //! [vcs]
 //! co_author = true             # optional; append the CodeLeveler/model commit trailer
 //!
@@ -50,6 +57,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 use toml_edit::{DocumentMut, value};
@@ -60,6 +68,7 @@ use leveler_model::{
 };
 use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
+use leveler_tools::search::SearchProviderKind;
 
 /// The parsed global config.
 #[derive(Debug, Default, Deserialize)]
@@ -115,6 +124,10 @@ pub struct GlobalConfig {
     /// Local storage lifecycle preferences (cache budget, ephemeral TTL).
     #[serde(default)]
     storage: GlobalStorage,
+    /// Web capability settings. Search is deliberately separate from every
+    /// model provider: changing the conversation model never changes it.
+    #[serde(default)]
+    web: GlobalWeb,
 }
 
 /// `[storage]`. Bounds on what CodeLeveler may reclaim from its own home.
@@ -158,6 +171,49 @@ impl Default for GlobalUpdate {
 
 fn default_check_interval_hours() -> u64 {
     1
+}
+
+/// `[web]`. Today one child: the search backend.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalWeb {
+    #[serde(default)]
+    search: Option<GlobalWebSearch>,
+}
+
+/// `[web.search]`. The search backend is chosen here, independently of
+/// `[providers.*]`: a model gateway URL is never a search endpoint.
+///
+/// Absent means legacy behavior: Tavily over `LEVELER_SEARCH_API_KEY`, and no
+/// search at all when that variable is unset. A present table is the explicit
+/// opt-in that authorizes paid search requests.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalWebSearch {
+    /// `deepseek` | `tavily`.
+    provider: String,
+    /// Environment variable holding the provider key. Defaults to
+    /// `DEEPSEEK_API_KEY` for DeepSeek and `LEVELER_SEARCH_API_KEY` for Tavily.
+    #[serde(default)]
+    api_key_env: Option<String>,
+    /// Search API base including the path prefix, excluding `/search`.
+    #[serde(default)]
+    base_url: Option<String>,
+    /// Provider-side result bound (1–50).
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// The resolved `[web.search]` settings the runtime consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSearchSettings {
+    pub provider: SearchProviderKind,
+    pub api_key_env: String,
+    pub base_url: Option<String>,
+    pub max_results: usize,
+    pub timeout: Duration,
 }
 
 /// `[assist]`. The two idle, automatic model calls the UI makes on the user's
@@ -480,6 +536,8 @@ pub struct GlobalBundle {
     /// Per-model soft compaction percent, keyed by the table id as written
     /// (`[models.<id>].soft_compaction_percent`).
     pub model_soft_percent: Vec<(String, u8)>,
+    /// `[web.search]`, resolved. `None` preserves the legacy Tavily path.
+    pub web_search: Option<WebSearchSettings>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -573,6 +631,7 @@ impl GlobalConfig {
         cfg.validate_browser()?;
         cfg.validate_reasoning()?;
         cfg.validate_context_soft_percent()?;
+        cfg.validate_web_search()?;
         Ok(cfg)
     }
 
@@ -614,6 +673,56 @@ impl GlobalConfig {
             .get(id)
             .and_then(|entry| entry.soft_compaction_percent)
             .or(self.context.soft_percent)
+    }
+
+    /// `[web.search]` is an explicit backend choice, so a misspelling or an
+    /// out-of-range bound is named at load instead of silently disabling
+    /// search (or, worse, spending against the wrong provider).
+    fn validate_web_search(&self) -> Result<(), GlobalConfigError> {
+        let Some(search) = &self.web.search else {
+            return Ok(());
+        };
+        if SearchProviderKind::parse(&search.provider).is_none() {
+            return Err(GlobalConfigError::Parse(format!(
+                "[web.search].provider must be deepseek or tavily; got `{}`",
+                search.provider
+            )));
+        }
+        if let Some(max_results) = search.max_results
+            && !(1..=leveler_tools::search::DEEPSEEK_MAX_RESULTS).contains(&max_results)
+        {
+            return Err(GlobalConfigError::Parse(format!(
+                "[web.search].max_results must be between 1 and {}; got {max_results}",
+                leveler_tools::search::DEEPSEEK_MAX_RESULTS
+            )));
+        }
+        if let Some(timeout_ms) = search.timeout_ms
+            && !(1..=600_000).contains(&timeout_ms)
+        {
+            return Err(GlobalConfigError::Parse(format!(
+                "[web.search].timeout_ms must be between 1 and 600000; got {timeout_ms}"
+            )));
+        }
+        if let Some(name) = &search.api_key_env
+            && name.trim().is_empty()
+        {
+            return Err(GlobalConfigError::Parse(
+                "[web.search].api_key_env must not be blank".into(),
+            ));
+        }
+        if let Some(base_url) = &search.base_url {
+            let value = base_url.trim();
+            if !(value.starts_with("http://") || value.starts_with("https://"))
+                || value
+                    .split_once("://")
+                    .is_none_or(|(_, rest)| rest.is_empty())
+            {
+                return Err(GlobalConfigError::Parse(format!(
+                    "[web.search].base_url must be an absolute http(s) URL; got `{base_url}`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_browser(&self) -> Result<(), GlobalConfigError> {
@@ -1113,6 +1222,21 @@ impl GlobalConfig {
             })
             .collect();
         let context_soft_percent = self.context.soft_percent;
+        let web_search = self.web.search.map(|search| {
+            let provider = SearchProviderKind::parse(&search.provider)
+                .expect("provider was validated at load");
+            WebSearchSettings {
+                provider,
+                api_key_env: search
+                    .api_key_env
+                    .unwrap_or_else(|| default_search_key_env(provider).to_string()),
+                base_url: search
+                    .base_url
+                    .map(|base| base.trim().trim_end_matches('/').to_string()),
+                max_results: search.max_results.unwrap_or(5),
+                timeout: Duration::from_millis(search.timeout_ms.unwrap_or(15_000)),
+            }
+        });
         let models = self
             .models
             .into_iter()
@@ -1202,7 +1326,16 @@ impl GlobalConfig {
             assist_away_summary: self.assist.away_summary,
             context_soft_percent,
             model_soft_percent,
+            web_search,
         }
+    }
+}
+
+/// The credential variable each provider uses when the user does not name one.
+fn default_search_key_env(provider: SearchProviderKind) -> &'static str {
+    match provider {
+        SearchProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
+        SearchProviderKind::Tavily => "LEVELER_SEARCH_API_KEY",
     }
 }
 
@@ -1292,6 +1425,7 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // ── Thinking Level: one vocabulary, three places it can be set ──────────
 
@@ -2322,5 +2456,125 @@ provider = "deepseek"
             GlobalConfig::save_default_model_at(&path, &leveler_model::ModelRef::new("p", "m"))
                 .unwrap_err();
         assert!(matches!(error, GlobalConfigError::Write(_)), "{error:?}");
+    }
+
+    // ── [web.search]: a search backend independent of every model ───────────
+
+    #[test]
+    fn a_deepseek_search_section_gets_the_documented_defaults() {
+        let cfg = GlobalConfig::from_toml_str(
+            r#"
+            [web.search]
+            provider = "deepseek"
+            "#,
+        )
+        .unwrap();
+        let search = cfg.into_bundle().web_search.expect("configured");
+        assert_eq!(search.provider, SearchProviderKind::DeepSeek);
+        assert_eq!(search.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(search.base_url, None, "the provider default applies");
+        assert_eq!(search.max_results, 5);
+        assert_eq!(search.timeout, Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn tavily_keeps_its_legacy_credential_variable() {
+        let cfg = GlobalConfig::from_toml_str(
+            r#"
+            [web.search]
+            provider = "tavily"
+            "#,
+        )
+        .unwrap();
+        let search = cfg.into_bundle().web_search.expect("configured");
+        assert_eq!(search.provider, SearchProviderKind::Tavily);
+        assert_eq!(search.api_key_env, "LEVELER_SEARCH_API_KEY");
+    }
+
+    /// No section means no new behavior: the pre-existing Tavily path stays
+    /// exactly as it was, and DeepSeek search is never enabled implicitly.
+    #[test]
+    fn an_absent_search_section_preserves_the_legacy_path() {
+        let cfg = GlobalConfig::from_toml_str("default_model = \"p/m\"\n").unwrap();
+        assert!(cfg.into_bundle().web_search.is_none());
+    }
+
+    /// The search endpoint must never be inferred from a model provider's
+    /// base URL — a gateway that serves chat need not serve `/v1/tools`.
+    #[test]
+    fn a_model_provider_base_url_never_becomes_the_search_endpoint() {
+        let cfg = GlobalConfig::from_toml_str(
+            r#"
+            [providers.deepseek]
+            base_url = "https://gateway.example/api/v1"
+            api_key_env = "GATEWAY_KEY"
+
+            [web.search]
+            provider = "deepseek"
+            "#,
+        )
+        .unwrap();
+        let search = cfg.into_bundle().web_search.expect("configured");
+        assert_eq!(search.base_url, None);
+        assert_eq!(search.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(
+            leveler_tools::search::DEEPSEEK_SEARCH_BASE_URL,
+            "https://api.deepseek.com/v1/tools"
+        );
+    }
+
+    #[test]
+    fn search_settings_accept_explicit_values() {
+        let cfg = GlobalConfig::from_toml_str(
+            r#"
+            [web.search]
+            provider = "deepseek"
+            api_key_env = "MY_SEARCH_KEY"
+            base_url = "https://search.example/v1/tools/"
+            max_results = 12
+            timeout_ms = 2500
+            "#,
+        )
+        .unwrap();
+        let search = cfg.into_bundle().web_search.expect("configured");
+        assert_eq!(search.api_key_env, "MY_SEARCH_KEY");
+        assert_eq!(
+            search.base_url.as_deref(),
+            Some("https://search.example/v1/tools")
+        );
+        assert_eq!(search.max_results, 12);
+        assert_eq!(search.timeout, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn an_unknown_search_provider_is_named_at_load() {
+        let error = GlobalConfig::from_toml_str(
+            r#"
+            [web.search]
+            provider = "openai"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("deepseek or tavily"), "{error}");
+        assert!(error.contains("openai"), "{error}");
+    }
+
+    #[test]
+    fn out_of_range_search_bounds_are_rejected() {
+        for body in [
+            "[web.search]\nprovider = \"deepseek\"\nmax_results = 0\n",
+            "[web.search]\nprovider = \"deepseek\"\nmax_results = 51\n",
+            "[web.search]\nprovider = \"deepseek\"\ntimeout_ms = 0\n",
+            "[web.search]\nprovider = \"deepseek\"\ntimeout_ms = 600001\n",
+            "[web.search]\nprovider = \"deepseek\"\napi_key_env = \"  \"\n",
+            "[web.search]\nprovider = \"deepseek\"\nbase_url = \"api.deepseek.com\"\n",
+            "[web.search]\nprovider = \"deepseek\"\nbase_url = \"ftp://example.com\"\n",
+        ] {
+            assert!(
+                GlobalConfig::from_toml_str(body).is_err(),
+                "must reject: {body}"
+            );
+        }
     }
 }

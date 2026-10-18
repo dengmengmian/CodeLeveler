@@ -273,7 +273,18 @@ Each goal starts with the base coding tools. The model loads optional capabiliti
 
 - **Chrome, Edge, or Chromium:** CodeLeveler starts a dedicated automation session. `browser_tab`, `browser_act`, and `browser_inspect` can navigate, interact, and inspect console, page-error, and network records.
 - **Safari:** opt in with `default = "safari"` under `[browser]` in `~/.leveler/config.toml`, then enable Safari Remote Automation. Safari supports tabs and interaction, but its WebDriver backend cannot provide console, page-error, or network inspection.
-- **Web search:** set `LEVELER_SEARCH_API_KEY` to a Tavily key. `web_search` performs one HTTP request with a 10-second timeout and no retry; it does not fall back to browser automation.
+- **Web search:** the backend is configured independently of the conversation model, in `~/.leveler/config.toml`:
+
+  ```toml
+  [web.search]
+  provider = "deepseek"          # deepseek | tavily
+  api_key_env = "DEEPSEEK_API_KEY"
+  max_results = 5
+  timeout_ms = 15000
+  # base_url = "https://api.deepseek.com/v1/tools"
+  ```
+
+  DeepSeek search calls `POST https://api.deepseek.com/v1/tools/search` once per tool call, with no auxiliary model request. Any configured model can use it, and switching models never changes the search provider. A model provider's `base_url` is never reused as the search endpoint. Without this section the legacy behavior is unchanged: set `LEVELER_SEARCH_API_KEY` to a Tavily key. `web_search` performs one HTTP request, honors the configured timeout, and does not retry or fall back to browser automation. It is never enabled by a model key alone: the `[web.search]` section (or the legacy variable) is the explicit opt-in.
 
 TUI `/web` and links opened from the UI still use the operating system's default browser.
 

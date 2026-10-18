@@ -1,19 +1,21 @@
-//! `web_search` — search the web (Tavily) for up-to-date information the
-//! repository and the model's training data may not cover.
+//! `web_search` — search the web for up-to-date information the repository and
+//! the model's training data may not cover.
 //!
-//! An OPTIONAL capability, and the tool does not decide whether it exists: the
-//! composition root answers "is a key configured" once
-//! (`leveler_app::Application::capability_availability`), and an unconfigured
-//! host never registers this tool at all. What reaches `execute` is therefore
-//! already carrying the key it needs — there is no "not configured" branch
-//! here, because that state cannot reach here.
+//! The tool owns the model-facing contract (`query` + `count`) and nothing
+//! about a backend. A [`SearchProvider`] owns the request shape, credentials
+//! and response mapping; the composition root selects it, so the conversation
+//! model and the search backend are independent facts.
 //!
-//! Runtime failures are a different thing entirely and stay handled: a timeout,
-//! an unreachable host, an HTTP error or an unparsable body all return an
-//! `is_error` result stating the mechanical fact. The model decides what to do
-//! next; this tool does not retry, does not fall back to another capability,
-//! and does not advise.
+//! An OPTIONAL capability: the composition root answers "is a provider
+//! configured" once, and an unconfigured host never registers this tool at all.
+//! What reaches `execute` therefore already carries a usable provider.
+//!
+//! Runtime failures are handled as mechanical facts: a timeout, an unreachable
+//! host, an HTTP error or an unparsable body all return an `is_error` result.
+//! The tool does not retry, does not fall back to another provider, does not
+//! start a model request, and does not advise.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,10 +25,12 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
 
+use crate::search::{
+    SearchNetwork, SearchProvider, SearchResult, SearchSource, TavilySearchProvider,
+};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-const ENDPOINT: &str = "https://api.tavily.com/search";
-const TIMEOUT: Duration = Duration::from_secs(10);
+const LEGACY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_COUNT: usize = 5;
 const MAX_COUNT: usize = 10;
 
@@ -39,20 +43,24 @@ struct Input {
     count: Option<usize>,
 }
 
-/// The web search tool, constructed with the key the composition root found.
-///
-/// The key is held, never logged, never echoed: it is absent from `Debug` (not
-/// derived), from every error string, and from every `ToolOutput`.
+/// The web search tool, constructed with the provider the composition root
+/// selected. The provider holds its own credential; the tool never sees it and
+/// therefore cannot log or echo it.
 pub struct WebSearchTool {
-    api_key: String,
+    provider: Arc<dyn SearchProvider>,
 }
 
 impl WebSearchTool {
-    /// Build the tool over a Tavily API key.
+    /// Legacy constructor: a Tavily key with the built-in endpoint and timeout.
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-        }
+        let provider = TavilySearchProvider::new(api_key, None, MAX_COUNT, LEGACY_TIMEOUT)
+            .expect("a non-empty key is the only precondition");
+        Self::with_provider(Arc::new(provider))
+    }
+
+    /// Build the tool over an already-selected provider.
+    pub fn with_provider(provider: Arc<dyn SearchProvider>) -> Self {
+        Self { provider }
     }
 }
 
@@ -79,6 +87,15 @@ impl Tool for WebSearchTool {
         RiskLevel::Network
     }
 
+    async fn network_resource(
+        &self,
+        _input: &serde_json::Value,
+    ) -> Result<Option<leveler_execution::NetworkResource>, String> {
+        crate::network::resolve_target(self.provider.endpoint())
+            .await
+            .map(Some)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -101,18 +118,32 @@ impl Tool for WebSearchTool {
         }
         let count = input.count.unwrap_or(DEFAULT_COUNT).clamp(1, MAX_COUNT);
 
+        let network = SearchNetwork {
+            scope: &network_scope,
+            unrestricted,
+        };
         // Race the request against cancellation so a killed turn returns promptly.
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 return Ok(ToolOutput::error("web_search 已取消。"));
             }
-            r = search(&self.api_key, &query, count, &network_scope, unrestricted) => r,
+            r = self.provider.search(&query, count, network, &cancellation) => r,
         };
 
         match result {
-            Ok(text) if !text.trim().is_empty() => Ok(ToolOutput::ok(text)),
-            Ok(_) => Ok(ToolOutput::ok(format!("web_search「{query}」:无结果。"))),
+            Ok(result) if result.sources.is_empty() => {
+                Ok(ToolOutput::ok(format!("web_search「{query}」:无结果。")))
+            }
+            Ok(result) => {
+                let content = format_results(&result);
+                let metadata = serde_json::json!({
+                    "provider": self.provider.id(),
+                    "sources": result.sources,
+                    "truncated": result.truncated,
+                });
+                Ok(ToolOutput::ok(content).with_metadata(metadata))
+            }
             // A mechanical fact about this request, and nothing more: what the
             // model does about it is the model's call.
             Err(reason) => Ok(ToolOutput::error(format!("web_search 失败:{reason}。"))),
@@ -120,132 +151,115 @@ impl Tool for WebSearchTool {
     }
 }
 
-/// The request body. Only the two fields the tool contract needs — Tavily's
-/// other parameters stay out until a real consumer asks for one.
-fn request_body(query: &str, count: usize) -> serde_json::Value {
-    serde_json::json!({
-        "query": query,
-        "search_depth": "basic",
-        "max_results": count,
-    })
-}
-
-/// One request, one answer. No retry, no fallback.
-async fn search(
-    api_key: &str,
-    query: &str,
-    count: usize,
-    scope: &leveler_execution::NetworkScope,
-    unrestricted: bool,
-) -> Result<String, String> {
-    let resp = crate::network::send(
-        scope,
-        unrestricted,
-        ENDPOINT,
-        reqwest::Method::POST,
-        Some(&request_body(query, count)),
-        Some(api_key),
-        TIMEOUT,
-    )
-    .await?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
-    }
-    let json: serde_json::Value = resp.json().await.map_err(|_| "响应无法解析".to_string())?;
-    Ok(format_results(&json, count))
-}
-
-/// Format the top `count` results as `N. title\n   url\n   snippet`.
+/// Render the normalized result as `N. title (date)\n   url\n   snippet`.
 ///
 /// Provider-neutral by construction: the model sees titles, URLs and snippets,
-/// never Tavily's response envelope or its per-result `score`.
-fn format_results(json: &serde_json::Value, count: usize) -> String {
-    let Some(items) = json.get("results").and_then(|v| v.as_array()) else {
-        return String::new();
-    };
+/// never a provider's response envelope or quality scores.
+fn format_results(result: &SearchResult) -> String {
     let mut out = String::new();
-    for (i, item) in items.iter().take(count).enumerate() {
-        let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let snippet = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!("{}. {title}\n   {url}\n   {snippet}\n\n", i + 1));
+    for (i, source) in result.sources.iter().enumerate() {
+        let title = display_title(source);
+        match &source.published_at {
+            Some(date) => out.push_str(&format!("{}. {title} ({date})\n", i + 1)),
+            None => out.push_str(&format!("{}. {title}\n", i + 1)),
+        }
+        out.push_str(&format!("   {}\n", source.url));
+        if !source.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", source.snippet));
+        }
+        out.push('\n');
+    }
+    if result.truncated {
+        out.push_str(&format!(
+            "(结果已截断至 {} 条,可细化查询获取更多。)\n",
+            result.sources.len()
+        ));
     }
     out
+}
+
+fn display_title(source: &SearchSource) -> &str {
+    if source.title.is_empty() {
+        &source.url
+    } else {
+        &source.title
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A fixed Tavily body, shaped as the API documents it.
-    fn tavily_fixture() -> serde_json::Value {
-        serde_json::json!({
-            "query": "tokio cancellation",
-            "results": [
-                {
-                    "title": "Tokio CancellationToken",
-                    "url": "https://docs.rs/tokio-util/latest/",
-                    "content": "Cancellation tokens provide...",
-                    "score": 0.98
-                },
-                {
-                    "title": "Tokio Documentation",
-                    "url": "https://tokio.rs/",
-                    "content": "An asynchronous runtime.",
-                    "score": 0.91
-                },
-                {
-                    "title": "Third",
-                    "url": "https://example.invalid/",
-                    "content": "third snippet",
-                    "score": 0.4
-                }
+    fn source(title: &str, url: &str, snippet: &str, date: Option<&str>) -> SearchSource {
+        SearchSource {
+            title: title.into(),
+            url: url.into(),
+            snippet: snippet.into(),
+            published_at: date.map(str::to_string),
+        }
+    }
+
+    fn fixture() -> SearchResult {
+        SearchResult {
+            sources: vec![
+                source(
+                    "Tokio CancellationToken",
+                    "https://docs.rs/tokio-util/latest/",
+                    "Cancellation tokens provide...",
+                    None,
+                ),
+                source(
+                    "Tokio Documentation",
+                    "https://tokio.rs/",
+                    "An asynchronous runtime.",
+                    Some("2026-02-02"),
+                ),
+                source("Third", "https://example.invalid/", "third snippet", None),
             ],
-            "response_time": 1.2
-        })
+            truncated: false,
+        }
     }
 
     #[test]
-    fn formats_tavily_results_from_title_url_content() {
-        let out = format_results(&tavily_fixture(), 5);
+    fn formats_results_from_title_url_snippet_and_date() {
+        let out = format_results(&fixture());
         assert!(out.contains("1. Tokio CancellationToken"));
         assert!(out.contains("https://docs.rs/tokio-util/latest/"));
         assert!(out.contains("Cancellation tokens provide..."));
-        assert!(out.contains("2. Tokio Documentation"));
+        assert!(out.contains("2. Tokio Documentation (2026-02-02)"));
     }
 
     #[test]
     fn provider_internal_fields_never_reach_the_model() {
-        let out = format_results(&tavily_fixture(), 5);
-        for leaked in ["score", "0.98", "response_time", "1.2"] {
+        let out = format_results(&fixture());
+        for leaked in [
+            "score",
+            "0.98",
+            "response_time",
+            "rerank_score",
+            "authority",
+        ] {
             assert!(!out.contains(leaked), "{leaked} leaked into the output");
         }
     }
 
     #[test]
-    fn count_caps_the_results() {
-        let out = format_results(&tavily_fixture(), 2);
-        assert!(out.contains("1. Tokio CancellationToken") && out.contains("2. Tokio"));
-        assert!(!out.contains("3. Third"), "count caps the results");
+    fn an_empty_title_falls_back_to_the_url() {
+        let result = SearchResult {
+            sources: vec![source("", "https://a.test", "", None)],
+            truncated: false,
+        };
+        let out = format_results(&result);
+        assert!(out.contains("1. https://a.test"), "{out}");
     }
 
     #[test]
-    fn missing_results_yields_empty() {
-        assert_eq!(format_results(&serde_json::json!({}), 5), "");
-    }
-
-    /// `count` maps to Tavily's `max_results`; `search_depth` is fixed and
-    /// nothing else is sent.
-    #[test]
-    fn request_body_carries_only_query_depth_and_max_results() {
-        let body = request_body("rust tokio", 7);
-        assert_eq!(body["query"], "rust tokio");
-        assert_eq!(body["search_depth"], "basic");
-        assert_eq!(body["max_results"], 7);
-        let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 3, "no extra provider parameters: {keys:?}");
+    fn truncation_is_stated_once() {
+        let mut result = fixture();
+        result.truncated = true;
+        let out = format_results(&result);
+        assert_eq!(out.matches("结果已截断").count(), 1, "{out}");
+        assert!(out.contains("3 条"), "{out}");
     }
 
     /// The model's contract is `query` + `count` — a provider swap must not

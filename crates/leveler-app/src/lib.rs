@@ -41,7 +41,7 @@ mod vcs;
 mod workspace_view;
 
 pub use collaboration::CollaborationExecution;
-pub use global_config::{GlobalConfig, GlobalConfigError};
+pub use global_config::{GlobalConfig, GlobalConfigError, WebSearchSettings};
 pub use interactive::InProcessRuntimeClient;
 pub use interactive::ui_thinking_state;
 pub use parallel::ParallelEditOutcome;
@@ -60,6 +60,9 @@ use leveler_provider::{
     load_provider_config, resolve_api_key,
 };
 use leveler_storage::{Database, SessionRepository};
+use leveler_tools::search::{
+    DeepSeekSearchProvider, SearchProvider, SearchProviderKind, TavilySearchProvider,
+};
 use leveler_tools::{CapabilityPacks, ToolContext, model_surface};
 use sha2::{Digest, Sha256};
 
@@ -180,6 +183,9 @@ pub struct LoadedConfig {
     /// `[models.<id>].soft_compaction_percent`, keyed by the table id as
     /// written. A per-model share of the effective input capacity.
     pub model_context_soft_percent: Vec<(String, u8)>,
+    /// `[web.search]`, resolved. `None` preserves the legacy Tavily path over
+    /// `LEVELER_SEARCH_API_KEY`.
+    pub web_search: Option<WebSearchSettings>,
 }
 
 impl LoadedConfig {
@@ -358,6 +364,7 @@ impl Default for LoadedConfig {
             assist_away_summary: true,
             context_soft_percent: None,
             model_context_soft_percent: Vec::new(),
+            web_search: None,
         }
     }
 }
@@ -582,6 +589,7 @@ impl Application {
             assist_away_summary: global.assist_away_summary,
             context_soft_percent: global.context_soft_percent,
             model_context_soft_percent: global.model_soft_percent,
+            web_search: global.web_search,
         })
     }
 
@@ -1108,7 +1116,10 @@ impl Application {
             .with_artifact_store(artifact_store)
             .with_memory_root(self.layout.memory_dir())
             .with_browser(self.browser.clone())
-            .with_search_api_key(search_api_key(self.environment.as_ref()));
+            .with_search_provider(resolve_search_provider(
+                self.config.web_search.as_ref(),
+                self.environment.as_ref(),
+            ));
         let tool_context = match workspace {
             Some(workspace) => {
                 ToolContext::with_environment(workspace, mode, self.environment.clone())
@@ -1117,7 +1128,10 @@ impl Application {
         }
         .with_policy_limits(max_files)
         .with_sandbox(sandbox)
-        .with_deny_env(provider_secret_env_names(&self.config.providers))
+        .with_deny_env(provider_secret_env_names(
+            &self.config.providers,
+            self.config.web_search.as_ref(),
+        ))
         .with_read_only(read_only);
         // The permission profile this turn authorizes under is the SESSION's
         // live cell, not the value captured here: a user who switches profile
@@ -1215,9 +1229,14 @@ impl Application {
             vcs: self.layout.primary_workspace().is_some()
                 && leveler_browser::which(environment, "git").is_some(),
             web_fetch: true,
-            // Advertising a search tool without a key spends schema on a call
-            // that can only fail. A blank value is not a configuration.
-            web_search: search_api_key(environment).is_some(),
+            // Advertising a search tool without a provider spends schema on a
+            // call that can only fail. The backend is chosen by configuration,
+            // never by the conversation model.
+            web_search: resolve_search_provider(
+                self.config.web_search.as_ref(),
+                self.environment.as_ref(),
+            )
+            .is_some(),
             // An image is useless to a model that cannot read one.
             media: self
                 .registry
@@ -1636,7 +1655,8 @@ impl Application {
         let mut request = leveler_execution::ProcessRequest::new(program, args, cwd.clone());
         request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
         request.deny_network = sandbox;
-        request.deny_env = provider_secret_env_names(&self.config.providers);
+        request.deny_env =
+            provider_secret_env_names(&self.config.providers, self.config.web_search.as_ref());
         request.write_scope = mode.write_scope(&cwd);
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
@@ -1653,13 +1673,78 @@ fn search_api_key(environment: &leveler_core::EnvSnapshot) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-pub(crate) fn provider_secret_env_names(providers: &[ProviderConfig]) -> Vec<String> {
+/// Resolve the configured search backend.
+///
+/// Deliberately takes no model: the conversation model and the search vendor
+/// are independent facts. `None` means search is unavailable, and the tool is
+/// never constructed. A present `[web.search]` is the explicit opt-in; an
+/// absent one preserves the legacy Tavily behavior.
+fn resolve_search_provider(
+    settings: Option<&WebSearchSettings>,
+    environment: &leveler_core::EnvSnapshot,
+) -> Option<Arc<dyn SearchProvider>> {
+    let Some(settings) = settings else {
+        // Legacy: Tavily over LEVELER_SEARCH_API_KEY, same endpoint, timeout
+        // and result bound the tool had before providers were configurable.
+        let key = search_api_key(environment)?;
+        return TavilySearchProvider::new(key, None, 10, std::time::Duration::from_secs(10))
+            .ok()
+            .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>);
+    };
+    let key = environment
+        .var(&settings.api_key_env)
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let Some(key) = key else {
+        tracing::debug!(
+            provider = settings.provider.as_str(),
+            api_key_env = %settings.api_key_env,
+            "web search is configured but its credential variable is unset or blank"
+        );
+        return None;
+    };
+    let resolved = match settings.provider {
+        SearchProviderKind::DeepSeek => DeepSeekSearchProvider::new(
+            key,
+            settings.base_url.as_deref(),
+            settings.max_results,
+            settings.timeout,
+        )
+        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+        SearchProviderKind::Tavily => TavilySearchProvider::new(
+            key,
+            settings.base_url.as_deref(),
+            settings.max_results,
+            settings.timeout,
+        )
+        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+    };
+    match resolved {
+        Ok(provider) => Some(provider),
+        Err(error) => {
+            tracing::warn!(
+                provider = settings.provider.as_str(),
+                %error,
+                "web search provider configuration is unusable; search stays unavailable"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn provider_secret_env_names(
+    providers: &[ProviderConfig],
+    web_search: Option<&WebSearchSettings>,
+) -> Vec<String> {
     let mut names: Vec<String> = providers
         .iter()
         .map(|p| p.api_key_env.clone())
         .filter(|n| !n.trim().is_empty())
         .collect();
     names.push("LEVELER_SEARCH_API_KEY".to_string());
+    if let Some(search) = web_search {
+        names.push(search.api_key_env.clone());
+    }
     names.sort();
     names.dedup();
     names
@@ -1700,7 +1785,11 @@ mod merge_tests {
     use leveler_model::ProtocolKind;
     use leveler_provider::ProviderConfig;
 
-    use super::{merge_providers, provider_secret_env_names, top_level_limits_from_config};
+    use super::{
+        WebSearchSettings, merge_providers, provider_secret_env_names, resolve_search_provider,
+        top_level_limits_from_config,
+    };
+    use leveler_tools::search::SearchProviderKind;
 
     fn provider(id: &str, api_key_env: Option<&str>) -> ProviderConfig {
         ProviderConfig {
@@ -1756,6 +1845,17 @@ mod merge_tests {
         )
     }
 
+    fn env_named(name: &str, value: Option<&str>) -> leveler_core::EnvSnapshot {
+        let values = value
+            .into_iter()
+            .map(|k| (std::ffi::OsString::from(name), std::ffi::OsString::from(k)));
+        leveler_core::EnvSnapshot::new(
+            values,
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp"),
+        )
+    }
+
     /// Case A — no key at all. `web_search` is not AVAILABLE, so it never
     /// reaches the model surface however much the product mode wants it.
     #[test]
@@ -1787,13 +1887,79 @@ mod merge_tests {
         );
     }
 
+    /// A configured DeepSeek search provider resolves from its own credential
+    /// variable, with the official endpoint, and takes no model input at all.
+    #[test]
+    fn deepseek_search_resolves_independently_of_any_model() {
+        let settings = WebSearchSettings {
+            provider: SearchProviderKind::DeepSeek,
+            api_key_env: "DEEPSEEK_API_KEY".into(),
+            base_url: None,
+            max_results: 5,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let provider = resolve_search_provider(
+            Some(&settings),
+            &env_named("DEEPSEEK_API_KEY", Some("ds-test-key")),
+        )
+        .expect("configured and credentialed");
+        assert_eq!(provider.id(), "deepseek");
+        assert_eq!(
+            provider.endpoint(),
+            "https://api.deepseek.com/v1/tools/search"
+        );
+        assert_eq!(provider.max_results(), 5);
+    }
+
+    #[test]
+    fn a_missing_search_credential_makes_search_unavailable() {
+        let settings = WebSearchSettings {
+            provider: SearchProviderKind::DeepSeek,
+            api_key_env: "DEEPSEEK_API_KEY".into(),
+            base_url: None,
+            max_results: 5,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        assert!(resolve_search_provider(Some(&settings), &env_with(None)).is_none());
+        assert!(
+            resolve_search_provider(Some(&settings), &env_named("DEEPSEEK_API_KEY", Some("   ")))
+                .is_none()
+        );
+    }
+
+    /// No `[web.search]` section: the historical Tavily key is still the only
+    /// way search turns on, and the provider is Tavily.
+    #[test]
+    fn legacy_configuration_still_resolves_tavily() {
+        let provider =
+            resolve_search_provider(None, &env_with(Some("tvly-test-value"))).expect("legacy key");
+        assert_eq!(provider.id(), "tavily");
+        assert_eq!(provider.endpoint(), "https://api.tavily.com/search");
+        assert!(resolve_search_provider(None, &env_with(None)).is_none());
+    }
+
+    #[test]
+    fn configured_search_secrets_are_scrubbed_from_children() {
+        let settings = WebSearchSettings {
+            provider: SearchProviderKind::DeepSeek,
+            api_key_env: "DEEPSEEK_API_KEY".into(),
+            base_url: None,
+            max_results: 5,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let names = provider_secret_env_names(&[provider("p", Some("P_KEY"))], Some(&settings));
+        assert!(names.contains(&"P_KEY".to_string()));
+        assert!(names.contains(&"DEEPSEEK_API_KEY".to_string()));
+        assert!(names.contains(&"LEVELER_SEARCH_API_KEY".to_string()));
+    }
+
     #[test]
     fn secret_env_names_cover_all_providers() {
         let a = provider("moonshot", Some("MOONSHOT_KEY"));
         let b = provider("deepseek", Some("DEEPSEEK_API_KEY"));
         let c = provider("keyless", None); // no api_key_env
 
-        let names = provider_secret_env_names(&[a, b, c]);
+        let names = provider_secret_env_names(&[a, b, c], None);
         assert!(names.contains(&"MOONSHOT_KEY".to_string()));
         assert!(names.contains(&"DEEPSEEK_API_KEY".to_string()));
         assert!(names.contains(&"LEVELER_SEARCH_API_KEY".to_string()));

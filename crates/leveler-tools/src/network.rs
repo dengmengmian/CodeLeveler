@@ -41,10 +41,18 @@ pub(crate) async fn send(
 ) -> Result<reqwest::Response, String> {
     // FullAccess is frozen execution authority, not a larger destination scope.
     // Let the HTTP client perform ordinary DNS/connect/redirect processing;
-    // no CodeLeveler scope or SSRF decision runs on this path.
+    // no CodeLeveler scope or SSRF decision runs on this path. A request that
+    // carries a credential or a JSON body still refuses redirects: following
+    // one could resend the Authorization header to another host.
     if unrestricted {
+        let redirects = if bearer.is_some() || json.is_some() {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::limited(10)
+        };
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(redirects)
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         let mut request = client.request(method, url);
@@ -54,10 +62,7 @@ pub(crate) async fn send(
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
-        return request
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"));
+        return request.send().await.map_err(request_error);
     }
     let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
     let mut effective_scope = scope.clone();
@@ -109,10 +114,7 @@ pub(crate) async fn send(
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"))?;
+        let response = request.send().await.map_err(request_error)?;
         if !response.status().is_redirection() {
             return Ok(response);
         }
@@ -133,6 +135,17 @@ pub(crate) async fn send(
             .map_err(|e| format!("bad redirect: {e}"))?;
     }
     Err("too many redirects".into())
+}
+
+/// Preserve the one classification callers need from a reqwest failure. The
+/// display text alone does not say "timed out" on every platform, so a search
+/// or fetch could not distinguish a timeout from an unreachable host.
+fn request_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "request failed: timed out".to_string()
+    } else {
+        format!("request failed: {error}")
+    }
 }
 
 /// SSRF exclusions for public HTTP documents; explicit local scopes use the
