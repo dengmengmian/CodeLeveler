@@ -1679,10 +1679,11 @@ fn resolve_search_provider(
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty());
     let Some(key) = key else {
-        tracing::debug!(
+        tracing::warn!(
             provider = settings.provider.as_str(),
             api_key_env = %settings.api_key_env,
-            "web search is configured but its credential variable is unset or blank"
+            "web search is configured but its credential variable is unset or blank; \
+             web_search stays unavailable"
         );
         return None;
     };
