@@ -183,8 +183,8 @@ pub struct LoadedConfig {
     /// `[models.<id>].soft_compaction_percent`, keyed by the table id as
     /// written. A per-model share of the effective input capacity.
     pub model_context_soft_percent: Vec<(String, u8)>,
-    /// `[web.search]`, resolved. `None` preserves the legacy Tavily path over
-    /// `LEVELER_SEARCH_API_KEY`.
+    /// `[web.search]`, resolved. `None` means web search is unavailable; there
+    /// is no legacy environment-only fallback.
     pub web_search: Option<WebSearchSettings>,
 }
 
@@ -1663,34 +1663,17 @@ impl Application {
     }
 }
 
-/// The one reader of `LEVELER_SEARCH_API_KEY` (a Tavily key). `None` when
-/// unset, empty or whitespace — availability and the tool's construction both
-/// come from here, so they can never disagree.
-fn search_api_key(environment: &leveler_core::EnvSnapshot) -> Option<String> {
-    environment
-        .var("LEVELER_SEARCH_API_KEY")
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-}
-
 /// Resolve the configured search backend.
 ///
 /// Deliberately takes no model: the conversation model and the search vendor
 /// are independent facts. `None` means search is unavailable, and the tool is
-/// never constructed. A present `[web.search]` is the explicit opt-in; an
-/// absent one preserves the legacy Tavily behavior.
+/// never constructed. `[web.search]` is the ONLY way to enable search: its
+/// explicit provider and credential variable are the opt-in.
 fn resolve_search_provider(
     settings: Option<&WebSearchSettings>,
     environment: &leveler_core::EnvSnapshot,
 ) -> Option<Arc<dyn SearchProvider>> {
-    let Some(settings) = settings else {
-        // Legacy: Tavily over LEVELER_SEARCH_API_KEY, same endpoint, timeout
-        // and result bound the tool had before providers were configurable.
-        let key = search_api_key(environment)?;
-        return TavilySearchProvider::new(key, None, 10, std::time::Duration::from_secs(10))
-            .ok()
-            .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>);
-    };
+    let settings = settings?;
     let key = environment
         .var(&settings.api_key_env)
         .map(|key| key.trim().to_string())
@@ -1741,6 +1724,8 @@ pub(crate) fn provider_secret_env_names(
         .map(|p| p.api_key_env.clone())
         .filter(|n| !n.trim().is_empty())
         .collect();
+    // The old Tavily variable is no longer a configuration source, but a
+    // leftover value is still scrubbed so it cannot reach a child process.
     names.push("LEVELER_SEARCH_API_KEY".to_string());
     if let Some(search) = web_search {
         names.push(search.api_key_env.clone());
@@ -1856,35 +1841,12 @@ mod merge_tests {
         )
     }
 
-    /// Case A — no key at all. `web_search` is not AVAILABLE, so it never
-    /// reaches the model surface however much the product mode wants it.
+    /// `[web.search]` is the only way to enable search. A leftover legacy
+    /// Tavily variable does not turn it on.
     #[test]
-    fn no_search_key_is_not_available() {
-        assert_eq!(crate::search_api_key(&env_with(None)), None);
-    }
-
-    /// Case B — a key that is present but blank is not a configuration. A
-    /// `Some("")` that counted as configured would advertise a tool whose
-    /// every call is a 401.
-    #[test]
-    fn blank_search_key_is_not_available() {
-        assert_eq!(crate::search_api_key(&env_with(Some(""))), None);
-        assert_eq!(crate::search_api_key(&env_with(Some("   "))), None);
-        assert_eq!(crate::search_api_key(&env_with(Some("\t\n"))), None);
-    }
-
-    /// Case C — a real key is AVAILABLE, and reaches the tool trimmed.
-    #[test]
-    fn a_real_search_key_is_available_and_trimmed() {
-        assert_eq!(
-            crate::search_api_key(&env_with(Some("tvly-test-value"))).as_deref(),
-            Some("tvly-test-value")
-        );
-        assert_eq!(
-            crate::search_api_key(&env_with(Some("  tvly-test-value  "))).as_deref(),
-            Some("tvly-test-value"),
-            "surrounding whitespace is not part of the key"
-        );
+    fn an_absent_search_section_disables_search() {
+        assert!(resolve_search_provider(None, &env_with(Some("tvly-test-value"))).is_none());
+        assert!(resolve_search_provider(None, &env_with(None)).is_none());
     }
 
     /// A configured DeepSeek search provider resolves from its own credential
@@ -1927,15 +1889,21 @@ mod merge_tests {
         );
     }
 
-    /// No `[web.search]` section: the historical Tavily key is still the only
-    /// way search turns on, and the provider is Tavily.
+    /// Tavily remains available, but only through an explicit `[web.search]`
+    /// section. Its default credential variable is the historical one.
     #[test]
-    fn legacy_configuration_still_resolves_tavily() {
-        let provider =
-            resolve_search_provider(None, &env_with(Some("tvly-test-value"))).expect("legacy key");
+    fn a_configured_tavily_provider_still_resolves() {
+        let settings = WebSearchSettings {
+            provider: SearchProviderKind::Tavily,
+            api_key_env: "LEVELER_SEARCH_API_KEY".into(),
+            base_url: None,
+            max_results: 5,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let provider = resolve_search_provider(Some(&settings), &env_with(Some("tvly-test-value")))
+            .expect("explicitly configured");
         assert_eq!(provider.id(), "tavily");
         assert_eq!(provider.endpoint(), "https://api.tavily.com/search");
-        assert!(resolve_search_provider(None, &env_with(None)).is_none());
     }
 
     #[test]

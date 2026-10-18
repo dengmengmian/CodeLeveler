@@ -184,9 +184,9 @@ struct GlobalWeb {
 /// `[web.search]`. The search backend is chosen here, independently of
 /// `[providers.*]`: a model gateway URL is never a search endpoint.
 ///
-/// Absent means legacy behavior: Tavily over `LEVELER_SEARCH_API_KEY`, and no
-/// search at all when that variable is unset. A present table is the explicit
-/// opt-in that authorizes paid search requests.
+/// This section is the ONLY way to enable web search. Absent means
+/// `web_search` is unavailable; there is no environment-only legacy fallback.
+/// A present table is the explicit opt-in that authorizes paid search requests.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalWebSearch {
@@ -536,7 +536,7 @@ pub struct GlobalBundle {
     /// Per-model soft compaction percent, keyed by the table id as written
     /// (`[models.<id>].soft_compaction_percent`).
     pub model_soft_percent: Vec<(String, u8)>,
-    /// `[web.search]`, resolved. `None` preserves the legacy Tavily path.
+    /// `[web.search]`, resolved. `None` means web search is unavailable.
     pub web_search: Option<WebSearchSettings>,
 }
 
@@ -2491,10 +2491,10 @@ provider = "deepseek"
         assert_eq!(search.api_key_env, "LEVELER_SEARCH_API_KEY");
     }
 
-    /// No section means no new behavior: the pre-existing Tavily path stays
-    /// exactly as it was, and DeepSeek search is never enabled implicitly.
+    /// No section means no search: the old environment-only Tavily path is
+    /// gone, and no provider is enabled implicitly.
     #[test]
-    fn an_absent_search_section_preserves_the_legacy_path() {
+    fn an_absent_search_section_disables_search() {
         let cfg = GlobalConfig::from_toml_str("default_model = \"p/m\"\n").unwrap();
         assert!(cfg.into_bundle().web_search.is_none());
     }

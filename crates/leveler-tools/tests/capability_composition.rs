@@ -14,9 +14,17 @@ fn caps() -> leveler_tools::Capabilities {
     ))
 }
 
-/// The same handles, plus the search key a configured host would have found.
+/// The same handles, plus the search provider a configured host would have
+/// built. The composition under test never depends on which vendor it is.
 fn caps_with_search_key() -> leveler_tools::Capabilities {
-    caps().with_search_api_key(Some("tvly-test-value".to_string()))
+    let provider = leveler_tools::search::TavilySearchProvider::new(
+        "tvly-test-value",
+        None,
+        10,
+        std::time::Duration::from_secs(10),
+    )
+    .expect("a non-empty test key");
+    caps().with_search_provider(Some(std::sync::Arc::new(provider)))
 }
 
 fn names(registry: &leveler_tools::ToolRegistry) -> Vec<String> {

@@ -90,27 +90,6 @@ impl Capabilities {
         self
     }
 
-    /// Legacy convenience: a Tavily backend over `key`. A blank value is not a
-    /// configuration: it is normalised to `None` here so availability and
-    /// construction cannot disagree.
-    pub fn with_search_api_key(mut self, key: Option<String>) -> Self {
-        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-        self.search_provider = key.map(|key| {
-            Arc::new(
-                crate::search::TavilySearchProvider::new(
-                    key,
-                    None,
-                    // The tool's own count bound; the provider cap never
-                    // narrows a request the model is allowed to make.
-                    10,
-                    std::time::Duration::from_secs(10),
-                )
-                .expect("a non-empty key is the only precondition"),
-            ) as Arc<dyn crate::search::SearchProvider>
-        });
-        self
-    }
-
     /// Reuse a process-lived background registry, so tasks survive the turn
     /// that started them.
     pub fn with_background_tasks(mut self, registry: Arc<BackgroundTaskRegistry>) -> Self {
