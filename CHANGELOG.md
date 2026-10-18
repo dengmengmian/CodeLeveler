@@ -17,6 +17,7 @@ Web search becomes a capability independent of the conversation model.
 
 - Only `[web.search]` enables search. The legacy `LEVELER_SEARCH_API_KEY` fallback is removed
 - A configured search whose credential variable is unset is logged at warn level, naming the variable, instead of a debug line the default filter never wrote
+- A Homebrew-managed install no longer replaces itself in the Cellar: the start-up updater and `leveler update` defer to `brew upgrade leveler`, while `--check` stays read-only. Script and manual installs keep self-updating
 
 ### Fixed
 

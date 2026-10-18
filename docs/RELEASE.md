@@ -32,6 +32,10 @@ Keep the key out of the repository and out of the TOML file. If the variable is
 unset, `web_search` stays unavailable, the model and every other feature keep
 working, and `~/.leveler/leveler.log` records a warning naming the variable.
 
+## Updates
+
+- A Homebrew-managed install no longer replaces itself in the Cellar. The start-up updater and `leveler update` defer to `brew upgrade leveler`, so the formula's record and the installed file stay in agreement; `leveler update --check` remains a read-only check. Installations from the install script or a manual copy keep their existing self-update behaviour.
+
 ## Qualification
 
 - The Dogfood coverage audit now persists this run's layer artifacts before taking the pre-RC verdict. A test that L1 passed is no longer reported as "L1 did not run for this candidate".

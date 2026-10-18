@@ -17,6 +17,7 @@
 
 - 只有 `[web.search]` 能启用搜索。旧的 `LEVELER_SEARCH_API_KEY` 回退已移除
 - 已配置搜索但凭据变量未设置时，以 warn 级别记录并点名该变量，而不是默认过滤器不会写出的 debug 日志
+- Homebrew 安装的版本不再自行替换 Cellar 中的文件：启动自动更新与 `leveler update` 改为提示 `brew upgrade leveler`，`--check` 仍只做只读检查；安装脚本与手动安装保留自更新
 
 ### 修复
 
