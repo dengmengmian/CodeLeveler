@@ -792,11 +792,18 @@ mod tests {
     }
 
     /// In-process handles plus the two a configured host would have found: a
-    /// search key and a browser. Both are placeholders — every test that uses
-    /// them asserts on composition, never on a request or a live browser.
+    /// search provider and a browser. Both are placeholders — every test that
+    /// uses them asserts on composition, never on a request or a live browser.
     fn configured_test_capabilities() -> crate::capabilities::Capabilities {
+        let search = crate::search::TavilySearchProvider::new(
+            "tvly-test-value",
+            None,
+            10,
+            std::time::Duration::from_secs(10),
+        )
+        .expect("a non-empty test key");
         crate::tools::test_capabilities()
-            .with_search_api_key(Some("tvly-test-value".to_string()))
+            .with_search_provider(Some(std::sync::Arc::new(search)))
             .with_browser(std::sync::Arc::new(leveler_browser::Browser::new(
                 leveler_core::environment().clone(),
                 std::env::temp_dir().join("leveler-registry-test-profile"),

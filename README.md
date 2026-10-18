@@ -284,7 +284,7 @@ Each goal starts with the base coding tools. The model loads optional capabiliti
   # base_url = "https://api.deepseek.com/v1/tools"
   ```
 
-  DeepSeek search calls `POST https://api.deepseek.com/v1/tools/search` once per tool call, with no auxiliary model request. Any configured model can use it, and switching models never changes the search provider. A model provider's `base_url` is never reused as the search endpoint. Without this section the legacy behavior is unchanged: set `LEVELER_SEARCH_API_KEY` to a Tavily key. `web_search` performs one HTTP request, honors the configured timeout, and does not retry or fall back to browser automation. It is never enabled by a model key alone: the `[web.search]` section (or the legacy variable) is the explicit opt-in.
+  DeepSeek search calls `POST https://api.deepseek.com/v1/tools/search` once per tool call, with no auxiliary model request. Any configured model can use it, and switching models never changes the search provider. A model provider's `base_url` is never reused as the search endpoint. Supported search providers are `deepseek` and `tavily`. This section is the only way to enable search: without it, `web_search` is unavailable, and a leftover `LEVELER_SEARCH_API_KEY` does not turn it on. `web_search` performs one HTTP request, honors the configured timeout, and does not retry or fall back to browser automation.
 
 TUI `/web` and links opened from the UI still use the operating system's default browser.
 
