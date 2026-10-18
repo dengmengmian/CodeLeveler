@@ -102,12 +102,7 @@ async fn connect_within(
 ) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
     match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
         Ok(Ok(client)) => Ok(Some(client)),
-        Ok(Err(TransportError::Io(error)))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
+        Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
             tracing::debug!(%error, socket = %path.display(), "skipping unavailable local runtime");
             Ok(None)
         }
@@ -121,6 +116,19 @@ async fn connect_within(
             Ok(None)
         }
     }
+}
+
+/// Whether a transport error means no runtime owns this endpoint. Linux can
+/// report a closed listener as ECONNRESET during the subscribe handshake, the
+/// same fact as ECONNREFUSED; neither says the endpoint is recoverable.
+#[cfg(any(unix, windows))]
+fn endpoint_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 /// Probe the default per-repository endpoint without blocking TUI startup on
@@ -1186,6 +1194,27 @@ mod probe_tests {
             matches!(result, Ok(Ok(None))),
             "a listening endpoint with a stalled handshake must not block startup"
         );
+    }
+
+    /// A stale endpoint can fail the subscribe handshake with ECONNRESET:
+    /// Linux reports this when the listener behind the socket file is gone.
+    /// That is the same fact as ECONNREFUSED — no runtime owns the endpoint —
+    /// and must not turn startup into a transport error.
+    #[test]
+    fn an_unusable_endpoint_is_no_runtime() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(
+                endpoint_unavailable(&std::io::Error::from(kind)),
+                "{kind:?} means no runtime is listening"
+            );
+        }
+        assert!(!endpoint_unavailable(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
     }
 
     /// The drain budget is a policy with exactly one surprising value: `0`
