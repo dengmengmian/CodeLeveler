@@ -2274,6 +2274,11 @@ fn a_failing_required_ci_run_blocks_the_release() {
         world.state().path_str("remote.ci_conclusion"),
         Some("FAILURE")
     );
+    assert!(
+        rendered.contains("was pushed to origin")
+            && !rendered.contains("was NOT tagged, pushed, or reset"),
+        "a failed CI after a successful push must say the commit was pushed: {rendered}"
+    );
 }
 
 #[test]
