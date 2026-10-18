@@ -4,6 +4,25 @@
 
 发布说明：[`docs/RELEASE.zh-CN.md`](docs/RELEASE.zh-CN.md)。
 
+## [1.0.19] - 2026-10-19
+
+网页搜索成为独立于对话模型的能力。
+
+### 新增
+
+- `[web.search]` 独立于 `[providers.*]` 与 `[models.*]` 选择搜索后端——DeepSeek 官方 Search API 或 Tavily。切换对话模型（包括换到其它厂商）不会改变搜索后端；模型 Provider 的 `base_url` 不会被当作搜索端点
+- `web_search` 只从配置的 `api_key_env` 读取凭据；该变量会从子进程环境中清除，其值不会进入日志或工具输出
+
+### 变更
+
+- 只有 `[web.search]` 能启用搜索。旧的 `LEVELER_SEARCH_API_KEY` 回退已移除
+- 已配置搜索但凭据变量未设置时，以 warn 级别记录并点名该变量，而不是默认过滤器不会写出的 debug 日志
+
+### 修复
+
+- TUI 展示首条搜索结果，不再显示外部数据占位符
+- Dogfood 覆盖率在给出 pre-RC 结论前先持久化本轮各层产物，L1 已通过的测试不再被报告为“L1 did not run for this candidate”；声明了其它候选的证据会被拒绝
+
 ## [未发布]
 
 ### 变更
