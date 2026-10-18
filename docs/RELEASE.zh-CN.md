@@ -30,6 +30,10 @@ timeout_ms = 15000
 TOML 文件。若该变量未设置，`web_search` 保持不可用，模型与其它功能照常工作，
 `~/.leveler/leveler.log` 会记录一条点名该变量的警告。
 
+## 更新
+
+- Homebrew 安装的版本不再自行替换 Cellar 中的文件。启动时的自动更新与 `leveler update` 都改为提示执行 `brew upgrade leveler`，让 Formula 的记录与实际安装文件保持一致；`leveler update --check` 仍只做只读检查。安装脚本或手动复制的版本保留原有自更新能力。
+
 ## 验收
 
 - Dogfood 覆盖率审计在给出 pre-RC 结论前，先把本轮各层产物写入运行目录。L1 已经通过的测试不会再被报告为“L1 did not run for this candidate”。

@@ -5,11 +5,30 @@
 //! This module turns that service into terminal output and drives the one
 //! surface that must never block a normal launch.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use leveler_update::{ReleaseSource, UpdatePolicy, UpdateService, UpdateStep};
 
 use crate::output::Line;
+
+/// Homebrew's Cellar owns the installed file. Replacing it from inside the app
+/// would make `brew`'s record disagree with the file it installed and take the
+/// upgrade away from the formula, so Homebrew must perform the update.
+fn managed_by_homebrew(exe: &Path) -> bool {
+    exe.components().any(|part| part.as_os_str() == "Cellar")
+}
+
+/// Whether the *running* binary lives in a Homebrew Cellar.
+fn running_from_homebrew() -> bool {
+    std::env::current_exe()
+        .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
+        .map(|exe| managed_by_homebrew(&exe))
+        .unwrap_or(false)
+}
+
+const HOMEBREW_UPDATE_HINT: &str =
+    "CodeLeveler is managed by Homebrew; update it with `brew upgrade leveler`.";
 
 /// Replace the process with the just-installed binary, or report why not.
 ///
@@ -28,6 +47,11 @@ pub(crate) async fn cmd_update(
     force: bool,
     version: Option<String>,
 ) -> anyhow::Result<ExitCode> {
+    // `--check` stays read-only and useful; only the install is refused.
+    if !check && running_from_homebrew() {
+        println!("{}", Line::warn(HOMEBREW_UPDATE_HINT));
+        return Ok(ExitCode::SUCCESS);
+    }
     let service = UpdateService::production()?;
     run_manual(&service, check, force, version.as_deref()).await
 }
@@ -88,6 +112,10 @@ pub(crate) async fn run_manual<S: ReleaseSource>(
 /// and a failed attempt is backstopped so restarting in a loop cannot hammer
 /// the API.
 pub(crate) async fn run_startup_update() {
+    if running_from_homebrew() {
+        // The formula owns this file; a self-replacement would contradict it.
+        return;
+    }
     let Ok(config) = leveler_app::GlobalConfig::load() else {
         return;
     };
@@ -295,6 +323,33 @@ mod tests {
         )
         .with_current(parse_version(current).unwrap())
         .with_triple(Some("aarch64-apple-darwin"))
+    }
+
+    #[test]
+    fn a_cellar_install_is_managed_by_homebrew() {
+        for path in [
+            "/opt/homebrew/Cellar/leveler/1.0.19/bin/leveler",
+            "/usr/local/Cellar/leveler/1.0.19/bin/leveler",
+            "/home/linuxbrew/.linuxbrew/Cellar/leveler/1.0.19/bin/leveler",
+        ] {
+            assert!(managed_by_homebrew(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_install_is_not_managed_by_homebrew() {
+        for path in [
+            "/Users/me/.local/bin/leveler",
+            "/Users/me/.cargo/bin/leveler",
+            "/tmp/MyCellar/leveler",
+        ] {
+            assert!(!managed_by_homebrew(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_homebrew_refusal_says_which_command_updates_it() {
+        assert!(HOMEBREW_UPDATE_HINT.contains("brew upgrade leveler"));
     }
 
     /// Exit-code contract: a successful no-op is 0; `--check` says 2 when an
