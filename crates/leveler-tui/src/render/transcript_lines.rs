@@ -354,7 +354,14 @@ pub fn item_render(
             sub_agent_lines(block, theme, wrap_width, &mut out, t, 0)
         }
         TranscriptItem::UserShell(shell) => {
-            out.extend(user_shell_lines(shell, theme, wrap_width, t, 0, false));
+            out.extend(user_shell_lines(
+                shell,
+                theme,
+                wrap_width,
+                t,
+                std::time::Duration::ZERO,
+                false,
+            ));
         }
         TranscriptItem::Plan(plan) => historical_plan_lines(plan, theme, wrap_width, &mut out, t),
         TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out, t),
@@ -1319,228 +1326,354 @@ fn push_prefixed(
     }
 }
 
-/// Rows of a finished local command kept visible before its result is folded.
+/// Rows of a local command kept visible before its result is folded.
 const USER_SHELL_PREVIEW_ROWS: usize = 6;
-/// Body indent: output belongs to the command row above it.
+/// Left status line, two cells on every row of one execution record.
+pub(crate) const USER_SHELL_RAIL: &str = "│ ";
+/// Body indent after the rail.
 const USER_SHELL_INDENT: &str = "  ";
+/// A running expansion is a controlled preview; finishing removes the cap.
+const USER_SHELL_RUNNING_EXPANDED_ROWS: usize = 2000;
+/// Bytes of raw output scanned for a live/collapsed preview.
+const USER_SHELL_PREVIEW_BYTES: usize = 16 * 1024;
+/// Rightmost cells of a running header that act as the clickable stop.
+pub(crate) const USER_SHELL_STOP_ZONE: usize = 10;
 
-/// User shell presentation adapter: one execution block → the shared
-/// disclosure language. Clearly marked as USER-initiated ("Run (user)"), so
-/// it can never read as an agent tool call.
+/// User shell execution record.
 ///
-/// The row is inline, not a drill-down: a local command is user-authored
-/// output, so its result lives in the conversation beside the command that
-/// produced it. Collapsed shows a bounded tail (plus the failure's own error
-/// line); expanded shows every retained row, wrapped, so nothing is cut off
-/// at the right edge.
+/// ```text
+/// │ ◆ Running (user) go test · 2s                    ✕ 停止
+/// │   $ go test
+/// │
+/// │   running tests...
+/// │   ok
+/// ```
+///
+/// The left rail spans the whole record and carries the execution status; the
+/// header names the execution subject (`(user)`), and the exact command follows
+/// on its own `$` line. Output keeps the terminal's line structure, with a
+/// subtle background difference between stdout and stderr.
 pub(crate) fn user_shell_lines(
     shell: &crate::transcript::UserShellBlock,
     theme: &Theme,
     wrap_width: usize,
     t: &crate::i18n::UiText,
-    now_elapsed_secs: u64,
+    now: std::time::Duration,
     focused: bool,
 ) -> Vec<Line<'static>> {
     use crate::transcript::UserShellStatus;
     let width = wrap_width.max(1);
     let mut out = Vec::new();
-    let label = format!("{} {}", t.user_shell_run_label, shell.command);
-    let lines: Vec<&str> = shell.output.lines().collect();
+    let status_color = shell_color(shell.status, theme);
+    let rail_style = Style::default().fg(status_color);
+    let rail = if focused { "→ " } else { USER_SHELL_RAIL };
 
-    if shell.status == UserShellStatus::Running {
-        let elapsed = (now_elapsed_secs as i64 - shell.started_elapsed_secs).max(0);
-        let suffix = if elapsed > 0 {
-            format!(" · {elapsed}s")
-        } else {
+    let elapsed = shell.status == UserShellStatus::Running;
+    let suffix = if elapsed {
+        let elapsed_ms = (now.as_millis() as i64 - shell.started_motion_ms).max(0);
+        let secs = (elapsed_ms / 1000) as u64;
+        if secs == 0 {
             String::new()
-        };
-        // The Command focus marker is the same `→` every focused command row
-        // wears; otherwise the live row keeps its own `◌`.
-        let opener = if focused { "→ " } else { "◌ " };
-        out.push(Line::from(vec![
-            Span::styled(
-                opener.to_string(),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(
-                crate::render::truncate_display(&label, width.saturating_sub(8)),
-                Style::default().fg(theme.text.primary),
-            ),
-            Span::styled(suffix, Style::default().fg(theme.text.muted)),
-        ]));
-        if shell.expanded {
-            push_shell_command_detail(&mut out, shell, &label, width, theme);
-            if shell.output_truncated {
-                push_shell_marker(&mut out, t.shell_truncated, theme, width);
-            }
-            push_shell_output(&mut out, &lines, width, theme);
         } else {
-            if shell.output_truncated {
-                push_shell_marker(&mut out, t.shell_truncated, theme, width);
-            }
-            push_shell_tail(&mut out, &lines, width, theme, t, true);
-        }
-        return out;
-    }
-
-    let failed = shell.status == UserShellStatus::Failed;
-    let label = match shell.status {
-        UserShellStatus::Cancelled => format!("{label} · {}", t.user_shell_cancelled),
-        UserShellStatus::Unknown => format!("{label} · {}", t.shell_status_unknown),
-        _ => label,
-    };
-    let presentation = crate::presentation::disclosure::DisclosurePresentation {
-        label: label.clone(),
-        failed: usize::from(failed),
-        failed_suffix: shell
-            .exit_code
-            .filter(|code| failed && *code != 0)
-            .map(|code| format!("exit {code}")),
-        needs_permission_suffix: None,
-        // A user shell is never a batch: it has no siblings to summarize.
-        ok_suffix: None,
-        expanded: shell.expanded,
-        // A user shell is a direct invocation, never a running stage header.
-        running: false,
-        // The result expands inline; there is no second surface to drill into.
-        drill_down: false,
-        duration_ms: shell.duration_ms,
-    };
-    let mut header = crate::presentation::disclosure::header_line(&presentation, theme, width);
-    // A user command's runtime is a measured fact even below the sub-100ms
-    // floor the shared header uses to keep agent clock noise off the row.
-    if let Some(ms) = shell.duration_ms.filter(|ms| *ms < 100) {
-        header.spans.push(Span::styled(
-            format!(
-                " · {}",
-                crate::presentation::disclosure::format_duration(ms)
-            ),
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-    out.push(header);
-
-    if shell.expanded {
-        push_shell_command_detail(&mut out, shell, &label, width, theme);
-        if shell.output_truncated {
-            push_shell_marker(&mut out, t.shell_truncated, theme, width);
-        }
-        push_shell_output(&mut out, &lines, width, theme);
-        return out;
-    }
-    if shell.output_truncated {
-        push_shell_marker(&mut out, t.shell_truncated, theme, width);
-    }
-    if failed {
-        let error = crate::activity_stream::shell_failure_line(&shell.output).or_else(|| {
-            lines
-                .iter()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| l.to_string())
-        });
-        if let Some(error) = error {
-            let room = width.saturating_sub(4).max(1);
-            out.push(Line::from(vec![
-                Span::styled(
-                    format!("{USER_SHELL_INDENT}└ "),
-                    Style::default().fg(theme.text.muted),
-                ),
-                Span::styled(
-                    crate::render::truncate_display(&error, room),
-                    Style::default().fg(theme.status.warning),
-                ),
-            ]));
+            format!(" · {secs}s")
         }
     } else {
-        push_shell_tail(&mut out, &lines, width, theme, t, false);
+        shell
+            .duration_ms
+            .map(|ms| {
+                format!(
+                    " · {}",
+                    crate::presentation::disclosure::format_duration(ms)
+                )
+            })
+            .unwrap_or_default()
+    };
+
+    let (glyph, title) = match shell.status {
+        UserShellStatus::Running => ("◆ ", t.user_shell_running_label),
+        UserShellStatus::Success => ("◆ ", t.user_shell_ran_label),
+        UserShellStatus::Failed => ("✗ ", t.user_shell_ran_label),
+        UserShellStatus::Cancelled => ("⊘ ", t.user_shell_cancelled_label),
+        UserShellStatus::Unknown => ("? ", t.user_shell_ran_label),
+    };
+    let command_line = shell.command.replace('\n', " ");
+    let mut header = vec![
+        Span::styled(rail.to_string(), rail_style),
+        Span::styled(glyph.to_string(), Style::default().fg(status_color)),
+        Span::styled(
+            format!("{title} "),
+            Style::default()
+                .fg(if shell.status == UserShellStatus::Running {
+                    theme.text.primary
+                } else {
+                    theme.text.secondary
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut facts = suffix.clone();
+    if shell.status == UserShellStatus::Failed
+        && let Some(code) = shell.exit_code
+        && code != 0
+    {
+        facts.push_str(&format!(
+            " · {}",
+            t.user_shell_exit_code.replace("{}", &code.to_string())
+        ));
+    }
+    if shell.status == UserShellStatus::Cancelled {
+        facts.push_str(&format!(" · {}", t.user_shell_cancelled));
+    }
+    if shell.status == UserShellStatus::Unknown {
+        facts.push_str(&format!(" · {}", t.shell_status_unknown));
+    }
+    let stop = (shell.status == UserShellStatus::Running).then_some(t.user_shell_stop);
+    let stop_w = stop
+        .map(|s| UnicodeWidthStr::width(format!(" · ✕ {s}").as_str()))
+        .unwrap_or(0);
+    let command_room = width.saturating_sub(
+        UnicodeWidthStr::width(rail)
+            + UnicodeWidthStr::width(glyph)
+            + UnicodeWidthStr::width(title)
+            + 1
+            + UnicodeWidthStr::width(facts.as_str())
+            + stop_w,
+    );
+    header.push(Span::styled(
+        crate::render::truncate_display(&command_line, command_room.max(1)),
+        Style::default().fg(theme.text.primary),
+    ));
+    header.push(Span::styled(facts, Style::default().fg(theme.text.muted)));
+    if let Some(stop) = stop {
+        let used: usize = header
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let label = format!(" · ✕ {stop}");
+        let pad = width.saturating_sub(used + UnicodeWidthStr::width(label.as_str()));
+        if pad > 0 {
+            header.push(Span::raw(" ".repeat(pad)));
+        }
+        header.push(Span::styled(
+            label,
+            Style::default().fg(theme.text.secondary),
+        ));
+    }
+    out.push(clip_spans(header, width));
+
+    // The exact command always has its own `$` line, wrapped, so the header
+    // never has to be the place the full command lives.
+    push_shell_command_rows(&mut out, shell, rail_style, theme, width);
+    if !shell.output.is_empty() {
+        out.push(Line::from(Span::styled(rail.to_string(), rail_style)));
+        push_shell_output_rows(&mut out, shell, rail_style, theme, t, width);
+    }
+    if shell.status == UserShellStatus::Failed {
+        // The failure summary stays visible even when the (folded) output is
+        // longer than the preview and the error sits outside it.
+        if !shell.expanded
+            && let Some(error) = crate::activity_stream::shell_failure_line(&shell.output)
+        {
+            push_shell_body(
+                &mut out,
+                rail,
+                rail_style,
+                &error,
+                Style::default().fg(theme.shell.error),
+                width,
+                theme,
+            );
+        }
+        if let Some(code) = shell.exit_code {
+            push_shell_body(
+                &mut out,
+                rail,
+                rail_style,
+                &format!("exit code {code}"),
+                Style::default()
+                    .fg(theme.shell.error)
+                    .add_modifier(Modifier::BOLD),
+                width,
+                theme,
+            );
+        }
     }
     out
 }
 
-/// The compact result tail under a collapsed command row: what just happened,
-/// with the folded row count named rather than silently dropped.
-fn push_shell_tail(
-    out: &mut Vec<Line<'static>>,
-    lines: &[&str],
-    width: usize,
-    theme: &Theme,
-    t: &crate::i18n::UiText,
-    live: bool,
-) {
-    let rows = if live {
-        crate::activity_stream::LIVE_TAIL_ROWS
-    } else {
-        USER_SHELL_PREVIEW_ROWS
-    };
-    let start = lines.len().saturating_sub(rows);
-    if start > 0 {
-        let marker = t.command_output_hidden.replace("{}", &start.to_string());
-        push_shell_marker(out, &marker, theme, width);
-    }
-    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
-    for raw in &lines[start..] {
-        let line = crate::render::sanitize_terminal_line(raw);
-        out.push(Line::from(Span::styled(
-            format!(
-                "{USER_SHELL_INDENT}{}",
-                crate::render::truncate_display(&line, room)
-            ),
-            Style::default().fg(theme.text.secondary),
-        )));
+fn shell_color(status: crate::transcript::UserShellStatus, theme: &Theme) -> ratatui::style::Color {
+    use crate::transcript::UserShellStatus;
+    match status {
+        UserShellStatus::Running => theme.shell.running,
+        UserShellStatus::Success => theme.shell.success,
+        UserShellStatus::Failed => theme.shell.error,
+        UserShellStatus::Cancelled => theme.shell.cancelled,
+        UserShellStatus::Unknown => theme.shell.cancelled,
     }
 }
 
-/// The full retained output, wrapped so a long row stays readable instead of
-/// being cut at the right edge.
-fn push_shell_output(out: &mut Vec<Line<'static>>, lines: &[&str], width: usize, theme: &Theme) {
-    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
-    for raw in lines {
-        let line = crate::render::sanitize_terminal_line(raw);
-        for row in wrap(&line, room) {
-            out.push(Line::from(Span::styled(
-                if row.is_empty() {
-                    String::new()
-                } else {
-                    format!("{USER_SHELL_INDENT}{row}")
-                },
-                Style::default().fg(theme.text.secondary),
-            )));
+fn push_shell_command_rows(
+    out: &mut Vec<Line<'static>>,
+    shell: &crate::transcript::UserShellBlock,
+    rail_style: Style,
+    theme: &Theme,
+    width: usize,
+) {
+    let room = width
+        .saturating_sub(UnicodeWidthStr::width(USER_SHELL_RAIL) + USER_SHELL_INDENT.len())
+        .max(1);
+    let command = if shell.command.trim().is_empty() {
+        "…".to_string()
+    } else {
+        shell.command.clone()
+    };
+    let mut first = true;
+    for logical in command.split('\n') {
+        for row in crate::shell_render::wrap_terminal_line(logical, room) {
+            let lead = if first { "$ " } else { "  " };
+            first = false;
+            out.push(Line::from(vec![
+                Span::styled(USER_SHELL_RAIL.to_string(), rail_style),
+                Span::styled(
+                    format!("{USER_SHELL_INDENT}{lead}{row}"),
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ]));
         }
     }
 }
 
-/// When the one-line header cannot carry the exact command (it was cut, or it
-/// contains a newline), the expanded body prints it in full.
-fn push_shell_command_detail(
+fn push_shell_output_rows(
     out: &mut Vec<Line<'static>>,
     shell: &crate::transcript::UserShellBlock,
-    label: &str,
-    width: usize,
+    rail_style: Style,
     theme: &Theme,
+    t: &crate::i18n::UiText,
+    width: usize,
 ) {
-    let header_room = width.saturating_sub(16);
-    if !shell.command.contains('\n') && UnicodeWidthStr::width(label) <= header_room {
-        return;
+    use crate::transcript::UserShellStatus;
+    let running = shell.status == UserShellStatus::Running;
+    let source = if shell.expanded {
+        shell.output.as_str()
+    } else {
+        crate::shell_render::tail_source(&shell.output, USER_SHELL_PREVIEW_BYTES)
+    };
+    let mut lines = crate::shell_render::render_output(source, &shell.output_marks);
+    let hidden_source = !shell.expanded && source.len() < shell.output.len();
+    let cap = if shell.expanded {
+        if running {
+            USER_SHELL_RUNNING_EXPANDED_ROWS
+        } else {
+            usize::MAX
+        }
+    } else {
+        USER_SHELL_PREVIEW_ROWS
+    };
+    let hidden_rows = lines.len().saturating_sub(cap);
+    if hidden_rows > 0 {
+        lines.drain(..hidden_rows);
     }
-    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
-    for row in wrap(&format!("$ {}", shell.command), room) {
-        out.push(Line::from(Span::styled(
-            format!("{USER_SHELL_INDENT}{row}"),
-            Style::default().fg(theme.text.secondary),
-        )));
+    if hidden_source || hidden_rows > 0 {
+        let marker = if running {
+            t.shell_running_expanded_hidden
+                .replace("{}", &lines.len().to_string())
+        } else {
+            t.shell_output_earlier_hidden.to_string()
+        };
+        push_shell_body(
+            out,
+            USER_SHELL_RAIL,
+            rail_style,
+            &marker,
+            Style::default().fg(theme.text.muted),
+            width,
+            theme,
+        );
+    }
+    if shell.output_truncated {
+        push_shell_body(
+            out,
+            USER_SHELL_RAIL,
+            rail_style,
+            t.shell_truncated,
+            Style::default().fg(theme.text.muted),
+            width,
+            theme,
+        );
+    }
+    let room = width
+        .saturating_sub(UnicodeWidthStr::width(USER_SHELL_RAIL) + USER_SHELL_INDENT.len())
+        .max(1);
+    for line in lines {
+        let text = crate::render::sanitize_terminal_line(&line.text);
+        let bg = if line.stderr {
+            theme.surface.elevated
+        } else {
+            theme.surface.input
+        };
+        let style = Style::default().fg(theme.text.secondary).bg(bg);
+        for row in crate::shell_render::wrap_terminal_line(&text, room) {
+            let line = if row.is_empty() {
+                Line::from(Span::styled(USER_SHELL_RAIL.to_string(), rail_style))
+            } else {
+                Line::from(vec![
+                    Span::styled(USER_SHELL_RAIL.to_string(), rail_style),
+                    Span::styled(format!("{USER_SHELL_INDENT}{row}"), style),
+                ])
+            };
+            out.push(line);
+        }
     }
 }
 
-fn push_shell_marker(out: &mut Vec<Line<'static>>, text: &str, theme: &Theme, width: usize) {
-    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
-    out.push(Line::from(Span::styled(
-        format!(
-            "{USER_SHELL_INDENT}{}",
-            crate::render::truncate_display(text, room)
-        ),
-        Style::default().fg(theme.text.muted),
-    )));
+#[allow(clippy::too_many_arguments)]
+fn push_shell_body(
+    out: &mut Vec<Line<'static>>,
+    rail: &str,
+    rail_style: Style,
+    text: &str,
+    style: Style,
+    width: usize,
+    _theme: &Theme,
+) {
+    let room = width
+        .saturating_sub(UnicodeWidthStr::width(rail) + USER_SHELL_INDENT.len())
+        .max(1);
+    for row in crate::shell_render::wrap_terminal_line(text, room) {
+        out.push(Line::from(vec![
+            Span::styled(rail.to_string(), rail_style),
+            Span::styled(format!("{USER_SHELL_INDENT}{row}"), style),
+        ]));
+    }
+}
+
+/// Cut a span list at `width` display cells so a wide header can never paint
+/// past the conversation's right edge.
+fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut used = 0usize;
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        let span_w = UnicodeWidthStr::width(span.content.as_ref());
+        if used + span_w <= width {
+            used += span_w;
+            out.push(span);
+            continue;
+        }
+        let mut cut = String::new();
+        for ch in span.content.chars() {
+            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + ch_w > width {
+                break;
+            }
+            used += ch_w;
+            cut.push(ch);
+        }
+        if !cut.is_empty() {
+            out.push(Span::styled(cut, span.style));
+        }
+        break;
+    }
+    Line::from(out)
 }
 
 #[cfg(test)]
@@ -1595,28 +1728,38 @@ mod tests {
             cwd: "/repo".into(),
             status,
             output: String::new(),
+            output_marks: Vec::new(),
             output_truncated: false,
             exit_code: None,
             duration_ms: Some(2_000),
-            started_elapsed_secs: 0,
+            started_motion_ms: 0,
             expanded: false,
+            expanded_pinned: false,
         };
-        let row: String =
-            user_shell_lines(&shell, &Theme::no_color(), 80, Locale::Zh.text(), 0, false)
-                .iter()
-                .map(line_text)
-                .collect();
+        let row: String = user_shell_lines(
+            &shell,
+            &Theme::no_color(),
+            80,
+            Locale::Zh.text(),
+            std::time::Duration::ZERO,
+            false,
+        )
+        .iter()
+        .map(line_text)
+        .collect();
         assert!(row.contains("状态未知"), "{row:?}");
         assert!(!row.contains('✗') && !row.contains("已取消"), "{row:?}");
     }
 
-    /// A user shell is an inline execution, not a drill-down surface: its row
-    /// carries the same `▸/▾` fold marker every other conversation block uses.
+    /// A user shell is an inline execution record: a status line, the
+    /// execution subject `(user)`, and the exact command on its own `$` row.
     #[test]
-    fn a_user_shell_row_advertises_inline_expand() {
+    fn a_user_shell_record_names_its_subject_and_command() {
         let shell = shell_block(UserShellStatus::Success, "ok", false);
         let rows = shell_rows(&shell, 80);
-        assert!(rows[0].contains('▸'), "{rows:?}");
+        assert!(rows[0].contains('│'), "left status rail: {rows:?}");
+        assert!(rows[0].contains("Ran (user)"), "{rows:?}");
+        assert!(rows[1].contains("$ git status"), "{rows:?}");
         assert!(!rows[0].contains('↗'), "{rows:?}");
     }
 
@@ -1658,7 +1801,7 @@ mod tests {
             false,
         );
         shell.duration_ms = None;
-        let rows = shell_rows_at(&shell, 80, 3);
+        let rows = shell_rows_at(&shell, 80, std::time::Duration::from_secs(3));
         let text = rows.join("\n");
         assert!(text.contains("running 128 tests"), "{text}");
         assert!(text.contains("3s"), "live elapsed is shown: {text}");
@@ -1673,7 +1816,10 @@ mod tests {
         let rows = shell_rows(&shell, 80);
         let text = rows.join("\n");
         assert!(text.contains("line-20"), "tail stays visible: {text}");
-        assert!(text.contains("未显示"), "the folded rows are named: {text}");
+        assert!(
+            text.contains("更早的输出已折叠"),
+            "the folded rows are named: {text}"
+        );
     }
 
     /// Expanded is the full retained record: every line, and long lines wrap
@@ -1691,8 +1837,13 @@ mod tests {
         for n in 1..=30 {
             assert!(text.contains(&format!("row-{n:02}")), "missing row-{n:02}");
         }
-        // Rows carry their body indent; the content itself must survive whole.
-        let joined: String = rows.join("").replace(' ', "");
+        // Rows carry the status rail and body indent; the content itself must
+        // survive whole across the wraps.
+        let joined: String = rows
+            .iter()
+            .map(|row| row.trim_start_matches('│').trim_start())
+            .collect::<String>()
+            .replace(' ', "");
         assert!(
             joined.contains(&long),
             "the long line is wrapped, not truncated: {rows:?}"
@@ -1716,7 +1867,7 @@ mod tests {
         shell.exit_code = Some(101);
         let rows = shell_rows(&shell, 80);
         let text = rows.join("\n");
-        assert!(text.contains("exit 101"), "{text}");
+        assert!(text.contains("exit code 101"), "{text}");
         assert!(text.contains("assertion failed"), "{text}");
     }
 
@@ -1731,7 +1882,11 @@ mod tests {
         let mut shell = shell_block(UserShellStatus::Success, "ok\n", true);
         shell.command = command.clone();
         let rows = shell_rows(&shell, 48);
-        let joined: String = rows.join("").replace(' ', "");
+        let joined: String = rows
+            .iter()
+            .map(|row| row.trim_start_matches('│').trim_start())
+            .collect::<String>()
+            .replace(' ', "");
         assert!(
             joined.contains(&command.replace(' ', "")),
             "the exact command is not reachable: {rows:?}"
@@ -1744,7 +1899,8 @@ mod tests {
     fn a_user_shell_with_no_output_is_only_its_header() {
         let shell = shell_block(UserShellStatus::Success, "", false);
         let rows = shell_rows(&shell, 80);
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "status row + `$ command`: {rows:?}");
+        assert!(rows[1].contains("$ git status"), "{rows:?}");
     }
 
     fn shell_block(
@@ -1758,29 +1914,31 @@ mod tests {
             cwd: "/repo".into(),
             status,
             output: output.into(),
+            output_marks: Vec::new(),
             output_truncated: false,
             exit_code: Some(0),
             duration_ms: Some(200),
-            started_elapsed_secs: 0,
+            started_motion_ms: 0,
             expanded,
+            expanded_pinned: false,
         }
     }
 
     fn shell_rows(shell: &crate::transcript::UserShellBlock, width: usize) -> Vec<String> {
-        shell_rows_at(shell, width, 0)
+        shell_rows_at(shell, width, std::time::Duration::ZERO)
     }
 
     fn shell_rows_at(
         shell: &crate::transcript::UserShellBlock,
         width: usize,
-        now_elapsed_secs: u64,
+        now: std::time::Duration,
     ) -> Vec<String> {
         user_shell_lines(
             shell,
             &Theme::no_color(),
             width,
             Locale::Zh.text(),
-            now_elapsed_secs,
+            now,
             false,
         )
         .iter()

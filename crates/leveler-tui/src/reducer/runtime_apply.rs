@@ -831,22 +831,24 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 execution_id.clone(),
                 command,
                 cwd,
-                state.elapsed_secs as i64,
+                state.motion_clock.as_millis() as i64,
             );
             // The block is in the conversation now; its output and terminal
             // event update the same row in place.
         }
         RuntimeEvent::UserShellOutput {
             execution_id,
+            stream,
             chunk,
-            ..
         } => {
             // Sanitize BEFORE it enters any buffer: shell output is
-            // untrusted terminal text (ANSI/OSC/control sequences).
-            let clean = leveler_core::sanitize_terminal_output(&chunk);
+            // untrusted terminal text (ANSI/OSC/control sequences). Carriage
+            // returns are preserved (through a sentinel) so the renderer can
+            // apply progress overwrites instead of showing one long line.
+            let clean = crate::shell_render::sanitize_shell_output(&chunk);
             state
                 .transcript
-                .append_user_shell_output(&execution_id, &clean);
+                .append_user_shell_output(&execution_id, &clean, stream == "stderr");
         }
         RuntimeEvent::UserShellExited {
             execution_id,
@@ -1676,6 +1678,13 @@ fn apply_session_with(
     // token state intact.
     let switching = state.session_id != session.id;
     apply_meta(state, &session);
+    if switching {
+        // Input mode and candidate requests are session-scoped: a recall or
+        // scan from the previous session must not land in the new draft.
+        state.input_mode = crate::shell_mode::InputMode::Normal;
+        state.history_mode = crate::shell_mode::InputMode::Normal;
+        state.completion.reset_on_edit();
+    }
     // Snapshot is runtime truth. A pending Shift+Tab from the previous
     // connection must not keep driving the cycle, and a next-step ghost from
     // the transcript this snapshot is about to replace no longer applies.
@@ -1896,7 +1905,7 @@ fn apply_session_with(
         // Back-date the start (possibly below zero) so the live runtime
         // keeps counting from the runtime's elapsed, not from zero at
         // reconnect.
-        let started = state.elapsed_secs as i64 - shell.elapsed_secs as i64;
+        let started = state.motion_clock.as_millis() as i64 - shell.elapsed_secs as i64 * 1000;
         state.transcript.push_user_shell_started(
             shell.id.clone(),
             shell.command.clone(),
@@ -1904,8 +1913,13 @@ fn apply_session_with(
             started,
         );
         if !shell.output_tail.is_empty() {
-            let clean = leveler_core::sanitize_terminal_output(&shell.output_tail);
-            state.transcript.append_user_shell_output(&shell.id, &clean);
+            let clean = crate::shell_render::sanitize_shell_output(&shell.output_tail);
+            state
+                .transcript
+                .append_user_shell_output(&shell.id, &clean, false);
+        }
+        if shell.output_truncated {
+            state.transcript.mark_user_shell_output_truncated(&shell.id);
         }
         if !running {
             state.transcript.complete_user_shell(

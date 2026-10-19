@@ -229,6 +229,27 @@ impl Composer {
         &self.buffer[..byte_of_grapheme(&self.buffer, self.cursor)]
     }
 
+    /// Cursor position as a byte offset into [`Self::text`]. Completion
+    /// providers index their replacement ranges in bytes.
+    pub fn cursor_byte(&self) -> usize {
+        byte_of_grapheme(&self.buffer, self.cursor)
+    }
+
+    /// Replace a byte range and place the cursor after the replacement.
+    /// Completion is the only caller; it never edits a paste/file chip.
+    pub fn replace_byte_range(&mut self, start: usize, end: usize, replacement: &str) {
+        if start > end
+            || end > self.buffer.len()
+            || !self.buffer.is_char_boundary(start)
+            || !self.buffer.is_char_boundary(end)
+        {
+            return;
+        }
+        self.begin_edit();
+        self.buffer.replace_range(start..end, replacement);
+        self.cursor = grapheme_index_of(&self.buffer, start + replacement.len());
+    }
+
     /// Logical lines (split on `\n`), for rendering.
     pub fn lines(&self) -> Vec<&str> {
         self.buffer.split('\n').collect()
@@ -744,6 +765,18 @@ impl Composer {
     /// Take the buffer for submission: clears it and records it in history
     /// (skipping empty and consecutive-duplicate entries, ).
     pub fn take(&mut self) -> String {
+        self.take_recording(None)
+    }
+
+    /// Take a local shell command. The history entry keeps the `! ` mode
+    /// marker so recalling it restores Shell Mode, while the returned command
+    /// never contains the marker.
+    pub fn take_shell(&mut self) -> String {
+        let text = self.canonical_text();
+        self.take_recording(Some(&format!("! {}", text.trim())))
+    }
+
+    fn take_recording(&mut self, history_entry: Option<&str>) -> String {
         let text = self.canonical_text();
         self.clear_edit_history();
         self.buffer.clear();
@@ -752,11 +785,28 @@ impl Composer {
         self.cursor = 0;
         self.history_index = None;
         self.stash = None;
-        let trimmed = text.trim();
-        if !trimmed.is_empty() && self.history.last().map(|h| h.as_str()) != Some(text.as_str()) {
-            self.history.push(text.clone());
+        let entry = history_entry
+            .map(str::to_string)
+            .unwrap_or_else(|| text.clone());
+        let trimmed = entry.trim();
+        if !trimmed.is_empty() && self.history.last().map(|h| h.as_str()) != Some(entry.as_str()) {
+            self.history.push(entry);
         }
         text
+    }
+
+    /// While browsing history, strip a leading mode marker from the restored
+    /// entry without detaching from the history stack. Returns whether it did.
+    pub fn strip_browsed_prefix(&mut self, prefix: &str) -> bool {
+        if self.history_index.is_none() {
+            return false;
+        }
+        let Some(rest) = self.buffer.strip_prefix(prefix) else {
+            return false;
+        };
+        self.buffer = rest.to_string();
+        self.cursor = grapheme_count(&self.buffer);
+        true
     }
 
     fn history_prev(&mut self) {

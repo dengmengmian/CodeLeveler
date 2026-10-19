@@ -515,7 +515,7 @@ async fn large_output_stays_bounded_with_a_truncation_flag() {
     h.client
         .send(run_shell(
             &h,
-            "i=0; while [ $i -lt 2000 ]; do printf '%0100d\\n' $i; i=$((i+1)); done",
+            "i=0; while [ $i -lt 12000 ]; do printf '%0100d\\n' $i; i=$((i+1)); done",
         ))
         .await
         .unwrap();
@@ -527,13 +527,13 @@ async fn large_output_stays_bounded_with_a_truncation_flag() {
     let snap = h.client.snapshot(&h.session_id).await.unwrap();
     let shell = snap.user_shells.last().expect("in history");
     assert!(
-        shell.output_tail.len() <= 64 * 1024,
+        shell.output_tail.len() <= 1024 * 1024,
         "tail bounded: {} bytes",
         shell.output_tail.len()
     );
     assert!(shell.output_truncated, "truncation is flagged, not silent");
     assert!(
-        shell.output_tail.contains("1999"),
+        shell.output_tail.contains("11999"),
         "the tail keeps the END of the output"
     );
 }

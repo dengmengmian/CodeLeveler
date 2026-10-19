@@ -97,6 +97,9 @@ pub enum Action {
     Resize(u16, u16),
     /// Project file paths loaded at the terminal edge for `@file` completion.
     FileCandidatesLoaded(Vec<String>),
+    /// Deterministic shell completion finished. The reducer drops a result
+    /// whose request no longer matches the live draft.
+    ShellCompletionsLoaded(crate::shell_mode::CompletionResult),
     /// An asynchronous edge effect completed.
     EffectCompleted(EffectCompletion),
     /// The embedded Web UI server finished starting: `Ok(url)` with the
@@ -157,6 +160,10 @@ pub enum Effect {
     },
     /// Load repository files without blocking the pure reducer.
     LoadFileCandidates { repository: String },
+    /// Scan the session cwd for deterministic shell candidates off-thread.
+    ShellComplete {
+        request: crate::shell_mode::CompletionRequest,
+    },
     /// Start the embedded browser Web UI server (`/web`). The event loop runs
     /// the injected [`WebLauncher`] and folds its result back as
     /// [`Action::WebLaunched`].

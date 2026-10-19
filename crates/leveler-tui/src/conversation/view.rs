@@ -39,6 +39,10 @@ pub struct ConvKey {
     /// The user shell row holding the same focus. A `!command` is stoppable
     /// from the keyboard too, and its live row wears the same `→` marker.
     pub(crate) focused_user_shell: Option<leveler_core::UserShellId>,
+    /// Whole elapsed seconds of the live user shell. A running record's
+    /// header prints the runtime, so a new second is a new frame; the
+    /// higher-frequency rail/spinner motion is a paint-time overlay only.
+    pub(crate) shell_elapsed_secs: u64,
     /// Whether an open clarification card owns the live question. Part of the
     /// key because it paints a transcript ROW (§35): the running call's row
     /// stops restating the question while the card is asking it.

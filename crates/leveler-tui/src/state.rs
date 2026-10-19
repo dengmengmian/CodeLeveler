@@ -452,6 +452,15 @@ pub struct AppState {
     pub conv: crate::conversation::ConversationView,
     /// Which region owns arrow keys (Tab toggles).
     pub workbench_focus: WorkbenchFocus,
+    /// Normal chat/goal input, or a local shell command (`!` mode marker).
+    pub input_mode: crate::shell_mode::InputMode,
+    /// The mode the live draft had before history browsing began, restored
+    /// when the browse returns to that draft.
+    pub history_mode: crate::shell_mode::InputMode,
+    /// Deterministic shell completion: open menu, pending request and cache.
+    pub completion: crate::shell_mode::CompletionMenu,
+    /// Last-painted clickable stop control in the shell live-activity row.
+    pub shell_live_stop_rect: Option<(u16, u16, u16, u16)>,
     /// Last painted Input/composer rect for click-to-focus.
     pub input_rect: Option<(u16, u16, u16, u16)>,
     /// Which first-class activity the Activity Detail screen is showing.
@@ -724,6 +733,10 @@ impl AppState {
             screen_scroll: 0,
             conv: crate::conversation::ConversationView::default(),
             workbench_focus: WorkbenchFocus::Input,
+            input_mode: crate::shell_mode::InputMode::Normal,
+            history_mode: crate::shell_mode::InputMode::Normal,
+            completion: crate::shell_mode::CompletionMenu::default(),
+            shell_live_stop_rect: None,
             input_rect: None,
             activity_open: None,
             activity_selected: None,
@@ -862,6 +875,20 @@ impl AppState {
 
     pub fn is_busy(&self) -> bool {
         self.status == RuntimeStatus::Busy
+    }
+
+    /// The one live user shell execution, if any. The runtime admits at most
+    /// one per session, and this is the single source of truth shared by the
+    /// inline record, the live-activity row, Ctrl+C and the stop controls.
+    pub fn running_user_shell(&self) -> Option<&crate::transcript::UserShellBlock> {
+        self.transcript.items().iter().find_map(|item| match item {
+            crate::transcript::TranscriptItem::UserShell(shell)
+                if shell.status == crate::transcript::UserShellStatus::Running =>
+            {
+                Some(shell)
+            }
+            _ => None,
+        })
     }
 
     /// Whether this client may offer a stop for a running command at all.

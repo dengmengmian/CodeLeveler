@@ -27,6 +27,9 @@ pub(super) fn touch_slash_filter(state: &mut AppState) {
     }
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
+    // Any edit invalidates the fetched candidate set and its replacement
+    // ranges. A response that lands later is dropped by request identity.
+    state.completion.reset_on_edit();
     crate::suggestion::dismiss(state);
     if crate::screen::skill_mention_query(state).is_some() {
         refresh_skill_catalog(state);
@@ -40,17 +43,11 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     if !state.composer.is_empty() {
         crate::suggestion::dismiss(state);
     }
-    // User shell escape: the RAW composer's first character is `!` — no
-    // leading-whitespace trim, so " !cargo test" stays a normal message and
-    // ordinary prose can never execute. Never reaches the model.
-    if state.composer.text().starts_with('!') {
-        // Command content comes from the canonical form so a pasted script
-        // runs as pasted, not as its `[Pasted: N lines]` chip (R004 F1).
-        let canonical = state.composer.canonical_text();
-        let cmd = canonical
-            .strip_prefix('!')
-            .unwrap_or(&canonical)
-            .to_string();
+    // Shell Mode is explicit input state; the `!` marker never enters the
+    // buffer, so the canonical text is the command itself. An empty shell
+    // submission gets its own hint instead of the chat no-op.
+    if state.input_mode == crate::shell_mode::InputMode::Shell {
+        let cmd = state.composer.canonical_text();
         return submit_user_shell(state, cmd);
     }
     let text = state.composer.text().trim().to_string();
@@ -459,7 +456,8 @@ pub(super) fn complete_file_mention(state: &mut AppState) {
 }
 
 pub(super) fn request_file_candidates(state: &mut AppState) -> Vec<Effect> {
-    if crate::screen::file_mention_query(state).is_some()
+    if state.input_mode == crate::shell_mode::InputMode::Normal
+        && crate::screen::file_mention_query(state).is_some()
         && !state.file_index_requested
         && let Some(repository) = state.repository.clone()
     {
@@ -1220,7 +1218,7 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
 /// timeline when the runtime reports it started.
 fn submit_user_shell(state: &mut AppState, cmd: String) -> Vec<Effect> {
     if cmd.trim().is_empty() {
-        // Bare `!`: keep the composer content so the user can continue
+        // Empty command: keep the mode and the draft so the user can continue
         // typing; just say what is missing.
         state.notification = Some(crate::state::Notification {
             level: leveler_client_protocol::NotificationLevel::Info,
@@ -1236,7 +1234,19 @@ fn submit_user_shell(state: &mut AppState, cmd: String) -> Vec<Effect> {
         });
         return Vec::new();
     }
-    state.composer.take();
+    if state.running_user_shell().is_some() {
+        // The runtime admits one foreground user shell per session. Refuse
+        // locally rather than lose the typed command to a rejected RPC.
+        state.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Warning,
+            message: state.t().user_shell_running_hint.to_string(),
+        });
+        return Vec::new();
+    }
+    // History keeps the mode marker (`! command`), so recalling it restores
+    // Shell Mode; the executed command is exactly what the user typed.
+    state.composer.take_shell();
+    super::shell::reset_after_submit(state);
     // The command and its result are transcript rows now. A reader who had
     // scrolled into history must see the row it just created and its output.
     crate::conversation::interaction::jump_to_live_edge(state);

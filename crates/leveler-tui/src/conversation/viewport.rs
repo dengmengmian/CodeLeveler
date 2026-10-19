@@ -60,6 +60,58 @@ fn paint_live_reasoning_rail(
     }
 }
 
+/// Animate the left rail and status glyph of every running local command in
+/// this window. Style-only over the already-built lines: the record's height,
+/// wrapping and hit rows never change, and the animation is defined by elapsed
+/// time so a burst of output cannot speed it up.
+fn paint_live_shell_rail(
+    state: &AppState,
+    item_spans: &[(usize, usize)],
+    scroll: usize,
+    lines: &mut [Line<'static>],
+) {
+    if !state.live_animation {
+        return;
+    }
+    let level =
+        crate::motion::breath_level(state.motion_clock, crate::shell_render::SHELL_BREATH_PERIOD);
+    let color = state.theme.shell.breathe(level);
+    let spinner = crate::status_line::spinner_frame((state.motion_clock.as_millis() / 120) as u64);
+    let window_end = scroll + lines.len();
+    for (index, item) in state.transcript.items().iter().enumerate() {
+        let TranscriptItem::UserShell(shell) = item else {
+            continue;
+        };
+        if shell.status != crate::transcript::UserShellStatus::Running {
+            continue;
+        }
+        let Some(&(start, end)) = item_spans.get(index) else {
+            continue;
+        };
+        if end <= scroll || start >= window_end {
+            continue;
+        }
+        for row in start..end.min(scroll + lines.len()) {
+            let Some(offset) = row.checked_sub(scroll) else {
+                continue;
+            };
+            let Some(line) = lines.get_mut(offset) else {
+                continue;
+            };
+            if let Some(rail) = line.spans.first_mut() {
+                rail.style = rail.style.fg(color);
+            }
+            // The header's second span is the status glyph.
+            if row == start
+                && let Some(glyph) = line.spans.get_mut(1)
+            {
+                glyph.content = format!("{spinner} ").into();
+                glyph.style = glyph.style.fg(color);
+            }
+        }
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = &state.theme;
     let content = crate::conversation::geometry::content_rect(area);
@@ -110,6 +162,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // is invalidated, and the highlight is style-only: line count, wrap and the
     // scroll anchor are exactly what the projection produced.
     paint_live_reasoning_rail(state, &all, &item_spans, scroll, &mut lines);
+    paint_live_shell_rail(state, &item_spans, scroll, &mut lines);
 
     // Selection is an explicit user act and owns the ink on the rows it
     // covers, so it is applied after the decorative rail highlight.

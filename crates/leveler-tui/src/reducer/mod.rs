@@ -20,6 +20,7 @@ mod paste_file;
 mod paste_image;
 mod runtime_apply;
 mod screen_nav;
+mod shell;
 mod submit;
 
 use overlay_keys::{handle_overlay_key, open_model_picker};
@@ -253,6 +254,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.file_candidates = files;
             Vec::new()
         }
+        Action::ShellCompletionsLoaded(result) => shell::apply_result(state, result),
         Action::CleanScanned(result) => {
             match result {
                 Ok(plan) => state.clean.plan_ready(plan),
@@ -374,11 +376,9 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 // which is why a refusal falls through to the composer below.
                 Vec::new()
             } else {
-                if !insert_file_references(state, &text) {
-                    state.composer.insert_paste(&text);
-                }
-                touch_slash_filter(state);
-                request_file_candidates(state)
+                let mut effects = shell::insert_text(state, &text, true);
+                effects.extend(request_file_candidates(state));
+                effects
             }
         }
         Action::TextInput(text) => {
@@ -407,17 +407,9 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 // dead even though the text landed.
                 state.workbench_focus = WorkbenchFocus::Input;
                 // PTY paste without bracketed-paste arrives as a key burst;
-                // still fold large multi-line blobs like Action::Paste.
-                // The terminal may deliver a dropped path as a burst of
-                // ordinary key text instead of a bracketed paste.
-                if !insert_file_references(state, &text) {
-                    if text.contains('\n') {
-                        state.composer.insert_paste(&text);
-                    } else {
-                        state.composer.insert_str(&text);
-                    }
-                }
-                touch_slash_filter(state);
+                // still fold large multi-line blobs like Action::Paste. The
+                // shared insertion path also recognises a leading `!`.
+                shell::insert_text(state, &text, false);
             }
             request_file_candidates(state)
         }
@@ -753,6 +745,62 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
         return Vec::new();
     }
+
+    // The completion menu owns the pointer over itself: wheel moves the
+    // selection, movement highlights, a click accepts (never executes).
+    if state.completion.open {
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.completion.move_selection(-1);
+                return Vec::new();
+            }
+            MouseEventKind::ScrollDown => {
+                state.completion.move_selection(1);
+                return Vec::new();
+            }
+            MouseEventKind::Moved => {
+                if let Some(rect) = state.completion.rect
+                    && rect.contains(point.into())
+                {
+                    let row = mouse.row.saturating_sub(rect.y) as usize;
+                    let index = state.completion.visible_start + row;
+                    if index < state.completion.items.len() {
+                        state.completion.selected = index;
+                        state.completion.hovered = Some(index);
+                    }
+                }
+                return Vec::new();
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(rect) = state.completion.rect
+                    && rect.contains(point.into())
+                {
+                    let row = mouse.row.saturating_sub(rect.y) as usize;
+                    let index = state.completion.visible_start + row;
+                    if index < state.completion.items.len() {
+                        state.completion.selected = index;
+                        return shell::accept_selected(state);
+                    }
+                    return Vec::new();
+                }
+                state.completion.close();
+            }
+            _ => {}
+        }
+    }
+
+    // Clickable stop on the fixed live-activity row.
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && point_in_rect(mouse.column, mouse.row, state.shell_live_stop_rect)
+        && let Some(shell) = state.running_user_shell()
+    {
+        let execution_id = shell.id.clone();
+        return vec![Effect::Send(ClientCommand::CancelUserShell {
+            session_id: state.session_id.clone(),
+            execution_id,
+        })];
+    }
     if matches!(state.active_screen, Screen::Activity | Screen::ActivityList)
         && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && let Some((_, _, task_id)) =
@@ -1031,8 +1079,33 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                         return Vec::new();
                     }
                     Hit::Disclosure { item } => {
-                        // Every disclosure — tool group or user shell — folds
-                        // inline. One hit map, one interaction.
+                        // A running user shell's header reserves its rightmost
+                        // cells for the clickable stop label. This is a stop,
+                        // not a fold; the rest of the header still toggles.
+                        let running = match state.transcript.items().get(item) {
+                            Some(crate::transcript::TranscriptItem::UserShell(shell))
+                                if shell.status == crate::transcript::UserShellStatus::Running =>
+                            {
+                                Some(shell.id.clone())
+                            }
+                            _ => None,
+                        };
+                        let on_stop = state.conv.rect.is_some_and(|(x, _, w, _)| {
+                            mouse.column
+                                >= x.saturating_add(
+                                    w.saturating_sub(crate::render::USER_SHELL_STOP_ZONE as u16),
+                                )
+                        });
+                        if let Some(execution_id) = running.filter(|_| on_stop) {
+                            interaction::clear_selection_drag(state);
+                            state.conv.selection.clear();
+                            return vec![Effect::Send(ClientCommand::CancelUserShell {
+                                session_id: state.session_id.clone(),
+                                execution_id,
+                            })];
+                        }
+                        // Every other disclosure — tool group or user shell —
+                        // folds inline. One hit map, one interaction.
                         interaction::toggle_fold(state, item);
                         state.conv.plain.clear();
                         interaction::clear_selection_drag(state);
@@ -1239,6 +1312,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         && !(conversation_scroll_reaches_through(state)
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
     {
+        // A modal owns the keys and the composer slot; a candidate menu
+        // underneath it would be stale the moment the modal closes.
+        state.completion.reset_on_edit();
         return handle_overlay_key(state, key);
     }
 
@@ -1350,6 +1426,13 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
     }
 
+    // An open completion menu owns its keys before the global focus/permission
+    // bindings: Tab accepts (never completes the permission cycle), Enter
+    // accepts (never sends the command), Shift+Tab steps back one row.
+    if let Some(effects) = shell::handle_menu_key(state, key) {
+        return effects;
+    }
+
     // Shift+Tab cycles the permission profile from anywhere — the one binding
     // every terminal coding agent shares, so muscle memory carries over.
     // Some terminals report it as Tab+SHIFT rather than BackTab. Not on the
@@ -1394,6 +1477,40 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         state.slash_selected = 0;
     }
 
+    // Shell Mode's mode marker is a mode, not text: `!` on an empty Normal
+    // composer enters it, and Esc/Backspace on an empty Shell composer leaves
+    // it. Both are checked before the ordinary edit/busy arms.
+    if !btw && state.active_screen == Screen::Conversation && state.overlay.is_none() {
+        // Typing claims Input focus, so `!` does the same on any region.
+        if state.input_mode == crate::shell_mode::InputMode::Normal
+            && state.composer.is_empty()
+            && !ctrl
+            && !alt
+            && key.code == KeyCode::Char('!')
+        {
+            state.workbench_focus = WorkbenchFocus::Input;
+            shell::enter(state);
+            return Vec::new();
+        }
+        // Leaving the mode is an editing action: it belongs to the composer,
+        // not to a focused list where Esc/Backspace mean something else.
+        if state.workbench_focus == WorkbenchFocus::Input
+            && state.input_mode == crate::shell_mode::InputMode::Shell
+            && state.composer.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Backspace
+                    | KeyCode::Char('\u{8}')
+                    | KeyCode::Char('\u{7f}')
+            )
+        {
+            shell::exit(state);
+            state.notification = None;
+            return Vec::new();
+        }
+    }
+
     match key.code {
         // Side thread: its own conversation scrolls with the shared scroll keys;
         // an empty composer means the user is reading, not editing.
@@ -1429,6 +1546,8 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Esc if state.workbench_focus == WorkbenchFocus::Pending => {
             state.workbench_focus = WorkbenchFocus::Input;
         }
+        // Multi-line input: Ctrl+J (below) and Alt/Opt+Enter. Shell commands
+        // may span lines; no new global Enter binding is introduced.
         KeyCode::Enter if ctrl || alt => {
             state.composer.newline();
             touch_slash_filter(state);
@@ -1543,6 +1662,17 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // footer advertises did nothing in Terminal.app, iTerm or tmux.
         KeyCode::Char('?') | KeyCode::Char('/') | KeyCode::Char('7') if ctrl => {
             return toggle_screen(state, Screen::Help);
+        }
+        // Shell Mode Tab is deterministic completion, only while the composer
+        // owns the input and the text is non-empty. With the menu open, Tab
+        // was consumed above (accept). Shift+Tab still cycles permission.
+        KeyCode::Tab
+            if state.input_mode == crate::shell_mode::InputMode::Shell
+                && state.workbench_focus == WorkbenchFocus::Input
+                && !btw
+                && !state.composer.is_empty() =>
+        {
+            return shell::request_tab(state, true);
         }
         KeyCode::Tab if file_popup_len > 0 => complete_file_mention(state),
         KeyCode::Tab if skill_popup_len > 0 => complete_skill_mention(state),
@@ -1696,11 +1826,21 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         // Input focus: ↑/↓ = history only (never steal for conversation scroll).
         KeyCode::Up if popup_len == 0 => {
+            let was_browsing = state.composer.is_browsing_history();
+            if !was_browsing {
+                state.history_mode = state.input_mode;
+            }
             state.composer.up();
+            shell::after_history_move(state, was_browsing);
             dismiss_suggestion_on_history_browse(state);
         }
         KeyCode::Down if popup_len == 0 => {
+            let was_browsing = state.composer.is_browsing_history();
+            if !was_browsing {
+                state.history_mode = state.input_mode;
+            }
             state.composer.down();
+            shell::after_history_move(state, was_browsing);
             dismiss_suggestion_on_history_browse(state);
         }
         KeyCode::Char('a') if !ctrl && state.composer.is_empty() && !btw => {
@@ -2213,6 +2353,33 @@ fn cycle_permission_profile(state: &mut AppState) -> Vec<Effect> {
 }
 
 fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
+    // Ctrl+C owns cancellation/clear/quit; a visible candidate menu must not
+    // survive the key that clears the draft under it.
+    state.completion.reset_on_edit();
+    // A foreground local command is this client's own work. Stop exactly that
+    // execution; never the agent, the side thread, or the application. A
+    // second press while it is still stopping re-sends the same id and must
+    // not fall through to the quit prompt.
+    if !state.is_busy()
+        && let Some(shell) = state.running_user_shell()
+    {
+        let execution_id = shell.id.clone();
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: state.t().user_shell_cancel_requested.to_string(),
+        });
+        return vec![Effect::Send(ClientCommand::CancelUserShell {
+            session_id: state.session_id.clone(),
+            execution_id,
+        })];
+    }
+    // An empty Shell composer: Ctrl+C leaves the mode before it can arm quit.
+    if state.input_mode == crate::shell_mode::InputMode::Shell && state.composer.is_empty() {
+        shell::exit(state);
+        state.disarm_ctrlc();
+        state.notification = None;
+        return Vec::new();
+    }
     if state.is_busy() {
         // Third press: the runtime is still stopping the turn, so exit the
         // client rather than trap the user in cancel-only key handling.
@@ -2602,6 +2769,10 @@ mod disclosure_tests {
             .unwrap();
         let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
         let (line, item) = *hits.iter().find(|(_, i)| *i == shell_idx).unwrap();
+        let before = match &s.transcript.items()[item] {
+            TranscriptItem::UserShell(shell) => shell.expanded,
+            _ => panic!("user shell item expected"),
+        };
         let row = screen_row_of(&s, line);
         click(&mut s, 3, row);
         assert_eq!(
@@ -2612,13 +2783,15 @@ mod disclosure_tests {
         let TranscriptItem::UserShell(shell) = &s.transcript.items()[item] else {
             panic!("user shell item expected");
         };
-        assert!(shell.expanded, "the click opened THAT execution");
+        assert_eq!(shell.expanded, !before, "the click toggled THAT execution");
+        assert!(shell.expanded_pinned, "a user click pins the fold");
+        let opened = shell.expanded;
         assert!(
             expanded_flags(&s).iter().all(|(_, e)| !e),
             "no tool group was toggled by the shell click"
         );
 
-        // The same row now folds it back.
+        // The same row now flips the fold back.
         let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
         let (line, _) = *hits.iter().find(|(_, i)| *i == item).unwrap();
         let row = screen_row_of(&s, line);
@@ -2626,7 +2799,47 @@ mod disclosure_tests {
         let TranscriptItem::UserShell(shell) = &s.transcript.items()[item] else {
             panic!("user shell item expected");
         };
-        assert!(!shell.expanded, "the second click folded it again");
+        assert_eq!(shell.expanded, !opened, "the second click toggled the fold");
+    }
+
+    #[test]
+    fn the_running_header_stop_zone_cancels_without_toggling() {
+        let mut s = test_state();
+        s.transcript.push_user_shell_started(
+            leveler_core::UserShellId::new("ush-stop"),
+            "sleep 30".into(),
+            "/repo".into(),
+            0,
+        );
+        let shell_idx = s
+            .transcript
+            .user_shell_index(&leveler_core::UserShellId::new("ush-stop"))
+            .unwrap();
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line, _) = *hits.iter().find(|(_, i)| *i == shell_idx).unwrap();
+        let row = screen_row_of(&s, line);
+        let (x, _, w, _) = s.conv.rect.unwrap();
+        let effects = reduce(
+            &mut s,
+            Action::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x + w.saturating_sub(2),
+                row,
+                modifiers: KeyModifiers::empty(),
+            }),
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Send(leveler_client_protocol::ClientCommand::CancelUserShell { execution_id, .. })]
+                    if execution_id.as_str() == "ush-stop"
+            ),
+            "{effects:?}"
+        );
+        let TranscriptItem::UserShell(shell) = &s.transcript.items()[shell_idx] else {
+            panic!("shell expected");
+        };
+        assert!(!shell.expanded, "stop does not toggle the record");
     }
 
     #[test]

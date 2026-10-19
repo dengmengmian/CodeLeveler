@@ -1166,12 +1166,13 @@ pub(crate) mod transcript_lines;
 
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
+pub(crate) use transcript_lines::{
+    USER_SHELL_STOP_ZONE, paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail,
+    turn_end_marker, user_shell_lines,
+};
 pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
     sub_agent_tree_lines,
-};
-pub(crate) use transcript_lines::{
-    paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail, turn_end_marker, user_shell_lines,
 };
 
 pub(crate) use panes::pad_line_to_width;
@@ -1179,8 +1180,8 @@ pub(crate) use panes::{render_list_focused, render_list_rows, render_scrolled};
 pub(crate) use text::{pad_display, sanitize_terminal_line, truncate_display, wrap};
 
 pub(crate) use footer::{
-    COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
-    render_slash_popup,
+    COMPOSER_MAX_ROWS, SHELL_COMPLETION_MAX_ROWS, composer_box_lines, composer_visible_rows,
+    render_attachments, render_shell_completion, render_slash_popup,
 };
 use screens::{render_diff_screen, render_help_screen, render_sessions_screen};
 
@@ -4272,6 +4273,25 @@ mod tests {
             joined.contains('╭') && joined.contains('│') && joined.contains('╰'),
             "bordered input expected: {joined}"
         );
+    }
+
+    #[test]
+    fn shell_mode_changes_only_the_composer_marker() {
+        let mut s = test_state();
+        s.composer.replace("cat readme.md");
+        let normal_rows = super::composer_visible_rows(&s, 60);
+        let (normal, normal_caret) = super::composer_box_lines(&s, 60);
+        s.input_mode = crate::shell_mode::InputMode::Shell;
+        let shell_rows = super::composer_visible_rows(&s, 60);
+        let (shell, shell_caret) = super::composer_box_lines(&s, 60);
+        assert_eq!(
+            normal_rows, shell_rows,
+            "the mode marker must not resize the box"
+        );
+        assert_eq!(normal.len(), shell.len());
+        assert_eq!(normal_caret, shell_caret);
+        assert!(line_str(&normal[1]).contains("› cat readme.md"));
+        assert!(line_str(&shell[1]).contains("! cat readme.md"));
     }
 
     #[test]
