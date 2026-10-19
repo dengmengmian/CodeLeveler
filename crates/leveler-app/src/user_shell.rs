@@ -22,9 +22,10 @@ use leveler_core::{SessionId, UserShellId};
 use leveler_engine::EngineEvent;
 use leveler_execution::{OutputStream, ProcessError, ProcessOutput};
 
-/// Bounded live/completed output tail per execution. Big enough for a useful
-/// Details view, small enough to ride snapshots and stay in memory.
-pub(crate) const OUTPUT_TAIL_CAP: usize = 64 * 1024;
+/// Bounded live/completed output tail per execution. Large enough for a real
+/// test run; the explicit truncation marker handles the rest, and 16 retained
+/// executions keep the session store bounded.
+pub(crate) const OUTPUT_TAIL_CAP: usize = 1024 * 1024;
 /// Completed executions kept per session for reconnect/history.
 const HISTORY_CAP: usize = 16;
 

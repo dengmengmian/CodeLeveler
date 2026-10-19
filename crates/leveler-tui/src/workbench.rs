@@ -182,6 +182,10 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // 待发送 sits directly above the composer: input the user wrote and has
     // not sent is part of what they can do now, not of the conversation.
     let pending_rows = crate::pending_inputs::panel_height(state, area.height);
+    // The live user-shell row is the ONE running-local-command indicator. It
+    // shares the user-shell status source with the inline record and vanishes
+    // on the terminal event, so the two can never disagree.
+    let live_rows: u16 = u16::from(state.running_user_shell().is_some());
     // An open overlay takes the composer's slot rather than floating over the
     // transcript, so the conversation shrinks by exactly what the decision box
     // needs and the message that raised it stays visible right above it.
@@ -238,7 +242,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // always so Context footer is not flush on the composer border.
     let chrome_above = strip_rows
         .saturating_add(attach_rows)
-        .saturating_add(pending_rows);
+        .saturating_add(pending_rows)
+        .saturating_add(live_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
 
     // One breathing row between the Context footer and the roster, so the
@@ -253,6 +258,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Length(strip_rows),  // runtime status + plan indicator
         Constraint::Length(attach_rows),
         Constraint::Length(pending_rows),
+        Constraint::Length(live_rows),
         Constraint::Length(pre_composer_gap),
         Constraint::Length(composer_rows),
         Constraint::Length(footer_rows),
@@ -277,8 +283,9 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     let strip_slot = chrome_slot(chunks[4]);
     let attach_slot = chrome_slot(chunks[5]);
     let pending_slot = chrome_slot(chunks[6]);
-    let input_slot = chrome_slot(chunks[8]);
-    let footer_slot = chrome_slot(chunks[9]);
+    let live_slot = chrome_slot(chunks[7]);
+    let input_slot = chrome_slot(chunks[9]);
+    let footer_slot = chrome_slot(chunks[10]);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -294,7 +301,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_state_strip(frame, strip_slot, state);
     render_attachments(frame, attach_slot, state);
     crate::pending_inputs::render(frame, pending_slot, state, area.height);
-    // chunks[7] = pre_composer_gap (leave blank)
+    render_shell_live_activity(frame, live_slot, state);
+    // chunks[8] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
@@ -302,13 +310,82 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         None => render_input(frame, input_slot, state),
     }
     render_footer(frame, footer_slot, state);
-    // chunks[10] = breathing row; the roster docks under the footer.
-    state.activity_hits = render_team_panel(frame, chunks[11], state);
+    // chunks[11] = breathing row; the roster docks under the footer.
+    state.activity_hits = render_team_panel(frame, chunks[12], state);
 
     // /btw is its own surface (see `crate::btw`), not an overlay here.
 
     if state.active_screen == Screen::Conversation && state.overlay.is_none() {
+        crate::render::render_shell_completion(frame, chunks[1], input_slot, state);
         render_slash_popup(frame, chunks[1], input_slot, state);
+    }
+}
+
+/// The live local command above the composer: spinner, command and elapsed on
+/// one row, with a clickable stop control. It is not a second activity panel;
+/// it is the same execution state the inline record paints.
+fn render_shell_live_activity(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let Some(shell) = state.running_user_shell() else {
+        state.shell_live_stop_rect = None;
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        state.shell_live_stop_rect = None;
+        return;
+    }
+    let theme = &state.theme;
+    let elapsed_ms =
+        (state.motion_clock.as_millis() as i64 - shell.started_motion_ms).max(0) as u64;
+    let elapsed = if elapsed_ms >= 60_000 {
+        format!("{}m{:02}s", elapsed_ms / 60_000, (elapsed_ms / 1000) % 60)
+    } else {
+        format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+    };
+    let stop = state.t().user_shell_stop;
+    let stop_label = format!("✕ {stop}");
+    let stop_w = UnicodeWidthStr::width(stop_label.as_str()) as u16;
+    // Time-based, not frame-based: a burst of output repaints many frames and
+    // must not make the spinner spin faster.
+    let spinner = if state.live_animation {
+        crate::status_line::spinner_frame((state.motion_clock.as_millis() / 120) as u64)
+    } else {
+        "◆"
+    };
+    let command = shell
+        .command
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let fixed = 1 + 1 + 1 + 1 + UnicodeWidthStr::width(elapsed.as_str()) + 3;
+    let room = (area.width as usize)
+        .saturating_sub(fixed + stop_w as usize + 3)
+        .max(4);
+    let command = crate::render::truncate_display(&command, room);
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{spinner} "),
+            Style::default().fg(theme.shell.running),
+        ),
+        Span::styled(command, Style::default().fg(theme.text.primary)),
+        Span::styled(
+            format!("… {elapsed}"),
+            Style::default().fg(theme.text.muted),
+        ),
+    ]);
+    let paragraph = Paragraph::new(vec![line]);
+    frame.render_widget(paragraph, area);
+    if stop_w + 2 <= area.width {
+        let x = area
+            .x
+            .saturating_add(area.width.saturating_sub(stop_w).saturating_sub(1));
+        state.shell_live_stop_rect = Some((x, area.y, stop_w, 1));
+        let style = Style::default().fg(theme.text.secondary);
+        let buf = frame.buffer_mut();
+        buf.set_stringn(x, area.y, &stop_label, stop_w as usize, style);
+    } else {
+        state.shell_live_stop_rect = None;
     }
 }
 

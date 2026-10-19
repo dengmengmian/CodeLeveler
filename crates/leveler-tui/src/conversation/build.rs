@@ -97,6 +97,13 @@ impl AppState {
             fold_version: self.conv.fold_version,
             focused_command: self.focused_command().cloned(),
             focused_user_shell: self.focused_user_shell_id().cloned(),
+            shell_elapsed_secs: self
+                .running_user_shell()
+                .map(|shell| {
+                    ((self.motion_clock.as_millis() as i64 - shell.started_motion_ms).max(0) / 1000)
+                        as u64
+                })
+                .unwrap_or(0),
             question_card_open: self.question_card_open(),
         };
         if let Some((k, lines, hits, commands, anchor, starts, sources)) =
@@ -425,7 +432,7 @@ fn build_conversation(
                         theme,
                         width,
                         t,
-                        state.elapsed_secs,
+                        state.motion_clock,
                         state.focused_user_shell_id() == Some(&shell.id),
                     ));
                 }

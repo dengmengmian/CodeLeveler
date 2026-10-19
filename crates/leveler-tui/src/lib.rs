@@ -54,6 +54,8 @@ pub mod render;
 pub mod screen;
 mod secondary;
 mod selection;
+pub mod shell_mode;
+pub(crate) mod shell_render;
 pub mod skills_view;
 mod splash;
 pub mod state;

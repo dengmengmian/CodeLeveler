@@ -9034,7 +9034,11 @@ fn bang_routes_to_user_shell_and_never_the_model() {
     // The command joins the conversation timeline in place. Nothing opens a
     // second surface; input history keeps it; the model history never sees it.
     assert_eq!(s.active_screen, Screen::Conversation);
-    assert!(s.composer.history().iter().any(|h| h == "!echo hi"));
+    assert!(
+        s.composer.history().iter().any(|h| h == "! echo hi"),
+        "history keeps the mode marker: {:?}",
+        s.composer.history()
+    );
     assert!(
         !s.transcript
             .items()
@@ -9083,13 +9087,23 @@ fn leading_whitespace_bang_is_a_normal_message() {
 }
 
 #[test]
-fn bare_bang_hints_and_keeps_the_composer() {
+fn bare_bang_enters_shell_mode_and_empty_enter_hints() {
     let mut s = opened();
     typed(&mut s, "!");
+    assert_eq!(
+        s.input_mode,
+        leveler_tui::shell_mode::InputMode::Shell,
+        "the marker is a mode, not text"
+    );
+    assert!(s.composer.is_empty(), "the marker never enters the command");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "{effects:?}");
-    assert_eq!(s.composer.text(), "!", "content preserved for editing");
     assert!(s.notification.is_some(), "the hint names what is missing");
+    assert_eq!(
+        s.input_mode,
+        leveler_tui::shell_mode::InputMode::Shell,
+        "empty Enter keeps the mode for more typing"
+    );
 }
 
 #[test]
@@ -9097,9 +9111,11 @@ fn busy_agent_turn_rejects_bang_locally() {
     let mut s = opened();
     s.status = leveler_client_protocol::RuntimeStatus::Busy;
     typed(&mut s, "!touch x");
+    assert_eq!(s.input_mode, leveler_tui::shell_mode::InputMode::Shell);
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "no command while busy: {effects:?}");
     assert!(s.notification.is_some());
+    assert_eq!(s.composer.text(), "touch x", "the draft is preserved");
 }
 
 #[test]
@@ -9167,7 +9183,7 @@ fn a_fast_local_command_renders_exactly_one_block() {
     );
     let screen = rendered(&mut s, 100, 30);
     assert_eq!(
-        screen.matches("用户执行 git status").count(),
+        screen.matches("Ran (user) git status").count(),
         1,
         "one execution, one row: {screen}"
     );
@@ -9210,11 +9226,11 @@ fn two_local_commands_stay_separate_ordered_blocks() {
         }),
     );
     let screen = rendered(&mut s, 100, 30);
-    let first = screen.find("用户执行 echo first").expect("first row");
-    let second = screen.find("用户执行 echo second").expect("second row");
+    let first = screen.find("Ran (user) echo first").expect("first row");
+    let second = screen.find("Ran (user) echo second").expect("second row");
     assert!(first < second, "transcript order is execution order");
     assert!(screen.contains("second output"), "{screen}");
-    assert_eq!(screen.matches("用户执行").count(), 2, "{screen}");
+    assert_eq!(screen.matches("Ran (user)").count(), 2, "{screen}");
 }
 
 #[test]
@@ -9245,7 +9261,6 @@ fn a_long_local_result_stays_reachable_at_every_terminal_size() {
     );
     for (w, h) in [(120, 40), (80, 24), (48, 20)] {
         let screen = rendered(&mut s, w, h);
-        assert!(screen.contains("cargo test"), "{w}x{h}: {screen}");
         assert!(
             screen.contains("TAILMARK"),
             "{w}x{h}: the tail of the result is not reachable: {screen}"
@@ -9254,7 +9269,21 @@ fn a_long_local_result_stays_reachable_at_every_terminal_size() {
             !screen.contains('�'),
             "{w}x{h}: a split wide glyph reached the terminal"
         );
+        assert!(screen.contains('›'), "{w}x{h}: composer missing: {screen}");
+        if h >= 24 {
+            assert!(screen.contains("cargo test"), "{w}x{h}: {screen}");
+        }
     }
+    // At the shortest height the command is above the followed tail, and the
+    // conversation's own scroll reaches it.
+    for _ in 0..8 {
+        reduce(&mut s, key(KeyCode::PageUp));
+    }
+    let screen = rendered(&mut s, 48, 20);
+    assert!(
+        screen.contains("cargo test"),
+        "the command row is reachable by scrolling: {screen}"
+    );
 }
 
 #[test]
@@ -9270,7 +9299,7 @@ fn a_running_user_shell_shows_its_live_output_in_the_conversation() {
         }),
     );
     let screen = rendered(&mut s, 100, 30);
-    assert!(screen.contains("用户执行"), "{screen}");
+    assert!(screen.contains("Running (user)"), "{screen}");
     assert!(screen.contains("cargo test"), "{screen}");
     assert!(
         screen.contains("running 128 tests"),
@@ -9302,7 +9331,7 @@ fn a_finished_user_shell_keeps_its_output_and_exit_code_in_the_conversation() {
     );
     let screen = rendered(&mut s, 100, 30);
     assert!(screen.contains("assertion failed"), "{screen}");
-    assert!(screen.contains("exit 101"), "{screen}");
+    assert!(screen.contains("exit code 101"), "{screen}");
     assert!(
         screen.contains("8.2s"),
         "the measured duration is shown: {screen}"
@@ -9360,7 +9389,7 @@ fn ctrl_o_expands_the_latest_user_shell_in_place() {
         Action::Runtime(RuntimeEvent::UserShellOutput {
             execution_id: leveler_core::UserShellId::new("ush-o"),
             stream: "stdout".into(),
-            chunk: (1..=20).map(|n| format!("diff-line-{n:02}\n")).collect(),
+            chunk: (1..=50).map(|n| format!("diff-line-{n:02}\n")).collect(),
         }),
     );
     reduce(
@@ -9382,7 +9411,7 @@ fn ctrl_o_expands_the_latest_user_shell_in_place() {
     };
     assert!(shell.expanded, "Ctrl+O opens the latest execution");
     let screen = rendered(&mut s, 100, 40);
-    assert!(screen.contains("diff-line-20"), "{screen}");
+    assert!(screen.contains("diff-line-50"), "{screen}");
     assert_eq!(s.active_screen, Screen::Conversation);
 }
 
@@ -9440,7 +9469,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
         .expect("running shell restored");
     assert_eq!(running.command, "sleep 60");
     assert!(
-        (s.elapsed_secs as i64 - running.started_elapsed_secs) >= 21,
+        (s.motion_clock.as_millis() as i64 - running.started_motion_ms) >= 21_000,
         "elapsed survives reconnect"
     );
     // The restored live command is still a keyboard-stoppable execution.
@@ -11975,4 +12004,656 @@ fn esc_does_not_dismiss_an_update_in_flight() {
         s.update.is_some(),
         "Esc must not hide an update that is still running"
     );
+}
+
+// ── Shell Mode: input state, completion and event ownership ─────────────────
+
+use leveler_tui::shell_mode::{CompletionItem, CompletionResult, CompletionSource, InputMode};
+
+fn shell_items(request: &leveler_tui::shell_mode::CompletionRequest) -> Vec<CompletionItem> {
+    let end = request.cursor;
+    let start = request.text.rfind(' ').map(|i| i + 1).unwrap_or(0);
+    vec![
+        CompletionItem {
+            display: "README.md".into(),
+            insert: "README.md".into(),
+            source: CompletionSource::File,
+            replace_start: start,
+            replace_end: end,
+            truncated: false,
+        },
+        CompletionItem {
+            display: "review.md".into(),
+            insert: "review.md".into(),
+            source: CompletionSource::File,
+            replace_start: start,
+            replace_end: end,
+            truncated: false,
+        },
+    ]
+}
+
+fn tab_shell(s: &mut AppState) -> leveler_tui::shell_mode::CompletionRequest {
+    let effects = reduce(s, key(KeyCode::Tab));
+    effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::ShellComplete { request } => Some(request),
+            _ => None,
+        })
+        .expect("Tab in shell mode must request completions")
+}
+
+fn shell_with_text(text: &str) -> AppState {
+    let mut s = opened();
+    typed(&mut s, "!");
+    typed(&mut s, text);
+    s
+}
+
+#[test]
+fn bang_enters_shell_mode_and_the_marker_never_reaches_the_command() {
+    let mut s = opened();
+    typed(&mut s, "!git status");
+    assert_eq!(s.input_mode, InputMode::Shell);
+    assert_eq!(s.composer.text(), "git status", "`!` is a mode marker");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { command, .. })] if command == "git status"
+        ),
+        "{effects:?}"
+    );
+    assert_eq!(
+        s.input_mode,
+        InputMode::Normal,
+        "submission restores Normal"
+    );
+}
+
+#[test]
+fn a_bang_in_the_middle_of_chat_text_is_ordinary_prose() {
+    let mut s = opened();
+    typed(&mut s, "hello ! world");
+    assert_eq!(s.input_mode, InputMode::Normal);
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit {
+                command: ClientCommand::SubmitMessage { .. },
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn esc_and_backspace_leave_only_an_empty_shell_mode() {
+    let mut s = opened();
+    typed(&mut s, "!");
+    assert_eq!(s.input_mode, InputMode::Shell);
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.input_mode, InputMode::Normal);
+
+    typed(&mut s, "!");
+    reduce(&mut s, key(KeyCode::Backspace));
+    assert_eq!(s.input_mode, InputMode::Normal);
+
+    // With text, Esc keeps the mode (and never silently drops the command).
+    typed(&mut s, "!ls -la");
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.input_mode, InputMode::Shell);
+    assert_eq!(s.composer.text(), "ls -la");
+}
+
+#[test]
+fn pasting_a_bang_command_enters_shell_mode() {
+    let mut s = opened();
+    reduce(&mut s, Action::Paste("!echo pasted".into()));
+    assert_eq!(s.input_mode, InputMode::Shell);
+    assert_eq!(s.composer.text(), "echo pasted");
+    assert!(
+        !s.composer.text().contains('!'),
+        "the marker is not command text"
+    );
+}
+
+#[test]
+fn history_recall_restores_the_mode_of_the_entry() {
+    let mut s = opened();
+    // A shell command is recorded with its marker.
+    typed(&mut s, "!echo shell-entry");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.input_mode, InputMode::Normal);
+    // A chat message after it.
+    typed(&mut s, "chat entry");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    reduce(&mut s, key(KeyCode::Up));
+    assert_eq!(s.composer.text(), "chat entry");
+    assert_eq!(s.input_mode, InputMode::Normal);
+    reduce(&mut s, key(KeyCode::Up));
+    assert_eq!(s.composer.text(), "echo shell-entry");
+    assert_eq!(
+        s.input_mode,
+        InputMode::Shell,
+        "a recalled `! ` entry restores Shell Mode"
+    );
+    reduce(&mut s, key(KeyCode::Down));
+    assert_eq!(s.input_mode, InputMode::Normal);
+}
+
+#[test]
+fn enter_in_an_open_completion_menu_accepts_and_never_executes() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    let result = CompletionResult {
+        request,
+        items: shell_items(&s.completion.pending.clone().unwrap()),
+        truncated: false,
+    };
+    reduce(&mut s, Action::ShellCompletionsLoaded(result));
+    assert!(
+        s.completion.open,
+        "two candidates with no longer prefix open"
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "accepting a candidate must not send a command: {effects:?}"
+    );
+    assert_eq!(s.composer.text(), "cat README.md");
+    assert!(!s.completion.open);
+    assert_eq!(s.input_mode, InputMode::Shell);
+}
+
+#[test]
+fn a_sole_candidate_completes_without_opening_a_menu() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    let mut items = shell_items(&request);
+    items.truncate(1);
+    reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request,
+            items,
+            truncated: false,
+        }),
+    );
+    assert!(!s.completion.open, "a sole candidate never flashes a menu");
+    assert_eq!(s.composer.text(), "cat README.md");
+}
+
+#[test]
+fn a_truncated_scan_never_auto_accepts_a_sole_candidate() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    let mut items = shell_items(&request);
+    items.truncate(1);
+    items[0].truncated = true;
+    reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request,
+            items,
+            truncated: true,
+        }),
+    );
+    assert!(s.completion.open, "an incomplete scan opens, never accepts");
+    assert_eq!(s.composer.text(), "cat re");
+}
+
+#[test]
+fn a_shared_longer_prefix_is_filled_before_the_menu() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    let end = request.cursor;
+    let start = request.text.rfind(' ').map(|i| i + 1).unwrap_or(0);
+    let item = |name: &str| CompletionItem {
+        display: name.into(),
+        insert: name.into(),
+        source: CompletionSource::File,
+        replace_start: start,
+        replace_end: end,
+        truncated: false,
+    };
+    let effects = reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request,
+            items: vec![item("review-a"), item("review-b")],
+            truncated: false,
+        }),
+    );
+    assert_eq!(s.composer.text(), "cat review-");
+    assert!(!s.completion.open, "the first Tab only fills the prefix");
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::ShellComplete { .. })),
+        "a fill refetches silently: {effects:?}"
+    );
+}
+
+#[test]
+fn a_stale_completion_result_never_rewrites_new_input() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    // The user keeps typing before the scan lands.
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty())),
+    );
+    let result = CompletionResult {
+        request: request.clone(),
+        items: shell_items(&request),
+        truncated: false,
+    };
+    reduce(&mut s, Action::ShellCompletionsLoaded(result));
+    assert_eq!(s.composer.text(), "cat rev", "the newer draft wins");
+    assert!(!s.completion.open);
+}
+
+#[test]
+fn esc_closes_the_menu_but_keeps_the_draft_and_mode() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request: request.clone(),
+            items: shell_items(&request),
+            truncated: false,
+        }),
+    );
+    assert!(s.completion.open);
+    reduce(&mut s, key(KeyCode::Esc));
+    assert!(!s.completion.open);
+    assert_eq!(s.composer.text(), "cat re");
+    assert_eq!(s.input_mode, InputMode::Shell);
+}
+
+#[test]
+fn shift_tab_steps_the_menu_and_leaves_permission_cycling_alone() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request: request.clone(),
+            items: shell_items(&request),
+            truncated: false,
+        }),
+    );
+    let before = s.mode;
+    let effects = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+    );
+    assert!(
+        effects.is_empty(),
+        "menu Shift+Tab must not change permission"
+    );
+    assert_eq!(s.mode, before);
+    assert!(s.completion.open);
+    // Closed menu: the global permission cycle is untouched.
+    s.completion.close();
+    let effects = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+    );
+    assert!(
+        !effects.is_empty(),
+        "with the menu closed Shift+Tab still cycles permission"
+    );
+}
+
+#[test]
+fn ctrl_c_cancels_the_running_shell_not_the_client_or_agent() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-cc", "sleep 30");
+    let effects = reduce(&mut s, ctrl('c'));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::CancelUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-cc"
+        ),
+        "{effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Quit)),
+        "Ctrl+C must not quit while a local command runs"
+    );
+}
+
+#[test]
+fn ctrl_b_has_no_shell_binding_and_never_cancels() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-b", "sleep 30");
+    let effects = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        effects.is_empty(),
+        "Ctrl+B is not a shell binding: {effects:?}"
+    );
+    assert!(
+        s.running_user_shell().is_some(),
+        "Ctrl+B must leave the execution running"
+    );
+    assert!(
+        !s.notification
+            .as_ref()
+            .is_some_and(|n| n.message.contains("后台")),
+        "no background capability may be advertised: {:?}",
+        s.notification
+    );
+}
+
+#[test]
+fn a_second_local_command_is_refused_locally_while_one_runs() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-busy", "sleep 30");
+    typed(&mut s, "!echo second");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "one foreground command at a time");
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|n| n.message.contains("本地命令")),
+        "{:?}",
+        s.notification
+    );
+    assert_eq!(s.composer.text(), "echo second", "the draft is preserved");
+}
+
+#[test]
+fn a_completion_click_accepts_without_executing() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request: request.clone(),
+            items: shell_items(&request),
+            truncated: false,
+        }),
+    );
+    rendered(&mut s, 100, 30);
+    let rect = s.completion.rect.expect("menu was painted");
+    let effects = reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 2,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(effects.is_empty(), "a click accepts, never executes");
+    assert_eq!(s.composer.text(), "cat review.md");
+    assert!(!s.completion.open);
+}
+
+#[test]
+fn mouse_wheel_moves_the_completion_selection() {
+    let mut s = shell_with_text("cat re");
+    let request = tab_shell(&mut s);
+    reduce(
+        &mut s,
+        Action::ShellCompletionsLoaded(CompletionResult {
+            request: request.clone(),
+            items: shell_items(&request),
+            truncated: false,
+        }),
+    );
+    rendered(&mut s, 100, 30);
+    let rect = s.completion.rect.expect("menu was painted");
+    assert_eq!(s.completion.selected, 0);
+    reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: rect.x + 2,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(s.completion.selected, 1);
+}
+
+#[test]
+fn the_live_activity_row_is_the_execution_record_and_disappears_on_exit() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-live-row", "sleep 30");
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("Running (user) sleep 30"), "{screen}");
+    assert!(screen.contains("sleep 30…"), "live row: {screen}");
+    assert!(screen.contains("✕ 停止"), "clickable stop: {screen}");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-live-row"),
+            exit_code: None,
+            duration_ms: 800,
+            status: "cancelled".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("Cancelled (user)"), "{screen}");
+    assert!(
+        !screen.contains("sleep 30…"),
+        "the live row vanished with the execution: {screen}"
+    );
+}
+
+#[test]
+fn the_live_stop_control_cancels_exactly_that_execution() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-stop", "sleep 30");
+    rendered(&mut s, 100, 30);
+    let (x, y, w, _) = s.shell_live_stop_rect.expect("stop control painted");
+    let effects = reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x + w / 2,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::CancelUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-stop"
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn output_stream_order_and_carriage_returns_survive() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-cr", "printf progress");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-cr"),
+            stream: "stdout".into(),
+            chunk: "progress 10%\rprogress 100%\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-cr"),
+            stream: "stderr".into(),
+            chunk: "warning\n".into(),
+        }),
+    );
+    let idx = s
+        .transcript
+        .user_shell_index(&leveler_core::UserShellId::new("ush-cr"))
+        .unwrap();
+    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
+        panic!("shell block expected");
+    };
+    assert_eq!(shell.output_marks.len(), 2, "stdout then stderr provenance");
+    assert!(!shell.stream_at(0));
+    assert!(shell.stream_at(shell.output.len() - 1));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-cr"),
+            exit_code: Some(0),
+            duration_ms: 50,
+            status: "success".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("progress 100%"), "{screen}");
+    assert!(
+        !screen.contains("progress 10%"),
+        "CR overwrote the line: {screen}"
+    );
+    assert!(screen.contains("warning"), "{screen}");
+}
+
+#[test]
+fn a_short_result_opens_in_full_and_a_long_one_folds() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-short", "printf ok");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-short"),
+            stream: "stdout".into(),
+            chunk: "one\ntwo\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-short"),
+            exit_code: Some(0),
+            duration_ms: 20,
+            status: "success".into(),
+        }),
+    );
+    let idx = s
+        .transcript
+        .user_shell_index(&leveler_core::UserShellId::new("ush-short"))
+        .unwrap();
+    assert!(matches!(&s.transcript.items()[idx], TranscriptItem::UserShell(b) if b.expanded));
+
+    shell_started(&mut s, "ush-long", "seq 1 500");
+    let mut chunk = String::new();
+    for n in 1..=500 {
+        chunk.push_str(&format!("row-{n}\n"));
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-long"),
+            stream: "stdout".into(),
+            chunk,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-long"),
+            exit_code: Some(0),
+            duration_ms: 20,
+            status: "success".into(),
+        }),
+    );
+    let idx = s
+        .transcript
+        .user_shell_index(&leveler_core::UserShellId::new("ush-long"))
+        .unwrap();
+    assert!(
+        matches!(&s.transcript.items()[idx], TranscriptItem::UserShell(b) if !b.expanded),
+        "a long result stays folded"
+    );
+}
+
+#[test]
+fn alt_enter_keeps_a_multiline_shell_command() {
+    let mut s = shell_with_text("echo one");
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+    );
+    reduce(&mut s, Action::TextInput("echo two".into()));
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+    );
+    reduce(&mut s, Action::TextInput("echo three".into()));
+    assert_eq!(s.composer.text(), "echo one\necho two\necho three");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { command, .. })]
+                if command == "echo one\necho two\necho three"
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn tab_in_normal_mode_never_requests_shell_completion() {
+    let mut s = opened();
+    typed(&mut s, "cat re");
+    let effects = reduce(&mut s, key(KeyCode::Tab));
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::ShellComplete { .. })),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn shell_mode_keeps_the_chat_collaboration_axis() {
+    let mut s = opened();
+    let axis = s.collaboration.clone();
+    typed(&mut s, "!");
+    assert_eq!(s.collaboration, axis);
+    typed(&mut s, "echo hi");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        s.collaboration, axis,
+        "Shell Mode is input state, not an axis"
+    );
+}
+
+#[test]
+fn a_completion_request_is_bound_to_the_cursor_position() {
+    let mut s = opened();
+    typed(&mut s, "!");
+    typed(&mut s, "cat review");
+    for _ in 0..3 {
+        reduce(&mut s, key(KeyCode::Left));
+    }
+    let effects = reduce(&mut s, key(KeyCode::Tab));
+    let request = effects
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::ShellComplete { request } => Some(request),
+            _ => None,
+        })
+        .expect("request");
+    assert_eq!(request.text, "cat review");
+    assert_eq!(request.cursor, "cat rev".len());
+    assert_eq!(request.cwd, s.repository.clone().unwrap());
 }

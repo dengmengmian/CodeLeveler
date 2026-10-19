@@ -225,6 +225,42 @@ pub struct DiffColors {
     pub removed_bg: Color,
 }
 
+/// User shell execution inks. Running is its own violet — a local command is
+/// the user's work, not the runtime's blue — and the breath moves between two
+/// shades of that same hue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellColors {
+    pub running: Color,
+    /// Dim end of the running rail/icon breath.
+    pub running_dim: Color,
+    pub success: Color,
+    pub error: Color,
+    /// Explicit cancellation: stopped, not succeeded and not failed.
+    pub cancelled: Color,
+}
+
+impl ShellColors {
+    /// Ink at `level` (`1.0` = running, `0.0` = running_dim). The terminal
+    /// cell has no alpha, so this steps between two shades; a palette without
+    /// RGB switches at the midpoint.
+    pub fn breathe(&self, level: f32) -> Color {
+        let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (self.running_dim, self.running)
+        else {
+            return if level < 0.5 {
+                self.running_dim
+            } else {
+                self.running
+            };
+        };
+        let step = (level.clamp(0.0, 1.0) * f32::from(BREATH_STEPS)).round();
+        let mix = |from: u8, to: u8| {
+            (f32::from(from) + (f32::from(to) - f32::from(from)) * (step / f32::from(BREATH_STEPS)))
+                as u8
+        };
+        Color::Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
+    }
+}
+
 /// A semantic theme. Components reference tokens, never literals.
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -238,6 +274,8 @@ pub struct Theme {
     pub accent: AccentColors,
     /// Plan indicator ink (see [`PlanColors`]).
     pub plan: PlanColors,
+    /// User shell execution inks (see [`ShellColors`]).
+    pub shell: ShellColors,
     pub status: StatusColors,
     pub diff: DiffColors,
     pub brand: BrandColors,
@@ -307,6 +345,13 @@ fn indexed_256_theme(theme: Theme) -> Theme {
         plan: PlanColors {
             primary: indexed(theme.plan.primary),
             dim: indexed(theme.plan.dim),
+        },
+        shell: ShellColors {
+            running: indexed(theme.shell.running),
+            running_dim: indexed(theme.shell.running_dim),
+            success: indexed(theme.shell.success),
+            error: indexed(theme.shell.error),
+            cancelled: indexed(theme.shell.cancelled),
         },
         status: StatusColors {
             success: indexed(theme.status.success),
@@ -443,6 +488,13 @@ impl Theme {
                 primary: rgb(0xA78BFA),
                 dim: rgb(0x6D5BC4),
             },
+            shell: ShellColors {
+                running: rgb(0xA78BFA),
+                running_dim: rgb(0x6D5BC4),
+                success: rgb(0x56C271),
+                error: rgb(0xE56B6F),
+                cancelled: rgb(0xE5B454),
+            },
             status: StatusColors {
                 success: rgb(0x56C271),
                 warning: rgb(0xE5B454),
@@ -510,6 +562,13 @@ impl Theme {
                 primary: rgb(0x7C3AED),
                 dim: rgb(0xA78BFA),
             },
+            shell: ShellColors {
+                running: rgb(0x7C3AED),
+                running_dim: rgb(0xA78BFA),
+                success: rgb(0x1A7F37),
+                error: rgb(0xCF222E),
+                cancelled: rgb(0x9A6700),
+            },
             status: StatusColors {
                 success: rgb(0x1A7F37),
                 warning: rgb(0x9A6700),
@@ -572,6 +631,13 @@ impl Theme {
             plan: PlanColors {
                 primary: rgb(0xC9A8FF),
                 dim: rgb(0x8B62E8),
+            },
+            shell: ShellColors {
+                running: rgb(0xC9A8FF),
+                running_dim: rgb(0x8B62E8),
+                success: rgb(0x3DDA6B),
+                error: rgb(0xFF6B6B),
+                cancelled: rgb(0xFFD24A),
             },
             status: StatusColors {
                 success: rgb(0x3DDA6B),
@@ -655,6 +721,13 @@ impl Theme {
             plan: PlanColors {
                 primary: Color::Reset,
                 dim: Color::Reset,
+            },
+            shell: ShellColors {
+                running: Color::Reset,
+                running_dim: Color::Reset,
+                success: Color::Reset,
+                error: Color::Reset,
+                cancelled: Color::Reset,
             },
             status: StatusColors {
                 success: Color::Reset,

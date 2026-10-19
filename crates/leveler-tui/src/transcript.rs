@@ -370,9 +370,18 @@ impl UserShellStatus {
     }
 }
 
+/// Which stream a byte range of user-shell output came from. The runtime
+/// interleaves stdout and stderr; the inline record keeps that provenance so
+/// the two can have a subtle background difference without recolouring text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputMark {
+    pub offset: usize,
+    pub stderr: bool,
+}
+
 /// A user shell execution (`!command`) — NOT a tool call and NOT a user
 /// message: it never enters the model conversation. Bounded, sanitized
-/// output tail only.
+/// output tail plus stream provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserShellBlock {
     pub id: leveler_core::UserShellId,
@@ -380,19 +389,48 @@ pub struct UserShellBlock {
     pub cwd: String,
     pub status: UserShellStatus,
     pub output: String,
+    pub output_marks: Vec<OutputMark>,
     pub output_truncated: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
-    /// Session-elapsed baseline when it started (drives the live runtime).
-    /// SIGNED: a reconnect back-dates this below zero so a shell that ran 21
-    /// minutes before the client attached still shows 21 minutes, not 0.
-    pub started_elapsed_secs: i64,
-    /// Show full output inline (mouse / Ctrl+O). Pure display state.
+    /// UI motion-clock baseline when it started. Back-dated on reconnect so a
+    /// command that ran 21 minutes before the client attached still shows 21
+    /// minutes, not 0.
+    /// UI motion clock (milliseconds) at start. Signed so a reconnect can
+    /// back-date a command that began before this client attached.
+    pub started_motion_ms: i64,
+    /// Show full output inline (mouse / Ctrl+O / Enter). Pure display state.
     pub expanded: bool,
+    /// The user chose the fold explicitly; a later terminal event must not
+    /// auto-expand over that choice.
+    pub expanded_pinned: bool,
 }
 
-/// Bounded client-side output tail for a user shell block.
-pub const USER_SHELL_OUTPUT_CAP: usize = 64 * 1024;
+/// Bounded client-side output tail for a user shell block. Large enough for a
+/// real test run; the explicit truncation marker is never omitted.
+pub const USER_SHELL_OUTPUT_CAP: usize = 1024 * 1024;
+
+/// A finished, short user result opens in full; a long one stays folded so it
+/// cannot bury the conversation. Both remain fully reachable by expanding.
+pub const USER_SHELL_AUTO_EXPAND_MAX_LINES: usize = 30;
+
+impl UserShellBlock {
+    /// Whether the byte at `offset` came from stderr (the last mark at or
+    /// before it). Empty/unknown ranges are stdout.
+    pub fn stream_at(&self, offset: usize) -> bool {
+        self.output_marks
+            .iter()
+            .rev()
+            .find(|mark| mark.offset <= offset)
+            .is_some_and(|mark| mark.stderr)
+    }
+
+    /// Final visible line count, honouring carriage-return overwrites only
+    /// approximately: this is a sizing decision, not the renderer.
+    fn display_line_count(&self) -> usize {
+        self.output.lines().count()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
@@ -1322,7 +1360,7 @@ impl TranscriptState {
         id: leveler_core::UserShellId,
         command: String,
         cwd: String,
-        started_elapsed_secs: i64,
+        started_motion_ms: i64,
     ) {
         self.bump();
         self.close_tool_group();
@@ -1335,32 +1373,89 @@ impl TranscriptState {
             cwd,
             status: UserShellStatus::Running,
             output: String::new(),
+            output_marks: Vec::new(),
             output_truncated: false,
             exit_code: None,
             duration_ms: None,
-            started_elapsed_secs,
+            started_motion_ms,
             expanded: false,
+            expanded_pinned: false,
         }));
     }
 
     /// Append sanitized output to a running user shell (bounded tail).
-    pub fn append_user_shell_output(&mut self, id: &leveler_core::UserShellId, chunk: &str) {
+    pub fn append_user_shell_output(
+        &mut self,
+        id: &leveler_core::UserShellId,
+        chunk: &str,
+        stderr: bool,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
         let Some(index) = self.user_shell_index(id) else {
             return;
         };
         self.bump();
-        if let TranscriptItem::UserShell(shell) = &mut self.items[index] {
-            shell.output.push_str(chunk);
-            if shell.output.len() > USER_SHELL_OUTPUT_CAP {
-                let cut = shell.output.len() - USER_SHELL_OUTPUT_CAP;
-                let cut = leveler_core::floor_char_boundary(&shell.output, cut);
-                shell.output.drain(..cut);
-                shell.output_truncated = true;
+        let Some(TranscriptItem::UserShell(shell)) = self.items.get_mut(index) else {
+            return;
+        };
+        let start = shell.output.len();
+        shell.output.push_str(chunk);
+        if shell
+            .output_marks
+            .last()
+            .is_none_or(|mark| mark.stderr != stderr)
+        {
+            shell.output_marks.push(OutputMark {
+                offset: start,
+                stderr,
+            });
+        }
+        if shell.output.len() > USER_SHELL_OUTPUT_CAP {
+            let cut = shell.output.len() - USER_SHELL_OUTPUT_CAP;
+            let cut = leveler_core::floor_char_boundary(&shell.output, cut);
+            let stream = shell.stream_at(cut);
+            shell.output.drain(..cut);
+            let mut marks: Vec<OutputMark> = shell
+                .output_marks
+                .drain(..)
+                .filter_map(|mark| {
+                    mark.offset.checked_sub(cut).map(|offset| OutputMark {
+                        offset,
+                        stderr: mark.stderr,
+                    })
+                })
+                .collect();
+            if marks.first().is_none_or(|mark| mark.offset != 0) {
+                marks.insert(
+                    0,
+                    OutputMark {
+                        offset: 0,
+                        stderr: stream,
+                    },
+                );
             }
+            marks.dedup_by(|a, b| a.offset == b.offset && a.stderr == b.stderr);
+            shell.output_marks = marks;
+            shell.output_truncated = true;
         }
     }
 
-    /// Finish a user shell execution with its terminal facts.
+    /// Mark a restored record whose source already dropped its head. The
+    /// snapshot carries the flag; the renderer must not present the tail as
+    /// the whole result.
+    pub fn mark_user_shell_output_truncated(&mut self, id: &leveler_core::UserShellId) {
+        if let Some(index) = self.user_shell_index(id)
+            && let TranscriptItem::UserShell(shell) = &mut self.items[index]
+        {
+            shell.output_truncated = true;
+            self.bump();
+        }
+    }
+
+    /// Finish a user shell execution with its terminal facts. A short result
+    /// opens in full; a long one stays folded unless the user pinned a fold.
     pub fn complete_user_shell(
         &mut self,
         id: &leveler_core::UserShellId,
@@ -1376,6 +1471,10 @@ impl TranscriptState {
             shell.exit_code = exit_code;
             shell.duration_ms = Some(duration_ms);
             shell.status = status;
+            if !shell.expanded_pinned {
+                shell.expanded = !shell.output_truncated
+                    && shell.display_line_count() <= USER_SHELL_AUTO_EXPAND_MAX_LINES;
+            }
         }
     }
 
@@ -1479,6 +1578,7 @@ impl TranscriptState {
             }
             Some(TranscriptItem::UserShell(shell)) => {
                 shell.expanded = mode.is_expanded();
+                shell.expanded_pinned = true;
                 true
             }
             Some(TranscriptItem::GoalRecap(block)) => {

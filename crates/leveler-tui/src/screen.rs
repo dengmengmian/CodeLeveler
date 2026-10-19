@@ -536,7 +536,8 @@ pub fn is_exact_slash_token(token: &str) -> bool {
 /// Like [`slash_popup`], but respects a user Esc-dismiss so the menu stays
 /// hidden until the composer text changes again.
 pub fn visible_slash_popup(state: &crate::state::AppState) -> Vec<(String, String)> {
-    if state.slash_popup_dismissed {
+    // Shell Mode owns the composer's completion surface.
+    if state.input_mode == crate::shell_mode::InputMode::Shell || state.slash_popup_dismissed {
         return Vec::new();
     }
     slash_popup(state.composer.text(), state.t())
@@ -567,8 +568,8 @@ pub fn skill_mention_query(state: &crate::state::AppState) -> Option<&str> {
 /// runtime injects a skill for any `$name` in the message, so completion is
 /// the whole interaction — there is no separate command.
 pub fn visible_skill_popup(state: &crate::state::AppState) -> Vec<(String, String)> {
-    // In a `!command` the `$` belongs to the shell.
-    if state.slash_popup_dismissed || state.composer.text().starts_with('!') {
+    // In Shell Mode the `$` belongs to the shell.
+    if state.input_mode == crate::shell_mode::InputMode::Shell || state.slash_popup_dismissed {
         return Vec::new();
     }
     let Some(query) = skill_mention_query(state) else {
@@ -597,8 +598,8 @@ pub fn file_mention_query(state: &crate::state::AppState) -> Option<&str> {
 
 /// Filter repository paths for the active `@file` mention.
 pub fn visible_file_popup(state: &crate::state::AppState) -> Vec<&str> {
-    // In a `!command` the `@` belongs to the shell (same rule as `$`).
-    if state.slash_popup_dismissed || state.composer.text().starts_with('!') {
+    // In Shell Mode the `@` belongs to the shell (same rule as `$`).
+    if state.input_mode == crate::shell_mode::InputMode::Shell || state.slash_popup_dismissed {
         return Vec::new();
     }
     let Some(query) = file_mention_query(state) else {

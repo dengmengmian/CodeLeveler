@@ -26,6 +26,12 @@ use leveler_client_protocol::UiThinkingAccess;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// The shared spinner frame for live surfaces outside the status strip (the
+/// shell live-activity row). One drumbeat, one source.
+pub(crate) fn spinner_frame(tick: u64) -> &'static str {
+    SPINNER[(tick as usize) % SPINNER.len()]
+}
+
 pub(crate) fn fmt_elapsed(secs: u64) -> String {
     if secs >= 60 {
         format!("{}m {:02}s", secs / 60, secs % 60)

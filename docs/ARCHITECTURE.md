@@ -1460,6 +1460,28 @@ verified by deterministic tests and real dogfood — do not regress them:
   product presentation, not Runtime lifecycle, execution permissions, side-effect
   ownership, event facts or persistence.
 - **Command details remain accessible**: ordinary commands expand in place in the conversation, showing the full command from the original arguments wrapped to terminal width; the running status does not repeat long commands. The background-task page retains a task list above its detail pane, with task identity and stop controls fixed while only detail content scrolls. Full commands and long logs wrap to width; mouse clicks select tasks, and the wheel selects tasks or scrolls details according to its region. Each task retains its own scroll and follow state, and cancellation results still come from Runtime.
+- **Shell Mode is input state, not a second execution surface**: `!` on an
+  empty Normal composer is a mode marker and never becomes command text; the
+  prompt, accent and placeholder change without moving the composer. Esc,
+  Backspace and Ctrl+C on an empty Shell composer leave the mode; the global
+  key map is otherwise unchanged (Shift+Tab keeps the permission cycle,
+  Ctrl+J/Alt+Enter keep newline entry, Tab only completes inside Shell Mode).
+  Completion is deterministic and offline over files, directories and PATH
+  executables; a shared prefix fills only the common part, an ambiguous or
+  capped (truncated) result opens the menu instead of accepting, and accepting
+  never executes. The candidate menu owns Tab/Enter/arrows/PageUp/PageDown/Esc
+  while open and is pointer- and wheel-operable.
+  Each execution is one inline record fed by the same runtime event as the
+  fixed live-activity row above the composer: a left status rail distinguishes
+  Running (purple, time-based breath), Ran (green), Failed (red, real exit
+  code) and Cancelled (amber, explicit); stdout and stderr keep their
+  provenance ink; the exact command has its own `$` line; output is terminal-
+  safe, folds with an explicit marker and remains fully reachable. The inline
+  header's rightmost cells and the live row are clickable stops; Ctrl+C cancels
+  exactly that execution, never the agent, the side thread or the application.
+  Only one foreground user command runs at a time. Resume restores the record
+  from the runtime without re-execution. Background transfer is not part of
+  this surface and is never advertised.
 - **Real transcripts start at the viewport top**: until content fills the viewport, unused rows stay below the transcript so streaming and tool-group folding do not move the first message. Only the empty-session splash is centered. Painting and mouse/selection mapping use the same Conversation geometry policy; overflowing content retains normal scrolling and live-tail following.
 - **Folding must not move the reading position**: the line anchored at the
   viewport's top edge keeps its place when an entry above or inside the viewport

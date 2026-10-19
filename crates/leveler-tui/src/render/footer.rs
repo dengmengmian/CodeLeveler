@@ -15,6 +15,24 @@ use super::text::{row_window, take_display_prefix, truncate_display, wrap_with_c
 pub(crate) const COMPOSER_MAX_ROWS: usize = 8;
 pub(crate) const COMPOSER_PROMPT: &str = "› ";
 pub(crate) const COMPOSER_CONT: &str = "  ";
+/// Shell Mode's mode marker. Both prompts are exactly two cells, so entering
+/// shell mode never moves the text, caret or box geometry.
+pub(crate) const SHELL_PROMPT: &str = "! ";
+const SHELL_CONT: &str = "  ";
+
+fn composer_prompt(state: &AppState) -> &'static str {
+    match state.input_mode {
+        crate::shell_mode::InputMode::Normal => COMPOSER_PROMPT,
+        crate::shell_mode::InputMode::Shell => SHELL_PROMPT,
+    }
+}
+
+fn composer_cont(state: &AppState) -> &'static str {
+    match state.input_mode {
+        crate::shell_mode::InputMode::Normal => COMPOSER_CONT,
+        crate::shell_mode::InputMode::Shell => SHELL_CONT,
+    }
+}
 
 /// Cells between the popup border and the command column.
 /// Selected rows draw `>` in the left pad; unselected rows keep a space.
@@ -253,6 +271,221 @@ pub(crate) fn render_slash_popup(
     }
 }
 
+/// Visible candidate rows. The menu scrolls; it never grows without bound.
+pub(crate) const SHELL_COMPLETION_MAX_ROWS: usize = 6;
+const SHELL_COMPLETION_MAX_WIDTH: u16 = 64;
+
+/// The window start that keeps the selected row centred, matching the
+/// reference completion menu.
+fn completion_scroll(selected: usize, total: usize, visible: usize) -> usize {
+    if total <= visible || selected < visible / 2 {
+        0
+    } else if selected + visible / 2 >= total {
+        total.saturating_sub(visible)
+    } else {
+        selected.saturating_sub(visible / 2)
+    }
+}
+
+fn completion_geometry(
+    transcript: Rect,
+    composer: Rect,
+    items: usize,
+) -> (Rect, Rect, Rect, usize) {
+    let available = composer.y.saturating_sub(transcript.y).max(1) as usize;
+    let rows = items
+        .min(SHELL_COMPLETION_MAX_ROWS)
+        .min(available.saturating_sub(2));
+    if rows == 0 {
+        return (Rect::default(), Rect::default(), Rect::default(), 0);
+    }
+    let height = (rows + 2) as u16;
+    // The popup starts at the composer's left edge; its width must stop at the
+    // transcript's right edge, not merely fit the terminal.
+    let max_w = transcript.right().saturating_sub(composer.x);
+    let width = SHELL_COMPLETION_MAX_WIDTH.min(max_w);
+    if width < 4 {
+        return (Rect::default(), Rect::default(), Rect::default(), 0);
+    }
+    let y = composer.y.saturating_sub(height).max(transcript.y);
+    let popup = Rect {
+        x: composer.x,
+        y,
+        width,
+        height,
+    };
+    let inner = Rect {
+        x: popup.x.saturating_add(1),
+        y: popup.y.saturating_add(1),
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    let pad = SLASH_POPUP_PAD_X.min(inner.width / 2);
+    let content = Rect {
+        x: inner.x.saturating_add(pad),
+        y: inner.y,
+        width: inner.width.saturating_sub(pad.saturating_mul(2)),
+        height: inner.height,
+    };
+    (popup, inner, content, rows)
+}
+
+fn completion_description(
+    source: crate::shell_mode::CompletionSource,
+    t: &crate::i18n::UiText,
+) -> &'static str {
+    match source {
+        crate::shell_mode::CompletionSource::Directory => t.shell_completion_dir,
+        crate::shell_mode::CompletionSource::Executable => t.shell_completion_executable,
+        crate::shell_mode::CompletionSource::File => t.shell_completion_file,
+    }
+}
+
+/// Completion dropdown above the composer. Same bordered surface and focus
+/// glyph as the slash popup; it never overlays the input itself.
+pub(crate) fn render_shell_completion(
+    frame: &mut Frame,
+    transcript: Rect,
+    composer: Rect,
+    state: &mut AppState,
+) {
+    if !state.completion.open || state.completion.items.is_empty() {
+        state.completion.rect = None;
+        return;
+    }
+    // The fixed live-activity row sits directly above the composer and must
+    // stay visible under the menu, so the menu anchors above it.
+    let anchor = Rect {
+        y: composer
+            .y
+            .saturating_sub(u16::from(state.running_user_shell().is_some())),
+        ..composer
+    };
+    let (popup, inner, content, rows) =
+        completion_geometry(transcript, anchor, state.completion.items.len());
+    if rows == 0 || popup.width == 0 || popup.height == 0 {
+        state.completion.rect = None;
+        return;
+    }
+    let theme = &state.theme;
+    let total = state.completion.items.len();
+    let visible = rows.min(total);
+    let selected = state.completion.selected.min(total.saturating_sub(1));
+    let start = completion_scroll(selected, total, visible);
+    let end = (start + visible).min(total);
+    state.completion.selected = selected;
+    state.completion.rect = Some(content);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border.normal));
+    frame.render_widget(Clear, popup);
+    theme.paint_surface(frame, popup, theme.surface.elevated);
+    frame.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 || content.width == 0 {
+        return;
+    }
+    let content_right = content.x.saturating_add(content.width);
+    let content_w = content.width as usize;
+    let labels: Vec<&str> = state.completion.items[start..end]
+        .iter()
+        .map(|item| item.display.as_str())
+        .collect();
+    let label_w = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(*label))
+        .max()
+        .unwrap_or(0)
+        .min(content_w.saturating_sub(8))
+        .max(4);
+    let desc_w = content_w.saturating_sub(2 + label_w + 1);
+    let buf = frame.buffer_mut();
+    for (offset, item) in state.completion.items[start..end].iter().enumerate() {
+        let index = start + offset;
+        let y = content.y.saturating_add(offset as u16);
+        if y >= inner.y.saturating_add(inner.height) || y >= buf.area.height {
+            break;
+        }
+        let is_selected = index == selected;
+        let (label_style, desc_style, pad_style) = if is_selected {
+            (
+                Style::default()
+                    .fg(theme.text.primary)
+                    .bg(theme.surface.selection)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.text.primary)
+                    .bg(theme.surface.selection),
+                Style::default().bg(theme.surface.selection),
+            )
+        } else {
+            (
+                Style::default()
+                    .fg(theme.accent.primary)
+                    .bg(theme.surface.elevated),
+                Style::default()
+                    .fg(theme.text.secondary)
+                    .bg(theme.surface.elevated),
+                Style::default().bg(theme.surface.elevated),
+            )
+        };
+        let fill_w = inner.width.min(buf.area.right().saturating_sub(inner.x)) as usize;
+        let fill = " ".repeat(fill_w);
+        buf.set_stringn(inner.x, y, &fill, fill_w, pad_style);
+        let marker = if is_selected {
+            crate::presentation::tokens::FOCUS_CURSOR
+        } else {
+            " "
+        };
+        put_clipped(
+            buf,
+            inner.x,
+            y,
+            marker,
+            content
+                .x
+                .max(inner.x.saturating_add(1))
+                .min(buf.area.right()),
+            pad_style,
+        );
+        let mut x = content.x;
+        x = put_clipped(
+            buf,
+            x,
+            y,
+            &truncate_display(&item.display, label_w),
+            content_right,
+            label_style,
+        );
+        let used = UnicodeWidthStr::width(truncate_display(&item.display, label_w).as_str());
+        if label_w > used {
+            x = put_clipped(
+                buf,
+                x,
+                y,
+                &" ".repeat(label_w - used),
+                content_right,
+                pad_style,
+            );
+        }
+        if desc_w > 0 {
+            x = put_clipped(buf, x, y, " ", content_right, pad_style);
+            let desc = completion_description(item.source, state.t());
+            put_clipped(
+                buf,
+                x,
+                y,
+                &truncate_display(desc, desc_w),
+                content_right,
+                desc_style,
+            );
+        }
+    }
+    // The visible window itself is state: mouse hit-testing maps a row back
+    // to the same items the reader sees.
+    state.completion.visible_start = start;
+}
+
 /// Shared match list for slash / @file / $skill popups (name, description).
 fn slash_popup_match_rows(state: &AppState) -> Vec<(String, String)> {
     let files = crate::screen::visible_file_popup(state);
@@ -306,12 +539,14 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
     // Wrapping the buffer and mapping the caret onto a row is the editor's own
     // mechanics, shared with every other surface that shows a `Composer`; the
     // decorations below belong to this box.
+    let prompt = composer_prompt(state);
+    let cont = composer_cont(state);
     let (rows, _) = wrap_with_caret(
         state.composer.text(),
         caret,
         inner_w,
-        UnicodeWidthStr::width(COMPOSER_PROMPT),
-        UnicodeWidthStr::width(COMPOSER_CONT),
+        UnicodeWidthStr::width(prompt),
+        UnicodeWidthStr::width(cont),
     );
     let mut vis: Vec<ComposerVisRow> = rows
         .into_iter()
@@ -320,12 +555,16 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             let first_row = index == 0;
             // The ghost owns the empty first row when it is showing; the
             // first-run hint stands down rather than stacking behind it.
-            let suggestion = (first_row && crate::suggestion::is_visible(state))
+            let shell = state.input_mode == crate::shell_mode::InputMode::Shell;
+            let suggestion = (first_row && !shell && crate::suggestion::is_visible(state))
                 .then(|| state.prompt_suggestion.clone())
                 .flatten();
-            let placeholder =
-                show_placeholder && first_row && state.composer.is_empty() && suggestion.is_none();
+            let placeholder = first_row
+                && state.composer.is_empty()
+                && suggestion.is_none()
+                && (shell || show_placeholder);
             let ghost = if first_row
+                && !shell
                 && caret.0 == 0
                 && state.composer.cursor() >= state.composer.text().len()
             {
@@ -334,11 +573,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
                 None
             };
             ComposerVisRow {
-                prompt: if first_row {
-                    COMPOSER_PROMPT
-                } else {
-                    COMPOSER_CONT
-                },
+                prompt: if first_row { prompt } else { cont },
                 text: row.text,
                 caret_col: row.caret_col,
                 placeholder,
@@ -350,10 +585,11 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
 
     if vis.is_empty() {
         vis.push(ComposerVisRow {
-            prompt: COMPOSER_PROMPT,
+            prompt,
             text: String::new(),
             caret_col: Some(0),
-            placeholder: show_placeholder,
+            placeholder: show_placeholder
+                || state.input_mode == crate::shell_mode::InputMode::Shell,
             ghost: None,
             suggestion: None,
         });
@@ -405,12 +641,23 @@ pub(crate) fn composer_box_lines(
                 && state.workbench_focus == crate::state::WorkbenchFocus::Input
         }
     };
+    let shell = state.input_mode == crate::shell_mode::InputMode::Shell;
     let border_color = if focused {
-        theme.border.focus
+        if shell {
+            theme.shell.running
+        } else {
+            theme.border.focus
+        }
     } else {
         theme.border.normal
     };
     let border = Style::default().fg(border_color);
+    let prompt = composer_prompt(state);
+    let prompt_style = if shell {
+        Style::default().fg(theme.shell.running)
+    } else {
+        Style::default().fg(theme.accent.primary)
+    };
 
     let width = width.max(8);
     let pad = crate::layout::INPUT_INTERNAL_PADDING_X as usize;
@@ -422,7 +669,7 @@ pub(crate) fn composer_box_lines(
     let (window, caret_row) = composer_visual_rows(state, content_w);
 
     let mut content: Vec<Line<'static>> = Vec::with_capacity(window.len());
-    let mut caret_col = COMPOSER_PROMPT.width() as u16;
+    let mut caret_col = prompt.width() as u16;
 
     for (vi, row) in window.iter().enumerate() {
         let mut spans = Vec::new();
@@ -430,7 +677,7 @@ pub(crate) fn composer_box_lines(
 
         let p = truncate_display(row.prompt, content_w);
         used += UnicodeWidthStr::width(p.as_str());
-        spans.push(Span::styled(p, Style::default().fg(theme.accent.primary)));
+        spans.push(Span::styled(p, prompt_style));
 
         let room = content_w.saturating_sub(used);
         let piece = truncate_display(&row.text, room);
@@ -444,7 +691,12 @@ pub(crate) fn composer_box_lines(
 
         if row.placeholder {
             let room = content_w.saturating_sub(used);
-            let hint = truncate_display(state.t().composer_placeholder, room);
+            let placeholder = if shell {
+                state.t().shell_composer_placeholder
+            } else {
+                state.t().composer_placeholder
+            };
+            let hint = truncate_display(placeholder, room);
             used += UnicodeWidthStr::width(hint.as_str());
             spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
         }
@@ -493,10 +745,10 @@ pub(crate) fn composer_box_lines(
     }
 
     if content.is_empty() {
-        let fill = content_w.saturating_sub(COMPOSER_PROMPT.width());
+        let fill = content_w.saturating_sub(prompt.width());
         content.push(Line::from(vec![
             Span::styled(format!("│{}", " ".repeat(pad)), border),
-            Span::styled(COMPOSER_PROMPT, Style::default().fg(theme.accent.primary)),
+            Span::styled(prompt, prompt_style),
             Span::raw(" ".repeat(fill)),
             Span::styled("│", border),
         ]));
@@ -583,7 +835,10 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
     if state.overlay.is_some() {
         return Vec::new();
     }
-    let hints = if state.workbench_focus == crate::state::WorkbenchFocus::Pending {
+    let hints = if state.completion.open {
+        // The candidate menu owns Tab/Enter/arrows/Esc.
+        t.shell_completion_menu_hint.to_string()
+    } else if state.workbench_focus == crate::state::WorkbenchFocus::Pending {
         format!(
             "Enter {} · Delete {} · Esc {}",
             t.pending_input_send, t.pending_input_delete, t.hint_back_to_input
@@ -633,13 +888,14 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
             .is_some_and(|plan| crate::workbench::plan_indicator_should_show(plan, state.is_busy()))
     {
         t.plan_focus_hint.to_string()
+    } else if state.running_user_shell().is_some() && !state.is_busy() {
+        // One foreground shell at a time: the useful action is stopping it.
+        format!("Ctrl+C {}", t.user_shell_stop)
     } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
-    } else if state.composer.text().starts_with('!') {
-        // `!` is the one composer prefix that changes where Enter goes: the
-        // line runs on this machine instead of reaching the model. The idle
-        // row that advertised it is gone by now, so nothing else says so.
-        t.hint_shell_mode.to_string()
+    } else if state.input_mode == crate::shell_mode::InputMode::Shell {
+        // Shell Mode changes where Enter goes and adds deterministic Tab.
+        t.shell_completion_hint.to_string()
     } else if state.composer.is_empty() && state.turn_nav.is_none() {
         // `!` sits right after `/`: both are composer entry points, and the
         // width-truncation rule keeps the two openers alive longest.
@@ -810,25 +1066,26 @@ mod p1_tests {
             .collect()
     }
 
-    /// `!` is a mode, not a character: Enter stops sending to the model and
-    /// runs the line on the user's machine. The idle row that advertised it
-    /// goes blank the moment it is typed, so the only thing distinguishing
-    /// "send" from "execute here" was the `!` the user typed. Say what Enter
-    /// does while the mode is on.
+    /// `!` is a mode, not a character. While it is on, the footer names the
+    /// keys that mean something different: Tab completes, Enter runs locally,
+    /// Esc/Backspace leave the mode.
     #[test]
-    fn shell_mode_says_that_enter_executes_here() {
+    fn shell_mode_names_its_completion_and_run_keys() {
         let mut s = state();
-        s.composer.replace("!git diff --stat");
+        s.input_mode = crate::shell_mode::InputMode::Shell;
+        s.composer.replace("git diff --stat");
         let text = hint_text(&s, 120);
         assert!(
-            text.contains("Shell"),
-            "shell mode has no marker on screen: {text:?}"
+            text.contains("Tab 补全"),
+            "shell mode has no completion marker: {text:?}"
         );
+        assert!(text.contains("Enter 执行"), "{text:?}");
         let mut en = state();
         en.locale = crate::i18n::Locale::En;
-        en.composer.replace("!ls");
+        en.input_mode = crate::shell_mode::InputMode::Shell;
+        en.composer.replace("ls");
         let text = hint_text(&en, 120);
-        assert!(text.contains("Shell"), "{text:?}");
+        assert!(text.contains("Tab complete"), "{text:?}");
     }
 
     /// Ordinary typing is not a mode: the row stays out of the way.

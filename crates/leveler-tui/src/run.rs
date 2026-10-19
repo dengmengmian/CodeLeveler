@@ -507,7 +507,8 @@ pub async fn run(
         // (spinner/elapsed). Idle ticks only repaint when the wall clock minute
         // changes (handled above via paint_now).
         if paint_now
-            || (ticked && (state.is_busy() || pending_runtime_paint))
+            || (ticked && (state.is_busy() || state.running_user_shell().is_some()))
+            || (ticked && pending_runtime_paint)
             || (!state.is_busy() && pending_immediate_paint)
             || (!state.is_busy()
                 && pending_background_paint
@@ -834,6 +835,17 @@ fn dispatch_effects(
                     let _ = tx.send(Action::FileCandidatesLoaded(files));
                 });
             }
+            Effect::ShellComplete { request } => {
+                let tx = completion_tx.clone();
+                tokio::spawn(async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || crate::shell_mode::complete(&request))
+                            .await;
+                    if let Ok(result) = result {
+                        let _ = tx.send(Action::ShellCompletionsLoaded(result));
+                    }
+                });
+            }
             Effect::StartWeb => match web_launcher {
                 Some(launcher) => {
                     let launcher = Arc::clone(launcher);
@@ -1137,6 +1149,15 @@ async fn maybe_coalesce_text_input(
     // Command focus stops with `x`), and turning that key into text before
     // the reducer ran swallowed the binding.
     if !coalescing_owns_key(state) {
+        return Action::Key(key);
+    }
+    // `!` on an empty Normal composer is a mode transition, not text. The
+    // reducer must see the key itself before any following characters are
+    // folded into a typing burst.
+    if first_char == '!'
+        && state.composer.is_empty()
+        && state.input_mode == crate::shell_mode::InputMode::Normal
+    {
         return Action::Key(key);
     }
 
