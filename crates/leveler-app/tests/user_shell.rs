@@ -782,6 +782,27 @@ async fn wait_pid_file(path: &std::path::Path) -> i32 {
     }
 }
 
+/// The process group `pid` belongs to. Every spawn is its own group, and the
+/// registry records the group leader. On Linux that leader is the `bwrap`
+/// sandbox wrapper, which forks the shell `echo $$` reports; on macOS
+/// `sandbox-exec` execs in place, so the two coincide.
+#[cfg(unix)]
+fn process_group_of(pid: i32) -> i32 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    assert!(
+        output.status.success(),
+        "ps could not read pid {pid}: {:?}",
+        output
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("ps prints a process group id")
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreground_shell_moves_to_background_with_same_process_and_output() {
@@ -834,9 +855,10 @@ async fn foreground_shell_moves_to_background_with_same_process_and_output() {
         _ => unreachable!(),
     };
     // The foreground record is now marked background and the execution is
-    // still the same id. The snapshot names the same process the foreground
-    // pid file recorded; `BackgroundTaskStarted` was already consumed by the
-    // wait above, and the snapshot is the authoritative live view.
+    // still the same id. The adopted task is the process-group leader the
+    // foreground spawn created; a respawn would be a different group. On
+    // Linux the leader is the sandbox wrapper, so it is the shell's group —
+    // not the shell pid itself — that must match.
     let snap = h.client.snapshot(&h.session_id).await.unwrap();
     let shell = snap
         .user_shells
@@ -852,8 +874,8 @@ async fn foreground_shell_moves_to_background_with_same_process_and_output() {
         .expect("background task is listed");
     assert_eq!(
         task.pid.map(|pid| pid as i32),
-        Some(foreground_pid),
-        "the background task is the same process, not a respawn"
+        Some(process_group_of(foreground_pid)),
+        "the background task owns the foreground shell's process group, not a respawn"
     );
 
     // Output produced after the transfer still reaches the shell record.
