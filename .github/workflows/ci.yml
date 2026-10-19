@@ -134,7 +134,12 @@ jobs:
         # Bounded step: a hang used to hold the runner until the 60-minute job
         # timeout, and a killed runner uploads no log. A step timeout fails with
         # the partial log still available, which is what identifies the test.
-        timeout-minutes: 30
+        timeout-minutes: 40
+        env:
+          # The default thread count peaks the Linux runner's memory when the
+          # whole workspace runs in one process group; a lost runner uploads
+          # no log. Two threads keep the suite deterministic and bounded.
+          RUST_TEST_THREADS: "2"
         run: cargo test --workspace --all-features --locked --no-fail-fast
 
   # The phone client. It is Dart, so it cannot ride the Rust job. Analyze and
