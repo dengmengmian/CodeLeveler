@@ -77,6 +77,13 @@ fn thinking_state(level: leveler_model::ThinkingLevel) -> UiThinkingState {
 }
 
 fn state() -> AppState {
+    state_with_draft(None)
+}
+
+/// A state whose draft path (and therefore its shell-output root) is real.
+/// `/copy output` and `/output` validate a capture against that root before
+/// acting, so their fixtures must live beneath it.
+fn state_with_draft(draft_path: Option<std::path::PathBuf>) -> AppState {
     AppState::new(
         Theme::no_color(),
         Boot {
@@ -84,7 +91,7 @@ fn state() -> AppState {
             user: "麻凡".to_string(),
             version: "0.1.0".to_string(),
             show_welcome: true,
-            draft_path: None,
+            draft_path,
             history_path: None,
             context_window: 0,
             locale: leveler_tui::Locale::Zh,
@@ -2472,6 +2479,34 @@ fn opened() -> AppState {
         }),
     );
     s
+}
+
+fn opened_at_state_root(root: &std::path::Path) -> AppState {
+    let mut s = state_with_draft(Some(root.join("state").join("draft.txt")));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+    s
+}
+
+/// A complete capture under the state root the handler validates against.
+fn complete_capture(root: &std::path::Path, id: &str, text: &str) -> std::path::PathBuf {
+    let directory = root.join("state").join("shell-output").join("s1").join(id);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("stdout.log"), text).unwrap();
+    std::fs::write(directory.join("stderr.log"), "").unwrap();
+    std::fs::write(directory.join("combined.log"), text).unwrap();
+    for stream in ["stdout", "stderr", "combined"] {
+        std::fs::write(
+            directory.join(format!("{stream}.meta.json")),
+            "{\"complete\":true}\n",
+        )
+        .unwrap();
+    }
+    std::fs::canonicalize(&directory).unwrap()
 }
 
 fn typed(s: &mut AppState, text: &str) -> Vec<Effect> {
@@ -9222,13 +9257,15 @@ fn a_replaced_shell_output_keeps_one_authoritative_record() {
 /// exists and the result was never truncated.
 #[test]
 fn copy_output_prefers_the_complete_capture() {
-    let mut s = opened();
+    let root = tempfile::tempdir().unwrap();
+    let capture = complete_capture(root.path(), "ush-copy", "clean │ line\n");
+    let mut s = opened_at_state_root(root.path());
     shell_started(&mut s, "ush-copy", "printf '│ x'");
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::UserShellCaptureReady {
             execution_id: leveler_core::UserShellId::new("ush-copy"),
-            directory: "/state/shell-output/s1/ush-copy".into(),
+            directory: capture.to_string_lossy().into_owned(),
         }),
     );
     reduce(
@@ -9253,7 +9290,7 @@ fn copy_output_prefers_the_complete_capture() {
     assert_eq!(
         effects,
         vec![Effect::CopyUserShellOutput {
-            directory: Some(std::path::PathBuf::from("/state/shell-output/s1/ush-copy")),
+            directory: Some(capture),
             retained: "clean │ line\n".into(),
         }]
     );
@@ -9305,15 +9342,15 @@ fn copy_output_refuses_a_running_command() {
 /// on demand, never loaded into the TUI.
 #[test]
 fn output_pages_the_capture_file_from_disk() {
-    let mut s = opened();
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("combined.log"), "full output\n").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let capture = complete_capture(root.path(), "ush-page", "full output\n");
+    let mut s = opened_at_state_root(root.path());
     shell_started(&mut s, "ush-page", "seq 1 1000000");
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::UserShellCaptureReady {
             execution_id: leveler_core::UserShellId::new("ush-page"),
-            directory: dir.path().to_string_lossy().into_owned(),
+            directory: capture.to_string_lossy().into_owned(),
         }),
     );
     reduce(
@@ -9330,7 +9367,7 @@ fn output_pages_the_capture_file_from_disk() {
     assert_eq!(
         effects,
         vec![Effect::OpenOutputPager {
-            source: leveler_tui::action::PagerSource::File(dir.path().join("combined.log")),
+            source: leveler_tui::action::PagerSource::File(capture.join("combined.log")),
         }]
     );
 }
