@@ -870,6 +870,27 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 .transcript
                 .append_user_shell_output(&execution_id, &clean, stream == "stderr");
         }
+        RuntimeEvent::UserShellOutputReplaced {
+            execution_id,
+            output_tail,
+            output_truncated,
+        } => {
+            // The bounded live channel may have dropped chunks. The runtime's
+            // retained view replaces the accumulated buffer; appending it
+            // would keep every hole and duplicate the overlapping bytes.
+            let clean = crate::shell_render::sanitize_shell_output(&output_tail);
+            state
+                .transcript
+                .replace_user_shell_output(&execution_id, &clean, output_truncated);
+        }
+        RuntimeEvent::UserShellCaptureReady {
+            execution_id,
+            directory,
+        } => {
+            state
+                .transcript
+                .set_user_shell_full_output(&execution_id, Some(directory));
+        }
         RuntimeEvent::UserShellExited {
             execution_id,
             exit_code,
@@ -1994,6 +2015,9 @@ fn apply_session_with(
                 state.transcript.mark_user_shell_output_truncated(&shell.id);
             }
         }
+        state
+            .transcript
+            .set_user_shell_full_output(&shell.id, shell.full_output.clone());
         if background {
             state
                 .transcript

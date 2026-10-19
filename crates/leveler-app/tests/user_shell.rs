@@ -538,6 +538,211 @@ async fn large_output_stays_bounded_with_a_truncation_flag() {
     );
 }
 
+/// A result larger than the retained tail must still be completely
+/// retrievable: the terminal record names an on-disk capture, and that capture
+/// contains every byte of the stream — not the in-memory tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn a_capped_shell_keeps_the_complete_stream_on_disk() {
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let (tmp, app) = app_with_repo(&server).await;
+    let layout = layout_for(tmp.path());
+    let app = std::sync::Arc::new(app);
+    let session_id = app
+        .create_session(&ModelRef::new("mock", "m"), "complete output")
+        .await
+        .unwrap();
+    let (client, mut events) = client_for(app.clone(), &session_id);
+    client
+        .send(ClientCommand::RunUserShell {
+            session_id: session_id.clone(),
+            command: "yes 'FULL-0123456789' | head -c 2097152; true".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut ready = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ev = tokio::time::timeout(remaining, events.recv())
+            .await
+            .expect("terminal before deadline")
+            .expect("stream open");
+        if let RuntimeEvent::UserShellCaptureReady {
+            execution_id,
+            directory,
+        } = ev
+        {
+            ready = Some((execution_id, directory));
+            continue;
+        }
+        if matches!(ev, RuntimeEvent::UserShellExited { .. }) {
+            break;
+        }
+    }
+    let (_, location) = ready.expect("the live view learns the capture location");
+    drop(client);
+    drop(app);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Read it the way a resumed session does: from the persisted terminal fact.
+    let app = std::sync::Arc::new(Application::assemble(layout).unwrap());
+    let (client, _events) = client_for(app, &session_id);
+    let snap = client.snapshot(&session_id).await.unwrap();
+    let shell = snap.user_shells.last().expect("terminal shell record");
+    assert!(
+        shell.output_truncated,
+        "a 2 MiB result exceeds the retained tail"
+    );
+    assert_eq!(
+        shell.full_output.as_deref(),
+        Some(location.as_str()),
+        "the resumed record carries the same complete capture"
+    );
+    assert!(
+        !shell.output_tail.contains("[full output:"),
+        "the capture location is a field, never injected into output text"
+    );
+    let location = std::path::PathBuf::from(&location);
+
+    let stdout = std::fs::read(location.join("stdout.log")).expect("captured stdout");
+    let stderr = std::fs::read(location.join("stderr.log")).expect("captured stderr");
+    let combined = std::fs::read(location.join("combined.log")).expect("captured combined");
+    assert_eq!(
+        combined.len(),
+        stdout.len() + stderr.len(),
+        "the combined copy loses no byte"
+    );
+    assert_eq!(
+        stdout.len(),
+        2 * 1024 * 1024,
+        "every stdout byte is on disk, not only the tail"
+    );
+    assert!(
+        stdout.starts_with(b"FULL-0123456789\n"),
+        "the capture starts at the beginning of the stream"
+    );
+    assert!(stderr.is_empty(), "no stderr was emitted");
+}
+
+/// The transfer chain must preserve one capture across the ownership move:
+/// bytes produced before Ctrl+B, bytes produced after it, and no replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn a_long_background_transfer_keeps_one_complete_capture() {
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let mut h = harness(&server).await;
+    h.client
+        .send(run_shell(
+            &h,
+            "sh -c 'yes A | head -c 1048576; echo BEFORE-DONE; sleep 1.5; \
+             yes B | head -c 1048576; echo AFTER-DONE; true'",
+        ))
+        .await
+        .unwrap();
+    let execution_id = match wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellStarted { .. }),
+        10,
+    )
+    .await
+    {
+        RuntimeEvent::UserShellStarted { execution_id, .. } => execution_id,
+        _ => unreachable!(),
+    };
+    // The foreground stream has already produced its first MiB.
+    wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellOutput { chunk, .. } if chunk.contains("BEFORE-DONE")),
+        20,
+    )
+    .await;
+    h.client
+        .send(ClientCommand::BackgroundUserShell {
+            session_id: h.session_id.clone(),
+            execution_id: execution_id.clone(),
+        })
+        .await
+        .unwrap();
+    let task_id = match wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellBackgrounded { .. }),
+        10,
+    )
+    .await
+    {
+        RuntimeEvent::UserShellBackgrounded { task_id, .. } => task_id,
+        _ => unreachable!(),
+    };
+    // The capture is announced before the generic card terminal event, so
+    // waiting for the latter first would drop the former.
+    let ready_directory = match wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellCaptureReady { .. }),
+        10,
+    )
+    .await
+    {
+        RuntimeEvent::UserShellCaptureReady { directory, .. } => directory,
+        _ => unreachable!(),
+    };
+    wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::BackgroundTaskExited { task_id: id, .. } if id == &task_id),
+        30,
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let shell = loop {
+        let snap = h.client.snapshot(&h.session_id).await.unwrap();
+        if let Some(shell) = snap
+            .user_shells
+            .iter()
+            .find(|shell| shell.id == execution_id && shell.status != "background")
+        {
+            break shell.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the terminal record never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        shell.full_output.as_deref(),
+        Some(ready_directory.as_str()),
+        "the live event and the terminal record name the same capture"
+    );
+    let location = shell.full_output.clone().unwrap_or_else(|| {
+        panic!(
+            "the transferred record carries the capture location: {:?}",
+            shell.output_tail
+        )
+    });
+    let location = std::path::PathBuf::from(location);
+    let stdout = std::fs::read(location.join("stdout.log")).expect("captured stdout");
+    let combined = std::fs::read(location.join("combined.log")).expect("captured combined");
+    assert_eq!(
+        combined.len(),
+        stdout.len() + std::fs::read(location.join("stderr.log")).unwrap().len(),
+        "the combined copy spans both halves of the transferred stream"
+    );
+    assert!(
+        stdout.len() > 2 * 1024 * 1024,
+        "both halves of the stream are captured, got {} bytes",
+        stdout.len()
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(text.contains("BEFORE-DONE"), "pre-transfer bytes survive");
+    assert!(text.contains("AFTER-DONE"), "post-transfer bytes survive");
+    assert_eq!(
+        text.matches("BEFORE-DONE").count(),
+        1,
+        "the handoff does not replay the foreground stream"
+    );
+}
+
 /// Wait for one event matching `pred`, dropping unrelated events (later waits
 /// for the same terminal fact must not be satisfied by an old one because each
 /// test uses a fresh harness).
@@ -709,6 +914,14 @@ async fn foreground_shell_moves_to_background_with_same_process_and_output() {
     };
     assert_eq!(shell.status, "success");
     assert!(shell.output_tail.contains("BEFORE") && shell.output_tail.contains("AFTER"));
+    // The registry's log tags each chunk with `[stdout] `/`[stderr] `; that is
+    // the background-card projection, not the user-shell record. Replacing the
+    // finished record with the exact capture keeps the raw source text.
+    assert!(
+        !shell.output_tail.contains("[stdout]") && !shell.output_tail.contains("[stderr]"),
+        "the transferred user-shell record is raw output: {:?}",
+        shell.output_tail
+    );
 }
 
 #[cfg(unix)]
@@ -1001,6 +1214,13 @@ async fn a_cold_runtime_restores_terminal_shell_history_with_output() {
         "retained output survives: {:?}",
         shell.output_tail
     );
+    let location = shell
+        .full_output
+        .clone()
+        .expect("the complete capture survives the cold runtime");
+    let combined = std::fs::read(std::path::PathBuf::from(location).join("combined.log"))
+        .expect("capture file survives");
+    assert_eq!(combined, b"COLD-MARK\n");
     assert!(snap.active_background_tasks.is_empty());
 }
 
@@ -1032,6 +1252,7 @@ async fn a_terminal_fact_wins_over_a_late_backgrounded_fact_in_cold_restore() {
             status: "success".into(),
             output_tail: "ORDER\n".into(),
             output_truncated: false,
+            full_output: None,
         },
         // The transfer fact is written late (for example by a racing worker).
         EngineEvent::UserShellBackgrounded {

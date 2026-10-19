@@ -404,6 +404,10 @@ pub struct UserShellBlock {
     pub output: String,
     pub output_marks: Vec<OutputMark>,
     pub output_truncated: bool,
+    /// The exact on-disk capture directory once the runtime's copy finished.
+    /// "Copy Output" reads it; the transcript never infers it from the painted
+    /// text. `None` while the execution runs or when the copy failed.
+    pub full_output: Option<String>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     /// The background registry task linked to this execution after a
@@ -428,7 +432,8 @@ pub struct UserShellBlock {
 pub const USER_SHELL_OUTPUT_CAP: usize = 1024 * 1024;
 
 /// A finished, short user result opens in full; a long one stays folded so it
-/// cannot bury the conversation. Both remain fully reachable by expanding.
+/// cannot bury the conversation. Both remain fully reachable by expanding,
+/// and the complete capture is always available through `/output`.
 pub const USER_SHELL_AUTO_EXPAND_MAX_LINES: usize = 30;
 
 impl UserShellBlock {
@@ -1392,6 +1397,7 @@ impl TranscriptState {
             output: String::new(),
             output_marks: Vec::new(),
             output_truncated: false,
+            full_output: None,
             exit_code: None,
             duration_ms: None,
             task_id: None,
@@ -1440,6 +1446,25 @@ impl TranscriptState {
             shell.output_marks.clear();
             shell.output.push_str(text);
             shell.output_truncated = truncated;
+        }
+    }
+
+    /// Record the exact capture directory the runtime completed for this
+    /// execution. `None` clears a path that no longer applies (a snapshot
+    /// without one), so "Copy Output" never reads a stale capture.
+    pub fn set_user_shell_full_output(
+        &mut self,
+        id: &leveler_core::UserShellId,
+        full_output: Option<String>,
+    ) {
+        let Some(index) = self.user_shell_index(id) else {
+            return;
+        };
+        if let TranscriptItem::UserShell(shell) = &mut self.items[index]
+            && shell.full_output != full_output
+        {
+            shell.full_output = full_output;
+            self.bump();
         }
     }
 
@@ -1531,6 +1556,9 @@ impl TranscriptState {
             shell.exit_code = exit_code;
             shell.duration_ms = Some(duration_ms);
             shell.status = status;
+            // A short finished result opens in full; a long one keeps the
+            // established fold (named in the record) and remains reachable by
+            // Ctrl+O, while `/output` reads the complete capture from disk.
             if !shell.expanded_pinned {
                 shell.expanded = !shell.output_truncated
                     && shell.display_line_count() <= USER_SHELL_AUTO_EXPAND_MAX_LINES;

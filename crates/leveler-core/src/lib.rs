@@ -37,8 +37,8 @@ pub use secret::{
 };
 pub use text::{
     ceil_char_boundary, floor_char_boundary, redact_secrets, redact_secrets_json,
-    redact_secrets_json_for_session, sanitize_terminal_output, truncate_head_bytes,
-    truncate_tail_bytes,
+    redact_secrets_json_for_session, sanitize_terminal_output,
+    sanitize_terminal_output_preserving_layout, truncate_head_bytes, truncate_tail_bytes,
 };
 pub use time::{Timestamp, now};
 

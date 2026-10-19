@@ -402,8 +402,14 @@ export type RuntimeEvent =
   | { type: 'context_expanded'; from_tokens: number; reason: string; to_tokens: number }
   /** A user shell execution (`!command`) started. User-originated direct host execution — not an agent tool call; clients render it as its own block and never feed it to the model conversation. */
   | { type: 'user_shell_started'; command: string; cwd: string; execution_id: UserShellId }
+  /** The same user shell execution moved from the foreground to the background. It is one process and one execution id; `task_id` links it to the background task list. Additive; older clients keep showing the foreground record until it exits. */
+  | { type: 'user_shell_backgrounded'; execution_id: UserShellId; task_id: string }
   /** Live output from a running user shell. `stream` is `stdout` or `stderr`. Transient: clients keep a bounded buffer; the runtime does not persist chunks. */
   | { type: 'user_shell_output'; chunk: string; execution_id: UserShellId; stream: string }
+  /** The runtime's authoritative retained view of a user shell's output. It REPLACES the client's accumulated live chunks: the bounded live channel may have dropped bytes, so appending would preserve a hole. Emitted before the terminal event when the live view could be lossy (and always when a background execution finishes). */
+  | { type: 'user_shell_output_replaced'; execution_id: UserShellId; output_tail: string; output_truncated: boolean }
+  /** The exact on-disk capture of a user shell execution is complete. `directory` holds `stdout.log`, `stderr.log` and `combined.log`. Clients use it for "Copy Output"; it is never inferred from painted text. Emitted before the terminal event, and only when every stream's sidecar reports a finished copy — an unfinished capture is never advertised. */
+  | { type: 'user_shell_capture_ready'; directory: string; execution_id: UserShellId }
   /** A user shell execution ended. `status` is `success | failed | cancelled`; `exit_code` is `None` when the process was killed or never spawned. */
   | { type: 'user_shell_exited'; duration_ms: number; execution_id: UserShellId; exit_code?: number | null; status: string }
   /** Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`. */
@@ -458,6 +464,8 @@ export type RuntimeEvent =
   | { type: 'background_task_started'; args: string[]; pid?: number | null; program: string; task_id: string }
   /** A live chunk of a background task's combined stdout/stderr, already sanitized and capped by the runtime. Additive; older clients ignore the unknown type. The final [`Self::BackgroundTaskExited`] log stays authoritative. */
   | { type: 'background_task_output'; chunk: string; task_id: string }
+  /** A background task's state could not be established (for example its adopted driver failed). This is not a natural exit and not a stop: the UI must show unknown, never Running, failed, or stopped. */
+  | { type: 'background_task_unknown'; duration_ms: number; output: string; task_id: string }
   /** A background task finished (exit or kill). `output` is the task's final retained log, authoritative over the streamed chunks (a lifecycle broadcast lag can drop a chunk). Empty when the runtime produced none. */
   | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; output?: string; stopped?: boolean; task_id: string }
   /** Authoritative replacement of a session's active background projection. Emitted after a lifecycle broadcast lag; history is unaffected. */
@@ -1220,15 +1228,19 @@ export interface UiUnfinishedGoal {
 export interface UiUserShell {
   command: string;
   cwd: string;
-  /** Seconds elapsed at snapshot time (running) or total runtime (done). */
+  /** Seconds elapsed at snapshot time (running/background) or total runtime (done). */
   elapsed_secs: number;
   exit_code?: number | null;
+  /** The directory holding this execution's complete raw capture (`stdout.log`, `stderr.log`, `combined.log`) once the copy finished. A client reads the copy for "Copy Output"; it never parses display text to find it. `None` while the execution runs (the capture is still being written) or when the host could not complete one. */
+  full_output?: string | null;
   id: UserShellId;
   output_tail?: string;
   /** True when `output_tail` dropped earlier output. */
   output_truncated?: boolean;
-  /** `running | success | failed | cancelled`. */
+  /** `running | background | success | failed | cancelled | unknown`. */
   status: string;
+  /** The registry task id when this execution runs in the background. The same execution id and process remain; this is the link to the background task list, not a second execution. */
+  task_id?: string | null;
 }
 
 /** Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation. */
@@ -1326,6 +1338,8 @@ export type ClientCommand =
   | { type: 'restore_checkpoint'; checkpoint_id: CheckpointId; session_id: SessionId }
   /** Side question (`/btw`): single-turn answer using current session context, without tools and without appending to the transcript store. Run an explicit user shell command (`!command`) in the session's repository. USER-ORIGINATED DIRECT EXECUTION: never reaches the model, the agent loop, or the tool registry. `command` is the raw shell string after the `!` prefix. */
   | { type: 'run_user_shell'; command: string; session_id: SessionId }
+  /** Move exactly one running foreground user shell to the background. This is an ownership transfer, not a re-run: the runtime keeps the same process and execution identity. Idempotent; it never spawns a second process. */
+  | { type: 'background_user_shell'; execution_id: UserShellId; session_id: SessionId }
   /** Cancel exactly one user shell execution. Deliberately separate from `CancelCurrentTurn`: a user shell is not an agent turn, and the id match ensures a stale cancel can never kill a newer execution. */
   | { type: 'cancel_user_shell'; execution_id: UserShellId; session_id: SessionId }
   /** Stop one background task the runtime is still running. The registry signals the process tree through its own lifecycle; the task settles as killed. Deliberately separate from `CancelCurrentTurn` and `CancelUserShell`: a background task outlives the turn that started it, and stopping it must not stop the turn. */

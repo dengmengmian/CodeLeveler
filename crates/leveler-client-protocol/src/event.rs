@@ -415,6 +415,26 @@ pub enum RuntimeEvent {
         stream: String,
         chunk: String,
     },
+    /// The runtime's authoritative retained view of a user shell's output.
+    /// It REPLACES the client's accumulated live chunks: the bounded live
+    /// channel may have dropped bytes, so appending would preserve a hole.
+    /// Emitted before the terminal event when the live view could be lossy
+    /// (and always when a background execution finishes).
+    UserShellOutputReplaced {
+        execution_id: leveler_core::UserShellId,
+        output_tail: String,
+        output_truncated: bool,
+    },
+    /// The exact on-disk capture of a user shell execution is complete.
+    /// `directory` holds `stdout.log`, `stderr.log` and `combined.log`.
+    /// Clients use it for "Copy Output"; it is never inferred from painted
+    /// text. Emitted before the terminal event, and only when every stream's
+    /// sidecar reports a finished copy — an unfinished capture is never
+    /// advertised.
+    UserShellCaptureReady {
+        execution_id: leveler_core::UserShellId,
+        directory: String,
+    },
     /// A user shell execution ended. `status` is `success | failed |
     /// cancelled`; `exit_code` is `None` when the process was killed or
     /// never spawned.

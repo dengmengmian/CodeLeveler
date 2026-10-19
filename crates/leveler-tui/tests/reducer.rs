@@ -9168,6 +9168,242 @@ fn user_shell_lifecycle_updates_the_block() {
     );
 }
 
+/// A live-channel drop is repaired by the runtime's retained view: the block
+/// replaces its accumulated chunks instead of appending a second copy.
+#[test]
+fn a_replaced_shell_output_keeps_one_authoritative_record() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-replace", "seq 1 3");
+    for chunk in ["1\n", "2\n"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::UserShellOutput {
+                execution_id: leveler_core::UserShellId::new("ush-replace"),
+                stream: "stdout".into(),
+                chunk: chunk.into(),
+            }),
+        );
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutputReplaced {
+            execution_id: leveler_core::UserShellId::new("ush-replace"),
+            output_tail: "1\n2\n3\n".into(),
+            output_truncated: true,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-replace"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    let idx = s
+        .transcript
+        .user_shell_index(&leveler_core::UserShellId::new("ush-replace"))
+        .unwrap();
+    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
+        panic!("shell block expected");
+    };
+    assert_eq!(shell.output, "1\n2\n3\n");
+    assert_eq!(
+        shell.output.matches("1\n").count(),
+        1,
+        "the replacement does not append a second copy"
+    );
+    assert!(shell.output_truncated);
+}
+
+/// `/copy output` copies the exact capture the runtime announced, never the
+/// painted rows. The retained text is only the fallback when no capture
+/// exists and the result was never truncated.
+#[test]
+fn copy_output_prefers_the_complete_capture() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-copy", "printf '│ x'");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellCaptureReady {
+            execution_id: leveler_core::UserShellId::new("ush-copy"),
+            directory: "/state/shell-output/s1/ush-copy".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-copy"),
+            stream: "stdout".into(),
+            chunk: "clean │ line\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-copy"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    s.composer.replace("/copy output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::CopyUserShellOutput {
+            directory: Some(std::path::PathBuf::from("/state/shell-output/s1/ush-copy")),
+            retained: "clean │ line\n".into(),
+        }]
+    );
+}
+
+/// A truncated tail with no capture must not be copied as if it were the
+/// whole output.
+#[test]
+fn copy_output_refuses_a_truncated_tail_without_a_capture() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-cut", "seq 1 100");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-cut"),
+            stream: "stdout".into(),
+            chunk: "99\n100\n".into(),
+        }),
+    );
+    s.transcript
+        .mark_user_shell_output_truncated(&leveler_core::UserShellId::new("ush-cut"));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-cut"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    s.composer.replace("/copy output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.notification.is_some(), "the refusal is visible");
+}
+
+/// A running command has no final output to copy yet.
+#[test]
+fn copy_output_refuses_a_running_command() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-live", "sleep 30");
+    s.composer.replace("/copy output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.notification.is_some());
+}
+
+/// `/output` hands the pager the capture file itself: a 10 MiB result is read
+/// on demand, never loaded into the TUI.
+#[test]
+fn output_pages_the_capture_file_from_disk() {
+    let mut s = opened();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("combined.log"), "full output\n").unwrap();
+    shell_started(&mut s, "ush-page", "seq 1 1000000");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellCaptureReady {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            directory: dir.path().to_string_lossy().into_owned(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    s.composer.replace("/output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::OpenOutputPager {
+            source: leveler_tui::action::PagerSource::File(dir.path().join("combined.log")),
+        }]
+    );
+}
+
+/// A complete retained result without a capture is paged from temporary text.
+#[test]
+fn output_pages_a_complete_retained_result() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-page", "echo ok");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            stream: "stdout".into(),
+            chunk: "ok\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    s.composer.replace("/output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::OpenOutputPager {
+            source: leveler_tui::action::PagerSource::Text("ok\n".into()),
+        }]
+    );
+}
+
+/// A pruned capture with only a truncated tail must not be paged as complete.
+#[test]
+fn output_refuses_a_truncated_tail_after_its_capture_is_gone() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-page", "seq 1 1000000");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellCaptureReady {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            directory: "/definitely/not/here".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            stream: "stdout".into(),
+            chunk: "TAIL\n".into(),
+        }),
+    );
+    s.transcript
+        .mark_user_shell_output_truncated(&leveler_core::UserShellId::new("ush-page"));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-page"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    s.composer.replace("/output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.notification.is_some());
+}
+
 #[test]
 fn a_fast_local_command_renders_exactly_one_block() {
     let mut s = opened();
@@ -9270,9 +9506,9 @@ fn a_long_local_result_stays_reachable_at_every_terminal_size() {
             "{w}x{h}: a split wide glyph reached the terminal"
         );
         assert!(screen.contains('›'), "{w}x{h}: composer missing: {screen}");
-        if h >= 24 {
-            assert!(screen.contains("cargo test"), "{w}x{h}: {screen}");
-        }
+        // A finished record now opens in full. It can be taller than the
+        // viewport, so the command row above the tail is reached by the
+        // conversation's own scroll — never by a folded preview.
     }
     // At the shortest height the command is above the followed tail, and the
     // conversation's own scroll reaches it.
@@ -9381,7 +9617,7 @@ fn tab_reaches_a_running_user_shell_and_x_stops_it_inline() {
 }
 
 #[test]
-fn ctrl_o_expands_the_latest_user_shell_in_place() {
+fn ctrl_o_toggles_the_latest_user_shell_in_place() {
     let mut s = opened();
     shell_started(&mut s, "ush-o", "git diff");
     reduce(
@@ -9389,7 +9625,7 @@ fn ctrl_o_expands_the_latest_user_shell_in_place() {
         Action::Runtime(RuntimeEvent::UserShellOutput {
             execution_id: leveler_core::UserShellId::new("ush-o"),
             stream: "stdout".into(),
-            chunk: (1..=50).map(|n| format!("diff-line-{n:02}\n")).collect(),
+            chunk: (1..=3).map(|n| format!("diff-line-{n:02}\n")).collect(),
         }),
     );
     reduce(
@@ -9401,17 +9637,24 @@ fn ctrl_o_expands_the_latest_user_shell_in_place() {
             status: "success".into(),
         }),
     );
-    reduce(&mut s, ctrl('o'));
     let idx = s
         .transcript
         .user_shell_index(&leveler_core::UserShellId::new("ush-o"))
         .unwrap();
+    // A short finished record opens in full; Ctrl+O is the user's fold, so
+    // the first press closes it and the second opens it again.
+    reduce(&mut s, ctrl('o'));
     let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
         panic!("shell block expected");
     };
-    assert!(shell.expanded, "Ctrl+O opens the latest execution");
+    assert!(!shell.expanded, "Ctrl+O closes the auto-opened record");
+    reduce(&mut s, ctrl('o'));
+    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
+        panic!("shell block expected");
+    };
+    assert!(shell.expanded, "Ctrl+O opens the latest execution again");
     let screen = rendered(&mut s, 100, 40);
-    assert!(screen.contains("diff-line-50"), "{screen}");
+    assert!(screen.contains("diff-line-03"), "{screen}");
     assert_eq!(s.active_screen, Screen::Conversation);
 }
 
@@ -9429,6 +9672,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
             exit_code: Some(0),
             output_tail: "done\n".into(),
             output_truncated: false,
+            full_output: None,
             task_id: None,
         },
         leveler_client_protocol::UiUserShell {
@@ -9440,6 +9684,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
             exit_code: None,
             output_tail: String::new(),
             output_truncated: false,
+            full_output: None,
             task_id: None,
         },
     ];
@@ -12531,7 +12776,7 @@ fn output_stream_order_and_carriage_returns_survive() {
 }
 
 #[test]
-fn a_short_result_opens_in_full_and_a_long_one_folds() {
+fn a_short_shell_result_opens_and_a_long_one_keeps_the_named_fold() {
     let mut s = opened();
     shell_started(&mut s, "ush-short", "printf ok");
     reduce(
@@ -12585,7 +12830,7 @@ fn a_short_result_opens_in_full_and_a_long_one_folds() {
         .unwrap();
     assert!(
         matches!(&s.transcript.items()[idx], TranscriptItem::UserShell(b) if !b.expanded),
-        "a long result stays folded"
+        "a long result keeps the established fold instead of burying the conversation"
     );
 }
 

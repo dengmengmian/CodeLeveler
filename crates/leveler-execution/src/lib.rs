@@ -63,7 +63,7 @@ pub use clarify::{
     ClarifyOutcome,
 };
 pub use command::{
-    CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, ProcessError,
+    CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, OutputTee, ProcessError,
     ProcessHandoff, ProcessIdentity, ProcessOutput, ProcessRequest, StreamOutcome,
     ToolExecutionStatus, VerifyNetworkPolicy, credential_env_names, is_credential_env_name,
     looks_like_absolute_path_arg, process_request_for_verify_check, seal_read_denials,

@@ -506,6 +506,13 @@ pub struct UiUserShell {
     /// True when `output_tail` dropped earlier output.
     #[serde(default)]
     pub output_truncated: bool,
+    /// The directory holding this execution's complete raw capture
+    /// (`stdout.log`, `stderr.log`, `combined.log`) once the copy finished.
+    /// A client reads the copy for "Copy Output"; it never parses display
+    /// text to find it. `None` while the execution runs (the capture is still
+    /// being written) or when the host could not complete one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output: Option<String>,
     /// The registry task id when this execution runs in the background. The
     /// same execution id and process remain; this is the link to the background
     /// task list, not a second execution.

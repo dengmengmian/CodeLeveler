@@ -972,6 +972,37 @@ fn dispatch_effects(
                     }
                 }
             }
+            Effect::CopyUserShellOutput {
+                directory,
+                retained,
+            } => {
+                // File read + clipboard write can both block (network
+                // clipboard, tmux). Keep them off the paint loop.
+                let tx = completion_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let text = match directory {
+                            Some(directory) => {
+                                crate::shell_render::read_complete_capture(&directory)?
+                            }
+                            None => crate::shell_render::copy_text(&retained),
+                        };
+                        if text.is_empty() {
+                            return Err("输出为空，未写入剪贴板".to_string());
+                        }
+                        let count = text.chars().count();
+                        let receipt = crate::clipboard::copy(&text)?;
+                        Ok((receipt, count))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                    let _ = tx.send(Action::UserShellOutputCopied(result));
+                });
+            }
+            Effect::OpenOutputPager { source } => {
+                let result = run_output_pager(alt, stdout, source);
+                let _ = completion_tx.send(Action::OutputPagerFinished(result));
+            }
         }
     }
 }
@@ -992,6 +1023,27 @@ fn run_external_editor(
     let result = crate::external_editor::edit_text(text);
     // Restore even when the edit failed: the alternative is a terminal left in
     // cooked mode with the UI still running.
+    if let Err(e) = crate::external_editor::resume_terminal(stdout) {
+        return Err(format!("终端未能恢复：{e}"));
+    }
+    result
+}
+
+/// Hand the terminal to `$PAGER` for the full output, then take it back.
+///
+/// A capture is passed as a path so the pager reads it on demand; only a
+/// complete retained result without a capture is written to a temporary file.
+fn run_output_pager(
+    alt: &mut Option<Terminal<CrosstermBackend<Stdout>>>,
+    stdout: &mut Stdout,
+    source: crate::action::PagerSource,
+) -> Result<(), String> {
+    *alt = None;
+    crate::external_editor::suspend_terminal(stdout).map_err(|e| format!("无法让出终端：{e}"))?;
+    let result = match source {
+        crate::action::PagerSource::File(path) => crate::external_editor::view_file(&path),
+        crate::action::PagerSource::Text(text) => crate::external_editor::view_text(&text),
+    };
     if let Err(e) = crate::external_editor::resume_terminal(stdout) {
         return Err(format!("终端未能恢复：{e}"));
     }

@@ -101,6 +101,196 @@ pub struct ProcessRequest {
 /// Default per-stream output cap (1 MiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
+/// Where a streamed run writes its exact raw bytes.
+///
+/// The in-memory capture is deliberately capped; this sink is how a caller
+/// that must offer the COMPLETE output (the user shell) keeps every byte
+/// without an unbounded buffer. One file per stream preserves each stream's
+/// bytes exactly; the order within a stream is the order the pipe delivered.
+/// A `<stream>.meta.json` sidecar records the byte count and whether the copy
+/// finished, so an incomplete capture is visible, never claimed as complete.
+#[derive(Debug, Clone)]
+pub struct OutputTee {
+    pub directory: PathBuf,
+}
+
+/// The combined copy of both streams, in the order the readers observed the
+/// bytes. Two OS pipes have no global order of their own; this copy records
+/// the order the runtime actually delivered, and stays complete even when the
+/// bounded live channel dropped chunks.
+struct CombinedTee {
+    log: Option<std::io::BufWriter<std::fs::File>>,
+    meta: PathBuf,
+    bytes: u64,
+    error: Option<String>,
+    /// Readers still writing. The last one flushes and writes the sidecar, so
+    /// neither reader can close the file under the other.
+    writers: usize,
+}
+
+impl CombinedTee {
+    fn open(directory: &std::path::Path, writers: usize) -> Self {
+        let path = directory.join("combined.log");
+        let meta = directory.join("combined.meta.json");
+        let created =
+            std::fs::create_dir_all(directory).and_then(|()| std::fs::File::create(&path));
+        match created {
+            Ok(file) => Self {
+                log: Some(std::io::BufWriter::new(file)),
+                meta,
+                bytes: 0,
+                error: None,
+                writers,
+            },
+            Err(error) => Self {
+                log: None,
+                meta,
+                bytes: 0,
+                error: Some(format!("could not create {}: {error}", path.display())),
+                writers,
+            },
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        use std::io::Write;
+        let Some(log) = self.log.as_mut() else {
+            return;
+        };
+        match log.write_all(bytes) {
+            Ok(()) => self.bytes = self.bytes.saturating_add(bytes.len() as u64),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn finish_one(&mut self) {
+        self.writers = self.writers.saturating_sub(1);
+        if self.writers > 0 {
+            return;
+        }
+        use std::io::Write;
+        if let Some(log) = self.log.as_mut()
+            && let Err(error) = log.flush()
+            && self.error.is_none()
+        {
+            self.error = Some(error.to_string());
+        }
+        let complete = self.error.is_none();
+        let error = self
+            .error
+            .as_deref()
+            .map(|e| {
+                format!(
+                    ", \"error\": {}",
+                    serde_json::to_string(e).unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
+        let meta = format!(
+            "{{\"stream\":\"combined\",\"bytes\":{},\"complete\":{}{}}}\n",
+            self.bytes, complete, error
+        );
+        let _ = std::fs::write(&self.meta, meta);
+    }
+}
+
+/// What one pipe reader is asked to capture.
+struct StreamTee {
+    directory: PathBuf,
+    stream: &'static str,
+    combined: std::sync::Arc<std::sync::Mutex<CombinedTee>>,
+}
+
+/// One stream reader's view of the tee: its own exact stream plus the shared
+/// combined copy.
+struct TeeCapture {
+    log: Option<std::io::BufWriter<std::fs::File>>,
+    meta: PathBuf,
+    stream: &'static str,
+    bytes: u64,
+    error: Option<String>,
+    combined: std::sync::Arc<std::sync::Mutex<CombinedTee>>,
+}
+
+impl TeeCapture {
+    fn open(
+        directory: &std::path::Path,
+        stream: &'static str,
+        combined: std::sync::Arc<std::sync::Mutex<CombinedTee>>,
+    ) -> Self {
+        let meta = directory.join(format!("{stream}.meta.json"));
+        let path = directory.join(format!("{stream}.log"));
+        let opened = std::fs::create_dir_all(directory).and_then(|()| std::fs::File::create(&path));
+        match opened {
+            Ok(file) => Self {
+                log: Some(std::io::BufWriter::new(file)),
+                meta,
+                stream,
+                bytes: 0,
+                error: None,
+                combined,
+            },
+            Err(error) => Self {
+                log: None,
+                meta,
+                stream,
+                bytes: 0,
+                error: Some(format!("could not create {}: {error}", path.display())),
+                combined,
+            },
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if let Ok(mut combined) = self.combined.lock() {
+            combined.write(bytes);
+        }
+        if self.error.is_some() {
+            return;
+        }
+        use std::io::Write;
+        let Some(log) = self.log.as_mut() else {
+            return;
+        };
+        match log.write_all(bytes) {
+            Ok(()) => self.bytes = self.bytes.saturating_add(bytes.len() as u64),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn finish(mut self) {
+        if let Ok(mut combined) = self.combined.lock() {
+            combined.finish_one();
+        }
+        use std::io::Write;
+        if let Some(log) = self.log.as_mut()
+            && let Err(error) = log.flush()
+            && self.error.is_none()
+        {
+            self.error = Some(error.to_string());
+        }
+        let complete = self.error.is_none();
+        let error = self
+            .error
+            .as_deref()
+            .map(|e| {
+                format!(
+                    ", \"error\": {}",
+                    serde_json::to_string(e).unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
+        let meta = format!(
+            "{{\"stream\":\"{}\",\"bytes\":{},\"complete\":{}{}}}\n",
+            self.stream, self.bytes, complete, error
+        );
+        let _ = std::fs::write(&self.meta, meta);
+    }
+}
+
 fn default_process_network_scope() -> crate::NetworkScope {
     crate::NetworkScope::Internet
 }
@@ -1114,6 +1304,21 @@ impl CommandRunner {
         chunks: tokio::sync::mpsc::Sender<OutputChunk>,
         handoff: CancellationToken,
     ) -> StreamOutcome {
+        self.run_streaming_handoff_tee(request, cancellation, chunks, handoff, None)
+            .await
+    }
+
+    /// [`Self::run_streaming_handoff`] with an exact on-disk copy of both raw
+    /// streams. The copy continues across a handoff because it lives in the
+    /// same reader tasks the new owner receives.
+    pub async fn run_streaming_handoff_tee(
+        &self,
+        request: ProcessRequest,
+        cancellation: CancellationToken,
+        chunks: tokio::sync::mpsc::Sender<OutputChunk>,
+        handoff: CancellationToken,
+        tee: Option<OutputTee>,
+    ) -> StreamOutcome {
         let process = match self.spawn(&request).await {
             Ok(process) => process,
             Err(error) => return StreamOutcome::Completed(Err(error)),
@@ -1126,6 +1331,7 @@ impl CommandRunner {
             Some(chunks),
             Some(handoff),
             started,
+            tee,
         )
         .await
     }
@@ -1695,6 +1901,7 @@ async fn drive_to_completion(
         chunks,
         None,
         std::time::Instant::now(),
+        None,
     )
     .await
     {
@@ -1723,10 +1930,26 @@ async fn drive_to_completion_inner(
     chunks: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
     handoff: Option<CancellationToken>,
     started: std::time::Instant,
+    tee: Option<OutputTee>,
 ) -> StreamOutcome {
     let mut stdout_pipe = process.take_stdout();
     let mut stderr_pipe = process.take_stderr();
     let cap = request.max_output_bytes;
+    // Both readers share one combined copy, finalized by whichever finishes
+    // last. The per-stream captures stay independent and exact.
+    let combined = tee.as_ref().map(|tee| {
+        std::sync::Arc::new(std::sync::Mutex::new(CombinedTee::open(&tee.directory, 2)))
+    });
+    let stdout_tee = tee.as_ref().map(|tee| StreamTee {
+        directory: tee.directory.clone(),
+        stream: "stdout",
+        combined: combined.clone().expect("combined tee"),
+    });
+    let stderr_tee = tee.as_ref().map(|tee| StreamTee {
+        directory: tee.directory.clone(),
+        stream: "stderr",
+        combined: combined.expect("combined tee"),
+    });
     // A shared deadline that unblocks the pipe readers once the child has
     // exited (see below), so a detached grandchild holding the write end can't
     // wedge us on an EOF that never comes.
@@ -1734,12 +1957,12 @@ async fn drive_to_completion_inner(
     let stdout_task = {
         let drain = drain.clone();
         let tx = chunks.clone().map(|tx| (OutputStream::Stdout, tx));
-        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx).await })
+        tokio::spawn(async move { read_capped(&mut stdout_pipe, cap, drain, tx, stdout_tee).await })
     };
     let stderr_task = {
         let drain = drain.clone();
         let tx = chunks.map(|tx| (OutputStream::Stderr, tx));
-        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
+        tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx, stderr_tee).await })
     };
 
     let handoff_wait = handoff.clone().unwrap_or_default();
@@ -2082,10 +2305,19 @@ async fn read_capped(
     cap: usize,
     drain: CancellationToken,
     chunks: Option<(OutputStream, tokio::sync::mpsc::Sender<OutputChunk>)>,
+    tee: Option<StreamTee>,
 ) -> (String, u64, u64) {
     let Some(p) = pipe else {
+        // A stream that was never piped still counts as one finished writer,
+        // or the combined sidecar would wait for a reader that does not exist.
+        if let Some(tee) = tee
+            && let Ok(mut combined) = tee.combined.lock()
+        {
+            combined.finish_one();
+        }
         return (String::new(), 0, 0);
     };
+    let mut tee = tee.map(|tee| TeeCapture::open(&tee.directory, tee.stream, tee.combined));
     let head_cap = cap / 2;
     let tail_cap = cap - head_cap;
     let mut head: Vec<u8> = Vec::new();
@@ -2105,6 +2337,12 @@ async fn read_capped(
         match read {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                // The complete-output copy is written BEFORE the bounded
+                // buffer and the lossy live channel: this is the byte stream
+                // the user may need to recover in full.
+                if let Some(tee) = tee.as_mut() {
+                    tee.write(&buf[..n]);
+                }
                 if let Some((stream, tx)) = &chunks {
                     // Live observer: forward the raw chunk before the
                     // retained-buffer capping below. A closed receiver just
@@ -2132,6 +2370,9 @@ async fn read_capped(
                 }
             }
         }
+    }
+    if let Some(tee) = tee {
+        tee.finish();
     }
     if dropped == 0 {
         head.extend(tail);
@@ -2555,7 +2796,7 @@ mod tests {
         });
         let drain = CancellationToken::new();
         drain.cancel();
-        let _ = read_capped(&mut pipe, 1024, drain, None).await;
+        let _ = read_capped(&mut pipe, 1024, drain, None, None).await;
 
         assert_eq!(
             reads.load(Ordering::Relaxed),
@@ -6247,6 +6488,116 @@ mod streaming_tests {
                 panic!("cancellation must never hand a process to a longer-lived owner")
             }
         }
+    }
+
+    /// The exact capture keeps every byte of each stream, plus a combined copy
+    /// in the order the readers observed it. The combined copy is what a
+    /// complete "Copy Output" consumes: the bounded in-memory tail may have
+    /// dropped bytes, and concatenating the two streams afterwards would
+    /// invent an ordering the process never produced.
+    #[tokio::test]
+    async fn the_tee_keeps_each_stream_exact_and_a_combined_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "yes out | head -c 300000; printf 'err-line\\n' 1>&2".into(),
+            ],
+            std::env::temp_dir(),
+        );
+        request.max_output_bytes = 4096;
+        let outcome = CommandRunner::new()
+            .run_streaming_handoff_tee(
+                request,
+                CancellationToken::new(),
+                tx,
+                CancellationToken::new(),
+                Some(OutputTee {
+                    directory: directory.path().to_path_buf(),
+                }),
+            )
+            .await;
+        let StreamOutcome::Completed(Ok(output)) = outcome else {
+            panic!("the process must complete successfully");
+        };
+        assert!(
+            output.live_dropped_bytes > 0,
+            "the live receiver was not drained, so bytes must have been dropped"
+        );
+
+        let stdout = std::fs::read(directory.path().join("stdout.log")).expect("stdout capture");
+        let stderr = std::fs::read(directory.path().join("stderr.log")).expect("stderr capture");
+        let combined =
+            std::fs::read(directory.path().join("combined.log")).expect("combined capture");
+        assert_eq!(stdout.len(), 300_000, "every stdout byte is on disk");
+        assert!(stdout.starts_with(b"out\n"), "capture starts at byte zero");
+        assert_eq!(stderr, b"err-line\n");
+        assert_eq!(
+            combined.len(),
+            stdout.len() + stderr.len(),
+            "the combined copy loses no byte from either stream"
+        );
+        let combined_text = String::from_utf8_lossy(&combined);
+        assert!(
+            combined_text.contains("err-line\n"),
+            "stderr is present in the combined copy"
+        );
+        for name in ["stdout.meta.json", "stderr.meta.json", "combined.meta.json"] {
+            let meta = std::fs::read_to_string(directory.path().join(name)).expect(name);
+            assert!(
+                meta.contains("\"complete\":true"),
+                "{name} must report a finished copy: {meta}"
+            );
+        }
+    }
+
+    /// 10 MiB is the product's stated worst case. The exact capture must hold
+    /// every byte even though the in-memory result is capped far below it.
+    #[tokio::test]
+    async fn the_tee_captures_ten_megabytes_without_dropping() {
+        const SIZE: usize = 10 * 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let consumer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                format!(
+                    "yes 'FILL-0123456789-abcdefghijklmnopqrstuvwxyz' | head -c {SIZE}; \
+                     printf '\\nTAIL-10M\\n'; true"
+                ),
+            ],
+            std::env::temp_dir(),
+        );
+        let started = std::time::Instant::now();
+        let outcome = CommandRunner::new()
+            .run_streaming_handoff_tee(
+                request,
+                CancellationToken::new(),
+                tx,
+                CancellationToken::new(),
+                Some(OutputTee {
+                    directory: directory.path().to_path_buf(),
+                }),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        eprintln!("10 MiB tee capture took {elapsed:?}");
+        consumer.await.expect("live consumer");
+        let StreamOutcome::Completed(Ok(output)) = outcome else {
+            panic!("the process must complete successfully");
+        };
+        assert!(output.truncated, "the in-memory result stays capped");
+        let stdout = std::fs::read(directory.path().join("stdout.log")).expect("stdout capture");
+        assert_eq!(stdout.len(), SIZE + "TAIL-10M\n".len() + 1);
+        assert!(stdout.ends_with(b"\nTAIL-10M\n"));
+        let combined =
+            std::fs::read(directory.path().join("combined.log")).expect("combined capture");
+        assert_eq!(combined.len(), stdout.len());
+        assert!(combined.ends_with(b"\nTAIL-10M\n"));
     }
 
     /// Cancellation during streaming kills the tree and returns Cancelled.

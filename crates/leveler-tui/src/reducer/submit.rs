@@ -566,6 +566,8 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "web" => start_web(state),
         "remote" => start_remote(state, false),
         "remote-loc" => start_remote(state, true),
+        "copy" => copy_slash(state, command),
+        "output" => output_slash(state),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
         "restore" => {
@@ -624,6 +626,177 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             Vec::new()
         }
     }
+}
+
+/// `/copy output|command|selection`.
+///
+/// Both output paths copy the authored content, never painted rows: the
+/// command is the exact string the user ran, and the output comes from the
+/// raw capture (or the complete retained text when it was never capped). A
+/// truncated tail is refused rather than silently passed off as the whole
+/// result.
+fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    use crate::transcript::{TranscriptItem, UserShellStatus};
+    let arg = command.split_whitespace().nth(1).unwrap_or("");
+    let latest = state
+        .transcript
+        .items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::UserShell(shell) => Some((
+                shell.status,
+                shell.command.clone(),
+                shell.output.clone(),
+                shell.output_truncated,
+                shell.full_output.clone(),
+            )),
+            _ => None,
+        });
+    match arg {
+        "command" => {
+            let Some((_, command, _, _, _)) = latest else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_no_shell.to_string(),
+                });
+                return Vec::new();
+            };
+            copy_now(state, &command)
+        }
+        "output" => {
+            let Some((status, _, retained, truncated, full_output)) = latest else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_no_shell.to_string(),
+                });
+                return Vec::new();
+            };
+            if matches!(
+                status,
+                UserShellStatus::Running | UserShellStatus::Background
+            ) {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_still_running.to_string(),
+                });
+                return Vec::new();
+            }
+            if let Some(directory) = full_output {
+                return vec![Effect::CopyUserShellOutput {
+                    directory: Some(std::path::PathBuf::from(directory)),
+                    retained,
+                }];
+            }
+            if truncated {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_output_unavailable.to_string(),
+                });
+                return Vec::new();
+            }
+            vec![Effect::CopyUserShellOutput {
+                directory: None,
+                retained,
+            }]
+        }
+        "selection" => {
+            crate::conversation::interaction::ensure_plain(state);
+            let text = crate::selection::extract_selected_text_with_layout(
+                &state.conv.plain,
+                &state.conv.plain_layout,
+                &state.conv.selection,
+            );
+            if text.is_empty() {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_selection_empty.to_string(),
+                });
+                return Vec::new();
+            }
+            copy_now(state, &text)
+        }
+        _ => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().copy_usage.to_string(),
+            });
+            Vec::new()
+        }
+    }
+}
+
+/// `/output`: page the latest command's complete output.
+///
+/// A capture is handed to the pager as a file path, so even a 10 MiB result is
+/// read on demand. Only a complete result that never had a capture is written
+/// to a temporary file. A truncated tail with no capture is refused.
+fn output_slash(state: &mut AppState) -> Vec<Effect> {
+    use crate::action::PagerSource;
+    use crate::transcript::TranscriptItem;
+    let latest = state
+        .transcript
+        .items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::UserShell(shell) => Some((
+                shell.output.clone(),
+                shell.output_truncated,
+                shell.full_output.clone(),
+            )),
+            _ => None,
+        });
+    let Some((retained, truncated, full_output)) = latest else {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().copy_no_shell.to_string(),
+        });
+        return Vec::new();
+    };
+    if let Some(directory) = full_output {
+        let path = std::path::PathBuf::from(directory).join("combined.log");
+        if path.is_file() {
+            return vec![Effect::OpenOutputPager {
+                source: PagerSource::File(path),
+            }];
+        }
+        // The capture was pruned or removed. Fall through only when the
+        // retained text still holds the whole result.
+    }
+    if truncated {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().copy_output_unavailable.to_string(),
+        });
+        return Vec::new();
+    }
+    vec![Effect::OpenOutputPager {
+        source: PagerSource::Text(crate::shell_render::copy_text(&retained)),
+    }]
+}
+
+/// Copy a small, already-clean string (a command, or a selection). Output
+/// captures go through [`Effect::CopyUserShellOutput`] so a large file never
+/// blocks this loop.
+fn copy_now(state: &mut AppState, text: &str) -> Vec<Effect> {
+    match crate::selection::copy_to_clipboard(text) {
+        Ok(receipt) if !text.is_empty() => {
+            let count = text.chars().count();
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: super::clipboard_notice(&receipt, count, state.locale),
+            });
+        }
+        Ok(_) => {}
+        Err(message) => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message,
+            });
+        }
+    }
+    Vec::new()
 }
 
 /// `/new`: start a fresh conversation.

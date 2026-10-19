@@ -122,6 +122,21 @@ pub enum Action {
     CleanScanned(Result<crate::clean::CleanPlanView, String>),
     /// A safe cleanup finished: what it reclaimed, or why it could not run.
     CleanRan(Result<crate::clean::CleanResultView, String>),
+    /// A user-shell "Copy Output" finished: the delivery receipt and copied
+    /// character count, or why the copy did not happen.
+    UserShellOutputCopied(Result<(crate::clipboard::CopyReceipt, usize), String>),
+    /// The full-output pager exited, or could not be started. The terminal has
+    /// already been restored by the event loop.
+    OutputPagerFinished(Result<(), String>),
+}
+
+/// Where a full-output pager reads from. A capture stays on disk (10 MiB must
+/// not be loaded into the TUI); a complete retained result is written to a
+/// temporary file beside it so the pager sees the same plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagerSource {
+    File(std::path::PathBuf),
+    Text(String),
 }
 
 /// Injected at startup by the CLI: local storage cleanup for `/clean`.
@@ -194,6 +209,20 @@ pub enum Effect {
     /// Run the safe cleanup over the plan the scan produced. Blocking; folded
     /// back as [`Action::CleanRan`]. Only `Safety::Safe` items are removed.
     RunCleanSafe,
+    /// Read a user shell's exact on-disk capture (or its retained output when
+    /// no capture exists) off-thread and copy it. Multi-megabyte output must
+    /// not freeze the event loop or the live animation. Folded back as
+    /// [`Action::UserShellOutputCopied`].
+    CopyUserShellOutput {
+        directory: Option<std::path::PathBuf>,
+        /// The retained text, used only when the execution has no complete
+        /// capture. The reducer never sends this when the retained text is
+        /// itself a truncated tail.
+        retained: String,
+    },
+    /// Suspend the TUI and open the complete output in `$PAGER` (default
+    /// `less -R`). A capture is paged from disk, never loaded whole.
+    OpenOutputPager { source: PagerSource },
     /// Tear down the UI and exit.
     Quit,
 }

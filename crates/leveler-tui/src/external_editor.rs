@@ -45,6 +45,51 @@ fn configured_editor() -> String {
     editor_command_line(env.var("VISUAL").as_deref(), env.var("EDITOR").as_deref())
 }
 
+/// Fallback pager. `less -R` passes ANSI colour through; `more` is the one
+/// pager every Windows install has.
+#[cfg(windows)]
+const DEFAULT_PAGER: &str = "more";
+#[cfg(not(windows))]
+const DEFAULT_PAGER: &str = "less -R";
+
+/// `$PAGER` when set, otherwise the platform default. The value is a shell
+/// command line, exactly like `$EDITOR`, so `PAGER="less -S"` works.
+fn pager_command_line(pager: Option<&str>) -> String {
+    pager
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PAGER)
+        .to_string()
+}
+
+fn configured_pager() -> String {
+    pager_command_line(leveler_core::environment().var("PAGER").as_deref())
+}
+
+/// Page a real file. The pager reads it on demand, so a 10 MiB capture never
+/// enters the TUI's address space.
+pub fn view_file(path: &Path) -> Result<(), String> {
+    let command_line = configured_pager();
+    let status = run_editor(&command_line, path)?;
+    if status {
+        Ok(())
+    } else {
+        Err(format!("`{command_line}` 以非零状态退出"))
+    }
+}
+
+/// Page text that does not have a file of its own (a complete retained
+/// result). The temporary directory lives until the pager exits.
+pub fn view_text(text: &str) -> Result<(), String> {
+    let dir = tempfile::Builder::new()
+        .prefix("leveler-output-")
+        .tempdir()
+        .map_err(|e| format!("无法创建临时目录：{e}"))?;
+    let path = dir.path().join("OUTPUT.txt");
+    std::fs::write(&path, text).map_err(|e| format!("无法写入临时文件：{e}"))?;
+    view_file(&path)
+}
+
 /// Open `text` in the user's editor and return what they left behind.
 ///
 /// Blocks until the editor exits. `Err` means the editor could not be run or
@@ -160,5 +205,12 @@ mod tests {
     #[test]
     fn nothing_configured_falls_back_to_a_guaranteed_editor() {
         assert_eq!(editor_command_line(None, None), DEFAULT_EDITOR);
+    }
+
+    #[test]
+    fn pager_uses_the_configured_command_line_or_the_platform_default() {
+        assert_eq!(pager_command_line(Some("most")), "most");
+        assert_eq!(pager_command_line(Some("  ")), DEFAULT_PAGER);
+        assert_eq!(pager_command_line(None), DEFAULT_PAGER);
     }
 }

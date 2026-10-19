@@ -899,6 +899,7 @@ async fn persist_background_user_shell_finished(
     status: String,
     output_tail: String,
     output_truncated: bool,
+    full_output: Option<String>,
 ) {
     let Ok(db) = app.open_database().await else {
         return;
@@ -930,6 +931,7 @@ async fn persist_background_user_shell_finished(
                 status,
                 output_tail,
                 output_truncated,
+                full_output,
             },
             &mut forward,
         )
@@ -1366,19 +1368,60 @@ impl InProcessRuntimeClient {
                             leveler_execution::BackgroundTaskStatus::Running
                             | leveler_execution::BackgroundTaskStatus::Killing => "unknown",
                         };
-                        let shell_output = task.log.clone();
-                        let shell_truncated = task.log_truncated;
+                        let registry_output = task.log.clone();
+                        let registry_truncated = task.log_truncated;
                         if let Some(execution_id) = background_user_shells
                             .execution_for_task(&background_session_id, &task.id)
                         {
-                            if let Some(shell) = background_user_shells.finish_background(
+                            // The registry log tags every chunk with its
+                            // stream. The user-shell record is raw source
+                            // output, so a complete capture replaces it; the
+                            // registry log is only the fallback when no capture
+                            // finished.
+                            let capture = background_app.upgrade().and_then(|app| {
+                                crate::user_shell::complete_capture_tail(
+                                    &crate::user_shell::output_directory(
+                                        &app.layout.state_dir,
+                                        &background_session_id,
+                                        &execution_id,
+                                    ),
+                                    crate::user_shell::OUTPUT_TAIL_CAP,
+                                )
+                            });
+                            let (shell_output, shell_truncated) = match capture {
+                                Some((text, truncated)) => (text, truncated),
+                                None => (registry_output, registry_truncated),
+                            };
+                            let finished = background_user_shells.finish_background(
                                 &background_session_id,
                                 &task.id,
                                 task.exit_code,
                                 shell_status,
                                 task.duration_ms,
                                 Some(&shell_output),
-                            ) {
+                            );
+                            if let Some(shell) = &finished {
+                                // The live background view may have dropped
+                                // chunks too; replace it with the retained
+                                // record before the terminal event.
+                                let _ =
+                                    background_sender.send(RuntimeEvent::UserShellOutputReplaced {
+                                        execution_id: execution_id.clone(),
+                                        output_tail: shell.output_tail.clone(),
+                                        output_truncated: shell.output_truncated,
+                                    });
+                                // The registry's retained log is capped. The
+                                // exact capture lives beside it; announce it
+                                // as a structured fact rather than injecting a
+                                // path line into the output text.
+                                if let Some(directory) = &shell.full_output {
+                                    let _ = background_sender.send(
+                                        RuntimeEvent::UserShellCaptureReady {
+                                            execution_id: execution_id.clone(),
+                                            directory: directory.clone(),
+                                        },
+                                    );
+                                }
                                 let _ = background_sender.send(RuntimeEvent::UserShellExited {
                                     execution_id: execution_id.clone(),
                                     exit_code: shell.exit_code,
@@ -1391,6 +1434,9 @@ impl InProcessRuntimeClient {
                                 let exit_code = task.exit_code;
                                 let duration_ms = task.duration_ms;
                                 let status = shell_status.to_string();
+                                let full_output = finished
+                                    .as_ref()
+                                    .and_then(|shell| shell.full_output.clone());
                                 tokio::spawn(async move {
                                     persist_background_user_shell_finished(
                                         app,
@@ -1401,6 +1447,7 @@ impl InProcessRuntimeClient {
                                         status,
                                         shell_output,
                                         shell_truncated,
+                                        full_output,
                                     )
                                     .await;
                                 });
@@ -1907,7 +1954,7 @@ impl InProcessRuntimeClient {
                 let db = match app.open_database().await {
                     Ok(db) => db,
                     Err(error) => {
-                        store.finish(&session_id, &id, None, "failed", None);
+                        store.finish(&session_id, &id, None, "failed", None, None);
                         active.finish(&admission);
                         let _ = events.send(RuntimeEvent::Notification {
                             level: NotificationLevel::Error,
@@ -1930,7 +1977,7 @@ impl InProcessRuntimeClient {
                 let token = match fenced {
                     Ok(token) => token,
                     Err(error) => {
-                        store.finish(&session_id, &id, None, "failed", None);
+                        store.finish(&session_id, &id, None, "failed", None, None);
                         active.finish(&admission);
                         let _ = events.send(RuntimeEvent::Notification {
                             level: NotificationLevel::Error,
@@ -1954,13 +2001,28 @@ impl InProcessRuntimeClient {
                 let shell_cwd = request.cwd.clone();
                 let shell_program = command_text.clone();
                 let runner_for_resume = runner.clone();
+                // The in-memory tail is bounded by design. This directory is
+                // the exact byte copy that makes a capped result still
+                // completely retrievable, before and after a background handoff.
+                let tee_directory = crate::user_shell::prepare_output_directory(
+                    &app.layout.state_dir,
+                    &session_id,
+                    &id,
+                );
+                let run_tee = tee_directory.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let mut run = tokio::spawn({
                     let cancel = cancel.clone();
                     let handoff = handoff.clone();
                     async move {
                         runner
-                            .run_streaming_handoff(request, cancel, tx, handoff)
+                            .run_streaming_handoff_tee(
+                                request,
+                                cancel,
+                                tx,
+                                handoff,
+                                Some(leveler_execution::OutputTee { directory: run_tee }),
+                            )
                             .await
                     }
                 });
@@ -2042,12 +2104,14 @@ impl InProcessRuntimeClient {
                         let link_session = session_id.clone();
                         let link_id = id.clone();
                         let link_slot = moved_slot.clone();
+                        let capture_dir = tee_directory.clone();
                         let on_adopted: Arc<dyn Fn(&str) + Send + Sync> =
                             Arc::new(move |task_id: &str| {
                                 let moved = link_store.background(
                                     &link_session,
                                     &link_id,
                                     task_id.to_string(),
+                                    capture_dir.clone(),
                                 );
                                 let _ = link_events.send(RuntimeEvent::UserShellBackgrounded {
                                     execution_id: link_id.clone(),
@@ -2188,22 +2252,6 @@ impl InProcessRuntimeClient {
                     && output.truncated
                 {
                     store.mark_output_truncated(&session_id, &id);
-                    let note = format!(
-                        "\n[output truncated; at least {} bytes omitted]\n",
-                        output.dropped_bytes
-                    );
-                    store.append_output(&session_id, &id, &note);
-                    let _ = log
-                        .append(
-                            None,
-                            leveler_engine::EngineEvent::UserShellOutput {
-                                execution_id: id.clone(),
-                                stream: "stderr".to_string(),
-                                chunk: note,
-                            },
-                            &mut forward,
-                        )
-                        .await;
                 }
                 let exit_code = match &result {
                     Ok(output) => output.exit_code,
@@ -2224,14 +2272,42 @@ impl InProcessRuntimeClient {
                     .foreground_output(&session_id, &id)
                     .unwrap_or_default();
                 let output_tail = authoritative.clone().unwrap_or(retained_tail);
-                let output_truncated = retained_truncated || authoritative.is_some();
+                // A live-channel drop alone is not truncation: the authoritative
+                // capture may still hold every byte. Only a capture that dropped
+                // its middle, or a tail longer than the store can retain, is
+                // reported as truncated.
+                let capture_dropped = match &result {
+                    Ok(output) => output.dropped_bytes > output.live_dropped_bytes,
+                    Err(_) => false,
+                };
+                let output_truncated = retained_truncated
+                    || authoritative.as_ref().is_some_and(|text| {
+                        capture_dropped || text.len() > crate::user_shell::OUTPUT_TAIL_CAP
+                    });
+                if authoritative.is_some() {
+                    // The live channel dropped bytes. Replace the client's
+                    // accumulated chunks with the runtime's real view before
+                    // the terminal event, so the finished record is not a
+                    // hole-punched stream.
+                    let _ = events.send(RuntimeEvent::UserShellOutputReplaced {
+                        execution_id: id.clone(),
+                        output_tail: output_tail.clone(),
+                        output_truncated,
+                    });
+                }
+                // The complete capture is a separate fact. It is advertised
+                // only when every stream's sidecar says the copy finished;
+                // never as a path line mixed into the output text.
+                let full_output = crate::user_shell::complete_output_directory(&tee_directory);
+                let finish_tail = authoritative.as_ref().map(|_| output_tail.as_str());
                 let duration_ms = store
                     .finish(
                         &session_id,
                         &id,
                         exit_code,
                         status,
-                        authoritative.as_deref(),
+                        finish_tail,
+                        full_output.clone(),
                     )
                     .unwrap_or(0);
                 // Release the session BEFORE the terminal event is published.
@@ -2254,6 +2330,7 @@ impl InProcessRuntimeClient {
                             status: status.to_string(),
                             output_tail,
                             output_truncated,
+                            full_output,
                         },
                         &mut forward,
                     )

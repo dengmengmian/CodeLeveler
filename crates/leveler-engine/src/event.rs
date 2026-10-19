@@ -372,6 +372,12 @@ pub enum EngineEvent {
         output_tail: String,
         #[serde(default)]
         output_truncated: bool,
+        /// The directory holding this execution's complete raw capture
+        /// (`stdout.log`, `stderr.log`, `combined.log`) when the copy finished.
+        /// Local-sensitive like the output itself. Additive: older payloads
+        /// decode it as `None` and keep the bounded tail as their only record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_output: Option<String>,
     },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a
