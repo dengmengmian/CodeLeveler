@@ -730,6 +730,25 @@ fn path_cache() -> &'static Mutex<PathCache> {
     })
 }
 
+/// Whether `name` carries one of the Windows executable extensions.
+///
+/// Windows has no executable permission bit; `CreateProcess` decides by
+/// extension, and the shell completion must use the same rule (`PATHEXT`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn has_executable_extension(name: &str) -> bool {
+    let Some(extension) = std::path::Path::new(name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+    else {
+        return false;
+    };
+    let path_ext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    path_ext.split(';').any(|candidate| {
+        let candidate = candidate.trim().trim_start_matches('.');
+        !candidate.is_empty() && candidate.eq_ignore_ascii_case(extension)
+    })
+}
+
 /// Scan every directory in `path_var` for regular, executable files.
 fn scan_path_from(path_var: &str) -> Vec<String> {
     let mut executables = Vec::new();
@@ -744,6 +763,9 @@ fn scan_path_from(path_var: &str) -> Vec<String> {
             if !meta.is_file() {
                 continue;
             }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -751,9 +773,11 @@ fn scan_path_from(path_var: &str) -> Vec<String> {
                     continue;
                 }
             }
-            if let Ok(name) = entry.file_name().into_string() {
-                executables.push(name);
+            #[cfg(windows)]
+            if !has_executable_extension(&name) {
+                continue;
             }
+            executables.push(name);
         }
     }
     executables.sort_unstable();
@@ -1078,6 +1102,17 @@ mod tests {
     }
 
     #[test]
+    fn windows_executable_extensions_follow_pathext() {
+        // The helper is platform-neutral so this rule is exercised on every
+        // test host; the PATH scan itself applies it only on Windows.
+        assert!(has_executable_extension("tool.exe"));
+        assert!(has_executable_extension("tool.CMD"));
+        assert!(has_executable_extension("tool.bat"));
+        assert!(!has_executable_extension("data.txt"));
+        assert!(!has_executable_extension("my-tool"));
+    }
+
+    #[test]
     fn path_scan_finds_only_executables() {
         let dir = std::env::temp_dir().join(format!(
             "leveler-shell-path-{}-{}",
@@ -1088,7 +1123,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("my-tool");
+        // Windows decides executability by extension; Unix by the mode bit.
+        let exe_name = if cfg!(windows) {
+            "my-tool.exe"
+        } else {
+            "my-tool"
+        };
+        let exe = dir.join(exe_name);
         std::fs::write(&exe, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
@@ -1098,7 +1139,7 @@ mod tests {
         let data = dir.join("data.txt");
         std::fs::write(&data, "x").unwrap();
         let found = scan_path_from(&dir.to_string_lossy());
-        assert!(found.contains(&"my-tool".to_string()));
+        assert!(found.contains(&exe_name.to_string()));
         assert!(!found.contains(&"data.txt".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
