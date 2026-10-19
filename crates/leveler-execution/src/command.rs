@@ -114,6 +114,39 @@ pub struct OutputTee {
     pub directory: PathBuf,
 }
 
+/// Create a capture directory readable only by this user.
+///
+/// Captured stdout/stderr may contain credentials or other secrets. The
+/// process umask is not a sufficient boundary, so the directory is forced to
+/// `0700` and every file to `0600` on Unix. Windows uses the user's profile
+/// ACL; this helper is a no-op there.
+fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = create_private_file(path)?;
+    file.write_all(contents.as_bytes())
+}
+
 /// The combined copy of both streams, in the order the readers observed the
 /// bytes. Two OS pipes have no global order of their own; this copy records
 /// the order the runtime actually delivered, and stays complete even when the
@@ -132,8 +165,7 @@ impl CombinedTee {
     fn open(directory: &std::path::Path, writers: usize) -> Self {
         let path = directory.join("combined.log");
         let meta = directory.join("combined.meta.json");
-        let created =
-            std::fs::create_dir_all(directory).and_then(|()| std::fs::File::create(&path));
+        let created = create_private_directory(directory).and_then(|()| create_private_file(&path));
         match created {
             Ok(file) => Self {
                 log: Some(std::io::BufWriter::new(file)),
@@ -193,7 +225,7 @@ impl CombinedTee {
             "{{\"stream\":\"combined\",\"bytes\":{},\"complete\":{}{}}}\n",
             self.bytes, complete, error
         );
-        let _ = std::fs::write(&self.meta, meta);
+        let _ = write_private_file(&self.meta, &meta);
     }
 }
 
@@ -223,7 +255,7 @@ impl TeeCapture {
     ) -> Self {
         let meta = directory.join(format!("{stream}.meta.json"));
         let path = directory.join(format!("{stream}.log"));
-        let opened = std::fs::create_dir_all(directory).and_then(|()| std::fs::File::create(&path));
+        let opened = create_private_directory(directory).and_then(|()| create_private_file(&path));
         match opened {
             Ok(file) => Self {
                 log: Some(std::io::BufWriter::new(file)),
@@ -287,7 +319,7 @@ impl TeeCapture {
             "{{\"stream\":\"{}\",\"bytes\":{},\"complete\":{}{}}}\n",
             self.stream, self.bytes, complete, error
         );
-        let _ = std::fs::write(&self.meta, meta);
+        let _ = write_private_file(&self.meta, &meta);
     }
 }
 
@@ -6534,6 +6566,24 @@ mod streaming_tests {
         assert_eq!(stdout.len(), 300_000, "every stdout byte is on disk");
         assert!(stdout.starts_with(b"out\n"), "capture starts at byte zero");
         assert_eq!(stderr, b"err-line\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "a capture directory is owner-only");
+            for name in ["stdout.log", "stderr.log", "combined.log"] {
+                let mode = std::fs::metadata(directory.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "{name} is owner-only");
+            }
+        }
         assert_eq!(
             combined.len(),
             stdout.len() + stderr.len(),

@@ -5027,6 +5027,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     // only replace that one honest failure with a second one.
                     return Ok(());
                 }
+                crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let _ = self.events.send(RuntimeEvent::SessionList {
                     sessions: self.list_sessions().await?,
                 });
@@ -5051,6 +5052,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     self.notify_error(&requester_session_id, format!("删除会话失败: {error}"));
                     return Ok(());
                 }
+                crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let _ = self
                     .events_for(&requester_session_id)
                     .send(RuntimeEvent::SessionList {

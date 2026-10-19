@@ -41,6 +41,7 @@ pub mod markdown;
 pub mod motion;
 pub mod multi_agent;
 mod observability;
+pub mod output_view;
 pub mod overlay;
 pub mod pending_inputs;
 #[cfg(test)]

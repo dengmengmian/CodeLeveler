@@ -1370,6 +1370,10 @@ verified by deterministic tests and real dogfood — do not regress them:
   lines; only the item whose content changed is recomputed. Items that read live
   state (ToolGroup / SubAgent / UserShell) are never memoized. **A height-only
   resize must still invalidate the projection.**
+- **Complete Shell output is windowed, not capped higher**: the Conversation
+  keeps a bounded preview; the full-output page costs per frame in proportion
+  to the visible window, its row index and a bounded prefetch, never to the
+  capture size. Neither layer materializes the whole result.
 - **Workspace Diff is O(1) in git subprocesses**: tracked changes use one
   `git diff --numstat HEAD` plus one multi-file `git diff HEAD`, and untracked
   files are rendered as new-file patches in Rust; the process count does not grow
@@ -1476,8 +1480,18 @@ verified by deterministic tests and real dogfood — do not regress them:
   Running (purple, time-based breath), Ran (green), Failed (red, real exit
   code) and Cancelled (amber, explicit); stdout and stderr keep their
   provenance ink; the exact command has its own `$` line; output is terminal-
-  safe, folds with an explicit marker and remains fully reachable. The inline
-  header's rightmost cells and the live row are clickable stops; Ctrl+C cancels
+  safe, folds with an explicit marker and remains fully reachable. A result
+  above the inline budget is never solved by raising an in-memory cap: the
+  record keeps a bounded preview and Enter or a header click opens the full
+  output page inside the TUI. That page holds only a logical-line byte index
+  and per-width wrapped-row counts, reads `combined.log` for the visible
+  window, and supports g/G, PageUp/PageDown, the wheel, drag-copy and `a` to
+  copy all. A width change rebuilds the index in the background and keeps the
+  top logical line. Capture directories are `0700` with `0600` files; a live
+  session retains every complete capture its records name, and a deleted
+  session's directory is reclaimed. A persisted path is accepted only under
+  the local `shell-output` root with `combined.log` as a regular file.
+  The inline header's rightmost cells and the live row are clickable stops; Ctrl+C cancels
   exactly that execution, never the agent, the side thread or the application.
   Only one foreground user command runs at a time. Resume restores the record
   from the runtime without re-execution. A running foreground command can move

@@ -125,6 +125,13 @@ pub enum Action {
     /// A user-shell "Copy Output" finished: the delivery receipt and copied
     /// character count, or why the copy did not happen.
     UserShellOutputCopied(Result<(crate::clipboard::CopyReceipt, usize), String>),
+    /// A complete output's index finished building. `result` is shared with
+    /// the new [`crate::output_view::OutputView`]; the generation discards a
+    /// result whose page was closed or whose width changed meanwhile.
+    OutputIndexReady {
+        generation: u64,
+        result: Result<std::sync::Arc<crate::output_view::OutputIndex>, String>,
+    },
     /// The full-output pager exited, or could not be started. The terminal has
     /// already been restored by the event loop.
     OutputPagerFinished(Result<(), String>),
@@ -219,6 +226,27 @@ pub enum Effect {
         /// capture. The reducer never sends this when the retained text is
         /// itself a truncated tail.
         retained: String,
+    },
+    /// Build the row index for a complete output off the paint loop. The
+    /// source is file-backed for a real capture; the result is bounded by the
+    /// number of logical lines, never by the rendered rows.
+    LoadOutputIndex {
+        source: crate::output_view::OutputSource,
+        width: usize,
+        generation: u64,
+    },
+    /// Copy a range of the full-output page, read from its source on a
+    /// blocking thread. The index is shared so the worker reuses the same
+    /// row mapping the page painted.
+    CopyOutputSelection {
+        index: std::sync::Arc<crate::output_view::OutputIndex>,
+        source: crate::output_view::OutputSource,
+        start: (usize, usize),
+        end: (usize, usize),
+    },
+    /// Copy the complete output, read from its authoritative source.
+    CopyOutputAll {
+        source: crate::output_view::OutputSource,
     },
     /// Suspend the TUI and open the complete output in `$PAGER` (default
     /// `less -R`). A capture is paged from disk, never loaded whole.
