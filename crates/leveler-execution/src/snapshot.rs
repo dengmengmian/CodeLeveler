@@ -68,9 +68,26 @@ impl WorkspaceSnapshot {
             std::fs::create_dir_all(parent)?;
         }
         let _serialized = CAPTURE.lock().await;
-        git(root, &["add", "-A", "."], Some(&index)).await?;
-        let sha = git(root, &["write-tree"], Some(&index)).await?;
-        Ok(Some(SnapshotId(sha.trim().to_string())))
+        match capture_with_index(root, &index).await {
+            Ok(sha) => Ok(Some(SnapshotId(sha.trim().to_string()))),
+            Err(_) => {
+                // The shared index is only an optimization. An external
+                // `git gc`/`prune` can remove objects it still references, and
+                // the index itself can be left unusable. Re-hash once with a
+                // fresh index: a command's settlement must not be lost to a
+                // stale cache, and the retry is bounded to this one capture.
+                // The retry index lives under `.git/leveler/`, never in the
+                // worktree, so staging it can never change the captured tree.
+                let fresh = git_dir.join("leveler").join(format!(
+                    "snapshot-retry-{}-{}.index",
+                    std::process::id(),
+                    TEMP_ORDINAL.fetch_add(1, Ordering::Relaxed)
+                ));
+                let result = capture_with_index(root, &fresh).await;
+                let _ = std::fs::remove_file(&fresh);
+                result.map(|sha| Some(SnapshotId(sha.trim().to_string())))
+            }
+        }
     }
 
     /// Capture only the namespace this execution may mutate. The temporary
@@ -379,6 +396,12 @@ async fn git_dir(root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Stage the working tree in `index` and write its tree object.
+async fn capture_with_index(root: &Path, index: &Path) -> Result<String, SnapshotError> {
+    git(root, &["add", "-A", "."], Some(index)).await?;
+    git(root, &["write-tree"], Some(index)).await
+}
+
 /// Run git in `root`, optionally against a scratch index, returning stdout.
 async fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<String, SnapshotError> {
     let mut cmd = tokio::process::Command::new("git");
@@ -441,15 +464,22 @@ fn in_cache_dir(
 static TEMP_ORDINAL: AtomicU64 = AtomicU64::new(0);
 
 /// A unique temp path for a scratch git index.
+///
+/// A test or a misconfigured host can supply an empty temp directory; falling
+/// back to the process temp dir keeps the scratch index out of the workspace,
+/// where `git add` would otherwise capture it.
 fn temp_index_path() -> PathBuf {
-    leveler_core::environment()
-        .temp_dir()
-        .to_path_buf()
-        .join(format!(
-            "leveler-snap-index-{}-{}",
-            std::process::id(),
-            TEMP_ORDINAL.fetch_add(1, Ordering::Relaxed)
-        ))
+    let captured = leveler_core::environment().temp_dir();
+    let base = if captured.as_os_str().is_empty() {
+        std::env::temp_dir()
+    } else {
+        captured.to_path_buf()
+    };
+    base.join(format!(
+        "leveler-snap-index-{}-{}",
+        std::process::id(),
+        TEMP_ORDINAL.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 #[cfg(test)]
@@ -549,6 +579,32 @@ mod tests {
             .unwrap();
         changed.sort();
         assert_eq!(changed, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn capture_recovers_when_the_shared_index_went_stale() {
+        // The persistent index is an optimization. An external `git gc`/`prune`
+        // can remove objects it still references, and the index itself can be
+        // left unusable; a capture must re-hash with a fresh index rather than
+        // fail the command's settlement.
+        let dir = leveler_test_support::git::scratch_repo();
+        sh(
+            dir.path(),
+            "echo one > a.txt && git add -A && git commit -qm init",
+        )
+        .await;
+        let first = WorkspaceSnapshot::capture(dir.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = dir.path().join(".git/leveler/snapshot.index");
+        std::fs::write(&index, b"stale index").unwrap();
+
+        let again = WorkspaceSnapshot::capture(dir.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, again, "a fresh index must recover the same tree");
     }
 
     #[tokio::test]
