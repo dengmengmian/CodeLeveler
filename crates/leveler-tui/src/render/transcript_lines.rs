@@ -325,9 +325,10 @@ pub fn paint_reasoning_rail(
 pub(crate) const USER_PROMPT_GUTTER: usize = 3;
 /// Blank columns between the card edge and its content.
 pub(crate) const USER_PROMPT_HPAD: usize = 1;
-/// The card's maximum share of the content area. A visual target, not a
-/// terminal size: the wrap and the paint both derive it from this one number.
-pub(crate) const USER_PROMPT_MAX_PERCENT: usize = 85;
+/// The card's share of the content area. The same width for every prompt,
+/// short or long: the card is the message's container, not a text bubble.
+/// The wrap and the paint both derive it from this one number.
+pub(crate) const USER_PROMPT_WIDTH_PERCENT: usize = 96;
 /// One column kept clear on the right so wrapped glyphs never touch the edge.
 const USER_PROMPT_RIGHT_PAD: usize = 1;
 /// Blank rows painted inside the card above and below the body.
@@ -336,12 +337,14 @@ pub(crate) const USER_PROMPT_PAD_ROWS: usize = 1;
 pub(crate) const USER_PROMPT_MARKER: &str = "❯";
 const USER_PROMPT_INDENT: &str = "   ";
 
-/// Widest a prompt card may be at this content width: 85% of the reading
-/// area, with a floor that keeps the marker usable on very narrow terminals.
-pub(crate) fn user_prompt_max_width(content_width: usize) -> usize {
-    let cap = content_width.saturating_mul(USER_PROMPT_MAX_PERCENT) / 100;
+/// The prompt card's width at this content width: 96% of the reading area,
+/// rounded up so the result never drops below the 95% visual target, with a
+/// floor that keeps the marker usable on very narrow terminals.
+pub(crate) fn user_prompt_width(content_width: usize) -> usize {
+    let percent = content_width.saturating_mul(USER_PROMPT_WIDTH_PERCENT);
+    let target = percent.saturating_add(99) / 100;
     let floor = (USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD).min(content_width);
-    cap.max(floor).min(content_width)
+    target.max(floor).min(content_width)
 }
 
 /// The user's own turn: a marker gutter, one blank row of card padding above
@@ -379,7 +382,7 @@ pub(crate) fn push_user_turn(
 /// The prompt body's visual rows and their soft-wrap joiners. Shared by the
 /// painter and the copy policy so the two cannot drift.
 fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
-    let inner = user_prompt_max_width(width)
+    let inner = user_prompt_width(width)
         .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
         .max(1);
     let mut wrapped = crate::render::text::wrap_with_joiners(text, inner);
@@ -387,33 +390,6 @@ fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
         wrapped.push((String::new(), None));
     }
     wrapped
-}
-
-/// The painted card width for the prompt occupying `span` in `lines`.
-///
-/// Short prompts shrink to their widest painted body row plus one column of
-/// right padding; long ones take [`user_prompt_max_width`]. Measured from the
-/// built lines, so the card can never be narrower than glyphs the terminal is
-/// about to paint.
-pub(crate) fn user_prompt_card_width(
-    lines: &[Line<'static>],
-    span: (usize, usize),
-    content_width: usize,
-) -> usize {
-    let cap = user_prompt_max_width(content_width);
-    let body_start = span.0.saturating_add(USER_PROMPT_PAD_ROWS);
-    let body_end = span.1.saturating_sub(USER_PROMPT_PAD_ROWS);
-    let mut widest = USER_PROMPT_GUTTER;
-    for line in lines
-        .get(body_start..body_end.min(lines.len()))
-        .unwrap_or(&[])
-    {
-        widest = widest.max(line.width());
-        if widest.saturating_add(USER_PROMPT_RIGHT_PAD) >= cap {
-            return cap;
-        }
-    }
-    widest.saturating_add(USER_PROMPT_RIGHT_PAD).min(cap)
 }
 
 /// Copy policy for [`push_user_turn`]: band padding rows are display-only and
@@ -1984,7 +1960,7 @@ mod tests {
         let t = Locale::Zh.text();
         let text = "这是一段足够长的用户输入，用来确认窄终端下自动换行仍然留出右边距。";
         let lines = item_render(&TranscriptItem::User(text.into()), &theme, 20, false, t);
-        let widest = user_prompt_max_width(20) - 1;
+        let widest = user_prompt_width(20) - 1;
         for row in &lines {
             let width = unicode_width::UnicodeWidthStr::width(line_text(row).as_str());
             assert!(

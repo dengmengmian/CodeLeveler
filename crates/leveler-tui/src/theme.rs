@@ -88,6 +88,11 @@ pub struct SurfaceColors {
     pub elevated: Color,
     pub input: Color,
     pub selection: Color,
+    /// The user's own turn. Brighter than the canvas and the generic elevated
+    /// surface so the prompt reads as a distinct card, but still well below
+    /// primary ink: the card identifies the message, it does not compete with
+    /// its text.
+    pub prompt: Color,
 }
 
 /// Text roles. Hierarchy is a different *color*, not `Modifier::DIM`.
@@ -317,6 +322,7 @@ fn indexed_256_theme(theme: Theme) -> Theme {
             elevated: indexed(theme.surface.elevated),
             input: indexed(theme.surface.input),
             selection: indexed(theme.surface.selection),
+            prompt: indexed(theme.surface.prompt),
         },
         text: TextColors {
             primary: indexed(theme.text.primary),
@@ -452,6 +458,7 @@ impl Theme {
                 elevated: rgb(0x1D2126),
                 input: rgb(0x15181C),
                 selection: rgb(0x253345),
+                prompt: rgb(0x2B313A),
             },
             text: TextColors {
                 primary: rgb(0xE7E9EC),
@@ -529,6 +536,9 @@ impl Theme {
                 elevated: rgb(0xF0F2F5),
                 input: rgb(0xFFFFFF),
                 selection: rgb(0xDCEBFF),
+                // The light counterpart of the dark prompt card: a soft
+                // blue-grey step below the canvas, never a highlight.
+                prompt: rgb(0xDFE5EC),
             },
             text: TextColors {
                 primary: rgb(0x20242A),
@@ -603,6 +613,7 @@ impl Theme {
                 elevated: rgb(0x0A0A0A),
                 input: rgb(0x000000),
                 selection: rgb(0x003366),
+                prompt: rgb(0x222222),
             },
             text: TextColors {
                 primary: rgb(0xFFFFFF),
@@ -689,6 +700,7 @@ impl Theme {
             elevated: Color::Reset,
             input: Color::Reset,
             selection: Color::Reset,
+            prompt: Color::Reset,
         };
         Self {
             id: ThemeId::DEFAULT,
@@ -961,6 +973,13 @@ mod tests {
         assert_min(t.primary, s.canvas, 7.0, "primary/canvas");
         assert_min(t.primary, s.input, 7.0, "primary/input");
         assert_min(t.primary, s.elevated, 7.0, "primary/elevated");
+        assert_min(t.primary, s.prompt, 7.0, "primary/prompt");
+        assert_min(
+            theme.accent.secondary,
+            s.prompt,
+            3.0,
+            "accent.secondary/prompt",
+        );
         assert_min(t.primary, s.selection, 4.5, "primary/selection");
         assert_min(t.final_lead, s.canvas, 4.5, "final_lead/canvas");
         assert_min(t.strong, s.canvas, 4.5, "strong/canvas");
@@ -1112,6 +1131,22 @@ mod tests {
             [plan.primary, plan.dim].contains(&low) && [plan.primary, plan.dim].contains(&high),
             "no invented in-between: {low:?} {high:?}"
         );
+    }
+
+    /// The prompt card must read as its own surface: a visible step away from
+    /// the canvas without approaching the brightness of body text.
+    #[test]
+    fn the_prompt_surface_is_visibly_distinct_from_the_canvas() {
+        for theme in [Theme::dark(), Theme::light(), Theme::high_contrast()] {
+            let ratio = contrast_ratio(theme.surface.prompt, theme.surface.canvas)
+                .expect("fixed palettes are RGB");
+            assert!(
+                ratio >= 1.15,
+                "{}: prompt/canvas contrast {ratio:.2} is too close",
+                theme.id.as_str()
+            );
+            assert_ne!(theme.surface.prompt, theme.surface.canvas);
+        }
     }
 
     #[test]

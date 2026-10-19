@@ -114,21 +114,20 @@ fn paint_live_shell_rail(
 
 /// Paint the user prompt's card and marker over the projection.
 ///
-/// Both are decoration: the card is a left-aligned surface that hugs the
-/// prompt's own text (never the full reading width), and the marker is one
-/// glyph in the card's reserved gutter. Line content, selection columns,
-/// wrapping and clipboard text are exactly what the build produced — copy
-/// cannot pick up either. Selected cells keep their own background.
+/// Both are decoration: the card is one left-aligned surface at a fixed width
+/// for every prompt, and the marker is one glyph in the card's reserved
+/// gutter. Line content, selection columns, wrapping and clipboard text are
+/// exactly what the build produced — copy cannot pick up either. Selected
+/// cells keep their own background.
 fn paint_user_prompt_decoration(
     frame: &mut Frame,
     state: &AppState,
-    all: &[Line<'static>],
     item_spans: &[(usize, usize)],
     scroll: usize,
     content: Rect,
 ) {
     use crate::render::transcript_lines::{
-        USER_PROMPT_HPAD, USER_PROMPT_MARKER, USER_PROMPT_PAD_ROWS, user_prompt_card_width,
+        USER_PROMPT_HPAD, USER_PROMPT_MARKER, USER_PROMPT_PAD_ROWS, user_prompt_width,
     };
 
     if content.width == 0 || content.height == 0 {
@@ -137,8 +136,8 @@ fn paint_user_prompt_decoration(
     let theme = &state.theme;
     // NO_COLOR paints no surfaces, so there is no card to draw; the marker
     // alone has to distinguish the prompt from agent prose.
-    let band = (!theme.is_monochrome() && theme.surface.elevated != Color::Reset)
-        .then_some(theme.surface.elevated);
+    let band = (!theme.is_monochrome() && theme.surface.prompt != Color::Reset)
+        .then_some(theme.surface.prompt);
     let selected = theme.surface.selection;
     let window_end = scroll + content.height as usize;
     let buf = frame.buffer_mut();
@@ -152,8 +151,8 @@ fn paint_user_prompt_decoration(
         if end <= scroll || start >= window_end {
             continue;
         }
-        let card_width = user_prompt_card_width(all, (start, end), content.width as usize);
-        let card_right = content.x + card_width.min(content.width as usize) as u16;
+        let card_right = content.x
+            + user_prompt_width(content.width as usize).min(content.width as usize) as u16;
         if let Some(band) = band {
             let band_style = Style::default().bg(band);
             for row in start.max(scroll)..end.min(window_end) {
@@ -267,7 +266,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ),
         content,
     );
-    paint_user_prompt_decoration(frame, state, &all, &item_spans, scroll, content);
+    paint_user_prompt_decoration(frame, state, &item_spans, scroll, content);
 
     // Scroll-to-bottom affordance: only when pinned away from live edge.
     // Hide while selecting/copying so the badge cannot cover or steal mouse
@@ -458,7 +457,7 @@ mod tests {
     fn a_user_prompt_paints_one_continuous_card_and_agent_prose_stays_on_canvas() {
         let mut state = test_state();
         let (u0, u1, a0, a1) = prompt_then_answer(&mut state);
-        let band = state.theme.surface.elevated;
+        let band = state.theme.surface.prompt;
         let canvas = state.theme.surface.canvas;
         let height = content().height as usize;
         let total = state.conversation_lines(content().width as usize).len();
@@ -508,10 +507,15 @@ mod tests {
                 );
             }
         }
-        let (_, last) = card.expect("prompt card");
+        let (first, last) = card.expect("prompt card");
+        let card_width = (last - first + 1) as usize;
         assert!(
-            last < c.x + c.width - 1,
-            "a short prompt must not span the reading width"
+            card_width * 100 >= c.width as usize * 95,
+            "the card must fill at least 95% of the reading width"
+        );
+        assert!(
+            card_width <= c.width as usize,
+            "the card must never overflow the reading width"
         );
         for row in a0..a1 {
             let y = painted_y(&state, row, height, total);
@@ -583,7 +587,7 @@ mod tests {
         assert!(u0 > 4, "fixture must leave room above the prompt");
         state.conv.auto_scroll = false;
         state.conv.scroll = u0 - 4;
-        let band = state.theme.surface.elevated;
+        let band = state.theme.surface.prompt;
         let canvas = state.theme.surface.canvas;
         let height = content().height as usize;
         let total = state.conversation_lines(width).len();
@@ -603,9 +607,14 @@ mod tests {
                 &row_right,
                 "one card width on every visible row"
             );
+            let width = (row_right - c.x + 1) as usize;
             assert!(
-                row_right < c.x + c.width - 1,
-                "a short prompt does not span the reading width"
+                width * 100 >= c.width as usize * 95,
+                "the prompt card fills at least 95% of the reading width"
+            );
+            assert!(
+                width <= c.width as usize,
+                "the prompt card never overflows the reading width"
             );
         }
         let right = right.expect("visible card rows");
@@ -629,11 +638,11 @@ mod tests {
         let buffer = paint(&mut state, 0);
         let c = content();
         let y = painted_y(&state, u0, height, total);
-        assert_eq!(buffer[(c.x, y)].bg, Theme::light().surface.elevated);
+        assert_eq!(buffer[(c.x, y)].bg, Theme::light().surface.prompt);
         assert_ne!(
             buffer[(c.x, y)].bg,
-            Theme::dark().surface.elevated,
-            "the dark band must not leak into the light theme"
+            Theme::dark().surface.prompt,
+            "the dark card must not leak into the light theme"
         );
     }
 

@@ -131,11 +131,20 @@ fn content_of(state: &AppState) -> (u16, u16, u16, u16) {
     state.conv.rect.expect("conversation rect published")
 }
 
+/// The card width every prompt must share at this content width: 96% of the
+/// reading area, rounded up, clamped to the content rect.
+fn expected_card_width(state: &AppState) -> u16 {
+    let (_, _, width, _) = content_of(state);
+    let target = (width as usize * 96).div_ceil(100);
+    let floor = 4.min(width as usize);
+    target.max(floor).min(width as usize) as u16
+}
+
 /// The painted card's left/right columns on one screen row. `None` when the
-/// row is canvas: the prompt card never fills the whole content row.
+/// row is canvas.
 fn card_span(state: &AppState, buffer: &Buffer, y: u16) -> Option<(u16, u16)> {
     let (x, _, width, _) = content_of(state);
-    let band = state.theme.surface.elevated;
+    let band = state.theme.surface.prompt;
     let mut first = None;
     let mut last = None;
     for col in x..x + width {
@@ -151,7 +160,7 @@ fn card_span(state: &AppState, buffer: &Buffer, y: u16) -> Option<(u16, u16)> {
 /// its cells are contiguous, and every column outside it stays on the canvas.
 fn assert_card_at(state: &AppState, buffer: &Buffer, y: u16) -> (u16, u16) {
     let (x, _, width, _) = content_of(state);
-    let band = state.theme.surface.elevated;
+    let band = state.theme.surface.prompt;
     let canvas = state.theme.surface.canvas;
     let span = card_span(state, buffer, y)
         .unwrap_or_else(|| panic!("row {y} carries no prompt card: {:?}", row_text(buffer, y)));
@@ -310,8 +319,8 @@ fn a_multiline_prompt_keeps_one_card_at_every_width() {
     let mut s = opened(vec![message("u1", UiRole::User, text)]);
     for (width, height) in [(120u16, 40u16), (80, 24), (48, 20)] {
         let buffer = paint(&mut s, width, height);
-        let (x, _, w, _) = content_of(&s);
-        let cap = (w as usize) * 85 / 100;
+        let (x, _, _, _) = content_of(&s);
+        let expected = expected_card_width(&s);
         let first = row_of(&buffer, "第一行中文");
         let blank = first + 1;
         let third = row_of(&buffer, "第三行 with English");
@@ -327,14 +336,14 @@ fn a_multiline_prompt_keeps_one_card_at_every_width() {
             }
         }
         let span = span.expect("card rows");
-        let card_width = (span.1 - span.0 + 1) as usize;
-        assert!(
-            card_width <= cap,
-            "{width}x{height}: card {card_width} exceeds the {cap} cap"
+        assert_eq!(
+            span.1 - span.0 + 1,
+            expected,
+            "{width}x{height}: every prompt card shares one width"
         );
         // The card is the content's left block, never the workspace gutter.
         assert_eq!(span.0, x);
-        assert_ne!(buffer[(x - 1, first)].bg, s.theme.surface.elevated);
+        assert_ne!(buffer[(x - 1, first)].bg, s.theme.surface.prompt);
         let marks = markers(&buffer);
         assert_eq!(marks.len(), 1, "{width}x{height}");
         assert_eq!(marks[0], (x + 1, first));
@@ -344,57 +353,62 @@ fn a_multiline_prompt_keeps_one_card_at_every_width() {
     }
 }
 
-/// A short message hugs its own text instead of occupying the whole row.
+/// A short message uses the same card as a long one: the card is the
+/// message's container, never a text-sized bubble.
 #[test]
-fn a_short_prompt_card_shrinks_to_its_text() {
-    let mut s = opened(vec![message("u1", UiRole::User, "hi")]);
+fn a_short_prompt_fills_the_same_card_as_a_long_one() {
+    let mut s = opened(vec![
+        message("u1", UiRole::User, "hi"),
+        message("a1", UiRole::Assistant, "短答"),
+        message("u2", UiRole::User, &format!("long {}", "word ".repeat(40))),
+    ]);
     let buffer = paint(&mut s, 100, 40);
-    let (x, _, width, _) = content_of(&s);
-    let y = row_of(&buffer, "❯");
-    let (left, right) = assert_card_at(&s, &buffer, y);
-    assert_eq!(left, x);
+    let expected = expected_card_width(&s);
+    let short_y = row_of(&buffer, "❯ hi");
+    let long_y = row_of(&buffer, "long word");
+    let (short_left, short_right) = assert_card_at(&s, &buffer, short_y);
+    let (long_left, long_right) = assert_card_at(&s, &buffer, long_y);
     assert_eq!(
-        right - left + 1,
-        6,
-        "card = the ❯ gutter (3) + 'hi' (2) + one column of right padding"
-    );
-    assert!(
-        (right - left + 1) < width / 2,
-        "a short prompt must not span the row"
+        short_left, long_left,
+        "both cards start at the content edge"
     );
     assert_eq!(
-        row_text(&buffer, y).trim(),
+        short_right - short_left + 1,
+        expected,
+        "a short prompt takes the full card"
+    );
+    assert_eq!(
+        long_right - long_left + 1,
+        expected,
+        "a long prompt takes the same card"
+    );
+    assert_eq!(
+        row_text(&buffer, short_y).trim(),
         "❯ hi",
         "no identity text and no extra decoration"
     );
 }
 
-/// A long unbroken message takes the width cap and every character survives.
+/// A long unbroken message fills the same card and every character survives.
 #[test]
-fn a_long_prompt_caps_at_85_percent_without_truncation() {
+fn a_long_prompt_fills_the_card_without_truncation() {
     let text = "Z".repeat(200);
     let mut s = opened(vec![message("u1", UiRole::User, &text)]);
     let buffer = paint(&mut s, 120, 40);
-    let (_, _, content_width, _) = content_of(&s);
-    let cap = (content_width as usize) * 85 / 100;
+    let expected = expected_card_width(&s);
     let rows = card_rows(&s, &buffer);
     assert!(rows.len() >= 3, "the message must wrap: {rows:?}");
     let mut painted = 0usize;
     for &y in &rows {
         let (left, right) = card_span(&s, &buffer, y).expect("card");
-        let card_width = (right - left + 1) as usize;
-        assert!(
-            card_width <= cap,
-            "row {y}: card {card_width} exceeds the {cap} cap"
+        assert_eq!(
+            right - left + 1,
+            expected,
+            "row {y}: every prompt card shares one width"
         );
         painted += row_text(&buffer, y).chars().filter(|c| *c == 'Z').count();
     }
     assert_eq!(painted, text.len(), "no character may be dropped");
-    assert!(
-        rows.iter()
-            .any(|&y| card_span(&s, &buffer, y).is_some_and(|(l, r)| (r - l + 1) as usize == cap)),
-        "a long prompt takes the full cap"
-    );
     assert_eq!(
         row_text(&buffer, rows[0]).trim(),
         "",
@@ -409,23 +423,23 @@ fn a_long_prompt_caps_at_85_percent_without_truncation() {
 }
 
 /// At the narrow acceptance width, mixed-width text stays complete and the
-/// card still respects the cap.
+/// card keeps its single fixed width.
 #[test]
 fn a_narrow_terminal_keeps_mixed_width_text_complete() {
     let tail = "Z".repeat(90);
     let text = format!("中文 English 😀 {tail}");
     let mut s = opened(vec![message("u1", UiRole::User, &text)]);
     let buffer = paint(&mut s, 48, 20);
-    let (_, _, content_width, _) = content_of(&s);
-    let cap = (content_width as usize) * 85 / 100;
+    let expected = expected_card_width(&s);
     let rows = card_rows(&s, &buffer);
     assert!(!rows.is_empty(), "the prompt must be visible");
     let mut painted = String::new();
     for &y in &rows {
         let (left, right) = card_span(&s, &buffer, y).expect("card");
-        assert!(
-            (right - left + 1) as usize <= cap,
-            "row {y}: card exceeds the {cap} cap"
+        assert_eq!(
+            right - left + 1,
+            expected,
+            "row {y}: every prompt card shares one width"
         );
         painted.push_str(&row_text(&buffer, y));
     }
@@ -437,10 +451,6 @@ fn a_narrow_terminal_keeps_mixed_width_text_complete() {
     for needle in ["中文", "English", "😀"] {
         assert!(painted.contains(needle), "missing {needle:?}: {painted:?}");
     }
-    let every_width = rows
-        .iter()
-        .all(|&y| card_span(&s, &buffer, y).is_some_and(|(l, r)| (r - l + 1) as usize <= cap));
-    assert!(every_width, "every row respects the cap");
 }
 
 /// The `❯` is the prompt's only decoration: soft accent ink, padded inside
@@ -459,7 +469,7 @@ fn the_marker_is_soft_blue_and_carries_no_identity_text() {
         marker.fg, s.theme.accent.secondary,
         "the marker wears the soft accent ink"
     );
-    assert_eq!(marker.bg, s.theme.surface.elevated, "inside the card");
+    assert_eq!(marker.bg, s.theme.surface.prompt, "inside the card");
     assert_eq!(
         buffer[(left + 2, y)].symbol(),
         " ",
@@ -482,7 +492,11 @@ fn the_marker_is_soft_blue_and_carries_no_identity_text() {
             "card must not draw a border/divider: {card_text:?}"
         );
     }
-    assert!(right > left);
+    assert_eq!(
+        right - left + 1,
+        expected_card_width(&s),
+        "the card keeps its fixed width for a short message"
+    );
 }
 
 /// Resizing cannot leave paint from the previous width behind: each size
@@ -499,9 +513,14 @@ fn resize_repaints_the_card_to_the_new_content_rect() {
         let row = row_of(&buffer, "宽度变化");
         let (left, right) = assert_card_at(&s, &buffer, row);
         assert_eq!(left, x);
+        assert_eq!(
+            right - left + 1,
+            expected_card_width(&s),
+            "the card is 95-100% of this content width"
+        );
         assert!(
-            (right - left + 1) as usize <= (w as usize) * 85 / 100,
-            "the card respects this width's cap"
+            (right - left + 1) as usize <= w as usize,
+            "the card never overflows the content"
         );
         assert_eq!(markers(&buffer), vec![(x + 1, row)]);
     }
