@@ -61,7 +61,7 @@ jobs:
   # must build exactly the commit the version bump produced.
   version:
     name: version guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.guard.outputs.version }}
       tag: ${{ steps.guard.outputs.tag }}
@@ -115,7 +115,7 @@ jobs:
   # and hand the same bytes to every Rust build.
   prepare-web:
     name: prepare WebUI (once)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       digest: ${{ steps.hash.outputs.digest }}
     steps:
@@ -155,7 +155,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -278,7 +278,7 @@ jobs:
     name: dry run · verify artifacts
     needs: build
     if: ${{ github.event.inputs.dry_run == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -321,7 +321,7 @@ jobs:
     name: prune stale release caches
     needs: build
     if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.dry_run != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - name: Keep only the newest release cache per target
@@ -344,7 +344,7 @@ jobs:
     name: publish release
     needs: [version, build]
     if: ${{ github.event.inputs.dry_run != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # Checkout first: a later checkout would wipe downloaded artifacts.
       - uses: actions/checkout@v5
