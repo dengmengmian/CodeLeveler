@@ -869,6 +869,29 @@
       }
     },
     {
+      "description": "The same user shell execution moved from the foreground to the background. It is one process and one execution id; `task_id` links it to the background task list. Additive; older clients keep showing the foreground record until it exits.",
+      "type": "object",
+      "required": [
+        "execution_id",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "execution_id": {
+          "$ref": "#/definitions/UserShellId"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "user_shell_backgrounded"
+          ]
+        }
+      }
+    },
+    {
       "description": "Live output from a running user shell. `stream` is `stdout` or `stderr`. Transient: clients keep a bounded buffer; the runtime does not persist chunks.",
       "type": "object",
       "required": [
@@ -1726,6 +1749,35 @@
           "type": "string",
           "enum": [
             "background_task_output"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A background task's state could not be established (for example its adopted driver failed). This is not a natural exit and not a stop: the UI must show unknown, never Running, failed, or stopped.",
+      "type": "object",
+      "required": [
+        "duration_ms",
+        "output",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "background_task_unknown"
           ]
         }
       }
@@ -4106,6 +4158,29 @@
           }
         },
         {
+          "description": "The same user shell execution moved from the foreground to the background. It is one process and one execution id; `task_id` links it to the background task list. Additive; older clients keep showing the foreground record until it exits.",
+          "type": "object",
+          "required": [
+            "execution_id",
+            "task_id",
+            "type"
+          ],
+          "properties": {
+            "execution_id": {
+              "$ref": "#/definitions/UserShellId"
+            },
+            "task_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "user_shell_backgrounded"
+              ]
+            }
+          }
+        },
+        {
           "description": "Live output from a running user shell. `stream` is `stdout` or `stderr`. Transient: clients keep a bounded buffer; the runtime does not persist chunks.",
           "type": "object",
           "required": [
@@ -4963,6 +5038,35 @@
               "type": "string",
               "enum": [
                 "background_task_output"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A background task's state could not be established (for example its adopted driver failed). This is not a natural exit and not a stop: the UI must show unknown, never Running, failed, or stopped.",
+          "type": "object",
+          "required": [
+            "duration_ms",
+            "output",
+            "task_id",
+            "type"
+          ],
+          "properties": {
+            "duration_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "output": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "background_task_unknown"
               ]
             }
           }
@@ -8029,7 +8133,7 @@
           "type": "string"
         },
         "elapsed_secs": {
-          "description": "Seconds elapsed at snapshot time (running) or total runtime (done).",
+          "description": "Seconds elapsed at snapshot time (running/background) or total runtime (done).",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -8055,8 +8159,15 @@
           "type": "boolean"
         },
         "status": {
-          "description": "`running | success | failed | cancelled`.",
+          "description": "`running | background | success | failed | cancelled | unknown`.",
           "type": "string"
+        },
+        "task_id": {
+          "description": "The registry task id when this execution runs in the background. The same execution id and process remain; this is the link to the background task list, not a second execution.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
