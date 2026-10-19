@@ -62,6 +62,7 @@ pub type ConvCacheEntry = (
     Option<usize>,
     std::rc::Rc<Vec<(usize, usize)>>,
     std::rc::Rc<Vec<SourceSpan>>,
+    std::rc::Rc<Vec<crate::selection::PlainRow>>,
 );
 
 /// Painted source ranges share the line cache and preserve exact reading positions.
@@ -120,6 +121,8 @@ pub struct CachedUnit {
     pub lines: std::rc::Rc<Vec<Line<'static>>>,
     pub hits: Vec<(usize, usize)>,
     pub commands: Vec<CachedCommand>,
+    /// Copy policy aligned 1:1 with `lines`.
+    pub copy: Vec<crate::selection::PlainRow>,
 }
 
 /// Per-item memo of wrapped transcript lines. Positional: entry N is the Nth

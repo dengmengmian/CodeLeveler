@@ -351,7 +351,20 @@ impl MdDoc {
         theme: &Theme,
         tone: AssistantTone,
     ) -> (Vec<Line<'static>>, usize) {
-        self.to_lines_split_inner(width, theme, tone)
+        let (lines, _, stable) = self.to_lines_with_copy(width, theme, tone);
+        (lines, stable)
+    }
+
+    /// Lay out the document and, in the same pass, the semantic copy policy
+    /// for every painted row. Renderers own this mapping: copy never inspects
+    /// the text to guess what was decoration.
+    pub fn to_lines_with_copy(
+        &self,
+        width: usize,
+        theme: &Theme,
+        tone: AssistantTone,
+    ) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>, usize) {
+        self.to_lines_split_with_copy_inner(width, theme, tone)
     }
 
     /// Flatten parsed Markdown into readable plain text for compact UI chrome.
@@ -397,17 +410,18 @@ impl MdDoc {
     /// tail (the last, possibly-still-growing block) should stay in the live
     /// region. For an empty doc the split index is 0.
     pub fn to_lines_split(&self, width: usize, theme: &Theme) -> (Vec<Line<'static>>, usize) {
-        self.to_lines_split_inner(width, theme, AssistantTone::Plain)
+        self.to_lines_split_with_tone(width, theme, AssistantTone::Plain)
     }
 
-    fn to_lines_split_inner(
+    fn to_lines_split_with_copy_inner(
         &self,
         width: usize,
         theme: &Theme,
         tone: AssistantTone,
-    ) -> (Vec<Line<'static>>, usize) {
+    ) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>, usize) {
         let width = width.max(1);
         let mut out: Vec<Line<'static>> = Vec::new();
+        let mut copy: Vec<crate::selection::PlainRow> = Vec::new();
         let mut last_block_start = 0;
         let mut block_starts = Vec::with_capacity(self.blocks.len());
         // A final answer's OPENING paragraph is its one-line conclusion, so the
@@ -418,6 +432,8 @@ impl MdDoc {
         for (i, block) in self.blocks.iter().enumerate() {
             if i > 0 {
                 out.push(Line::from(""));
+                // A block boundary is a real paragraph break in the source.
+                copy.push(crate::selection::PlainRow::default());
             }
             last_block_start = out.len();
             block_starts.push(last_block_start);
@@ -427,7 +443,7 @@ impl MdDoc {
             if lead {
                 lead_pending = false;
             }
-            render_block(block, width, theme, tone, lead, &mut out);
+            render_block(block, width, theme, tone, lead, &mut out, &mut copy);
         }
         // Within the LAST (still-streaming) block, greedy wrapping normally
         // leaves only the final display line mutable. An unmatched strong
@@ -436,7 +452,7 @@ impl MdDoc {
         let stable = if self.streaming_table_tail {
             let unstable_block = match self.blocks.as_slice() {
                 [.., MdBlock::Table { .. }, _] => self.blocks.len() - 2,
-                [] => return (out, 0),
+                [] => return (out, copy, 0),
                 _ => self.blocks.len() - 1,
             };
             block_starts[unstable_block]
@@ -449,7 +465,7 @@ impl MdDoc {
                 Some(_) => out.len().saturating_sub(1),
             }
         };
-        (out, stable)
+        (out, copy, stable)
     }
 }
 
@@ -484,6 +500,7 @@ fn render_block(
     // This paragraph is the final answer's lead (opening conclusion).
     lead: bool,
     out: &mut Vec<Line<'static>>,
+    copy: &mut Vec<crate::selection::PlainRow>,
 ) {
     {
         match block {
@@ -502,7 +519,8 @@ fn render_block(
                 };
                 let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
                 let mut heading = Vec::new();
-                if *level <= 2 {
+                let bar = *level <= 2;
+                if bar {
                     heading.push(MdSpan {
                         text: "▎".to_string(),
                         bold: true,
@@ -512,7 +530,20 @@ fn render_block(
                     });
                 }
                 heading.extend(spans.iter().cloned());
-                out.extend(wrap_spans(&heading, width, theme, style, None));
+                let heading_prefix = format!("{} ", "#".repeat(usize::from(*level)));
+                let (lines, joiners) = wrap_spans_with_joiners(&heading, width, theme, style, None);
+                for (index, (line, joiner)) in lines.into_iter().zip(joiners).enumerate() {
+                    out.push(line);
+                    copy.push(crate::selection::PlainRow {
+                        // The scan bar is only painted on the first row.
+                        indent: u16::from(bar && index == 0),
+                        prefix: joiner
+                            .is_none()
+                            .then(|| heading_prefix.clone().into_boxed_str()),
+                        joiner: joiner.map(String::into_boxed_str),
+                        ..Default::default()
+                    });
+                }
             }
             MdBlock::Paragraph(spans) => {
                 // The opening paragraph carries the answer's conclusion and is
@@ -527,27 +558,36 @@ fn render_block(
                 } else {
                     Style::default().fg(tone.body_ink(theme))
                 };
-                out.extend(wrap_spans(
-                    spans,
-                    width,
-                    theme,
-                    style,
-                    Some(theme.text.strong),
-                ));
+                let (lines, joiners) =
+                    wrap_spans_with_joiners(spans, width, theme, style, Some(theme.text.strong));
+                for (line, joiner) in lines.into_iter().zip(joiners) {
+                    out.push(line);
+                    copy.push(crate::selection::PlainRow {
+                        joiner: joiner.map(String::into_boxed_str),
+                        ..Default::default()
+                    });
+                }
             }
             MdBlock::Quote(spans) => {
                 let inner = width.saturating_sub(2).max(1);
-                for line in wrap_spans(
+                let (lines, joiners) = wrap_spans_with_joiners(
                     spans,
                     inner,
                     theme,
                     Style::default().fg(theme.text.secondary),
                     Some(theme.text.strong),
-                ) {
+                );
+                for (line, joiner) in lines.into_iter().zip(joiners) {
                     let mut spans =
                         vec![Span::styled("▌ ", Style::default().fg(theme.border.normal))];
                     spans.extend(line.spans);
                     out.push(Line::from(spans));
+                    copy.push(crate::selection::PlainRow {
+                        indent: 2,
+                        prefix: joiner.is_none().then(|| "> ".to_string().into_boxed_str()),
+                        joiner: joiner.map(String::into_boxed_str),
+                        ..Default::default()
+                    });
                 }
             }
             MdBlock::List { ordered, items } => {
@@ -566,11 +606,24 @@ fn render_block(
                     } else {
                         "• ".to_string()
                     };
-                    let indent = " ".repeat(marker.width());
-                    let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped =
-                        wrap_spans(item, inner, theme, body_style, Some(theme.text.strong));
-                    for (li, line) in wrapped.into_iter().enumerate() {
+                    let marker_width = marker.width();
+                    let indent = " ".repeat(marker_width);
+                    let inner = width.saturating_sub(marker_width).max(1);
+                    let (wrapped, joiners) = wrap_spans_with_joiners(
+                        item,
+                        inner,
+                        theme,
+                        body_style,
+                        Some(theme.text.strong),
+                    );
+                    // Unordered items paste as a Markdown bullet; `•` is a
+                    // painted glyph, not a Markdown marker.
+                    let semantic = if *ordered {
+                        marker.clone()
+                    } else {
+                        "- ".to_string()
+                    };
+                    for (li, (line, joiner)) in wrapped.into_iter().zip(joiners).enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
                         } else {
@@ -579,6 +632,12 @@ fn render_block(
                         let mut spans = vec![Span::styled(lead, marker_style)];
                         spans.extend(line.spans);
                         out.push(Line::from(spans));
+                        copy.push(crate::selection::PlainRow {
+                            indent: marker_width as u16,
+                            prefix: (li == 0).then(|| semantic.clone().into_boxed_str()),
+                            joiner: joiner.map(String::into_boxed_str),
+                            ..Default::default()
+                        });
                     }
                 }
             }
@@ -591,18 +650,26 @@ fn render_block(
                         .map(|segs| segs.iter().map(|(_, t)| t.as_str()).collect::<String>())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    crate::diff_view::render_diff_fence(&src, title.as_deref(), width, theme, out);
+                    let (rendered, rows) = crate::diff_view::render_diff_fence_with_copy(
+                        &src,
+                        title.as_deref(),
+                        width,
+                        theme,
+                    );
+                    out.extend(rendered);
+                    copy.extend(rows);
                 } else {
                     // Short code = inline; long/file = light container (no solid fill).
-                    crate::code_block::render_code_block(
+                    let (rendered, rows) = crate::code_block::code_block_with_copy(
                         title.as_deref(),
                         lang.as_deref(),
                         lines.len(),
                         width,
                         theme,
                         |idx| wrap_code_line(&lines[idx], avail, theme),
-                        out,
                     );
+                    out.extend(rendered);
+                    copy.extend(rows);
                 }
             }
             MdBlock::Table {
@@ -610,13 +677,19 @@ fn render_block(
                 header,
                 rows,
             } => {
-                out.extend(table_lines(header, rows, align, width, theme));
+                let (rendered, layout) = table_lines_with_copy(header, rows, align, width, theme);
+                out.extend(rendered);
+                copy.extend(layout);
             }
             MdBlock::Rule => {
                 out.push(Line::from(Span::styled(
                     "─".repeat(width.min(40)),
                     Style::default().fg(theme.border.normal),
                 )));
+                copy.push(crate::selection::PlainRow {
+                    skip: true,
+                    ..Default::default()
+                });
             }
         }
     }
@@ -729,6 +802,33 @@ const MIN_FLEX_COL: usize = 16;
 /// they overflow, every descriptive column shares the available width instead
 /// of sacrificing all but the single longest one. If even that can't fit a
 /// legible grid, the table degrades to stacked "label: value" records.
+/// Table grid rows plus copy policy. The grid's own horizontal rules are
+/// chrome; data rows copy as painted (the `│` separators are the table's
+/// visible structure, not a block decoration).
+fn table_lines_with_copy(
+    header: &[Vec<MdSpan>],
+    rows: &[Vec<Vec<MdSpan>>],
+    align: &[ColAlign],
+    width: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
+    let lines = table_lines(header, rows, align, width, theme);
+    let copy = lines
+        .iter()
+        .map(|line| {
+            let first = line
+                .spans
+                .first()
+                .and_then(|span| span.content.chars().next());
+            crate::selection::PlainRow {
+                skip: matches!(first, Some('╭' | '├' | '╰')),
+                ..Default::default()
+            }
+        })
+        .collect();
+    (lines, copy)
+}
+
 fn table_lines(
     header: &[Vec<MdSpan>],
     rows: &[Vec<Vec<MdSpan>>],
@@ -1021,10 +1121,23 @@ fn wrap_spans(
     width: usize,
     theme: &Theme,
     base: Style,
+    strong: Option<Color>,
+) -> Vec<Line<'static>> {
+    wrap_spans_with_joiners(spans, width, theme, base, strong).0
+}
+
+/// [`wrap_spans`] plus, per row, how it joins the previous row: `None` starts
+/// a new logical line, `Some(joiner)` is a soft wrap that dropped `joiner`
+/// (often empty for CJK or an overlong token).
+fn wrap_spans_with_joiners(
+    spans: &[MdSpan],
+    width: usize,
+    theme: &Theme,
+    base: Style,
     // Ink for `**strong**` spans, or `None` where bold is structural rather
     // than emphasis (headings). Code and links still override it.
     strong: Option<Color>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Option<String>>) {
     let style_of = |s: &MdSpan| {
         let mut style = base;
         if s.bold {
@@ -1054,11 +1167,22 @@ fn wrap_spans(
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut joiners: Vec<Option<String>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
+    // How the line being built joins the previous line. Set when a wrap
+    // dropped whitespace; `None` means a logical line start.
+    let mut pending: Option<String> = None;
 
-    let flush = |cur: &mut Vec<Span<'static>>, col: &mut usize, lines: &mut Vec<Line<'static>>| {
+    let flush = |cur: &mut Vec<Span<'static>>,
+                 col: &mut usize,
+                 lines: &mut Vec<Line<'static>>,
+                 joiners: &mut Vec<Option<String>>,
+                 pending: &mut Option<String>,
+                 next: Option<String>| {
         lines.push(Line::from(std::mem::take(cur)));
+        joiners.push(pending.take());
+        *pending = next;
         *col = 0;
     };
 
@@ -1072,7 +1196,14 @@ fn wrap_spans(
         // Split into word / whitespace tokens.
         for token in split_tokens(&span.text) {
             if token == "\n" {
-                flush(&mut cur, &mut col, &mut lines);
+                flush(
+                    &mut cur,
+                    &mut col,
+                    &mut lines,
+                    &mut joiners,
+                    &mut pending,
+                    None,
+                );
                 continue;
             }
             let is_space = token.chars().all(|c| c == ' ');
@@ -1082,7 +1213,15 @@ fn wrap_spans(
                     continue; // drop leading spaces on a fresh line
                 }
                 if col + tw > width {
-                    flush(&mut cur, &mut col, &mut lines);
+                    // This space is the joiner between the two visual rows.
+                    flush(
+                        &mut cur,
+                        &mut col,
+                        &mut lines,
+                        &mut joiners,
+                        &mut pending,
+                        Some(token.clone()),
+                    );
                 } else {
                     cur.push(Span::styled(token.clone(), style));
                     col += tw;
@@ -1109,14 +1248,29 @@ fn wrap_spans(
                     for g in piece.graphemes(true) {
                         let gw = grapheme_width(g).max(1);
                         if col + gw > width && col > 0 {
-                            flush(&mut cur, &mut col, &mut lines);
+                            // The break dropped no source character.
+                            flush(
+                                &mut cur,
+                                &mut col,
+                                &mut lines,
+                                &mut joiners,
+                                &mut pending,
+                                Some(String::new()),
+                            );
                         }
                         cur.push(Span::styled(g.to_string(), piece_style));
                         col += gw;
                     }
                 } else {
                     if col + pw > width && col > 0 {
-                        flush(&mut cur, &mut col, &mut lines);
+                        flush(
+                            &mut cur,
+                            &mut col,
+                            &mut lines,
+                            &mut joiners,
+                            &mut pending,
+                            Some(String::new()),
+                        );
                     }
                     cur.push(Span::styled(piece, piece_style));
                     col += pw;
@@ -1124,13 +1278,11 @@ fn wrap_spans(
             }
         }
     }
-    if !cur.is_empty() {
+    if !cur.is_empty() || lines.is_empty() {
         lines.push(Line::from(cur));
+        joiners.push(pending.take());
     }
-    if lines.is_empty() {
-        lines.push(Line::from(""));
-    }
-    lines
+    (lines, joiners)
 }
 
 /// Split text into maximal word and whitespace runs.
@@ -2573,6 +2725,7 @@ mod tests {
                         AssistantTone::Plain,
                         false,
                         &mut projected,
+                        &mut Vec::new(),
                     );
                     let header_rows = usize::from(
                         source.lines().count() > crate::code_block::SHORT_CODE_MAX_LINES,

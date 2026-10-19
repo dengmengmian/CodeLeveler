@@ -81,15 +81,26 @@ impl TextSelection {
 
 /// How one painted conversation row maps to copyable text.
 ///
-/// A user prompt owns a marker gutter (painted decoration) and one blank row
-/// above and below its body. `indent` names the gutter columns that must
-/// never be copied; `skip` marks a row that carries no text at all. The row's
-/// plain text itself stays aligned with the screen, so selection columns and
-/// URL hit-testing keep working unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The row's plain text stays aligned with the screen, so selection columns
+/// and URL hit-testing keep working unchanged. Everything here is produced by
+/// the renderer that painted the row — never inferred from the text:
+///
+/// * `indent` — leading display columns that are decoration (marker gutter,
+///   code gutter, rail).
+/// * `skip` — the row has no authored text (block header, status, padding,
+///   divider) and must not copy.
+/// * `joiner` — `Some` means this row is a soft wrap of the previous logical
+///   line; copy that joiner instead of a newline. `Some("")` is a break with
+///   no source character (CJK/overlong code).
+/// * `prefix` — the semantic marker the renderer replaced with a visual glyph
+///   (heading `#`, list `- `/`1. `, quote `> `). Emitted only when the
+///   selection starts at the marker.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PlainRow {
     pub indent: u16,
     pub skip: bool,
+    pub joiner: Option<Box<str>>,
+    pub prefix: Option<Box<str>>,
 }
 
 /// Extract plain text for a selection from absolute content lines, honoring
@@ -111,29 +122,40 @@ pub fn extract_selected_text_with_layout(
     let mut out = String::new();
     let mut wrote_row = false;
     for row in start_row..=end_row {
-        let row_layout = layout.get(row).copied().unwrap_or_default();
-        // A padding row carries no text: it neither copies nor contributes a
-        // newline between the real rows around it.
+        let row_layout = layout.get(row).cloned().unwrap_or_default();
+        // A display-only row neither copies nor contributes a line break.
         if row_layout.skip {
             continue;
         }
         let line = plain_lines.get(row).map(String::as_str).unwrap_or("");
-        let from =
-            (if row == start_row { start.col } else { 0 }).max(usize::from(row_layout.indent));
+        let from_raw = if row == start_row { start.col } else { 0 };
+        let indent = usize::from(row_layout.indent);
+        let from = from_raw.max(indent);
         let to = if row == end_row {
             end.col
         } else {
             UnicodeWidthStr::width(line)
         };
-        let slice = if to > from {
-            slice_display_cols(line, from, to)
-        } else {
-            String::new()
-        };
-        if wrote_row {
-            out.push('\n');
+        // The selection ends inside this row's decoration: it reaches no text.
+        if to < from {
+            continue;
         }
-        out.push_str(&slice);
+        if wrote_row {
+            match row_layout.joiner.as_deref() {
+                // A soft wrap: the renderer broke the line here, the source
+                // had only this whitespace (often none, for CJK/code).
+                Some(joiner) => out.push_str(joiner),
+                None => out.push('\n'),
+            }
+        }
+        if from_raw <= indent
+            && let Some(prefix) = row_layout.prefix.as_deref()
+        {
+            out.push_str(prefix);
+        }
+        if to > from {
+            out.push_str(&slice_display_cols(line, from, to));
+        }
         wrote_row = true;
     }
     out
@@ -320,22 +342,27 @@ mod tests {
             PlainRow {
                 indent: 0,
                 skip: true,
+                ..Default::default()
             },
             PlainRow {
                 indent: 2,
                 skip: false,
+                ..Default::default()
             },
             PlainRow {
                 indent: 2,
                 skip: false,
+                ..Default::default()
             },
             PlainRow {
                 indent: 2,
                 skip: false,
+                ..Default::default()
             },
             PlainRow {
                 indent: 0,
                 skip: true,
+                ..Default::default()
             },
         ];
         let mut sel = TextSelection::default();
@@ -355,6 +382,7 @@ mod tests {
         let layout = vec![PlainRow {
             indent: 2,
             skip: false,
+            ..Default::default()
         }];
         let mut sel = TextSelection::default();
         sel.begin(TextPos { row: 0, col: 0 });
@@ -364,6 +392,92 @@ mod tests {
             extract_selected_text_with_layout(&lines, &layout, &sel),
             "hello"
         );
+    }
+
+    /// A soft wrap is one logical line: copy the renderer's joiner, never a
+    /// newline. A word wrap keeps the dropped space; a CJK/code break adds
+    /// nothing.
+    #[test]
+    fn a_soft_wrap_rejoins_without_a_newline() {
+        let lines = vec![
+            "hello".to_string(),
+            "world".to_string(),
+            "下一行".to_string(),
+        ];
+        let layout = vec![
+            PlainRow::default(),
+            PlainRow {
+                joiner: Some(" ".into()),
+                ..Default::default()
+            },
+            PlainRow::default(),
+        ];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos { row: 2, col: 6 });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "hello world\n下一行"
+        );
+    }
+
+    /// A list/heading/quote marker the renderer replaced with a glyph is
+    /// restored only when the selection starts at the marker.
+    #[test]
+    fn a_semantic_prefix_is_restored_at_the_marker() {
+        let lines = vec!["• alpha".to_string(), "• beta".to_string()];
+        let layout = vec![
+            PlainRow {
+                indent: 2,
+                prefix: Some("- ".into()),
+                ..Default::default()
+            },
+            PlainRow {
+                indent: 2,
+                prefix: Some("- ".into()),
+                ..Default::default()
+            },
+        ];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos { row: 1, col: 6 });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "- alpha\n- beta"
+        );
+
+        // Starting inside the body does not inject a marker.
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 4 });
+        sel.extend(TextPos { row: 0, col: 7 });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "pha"
+        );
+    }
+
+    /// A selection that ends inside the decoration contributes no line.
+    #[test]
+    fn a_selection_ending_in_the_gutter_adds_nothing() {
+        let lines = vec!["  hello".to_string(), "  world".to_string()];
+        let layout = vec![
+            PlainRow {
+                indent: 2,
+                ..Default::default()
+            },
+            PlainRow {
+                indent: 2,
+                ..Default::default()
+            },
+        ];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos { row: 0, col: 1 });
+        sel.finish();
+        assert_eq!(extract_selected_text_with_layout(&lines, &layout, &sel), "");
     }
 
     #[test]

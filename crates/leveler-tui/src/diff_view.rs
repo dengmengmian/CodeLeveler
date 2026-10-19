@@ -6,7 +6,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::render::{truncate_display, wrap};
+use crate::render::truncate_display;
 use crate::theme::Theme;
 
 /// Max body lines shown before middle fold (header is extra).
@@ -158,15 +158,19 @@ fn compact_file(path: &str) -> String {
         .to_string()
 }
 
-/// Render DiffView into conversation lines (no solid block background).
-pub fn render_diff_view(
+/// Render a diff plus its semantic copy policy: the `▼` header and the
+/// "lines hidden" marker are display chrome and do not copy. Body rows are
+/// the patch's own `+`/`-`/space-prefixed text; the two-column gutter is
+/// visual, and a wrapped source line rejoins with no injected newline.
+pub fn render_diff_view_with_copy(
     view: &DiffView,
     width: usize,
     theme: &Theme,
-    out: &mut Vec<Line<'static>>,
-) {
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
     let width = width.max(12);
     let header = view.header_label();
+    let mut out = Vec::new();
+    let mut copy = Vec::new();
 
     // Compact header — not a black box.
     out.push(Line::from(vec![
@@ -178,23 +182,32 @@ pub fn render_diff_view(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    copy.push(crate::selection::PlainRow {
+        skip: true,
+        ..Default::default()
+    });
 
     let body = fold_diff_lines(&view.lines);
     for part in body {
         match part {
             Folded::Line(line) => {
-                for row in render_diff_line(line, width, theme) {
-                    out.push(row);
-                }
+                let (rows, layout) = render_diff_line_with_copy(line, width, theme);
+                out.extend(rows);
+                copy.extend(layout);
             }
             Folded::Omitted(n) => {
                 out.push(Line::from(Span::styled(
                     format!("  ⋮ {n} lines hidden"),
                     Style::default().fg(theme.text.muted),
                 )));
+                copy.push(crate::selection::PlainRow {
+                    skip: true,
+                    ..Default::default()
+                });
             }
         }
     }
+    (out, copy)
 }
 
 enum Folded<'a> {
@@ -271,7 +284,11 @@ fn fold_diff_lines(lines: &[DiffLine]) -> Vec<Folded<'_>> {
     out
 }
 
-fn render_diff_line(line: &DiffLine, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn render_diff_line_with_copy(
+    line: &DiffLine,
+    width: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
     let (prefix, style) = match line.kind {
         DiffLineKind::Add => ("  ", Style::default().fg(theme.diff.added)),
         DiffLineKind::Remove => ("  ", Style::default().fg(theme.diff.removed)),
@@ -280,35 +297,34 @@ fn render_diff_line(line: &DiffLine, width: usize, theme: &Theme) -> Vec<Line<'s
         DiffLineKind::Context => ("  ", Style::default().fg(theme.text.secondary)),
     };
     let inner = width.saturating_sub(prefix.len()).max(1);
-    let text = if line.kind == DiffLineKind::HunkHeader {
-        // Soften @@ headers.
-        line.text.clone()
-    } else {
-        line.text.clone()
-    };
-    wrap(&text, inner)
-        .into_iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let lead = if i == 0 { prefix } else { "  " };
-            Line::from(vec![
-                Span::styled(lead.to_string(), Style::default().fg(theme.border.normal)),
-                Span::styled(row, style),
-            ])
-        })
-        .collect()
+    let text = line.text.clone();
+    let mut out = Vec::new();
+    let mut copy = Vec::new();
+    for (row, joiner) in crate::render::text::wrap_with_joiners(&text, inner) {
+        let lead = if joiner.is_none() { prefix } else { "  " };
+        out.push(Line::from(vec![
+            Span::styled(lead.to_string(), Style::default().fg(theme.border.normal)),
+            Span::styled(row, style),
+        ]));
+        copy.push(crate::selection::PlainRow {
+            indent: prefix.len() as u16,
+            joiner: joiner.map(String::into_boxed_str),
+            ..Default::default()
+        });
+    }
+    (out, copy)
 }
 
-/// Convenience: parse + render a markdown `diff` fence body.
-pub fn render_diff_fence(
+/// Parse and render a markdown `diff` fence body, with the semantic copy
+/// policy for each painted row.
+pub fn render_diff_fence_with_copy(
     src: &str,
     title_hint: Option<&str>,
     width: usize,
     theme: &Theme,
-    out: &mut Vec<Line<'static>>,
-) {
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
     let view = DiffView::parse(src, title_hint);
-    render_diff_view(&view, width, theme, out);
+    render_diff_view_with_copy(&view, width, theme)
 }
 
 #[cfg(test)]
@@ -340,8 +356,7 @@ mod tests {
     #[test]
     fn render_has_header_and_no_code_bg_box() {
         let theme = Theme::no_color();
-        let mut out = Vec::new();
-        render_diff_fence(SAMPLE, Some("auth.go:120"), 60, &theme, &mut out);
+        let (out, _) = render_diff_fence_with_copy(SAMPLE, Some("auth.go:120"), 60, &theme);
         let text: Vec<String> = out
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -379,8 +394,7 @@ mod tests {
             }
         }
         let v = DiffView::parse(&body, None);
-        let mut out = Vec::new();
-        render_diff_view(&v, 60, &Theme::no_color(), &mut out);
+        let (out, _) = render_diff_view_with_copy(&v, 60, &Theme::no_color());
         let text: Vec<String> = out
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
