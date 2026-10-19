@@ -143,6 +143,125 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
 /// rows; this page is where the full list lives, so six children stay reachable
 /// exactly like two. It is observational, like the roster: Enter opens a child's
 /// detail, `x` stops a running one, and nothing here cancels work by itself.
+/// The full-output page: a Secondary Surface over the conversation whose body
+/// is a window over a file-backed row index.
+///
+/// The page never builds the whole output. It asks [`crate::output_view::OutputView`]
+/// for exactly the rows the body can paint; selection is highlighted from the
+/// same rows. While the index is being built it paints the bounded provisional
+/// tail instead of an empty screen.
+fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let t = state.t();
+    let page_data = state.output_view.as_ref().map(|view| {
+        let rows_label = view
+            .total_rows()
+            .map(|rows| t.output_screen_rows.replace("{}", &rows.to_string()))
+            .unwrap_or_else(|| t.output_screen_loading.to_string());
+        let follow = if view.follow {
+            t.output_screen_follow
+        } else {
+            t.output_screen_paused
+        };
+        format!("{rows_label} · {follow}")
+    });
+    // Copy feedback is otherwise painted only on the Conversation strip; a
+    // secondary page must still say whether the clipboard write happened.
+    let (status_text, status_color) = match state.notification.as_ref() {
+        Some(note) => {
+            use leveler_client_protocol::NotificationLevel;
+            let (icon, color) = match note.level {
+                NotificationLevel::Info => ("ℹ", state.theme.accent.primary),
+                NotificationLevel::Warning => ("⚠", state.theme.status.warning),
+                NotificationLevel::Error => ("✕", state.theme.status.error),
+            };
+            (Some(format!("{icon} {}", note.message)), color)
+        }
+        None => (page_data, state.theme.text.muted),
+    };
+    let page = crate::secondary::SecondaryPage {
+        title: t.output_screen_title,
+        status: status_text
+            .map(|status| vec![Span::styled(status, Style::default().fg(status_color))])
+            .unwrap_or_default(),
+        hint: t.output_screen_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let Some(view) = state.output_view.as_mut() else {
+        return;
+    };
+    let width = body.width as usize;
+    view.rect = Some((body.x, body.y, body.width, body.height));
+    state.output_rect = view.rect;
+    let height = body.height as usize;
+    view.sync_geometry(height);
+    if view
+        .index
+        .as_ref()
+        .is_some_and(|index| index.width != width)
+    {
+        // The reducer rebuilds at the new width; painting the old rows would
+        // put wrapped text under the wrong columns.
+        let line = Line::from(Span::styled(
+            t.output_screen_reflow.to_string(),
+            Style::default().fg(state.theme.text.muted),
+        ));
+        frame.render_widget(Paragraph::new(line), body);
+        return;
+    }
+    if let Some(error) = view.error.clone().filter(|_| view.index.is_none()) {
+        let line = Line::from(Span::styled(
+            error,
+            Style::default().fg(state.theme.status.error),
+        ));
+        frame.render_widget(Paragraph::new(line), body);
+        return;
+    }
+    let rows = match view.visible(height) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let line = Line::from(Span::styled(
+                error,
+                Style::default().fg(state.theme.status.error),
+            ));
+            frame.render_widget(Paragraph::new(line), body);
+            return;
+        }
+    };
+    if rows.is_empty() {
+        let line = Line::from(Span::styled(
+            t.output_screen_empty.to_string(),
+            Style::default().fg(state.theme.text.muted),
+        ));
+        frame.render_widget(Paragraph::new(line), body);
+        return;
+    }
+    let selection = view.selection.clone();
+    let scroll = view.scroll;
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            let line = Line::from(Span::styled(
+                row.display,
+                Style::default().fg(state.theme.text.secondary),
+            ));
+            crate::selection::apply_selection_highlight(
+                line,
+                scroll + offset,
+                &selection,
+                &state.theme,
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
 fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let hint = if state.team.children.is_empty() {
@@ -1244,6 +1363,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_context_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
+        Screen::Output => render_output_screen(frame, area, state),
     }
     if let Some(overlay) = &state.overlay {
         crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);

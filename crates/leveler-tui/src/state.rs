@@ -473,6 +473,8 @@ pub struct AppState {
     pub shell_live_background_rect: Option<(u16, u16, u16, u16)>,
     /// Last painted Input/composer rect for click-to-focus.
     pub input_rect: Option<(u16, u16, u16, u16)>,
+    /// Last-painted body rect of the full-output page, for mouse mapping.
+    pub output_rect: Option<(u16, u16, u16, u16)>,
     /// Which first-class activity the Activity Detail screen is showing.
     pub activity_open: Option<crate::activity::ActivityId>,
     /// Keyboard selection into [`crate::activity::summaries`], stable by id.
@@ -481,6 +483,9 @@ pub struct AppState {
     /// scrolls back. Owned here like `conv`; the renderer publishes the
     /// measured viewport each frame and the reducer maps scroll intents.
     pub activity_view: crate::activity::ActivityView,
+    /// Full-output page for a completed user shell. The page is file-backed
+    /// and windowed; the conversation never materializes its rows.
+    pub output_view: Option<crate::output_view::OutputView>,
     /// Last-painted status-strip hits: (row y, activity). Mouse open uses this.
     pub activity_hits: Vec<(u16, crate::activity::ActivityId)>,
     /// Keyboard selection into the background-jobs list page, by task id.
@@ -749,9 +754,11 @@ impl AppState {
             shell_live_stop_rect: None,
             shell_live_background_rect: None,
             input_rect: None,
+            output_rect: None,
             activity_open: None,
             activity_selected: None,
             activity_view: crate::activity::ActivityView::default(),
+            output_view: None,
             activity_hits: Vec::new(),
             team_selected: None,
             background_list_selected: None,
@@ -924,6 +931,22 @@ impl AppState {
         };
         let (item, call) = self.call_location(id)?;
         self.command_is_stoppable(item, call).then_some(id)
+    }
+
+    /// The local root under which this session's shell captures live.
+    ///
+    /// The composer draft path is `<state_dir>/draft.txt`, so its parent IS
+    /// the authoritative state dir. This keeps the trust boundary in the UI
+    /// without adding a second copy of the layout to `Boot`.
+    pub fn shell_output_root(&self) -> Option<std::path::PathBuf> {
+        if let Some(state_dir) = self.boot.draft_path.as_ref().and_then(|path| path.parent()) {
+            return Some(state_dir.join("shell-output"));
+        }
+        // A host that did not pass a draft path still has the global home.
+        // This is deliberately the union of project captures, not an
+        // arbitrary filesystem path.
+        let home = leveler_core::leveler_home_dir_from(|name| std::env::var_os(name))?;
+        Some(home.join("state").join("projects"))
     }
 
     /// The user shell id that should wear the Command focus marker, when the

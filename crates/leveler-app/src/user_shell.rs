@@ -30,12 +30,38 @@ use leveler_execution::{OutputStream, ProcessError, ProcessOutput};
 pub(crate) const OUTPUT_TAIL_CAP: usize = 1024 * 1024;
 /// Completed executions kept per session for reconnect/history.
 const HISTORY_CAP: usize = 16;
-/// Exact raw-stream captures kept per session. Each execution has one
-/// directory; pruning runs before a new execution starts, so a capture that
-/// is still being written (the current one) is never a candidate. Both a
-/// count and a byte budget bound what a long session can retain.
-const OUTPUT_KEEP: usize = 32;
-const OUTPUT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+// Complete captures are retained for the life of their session. They are
+// referenced by the transcript (a finished record names its capture), so
+// trimming the oldest ones would delete a file the session can still open.
+// `remove_session_output` reclaims them when the session itself is deleted.
+
+/// A path component that cannot escape `shell-output`.
+///
+/// Identifiers are UUIDs (or `ush-<uuid>`), so valid values pass unchanged.
+/// A malformed id from a client is hex-encoded instead of being joined as a
+/// path segment; the cleanup and capture paths are destructive/authoritative
+/// and must not honour `..` or a separator.
+fn safe_component(value: &str) -> String {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        return value.to_string();
+    }
+    let mut encoded = String::from("invalid-");
+    for byte in value.bytes().take(32) {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn session_output_directory(state_dir: &Path, session_id: &SessionId) -> PathBuf {
+    state_dir
+        .join("shell-output")
+        .join(safe_component(session_id.as_str()))
+}
 
 /// The directory that holds one execution's exact stdout/stderr streams.
 pub(crate) fn output_directory(
@@ -43,10 +69,7 @@ pub(crate) fn output_directory(
     session_id: &SessionId,
     id: &UserShellId,
 ) -> PathBuf {
-    state_dir
-        .join("shell-output")
-        .join(session_id.as_str())
-        .join(id.as_str())
+    session_output_directory(state_dir, session_id).join(safe_component(id.as_str()))
 }
 
 /// The directory of a COMPLETE capture, or `None` when any stream's sidecar
@@ -96,63 +119,43 @@ pub(crate) fn prepare_output_directory(
     session_id: &SessionId,
     id: &UserShellId,
 ) -> PathBuf {
-    let session_dir = state_dir.join("shell-output").join(session_id.as_str());
-    prune_output_directories(&session_dir, id, OUTPUT_KEEP);
+    let session_dir = session_output_directory(state_dir, session_id);
+    if let Err(error) = ensure_private_directory(&session_dir) {
+        tracing::warn!(
+            %error,
+            path = %session_dir.display(),
+            "user shell capture directory could not be made private"
+        );
+    }
     output_directory(state_dir, session_id, id)
 }
 
-/// Keep the newest `keep` capture directories (plus the one about to start),
-/// and drop the oldest until the session's captures fit the byte budget.
-fn prune_output_directories(session_dir: &Path, current: &UserShellId, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(session_dir) else {
-        return;
-    };
-    let mut directories: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| entry.file_name().to_string_lossy() != current.as_str())
-        .filter_map(|entry| {
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            let path = entry.path();
-            // A capture without both sidecars is still being written (the
-            // current execution) or died before finishing. Never unlink a
-            // live writer's file; only an abandoned one older than a week is
-            // eligible.
-            let complete = ["stdout", "stderr"]
-                .iter()
-                .all(|stream| path.join(format!("{stream}.meta.json")).is_file());
-            let age = std::time::SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or_default();
-            if !complete && age < std::time::Duration::from_secs(7 * 24 * 60 * 60) {
-                return None;
-            }
-            Some((modified, directory_bytes(&path), path))
-        })
-        .collect();
-    directories.sort_by_key(|(modified, _, _)| *modified);
-    let mut remaining = directories.len();
-    let mut total: u64 = directories.iter().map(|(_, bytes, _)| *bytes).sum();
-    for (_, bytes, path) in directories {
-        if remaining <= keep && total <= OUTPUT_TOTAL_BYTES {
-            break;
-        }
-        let _ = std::fs::remove_dir_all(&path);
-        remaining = remaining.saturating_sub(1);
-        total = total.saturating_sub(bytes);
+/// Create a directory only this user can enter. Captured output may contain
+/// credentials, so the process umask is not the boundary.
+fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    Ok(())
 }
 
-fn directory_bytes(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|meta| meta.is_file())
-        .map(|meta| meta.len())
-        .sum()
+/// Remove a deleted session's captures. The database is the authority for
+/// whether a session exists; this only reclaims its derived files after the
+/// delete committed.
+pub(crate) fn remove_session_output(state_dir: &Path, session_id: &SessionId) {
+    let path = session_output_directory(state_dir, session_id);
+    if path.is_dir()
+        && let Err(error) = std::fs::remove_dir_all(&path)
+    {
+        tracing::warn!(
+            %error,
+            path = %path.display(),
+            "deleted session output could not be removed"
+        );
+    }
 }
 
 /// Bounded tail buffer with an honest truncation flag.
@@ -918,34 +921,92 @@ mod tests {
     }
 
     #[test]
-    fn output_pruning_keeps_the_newest_captures_and_the_current_one() {
+    fn a_new_execution_never_removes_captures_the_session_still_references() {
         let root = tempfile::tempdir().unwrap();
         let session = SessionId::new("s1");
         let session_dir = root.path().join("shell-output").join(session.as_str());
-        for index in 0..4 {
+        for index in 0..40 {
             let id = UserShellId::new(format!("ush-{index}"));
             let directory = output_directory(root.path(), &session, &id);
             std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(directory.join("stdout.log"), vec![b'x'; 8]).unwrap();
-            for stream in ["stdout", "stderr", "combined"] {
-                std::fs::write(
-                    directory.join(format!("{stream}.meta.json")),
-                    format!(r#"{{"stream":"{stream}","bytes":8,"complete":true}}"#),
-                )
-                .unwrap();
-            }
+            std::fs::write(directory.join("combined.log"), b"x").unwrap();
         }
         let current = UserShellId::new("current");
-        let current_dir = output_directory(root.path(), &session, &current);
-        std::fs::create_dir_all(&current_dir).unwrap();
-        std::fs::write(current_dir.join("stdout.log"), b"current").unwrap();
-
-        prune_output_directories(&session_dir, &current, 2);
+        prepare_output_directory(root.path(), &session, &current);
         let entries = std::fs::read_dir(&session_dir).unwrap().count();
-        assert_eq!(entries, 3, "kept captures are bounded");
+        assert_eq!(
+            entries, 40,
+            "a finished record still names its capture, so starting another command must not delete it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prepared_capture_directory_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let session = SessionId::new("s1");
+        let id = UserShellId::new("ush-private");
+        let directory = prepare_output_directory(root.path(), &session, &id);
+        let session_dir = root.path().join("shell-output").join(session.as_str());
+        let mode = std::fs::metadata(&session_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "session captures are owner-only");
         assert!(
-            current_dir.exists(),
-            "the execution about to start is never pruned"
+            !directory.exists(),
+            "the execution crate creates the leaf with its own mode"
+        );
+    }
+
+    #[test]
+    fn a_malformed_session_id_cannot_escape_the_capture_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        let hostile = SessionId::new("../../outside");
+        remove_session_output(root.path(), &hostile);
+        assert!(
+            outside.join("keep").exists(),
+            "cleanup never follows a session id out of shell-output"
+        );
+        let path = session_output_directory(root.path(), &hostile);
+        assert!(
+            path.starts_with(root.path().join("shell-output")),
+            "a malformed id is encoded, not joined: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn deleting_a_session_removes_only_its_own_captures() {
+        let root = tempfile::tempdir().unwrap();
+        let deleted = SessionId::new("s-deleted");
+        let kept = SessionId::new("s-kept");
+        for session in [&deleted, &kept] {
+            let id = UserShellId::new("ush-1");
+            let directory = output_directory(root.path(), session, &id);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("combined.log"), b"x").unwrap();
+        }
+        remove_session_output(root.path(), &deleted);
+        assert!(
+            !root
+                .path()
+                .join("shell-output")
+                .join(deleted.as_str())
+                .exists(),
+            "the deleted session's captures are reclaimed"
+        );
+        assert!(
+            root.path()
+                .join("shell-output")
+                .join(kept.as_str())
+                .exists(),
+            "another session's captures are untouched"
         );
     }
 }

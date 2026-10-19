@@ -683,10 +683,24 @@ fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 return Vec::new();
             }
             if let Some(directory) = full_output {
-                return vec![Effect::CopyUserShellOutput {
-                    directory: Some(std::path::PathBuf::from(directory)),
-                    retained,
-                }];
+                match valid_capture(state, &directory) {
+                    Ok(capture) => {
+                        return vec![Effect::CopyUserShellOutput {
+                            directory: Some(capture.directory),
+                            retained,
+                        }];
+                    }
+                    Err(error) if truncated => {
+                        state.notification = Some(Notification {
+                            level: NotificationLevel::Warning,
+                            message: error,
+                        });
+                        return Vec::new();
+                    }
+                    // The capture is gone but the retained text is complete;
+                    // copy what is actually known rather than refusing.
+                    Err(_) => {}
+                }
             }
             if truncated {
                 state.notification = Some(Notification {
@@ -754,16 +768,15 @@ fn output_slash(state: &mut AppState) -> Vec<Effect> {
         });
         return Vec::new();
     };
-    if let Some(directory) = full_output {
-        let path = std::path::PathBuf::from(directory).join("combined.log");
-        if path.is_file() {
-            return vec![Effect::OpenOutputPager {
-                source: PagerSource::File(path),
-            }];
-        }
-        // The capture was pruned or removed. Fall through only when the
-        // retained text still holds the whole result.
+    if let Some(directory) = full_output
+        && let Ok(capture) = valid_capture(state, &directory)
+    {
+        return vec![Effect::OpenOutputPager {
+            source: PagerSource::File(capture.combined),
+        }];
     }
+    // The capture was pruned, removed or outside the local state root. Fall
+    // through only when the retained text still holds the whole result.
     if truncated {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
@@ -774,6 +787,14 @@ fn output_slash(state: &mut AppState) -> Vec<Effect> {
     vec![Effect::OpenOutputPager {
         source: PagerSource::Text(crate::shell_render::copy_text(&retained)),
     }]
+}
+
+/// Validate a persisted capture path against the local state root.
+fn valid_capture(state: &AppState, directory: &str) -> Result<crate::output_view::Capture, String> {
+    crate::output_view::Capture::open(
+        std::path::Path::new(directory),
+        state.shell_output_root().as_deref(),
+    )
 }
 
 /// Copy a small, already-clean string (a command, or a selection). Output

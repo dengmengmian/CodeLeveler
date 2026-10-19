@@ -2766,6 +2766,42 @@ mod semantic_copy_tests {
         );
     }
 
+    /// Narration and the final answer are different semantic roles but the
+    /// same authored prose: both copy in full, without their painted bullets.
+    #[test]
+    fn narration_and_the_final_answer_both_copy_their_text() {
+        let mut s = dark_state();
+        s.transcript.push_user("question".into());
+        let id = MessageId::new("narration");
+        s.transcript.begin_assistant(id.clone());
+        s.transcript
+            .append_assistant(&id, "Narration: reading the files.");
+        s.transcript.finish_assistant(&id);
+        if let TranscriptItem::Assistant(block) = &mut s.transcript.items_mut()[1] {
+            block.kind = crate::transcript::AssistantKind::Progress;
+        }
+        answer(&mut s, "Final: the answer.");
+        let all = copy_rows(&s, 80, 0, s.conversation_plain(80).0.len());
+        assert!(all.contains("Narration: reading the files."), "{all:?}");
+        assert!(all.contains("Final: the answer."), "{all:?}");
+        assert!(!all.contains('●'), "the painted bullet never copies");
+    }
+
+    /// A runtime note is a host fact, not a user prompt: it copies its text
+    /// with no user marker and no host glyph.
+    #[test]
+    fn a_runtime_note_never_becomes_a_user_prompt_in_a_copy() {
+        let mut s = dark_state();
+        s.transcript.push_user("real ask".into());
+        s.transcript.push_note("runtime injected fact".into());
+        answer(&mut s, "done");
+        let all = copy_rows(&s, 80, 0, s.conversation_plain(80).0.len());
+        assert!(all.starts_with("real ask"), "{all:?}");
+        assert!(all.contains("runtime injected fact"), "{all:?}");
+        assert!(!all.contains('❯'), "the user marker is paint-only");
+        assert!(!all.contains('◆'), "the note glyph is paint-only");
+    }
+
     fn push_shell(state: &mut AppState, command: &str, output: &str) -> usize {
         let id = leveler_core::UserShellId::new("ush-copy");
         state.transcript.push_user_shell_started(
@@ -2853,8 +2889,12 @@ mod semantic_copy_tests {
         let (plain, _) = s.conversation_plain(80);
         let painted: String = plain.join("\n");
         assert!(
-            painted.contains("完整输出: /state/capture"),
-            "the pointer is visible: {painted:?}"
+            painted.contains("完整输出可用"),
+            "the open affordance is visible: {painted:?}"
+        );
+        assert!(
+            !painted.contains("/state/capture"),
+            "the capture path is internal and must not leak into the UI: {painted:?}"
         );
         let copied = copy_item(&s, 80, index);
         assert_eq!(copied, "seq 1 1000000\nTAIL-ONLY");
@@ -2862,6 +2902,41 @@ mod semantic_copy_tests {
             !copied.contains("完整输出"),
             "metadata never enters a selection copy"
         );
+    }
+
+    /// A virtual output block never lays out its full result in the
+    /// conversation, even when a running block was pinned expanded.
+    #[test]
+    fn a_capture_backed_result_stays_a_bounded_record() {
+        let mut s = dark_state();
+        let id = leveler_core::UserShellId::new("ush-virtual");
+        s.transcript
+            .push_user_shell_started(id.clone(), "big".into(), "/repo".into(), 0);
+        let body: String = (0..20_000).map(|n| format!("line-{n:05}\n")).collect();
+        s.transcript.append_user_shell_output(&id, &body, false);
+        s.transcript
+            .set_user_shell_full_output(&id, Some("/state/capture".into()));
+        s.transcript.mark_user_shell_output_truncated(&id);
+        s.transcript.complete_user_shell(
+            &id,
+            Some(0),
+            10,
+            crate::transcript::UserShellStatus::Success,
+        );
+        let index = s.transcript.user_shell_index(&id).expect("shell");
+        s.transcript.expand_item_display(index);
+        let lines = s.conversation_lines(80);
+        assert!(
+            lines.len() < 100,
+            "20k output lines must not be laid out inline: {} rows",
+            lines.len()
+        );
+        let painted: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(painted.contains("完整输出可用"));
     }
 
     /// A screen wrap of one terminal line is one source line: copy rejoins it

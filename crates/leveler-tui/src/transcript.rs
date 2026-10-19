@@ -436,6 +436,12 @@ pub const USER_SHELL_OUTPUT_CAP: usize = 1024 * 1024;
 /// and the complete capture is always available through `/output`.
 pub const USER_SHELL_AUTO_EXPAND_MAX_LINES: usize = 30;
 
+/// A result above either bound is browsed on the full-output page instead of
+/// being wrapped into the Conversation. The page renders only its viewport;
+/// the Conversation keeps the bounded preview in every case.
+pub const USER_SHELL_INLINE_MAX_BYTES: usize = 256 * 1024;
+pub const USER_SHELL_INLINE_MAX_LINES: usize = 2000;
+
 impl UserShellBlock {
     /// Whether the byte at `offset` came from stderr (the last mark at or
     /// before it). Empty/unknown ranges are stdout.
@@ -451,6 +457,20 @@ impl UserShellBlock {
     /// approximately: this is a sizing decision, not the renderer.
     fn display_line_count(&self) -> usize {
         self.output.lines().count()
+    }
+
+    /// Whether this finished result belongs on the full-output page.
+    ///
+    /// This is the ONE boundary: the reducer opens the page for it and the
+    /// inline renderer refuses to lay it out even if a running block was
+    /// pinned open. A capture is required; without one the retained text is
+    /// the only truth and the record stays inline.
+    pub fn needs_output_page(&self) -> bool {
+        self.status.is_terminal()
+            && self.full_output.is_some()
+            && (self.output_truncated
+                || self.output.len() > USER_SHELL_INLINE_MAX_BYTES
+                || self.output.lines().count() > USER_SHELL_INLINE_MAX_LINES)
     }
 }
 

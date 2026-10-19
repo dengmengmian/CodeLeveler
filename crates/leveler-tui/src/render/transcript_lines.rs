@@ -1725,14 +1725,19 @@ fn push_shell_output_rows(
 ) {
     use crate::transcript::UserShellStatus;
     let running = shell.status == UserShellStatus::Running;
-    let source = if shell.expanded {
+    // A result owned by the full-output page stays a bounded record inline,
+    // even if a running block was pinned open: the conversation must never lay
+    // out the whole result.
+    let virtual_output = shell.needs_output_page();
+    let expanded = shell.expanded && !virtual_output;
+    let source = if expanded {
         shell.output.as_str()
     } else {
         crate::shell_render::tail_source(&shell.output, USER_SHELL_PREVIEW_BYTES)
     };
     let mut lines = crate::shell_render::render_output(source, &shell.output_marks);
-    let hidden_source = !shell.expanded && source.len() < shell.output.len();
-    let cap = if shell.expanded {
+    let hidden_source = !expanded && source.len() < shell.output.len();
+    let cap = if expanded {
         if running {
             USER_SHELL_RUNNING_EXPANDED_ROWS
         } else {
@@ -1745,7 +1750,7 @@ fn push_shell_output_rows(
     if hidden_rows > 0 {
         lines.drain(..hidden_rows);
     }
-    if hidden_source || hidden_rows > 0 {
+    if (hidden_source || hidden_rows > 0) && !virtual_output {
         let marker = if running {
             t.shell_running_expanded_hidden
                 .replace("{}", &lines.len().to_string())
@@ -1807,7 +1812,7 @@ fn push_shell_output_rows(
     // describes.
     if shell.output_truncated {
         let marker = match shell.full_output.as_deref() {
-            Some(directory) => t.shell_full_output_at.replace("{}", directory),
+            Some(_) => t.shell_full_output_ready.to_string(),
             None => t.shell_truncated.to_string(),
         };
         push_shell_body(

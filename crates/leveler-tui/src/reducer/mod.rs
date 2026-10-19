@@ -247,7 +247,11 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Resize(cols, rows) => {
             state.size = (cols, rows);
-            Vec::new()
+            if state.active_screen == Screen::Output {
+                request_output_index(state)
+            } else {
+                Vec::new()
+            }
         }
         Action::IdleTick(_) => Vec::new(),
         Action::FileCandidatesLoaded(files) => {
@@ -281,6 +285,32 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 },
             });
             Vec::new()
+        }
+        Action::OutputIndexReady { generation, result } => {
+            let width = output_view_width(state);
+            let Some(view) = state.output_view.as_mut() else {
+                return Vec::new();
+            };
+            if view.generation != generation {
+                return Vec::new();
+            }
+            match result {
+                Ok(index) if index.width != width => {
+                    // The terminal changed width while the scan ran. The
+                    // completion belongs to a layout that is no longer on
+                    // screen; rebuild instead of applying stale rows.
+                    request_output_index(state)
+                }
+                Ok(index) => {
+                    view.apply_index(index);
+                    Vec::new()
+                }
+                Err(message) => {
+                    view.loading = false;
+                    view.error = Some(message);
+                    Vec::new()
+                }
+            }
         }
         Action::OutputPagerFinished(result) => {
             if let Err(message) = result {
@@ -867,6 +897,9 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     {
         return screen_nav::back(state);
     }
+    if state.active_screen == Screen::Output {
+        return output_mouse(state, mouse);
+    }
     if state.active_screen == Screen::ActivityList {
         let point = (mouse.column, mouse.row).into();
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
@@ -1155,6 +1188,13 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                                 execution_id,
                             })];
                         }
+                        // A large finished local command opens the windowed
+                        // full-output page; everything else folds inline.
+                        if let Some(effects) = open_output_view(state, item) {
+                            interaction::clear_selection_drag(state);
+                            state.conv.selection.clear();
+                            return effects;
+                        }
                         // Every other disclosure — tool group or user shell —
                         // folds inline. One hit map, one interaction.
                         interaction::toggle_fold(state, item);
@@ -1241,8 +1281,307 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     Vec::new()
 }
 
+/// Content width of the full-output page at the current terminal size.
+fn output_view_width(state: &AppState) -> usize {
+    let cols = state.size.0;
+    let pad = crate::secondary::padding_x(cols);
+    cols.saturating_sub(pad.saturating_mul(2)).max(1) as usize
+}
+
+/// Ask the edge to (re)build the output index at the current width. The
+/// previous index stays visible until the new one lands; a completion for an
+/// older generation is discarded.
+fn request_output_index(state: &mut AppState) -> Vec<Effect> {
+    let width = output_view_width(state);
+    let Some(view) = state.output_view.as_mut() else {
+        return Vec::new();
+    };
+    if view
+        .index
+        .as_ref()
+        .is_some_and(|index| index.width == width)
+        && !view.loading
+    {
+        return Vec::new();
+    }
+    view.capture_anchor();
+    view.loading = true;
+    view.generation = view.generation.wrapping_add(1);
+    let generation = view.generation;
+    vec![Effect::LoadOutputIndex {
+        source: view.source.clone(),
+        width,
+        generation,
+    }]
+}
+
+/// Open the full-output page for a finished local command, when the output is
+/// too large to belong inline. Returns `None` when the caller should perform
+/// its normal fold instead.
+fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
+    use crate::transcript::TranscriptItem;
+    let (command, retained, truncated, full_output) = match state.transcript.items().get(item) {
+        Some(TranscriptItem::UserShell(shell)) if shell.needs_output_page() => (
+            shell.command.clone(),
+            shell.output.clone(),
+            shell.output_truncated,
+            shell.full_output.clone(),
+        ),
+        _ => return None,
+    };
+    let root = state.shell_output_root();
+    let source = match full_output.as_deref() {
+        Some(directory) => {
+            match crate::output_view::Capture::open(
+                std::path::Path::new(directory),
+                root.as_deref(),
+            ) {
+                Ok(capture) => capture.source(),
+                Err(error) => {
+                    if truncated {
+                        state.notification = Some(Notification {
+                            level: NotificationLevel::Warning,
+                            message: error,
+                        });
+                        return None;
+                    }
+                    // The capture is gone but the retained text is complete:
+                    // page it from memory rather than claiming the whole
+                    // result is unavailable.
+                    crate::output_view::OutputSource::Memory(retained.clone().into())
+                }
+            }
+        }
+        None if !truncated => crate::output_view::OutputSource::Memory(retained.clone().into()),
+        None => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().copy_output_unavailable.to_string(),
+            });
+            return None;
+        }
+    };
+    // A viewer-backed block must not also be laid out inline: the whole point
+    // is that the conversation keeps a bounded record.
+    state.transcript.collapse_item_display(item);
+    let width = output_view_width(state);
+    let title = command.replace('\n', " ");
+    let effect_source = source.clone();
+    let mut view = crate::output_view::OutputView::new(source, title, width);
+    view.generation = 1;
+    state.output_view = Some(view);
+    state.active_screen = Screen::Output;
+    state.detail_return = Some(Screen::Conversation);
+    state.screen_scroll = 0;
+    state.conv.selection.clear();
+    Some(vec![Effect::LoadOutputIndex {
+        source: effect_source,
+        width,
+        generation: 1,
+    }])
+}
+
+/// Key bindings for the full-output page.
+pub(super) fn output_screen_key(state: &mut AppState, key: &KeyEvent) -> Vec<Effect> {
+    if key.code == KeyCode::Esc {
+        state.output_view = None;
+        state.active_screen = Screen::Conversation;
+        state.screen_scroll = 0;
+        return Vec::new();
+    }
+    let Some(view) = state.output_view.as_mut() else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => view.scroll_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => view.scroll_by(1),
+        KeyCode::PageUp => view.scroll_page(-1),
+        KeyCode::PageDown => view.scroll_page(1),
+        KeyCode::Home | KeyCode::Char('g') => view.jump_to_top(),
+        KeyCode::End | KeyCode::Char('G') => view.jump_to_bottom(),
+        KeyCode::Char('y')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if view.selection.is_empty() {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_selection_empty.to_string(),
+                });
+                return Vec::new();
+            }
+            if let Some(index) = view.index.clone() {
+                let (start, end) = view.selection.range().expect("selection is not empty");
+                return vec![Effect::CopyOutputSelection {
+                    index,
+                    source: view.source.clone(),
+                    start: (start.row, start.col),
+                    end: (end.row, end.col),
+                }];
+            }
+        }
+        KeyCode::Char('a')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let source = view.source.clone();
+            return vec![Effect::CopyOutputAll { source }];
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Map a screen cell to a position inside the full-output page.
+fn output_position(
+    view: &crate::output_view::OutputView,
+    col: u16,
+    row: u16,
+) -> Option<crate::selection::TextPos> {
+    let (rx, ry, rw, rh) = view.rect?;
+    if rw == 0 || rh == 0 {
+        return None;
+    }
+    // Clamp the pointer to the body, exactly like the Conversation mapping.
+    // A selection drag naturally runs past the right edge and into the two-row
+    // scroll hot zone; rejecting those cells would drop the focus and copy an
+    // empty selection.
+    let col = col.clamp(rx, rx.saturating_add(rw.saturating_sub(1)));
+    let row = row.clamp(ry, ry.saturating_add(rh.saturating_sub(1)));
+    let local = row - ry;
+    let screen_row = view.scroll.saturating_add(local as usize);
+    if let Some(index) = &view.index
+        && screen_row >= index.total_rows
+    {
+        return None;
+    }
+    Some(crate::selection::TextPos {
+        row: screen_row,
+        col: (col - rx) as usize,
+    })
+}
+
+/// Mouse handling for the full-output page: wheel scrolls, drag selects, and
+/// release copies the selection off the paint loop.
+fn output_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    let Some(view) = state.output_view.as_mut() else {
+        return Vec::new();
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            };
+            view.scroll_by(delta);
+            Vec::new()
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if view.index.is_none() {
+                return Vec::new();
+            }
+            let Some(pos) = output_position(view, mouse.column, mouse.row) else {
+                return Vec::new();
+            };
+            view.selection.begin(pos);
+            view.dragging = true;
+            view.last_mouse = Some((mouse.column, mouse.row));
+            update_output_edge(view, mouse.column, mouse.row);
+            Vec::new()
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if !view.dragging {
+                return Vec::new();
+            }
+            view.last_mouse = Some((mouse.column, mouse.row));
+            if let Some(pos) = output_position(view, mouse.column, mouse.row) {
+                view.selection.extend(pos);
+            }
+            update_output_edge(view, mouse.column, mouse.row);
+            Vec::new()
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if !view.dragging {
+                return Vec::new();
+            }
+            view.dragging = false;
+            view.edge_dir = 0;
+            view.edge_streak = 0;
+            view.selection.finish();
+            if view.selection.is_empty() {
+                return Vec::new();
+            }
+            let Some(index) = view.index.clone() else {
+                return Vec::new();
+            };
+            let (start, end) = view.selection.range().expect("selection is not empty");
+            vec![Effect::CopyOutputSelection {
+                index,
+                source: view.source.clone(),
+                start: (start.row, start.col),
+                end: (end.row, end.col),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn update_output_edge(view: &mut crate::output_view::OutputView, col: u16, row: u16) {
+    let Some((rx, ry, rw, rh)) = view.rect else {
+        view.edge_dir = 0;
+        return;
+    };
+    if rh == 0 || col < rx || col >= rx.saturating_add(rw) {
+        view.edge_dir = 0;
+        view.edge_streak = 0;
+        return;
+    }
+    const EDGE: u16 = 2;
+    let edge = EDGE.min(rh);
+    let dir = if row <= ry.saturating_add(edge.saturating_sub(1)) {
+        -1
+    } else if row >= ry.saturating_add(rh.saturating_sub(edge)) {
+        1
+    } else {
+        0
+    };
+    if dir == 0 {
+        view.edge_dir = 0;
+        view.edge_streak = 0;
+    } else if view.edge_dir != dir {
+        view.edge_dir = dir;
+        view.edge_streak = 0;
+    }
+}
+
+/// Edge auto-scroll while a full-output selection is dragged past the body.
+fn output_selection_tick(state: &mut AppState) {
+    let Some(view) = state.output_view.as_mut() else {
+        return;
+    };
+    if !view.dragging || view.edge_dir == 0 {
+        return;
+    }
+    let step = interaction::edge_scroll_step(view.edge_streak);
+    view.edge_streak = view.edge_streak.saturating_add(1);
+    view.scroll_by(isize::from(view.edge_dir) * step as isize);
+    let Some((col, row)) = view.last_mouse else {
+        return;
+    };
+    if let Some(pos) = output_position(view, col, row) {
+        view.selection.extend(pos);
+    }
+}
+
 /// Continuous edge scroll while the primary button is held in a hot zone.
 fn handle_selection_tick(state: &mut AppState) -> Vec<Effect> {
+    if state.active_screen == Screen::Output {
+        output_selection_tick(state);
+        return Vec::new();
+    }
     if !state.conv.selection.dragging || state.conv.selection_edge_dir == 0 {
         return Vec::new();
     }
@@ -1665,7 +2004,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // Command focus: Enter toggles the focused command's output, exactly
         // as clicking its row does.
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Command => {
-            toggle_selected_command(state);
+            return toggle_selected_command(state);
         }
         // `x` stops exactly the focused running command — never "the latest
         // one" and never the whole turn. Only bound while the Command focus
@@ -2126,24 +2465,28 @@ fn reveal_selected_command(state: &mut AppState) {
 }
 
 /// Toggle the focused command's output. Clicking its row does the same.
-fn toggle_selected_command(state: &mut AppState) {
+fn toggle_selected_command(state: &mut AppState) -> Vec<Effect> {
     let Some(target) = state.command_selected.clone() else {
-        return;
+        return Vec::new();
     };
     let Some((item, call)) = state.command_location(&target) else {
         state.command_selected = None;
-        return;
+        return Vec::new();
     };
     match call {
         Some(call) => {
             interaction::toggle_call(state, item, call);
         }
         None => {
+            if let Some(effects) = open_output_view(state, item) {
+                return effects;
+            }
             interaction::toggle_fold(state, item);
         }
     }
     state.conv.plain.clear();
     state.conv.plain_layout.clear();
+    Vec::new()
 }
 
 /// Ask the runtime to stop ONE focused running execution. The row says
@@ -2540,6 +2883,9 @@ mod context_refresh_tests;
 mod history_replay_tests;
 #[cfg(test)]
 mod input_recovery_tests;
+
+#[cfg(test)]
+mod output_view_tests;
 
 #[cfg(test)]
 mod pending_input_tests;

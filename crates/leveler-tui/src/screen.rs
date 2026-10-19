@@ -47,6 +47,10 @@ pub enum Screen {
     /// `/clean`: reclaim CodeLeveler-owned local storage. A page over the host's
     /// cleanup plan; scan and cleanup run off-thread.
     Clean,
+    /// Complete output of a finished local command. File-backed and windowed:
+    /// the page paints only the visible rows, so a 50 MiB result costs the
+    /// same per frame as a 1 KiB one.
+    Output,
 }
 
 /// Help / popup grouping for slash commands.
@@ -1251,6 +1255,7 @@ mod reachability_tests {
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Context => Some("`/context` — screen_nav::open_context"),
+            Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
         }
     }
 
@@ -1271,6 +1276,7 @@ mod reachability_tests {
             Screen::Doctor,
             Screen::Trace,
             Screen::Context,
+            Screen::Output,
         ];
         for screen in all {
             assert!(

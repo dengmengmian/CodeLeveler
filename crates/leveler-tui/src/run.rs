@@ -1003,6 +1003,48 @@ fn dispatch_effects(
                 let result = run_output_pager(alt, stdout, source);
                 let _ = completion_tx.send(Action::OutputPagerFinished(result));
             }
+            Effect::LoadOutputIndex {
+                source,
+                width,
+                generation,
+            } => {
+                let tx = completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = crate::output_view::OutputIndex::build(&source, width)
+                        .map(std::sync::Arc::new);
+                    let _ = tx.send(Action::OutputIndexReady { generation, result });
+                });
+            }
+            Effect::CopyOutputSelection {
+                index,
+                source,
+                start,
+                end,
+            } => {
+                let tx = completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut selection = crate::selection::TextSelection::default();
+                    selection.begin(crate::selection::TextPos {
+                        row: start.0,
+                        col: start.1,
+                    });
+                    selection.extend(crate::selection::TextPos {
+                        row: end.0,
+                        col: end.1,
+                    });
+                    let text = crate::output_view::selection_rows(&index, &source, &selection)
+                        .map(|rows| crate::output_view::selection_text(&rows, &selection))
+                        .and_then(|text| clipboard_result(&text));
+                    let _ = tx.send(Action::UserShellOutputCopied(text));
+                });
+            }
+            Effect::CopyOutputAll { source } => {
+                let tx = completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let text = source.copy_all().and_then(|text| clipboard_result(&text));
+                    let _ = tx.send(Action::UserShellOutputCopied(text));
+                });
+            }
         }
     }
 }
@@ -1027,6 +1069,16 @@ fn run_external_editor(
         return Err(format!("终端未能恢复：{e}"));
     }
     result
+}
+
+/// Write already-semantic output text to the clipboard, with the same empty
+/// guard every copy path uses.
+fn clipboard_result(text: &str) -> Result<(crate::clipboard::CopyReceipt, usize), String> {
+    if text.is_empty() {
+        return Err("输出为空，未写入剪贴板".to_string());
+    }
+    let count = text.chars().count();
+    crate::clipboard::copy(text).map(|receipt| (receipt, count))
 }
 
 /// Hand the terminal to `$PAGER` for the full output, then take it back.

@@ -250,6 +250,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 _ => {}
             }
         }
+        Screen::Output => return super::output_screen_key(state, &key),
         Screen::Activity => match key.code {
             KeyCode::Esc => return back(state),
             // `x` stops exactly the open activity; its parent turn keeps
@@ -511,6 +512,12 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
             }
         }
         Screen::Activity => crate::activity::close(state),
+        Screen::Output => {
+            // The page owns no live process; leaving it only drops its
+            // windowed projection and any outstanding index request.
+            state.output_view = None;
+            close_screen(state);
+        }
         Screen::ActivityList => {
             // Two levels of back: leave the log first, then the page.
             if state.background_list_focus == crate::activity::BackgroundPane::Output {
