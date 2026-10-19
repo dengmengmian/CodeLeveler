@@ -318,22 +318,36 @@ pub fn paint_reasoning_rail(
     }
 }
 
-/// Columns reserved before every prompt row: the `❯` marker and its gap.
+/// Columns reserved before every prompt row: the card's left padding, the `❯`
+/// marker, and the blank column between the marker and the body text.
 /// The marker itself is painted by the conversation viewport, not written
 /// into the line, so copied text never contains it.
-pub(crate) const USER_PROMPT_GUTTER: usize = 2;
-/// One column kept clear on the right so wrapped glyphs never touch the band.
+pub(crate) const USER_PROMPT_GUTTER: usize = 3;
+/// Blank columns between the card edge and its content.
+pub(crate) const USER_PROMPT_HPAD: usize = 1;
+/// The card's maximum share of the content area. A visual target, not a
+/// terminal size: the wrap and the paint both derive it from this one number.
+pub(crate) const USER_PROMPT_MAX_PERCENT: usize = 85;
+/// One column kept clear on the right so wrapped glyphs never touch the edge.
 const USER_PROMPT_RIGHT_PAD: usize = 1;
-/// Blank rows painted inside the band above and below the body.
+/// Blank rows painted inside the card above and below the body.
 pub(crate) const USER_PROMPT_PAD_ROWS: usize = 1;
 /// The prompt's leading icon.
 pub(crate) const USER_PROMPT_MARKER: &str = "❯";
-const USER_PROMPT_INDENT: &str = "  ";
+const USER_PROMPT_INDENT: &str = "   ";
 
-/// The user's own turn: a marker gutter, one blank row of band padding above
+/// Widest a prompt card may be at this content width: 85% of the reading
+/// area, with a floor that keeps the marker usable on very narrow terminals.
+pub(crate) fn user_prompt_max_width(content_width: usize) -> usize {
+    let cap = content_width.saturating_mul(USER_PROMPT_MAX_PERCENT) / 100;
+    let floor = (USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD).min(content_width);
+    cap.max(floor).min(content_width)
+}
+
+/// The user's own turn: a marker gutter, one blank row of card padding above
 /// and below, and the user's text at primary ink.
 ///
-/// The `❯` marker and the background band are painted over this projection by
+/// The `❯` marker and the card surface are painted over this projection by
 /// the conversation viewport. Keeping them out of the line means wrapping,
 /// selection columns, URL hit-testing and clipboard text all see exactly the
 /// user's own bytes — decoration can never be copied.
@@ -365,7 +379,7 @@ pub(crate) fn push_user_turn(
 /// The prompt body's visual rows and their soft-wrap joiners. Shared by the
 /// painter and the copy policy so the two cannot drift.
 fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
-    let inner = width
+    let inner = user_prompt_max_width(width)
         .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
         .max(1);
     let mut wrapped = crate::render::text::wrap_with_joiners(text, inner);
@@ -373,6 +387,33 @@ fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
         wrapped.push((String::new(), None));
     }
     wrapped
+}
+
+/// The painted card width for the prompt occupying `span` in `lines`.
+///
+/// Short prompts shrink to their widest painted body row plus one column of
+/// right padding; long ones take [`user_prompt_max_width`]. Measured from the
+/// built lines, so the card can never be narrower than glyphs the terminal is
+/// about to paint.
+pub(crate) fn user_prompt_card_width(
+    lines: &[Line<'static>],
+    span: (usize, usize),
+    content_width: usize,
+) -> usize {
+    let cap = user_prompt_max_width(content_width);
+    let body_start = span.0.saturating_add(USER_PROMPT_PAD_ROWS);
+    let body_end = span.1.saturating_sub(USER_PROMPT_PAD_ROWS);
+    let mut widest = USER_PROMPT_GUTTER;
+    for line in lines
+        .get(body_start..body_end.min(lines.len()))
+        .unwrap_or(&[])
+    {
+        widest = widest.max(line.width());
+        if widest.saturating_add(USER_PROMPT_RIGHT_PAD) >= cap {
+            return cap;
+        }
+    }
+    widest.saturating_add(USER_PROMPT_RIGHT_PAD).min(cap)
 }
 
 /// Copy policy for [`push_user_turn`]: band padding rows are display-only and
@@ -1906,7 +1947,7 @@ mod tests {
         let t = Locale::Zh.text();
         let lines = item_render(&TranscriptItem::User("hello".into()), &theme, 40, false, t);
         let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(text, vec!["", "  hello", ""], "prompt rows");
+        assert_eq!(text, vec!["", "   hello", ""], "prompt rows");
         assert!(
             !text.iter().any(|row| row.contains('❯')),
             "the marker is painted, never line content: {text:?}"
@@ -1927,22 +1968,28 @@ mod tests {
             t,
         );
         let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(text, vec!["", "  alpha", "  ", "  beta", ""], "prompt rows");
+        assert_eq!(
+            text,
+            vec!["", "   alpha", "   ", "   beta", ""],
+            "prompt rows"
+        );
     }
 
-    /// The body wraps inside the band: the gutter is reserved and one column
-    /// stays clear on the right so glyphs never touch the band edge.
+    /// The body wraps inside the card: the marker gutter is reserved, the
+    /// card is capped at its share of the content width, and one column stays
+    /// clear on the right so glyphs never touch the card edge.
     #[test]
     fn a_wrapped_prompt_keeps_its_right_padding() {
         let theme = Theme::dark();
         let t = Locale::Zh.text();
         let text = "这是一段足够长的用户输入，用来确认窄终端下自动换行仍然留出右边距。";
         let lines = item_render(&TranscriptItem::User(text.into()), &theme, 20, false, t);
+        let widest = user_prompt_max_width(20) - 1;
         for row in &lines {
             let width = unicode_width::UnicodeWidthStr::width(line_text(row).as_str());
             assert!(
-                width <= 19,
-                "row must stay inside the band: {:?}",
+                width <= widest,
+                "row must stay inside the card: {:?}",
                 line_text(row)
             );
         }
