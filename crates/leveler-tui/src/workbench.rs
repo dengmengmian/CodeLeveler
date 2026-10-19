@@ -2935,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_first_glyph_sits_on_the_gutter() {
+    fn conversation_prompt_card_starts_on_the_gutter_with_a_padded_marker() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -2958,8 +2958,11 @@ mod tests {
         }
         assert_eq!(
             marker_x,
-            Some(crate::conversation::geometry::GUTTER_X),
-            "top-level conversation marker must sit at the gutter, not the edge"
+            Some(
+                crate::conversation::geometry::GUTTER_X
+                    + crate::render::transcript_lines::USER_PROMPT_HPAD as u16
+            ),
+            "the card starts at the gutter and pads its marker one cell inside"
         );
     }
 

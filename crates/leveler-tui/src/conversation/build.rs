@@ -2606,6 +2606,22 @@ mod semantic_copy_tests {
         assert!(!copied.starts_with('❯'));
     }
 
+    /// A prompt that wraps inside its card copies exactly its source at every
+    /// width: the card gutter and its padding never reach the clipboard.
+    #[test]
+    fn a_long_wrapped_prompt_copies_its_source_without_card_padding() {
+        let mut s = dark_state();
+        let source = (0..30)
+            .map(|i| format!("word{i:02} "))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        s.transcript.push_user(source.clone());
+        for width in [80usize, 60, 48] {
+            assert_eq!(copy_item(&s, width, 0), source, "width {width}");
+        }
+    }
+
     #[test]
     fn markdown_copies_block_structure_without_visual_glyphs() {
         let mut s = dark_state();

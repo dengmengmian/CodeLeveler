@@ -112,25 +112,30 @@ fn paint_live_shell_rail(
     }
 }
 
-/// Paint the user prompt's band and marker over the projection.
+/// Paint the user prompt's card and marker over the projection.
 ///
-/// Both are decoration: the band is a row-wide surface behind every line of
-/// the prompt's item span (vertical padding included), and the marker is one
-/// glyph in the reserved gutter. Line content, selection columns, wrapping and
-/// clipboard text are exactly what the build produced — copy cannot pick up
-/// either. Selected cells keep their own background.
+/// Both are decoration: the card is a left-aligned surface that hugs the
+/// prompt's own text (never the full reading width), and the marker is one
+/// glyph in the card's reserved gutter. Line content, selection columns,
+/// wrapping and clipboard text are exactly what the build produced — copy
+/// cannot pick up either. Selected cells keep their own background.
 fn paint_user_prompt_decoration(
     frame: &mut Frame,
     state: &AppState,
+    all: &[Line<'static>],
     item_spans: &[(usize, usize)],
     scroll: usize,
     content: Rect,
 ) {
+    use crate::render::transcript_lines::{
+        USER_PROMPT_HPAD, USER_PROMPT_MARKER, USER_PROMPT_PAD_ROWS, user_prompt_card_width,
+    };
+
     if content.width == 0 || content.height == 0 {
         return;
     }
     let theme = &state.theme;
-    // NO_COLOR paints no surfaces, so there is no band to draw; the marker
+    // NO_COLOR paints no surfaces, so there is no card to draw; the marker
     // alone has to distinguish the prompt from agent prose.
     let band = (!theme.is_monochrome() && theme.surface.elevated != Color::Reset)
         .then_some(theme.surface.elevated);
@@ -147,11 +152,13 @@ fn paint_user_prompt_decoration(
         if end <= scroll || start >= window_end {
             continue;
         }
+        let card_width = user_prompt_card_width(all, (start, end), content.width as usize);
+        let card_right = content.x + card_width.min(content.width as usize) as u16;
         if let Some(band) = band {
             let band_style = Style::default().bg(band);
             for row in start.max(scroll)..end.min(window_end) {
                 let y = content.y + (row - scroll) as u16;
-                for x in content.x..content.x + content.width {
+                for x in content.x..card_right {
                     let Some(cell) = buf.cell_mut((x, y)) else {
                         continue;
                     };
@@ -162,13 +169,14 @@ fn paint_user_prompt_decoration(
             }
         }
         // The first body row follows the prompt's top padding row.
-        let marker_row = start + crate::render::transcript_lines::USER_PROMPT_PAD_ROWS;
+        let marker_row = start + USER_PROMPT_PAD_ROWS;
         if marker_row >= scroll && marker_row < window_end && marker_row < end {
             let y = content.y + (marker_row - scroll) as u16;
-            if let Some(cell) = buf.cell_mut((content.x, y)) {
-                cell.set_symbol(crate::render::transcript_lines::USER_PROMPT_MARKER);
+            let marker_x = content.x + USER_PROMPT_HPAD as u16;
+            if let Some(cell) = buf.cell_mut((marker_x, y)) {
+                cell.set_symbol(USER_PROMPT_MARKER);
                 if cell.bg != selected {
-                    cell.set_style(Style::default().fg(theme.text.secondary));
+                    cell.set_style(Style::default().fg(theme.accent.secondary));
                 }
             }
         }
@@ -259,7 +267,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ),
         content,
     );
-    paint_user_prompt_decoration(frame, state, &item_spans, scroll, content);
+    paint_user_prompt_decoration(frame, state, &all, &item_spans, scroll, content);
 
     // Scroll-to-bottom affordance: only when pinned away from live edge.
     // Hide while selecting/copying so the badge cannot cover or steal mouse
@@ -442,11 +450,12 @@ mod tests {
         (u0, u1, a0, a1)
     }
 
-    /// A prompt owns one continuous band: every content column of every prompt
-    /// row, including its padding and internal blank line. The answer that
-    /// follows immediately returns to the canvas.
+    /// A prompt owns one continuous card: every row of the prompt, including
+    /// its padding and internal blank line, is banded over the same left-
+    /// aligned span. Short prompts stop well before the reading width; the
+    /// answer that follows immediately returns to the canvas.
     #[test]
-    fn a_user_prompt_paints_one_continuous_band_and_agent_prose_stays_on_canvas() {
+    fn a_user_prompt_paints_one_continuous_card_and_agent_prose_stays_on_canvas() {
         let mut state = test_state();
         let (u0, u1, a0, a1) = prompt_then_answer(&mut state);
         let band = state.theme.surface.elevated;
@@ -455,9 +464,20 @@ mod tests {
         let total = state.conversation_lines(content().width as usize).len();
         let buffer = paint(&mut state, 0);
         let c = content();
+        let mut card: Option<(u16, u16)> = None;
         for row in u0..u1 {
             let y = painted_y(&state, row, height, total);
-            for x in c.x..c.x + c.width {
+            let cols: Vec<u16> = (c.x..c.x + c.width)
+                .filter(|x| buffer[(*x, y)].bg == band)
+                .collect();
+            let (first, last) = (*cols.first().expect("card starts"), *cols.last().unwrap());
+            assert_eq!(first, c.x, "the card is left-aligned");
+            if let Some(expected) = card {
+                assert_eq!((first, last), expected, "one width on every row");
+            } else {
+                card = Some((first, last));
+            }
+            for x in first..=last {
                 // A wide glyph owns the following cell; the terminal paints
                 // both columns with the glyph's style, so the covered cell's
                 // stored style is irrelevant (TestBackend leaves it alone).
@@ -467,17 +487,32 @@ mod tests {
                 assert_eq!(
                     buffer[(x, y)].bg,
                     band,
-                    "prompt row {row} column {x} must carry the band"
+                    "prompt row {row} column {x} must carry the card"
+                );
+            }
+            for x in last + 1..c.x + c.width {
+                if covered_by_wide(&buffer, x, y) {
+                    continue;
+                }
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    canvas,
+                    "prompt row {row} column {x} is outside the card"
                 );
             }
             for x in 0..c.x {
                 assert_ne!(
                     buffer[(x, y)].bg,
                     band,
-                    "the band must not enter the workspace gutter"
+                    "the card must not enter the workspace gutter"
                 );
             }
         }
+        let (_, last) = card.expect("prompt card");
+        assert!(
+            last < c.x + c.width - 1,
+            "a short prompt must not span the reading width"
+        );
         for row in a0..a1 {
             let y = painted_y(&state, row, height, total);
             for x in c.x..c.x + c.width {
@@ -510,12 +545,18 @@ mod tests {
         assert_eq!(marks.len(), 1, "one marker per prompt: {marks:?}");
         assert_eq!(
             marks[0],
-            (c.x, painted_y(&state, u0 + 1, height, total)),
-            "the marker sits in the gutter of the first body row"
+            (c.x + 1, painted_y(&state, u0 + 1, height, total)),
+            "the marker is padded inside the card on the first body row"
         );
         // Continuation rows are indented by exactly the gutter width.
         let y = painted_y(&state, u0 + 2, height, total);
-        assert_eq!(buffer[(c.x + 1, y)].symbol(), " ");
+        for x in c.x..c.x + 3 {
+            assert_eq!(
+                buffer[(x, y)].symbol(),
+                " ",
+                "continuation row {y} keeps the marker gutter clear at {x}"
+            );
+        }
         assert!(u1 > u0 + 2, "fixture must have a continuation row");
     }
 
@@ -550,10 +591,29 @@ mod tests {
         let c = content();
         let first = painted_y(&state, u0, height, total);
         let last = painted_y(&state, u1 - 1, height, total);
+        let mut right = None;
         for y in first..=last {
             assert_eq!(buffer[(c.x, y)].bg, band, "visible prompt row {y}");
-            assert_eq!(buffer[(c.x + c.width - 1, y)].bg, band, "full width");
+            let row_right = (c.x..c.x + c.width)
+                .filter(|x| buffer[(*x, y)].bg == band)
+                .next_back()
+                .expect("card row");
+            assert_eq!(
+                right.get_or_insert(row_right),
+                &row_right,
+                "one card width on every visible row"
+            );
+            assert!(
+                row_right < c.x + c.width - 1,
+                "a short prompt does not span the reading width"
+            );
         }
+        let right = right.expect("visible card rows");
+        assert_eq!(
+            buffer[(right + 1, first)].bg,
+            canvas,
+            "the row ends outside the card"
+        );
         assert_eq!(buffer[(c.x, first - 1)].bg, canvas, "row above is clean");
         assert_eq!(buffer[(c.x, last + 1)].bg, canvas, "row below is clean");
     }
