@@ -327,10 +327,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 fn render_shell_live_activity(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let Some(shell) = state.running_user_shell() else {
         state.shell_live_stop_rect = None;
+        state.shell_live_background_rect = None;
         return;
     };
     if area.width == 0 || area.height == 0 {
         state.shell_live_stop_rect = None;
+        state.shell_live_background_rect = None;
         return;
     }
     let theme = &state.theme;
@@ -344,6 +346,12 @@ fn render_shell_live_activity(frame: &mut Frame, area: Rect, state: &mut AppStat
     let stop = state.t().user_shell_stop;
     let stop_label = format!("✕ {stop}");
     let stop_w = UnicodeWidthStr::width(stop_label.as_str()) as u16;
+    let background = state.t().user_shell_background;
+    let background_label = format!("↗ {background}");
+    let background_w = UnicodeWidthStr::width(background_label.as_str()) as u16;
+    let separator = " · ";
+    let separator_w = UnicodeWidthStr::width(separator) as u16;
+    let controls_w = background_w + separator_w + stop_w;
     // Time-based, not frame-based: a burst of output repaints many frames and
     // must not make the spinner spin faster.
     let spinner = if state.live_animation {
@@ -360,7 +368,7 @@ fn render_shell_live_activity(frame: &mut Frame, area: Rect, state: &mut AppStat
         .to_string();
     let fixed = 1 + 1 + 1 + 1 + UnicodeWidthStr::width(elapsed.as_str()) + 3;
     let room = (area.width as usize)
-        .saturating_sub(fixed + stop_w as usize + 3)
+        .saturating_sub(fixed + controls_w as usize + 3)
         .max(4);
     let command = crate::render::truncate_display(&command, room);
     let line = Line::from(vec![
@@ -376,16 +384,28 @@ fn render_shell_live_activity(frame: &mut Frame, area: Rect, state: &mut AppStat
     ]);
     let paragraph = Paragraph::new(vec![line]);
     frame.render_widget(paragraph, area);
-    if stop_w + 2 <= area.width {
+    if controls_w + 2 <= area.width {
         let x = area
             .x
-            .saturating_add(area.width.saturating_sub(stop_w).saturating_sub(1));
-        state.shell_live_stop_rect = Some((x, area.y, stop_w, 1));
+            .saturating_add(area.width.saturating_sub(controls_w).saturating_sub(1));
         let style = Style::default().fg(theme.text.secondary);
         let buf = frame.buffer_mut();
-        buf.set_stringn(x, area.y, &stop_label, stop_w as usize, style);
+        buf.set_stringn(x, area.y, &background_label, background_w as usize, style);
+        state.shell_live_background_rect = Some((x, area.y, background_w, 1));
+        let separator_x = x.saturating_add(background_w);
+        buf.set_stringn(
+            separator_x,
+            area.y,
+            separator,
+            separator_w as usize,
+            Style::default().fg(theme.text.muted),
+        );
+        let stop_x = separator_x.saturating_add(separator_w);
+        buf.set_stringn(stop_x, area.y, &stop_label, stop_w as usize, style);
+        state.shell_live_stop_rect = Some((stop_x, area.y, stop_w, 1));
     } else {
         state.shell_live_stop_rect = None;
+        state.shell_live_background_rect = None;
     }
 }
 
@@ -4810,6 +4830,7 @@ mod tests {
             pid: None,
             last_output_at: None,
             output: String::new(),
+            unknown: false,
         }
     }
 
@@ -5137,5 +5158,46 @@ mod tests {
                 );
             }
         }
+    }
+    /// The live row is the second stop surface and the pointer entry for
+    /// backgrounding; both controls are published as hit rects.
+    #[test]
+    fn the_live_shell_row_publishes_background_and_stop_hit_rects() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.transcript.push_user_shell_started(
+            leveler_core::UserShellId::new("ush-live"),
+            "go test ./...".into(),
+            "/repo".into(),
+            0,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_shell_live_activity(frame, area, &mut state);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let compact = text.replace(' ', "");
+        assert!(compact.contains("↗转后台"), "{text}");
+        assert!(compact.contains("✕停止"), "{text}");
+        assert!(text.contains("go test ./..."), "{text}");
+        assert!(
+            state.shell_live_background_rect.is_some(),
+            "the background control has a click target"
+        );
+        assert!(
+            state.shell_live_stop_rect.is_some(),
+            "the stop control has a click target"
+        );
     }
 }

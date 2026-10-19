@@ -29,7 +29,10 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use leveler_core::{CheckpointId, CommandId, SessionId};
-use leveler_execution::{Approver, AutoApprove, PermissionProfile};
+use leveler_execution::{
+    AdoptedTaskSpec, Approver, AutoApprove, BackgroundTaskLifetime, OutputStream,
+    PermissionProfile, StreamOutcome,
+};
 use leveler_media::{MediaError, MediaStore};
 use leveler_model::{
     ContentPart, ImageSource, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, Role,
@@ -857,6 +860,85 @@ fn side_question_message(question: &str, runtime_context: &str) -> Message {
     )
 }
 
+/// One streamed user-shell chunk: the store tail and the persisted/forwarded
+/// transient event move together, so live and reconnect views cannot drift.
+async fn append_user_shell_chunk(
+    store: &crate::user_shell::UserShellStore,
+    log: &leveler_engine::EventLog<'_>,
+    forward: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
+    session_id: &SessionId,
+    id: &leveler_core::UserShellId,
+    chunk: leveler_execution::OutputChunk,
+) {
+    store.append_output(session_id, id, &chunk.text);
+    let _ = log
+        .append(
+            None,
+            leveler_engine::EngineEvent::UserShellOutput {
+                execution_id: id.clone(),
+                stream: crate::user_shell::stream_tag(chunk.stream).to_string(),
+                chunk: chunk.text,
+            },
+            forward,
+        )
+        .await;
+}
+
+/// Persist the terminal fact for an execution that completed in the background.
+///
+/// The original foreground ownership token is stale once another turn acquires
+/// the session, so this takes the CURRENT token only when it still belongs to
+/// this runtime. If another runtime owns the session, the live event is still
+/// delivered but nothing is written: a stale runtime must never extend the log.
+async fn persist_background_user_shell_finished(
+    app: Arc<Application>,
+    session_id: SessionId,
+    execution_id: leveler_core::UserShellId,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    status: String,
+    output_tail: String,
+    output_truncated: bool,
+) {
+    let Ok(db) = app.open_database().await else {
+        return;
+    };
+    let Ok(engine) = app.task_engine(&db) else {
+        return;
+    };
+    // A live turn from this runtime already owns the session: reuse its token.
+    // An idle session has no writer, so acquire the unowned epoch briefly and
+    // release it after the append. A foreign owner means this runtime must not
+    // write; the live event remains the only delivery.
+    let (token, acquired) = match engine.current_ownership(&session_id).await {
+        Ok(Some(token)) => (token, false),
+        Ok(None) => match engine.acquire_if_unowned(&session_id).await {
+            Ok(Some(token)) => (token, true),
+            Ok(None) | Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    let log = leveler_engine::EventLog::new_owned(&db, session_id, token.clone());
+    let mut forward = |_event: leveler_engine::EngineEvent| {};
+    let _ = log
+        .append(
+            None,
+            leveler_engine::EngineEvent::UserShellFinished {
+                execution_id,
+                exit_code,
+                duration_ms,
+                status,
+                output_tail,
+                output_truncated,
+            },
+            &mut forward,
+        )
+        .await;
+    if acquired {
+        let _ = engine.release_ownership(&token).await;
+    }
+}
+
 /// The runtime's background status as the observer projection names it. One
 /// mapping, so the side question and the Background Tasks page cannot describe
 /// the same task differently.
@@ -867,6 +949,7 @@ fn background_status_label(status: leveler_execution::BackgroundTaskStatus) -> &
         Status::Killing => "killing",
         Status::Exited => "exited",
         Status::Killed => "stopped",
+        Status::Unknown => "unknown",
     }
 }
 
@@ -1232,6 +1315,10 @@ impl InProcessRuntimeClient {
         let mut background_events = background_registry.subscribe();
         let background_session_id = session_id.clone();
         let background_sender = events.clone();
+        let background_user_shells = self.user_shells.clone();
+        // Weak: the bridge task must not keep the whole application (and its
+        // database pool) alive for the life of the registry subscription.
+        let background_app = std::sync::Arc::downgrade(&self.app);
         tokio::spawn(async move {
             loop {
                 match background_events.recv().await {
@@ -1263,14 +1350,78 @@ impl InProcessRuntimeClient {
                             task.status == leveler_execution::BackgroundTaskStatus::Killed;
                         let ok = task.status == leveler_execution::BackgroundTaskStatus::Exited
                             && task.exit_code == Some(0);
-                        let _ = background_sender.send(RuntimeEvent::BackgroundTaskExited {
-                            task_id: task.id,
-                            exit_code: task.exit_code,
-                            duration_ms: task.duration_ms,
-                            ok,
-                            stopped,
-                            output: task.log,
-                        });
+                        // An adopted user shell keeps its own execution record
+                        // and gets the same terminal facts. The background
+                        // registry is the lifecycle authority; this projection
+                        // does not create a second task.
+                        let shell_status = match task.status {
+                            leveler_execution::BackgroundTaskStatus::Exited
+                                if task.exit_code == Some(0) =>
+                            {
+                                "success"
+                            }
+                            leveler_execution::BackgroundTaskStatus::Exited => "failed",
+                            leveler_execution::BackgroundTaskStatus::Killed => "cancelled",
+                            leveler_execution::BackgroundTaskStatus::Unknown => "unknown",
+                            leveler_execution::BackgroundTaskStatus::Running
+                            | leveler_execution::BackgroundTaskStatus::Killing => "unknown",
+                        };
+                        let shell_output = task.log.clone();
+                        let shell_truncated = task.log_truncated;
+                        if let Some(execution_id) = background_user_shells
+                            .execution_for_task(&background_session_id, &task.id)
+                        {
+                            if let Some(shell) = background_user_shells.finish_background(
+                                &background_session_id,
+                                &task.id,
+                                task.exit_code,
+                                shell_status,
+                                task.duration_ms,
+                                Some(&shell_output),
+                            ) {
+                                let _ = background_sender.send(RuntimeEvent::UserShellExited {
+                                    execution_id: execution_id.clone(),
+                                    exit_code: shell.exit_code,
+                                    duration_ms: task.duration_ms,
+                                    status: shell_status.to_string(),
+                                });
+                            }
+                            if let Some(app) = background_app.upgrade() {
+                                let session = background_session_id.clone();
+                                let exit_code = task.exit_code;
+                                let duration_ms = task.duration_ms;
+                                let status = shell_status.to_string();
+                                tokio::spawn(async move {
+                                    persist_background_user_shell_finished(
+                                        app,
+                                        session,
+                                        execution_id,
+                                        exit_code,
+                                        duration_ms,
+                                        status,
+                                        shell_output,
+                                        shell_truncated,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                        if task.status == leveler_execution::BackgroundTaskStatus::Unknown {
+                            let _ = background_sender.send(RuntimeEvent::BackgroundTaskUnknown {
+                                task_id: task.id,
+                                duration_ms: task.duration_ms,
+                                output: task.log,
+                            });
+                        } else {
+                            let _ = background_sender.send(RuntimeEvent::BackgroundTaskExited {
+                                task_id: task.id,
+                                exit_code: task.exit_code,
+                                duration_ms: task.duration_ms,
+                                ok,
+                                stopped,
+                                output: task.log,
+                            });
+                        }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1726,12 +1877,14 @@ impl InProcessRuntimeClient {
             };
         let id = leveler_core::UserShellId::new(format!("ush-{}", leveler_core::new_uuid_string()));
         let cwd_display = cwd.display().to_string();
+        let handoff = CancellationToken::new();
         self.user_shells.begin(
             &session_id,
             id.clone(),
             trimmed.to_string(),
             cwd_display.clone(),
             cancel.clone(),
+            handoff.clone(),
         );
 
         let app = self.app.clone();
@@ -1797,32 +1950,226 @@ impl InProcessRuntimeClient {
                     )
                     .await;
 
+                let shell_write_scope = request.write_scope.clone();
+                let shell_cwd = request.cwd.clone();
+                let shell_program = command_text.clone();
+                let runner_for_resume = runner.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-                let run = tokio::spawn({
+                let mut run = tokio::spawn({
                     let cancel = cancel.clone();
-                    async move { runner.run_streaming(request, cancel, tx).await }
+                    let handoff = handoff.clone();
+                    async move {
+                        runner
+                            .run_streaming_handoff(request, cancel, tx, handoff)
+                            .await
+                    }
                 });
+                let joined = loop {
+                    tokio::select! {
+                        joined = &mut run => break joined,
+                        chunk = rx.recv() => match chunk {
+                            Some(chunk) => {
+                                append_user_shell_chunk(
+                                    &store,
+                                    &log,
+                                    &mut forward,
+                                    &session_id,
+                                    &id,
+                                    chunk,
+                                )
+                                .await;
+                            }
+                            None => break run.await,
+                        },
+                    }
+                };
+                let outcome = match joined {
+                    Ok(outcome) => outcome,
+                    Err(join_error) => {
+                        StreamOutcome::Completed(Err(leveler_execution::ProcessError::Io {
+                            program: "user-shell".into(),
+                            source: std::io::Error::other(join_error.to_string()),
+                        }))
+                    }
+                };
+                let result = if let StreamOutcome::HandedOff(parts) = outcome {
+                    let parts = *parts;
+                    if cancel.is_cancelled() {
+                        // Cancellation won before the transfer committed.
+                        store.complete_background_request(
+                            &session_id,
+                            &id,
+                            Err("命令已取消".to_string()),
+                        );
+                        runner_for_resume
+                            .finish_handoff(parts, cancel.clone())
+                            .await
+                    } else {
+                        let started = store
+                            .active_started(&session_id, &id)
+                            .unwrap_or_else(std::time::Instant::now);
+                        let (initial_output, initial_truncated) = store
+                            .foreground_output(&session_id, &id)
+                            .unwrap_or_default();
+                        let observer_events = events.clone();
+                        let observer_store = store.clone();
+                        let observer_session = session_id.clone();
+                        let observer_id = id.clone();
+                        let observer =
+                            std::sync::Arc::new(move |stream: OutputStream, text: &str| {
+                                observer_store.append_background_output(
+                                    &observer_session,
+                                    &observer_id,
+                                    text,
+                                );
+                                let stream = match stream {
+                                    OutputStream::Stdout => "stdout",
+                                    OutputStream::Stderr => "stderr",
+                                };
+                                let _ = observer_events.send(RuntimeEvent::UserShellOutput {
+                                    execution_id: observer_id.clone(),
+                                    stream: stream.to_string(),
+                                    chunk: text.to_string(),
+                                });
+                            });
+                        // The registry calls this before its reaper can emit
+                        // a terminal event, so the live view always learns the
+                        // task link before the exit of the same execution.
+                        let moved_slot: Arc<Mutex<Option<crate::user_shell::BackgroundedActive>>> =
+                            Arc::new(Mutex::new(None));
+                        let link_store = store.clone();
+                        let link_events = events.clone();
+                        let link_session = session_id.clone();
+                        let link_id = id.clone();
+                        let link_slot = moved_slot.clone();
+                        let on_adopted: Arc<dyn Fn(&str) + Send + Sync> =
+                            Arc::new(move |task_id: &str| {
+                                let moved = link_store.background(
+                                    &link_session,
+                                    &link_id,
+                                    task_id.to_string(),
+                                );
+                                let _ = link_events.send(RuntimeEvent::UserShellBackgrounded {
+                                    execution_id: link_id.clone(),
+                                    task_id: task_id.to_string(),
+                                });
+                                *link_slot.lock().unwrap() = moved;
+                            });
+                        let spec = AdoptedTaskSpec {
+                            owner_scope: Some(session_id.as_str().to_string()),
+                            writer_scope: "user-shell".to_string(),
+                            // The registry row is a display fact for a process
+                            // that is already running; the shell string is the
+                            // useful label, not a respawn recipe.
+                            program: shell_program,
+                            args: Vec::new(),
+                            cwd: shell_cwd,
+                            write_scope: shell_write_scope,
+                            lifetime: BackgroundTaskLifetime::Runtime,
+                            started,
+                            initial_output: initial_output.clone(),
+                            observer: Some(observer),
+                            on_adopted: Some(on_adopted),
+                        };
+                        match app
+                            .background_tasks()
+                            .adopt(parts, rx, spec, CancellationToken::new())
+                            .await
+                        {
+                            Ok(task_id) => {
+                                let moved = moved_slot.lock().unwrap().take();
+                                let backgrounded =
+                                    leveler_engine::EngineEvent::UserShellBackgrounded {
+                                        execution_id: id.clone(),
+                                        task_id: task_id.clone(),
+                                        output_tail: initial_output,
+                                        output_truncated: initial_truncated,
+                                    };
+                                // Persist for cold resume, but deliver the live
+                                // fact on the session stream directly: the
+                                // foreground's bridge has already served its
+                                // role and must not become a second delivery
+                                // authority for this transfer.
+                                let mut persist_only = |_event: leveler_engine::EngineEvent| {};
+                                let _ = log.append(None, backgrounded, &mut persist_only).await;
+                                active.finish(&admission);
+                                let released = async {
+                                    app.task_engine(&db)?
+                                        .release_ownership(&token)
+                                        .await
+                                        .map_err(crate::session::app_error_from_engine)
+                                }
+                                .await;
+                                if let Err(error) = released {
+                                    tracing::warn!(
+                                        %error,
+                                        session = session_id.as_str(),
+                                        "background user shell could not release the session"
+                                    );
+                                }
+                                if let Some(moved) = moved {
+                                    moved.reply(Ok(task_id));
+                                }
+                                return;
+                            }
+                            Err(error) => {
+                                store.complete_background_request(
+                                    &session_id,
+                                    &id,
+                                    Err(error.error.clone()),
+                                );
+                                rx = error.chunks;
+                                let mut finish = Box::pin(
+                                    runner_for_resume.finish_handoff(error.handoff, cancel.clone()),
+                                );
+                                let result = loop {
+                                    tokio::select! {
+                                        result = &mut finish => break result,
+                                        chunk = rx.recv() => match chunk {
+                                            Some(chunk) => {
+                                                append_user_shell_chunk(
+                                                    &store,
+                                                    &log,
+                                                    &mut forward,
+                                                    &session_id,
+                                                    &id,
+                                                    chunk,
+                                                )
+                                                .await;
+                                            }
+                                            None => break finish.await,
+                                        },
+                                    }
+                                };
+                                while let Some(chunk) = rx.recv().await {
+                                    append_user_shell_chunk(
+                                        &store,
+                                        &log,
+                                        &mut forward,
+                                        &session_id,
+                                        &id,
+                                        chunk,
+                                    )
+                                    .await;
+                                }
+                                result
+                            }
+                        }
+                    }
+                } else {
+                    match outcome {
+                        StreamOutcome::Completed(result) => result,
+                        StreamOutcome::HandedOff(_) => unreachable!("handled above"),
+                    }
+                };
+                // Any pending transfer request lost the race with a natural
+                // exit. Answer it explicitly; it must not wait for a timeout.
+                store.complete_background_request(&session_id, &id, Err("命令已结束".to_string()));
+                // Drain chunks that were buffered before the receivers closed.
                 while let Some(chunk) = rx.recv().await {
-                    store.append_output(&session_id, &id, &chunk.text);
-                    let _ = log
-                        .append(
-                            None,
-                            leveler_engine::EngineEvent::UserShellOutput {
-                                execution_id: id.clone(),
-                                stream: crate::user_shell::stream_tag(chunk.stream).to_string(),
-                                chunk: chunk.text,
-                            },
-                            &mut forward,
-                        )
+                    append_user_shell_chunk(&store, &log, &mut forward, &session_id, &id, chunk)
                         .await;
                 }
-                let result = match run.await {
-                    Ok(result) => result,
-                    Err(join_error) => Err(leveler_execution::ProcessError::Io {
-                        program: "user-shell".into(),
-                        source: std::io::Error::other(join_error.to_string()),
-                    }),
-                };
                 let status = crate::user_shell::terminal_status(&result);
                 // The live channel is bounded and drops rather than block the
                 // child, so the tail this store streamed can be missing bytes
@@ -1873,6 +2220,11 @@ impl InProcessRuntimeClient {
                     // error where the user will look for it.
                     store.append_output(&session_id, &id, &format!("{error}\n"));
                 }
+                let (retained_tail, retained_truncated) = store
+                    .foreground_output(&session_id, &id)
+                    .unwrap_or_default();
+                let output_tail = authoritative.clone().unwrap_or(retained_tail);
+                let output_truncated = retained_truncated || authoritative.is_some();
                 let duration_ms = store
                     .finish(
                         &session_id,
@@ -1900,6 +2252,8 @@ impl InProcessRuntimeClient {
                             exit_code,
                             duration_ms,
                             status: status.to_string(),
+                            output_tail,
+                            output_truncated,
                         },
                         &mut forward,
                     )
@@ -2161,6 +2515,55 @@ impl InProcessRuntimeClient {
                 level: NotificationLevel::Error,
                 message,
             });
+    }
+
+    fn notify_info(&self, session_id: &SessionId, message: String) {
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::Notification {
+                level: NotificationLevel::Info,
+                message,
+            });
+    }
+
+    /// Move one running foreground shell to the background registry. The
+    /// transfer is performed by the worker that owns the streaming driver; this
+    /// command only asks and waits for the authoritative answer. No process is
+    /// spawned or restarted here.
+    async fn handle_background_user_shell(
+        &self,
+        session_id: SessionId,
+        execution_id: leveler_core::UserShellId,
+    ) -> Result<(), ClientError> {
+        match self
+            .user_shells
+            .request_background(&session_id, &execution_id)
+        {
+            crate::user_shell::BackgroundRequest::NotFound => {
+                self.notify_error(&session_id, "该命令已结束或不存在,无需转后台".to_string())
+            }
+            crate::user_shell::BackgroundRequest::AlreadyBackground(task_id) => {
+                self.notify_info(&session_id, format!("该命令已在后台运行: {task_id}"))
+            }
+            crate::user_shell::BackgroundRequest::Pending => {
+                self.notify_info(&session_id, "正在转后台,请稍候".to_string())
+            }
+            crate::user_shell::BackgroundRequest::Requested(reply) => {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), reply).await {
+                    Ok(Ok(Ok(task_id))) => {
+                        self.notify_info(&session_id, format!("已转后台: {task_id}"))
+                    }
+                    Ok(Ok(Err(error))) => {
+                        self.notify_error(&session_id, format!("转后台失败: {error}"))
+                    }
+                    Ok(Err(_)) => {
+                        self.notify_error(&session_id, "转后台请求未完成,命令仍在运行".to_string())
+                    }
+                    Err(_) => self.notify_error(&session_id, "转后台超时,命令仍在运行".to_string()),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Truncate a session's stored messages after `ordinal`, propagating any
@@ -4749,6 +5152,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 command,
             } => self.handle_run_user_shell(session_id, command).await,
+            ClientCommand::BackgroundUserShell {
+                session_id,
+                execution_id,
+            } => {
+                self.handle_background_user_shell(session_id, execution_id)
+                    .await
+            }
             ClientCommand::CancelUserShell {
                 session_id,
                 execution_id,
@@ -5495,7 +5905,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             diff: live.diff,
             checkpoints,
             recaps,
-            user_shells: self.user_shells.snapshot(session_id),
+            user_shells: {
+                let live = self.user_shells.snapshot(session_id);
+                let live_ids: std::collections::HashSet<_> =
+                    live.iter().map(|shell| shell.id.clone()).collect();
+                let mut restored = crate::user_shell::restore_from_events(&db, session_id)
+                    .await
+                    .map_err(ClientError::Runtime)?;
+                restored.retain(|shell| !live_ids.contains(&shell.id));
+                restored.extend(live);
+                restored
+            },
             completion_report: live.completion_report,
             thinking,
             work_profile: Some("single".into()),

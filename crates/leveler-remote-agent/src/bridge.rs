@@ -664,6 +664,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::CancelBtw { .. } => "cancel_btw",
         ClientCommand::Recap { .. } => "recap",
         ClientCommand::RunUserShell { .. } => "run_user_shell",
+        ClientCommand::BackgroundUserShell { .. } => "background_user_shell",
         ClientCommand::CancelUserShell { .. } => "cancel_user_shell",
         ClientCommand::CancelBackgroundTask { .. } => "cancel_background_task",
         ClientCommand::CancelChild { .. } => "cancel_child",

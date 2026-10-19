@@ -387,6 +387,87 @@ impl TaskEngine {
         }
     }
 
+    /// The current ownership token, but only when it belongs to THIS runtime.
+    ///
+    /// Long-lived work (an adopted background task) can outlive the turn that
+    /// started it. Once another turn acquires ownership the old token is
+    /// stale, yet the runtime is still the legitimate writer. This returns the
+    /// current epoch for that same runtime without advancing it, so a
+    /// background terminal fact can be persisted without stealing ownership
+    /// from the live turn. `None` means another runtime owns the session.
+    pub async fn current_ownership(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<leveler_core::OwnershipToken>, EngineError> {
+        let task_id = self
+            .stores
+            .tasks
+            .ensure_for_session(session_id, leveler_core::now())
+            .await?;
+        let Some(current) = self.stores.ownership.current(&task_id).await? else {
+            return Ok(None);
+        };
+        let Some(runtime_id) = current.runtime.clone() else {
+            return Ok(None);
+        };
+        if runtime_id != self.runtime_id {
+            return Ok(None);
+        }
+        Ok(Some(leveler_core::OwnershipToken {
+            task_id,
+            runtime_id,
+            boot_id: current.boot.unwrap_or_else(|| self.boot.id.clone()),
+            owner_epoch: current.epoch,
+        }))
+    }
+
+    /// Acquire ownership only when the session is currently UNOWNED.
+    ///
+    /// A background fact can outlive the foreground turn that released the
+    /// session. It still has to be persisted, but it must never extend or
+    /// invalidate a live turn's token. This is a compare-and-acquire at the
+    /// unowned epoch: a concurrent turn that wins the CAS makes this return
+    /// `None`; a live turn's ownership is never reacquired or advanced.
+    pub async fn acquire_if_unowned(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<leveler_core::OwnershipToken>, EngineError> {
+        let task_id = self
+            .stores
+            .tasks
+            .ensure_for_session(session_id, leveler_core::now())
+            .await?;
+        // Same fail-closed rule as a normal acquire: a running turn with no
+        // boot cannot be proven dead, so it may still be writing.
+        if self
+            .stores
+            .turns
+            .list_running(Some(session_id))
+            .await?
+            .iter()
+            .any(|turn| turn.owner_boot_id.is_none())
+        {
+            return Ok(None);
+        }
+        let Some(current) = self.stores.ownership.current(&task_id).await? else {
+            return Ok(None);
+        };
+        if current.runtime.is_some() || current.boot.is_some() {
+            return Ok(None);
+        }
+        match self
+            .stores
+            .ownership
+            .acquire(&task_id, &self.runtime_id, &self.boot.id, current.epoch)
+            .await
+        {
+            Ok(token) => Ok(Some(token)),
+            // A turn or another runtime won the unowned epoch first.
+            Err(leveler_storage::OwnershipError::Stale { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Why this boot may not take a task from `owner`, if it may not: another
     /// runtime holds it, or another boot that is alive or cannot be probed.
     fn owner_refusal(

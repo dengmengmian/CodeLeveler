@@ -338,6 +338,19 @@ pub enum EngineEvent {
         command: String,
         cwd: String,
     },
+    /// The same user shell execution moved to the background registry.
+    /// Persisted so a cold resume can distinguish "backgrounded and then the
+    /// runtime died" from a foreground turn that never settled. `task_id` is
+    /// the registry link; the output tail is what had been shown before the
+    /// transfer.
+    UserShellBackgrounded {
+        execution_id: leveler_core::UserShellId,
+        task_id: String,
+        #[serde(default)]
+        output_tail: String,
+        #[serde(default)]
+        output_truncated: bool,
+    },
     /// TRANSIENT: live output chunk from a running user shell. `stream` is
     /// `stdout` or `stderr`. Never persisted — clients keep a bounded buffer.
     UserShellOutput {
@@ -353,6 +366,12 @@ pub enum EngineEvent {
         exit_code: Option<i32>,
         duration_ms: u64,
         status: String,
+        /// Bounded output retained for resume. Additive: older payloads
+        /// decode with an empty tail.
+        #[serde(default)]
+        output_tail: String,
+        #[serde(default)]
+        output_truncated: bool,
     },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a
@@ -831,6 +850,7 @@ impl EngineEvent {
             // User shell facts carry the raw command line and its output —
             // local-sensitive by construction.
             | EngineEvent::UserShellStarted { .. }
+            | EngineEvent::UserShellBackgrounded { .. }
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
             // Raw command output — local-sensitive like the user shell's.
@@ -992,6 +1012,7 @@ impl EngineEvent {
             | EngineEvent::AdvisoryStarted { .. }
             | EngineEvent::ContextExpanded { .. }
             | EngineEvent::UserShellStarted { .. }
+            | EngineEvent::UserShellBackgrounded { .. }
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
             | EngineEvent::ToolCallOutput { .. }

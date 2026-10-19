@@ -342,6 +342,14 @@ pub enum ClientCommand {
         session_id: SessionId,
         command: String,
     },
+    /// Move exactly one running foreground user shell to the background.
+    /// This is an ownership transfer, not a re-run: the runtime keeps the
+    /// same process and execution identity. Idempotent; it never spawns a
+    /// second process.
+    BackgroundUserShell {
+        session_id: SessionId,
+        execution_id: leveler_core::UserShellId,
+    },
     /// Cancel exactly one user shell execution. Deliberately separate from
     /// `CancelCurrentTurn`: a user shell is not an agent turn, and the id
     /// match ensures a stale cancel can never kill a newer execution.
@@ -549,6 +557,7 @@ impl ClientCommand {
             | ClientCommand::ForkSession { session_id }
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::RunUserShell { session_id, .. }
+            | ClientCommand::BackgroundUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
             | ClientCommand::CancelBackgroundTask { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
@@ -613,6 +622,13 @@ mod tests {
                 command: "cargo test --workspace".to_string(),
             },
             "run_user_shell",
+        );
+        roundtrip(
+            ClientCommand::BackgroundUserShell {
+                session_id: SessionId::new("s1"),
+                execution_id: leveler_core::UserShellId::new("ush-1"),
+            },
+            "background_user_shell",
         );
         roundtrip(
             ClientCommand::CancelUserShell {

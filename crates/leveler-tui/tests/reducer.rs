@@ -9429,6 +9429,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
             exit_code: Some(0),
             output_tail: "done\n".into(),
             output_truncated: false,
+            task_id: None,
         },
         leveler_client_protocol::UiUserShell {
             id: leveler_core::UserShellId::new("ush-live"),
@@ -9439,6 +9440,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
             exit_code: None,
             output_tail: String::new(),
             output_truncated: false,
+            task_id: None,
         },
     ];
     reduce(
@@ -12332,31 +12334,6 @@ fn ctrl_c_cancels_the_running_shell_not_the_client_or_agent() {
 }
 
 #[test]
-fn ctrl_b_has_no_shell_binding_and_never_cancels() {
-    let mut s = opened();
-    shell_started(&mut s, "ush-b", "sleep 30");
-    let effects = reduce(
-        &mut s,
-        Action::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
-    );
-    assert!(
-        effects.is_empty(),
-        "Ctrl+B is not a shell binding: {effects:?}"
-    );
-    assert!(
-        s.running_user_shell().is_some(),
-        "Ctrl+B must leave the execution running"
-    );
-    assert!(
-        !s.notification
-            .as_ref()
-            .is_some_and(|n| n.message.contains("后台")),
-        "no background capability may be advertised: {:?}",
-        s.notification
-    );
-}
-
-#[test]
 fn a_second_local_command_is_refused_locally_while_one_runs() {
     let mut s = opened();
     shell_started(&mut s, "ush-busy", "sleep 30");
@@ -12451,6 +12428,33 @@ fn the_live_activity_row_is_the_execution_record_and_disappears_on_exit() {
         !screen.contains("sleep 30…"),
         "the live row vanished with the execution: {screen}"
     );
+}
+
+#[test]
+fn a_terminal_shell_is_never_downgraded_by_a_late_background_event() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-race", "echo done");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-race"),
+            exit_code: Some(0),
+            duration_ms: 12,
+            status: "success".into(),
+        }),
+    );
+    // The transfer fact races the terminal event. The terminal fact is
+    // authoritative; the late link must not repaint it as still running.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellBackgrounded {
+            execution_id: leveler_core::UserShellId::new("ush-race"),
+            task_id: "bg-1".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("Ran (user) echo done"), "{screen}");
+    assert!(!screen.contains("Background (user)"), "{screen}");
 }
 
 #[test]
@@ -12656,4 +12660,117 @@ fn a_completion_request_is_bound_to_the_cursor_position() {
     assert_eq!(request.text, "cat review");
     assert_eq!(request.cursor, "cat rev".len());
     assert_eq!(request.cwd, s.repository.clone().unwrap());
+}
+
+#[test]
+fn ctrl_b_backgrounds_exactly_the_running_shell_and_never_cancels_it() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-bg", "go test ./...");
+    let effects = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::BackgroundUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-bg"
+        ),
+        "{effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(ClientCommand::CancelUserShell { .. })
+                | Effect::Send(ClientCommand::CancelCurrentTurn { .. })
+                | Effect::Quit
+        )),
+        "Ctrl+B must not cancel, stop the agent, or quit: {effects:?}"
+    );
+}
+
+#[test]
+fn ctrl_b_is_contextual_and_does_nothing_without_a_running_shell() {
+    let mut s = opened();
+    let effects = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+    );
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+#[test]
+fn the_live_background_control_moves_the_same_execution() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-live-bg", "sleep 30");
+    rendered(&mut s, 100, 30);
+    let (x, y, w, _) = s
+        .shell_live_background_rect
+        .expect("background control painted");
+    let effects = reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x + w / 2,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::BackgroundUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-live-bg"
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn the_inline_header_background_zone_moves_the_same_execution() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-header-bg", "sleep 30");
+    let screen = rendered(&mut s, 100, 30);
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Running (user)"))
+        .expect("running header painted");
+    let column = line.find('↗').expect("background control painted") as u16;
+    let row = row as u16;
+    let effects = reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::BackgroundUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-header-bg"
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn a_backgrounded_shell_loses_the_live_row_and_the_foreground_stop() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-gone", "sleep 30");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellBackgrounded {
+            execution_id: leveler_core::UserShellId::new("ush-gone"),
+            task_id: "bg-1".into(),
+        }),
+    );
+    assert!(s.running_user_shell().is_none());
+    assert!(s.stoppable_commands().is_empty());
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("Background (user)"), "{screen}");
+    assert!(!screen.contains("sleep 30…"), "{screen}");
 }

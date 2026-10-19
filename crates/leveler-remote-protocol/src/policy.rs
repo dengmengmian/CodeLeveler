@@ -256,6 +256,7 @@ impl RemotePolicy {
             // product surface is the local TUI; remote gets nothing, not
             // even cancel (it could kill work it cannot see).
             ClientCommand::RunUserShell { .. }
+            | ClientCommand::BackgroundUserShell { .. }
             | ClientCommand::CancelUserShell { .. }
             | ClientCommand::CancelBackgroundTask { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,

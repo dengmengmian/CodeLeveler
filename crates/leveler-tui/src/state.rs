@@ -166,6 +166,9 @@ pub struct BackgroundTaskChrome {
     /// or session cleanup. A stopped task is not a failure, whatever its exit
     /// code. Never inferred from `exit_code` in the presentation layer.
     pub stopped: bool,
+    /// The runtime could not establish the terminal state. Never rendered as
+    /// running, failed, or stopped.
+    pub unknown: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     /// The process-group leader's OS pid, from the runtime's start/reconcile
@@ -187,6 +190,7 @@ impl BackgroundTaskChrome {
             started_elapsed_secs,
             ok: None,
             stopped: false,
+            unknown: false,
             exit_code: None,
             duration_ms: None,
             pid: None,
@@ -203,7 +207,7 @@ impl BackgroundTaskChrome {
     /// it was stopped. This is the only state that counts toward the failure
     /// badge.
     pub fn is_failed(&self) -> bool {
-        self.ok == Some(false) && !self.stopped
+        self.ok == Some(false) && !self.stopped && !self.unknown
     }
 }
 
@@ -215,10 +219,14 @@ pub enum BackgroundOutcome {
     Completed,
     Failed,
     Stopped,
+    Unknown,
 }
 
 impl BackgroundTaskChrome {
     pub fn outcome(&self) -> BackgroundOutcome {
+        if self.unknown {
+            return BackgroundOutcome::Unknown;
+        }
         match self.ok {
             None => BackgroundOutcome::Running,
             Some(true) => BackgroundOutcome::Completed,
@@ -461,6 +469,8 @@ pub struct AppState {
     pub completion: crate::shell_mode::CompletionMenu,
     /// Last-painted clickable stop control in the shell live-activity row.
     pub shell_live_stop_rect: Option<(u16, u16, u16, u16)>,
+    /// Last-painted clickable background control in the shell live-activity row.
+    pub shell_live_background_rect: Option<(u16, u16, u16, u16)>,
     /// Last painted Input/composer rect for click-to-focus.
     pub input_rect: Option<(u16, u16, u16, u16)>,
     /// Which first-class activity the Activity Detail screen is showing.
@@ -737,6 +747,7 @@ impl AppState {
             history_mode: crate::shell_mode::InputMode::Normal,
             completion: crate::shell_mode::CompletionMenu::default(),
             shell_live_stop_rect: None,
+            shell_live_background_rect: None,
             input_rect: None,
             activity_open: None,
             activity_selected: None,

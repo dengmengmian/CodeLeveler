@@ -790,6 +790,19 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         }
     }
 
+    // Clickable background control on the fixed live-activity row. The same
+    // execution changes owner; this never spawns a second command.
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && point_in_rect(mouse.column, mouse.row, state.shell_live_background_rect)
+        && let Some(shell) = state.running_user_shell()
+    {
+        let execution_id = shell.id.clone();
+        return vec![Effect::Send(ClientCommand::BackgroundUserShell {
+            session_id: state.session_id.clone(),
+            execution_id,
+        })];
+    }
+
     // Clickable stop on the fixed live-activity row.
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && point_in_rect(mouse.column, mouse.row, state.shell_live_stop_rect)
@@ -1091,12 +1104,27 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                             }
                             _ => None,
                         };
-                        let on_stop = state.conv.rect.is_some_and(|(x, _, w, _)| {
-                            mouse.column
-                                >= x.saturating_add(
-                                    w.saturating_sub(crate::render::USER_SHELL_STOP_ZONE as u16),
+                        let stop_zone = crate::render::USER_SHELL_STOP_ZONE as u16;
+                        let background_zone = unicode_width::UnicodeWidthStr::width(
+                            format!(" · ↗ {}", state.t().user_shell_background).as_str(),
+                        ) as u16;
+                        let (on_background, on_stop) =
+                            state.conv.rect.map_or((false, false), |(x, _, w, _)| {
+                                let stop_start = x.saturating_add(w.saturating_sub(stop_zone));
+                                let background_start = stop_start.saturating_sub(background_zone);
+                                (
+                                    mouse.column >= background_start && mouse.column < stop_start,
+                                    mouse.column >= stop_start,
                                 )
-                        });
+                            });
+                        if let Some(execution_id) = running.clone().filter(|_| on_background) {
+                            interaction::clear_selection_drag(state);
+                            state.conv.selection.clear();
+                            return vec![Effect::Send(ClientCommand::BackgroundUserShell {
+                                session_id: state.session_id.clone(),
+                                execution_id,
+                            })];
+                        }
                         if let Some(execution_id) = running.filter(|_| on_stop) {
                             interaction::clear_selection_drag(state);
                             state.conv.selection.clear();
@@ -1434,6 +1462,22 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // accepts (never sends the command), Shift+Tab steps back one row.
     if let Some(effects) = shell::handle_menu_key(state, key) {
         return effects;
+    }
+
+    // Ctrl+B moves exactly the running foreground user shell to the background
+    // registry. It is contextual: with no foreground shell it falls through to
+    // the existing keymap, so tmux's prefix and every other binding are
+    // untouched. The mouse control is the non-keyboard path.
+    if !btw
+        && ctrl
+        && matches!(key.code, KeyCode::Char('b'))
+        && let Some(shell) = state.running_user_shell()
+    {
+        let execution_id = shell.id.clone();
+        return vec![Effect::Send(ClientCommand::BackgroundUserShell {
+            session_id: state.session_id.clone(),
+            execution_id,
+        })];
     }
 
     // Shift+Tab cycles the permission profile from anywhere — the one binding

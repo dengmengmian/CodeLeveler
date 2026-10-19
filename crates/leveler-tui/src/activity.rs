@@ -98,6 +98,7 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             crate::state::BackgroundOutcome::Completed => ActivityStatus::Completed,
             crate::state::BackgroundOutcome::Failed => ActivityStatus::Failed,
             crate::state::BackgroundOutcome::Stopped => ActivityStatus::Stopped,
+            crate::state::BackgroundOutcome::Unknown => ActivityStatus::Interrupted,
         };
         let row = ActivitySummary {
             id: ActivityId::Background(task_id.clone()),
@@ -1209,6 +1210,7 @@ second line ignored"
                 pid: None,
                 last_output_at: None,
                 output: String::new(),
+                unknown: false,
             },
         );
         state.background_task_labels.insert(
@@ -1578,6 +1580,7 @@ second line ignored"
                 pid: None,
                 last_output_at: None,
                 output: "test result: ok\n".into(),
+                unknown: false,
             },
         );
         assert_eq!(running_background_count(&state), 0);
@@ -1611,6 +1614,7 @@ second line ignored"
                 pid: None,
                 last_output_at: None,
                 output: String::new(),
+                unknown: false,
             },
         );
         // `bound_terminal_background` is the only pruning left, and it keeps
@@ -1641,6 +1645,7 @@ second line ignored"
                     pid: None,
                     last_output_at: None,
                     output: String::new(),
+                    unknown: false,
                 },
             );
         }
@@ -1674,6 +1679,7 @@ second line ignored"
             pid: None,
             last_output_at: None,
             output: String::new(),
+            unknown: false,
         }
     }
 

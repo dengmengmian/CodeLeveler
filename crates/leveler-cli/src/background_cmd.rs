@@ -134,6 +134,7 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
                         BackgroundTaskStatus::Killing => "killing",
                         BackgroundTaskStatus::Exited => "exited",
                         BackgroundTaskStatus::Killed => "killed",
+                        BackgroundTaskStatus::Unknown => "unknown",
                     },
                     owner: "execution-host",
                     elapsed_ms: snapshot.duration_ms,

@@ -10,7 +10,10 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use crate::command::{CommandRunner, ManagedProcess, ProcessIdentity, ProcessRequest};
+use crate::command::{
+    CommandRunner, ManagedProcess, OutputChunk, OutputStream, ProcessHandoff, ProcessIdentity,
+    ProcessRequest,
+};
 use crate::snapshot::SnapshotId;
 
 /// Pre-spawn workspace snapshot and write authority, used to settle a
@@ -69,6 +72,9 @@ pub enum BackgroundTaskStatus {
     Killing,
     Exited,
     Killed,
+    /// The runtime lost the ability to observe the process (for example an
+    /// adopted driver task panicked). Never report this as a natural exit.
+    Unknown,
 }
 
 /// How long the runtime retains ownership of a background process.
@@ -97,7 +103,7 @@ impl BackgroundTaskStatus {
     }
 
     fn is_terminal(self) -> bool {
-        matches!(self, Self::Exited | Self::Killed)
+        matches!(self, Self::Exited | Self::Killed | Self::Unknown)
     }
 }
 
@@ -121,6 +127,10 @@ pub struct BackgroundTaskSnapshot {
     /// stopped by their owner through the runtime; daemon-scoped tasks have no
     /// owner and are not addressable by a client session.
     pub owner_scope: Option<String>,
+    /// True when the retained log dropped earlier bytes. The marker is also in
+    /// the log; this is the machine-readable form for projections.
+    #[serde(default)]
+    pub log_truncated: bool,
 }
 
 /// One atomic observation of status and a bounded slice of retained output.
@@ -133,6 +143,44 @@ pub struct BackgroundTaskObservation {
     pub dropped_bytes: u64,
     pub next_cursor: u64,
     pub log_remaining: bool,
+}
+
+/// Metadata for adopting an already-running foreground process.
+///
+/// The process itself arrives in a [`ProcessHandoff`]; this is only the
+/// identity and accounting the registry needs to publish the same task
+/// lifecycle it would have published for a background spawn.
+#[derive(Clone)]
+pub struct AdoptedTaskSpec {
+    pub owner_scope: Option<String>,
+    pub writer_scope: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub write_scope: crate::WriteScope,
+    pub lifetime: BackgroundTaskLifetime,
+    /// The foreground process start, not the adoption time: duration is the
+    /// whole execution, as the user saw it.
+    pub started: Instant,
+    /// Output already streamed before the handoff. It stays visible in the
+    /// background task's log; it is never replayed as a new chunk.
+    pub initial_output: String,
+    /// A session-owned observer for live chunks (the user-shell transcript).
+    /// It receives the same chunks the registry records, once per chunk.
+    pub observer: Option<Arc<dyn Fn(OutputStream, &str) + Send + Sync>>,
+    /// Runs with the committed task id after the registry owns the process
+    /// and before its reaper can publish a terminal event. The originating
+    /// view uses this to establish the execution↔task link first, so no
+    /// terminal fact can overtake the transfer in that view.
+    pub on_adopted: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+/// A refused adoption. The caller still owns the running process and its
+/// output stream, so it can resume the foreground lifecycle unchanged.
+pub struct AdoptError {
+    pub error: String,
+    pub handoff: ProcessHandoff,
+    pub chunks: tokio::sync::mpsc::Receiver<OutputChunk>,
 }
 
 /// Registry-owned lifecycle facts for UI/runtime projections.
@@ -235,6 +283,9 @@ struct TaskInner {
     identity: Option<ProcessIdentity>,
     done: Arc<Notify>,
     changed: Arc<Notify>,
+    /// For a process adopted from a foreground owner: the token that stops the
+    /// same driver. `child` still owns the process handle and the reaper.
+    adopted_cancel: Option<CancellationToken>,
     process_done: bool,
     log_pumps_remaining: u8,
     /// The process group this task owns has been confirmed gone, so any log
@@ -876,6 +927,7 @@ impl BackgroundTaskRegistry {
                 identity: Some(identity),
                 done: done.clone(),
                 changed: Arc::new(Notify::new()),
+                adopted_cancel: None,
                 process_done: false,
                 log_pumps_remaining,
                 group_reaped: false,
@@ -995,6 +1047,261 @@ impl BackgroundTaskRegistry {
             }
             if let Some(kod) = kill_on_drop.upgrade() {
                 kod.remove(&tid);
+            }
+        });
+
+        Ok(id)
+    }
+
+    /// Adopt an already-running foreground process into this registry.
+    ///
+    /// This is an ownership transfer, not a spawn: the process, both pipe
+    /// readers and their output channel are the ones the foreground created.
+    /// The registry becomes the lifecycle authority (wait, kill, terminal,
+    /// log) and the foreground driver is gone. The same output chunks are
+    /// forwarded to `spec.observer` for the originating view.
+    pub async fn adopt(
+        &self,
+        mut handoff: ProcessHandoff,
+        mut chunks: tokio::sync::mpsc::Receiver<OutputChunk>,
+        spec: AdoptedTaskSpec,
+        cancel: CancellationToken,
+    ) -> Result<String, AdoptError> {
+        let (id, identity, process, stdout_task, stderr_task, drain, request) = {
+            let mut st = self.inner.lock().await;
+            if !self.retain_process_facts {
+                prune_terminal_tasks(&mut st);
+            }
+            let running = st.tasks.values().filter(|t| t.status.is_active()).count();
+            if running + self.pending_spawns.load(Ordering::Acquire) >= MAX_CONCURRENT {
+                return Err(AdoptError {
+                    error: format!("background task limit reached ({MAX_CONCURRENT} concurrent)"),
+                    handoff,
+                    chunks,
+                });
+            }
+            let sandbox_scratch = handoff.process.take_sandbox_scratch();
+            let identity = handoff.process.identity();
+            let pid = process_identity_pid(&identity);
+            let process = handoff.process;
+            let stdout_task = handoff.stdout_task;
+            let stderr_task = handoff.stderr_task;
+            let drain = handoff.drain;
+            let request = handoff.request;
+            st.next += 1;
+            let id = format!("bg-{}", st.next);
+            let done = Arc::new(Notify::new());
+            let changed = Arc::new(Notify::new());
+            let mut log = leveler_core::sanitize_terminal_output(&spec.initial_output);
+            let log_prefix_len = truncate_log(&mut log).unwrap_or(0);
+            st.tasks.insert(
+                id.clone(),
+                TaskInner {
+                    id: id.clone(),
+                    owner_scope: spec.owner_scope.clone(),
+                    writer_scope: spec.writer_scope.clone(),
+                    write_scope: spec.write_scope.clone(),
+                    lifetime: spec.lifetime,
+                    program: spec.program.clone(),
+                    args: spec.args.clone(),
+                    cwd: spec.cwd.clone(),
+                    status: BackgroundTaskStatus::Running,
+                    exit_code: None,
+                    pid: Some(pid),
+                    log_end: log.len() as u64,
+                    log,
+                    log_prefix_len,
+                    default_log_cursor: 0,
+                    started: spec.started,
+                    finished: None,
+                    // The adopted reaper owns the process handle directly;
+                    // kill reaches it through the identity and token below.
+                    child: None,
+                    identity: Some(identity),
+                    done: done.clone(),
+                    changed: changed.clone(),
+                    adopted_cancel: Some(cancel.clone()),
+                    process_done: false,
+                    log_pumps_remaining: 0,
+                    group_reaped: false,
+                    mutation_baseline: None,
+                    settlement: None,
+                    settlement_reported: false,
+                    sandbox_scratch,
+                },
+            );
+            (
+                id,
+                identity,
+                process,
+                stdout_task,
+                stderr_task,
+                drain,
+                request,
+            )
+        };
+        self.kill_on_drop.insert(id.clone(), identity);
+        {
+            let st = self.inner.lock().await;
+            if let Some(task) = st.tasks.get(&id) {
+                let _ = self.lifecycle_events.send(BackgroundTaskEvent::Started {
+                    owner_scope: task.owner_scope.clone(),
+                    task: snapshot(task),
+                });
+            }
+        }
+
+        if let Some(on_adopted) = spec.on_adopted.as_ref() {
+            // No reaper exists yet, so nothing can publish Exited before the
+            // caller has linked this task to the execution it adopted.
+            on_adopted(&id);
+        }
+
+        let observer = spec.observer;
+        let pump_reg = self.inner.clone();
+        let pump_events = self.lifecycle_events.clone();
+        let pump_id = id.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(chunk) = chunks.recv().await {
+                if let Some(observer) = &observer {
+                    observer(chunk.stream, &chunk.text);
+                }
+                let stream = match chunk.stream {
+                    OutputStream::Stdout => BackgroundOutputStream::Stdout,
+                    OutputStream::Stderr => BackgroundOutputStream::Stderr,
+                };
+                if let Some((owner_scope, text)) =
+                    append_text_log(&pump_reg, &pump_id, stream, &chunk.text).await
+                {
+                    let _ = pump_events.send(BackgroundTaskEvent::Output {
+                        owner_scope,
+                        task_id: pump_id.clone(),
+                        chunk: text,
+                    });
+                }
+            }
+        });
+
+        let reg = self.inner.clone();
+        let tid = id.clone();
+        let lifecycle_events = self.lifecycle_events.clone();
+        let kill_on_drop = Arc::downgrade(&self.kill_on_drop);
+        let reaper_identity = identity;
+        // The timeout belongs to the execution, not to the new owner: a
+        // transfer must not extend how long the process may run.
+        let timeout_left = request
+            .timeout
+            .checked_sub(spec.started.elapsed())
+            .unwrap_or_default();
+        let supervisor_reg = reg.clone();
+        let supervisor_tid = tid.clone();
+        let supervisor_events = lifecycle_events.clone();
+        let supervisor_kill_on_drop = kill_on_drop.clone();
+        let reaper = tokio::spawn(async move {
+            let mut process = process;
+            let first = tokio::select! {
+                biased;
+                status = process.wait() => AdoptedFirst::Exited(status),
+                _ = cancel.cancelled() => AdoptedFirst::Cancelled,
+                _ = tokio::time::sleep(timeout_left) => AdoptedFirst::TimedOut,
+            };
+            let mut cancelled = false;
+            let code = match first {
+                AdoptedFirst::Exited(status) => status.ok().and_then(|s| s.code()),
+                AdoptedFirst::Cancelled => {
+                    cancelled = true;
+                    drain.cancel();
+                    process.terminate_tree().await;
+                    let _ = process.wait_deadline().await;
+                    None
+                }
+                AdoptedFirst::TimedOut => {
+                    process.terminate_tree().await;
+                    let status = process.wait_deadline().await;
+                    status.ok().and_then(|s| s.code())
+                }
+            };
+            // The process group, not the launcher, owns the workload.
+            while !reaper_identity.group_gone().await {
+                tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
+            }
+            // Detached grandchildren may hold the pipes; the child's own
+            // output is already buffered. Bound the drain exactly like the
+            // foreground path.
+            tokio::time::sleep(LOG_DRAIN_GRACE).await;
+            drain.cancel();
+            let (stdout, stdout_dropped, stdout_live) = stdout_task.await.unwrap_or_default();
+            let (stderr, stderr_dropped, stderr_live) = stderr_task.await.unwrap_or_default();
+            // Reader tasks have dropped their senders; the pump is finite.
+            let _ = pump.await;
+            let dropped = stdout_dropped.max(stdout_live) + stderr_dropped.max(stderr_live);
+            if dropped > 0 {
+                let note = format!("\n[background output omitted: {dropped} bytes]\n");
+                let _ = append_text_log(&reg, &tid, BackgroundOutputStream::Stderr, &note).await;
+            }
+            let authoritative = if stdout_live > 0 || stderr_live > 0 {
+                let mut text = stdout;
+                text.push_str(&stderr);
+                Some(text)
+            } else {
+                None
+            };
+            {
+                let mut st = reg.lock().await;
+                if let Some(task) = st.tasks.get_mut(&tid) {
+                    task.process_done = true;
+                    task.exit_code = code;
+                    task.group_reaped = true;
+                    task.identity = None;
+                    if cancelled
+                        && !matches!(task.status, BackgroundTaskStatus::Killing)
+                        && !task.status.is_terminal()
+                    {
+                        task.status = BackgroundTaskStatus::Killing;
+                    }
+                    if let Some(text) = authoritative {
+                        let prefix = format!("[stdout] {text}");
+                        task.log.push_str(&prefix);
+                        task.log_end = task.log_end.saturating_add(prefix.len() as u64);
+                        if let Some(prefix_len) = truncate_log(&mut task.log) {
+                            task.log_prefix_len = prefix_len;
+                        }
+                    }
+                    if finalize_if_drained(task) {
+                        let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
+                            owner_scope: task.owner_scope.clone(),
+                            task: snapshot(task),
+                        });
+                    }
+                }
+            }
+            if let Some(kod) = kill_on_drop.upgrade() {
+                kod.remove(&tid);
+            }
+        });
+
+        // A panicked reaper must not leave a Running ghost. Its JoinHandle is
+        // the only supervisor; no second lifecycle registry is introduced.
+        tokio::spawn(async move {
+            if reaper.await.is_ok() {
+                return;
+            }
+            reaper_identity.kill_tree();
+            let mut st = supervisor_reg.lock().await;
+            if let Some(task) = st.tasks.get_mut(&supervisor_tid) {
+                task.status = BackgroundTaskStatus::Unknown;
+                task.finished = Some(Instant::now());
+                task.identity = None;
+                task.sandbox_scratch.take();
+                task.done.notify_waiters();
+                task.changed.notify_waiters();
+                let _ = supervisor_events.send(BackgroundTaskEvent::Exited {
+                    owner_scope: task.owner_scope.clone(),
+                    task: snapshot(task),
+                });
+            }
+            if let Some(kod) = supervisor_kill_on_drop.upgrade() {
+                kod.remove(&supervisor_tid);
             }
         });
 
@@ -1727,6 +2034,7 @@ impl BackgroundTaskRegistry {
                 return Ok(snapshot(task));
             }
             let identity = task.identity;
+            let adopted_cancel = task.adopted_cancel.clone();
             let has_child = task.child.is_some();
             // Without pid/pgid and without Child we cannot signal at all.
             if identity.is_none() && !has_child {
@@ -1742,6 +2050,11 @@ impl BackgroundTaskRegistry {
             task.changed.notify_waiters();
             if let Some(child) = task.child.as_mut() {
                 child.start_kill();
+            }
+            if let Some(token) = adopted_cancel {
+                // The adopted driver treats this as a stop, not a natural
+                // exit, and terminates the same process tree it was handed.
+                token.cancel();
             }
             identity
         };
@@ -1928,6 +2241,12 @@ fn finalize_if_drained(task: &mut TaskInner) -> bool {
     true
 }
 
+enum AdoptedFirst {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+    TimedOut,
+}
+
 /// Append one read to the task log and return the sanitized chunk with the
 /// task's owner scope, so the caller can publish live output. `None` when the
 /// task is gone or the read carried nothing printable.
@@ -1937,15 +2256,26 @@ async fn append_log(
     stream: BackgroundOutputStream,
     bytes: &[u8],
 ) -> Option<(Option<String>, String)> {
+    let raw = String::from_utf8_lossy(bytes);
+    append_text_log(reg, id, stream, &raw).await
+}
+
+/// The same log append for an already-decoded chunk (the adopted path, whose
+/// output was decoded by the foreground reader).
+async fn append_text_log(
+    reg: &Arc<Mutex<RegistryState>>,
+    id: &str,
+    stream: BackgroundOutputStream,
+    text: &str,
+) -> Option<(Option<String>, String)> {
     let mut st = reg.lock().await;
     let task = st.tasks.get_mut(id)?;
     if task.status.is_terminal() {
         return None;
     }
-    let raw = String::from_utf8_lossy(bytes);
     // Sanitize BEFORE the registry buffer: the log cap and every projection are
     // then measured on the same clean text.
-    let sanitized = leveler_core::sanitize_terminal_output(&raw);
+    let sanitized = leveler_core::sanitize_terminal_output(text);
     if sanitized.is_empty() {
         return None;
     }
@@ -2019,6 +2349,7 @@ fn snapshot_with_log(task: &TaskInner, log: String) -> BackgroundTaskSnapshot {
         duration_ms,
         pid: task.pid,
         owner_scope: task.owner_scope.clone(),
+        log_truncated: task.log_prefix_len > 0,
     }
 }
 
@@ -2117,6 +2448,321 @@ mod tests {
             .await
             .expect("replacement task finishes");
         assert_eq!(finished.exit_code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopted_foreground_process_keeps_identity_output_and_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = CommandRunner::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "echo before; sleep 1; echo after".into()],
+            dir.path().to_path_buf(),
+        );
+        let run = tokio::spawn({
+            let handoff = handoff.clone();
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run_streaming_handoff(request, CancellationToken::new(), tx, handoff)
+                    .await
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("output before handoff")
+            .expect("channel open");
+        assert!(first.text.contains("before"), "{first:?}");
+        handoff.cancel();
+        let parts = match tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("handoff returned")
+            .expect("driver task")
+        {
+            crate::command::StreamOutcome::HandedOff(parts) => *parts,
+            _ => panic!("a live process must be handed off"),
+        };
+        let pgid = parts.process.identity().pgid();
+        let reg = host_registry();
+        let id = reg
+            .adopt(
+                parts,
+                rx,
+                AdoptedTaskSpec {
+                    owner_scope: Some("session".into()),
+                    writer_scope: "user-shell".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "echo before; sleep 1; echo after".into()],
+                    cwd: dir.path().to_path_buf(),
+                    write_scope: crate::WriteScope::Unrestricted,
+                    lifetime: BackgroundTaskLifetime::Runtime,
+                    started: Instant::now() - Duration::from_millis(100),
+                    initial_output: first.text,
+                    observer: None,
+                    on_adopted: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.error)
+            .expect("adopt");
+        let running = reg.get(&id).await.expect("task");
+        assert_eq!(running.status, BackgroundTaskStatus::Running);
+        assert_eq!(running.pid, Some(pgid as u32));
+        assert!(running.log.contains("before"), "{:?}", running.log);
+        assert!(
+            process_alive(pgid as u32),
+            "adoption must not respawn or restart the process"
+        );
+
+        let terminal = reg
+            .wait(&id, Some(Duration::from_secs(6)), &CancellationToken::new())
+            .await
+            .expect("terminal");
+        assert_eq!(
+            terminal.status,
+            BackgroundTaskStatus::Exited,
+            "{terminal:?}"
+        );
+        assert_eq!(terminal.exit_code, Some(0));
+        assert!(terminal.log.contains("before") && terminal.log.contains("after"));
+        assert_eq!(terminal.pid, Some(pgid as u32), "identity stayed stable");
+        assert!(!process_alive(pgid as u32), "the adopted tree was reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_adoption_link_runs_before_any_terminal_event() {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = CommandRunner::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "echo linked; sleep 0.2".into()],
+            dir.path().to_path_buf(),
+        );
+        let run = tokio::spawn({
+            let handoff = handoff.clone();
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run_streaming_handoff(request, CancellationToken::new(), tx, handoff)
+                    .await
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("output before handoff")
+            .expect("channel open");
+        assert!(first.text.contains("linked"), "{first:?}");
+        handoff.cancel();
+        let parts = match tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("handoff returned")
+            .expect("driver task")
+        {
+            crate::command::StreamOutcome::HandedOff(parts) => *parts,
+            _ => panic!("a live process must be handed off"),
+        };
+        let reg = host_registry();
+        let mut events = reg.subscribe();
+        let linked = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = linked.clone();
+        let id = reg
+            .adopt(
+                parts,
+                rx,
+                AdoptedTaskSpec {
+                    owner_scope: Some("session".into()),
+                    writer_scope: "user-shell".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "echo linked; sleep 0.2".into()],
+                    cwd: dir.path().to_path_buf(),
+                    write_scope: crate::WriteScope::Unrestricted,
+                    lifetime: BackgroundTaskLifetime::Runtime,
+                    started: Instant::now(),
+                    initial_output: first.text,
+                    observer: None,
+                    on_adopted: Some(std::sync::Arc::new(move |_task_id: &str| {
+                        flag.store(true, Ordering::SeqCst);
+                    })),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.error)
+            .expect("adopt");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let event = tokio::time::timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                events.recv(),
+            )
+            .await
+            .expect("terminal event before deadline")
+            .expect("lifecycle stream open");
+            if matches!(
+                &event,
+                BackgroundTaskEvent::Exited { task, .. } if task.id == id
+            ) {
+                assert!(
+                    linked.load(Ordering::SeqCst),
+                    "the link callback must run before Exited is published"
+                );
+                break;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_task_keeps_the_executions_timeout_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = CommandRunner::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let mut request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        request.timeout = Duration::from_millis(700);
+        let run = tokio::spawn({
+            let handoff = handoff.clone();
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run_streaming_handoff(request, CancellationToken::new(), tx, handoff)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handoff.cancel();
+        let parts = match tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("handoff returned")
+            .expect("driver task")
+        {
+            crate::command::StreamOutcome::HandedOff(parts) => *parts,
+            _ => panic!("a live process must be handed off"),
+        };
+        let reg = host_registry();
+        let adopted_at = Instant::now();
+        let id = reg
+            .adopt(
+                parts,
+                rx,
+                AdoptedTaskSpec {
+                    owner_scope: Some("session".into()),
+                    writer_scope: "user-shell".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: dir.path().to_path_buf(),
+                    write_scope: crate::WriteScope::Unrestricted,
+                    lifetime: BackgroundTaskLifetime::Runtime,
+                    // 600ms of the 700ms budget was already spent in the
+                    // foreground; adoption must not reset the clock.
+                    started: Instant::now() - Duration::from_millis(600),
+                    initial_output: String::new(),
+                    observer: None,
+                    on_adopted: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.error)
+            .expect("adopt");
+        let terminal = reg
+            .wait(&id, Some(Duration::from_secs(3)), &CancellationToken::new())
+            .await
+            .expect("terminal");
+        let elapsed = adopted_at.elapsed();
+        assert_eq!(terminal.status, BackgroundTaskStatus::Exited);
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "the original budget must not restart at adoption: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killing_an_adopted_task_stops_the_same_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = CommandRunner::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        let run = tokio::spawn({
+            let handoff = handoff.clone();
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run_streaming_handoff(request, CancellationToken::new(), tx, handoff)
+                    .await
+            }
+        });
+        let parts = {
+            handoff.cancel();
+            match tokio::time::timeout(Duration::from_secs(2), run)
+                .await
+                .expect("handoff returned")
+                .expect("driver task")
+            {
+                crate::command::StreamOutcome::HandedOff(parts) => *parts,
+                _ => panic!("a live process must be handed off"),
+            }
+        };
+        let pgid = parts.process.identity().pgid();
+        let reg = host_registry();
+        let id = reg
+            .adopt(
+                parts,
+                tokio::sync::mpsc::channel(64).1,
+                AdoptedTaskSpec {
+                    owner_scope: Some("session".into()),
+                    writer_scope: "user-shell".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: dir.path().to_path_buf(),
+                    write_scope: crate::WriteScope::Unrestricted,
+                    lifetime: BackgroundTaskLifetime::Runtime,
+                    started: Instant::now(),
+                    initial_output: String::new(),
+                    observer: None,
+                    on_adopted: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.error)
+            .expect("adopt");
+        assert!(process_alive(pgid as u32));
+        reg.kill_owned(&id, "session").await.expect("kill");
+        let terminal = reg
+            .wait_owned(
+                &id,
+                "session",
+                Some(Duration::from_secs(6)),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("terminal");
+        assert_eq!(
+            terminal.status,
+            BackgroundTaskStatus::Killed,
+            "{terminal:?}"
+        );
+        assert!(!process_alive(pgid as u32), "the same process tree is gone");
     }
 
     #[tokio::test]
@@ -2337,6 +2983,7 @@ mod tests {
                     identity: None,
                     done: Arc::new(Notify::new()),
                     changed: Arc::new(Notify::new()),
+                    adopted_cancel: None,
                     process_done: true,
                     log_pumps_remaining: 0,
                     group_reaped: false,
@@ -2375,6 +3022,7 @@ mod tests {
                     identity: None,
                     done: Arc::new(Notify::new()),
                     changed: Arc::new(Notify::new()),
+                    adopted_cancel: None,
                     process_done: false,
                     log_pumps_remaining: 0,
                     group_reaped: false,
@@ -2428,6 +3076,7 @@ mod tests {
             identity: None,
             done: Arc::new(Notify::new()),
             changed: Arc::new(Notify::new()),
+            adopted_cancel: None,
             process_done: true,
             log_pumps_remaining: 0,
             group_reaped: true,
@@ -2468,6 +3117,7 @@ mod tests {
             identity: None,
             done: Arc::new(Notify::new()),
             changed: Arc::new(Notify::new()),
+            adopted_cancel: None,
             process_done: true,
             log_pumps_remaining: 0,
             group_reaped: false,

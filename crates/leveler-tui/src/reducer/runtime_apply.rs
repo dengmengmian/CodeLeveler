@@ -836,6 +836,26 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // The block is in the conversation now; its output and terminal
             // event update the same row in place.
         }
+        RuntimeEvent::UserShellBackgrounded {
+            execution_id,
+            task_id,
+        } => {
+            state
+                .transcript
+                .background_user_shell(&execution_id, &task_id);
+            // A background execution is no longer stoppable through the
+            // foreground Command focus or Ctrl+C; its task list owns it now.
+            if state.command_selected.as_ref()
+                == Some(&crate::state::CommandTarget::UserShell(
+                    execution_id.clone(),
+                ))
+            {
+                state.command_selected = None;
+                if state.workbench_focus == crate::state::WorkbenchFocus::Command {
+                    state.workbench_focus = crate::state::WorkbenchFocus::Input;
+                }
+            }
+        }
         RuntimeEvent::UserShellOutput {
             execution_id,
             stream,
@@ -1019,6 +1039,40 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.trace.loaded = Some(observation);
             state.trace.clamp();
         }
+        RuntimeEvent::BackgroundTaskUnknown {
+            task_id,
+            duration_ms,
+            output,
+        } => {
+            let label = match state.background_task_labels.get_mut(&task_id) {
+                Some(chrome) => {
+                    chrome.ok = Some(false);
+                    chrome.stopped = false;
+                    chrome.unknown = true;
+                    chrome.exit_code = None;
+                    chrome.duration_ms = Some(duration_ms);
+                    if !output.is_empty() {
+                        chrome.output = output;
+                    }
+                    chrome.label.clone()
+                }
+                None => state.t().background_task_generic.to_string(),
+            };
+            crate::activity::bound_terminal_background(state);
+            let linked_shell = state.transcript.items().iter().any(|item| {
+                matches!(
+                    item,
+                    crate::transcript::TranscriptItem::UserShell(shell)
+                        if shell.task_id.as_deref() == Some(task_id.as_str())
+                )
+            });
+            if !linked_shell {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().background_task_unknown.replace("{}", &label),
+                });
+            }
+        }
         RuntimeEvent::BackgroundTaskExited {
             task_id,
             exit_code,
@@ -1037,6 +1091,16 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 exit_code,
                 duration_ms,
             );
+            // A user shell adopted into the background already has its own
+            // record. That record is the user-facing completion; the generic
+            // background notice would be a second surface for one fact.
+            let linked_shell = state.transcript.items().iter().any(|item| {
+                matches!(
+                    item,
+                    crate::transcript::TranscriptItem::UserShell(shell)
+                        if shell.task_id.as_deref() == Some(task_id.as_str())
+                )
+            });
             let t = state.t();
             // Terminal is history, but the TUI keeps the entry so the Activity
             // row and its detail stay reopenable. The registry record is the
@@ -1083,10 +1147,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 };
                 (message, None)
             };
-            if !has_starter {
+            if !has_starter && !linked_shell {
                 state.transcript.push_note(message.clone());
             }
-            if let Some(level) = level {
+            if !linked_shell && let Some(level) = level {
                 state.notification = Some(Notification { level, message });
             }
         }
@@ -1902,26 +1966,39 @@ fn apply_session_with(
     // reconnect via the snapshot; blocks are rebuilt in order.
     for shell in &session.user_shells {
         let running = shell.status == "running";
+        let background = shell.status == "background";
         // Back-date the start (possibly below zero) so the live runtime
         // keeps counting from the runtime's elapsed, not from zero at
         // reconnect.
         let started = state.motion_clock.as_millis() as i64 - shell.elapsed_secs as i64 * 1000;
+        let existed = state.transcript.user_shell_index(&shell.id).is_some();
         state.transcript.push_user_shell_started(
             shell.id.clone(),
             shell.command.clone(),
             shell.cwd.clone(),
             started,
         );
-        if !shell.output_tail.is_empty() {
+        if existed {
             let clean = crate::shell_render::sanitize_shell_output(&shell.output_tail);
             state
                 .transcript
-                .append_user_shell_output(&shell.id, &clean, false);
+                .replace_user_shell_output(&shell.id, &clean, shell.output_truncated);
+        } else {
+            if !shell.output_tail.is_empty() {
+                let clean = crate::shell_render::sanitize_shell_output(&shell.output_tail);
+                state
+                    .transcript
+                    .append_user_shell_output(&shell.id, &clean, false);
+            }
+            if shell.output_truncated {
+                state.transcript.mark_user_shell_output_truncated(&shell.id);
+            }
         }
-        if shell.output_truncated {
-            state.transcript.mark_user_shell_output_truncated(&shell.id);
-        }
-        if !running {
+        if background {
+            state
+                .transcript
+                .background_user_shell(&shell.id, shell.task_id.as_deref().unwrap_or(""));
+        } else if !running {
             state.transcript.complete_user_shell(
                 &shell.id,
                 shell.exit_code,

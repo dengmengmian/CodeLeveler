@@ -890,7 +890,10 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         t.plan_focus_hint.to_string()
     } else if state.running_user_shell().is_some() && !state.is_busy() {
         // One foreground shell at a time: the useful action is stopping it.
-        format!("Ctrl+C {}", t.user_shell_stop)
+        format!(
+            "Ctrl+B {} · Ctrl+C {}",
+            t.user_shell_background, t.user_shell_stop
+        )
     } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.input_mode == crate::shell_mode::InputMode::Shell {
