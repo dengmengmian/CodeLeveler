@@ -1393,7 +1393,7 @@
           "type": "string"
         },
         "elapsed_secs": {
-          "description": "Seconds elapsed at snapshot time (running) or total runtime (done).",
+          "description": "Seconds elapsed at snapshot time (running/background) or total runtime (done).",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -1419,8 +1419,15 @@
           "type": "boolean"
         },
         "status": {
-          "description": "`running | success | failed | cancelled`.",
+          "description": "`running | background | success | failed | cancelled | unknown`.",
           "type": "string"
+        },
+        "task_id": {
+          "description": "The registry task id when this execution runs in the background. The same execution id and process remain; this is the link to the background task list, not a second execution.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
