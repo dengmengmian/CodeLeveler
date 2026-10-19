@@ -15,6 +15,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
+  # The workspace's test binaries are large enough to exhaust the Linux
+  # runner's small disk while linking. Line-table debug info keeps useful
+  # backtraces at a fraction of the size.
+  CARGO_PROFILE_DEV_DEBUG: "1"
+  CARGO_PROFILE_TEST_DEBUG: "1"
 
 jobs:
   check:
@@ -31,6 +36,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+
+      # ubuntu-latest has ~14 GiB free; the preinstalled SDKs take most of
+      # the disk before a Rust workspace is built. Free them first.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          sudo docker image prune -af || true
+          df -h /
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
