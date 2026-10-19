@@ -32,6 +32,11 @@ Keep the key out of the repository and out of the TOML file. If the variable is
 unset, `web_search` stays unavailable, the model and every other feature keep
 working, and `~/.leveler/leveler.log` records a warning naming the variable.
 
+## Terminal
+
+- The user's own turn renders as one full-width background band: the dark theme uses a quiet `#171A1E` step above the `#111315` canvas, the soft-blue `❯` opens the first row, and the message body keeps primary ink. Short and long messages share the same width, the band is exactly as tall as the message, and there is no identity label, border or divider.
+- Selecting the band still copies the authored text exactly; the background, marker and gutter never reach the clipboard.
+
 ## Updates
 
 - A Homebrew-managed install no longer replaces itself in the Cellar. The start-up updater and `leveler update` defer to `brew upgrade leveler`, so the formula's record and the installed file stay in agreement; `leveler update --check` remains a read-only check. Installations from the install script or a manual copy keep their existing self-update behaviour.
