@@ -1868,6 +1868,7 @@ mod tests {
                 pid: None,
                 last_output_at: None,
                 output: String::new(),
+                unknown: false,
             },
         );
         let text = status_text(&state);

@@ -2525,6 +2525,7 @@ mod tests {
                 pid: None,
                 last_output_at: None,
                 output: "Compiling leveler-core ...\ntest result: ok\n".into(),
+                unknown: false,
             },
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
@@ -2560,6 +2561,7 @@ mod tests {
                 pid: None,
                 last_output_at: None,
                 output: "test result: ok. 428 passed\n".into(),
+                unknown: false,
             },
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
@@ -2652,6 +2654,7 @@ mod tests {
                 pid: None,
                 last_output_at: None,
                 output: "Compiling leveler-tui\n".into(),
+                unknown: false,
             },
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
@@ -2760,6 +2763,7 @@ mod tests {
                     pid: None,
                     last_output_at: None,
                     output: "a line of output that is much wider than the terminal\n".into(),
+                    unknown: false,
                 },
             );
             bg.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));

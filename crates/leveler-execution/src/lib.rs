@@ -53,9 +53,9 @@ pub use approval::{
 };
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{
-    BackgroundCleanupTicket, BackgroundSettlement, BackgroundTaskEvent, BackgroundTaskLifetime,
-    BackgroundTaskObservation, BackgroundTaskRegistry, BackgroundTaskSnapshot,
-    BackgroundTaskStatus, MutationBaseline,
+    AdoptError, AdoptedTaskSpec, BackgroundCleanupTicket, BackgroundSettlement,
+    BackgroundTaskEvent, BackgroundTaskLifetime, BackgroundTaskObservation, BackgroundTaskRegistry,
+    BackgroundTaskSnapshot, BackgroundTaskStatus, MutationBaseline,
 };
 pub use checkpoint::Checkpoint;
 pub use clarify::{
@@ -64,9 +64,10 @@ pub use clarify::{
 };
 pub use command::{
     CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, ProcessError,
-    ProcessIdentity, ProcessOutput, ProcessRequest, ToolExecutionStatus, VerifyNetworkPolicy,
-    credential_env_names, is_credential_env_name, looks_like_absolute_path_arg,
-    process_request_for_verify_check, seal_read_denials, shell_invocation,
+    ProcessHandoff, ProcessIdentity, ProcessOutput, ProcessRequest, StreamOutcome,
+    ToolExecutionStatus, VerifyNetworkPolicy, credential_env_names, is_credential_env_name,
+    looks_like_absolute_path_arg, process_request_for_verify_check, seal_read_denials,
+    shell_invocation,
 };
 pub use credential::{CredentialMaterial, fill_http_credential};
 pub use git_effects::{

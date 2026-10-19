@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use leveler_client_protocol::UiUserShell;
@@ -70,14 +71,54 @@ struct ActiveShell {
     cwd: String,
     started: Instant,
     cancel: CancellationToken,
+    /// Cancelled to ask the streaming driver to hand the same process over.
+    handoff: CancellationToken,
+    /// The one in-flight move-to-background request, if any.
+    background_request: Option<oneshot::Sender<Result<String, String>>>,
+    tail: OutputTail,
+}
+
+#[derive(Debug)]
+struct BackgroundShell {
+    shell: UiUserShell,
+    started: Instant,
     tail: OutputTail,
 }
 
 #[derive(Debug, Default)]
 struct SessionShells {
     active: Option<ActiveShell>,
+    /// Executions moved to the background registry. Their task id is the link
+    /// to that registry; the execution id and process are unchanged.
+    background: Vec<BackgroundShell>,
     /// Completed executions, oldest first.
     history: VecDeque<UiUserShell>,
+}
+
+/// Outcome of asking the active execution to move to the background.
+#[derive(Debug)]
+pub(crate) enum BackgroundRequest {
+    NotFound,
+    /// The execution already runs in the background; this is the same task.
+    AlreadyBackground(String),
+    /// A request is already in flight. Idempotent: no second task is made.
+    Pending,
+    /// The worker owns this response. It answers exactly once.
+    Requested(oneshot::Receiver<Result<String, String>>),
+}
+
+/// What the worker needs to hand the active execution over: the output it has
+/// already shown, and the reply slot for the client command.
+pub(crate) struct BackgroundedActive {
+    reply: Option<oneshot::Sender<Result<String, String>>>,
+}
+
+impl BackgroundedActive {
+    pub fn reply(self, result: Result<String, String>) {
+        if let Some(tx) = self.reply {
+            let _ = tx.send(result);
+        }
+    }
 }
 
 /// The one owner of user-shell execution state: the active execution per
@@ -96,6 +137,7 @@ impl UserShellStore {
         command: String,
         cwd: String,
         cancel: CancellationToken,
+        handoff: CancellationToken,
     ) {
         let mut inner = self.inner.lock().unwrap();
         let shells = inner.entry(session_id.clone()).or_default();
@@ -105,8 +147,193 @@ impl UserShellStore {
             cwd,
             started: Instant::now(),
             cancel,
+            handoff,
+            background_request: None,
             tail: OutputTail::default(),
         });
+    }
+
+    /// Ask the active execution to move to the background. The worker observes
+    /// the handoff token and transfers the same process. A repeated request
+    /// returns `Pending`; it never queues a second transfer.
+    pub fn request_background(
+        &self,
+        session_id: &SessionId,
+        id: &UserShellId,
+    ) -> BackgroundRequest {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(shells) = inner.get_mut(session_id) else {
+            return BackgroundRequest::NotFound;
+        };
+        if let Some(active) = shells.active.as_mut().filter(|a| &a.id == id) {
+            if active.background_request.is_some() {
+                return BackgroundRequest::Pending;
+            }
+            let (tx, rx) = oneshot::channel();
+            active.background_request = Some(tx);
+            active.handoff.cancel();
+            return BackgroundRequest::Requested(rx);
+        }
+        if let Some(shell) = shells
+            .background
+            .iter()
+            .find(|b| &b.shell.id == id)
+            .and_then(|b| b.shell.task_id.clone())
+        {
+            return BackgroundRequest::AlreadyBackground(shell);
+        }
+        BackgroundRequest::NotFound
+    }
+
+    /// Answer a pending transfer request exactly once. A late or duplicate
+    /// answer is a no-op.
+    pub fn complete_background_request(
+        &self,
+        session_id: &SessionId,
+        id: &UserShellId,
+        result: Result<String, String>,
+    ) {
+        let sender = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(session_id)
+            .and_then(|s| s.active.as_mut())
+            .filter(|a| &a.id == id)
+            .and_then(|a| a.background_request.take());
+        if let Some(tx) = sender {
+            let _ = tx.send(result);
+        }
+    }
+
+    /// When the active foreground execution started. The adopted task keeps
+    /// the whole execution's duration rather than starting a new clock.
+    pub fn active_started(&self, session_id: &SessionId, id: &UserShellId) -> Option<Instant> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(session_id)?
+            .active
+            .as_ref()
+            .filter(|a| &a.id == id)
+            .map(|a| a.started)
+    }
+
+    /// The output the foreground already showed, for seeding the adopted
+    /// task's log. Not a second copy of the execution.
+    pub fn foreground_output(
+        &self,
+        session_id: &SessionId,
+        id: &UserShellId,
+    ) -> Option<(String, bool)> {
+        let inner = self.inner.lock().unwrap();
+        let active = inner
+            .get(session_id)?
+            .active
+            .as_ref()
+            .filter(|a| &a.id == id)?;
+        Some(active.tail.snapshot())
+    }
+
+    /// Commit the ownership move: the active execution becomes a background
+    /// record linked to `task_id`. The reply slot is returned so the worker
+    /// can answer only after the registry accepted the process.
+    pub fn background(
+        &self,
+        session_id: &SessionId,
+        id: &UserShellId,
+        task_id: String,
+    ) -> Option<BackgroundedActive> {
+        let mut inner = self.inner.lock().unwrap();
+        let shells = inner.get_mut(session_id)?;
+        if shells.active.as_ref().is_none_or(|a| &a.id != id) {
+            return None;
+        }
+        let active = shells.active.take()?;
+        let (output, output_truncated) = active.tail.snapshot();
+        let elapsed_secs = active.started.elapsed().as_secs();
+        shells.background.push(BackgroundShell {
+            shell: UiUserShell {
+                id: active.id,
+                command: active.command,
+                cwd: active.cwd,
+                status: "background".to_string(),
+                elapsed_secs,
+                exit_code: None,
+                output_tail: output.clone(),
+                output_truncated,
+                task_id: Some(task_id),
+            },
+            started: active.started,
+            tail: active.tail,
+        });
+        Some(BackgroundedActive {
+            reply: active.background_request,
+        })
+    }
+
+    /// Append a live chunk to a background execution, found by execution id.
+    pub fn append_background_output(&self, session_id: &SessionId, id: &UserShellId, chunk: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(shell) = inner
+            .get_mut(session_id)
+            .and_then(|s| s.background.iter_mut().find(|b| &b.shell.id == id))
+        {
+            shell.tail.push(chunk);
+        }
+    }
+
+    /// Resolve the execution linked to a background registry task.
+    pub fn execution_for_task(&self, session_id: &SessionId, task_id: &str) -> Option<UserShellId> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(session_id)?
+            .background
+            .iter()
+            .find(|b| b.shell.task_id.as_deref() == Some(task_id))
+            .map(|b| b.shell.id.clone())
+    }
+
+    /// Move a background execution to history with the registry's terminal
+    /// facts. Returns the updated shell for the live event.
+    pub fn finish_background(
+        &self,
+        session_id: &SessionId,
+        task_id: &str,
+        exit_code: Option<i32>,
+        status: &str,
+        duration_ms: u64,
+        authoritative: Option<&str>,
+    ) -> Option<UiUserShell> {
+        let mut inner = self.inner.lock().unwrap();
+        let shells = inner.get_mut(session_id)?;
+        let index = shells
+            .background
+            .iter()
+            .position(|b| b.shell.task_id.as_deref() == Some(task_id))?;
+        let background = shells.background.remove(index);
+        let mut tail = background.tail;
+        if let Some(text) = authoritative {
+            tail.adopt(text);
+        }
+        let (output_tail, output_truncated) = tail.snapshot();
+        let shell = UiUserShell {
+            id: background.shell.id,
+            command: background.shell.command,
+            cwd: background.shell.cwd,
+            status: status.to_string(),
+            elapsed_secs: duration_ms / 1000,
+            exit_code,
+            output_tail,
+            output_truncated,
+            task_id: None,
+        };
+        shells.history.push_back(shell.clone());
+        while shells.history.len() > HISTORY_CAP {
+            shells.history.pop_front();
+        }
+        Some(shell)
     }
 
     pub fn append_output(&self, session_id: &SessionId, id: &UserShellId, chunk: &str) {
@@ -148,30 +375,32 @@ impl UserShellStore {
     ) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
         let shells = inner.get_mut(session_id)?;
-        if shells.active.as_ref().is_none_or(|a| &a.id != id) {
-            return None;
+        if let Some(active) = shells.active.take().filter(|a| &a.id == id) {
+            let duration_ms = active.started.elapsed().as_millis() as u64;
+            let mut tail = active.tail;
+            if let Some(text) = authoritative {
+                tail.adopt(text);
+            }
+            let (output_tail, output_truncated) = tail.snapshot();
+            shells.history.push_back(UiUserShell {
+                id: active.id,
+                command: active.command,
+                cwd: active.cwd,
+                status: status.to_string(),
+                elapsed_secs: duration_ms / 1000,
+                exit_code,
+                output_tail,
+                output_truncated,
+                task_id: None,
+            });
+            while shells.history.len() > HISTORY_CAP {
+                shells.history.pop_front();
+            }
+            return Some(duration_ms);
         }
-        let active = shells.active.take().unwrap();
-        let duration_ms = active.started.elapsed().as_millis() as u64;
-        let mut tail = active.tail;
-        if let Some(text) = authoritative {
-            tail.adopt(text);
-        }
-        let (output_tail, output_truncated) = tail.snapshot();
-        shells.history.push_back(UiUserShell {
-            id: active.id,
-            command: active.command,
-            cwd: active.cwd,
-            status: status.to_string(),
-            elapsed_secs: duration_ms / 1000,
-            exit_code,
-            output_tail,
-            output_truncated,
-        });
-        while shells.history.len() > HISTORY_CAP {
-            shells.history.pop_front();
-        }
-        Some(duration_ms)
+        // A background execution reaches history through the background
+        // registry's terminal event, not through the foreground worker.
+        None
     }
 
     /// The cancel token for exactly this execution — a stale id never cancels
@@ -198,6 +427,20 @@ impl UserShellStore {
             return Vec::new();
         };
         let mut out: Vec<UiUserShell> = shells.history.iter().cloned().collect();
+        for background in &shells.background {
+            let (output_tail, output_truncated) = background.tail.snapshot();
+            out.push(UiUserShell {
+                id: background.shell.id.clone(),
+                command: background.shell.command.clone(),
+                cwd: background.shell.cwd.clone(),
+                status: "background".to_string(),
+                elapsed_secs: background.started.elapsed().as_secs(),
+                exit_code: None,
+                output_tail,
+                output_truncated,
+                task_id: background.shell.task_id.clone(),
+            });
+        }
         if let Some(active) = &shells.active {
             let (output_tail, output_truncated) = active.tail.snapshot();
             out.push(UiUserShell {
@@ -209,10 +452,117 @@ impl UserShellStore {
                 exit_code: None,
                 output_tail,
                 output_truncated,
+                task_id: None,
             });
         }
         out
     }
+}
+
+/// Rebuild user-shell records from the durable event log for a snapshot after
+/// a runtime restart. Live in-memory records win; this only fills executions
+/// the current runtime no longer holds.
+///
+/// A started execution without a terminal fact is `unknown`, never `running`:
+/// the process belonged to the dead runtime generation, so claiming it still
+/// runs would be a lie.
+pub(crate) async fn restore_from_events(
+    db: &leveler_storage::Database,
+    session_id: &SessionId,
+) -> Result<Vec<UiUserShell>, String> {
+    use leveler_storage::EventStore;
+    let rows = db
+        .load_by_types(
+            session_id,
+            &[
+                "user_shell_started",
+                "user_shell_backgrounded",
+                "user_shell_finished",
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut ordered: Vec<UiUserShell> = Vec::new();
+    let mut index: HashMap<UserShellId, usize> = HashMap::new();
+    for row in rows {
+        let event = leveler_engine::EngineEvent::from_payload(&row.payload)
+            .map_err(|error| error.to_string())?;
+        match event {
+            leveler_engine::EngineEvent::UserShellStarted {
+                execution_id,
+                command,
+                cwd,
+            } => {
+                index.insert(execution_id.clone(), ordered.len());
+                ordered.push(UiUserShell {
+                    id: execution_id,
+                    command,
+                    cwd,
+                    // Internal placeholder until a terminal fact is applied;
+                    // the final pass turns a remaining one into `unknown`.
+                    status: "running".to_string(),
+                    elapsed_secs: 0,
+                    exit_code: None,
+                    output_tail: String::new(),
+                    output_truncated: false,
+                    task_id: None,
+                });
+            }
+            leveler_engine::EngineEvent::UserShellBackgrounded {
+                execution_id,
+                task_id,
+                output_tail,
+                output_truncated,
+            } => {
+                if let Some(shell) = index
+                    .get(&execution_id)
+                    .and_then(|index| ordered.get_mut(*index))
+                {
+                    // A terminal fact already written for this execution wins
+                    // even if the transfer event reached the log later: the
+                    // process is over, and no later record may claim it runs.
+                    if !matches!(shell.status.as_str(), "success" | "failed" | "cancelled") {
+                        shell.status = "background".to_string();
+                        shell.task_id = Some(task_id);
+                        if !output_tail.is_empty() {
+                            shell.output_tail = output_tail;
+                            shell.output_truncated = output_truncated;
+                        }
+                    }
+                }
+            }
+            leveler_engine::EngineEvent::UserShellFinished {
+                execution_id,
+                exit_code,
+                duration_ms,
+                status,
+                output_tail,
+                output_truncated,
+            } => {
+                if let Some(shell) = index
+                    .get(&execution_id)
+                    .and_then(|index| ordered.get_mut(*index))
+                {
+                    shell.status = status;
+                    shell.exit_code = exit_code;
+                    shell.elapsed_secs = duration_ms / 1000;
+                    shell.output_tail = output_tail;
+                    shell.output_truncated = output_truncated;
+                    shell.task_id = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    // A background/started record with no terminal fact lost its owner with the
+    // old runtime generation. It is unknown, not a live background task.
+    for shell in &mut ordered {
+        if matches!(shell.status.as_str(), "running" | "background") {
+            shell.status = "unknown".to_string();
+            shell.task_id = None;
+        }
+    }
+    Ok(ordered)
 }
 
 /// Terminal status wording on the wire (`UserShellFinished.status`).
@@ -294,6 +644,7 @@ mod tests {
             "seq 1 2000".into(),
             "/repo".into(),
             CancellationToken::new(),
+            CancellationToken::new(),
         );
         // Only the head of the stream made it through before chunks were lost.
         store.append_output(&session, &id, "1\n2\n");
@@ -328,6 +679,7 @@ mod tests {
             "echo one".into(),
             "/repo".into(),
             CancellationToken::new(),
+            CancellationToken::new(),
         );
         store.append_output(&session, &id, "out\nerr\n");
         store.finish(&session, &id, Some(0), "success", None);
@@ -347,6 +699,7 @@ mod tests {
             "sleep 1".into(),
             "/repo".into(),
             CancellationToken::new(),
+            CancellationToken::new(),
         );
         store.finish(&session, &old, Some(0), "success", None);
         store.begin(
@@ -354,6 +707,7 @@ mod tests {
             new.clone(),
             "sleep 2".into(),
             "/repo".into(),
+            CancellationToken::new(),
             CancellationToken::new(),
         );
         assert!(store.cancel_token(&session, &old).is_none());
@@ -371,6 +725,7 @@ mod tests {
             "echo one".into(),
             "/repo".into(),
             CancellationToken::new(),
+            CancellationToken::new(),
         );
         store.append_output(&session, &a, "one\n");
         store.finish(&session, &a, Some(0), "success", None);
@@ -380,6 +735,7 @@ mod tests {
             b.clone(),
             "sleep 9".into(),
             "/repo".into(),
+            CancellationToken::new(),
             CancellationToken::new(),
         );
         let snap = store.snapshot(&session);

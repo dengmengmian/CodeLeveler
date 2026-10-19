@@ -399,6 +399,14 @@ pub enum RuntimeEvent {
         command: String,
         cwd: String,
     },
+    /// The same user shell execution moved from the foreground to the
+    /// background. It is one process and one execution id; `task_id` links it
+    /// to the background task list. Additive; older clients keep showing the
+    /// foreground record until it exits.
+    UserShellBackgrounded {
+        execution_id: leveler_core::UserShellId,
+        task_id: String,
+    },
     /// Live output from a running user shell. `stream` is `stdout` or
     /// `stderr`. Transient: clients keep a bounded buffer; the runtime does
     /// not persist chunks.
@@ -629,6 +637,14 @@ pub enum RuntimeEvent {
     /// unknown type. The final [`Self::BackgroundTaskExited`] log stays
     /// authoritative.
     BackgroundTaskOutput { task_id: String, chunk: String },
+    /// A background task's state could not be established (for example its
+    /// adopted driver failed). This is not a natural exit and not a stop: the
+    /// UI must show unknown, never Running, failed, or stopped.
+    BackgroundTaskUnknown {
+        task_id: String,
+        duration_ms: u64,
+        output: String,
+    },
     /// A background task finished (exit or kill). `output` is the task's final
     /// retained log, authoritative over the streamed chunks (a lifecycle
     /// broadcast lag can drop a chunk). Empty when the runtime produced none.

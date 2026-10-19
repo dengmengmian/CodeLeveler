@@ -63,6 +63,7 @@ fn format_snap(snap: &leveler_execution::BackgroundTaskSnapshot) -> String {
         BackgroundTaskStatus::Killing => "killing",
         BackgroundTaskStatus::Exited => "exited",
         BackgroundTaskStatus::Killed => "killed",
+        BackgroundTaskStatus::Unknown => "unknown",
     };
     format!(
         "task_id: {}\nstatus: {status}\nprogram: {}\nargs: {:?}\nexit_code: {:?}\n\
@@ -83,6 +84,7 @@ fn format_wait_delta(
         BackgroundTaskStatus::Killing => "killing",
         BackgroundTaskStatus::Exited => "exited",
         BackgroundTaskStatus::Killed => "killed",
+        BackgroundTaskStatus::Unknown => "unknown",
     };
     let mut text = format!(
         "task_id: {} status: {status} next_cursor: {next_cursor}",

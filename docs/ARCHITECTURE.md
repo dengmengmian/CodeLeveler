@@ -1480,8 +1480,17 @@ verified by deterministic tests and real dogfood — do not regress them:
   header's rightmost cells and the live row are clickable stops; Ctrl+C cancels
   exactly that execution, never the agent, the side thread or the application.
   Only one foreground user command runs at a time. Resume restores the record
-  from the runtime without re-execution. Background transfer is not part of
-  this surface and is never advertised.
+  from the runtime without re-execution. A running foreground command can move
+  to the background with Ctrl+B or by clicking `↗ background` on the inline
+  header or the live row: the same execution ID, process and process group are
+  adopted by the existing background-task registry, with no respawn, re-run or
+  appended `&`. Output, exit code, duration and cancellation stay continuous;
+  the live row disappears, the record survives as Background and the existing
+  background list finds it by task ID. Ctrl+C cancels only the foreground
+  execution; a background task is stopped only through the background stop.
+  Resume never re-executes a background record, and a record without a terminal
+  fact after a runtime restart is shown as unknown, never as Running or
+  Completed.
 - **Real transcripts start at the viewport top**: until content fills the viewport, unused rows stay below the transcript so streaming and tool-group folding do not move the first message. Only the empty-session splash is centered. Painting and mouse/selection mapping use the same Conversation geometry policy; overflowing content retains normal scrolling and live-tail following.
 - **Folding must not move the reading position**: the line anchored at the
   viewport's top edge keeps its place when an entry above or inside the viewport

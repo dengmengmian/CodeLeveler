@@ -352,6 +352,9 @@ pub struct SubAgentBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserShellStatus {
     Running,
+    /// The same execution moved to the background registry. It is still alive,
+    /// but it is no longer the foreground shell and no longer owns Ctrl+C.
+    Background,
     Success,
     Failed,
     Cancelled,
@@ -360,8 +363,18 @@ pub enum UserShellStatus {
 }
 
 impl UserShellStatus {
+    /// A terminal record has an authoritative outcome and must never be
+    /// downgraded by a late transfer event.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failed | Self::Cancelled | Self::Unknown
+        )
+    }
+
     pub fn from_wire(status: &str) -> Self {
         match status {
+            "background" => Self::Background,
             "success" => Self::Success,
             "cancelled" => Self::Cancelled,
             "unknown" => Self::Unknown,
@@ -393,6 +406,10 @@ pub struct UserShellBlock {
     pub output_truncated: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
+    /// The background registry task linked to this execution after a
+    /// foreground→background transfer. Display/identity only; the registry is
+    /// the lifecycle authority.
+    pub task_id: Option<String>,
     /// UI motion-clock baseline when it started. Back-dated on reconnect so a
     /// command that ran 21 minutes before the client attached still shows 21
     /// minutes, not 0.
@@ -1377,10 +1394,53 @@ impl TranscriptState {
             output_truncated: false,
             exit_code: None,
             duration_ms: None,
+            task_id: None,
             started_motion_ms,
             expanded: false,
             expanded_pinned: false,
         }));
+    }
+
+    /// Mark the same execution as running in the background. The process and
+    /// id are unchanged; only its lifecycle owner and UI presentation move.
+    pub fn background_user_shell(&mut self, id: &leveler_core::UserShellId, task_id: &str) {
+        let Some(index) = self.user_shell_index(id) else {
+            return;
+        };
+        self.bump();
+        if let Some(TranscriptItem::UserShell(shell)) = self.items.get_mut(index) {
+            // The task link is useful even if a terminal event arrived first
+            // (it suppresses the generic background notice). The status is
+            // never downgraded from a terminal fact to Background.
+            shell.task_id = Some(task_id.to_string());
+            if !shell.status.is_terminal() {
+                shell.status = UserShellStatus::Background;
+            }
+        }
+    }
+
+    /// Replace a shell's output with the snapshot's retained tail.
+    ///
+    /// `SessionOpened` is also the lag/reconnect resync path, where the block
+    /// already exists. Appending the snapshot tail again would duplicate every
+    /// byte already shown; the runtime's tail is the authoritative retained
+    /// view, so the block takes it wholesale.
+    pub fn replace_user_shell_output(
+        &mut self,
+        id: &leveler_core::UserShellId,
+        text: &str,
+        truncated: bool,
+    ) {
+        let Some(index) = self.user_shell_index(id) else {
+            return;
+        };
+        self.bump();
+        if let TranscriptItem::UserShell(shell) = &mut self.items[index] {
+            shell.output.clear();
+            shell.output_marks.clear();
+            shell.output.push_str(text);
+            shell.output_truncated = truncated;
+        }
     }
 
     /// Append sanitized output to a running user shell (bounded tail).
@@ -2098,6 +2158,27 @@ mod tests {
         // In-place mutation via the slice escape hatch must also invalidate.
         let _ = t.items_mut();
         assert!(t.version() > v3, "items_mut must bump");
+    }
+
+    #[test]
+    fn a_snapshot_replaces_shell_output_instead_of_duplicating_it() {
+        let mut t = TranscriptState::new();
+        let id = leveler_core::UserShellId::new("ush-snapshot");
+        t.push_user_shell_started(id.clone(), "echo x".into(), "/repo".into(), 0);
+        t.append_user_shell_output(&id, "x\n", false);
+        // The lag/reconnect path applies the same retained tail to an existing
+        // block; it must not append a second copy.
+        t.replace_user_shell_output(&id, "x\n", false);
+        let shell = t
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TranscriptItem::UserShell(shell) if shell.id == id => Some(shell),
+                _ => None,
+            })
+            .expect("shell block");
+        assert_eq!(shell.output, "x\n");
+        assert!(!shell.output_truncated);
     }
 
     // ── Semantic activity boundaries ────────────────────────────────────────

@@ -494,9 +494,10 @@ pub struct UiUserShell {
     pub id: leveler_core::UserShellId,
     pub command: String,
     pub cwd: String,
-    /// `running | success | failed | cancelled`.
+    /// `running | background | success | failed | cancelled | unknown`.
     pub status: String,
-    /// Seconds elapsed at snapshot time (running) or total runtime (done).
+    /// Seconds elapsed at snapshot time (running/background) or total runtime
+    /// (done).
     pub elapsed_secs: u64,
     #[serde(default)]
     pub exit_code: Option<i32>,
@@ -505,6 +506,11 @@ pub struct UiUserShell {
     /// True when `output_tail` dropped earlier output.
     #[serde(default)]
     pub output_truncated: bool,
+    /// The registry task id when this execution runs in the background. The
+    /// same execution id and process remain; this is the link to the background
+    /// task list, not a second execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// A task's own terminal declaration, projected from its durable TaskFinished stop.

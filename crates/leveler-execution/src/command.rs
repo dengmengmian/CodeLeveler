@@ -953,6 +953,32 @@ pub struct OutputChunk {
     pub text: String,
 }
 
+/// A still-running process whose output has already started streaming and
+/// whose lifecycle is being handed to a longer-lived owner.
+///
+/// The process, its pipes and its reader tasks are the SAME ones the
+/// foreground run created. Nothing is respawned and no output is re-read:
+/// the receiver that fed the foreground continues to receive both pipes until
+/// the new owner finishes them with [`CommandRunner::finish_handoff`].
+pub struct ProcessHandoff {
+    pub process: ManagedProcess,
+    pub stdout_task: tokio::task::JoinHandle<(String, u64, u64)>,
+    pub stderr_task: tokio::task::JoinHandle<(String, u64, u64)>,
+    /// Cancels a detached grandchild holding a pipe open after the child exits.
+    pub drain: CancellationToken,
+    /// The request that produced this process (caps, timeout, program name).
+    pub request: ProcessRequest,
+    /// Process start, retained so the adopter's duration covers the whole
+    /// execution rather than only the backgrounded part.
+    pub started: std::time::Instant,
+}
+
+/// Outcome of a run that may be handed to another lifecycle owner.
+pub enum StreamOutcome {
+    Completed(Result<ProcessOutput, ProcessError>),
+    HandedOff(Box<ProcessHandoff>),
+}
+
 /// The platform shell wrapper for a raw command string: `sh -c` on Unix,
 /// `cmd /C` on Windows. THE single copy — the agent `shell_command` tool,
 /// approval classification, and user shell execution all consume this so the
@@ -1073,6 +1099,45 @@ impl CommandRunner {
         chunks: tokio::sync::mpsc::Sender<OutputChunk>,
     ) -> Result<ProcessOutput, ProcessError> {
         self.run_observed(request, cancellation, Some(chunks)).await
+    }
+
+    /// Run with streaming output, but let a longer-lived owner take over the
+    /// exact running process without killing or respawning it.
+    ///
+    /// `handoff` is a request, not a command: if the child exits (or is
+    /// cancelled) before the signal is observed, the ordinary terminal result
+    /// wins and nothing is transferred.
+    pub async fn run_streaming_handoff(
+        &self,
+        request: ProcessRequest,
+        cancellation: CancellationToken,
+        chunks: tokio::sync::mpsc::Sender<OutputChunk>,
+        handoff: CancellationToken,
+    ) -> StreamOutcome {
+        let process = match self.spawn(&request).await {
+            Ok(process) => process,
+            Err(error) => return StreamOutcome::Completed(Err(error)),
+        };
+        let started = std::time::Instant::now();
+        drive_to_completion_inner(
+            process,
+            &request,
+            cancellation,
+            Some(chunks),
+            Some(handoff),
+            started,
+        )
+        .await
+    }
+
+    /// Finish a handed-off process under its new owner. The process, pipes,
+    /// reader tasks and drain token are the ones from the foreground run.
+    pub async fn finish_handoff(
+        &self,
+        handoff: ProcessHandoff,
+        cancellation: CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        finish_handed_off(handoff, cancellation).await
     }
 
     async fn run_observed(
@@ -1618,11 +1683,47 @@ fn synthetic_killed_status() -> std::process::ExitStatus {
 /// honor timeout and cancellation by terminating the whole tree, and never
 /// block forever on a post-kill wait.
 async fn drive_to_completion(
-    mut process: ManagedProcess,
+    process: ManagedProcess,
     request: &ProcessRequest,
     cancellation: CancellationToken,
     chunks: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
 ) -> Result<ProcessOutput, ProcessError> {
+    match drive_to_completion_inner(
+        process,
+        request,
+        cancellation,
+        chunks,
+        None,
+        std::time::Instant::now(),
+    )
+    .await
+    {
+        StreamOutcome::Completed(result) => result,
+        // No handoff token was supplied, so this is unreachable by
+        // construction. Keep the invariant explicit instead of fabricating a
+        // success.
+        StreamOutcome::HandedOff(_) => Err(ProcessError::Io {
+            program: request.program.clone(),
+            source: std::io::Error::other("process handoff without a handoff request"),
+        }),
+    }
+}
+
+enum DriveFirst {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+    TimedOut,
+    Handoff,
+}
+
+async fn drive_to_completion_inner(
+    mut process: ManagedProcess,
+    request: &ProcessRequest,
+    cancellation: CancellationToken,
+    chunks: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
+    handoff: Option<CancellationToken>,
+    started: std::time::Instant,
+) -> StreamOutcome {
     let mut stdout_pipe = process.take_stdout();
     let mut stderr_pipe = process.take_stderr();
     let cap = request.max_output_bytes;
@@ -1641,15 +1742,121 @@ async fn drive_to_completion(
         tokio::spawn(async move { read_capped(&mut stderr_pipe, cap, drain, tx).await })
     };
 
+    let handoff_wait = handoff.clone().unwrap_or_default();
+    let first = tokio::select! {
+        biased;
+        status = process.wait() => DriveFirst::Exited(status),
+        _ = cancellation.cancelled() => DriveFirst::Cancelled,
+        _ = tokio::time::sleep(request.timeout) => DriveFirst::TimedOut,
+        _ = handoff_wait.cancelled() => DriveFirst::Handoff,
+    };
+
+    if matches!(first, DriveFirst::Handoff) {
+        return StreamOutcome::HandedOff(Box::new(ProcessHandoff {
+            process,
+            stdout_task,
+            stderr_task,
+            drain,
+            request: request.clone(),
+            started,
+        }));
+    }
+
     let mut timed_out = false;
-    let status = tokio::select! {
-        status = process.wait() => status,
-        _ = tokio::time::sleep(request.timeout) => {
+    let status = match first {
+        DriveFirst::Exited(status) => status,
+        DriveFirst::Cancelled => {
+            drain.cancel();
+            process.terminate_tree().await;
+            let reaped = process.wait_reaped().await;
+            return StreamOutcome::Completed(if reaped && process.tree_gone().await {
+                Err(ProcessError::Cancelled)
+            } else {
+                Err(ProcessError::CancelUnconfirmed)
+            });
+        }
+        DriveFirst::TimedOut => {
             timed_out = true;
             process.terminate_tree().await;
             process.wait_deadline().await
         }
-        _ = cancellation.cancelled() => {
+        DriveFirst::Handoff => unreachable!("handled above"),
+    };
+
+    let status = match status {
+        Ok(status) => status,
+        Err(source) => {
+            return StreamOutcome::Completed(Err(ProcessError::Io {
+                program: request.program.clone(),
+                source,
+            }));
+        }
+    };
+
+    // The child has exited. Its own output is already in the pipe buffers; only
+    // a detached grandchild can still hold the write end open. Give the readers
+    // a brief grace to drain, then cut them loose.
+    {
+        let drain = drain.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PIPE_DRAIN_GRACE).await;
+            drain.cancel();
+        });
+    }
+    let (stdout, stdout_dropped, stdout_live_dropped) = stdout_task.await.unwrap_or_default();
+    let (stderr, stderr_dropped, stderr_live_dropped) = stderr_task.await.unwrap_or_default();
+    let dropped_bytes = stdout_dropped + stderr_dropped;
+    let live_dropped_bytes = stdout_live_dropped + stderr_live_dropped;
+    process.reap_group();
+    if !process.tree_gone().await {
+        return StreamOutcome::Completed(Err(ProcessError::Io {
+            program: request.program.clone(),
+            source: std::io::Error::other("process group termination could not be confirmed"),
+        }));
+    }
+
+    StreamOutcome::Completed(Ok(ProcessOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        timed_out,
+        truncated: dropped_bytes > 0,
+        dropped_bytes,
+        live_dropped_bytes,
+    }))
+}
+
+/// The second half of a handed-off run: wait for the same child, let the same
+/// readers finish, and produce the same terminal facts.
+async fn finish_handed_off(
+    handoff: ProcessHandoff,
+    cancellation: CancellationToken,
+) -> Result<ProcessOutput, ProcessError> {
+    let ProcessHandoff {
+        mut process,
+        stdout_task,
+        stderr_task,
+        drain,
+        request,
+        started,
+    } = handoff;
+    // The timeout is anchored to the execution start, so resuming the
+    // foreground after a refused adoption does not grant a fresh budget.
+    let timeout_left = request
+        .timeout
+        .checked_sub(started.elapsed())
+        .unwrap_or_default();
+    let first = tokio::select! {
+        biased;
+        status = process.wait() => DriveFirst::Exited(status),
+        _ = cancellation.cancelled() => DriveFirst::Cancelled,
+        _ = tokio::time::sleep(timeout_left) => DriveFirst::TimedOut,
+    };
+
+    let mut timed_out = false;
+    let status = match first {
+        DriveFirst::Exited(status) => status,
+        DriveFirst::Cancelled => {
             drain.cancel();
             process.terminate_tree().await;
             let reaped = process.wait_reaped().await;
@@ -1659,6 +1866,12 @@ async fn drive_to_completion(
                 Err(ProcessError::CancelUnconfirmed)
             };
         }
+        DriveFirst::TimedOut => {
+            timed_out = true;
+            process.terminate_tree().await;
+            process.wait_deadline().await
+        }
+        DriveFirst::Handoff => unreachable!("no handoff token in a handed-off finish"),
     };
 
     let status = status.map_err(|source| ProcessError::Io {
@@ -1666,9 +1879,6 @@ async fn drive_to_completion(
         source,
     })?;
 
-    // The child has exited. Its own output is already in the pipe buffers; only
-    // a detached grandchild can still hold the write end open. Give the readers
-    // a brief grace to drain, then cut them loose.
     {
         let drain = drain.clone();
         tokio::spawn(async move {
@@ -5941,6 +6151,102 @@ mod streaming_tests {
         let output = handle.await.unwrap().expect("run completed");
         assert_eq!(output.exit_code, Some(0));
         assert!(output.stdout.contains("line1") && output.stdout.contains("line2"));
+    }
+
+    /// The foreground driver can hand the exact running process to a new
+    /// owner: same pid/process group, both pipes keep streaming, and the
+    /// terminal facts are produced by the adopter rather than a respawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_keeps_the_same_process_and_streams_after_transfer() {
+        let runner = CommandRunner::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "echo before; sleep 1; echo after; sleep 0.2".into(),
+            ],
+            std::env::temp_dir(),
+        );
+        let run = tokio::spawn({
+            let handoff = handoff.clone();
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run_streaming_handoff(request, CancellationToken::new(), tx, handoff)
+                    .await
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("output before handoff")
+            .expect("channel open");
+        assert!(first.text.contains("before"), "{first:?}");
+
+        handoff.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("handoff returned")
+            .expect("driver task");
+        let StreamOutcome::HandedOff(parts) = outcome else {
+            panic!("a live process must hand off, not complete or respawn");
+        };
+        let parts = *parts;
+        let pgid = parts.process.identity().pgid();
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pgid), None).is_ok(),
+            "the handed-off process group is still alive"
+        );
+
+        let consumer = tokio::spawn(async move {
+            let mut live = String::new();
+            while let Some(chunk) = rx.recv().await {
+                live.push_str(&chunk.text);
+            }
+            live
+        });
+        let output = runner
+            .finish_handoff(parts, CancellationToken::new())
+            .await
+            .expect("handed-off process completes");
+        let live = consumer.await.expect("live consumer");
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.contains("before") && output.stdout.contains("after"));
+        assert!(
+            live.contains("after"),
+            "output produced after the transfer still streams: {live:?}"
+        );
+    }
+
+    /// Cancellation and a handoff request may race. Cancellation wins: a stop
+    /// that was already requested must never be converted into background work.
+    #[tokio::test]
+    async fn cancellation_beats_a_simultaneous_handoff_request() {
+        let runner = CommandRunner::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handoff = CancellationToken::new();
+        cancel.cancel();
+        handoff.cancel();
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30".into()],
+            std::env::temp_dir(),
+        );
+        let outcome = runner
+            .run_streaming_handoff(request, cancel, tx, handoff)
+            .await;
+        match outcome {
+            StreamOutcome::Completed(Err(ProcessError::Cancelled)) => {}
+            StreamOutcome::Completed(other) => {
+                panic!("cancellation must win over handoff: {other:?}")
+            }
+            StreamOutcome::HandedOff(_) => {
+                panic!("cancellation must never hand a process to a longer-lived owner")
+            }
+        }
     }
 
     /// Cancellation during streaming kills the tree and returns Cancelled.

@@ -939,6 +939,16 @@ impl EventBridge {
                     cwd,
                 });
             }
+            EngineEvent::UserShellBackgrounded {
+                execution_id,
+                task_id,
+                ..
+            } => {
+                let _ = self.events.send(RuntimeEvent::UserShellBackgrounded {
+                    execution_id,
+                    task_id,
+                });
+            }
             EngineEvent::UserShellOutput {
                 execution_id,
                 stream,
@@ -955,6 +965,7 @@ impl EventBridge {
                 exit_code,
                 duration_ms,
                 status,
+                ..
             } => {
                 let _ = self.events.send(RuntimeEvent::UserShellExited {
                     execution_id,
@@ -3515,6 +3526,8 @@ mod projection_equivalence {
                 exit_code: Some(0),
                 duration_ms: 4200,
                 status: "success".into(),
+                output_tail: String::new(),
+                output_truncated: false,
             },
         ]);
         assert_eq!(

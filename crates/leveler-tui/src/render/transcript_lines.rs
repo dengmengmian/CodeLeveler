@@ -1479,7 +1479,10 @@ pub(crate) fn user_shell_lines(
     let rail_style = Style::default().fg(status_color);
     let rail = if focused { "→ " } else { USER_SHELL_RAIL };
 
-    let elapsed = shell.status == UserShellStatus::Running;
+    let elapsed = matches!(
+        shell.status,
+        UserShellStatus::Running | UserShellStatus::Background
+    );
     let suffix = if elapsed {
         let elapsed_ms = (now.as_millis() as i64 - shell.started_motion_ms).max(0);
         let secs = (elapsed_ms / 1000) as u64;
@@ -1502,6 +1505,7 @@ pub(crate) fn user_shell_lines(
 
     let (glyph, title) = match shell.status {
         UserShellStatus::Running => ("◆ ", t.user_shell_running_label),
+        UserShellStatus::Background => ("↗ ", t.user_shell_background_label),
         UserShellStatus::Success => ("◆ ", t.user_shell_ran_label),
         UserShellStatus::Failed => ("✗ ", t.user_shell_ran_label),
         UserShellStatus::Cancelled => ("⊘ ", t.user_shell_cancelled_label),
@@ -1514,11 +1518,16 @@ pub(crate) fn user_shell_lines(
         Span::styled(
             format!("{title} "),
             Style::default()
-                .fg(if shell.status == UserShellStatus::Running {
-                    theme.text.primary
-                } else {
-                    theme.text.secondary
-                })
+                .fg(
+                    if matches!(
+                        shell.status,
+                        UserShellStatus::Running | UserShellStatus::Background
+                    ) {
+                        theme.text.primary
+                    } else {
+                        theme.text.secondary
+                    },
+                )
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -1538,35 +1547,41 @@ pub(crate) fn user_shell_lines(
     if shell.status == UserShellStatus::Unknown {
         facts.push_str(&format!(" · {}", t.shell_status_unknown));
     }
-    let stop = (shell.status == UserShellStatus::Running).then_some(t.user_shell_stop);
-    let stop_w = stop
-        .map(|s| UnicodeWidthStr::width(format!(" · ✕ {s}").as_str()))
-        .unwrap_or(0);
+    let running = shell.status == UserShellStatus::Running;
+    let stop = running.then_some(t.user_shell_stop);
+    let background = running.then_some(t.user_shell_background);
+    let stop_label = stop.map(|s| format!(" · ✕ {s}")).unwrap_or_default();
+    let background_label = background.map(|s| format!(" · ↗ {s}")).unwrap_or_default();
+    let controls_w = UnicodeWidthStr::width(stop_label.as_str())
+        + UnicodeWidthStr::width(background_label.as_str());
     let command_room = width.saturating_sub(
         UnicodeWidthStr::width(rail)
             + UnicodeWidthStr::width(glyph)
             + UnicodeWidthStr::width(title)
             + 1
             + UnicodeWidthStr::width(facts.as_str())
-            + stop_w,
+            + controls_w,
     );
     header.push(Span::styled(
         crate::render::truncate_display(&command_line, command_room.max(1)),
         Style::default().fg(theme.text.primary),
     ));
     header.push(Span::styled(facts, Style::default().fg(theme.text.muted)));
-    if let Some(stop) = stop {
+    if running {
         let used: usize = header
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum();
-        let label = format!(" · ✕ {stop}");
-        let pad = width.saturating_sub(used + UnicodeWidthStr::width(label.as_str()));
+        let pad = width.saturating_sub(used + controls_w);
         if pad > 0 {
             header.push(Span::raw(" ".repeat(pad)));
         }
         header.push(Span::styled(
-            label,
+            background_label,
+            Style::default().fg(theme.text.secondary),
+        ));
+        header.push(Span::styled(
+            stop_label,
             Style::default().fg(theme.text.secondary),
         ));
     }
@@ -1616,6 +1631,8 @@ fn shell_color(status: crate::transcript::UserShellStatus, theme: &Theme) -> rat
     use crate::transcript::UserShellStatus;
     match status {
         UserShellStatus::Running => theme.shell.running,
+        // The same ink the background Activity rows use for a running task.
+        UserShellStatus::Background => theme.accent.primary,
         UserShellStatus::Success => theme.shell.success,
         UserShellStatus::Failed => theme.shell.error,
         UserShellStatus::Cancelled => theme.shell.cancelled,
@@ -1886,6 +1903,7 @@ mod tests {
         let status = UserShellStatus::from_wire("unknown");
         let shell = UserShellBlock {
             id: leveler_core::UserShellId::new("ush-1"),
+            task_id: None,
             command: "sleep 30".into(),
             cwd: "/repo".into(),
             status,
@@ -2065,6 +2083,28 @@ mod tests {
         assert!(rows[1].contains("$ git status"), "{rows:?}");
     }
 
+    #[test]
+    fn a_running_shell_shows_background_and_stop_controls_in_order() {
+        let rows = shell_rows(&shell_block(UserShellStatus::Running, "", false), 100);
+        let header = &rows[0];
+        let background = header.find("↗ 转后台").expect("background control");
+        let stop = header.find("✕ 停止").expect("stop control");
+        assert!(
+            background < stop,
+            "background precedes stop on the right: {header}"
+        );
+        assert!(header.starts_with("│ "), "{header}");
+    }
+
+    #[test]
+    fn a_background_shell_has_no_foreground_controls() {
+        let rows = shell_rows(&shell_block(UserShellStatus::Background, "", false), 100);
+        let header = &rows[0];
+        assert!(header.contains("Background (user)"), "{header}");
+        assert!(!header.contains("✕ 停止"), "{header}");
+        assert!(!header.contains("↗ 转后台"), "{header}");
+    }
+
     fn shell_block(
         status: UserShellStatus,
         output: &str,
@@ -2072,6 +2112,7 @@ mod tests {
     ) -> crate::transcript::UserShellBlock {
         crate::transcript::UserShellBlock {
             id: leveler_core::UserShellId::new("ush-render"),
+            task_id: None,
             command: "git status".into(),
             cwd: "/repo".into(),
             status,
