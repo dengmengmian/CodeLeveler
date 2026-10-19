@@ -37,7 +37,7 @@ impl AppState {
         std::rc::Rc<Vec<Line<'static>>>,
         std::rc::Rc<Vec<(usize, usize)>>,
     ) {
-        let (lines, hits, _, _, _, _) = self.conversation_build(width);
+        let (lines, hits, _, _, _, _, _) = self.conversation_build(width);
         (lines, hits)
     }
 
@@ -61,19 +61,23 @@ impl AppState {
     }
 
     /// The copy projection for the current conversation build: exact screen
-    /// text plus per-row decoration layout. Built from the same memoized lines
+    /// text plus the renderer-owned copy policy. Both come from the same build
     /// the viewport paints, so a selection can never describe a different
     /// layout than the one on screen.
     pub(crate) fn conversation_plain(
         &self,
         width: usize,
     ) -> (Vec<String>, Vec<crate::selection::PlainRow>) {
-        let (lines, _, _, _, spans, _) = self.conversation_build(width);
-        plain_projection(&lines, &spans, self.transcript.items())
+        let (lines, _, _, _, _, _, copy) = self.conversation_build(width);
+        (
+            lines.iter().map(crate::selection::line_to_plain).collect(),
+            copy.as_ref().clone(),
+        )
     }
 
     /// The memoized build: lines, disclosure hit rows, command rows, the
-    /// last Final answer's start line, and every item's line span.
+    /// last Final answer's start line, every item's line span, painted source
+    /// ranges, and the copy policy aligned with the lines.
     #[allow(clippy::type_complexity)]
     pub(crate) fn conversation_build(
         &self,
@@ -85,9 +89,11 @@ impl AppState {
         Option<usize>,
         std::rc::Rc<Vec<(usize, usize)>>,
         std::rc::Rc<Vec<super::view::SourceSpan>>,
+        std::rc::Rc<Vec<crate::selection::PlainRow>>,
     ) {
         if crate::splash::conversation_is_empty(self) {
-            let (lines, hits, commands, anchor, starts, sources) = build_conversation(self, width);
+            let (lines, hits, commands, anchor, starts, sources, copy) =
+                build_conversation(self, width);
             return (
                 std::rc::Rc::new(lines),
                 std::rc::Rc::new(hits),
@@ -95,6 +101,7 @@ impl AppState {
                 anchor,
                 std::rc::Rc::new(starts),
                 std::rc::Rc::new(sources),
+                std::rc::Rc::new(copy),
             );
         }
         let key = ConvKey {
@@ -118,7 +125,7 @@ impl AppState {
                 .unwrap_or(0),
             question_card_open: self.question_card_open(),
         };
-        if let Some((k, lines, hits, commands, anchor, starts, sources)) =
+        if let Some((k, lines, hits, commands, anchor, starts, sources, copy)) =
             self.conv.cache.borrow().as_ref()
             && *k == key
         {
@@ -130,18 +137,21 @@ impl AppState {
                 *anchor,
                 starts.clone(),
                 sources.clone(),
+                copy.clone(),
             );
         }
         let started = crate::profile::start();
-        let (lines, hits, commands, anchor, starts, sources) = build_conversation(self, width);
+        let (lines, hits, commands, anchor, starts, sources, copy) =
+            build_conversation(self, width);
         crate::profile::stop(started, "tui.projection_ms");
         crate::profile::add("tui.build_count", 1);
-        let (lines, hits, commands, starts, sources) = (
+        let (lines, hits, commands, starts, sources, copy) = (
             std::rc::Rc::new(lines),
             std::rc::Rc::new(hits),
             std::rc::Rc::new(commands),
             std::rc::Rc::new(starts),
             std::rc::Rc::new(sources),
+            std::rc::Rc::new(copy),
         );
         *self.conv.cache.borrow_mut() = Some((
             key,
@@ -151,8 +161,9 @@ impl AppState {
             anchor,
             starts.clone(),
             sources.clone(),
+            copy.clone(),
         ));
-        (lines, hits, commands, anchor, starts, sources)
+        (lines, hits, commands, anchor, starts, sources, copy)
     }
 
     /// The command row under content (`abs_line`, display `col`), if any.
@@ -161,7 +172,7 @@ impl AppState {
         width: usize,
         abs_line: usize,
     ) -> Option<super::view::CommandHit> {
-        let (_, _, commands, _, _, _) = self.conversation_build(width);
+        let (_, _, commands, _, _, _, _) = self.conversation_build(width);
         commands.iter().find(|hit| hit.line == abs_line).copied()
     }
 
@@ -185,49 +196,8 @@ pub fn build_conversation_lines_with_hits(
     state: &AppState,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
-    let (lines, hits, _, _, _, _) = build_conversation(state, width);
+    let (lines, hits, _, _, _, _, _) = build_conversation(state, width);
     (lines, hits)
-}
-
-/// Painted lines plus the copy layout that belongs to them.
-///
-/// Only a real user prompt carries decoration: its first and last
-/// [`USER_PROMPT_PAD_ROWS`](crate::render::transcript_lines::USER_PROMPT_PAD_ROWS)
-/// rows are band padding, and its body rows begin after the marker gutter.
-/// Everything else is ordinary text.
-pub(crate) fn plain_projection(
-    lines: &[Line<'static>],
-    item_spans: &[(usize, usize)],
-    items: &[TranscriptItem],
-) -> (Vec<String>, Vec<crate::selection::PlainRow>) {
-    let plain = lines.iter().map(crate::selection::line_to_plain).collect();
-    let mut layout = vec![crate::selection::PlainRow::default(); lines.len()];
-    let pad = crate::render::transcript_lines::USER_PROMPT_PAD_ROWS;
-    let indent = crate::render::transcript_lines::USER_PROMPT_GUTTER as u16;
-    for (index, item) in items.iter().enumerate() {
-        if !matches!(item, TranscriptItem::User(_)) {
-            continue;
-        }
-        let Some(&(start, end)) = item_spans.get(index) else {
-            continue;
-        };
-        if start >= end || start >= lines.len() {
-            continue;
-        }
-        let end = end.min(lines.len());
-        let body_start = (start + pad).min(end);
-        let body_end = end.saturating_sub(pad).max(body_start);
-        for row in &mut layout[start..body_start] {
-            row.skip = true;
-        }
-        for row in &mut layout[body_end..end] {
-            row.skip = true;
-        }
-        for row in &mut layout[body_start..body_end] {
-            row.indent = indent;
-        }
-    }
-    (plain, layout)
 }
 
 /// Build the conversation, its disclosure hit rows, and its command rows in
@@ -247,10 +217,13 @@ fn build_conversation(
     Option<usize>,
     Vec<(usize, usize)>,
     Vec<super::view::SourceSpan>,
+    Vec<crate::selection::PlainRow>,
 ) {
     let theme = &state.theme;
     let t = state.t();
     let mut out: Vec<Line<'static>> = Vec::new();
+    // Semantic copy policy, aligned 1:1 with `out`.
+    let mut copy: Vec<crate::selection::PlainRow> = Vec::new();
     let mut hits: Vec<(usize, usize)> = Vec::new();
     let mut commands: Vec<super::view::CommandHit> = Vec::new();
     let mut sources = Vec::new();
@@ -270,13 +243,22 @@ fn build_conversation(
             .map(|(_, _, _, h)| h as usize)
             .filter(|h| *h > 0)
             .unwrap_or(24);
+        let splash = crate::splash::splash_lines(state, width, height, theme, t);
+        let copy = vec![
+            crate::selection::PlainRow {
+                skip: true,
+                ..Default::default()
+            };
+            splash.len()
+        ];
         return (
-            crate::splash::splash_lines(state, width, height, theme, t),
+            splash,
             hits,
             commands,
             final_anchor,
             item_spans,
             sources,
+            copy,
         );
     }
 
@@ -302,6 +284,7 @@ fn build_conversation(
                 let fold = &folds.runs[run];
                 if !out.is_empty() {
                     out.push(Line::from(""));
+                    copy.push(crate::selection::PlainRow::default());
                 }
                 let before = out.len();
                 render_process_fold(
@@ -315,6 +298,14 @@ fn build_conversation(
                     theme,
                     t,
                 );
+                // The execution receipt is evidence UI, not message body.
+                copy.extend(std::iter::repeat_n(
+                    crate::selection::PlainRow {
+                        skip: true,
+                        ..Default::default()
+                    },
+                    out.len() - before,
+                ));
                 for &(item_index, _) in &fold.members {
                     let old = item_spans[item_index];
                     item_spans[item_index] = if old == (0, 0) {
@@ -354,6 +345,7 @@ fn build_conversation(
         let gap_at =
             (idx > 0 && !out.is_empty() && items_need_gap(&items[idx - 1], item)).then(|| {
                 out.push(Line::from(""));
+                copy.push(crate::selection::PlainRow::default());
                 out.len() - 1
             });
         let first_item = idx;
@@ -384,21 +376,22 @@ fn build_conversation(
         );
         if cacheable {
             let reused = prev_units.next();
-            let (lines, unit_hits, unit_commands, unit_items) = match reused {
+            let (lines, unit_hits, unit_commands, unit_copy, unit_items) = match reused {
                 Some(unit)
                     if unit.env == env && unit.items.len() == 1 && &unit.items[0] == item =>
                 {
                     crate::profile::add("tui.unit_reused_count", 1);
-                    (unit.lines, unit.hits, unit.commands, unit.items)
+                    (unit.lines, unit.hits, unit.commands, unit.copy, unit.items)
                 }
                 _ => {
                     crate::profile::add("tui.unit_rewrapped_count", 1);
-                    let (lines, unit_hits, unit_commands) =
+                    let (lines, unit_hits, unit_commands, unit_copy) =
                         render_cacheable_unit(state, item, width);
                     (
                         std::rc::Rc::new(lines),
                         unit_hits,
                         unit_commands,
+                        unit_copy,
                         vec![item.clone()],
                     )
                 }
@@ -416,12 +409,14 @@ fn build_conversation(
                 });
             }
             out.extend(lines.iter().cloned());
+            copy.extend(unit_copy.iter().cloned());
             new_units.push(super::view::CachedUnit {
                 items: unit_items,
                 env,
                 lines,
                 hits: unit_hits,
                 commands: unit_commands,
+                copy: unit_copy,
             });
         } else {
             match item {
@@ -458,6 +453,14 @@ fn build_conversation(
                             stoppable: row.stoppable,
                         });
                     }
+                    // Tool execution is evidence UI, not message body.
+                    copy.extend(std::iter::repeat_n(
+                        crate::selection::PlainRow {
+                            skip: true,
+                            ..Default::default()
+                        },
+                        out.len() - base,
+                    ));
                 }
                 TranscriptItem::SubAgent(first) => {
                     // A run of consecutive sub-agent blocks renders as one tree
@@ -468,6 +471,7 @@ fn build_conversation(
                         blocks.push(next);
                         idx += 1;
                     }
+                    let base = out.len();
                     out.extend(sub_agent_tree_lines(
                         &blocks,
                         theme,
@@ -475,12 +479,20 @@ fn build_conversation(
                         t,
                         state.elapsed_secs,
                     ));
+                    copy.extend(std::iter::repeat_n(
+                        crate::selection::PlainRow {
+                            skip: true,
+                            ..Default::default()
+                        },
+                        out.len() - base,
+                    ));
                 }
                 TranscriptItem::UserShell(shell) => {
                     // Every user shell row is a click target: click folds its
                     // output inline (running or finished) — the same hit map
                     // every other disclosure uses, geometry stays untouched.
                     hits.push((out.len(), idx));
+                    let base = out.len();
                     out.extend(crate::render::user_shell_lines(
                         shell,
                         theme,
@@ -488,6 +500,13 @@ fn build_conversation(
                         t,
                         state.motion_clock,
                         state.focused_user_shell_id() == Some(&shell.id),
+                    ));
+                    copy.extend(std::iter::repeat_n(
+                        crate::selection::PlainRow {
+                            skip: true,
+                            ..Default::default()
+                        },
+                        out.len() - base,
                     ));
                 }
                 _ => unreachable!("non-cacheable item handled above"),
@@ -498,6 +517,7 @@ fn build_conversation(
         let invisible = out.len() == before_item;
         if invisible && let Some(at) = gap_at {
             out.remove(at);
+            copy.remove(at);
         }
         if !invisible {
             let call = independent_call.and_then(|(start, _)| match &items[first_item] {
@@ -530,7 +550,12 @@ fn build_conversation(
     }
 
     *state.conv.item_cache.borrow_mut() = super::view::ItemLineCache { units: new_units };
-    (out, hits, commands, final_anchor, item_spans, sources)
+    debug_assert_eq!(
+        copy.len(),
+        out.len(),
+        "the copy policy must be aligned 1:1 with painted lines"
+    );
+    (out, hits, commands, final_anchor, item_spans, sources, copy)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -908,23 +933,40 @@ fn render_cacheable_unit(
     Vec<Line<'static>>,
     Vec<(usize, usize)>,
     Vec<super::view::CachedCommand>,
+    Vec<crate::selection::PlainRow>,
 ) {
+    use crate::render::transcript_lines::{
+        assistant_render_with_copy, prefixed_copy_rows, push_user_turn, thought_lines_with_copy,
+        user_copy_rows,
+    };
     let theme = &state.theme;
     let t = state.t();
     let mut hits: Vec<(usize, usize)> = Vec::new();
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut copy: Vec<crate::selection::PlainRow> = Vec::new();
     match item {
         TranscriptItem::User(text) => {
-            crate::render::transcript_lines::push_user_turn(text, theme, width, &mut out);
+            push_user_turn(text, theme, width, &mut out);
+            copy = user_copy_rows(text, width);
         }
         TranscriptItem::Assistant(block) => {
             // Prose is communication: always in full, never a click target.
-            out.extend(crate::render::assistant_render(block, theme, width));
+            let (lines, rows) = assistant_render_with_copy(block, theme, width);
+            out.extend(lines);
+            copy = rows;
         }
-        TranscriptItem::GoalRecap(_) | TranscriptItem::MemoryList(_) => {
+        TranscriptItem::MemoryList(block) => {
+            hits.push((0, 0));
+            out.extend(item_render(item, theme, width, state.tools_expanded, t));
+            let marker = if block.expanded { "▾ " } else { "▸ " };
+            copy = prefixed_copy_rows(marker, &block.summary, width);
+            if block.expanded {
+                copy.extend(prefixed_copy_rows("  ", &block.details, width));
+            }
+        }
+        TranscriptItem::GoalRecap(_) => {
             // A goal recap's first line is its disclosure row: click expands the
-            // persisted checkpoint's structured sections. A memory listing uses
-            // the same interaction for its details.
+            // persisted checkpoint's structured sections.
             hits.push((0, 0));
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
         }
@@ -934,20 +976,44 @@ fn render_cacheable_unit(
             // conversation row — the transcript keeps it, the conversation does
             // not, so a finished turn reads as its work and its answer.
             if !block.done {
-                let lines = item_render(item, theme, width, state.tools_expanded, t);
+                let (lines, rows) = thought_lines_with_copy(block, theme, width, t);
                 if !lines.is_empty() && !block.text.trim().is_empty() {
                     hits.push((0, 0));
                 }
                 out.extend(lines);
+                copy = rows;
             }
         }
         TranscriptItem::Failure(_) => {
             hits.push((0, 0));
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
         }
+        TranscriptItem::Error(text) => {
+            out.extend(item_render(item, theme, width, state.tools_expanded, t));
+            copy = prefixed_copy_rows("✗ ", text, width);
+        }
+        TranscriptItem::Note(text) => {
+            out.extend(item_render(item, theme, width, state.tools_expanded, t));
+            copy = prefixed_copy_rows("◆ ", text, width);
+        }
         other => out.extend(item_render(other, theme, width, state.tools_expanded, t)),
     }
-    (out, hits, Vec::new())
+    // A surface with no semantic rows (a settled status block, a tool group,
+    // a plan card) is display-only: its whole span is skipped.
+    debug_assert!(
+        copy.is_empty() || copy.len() == out.len(),
+        "copy policy must describe every painted row"
+    );
+    if copy.len() != out.len() {
+        copy = vec![
+            crate::selection::PlainRow {
+                skip: true,
+                ..Default::default()
+            };
+            out.len()
+        ];
+    }
+    (out, hits, Vec::new(), copy)
 }
 
 #[cfg(test)]
@@ -2458,5 +2524,235 @@ mod exploration_fold_tests {
         let after = render(&s);
         assert_eq!(before, after, "closing restores the collapsed frame");
         assert!(open.len() > before.len(), "opening revealed detail");
+    }
+}
+
+#[cfg(test)]
+mod semantic_copy_tests {
+    use super::*;
+    use crate::selection::{TextPos, TextSelection, extract_selected_text_with_layout};
+    use crate::state::Boot;
+    use leveler_client_protocol::{MessageId, SessionId};
+
+    fn dark_state() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::dark(),
+            Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        );
+        s.size = (80, 40);
+        s.conv.rect = Some((0, 2, 80, 30));
+        s
+    }
+
+    fn copy_rows(state: &AppState, width: usize, start: usize, end: usize) -> String {
+        let (plain, layout) = state.conversation_plain(width);
+        assert!(end > start, "empty selection");
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: start, col: 0 });
+        sel.extend(TextPos {
+            row: end - 1,
+            col: 10_000,
+        });
+        sel.finish();
+        extract_selected_text_with_layout(&plain, &layout, &sel)
+    }
+
+    fn copy_item(state: &AppState, width: usize, item: usize) -> String {
+        let (start, end) = state.item_span(item, width).expect("item span");
+        copy_rows(state, width, start, end)
+    }
+
+    fn answer(state: &mut AppState, text: &str) {
+        let id = MessageId::new(format!("a{}", state.transcript.items().len()));
+        state.transcript.begin_assistant(id.clone());
+        state.transcript.append_assistant(&id, text);
+        state.transcript.finish_assistant(&id);
+    }
+
+    #[test]
+    fn a_prompt_copies_its_source_and_never_the_painted_marker() {
+        let mut s = dark_state();
+        // The source itself contains the marker glyph: it must survive.
+        s.transcript.push_user("第一行 ❯ 是原文\n\n第二段".into());
+        let copied = copy_item(&s, 80, 0);
+        assert_eq!(copied, "第一行 ❯ 是原文\n\n第二段");
+        // The band padding and the painted marker are not in the item text.
+        assert!(!copied.starts_with('❯'));
+    }
+
+    #[test]
+    fn markdown_copies_block_structure_without_visual_glyphs() {
+        let mut s = dark_state();
+        answer(
+            &mut s,
+            "## 标题\n\n正文 **加粗** 文本。\n\n- 第一项\n- 第二项\n\n> 引用\n",
+        );
+        let copied = copy_item(&s, 80, 0);
+        assert_eq!(
+            copied,
+            "## 标题\n\n正文 加粗 文本。\n\n- 第一项\n- 第二项\n\n> 引用"
+        );
+        assert!(!copied.contains('▎'), "{copied:?}");
+        assert!(!copied.contains('•'), "{copied:?}");
+        assert!(!copied.contains('▌'), "{copied:?}");
+        assert!(!copied.contains("**"), "{copied:?}");
+    }
+
+    #[test]
+    fn a_code_block_copies_pure_code_without_header_or_fence() {
+        let mut s = dark_state();
+        answer(
+            &mut s,
+            "```sql\nSELECT id, name\nFROM users      -- 注释\nWHERE id = 1\nORDER BY name\nLIMIT 10;\n```",
+        );
+        let copied = copy_item(&s, 80, 0);
+        assert_eq!(
+            copied,
+            "SELECT id, name\nFROM users      -- 注释\nWHERE id = 1\nORDER BY name\nLIMIT 10;"
+        );
+        assert!(!copied.contains("sql"), "{copied:?}");
+        assert!(!copied.contains("```"), "{copied:?}");
+    }
+
+    #[test]
+    fn wrapped_code_rejoins_to_the_source_line() {
+        let mut s = dark_state();
+        let long = "let value = call_something(alpha, beta, gamma, delta, epsilon, zeta);";
+        answer(
+            &mut s,
+            &format!("```rust\nfn main() {{\n    {long}\n}}\n```"),
+        );
+        for width in [80usize, 48, 32] {
+            let copied = copy_item(&s, width, 0);
+            assert_eq!(
+                copied,
+                format!("fn main() {{\n    {long}\n}}"),
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_and_shell_code_keep_indentation_and_comments() {
+        for (lang, body) in [
+            (
+                "json",
+                "{\n  \"name\": \"leveler\",\n  \"values\": [1, 2, 3]\n}",
+            ),
+            (
+                "sh",
+                "# keep this comment\nmkdir -p out\n  echo \"  indented\"\nexit 0",
+            ),
+        ] {
+            let mut s = dark_state();
+            let mut md = String::from("```");
+            md.push_str(lang);
+            md.push('\n');
+            md.push_str(body);
+            md.push_str("\n```");
+            answer(&mut s, &md);
+            let copied = copy_item(&s, 80, 0);
+            assert_eq!(copied, body, "{lang}");
+        }
+    }
+
+    #[test]
+    fn reasoning_copies_its_body_without_header_or_rail() {
+        let mut s = dark_state();
+        s.transcript.begin_thought();
+        s.transcript.append_thought("先检查输入。\n再核对输出。");
+        let index = s.transcript.items().len() - 1;
+        s.transcript
+            .set_item_display(index, crate::fold::DisplayMode::Expanded);
+        let copied = copy_item(&s, 80, index);
+        assert_eq!(copied, "先检查输入。\n再核对输出。");
+        assert!(!copied.contains('◆'), "{copied:?}");
+        assert!(!copied.contains('│'), "{copied:?}");
+    }
+
+    #[test]
+    fn tool_rows_never_enter_a_message_copy() {
+        let mut s = dark_state();
+        s.transcript.push_user("查一下".into());
+        let id = leveler_client_protocol::ToolCallId::new("t1");
+        s.transcript.push_tool_started(
+            id.clone(),
+            "read_file".into(),
+            serde_json::json!({ "path": "a.rs" }).to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+        s.transcript
+            .complete_tool(&id, true, "read".into(), 5, None);
+        // Seal the run so the group renders as settled history.
+        s.transcript.push_note("sealed".into());
+        answer(&mut s, "答案在正文里。");
+        let total = s.conversation_plain(80).0.len();
+        let copied = copy_rows(&s, 80, 0, total);
+        assert!(copied.contains("查一下"), "{copied:?}");
+        assert!(copied.contains("答案在正文里。"), "{copied:?}");
+        assert!(!copied.contains("读取"), "{copied:?}");
+        assert!(!copied.contains('›'), "{copied:?}");
+        assert!(!copied.contains('▸'), "{copied:?}");
+        assert!(!copied.contains("0.0s"), "{copied:?}");
+    }
+
+    #[test]
+    fn prompt_leading_indentation_and_internal_spaces_survive() {
+        let mut s = dark_state();
+        s.transcript
+            .push_user("  前导空格\n正常行 a  b   c".into());
+        assert_eq!(
+            copy_item(&s, 60, 0),
+            "  前导空格\n正常行 a  b   c"
+        );
+    }
+
+    #[test]
+    fn unicode_emoji_and_source_glyphs_survive_copy() {
+        let mut s = dark_state();
+        s.transcript
+            .push_user("中文 😀 émoji — 保留\n第二行：❯".into());
+        answer(
+            &mut s,
+            "```text\n│ 这是原文里的竖线\n• 这是原文里的圆点\n# 这是原文里的井号\n```\n\n结束 😀",
+        );
+        let user = copy_item(&s, 60, 0);
+        assert_eq!(user, "中文 😀 émoji — 保留\n第二行：❯");
+        let answer = copy_item(&s, 60, 1);
+        assert_eq!(
+            answer,
+            "│ 这是原文里的竖线\n• 这是原文里的圆点\n# 这是原文里的井号\n\n结束 😀"
+        );
+    }
+
+    #[test]
+    fn a_cross_block_drag_keeps_each_blocks_real_text() {
+        let mut s = dark_state();
+        s.transcript.push_user("第一块".into());
+        answer(
+            &mut s,
+            "回答一。\n\n- 列表项\n\n```sh\necho ok\nprintf done\n```",
+        );
+        let all = copy_rows(&s, 60, 0, s.conversation_plain(60).0.len());
+        assert!(all.starts_with("第一块"), "{all:?}");
+        assert!(
+            all.contains("回答一。\n\n- 列表项\n\necho ok\nprintf done"),
+            "{all:?}"
+        );
     }
 }

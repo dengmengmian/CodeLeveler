@@ -101,84 +101,67 @@ pub fn needs_container(title: Option<&str>, line_count: usize) -> bool {
     title.is_some() || line_count > SHORT_CODE_MAX_LINES
 }
 
-/// Render code for Conversation: short = inline; long/file = light container.
+/// Render a code block plus its semantic copy policy.
 ///
-/// No solid black fill. Diffs must not call this.
-pub fn render_code_block<F>(
+/// The language/path header is display chrome and does not copy. The two
+/// leading gutter columns are visual; code rows after them are the source
+/// line. A source line wrapped to several screen rows is one logical line:
+/// its continuation rows carry an empty joiner, so copy rejoins the exact
+/// code instead of inventing newlines.
+pub fn code_block_with_copy<F>(
     title: Option<&str>,
     lang: Option<&str>,
     line_count: usize,
     width: usize,
     theme: &Theme,
     mut line_render: F,
-    out: &mut Vec<Line<'static>>,
-) where
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>)
+where
     F: FnMut(usize) -> Vec<Vec<Span<'static>>>,
 {
     let width = width.max(8);
-    if !needs_container(title, line_count) {
-        render_inline(line_count, theme, &mut line_render, out);
-        return;
+    let container = needs_container(title, line_count);
+    let mut out = Vec::new();
+    let mut copy = Vec::new();
+    if container {
+        let header = title
+            .map(str::to_string)
+            .or_else(|| lang.map(|l| l.to_string()))
+            .unwrap_or_else(|| "code".to_string());
+        out.push(Line::from(vec![
+            Span::styled("· ", Style::default().fg(theme.border.normal)),
+            Span::styled(
+                truncate_display(&header, width.saturating_sub(2).max(4)),
+                Style::default()
+                    .fg(theme.text.secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        copy.push(crate::selection::PlainRow {
+            skip: true,
+            ..Default::default()
+        });
     }
-    render_container(title, lang, line_count, width, theme, line_render, out);
-}
-
-/// Inline: two-space indent, syntax only, conversation background.
-fn render_inline<F>(
-    line_count: usize,
-    theme: &Theme,
-    line_render: &mut F,
-    out: &mut Vec<Line<'static>>,
-) where
-    F: FnMut(usize) -> Vec<Vec<Span<'static>>>,
-{
-    for idx in 0..line_count {
-        for row in line_render(idx) {
-            let mut spans = vec![Span::styled(
-                "  ",
-                Style::default().fg(theme.text.secondary),
-            )];
-            spans.extend(row);
-            out.push(Line::from(spans));
-        }
-    }
-}
-
-/// Light container: path header + complete body. Gutter is border only (no fill).
-fn render_container<F>(
-    title: Option<&str>,
-    lang: Option<&str>,
-    line_count: usize,
-    width: usize,
-    theme: &Theme,
-    mut line_render: F,
-    out: &mut Vec<Line<'static>>,
-) where
-    F: FnMut(usize) -> Vec<Vec<Span<'static>>>,
-{
-    let header = title
-        .map(str::to_string)
-        .or_else(|| lang.map(|l| l.to_string()))
-        .unwrap_or_else(|| "code".to_string());
-    out.push(Line::from(vec![
-        Span::styled("· ", Style::default().fg(theme.border.normal)),
-        Span::styled(
-            truncate_display(&header, width.saturating_sub(2).max(4)),
-            Style::default()
-                .fg(theme.text.secondary)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
+    let gutter = if container {
+        Style::default().fg(theme.border.normal)
+    } else {
+        Style::default().fg(theme.text.secondary)
+    };
     // The conversation viewport owns scrolling. A separate source-line fold or
     // screen-row cap here makes wrapped code unreachable at narrow widths.
     for idx in 0..line_count {
-        for row in line_render(idx) {
-            let mut spans = vec![Span::styled("  ", Style::default().fg(theme.border.normal))];
+        for (row_index, row) in line_render(idx).into_iter().enumerate() {
+            let mut spans = vec![Span::styled("  ", gutter)];
             spans.extend(row);
             out.push(Line::from(spans));
+            copy.push(crate::selection::PlainRow {
+                indent: 2,
+                joiner: (row_index > 0).then(|| "".to_string().into_boxed_str()),
+                ..Default::default()
+            });
         }
     }
+    (out, copy)
 }
 
 /// Map syntect RGB into a low-noise palette — **no background fill**.
@@ -204,20 +187,12 @@ mod tests {
     fn wrapped_code_keeps_every_screen_row() {
         let theme = Theme::no_color();
         for source_lines in [1, 4, 6, 40] {
-            let mut out = Vec::new();
-            render_code_block(
-                None,
-                Some("rust"),
-                source_lines,
-                48,
-                &theme,
-                |i| {
+            let (out, _) =
+                code_block_with_copy(None, Some("rust"), source_lines, 48, &theme, |i| {
                     (0..5)
                         .map(|j| vec![Span::raw(format!("source-{i}-wrapped-{j}"))])
                         .collect()
-                },
-                &mut out,
-            );
+                });
             let text: Vec<String> = out
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -244,16 +219,9 @@ mod tests {
     #[test]
     fn short_code_is_inline_without_box() {
         let theme = Theme::no_color();
-        let mut out = Vec::new();
-        render_code_block(
-            None,
-            Some("rust"),
-            2,
-            40,
-            &theme,
-            |i| vec![vec![Span::raw(format!("let x = {i};"))]],
-            &mut out,
-        );
+        let (out, _) = code_block_with_copy(None, Some("rust"), 2, 40, &theme, |i| {
+            vec![vec![Span::raw(format!("let x = {i};"))]]
+        });
         let text: Vec<String> = out
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -271,16 +239,10 @@ mod tests {
     #[test]
     fn file_code_gets_light_header_not_black_box() {
         let theme = Theme::no_color();
-        let mut out = Vec::new();
-        render_code_block(
-            Some("webhook.go:792"),
-            Some("go"),
-            30,
-            60,
-            &theme,
-            |i| vec![vec![Span::raw(format!("line {i}"))]],
-            &mut out,
-        );
+        let (out, _) =
+            code_block_with_copy(Some("webhook.go:792"), Some("go"), 30, 60, &theme, |i| {
+                vec![vec![Span::raw(format!("line {i}"))]]
+            });
         let text: Vec<String> = out
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())

@@ -56,17 +56,42 @@ pub(crate) fn sanitize_terminal_line(s: &str) -> String {
 
 /// Width-aware wrap that preserves explicit newlines.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
+    wrap_with_joiners(text, width)
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect()
+}
+
+/// [`wrap`] plus, for each visual row, the source whitespace the wrapper
+/// dropped at the preceding soft wrap.
+///
+/// `None` means "this row starts a new logical line". `Some("")` is a break
+/// with no source character (CJK runs, overlong code). The joiner is recovered
+/// from the original logical line rather than guessed, so copying rejoins the
+/// row with exactly what the renderer removed.
+pub(crate) fn wrap_with_joiners(text: &str, width: usize) -> Vec<(String, Option<String>)> {
     if text.is_empty() {
-        return vec![String::new()];
+        return vec![(String::new(), None)];
     }
     let mut out = Vec::new();
     for logical in text.split('\n') {
         if logical.is_empty() {
-            out.push(String::new());
+            out.push((String::new(), None));
             continue;
         }
-        for piece in textwrap::wrap(logical, width) {
-            out.push(piece.into_owned());
+        let pieces = textwrap::wrap(logical, width);
+        let mut rest = logical;
+        for (index, piece) in pieces.into_iter().enumerate() {
+            let piece = piece.into_owned();
+            let start = rest.find(piece.as_str()).unwrap_or(0);
+            let joiner = if index == 0 {
+                None
+            } else {
+                Some(rest[..start].to_string())
+            };
+            let end = start.saturating_add(piece.len()).min(rest.len());
+            rest = &rest[end..];
+            out.push((piece, joiner));
         }
     }
     out
@@ -209,6 +234,39 @@ mod pad_tests {
     #[test]
     fn a_label_wider_than_its_column_is_left_alone() {
         assert_eq!(pad_display("运行时长", 4), "运行时长");
+    }
+}
+
+#[cfg(test)]
+mod wrap_joiner_tests {
+    use super::wrap_with_joiners;
+
+    fn joined(text: &str, width: usize) -> String {
+        let rows = wrap_with_joiners(text, width);
+        let mut out = String::new();
+        for (index, (row, joiner)) in rows.iter().enumerate() {
+            if index > 0 {
+                out.push_str(joiner.as_deref().unwrap_or("\n"));
+            }
+            out.push_str(row);
+        }
+        out
+    }
+
+    #[test]
+    fn a_word_wrap_keeps_its_space() {
+        assert_eq!(joined("hello world again", 11), "hello world again");
+    }
+
+    #[test]
+    fn a_cjk_wrap_adds_no_separator() {
+        let text = "这是一段会被自动换行的中文文本";
+        assert_eq!(joined(text, 4), text);
+    }
+
+    #[test]
+    fn explicit_newlines_survive_with_blank_lines() {
+        assert_eq!(joined("a\n\nb", 10), "a\n\nb");
     }
 }
 

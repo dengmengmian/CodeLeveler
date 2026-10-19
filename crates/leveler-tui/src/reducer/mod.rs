@@ -2035,7 +2035,7 @@ fn reveal_selected_command(state: &mut AppState) {
     let line = match call {
         Some(call) => {
             crate::conversation::build::reveal_command_receipt(state, item, call);
-            let (_, _, commands, _, _, _) = state.conversation_build(width);
+            let (_, _, commands, _, _, _, _) = state.conversation_build(width);
             commands
                 .iter()
                 .find(|hit| hit.item == item && hit.call == call && !hit.receipt)

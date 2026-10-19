@@ -232,7 +232,7 @@ pub(crate) fn restore_reading_anchor(state: &mut AppState, anchor: Option<Readin
 /// semantic group does not move the diff or command currently being read.
 fn top_of_viewport(state: &AppState, width: usize) -> Option<ReadingAnchor> {
     let height = geometry::viewport_height(state);
-    let (lines, _, _, _, spans, sources) = state.conversation_build(width);
+    let (lines, _, _, _, spans, sources, _) = state.conversation_build(width);
     let painted = geometry::effective_scroll(state.conv.scroll, false, lines.len(), height);
     if let Some(source) = sources
         .iter()

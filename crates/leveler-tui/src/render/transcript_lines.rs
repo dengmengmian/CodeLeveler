@@ -24,19 +24,21 @@ pub fn assistant_split(
     theme: &Theme,
     wrap_width: usize,
 ) -> (Vec<Line<'static>>, usize) {
-    assistant_body(block, theme, wrap_width)
+    let (lines, stable, _) = assistant_body_with_copy(block, theme, wrap_width);
+    (lines, stable)
 }
 
 /// The message's own wrapped rows, before the bullet gutter: every VISUAL line
 /// the text occupies at this width, plus the live "▌" cursor while streaming
 /// (which is one of those rows, and so counts against the bound). This is the
 /// unit the presentation bound is measured in — never Markdown blocks, never
-/// paragraphs, never `\n` counts.
-fn assistant_body(
+/// paragraphs, never `\n` counts. The Markdown layout also supplies the
+/// semantic copy policy in the same pass; the live cursor row is display-only.
+fn assistant_body_with_copy(
     block: &AssistantBlock,
     theme: &Theme,
     wrap_width: usize,
-) -> (Vec<Line<'static>>, usize) {
+) -> (Vec<Line<'static>>, usize, Vec<crate::selection::PlainRow>) {
     // Prose uses the full conversation width without a role gutter.
     let inner = wrap_width.max(1);
     // Use the cached parse when done, else parse the partial text this frame so
@@ -55,7 +57,7 @@ fn assistant_body(
             crate::markdown::AssistantTone::Progress
         }
     };
-    let (mut lines, mut stable) = doc.to_lines_split_with_tone(inner, theme, tone);
+    let (mut lines, mut copy, mut stable) = doc.to_lines_with_copy(inner, theme, tone);
     if block.done {
         // A finished message is fully stable.
         stable = lines.len();
@@ -65,8 +67,12 @@ fn assistant_body(
             "▌",
             Style::default().fg(theme.text.secondary),
         )));
+        copy.push(crate::selection::PlainRow {
+            skip: true,
+            ..Default::default()
+        });
     }
-    (lines, stable)
+    (lines, stable, copy)
 }
 
 /// Render an assistant message for the conversation.
@@ -82,6 +88,16 @@ pub fn assistant_render(
     wrap_width: usize,
 ) -> Vec<Line<'static>> {
     assistant_split(block, theme, wrap_width).0
+}
+
+/// [`assistant_render`] plus the copy policy produced by the same layout pass.
+pub(crate) fn assistant_render_with_copy(
+    block: &AssistantBlock,
+    theme: &Theme,
+    wrap_width: usize,
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
+    let (lines, _, copy) = assistant_body_with_copy(block, theme, wrap_width);
+    (lines, copy)
 }
 
 /// A duration for a Thought header, e.g. `2.8s`, `48.0s`, `1m 5s`. A segment
@@ -130,8 +146,20 @@ pub fn thought_lines(
     wrap_width: usize,
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
+    thought_lines_with_copy(block, theme, wrap_width, t).0
+}
+
+/// [`thought_lines`] plus the copy policy for every painted row: the header
+/// (state + duration) is display metadata, the `│ ` rail is a gutter, and the
+/// reasoning text itself is the semantic content.
+pub(crate) fn thought_lines_with_copy(
+    block: &ThoughtBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &crate::i18n::UiText,
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
     if block.done && block.text.trim().is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let header_style = Style::default()
         .fg(thinking_ink(block.done, theme))
@@ -155,24 +183,33 @@ pub fn thought_lines(
         Span::styled("◆ ", Style::default().fg(thinking_ink(block.done, theme))),
         Span::styled(header, header_style),
     ])];
+    let mut copy = vec![crate::selection::PlainRow {
+        skip: true,
+        ..Default::default()
+    }];
     let inner = wrap_width.saturating_sub(2).max(1);
     let body_style = Style::default().fg(theme.text.muted);
-    let rail = |text: String| {
-        Line::from(vec![
-            Span::styled(REASONING_RAIL_GUTTER, body_style),
-            Span::styled(text, body_style),
-        ])
-    };
     // A live segment without reasoning gets a header and nothing else.
     if !block.display.is_collapsed() && !block.text.is_empty() {
-        let mut body: Vec<Line<'static>> = wrap(&block.text, inner).into_iter().map(rail).collect();
+        let mut body: Vec<(String, Option<String>)> =
+            crate::render::text::wrap_with_joiners(&block.text, inner);
         if block.display != DisplayMode::Expanded {
             let omitted = body.len().saturating_sub(THOUGHT_PREVIEW_LINES);
             body.drain(..omitted);
         }
-        out.extend(body);
+        for (text, joiner) in body {
+            out.push(Line::from(vec![
+                Span::styled(REASONING_RAIL_GUTTER, body_style),
+                Span::styled(text, body_style),
+            ]));
+            copy.push(crate::selection::PlainRow {
+                indent: 2,
+                joiner: joiner.map(String::into_boxed_str),
+                ..Default::default()
+            });
+        }
     }
-    out
+    (out, copy)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -311,17 +348,10 @@ pub(crate) fn push_user_turn(
     out: &mut Vec<Line<'static>>,
 ) {
     let ink = Style::default().fg(theme.text.primary);
-    let inner = width
-        .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
-        .max(1);
-    let mut wrapped = wrap(text, inner);
-    if wrapped.is_empty() {
-        wrapped.push(String::new());
-    }
     for _ in 0..USER_PROMPT_PAD_ROWS {
         out.push(Line::from(""));
     }
-    for line in wrapped {
+    for (line, _) in user_wrapped(text, width) {
         out.push(Line::from(vec![
             Span::raw(USER_PROMPT_INDENT),
             Span::styled(line, ink),
@@ -330,6 +360,45 @@ pub(crate) fn push_user_turn(
     for _ in 0..USER_PROMPT_PAD_ROWS {
         out.push(Line::from(""));
     }
+}
+
+/// The prompt body's visual rows and their soft-wrap joiners. Shared by the
+/// painter and the copy policy so the two cannot drift.
+fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
+    let inner = width
+        .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
+        .max(1);
+    let mut wrapped = crate::render::text::wrap_with_joiners(text, inner);
+    if wrapped.is_empty() {
+        wrapped.push((String::new(), None));
+    }
+    wrapped
+}
+
+/// Copy policy for [`push_user_turn`]: band padding rows are display-only and
+/// the marker gutter is decoration; every body row is the user's own text.
+pub(crate) fn user_copy_rows(text: &str, width: usize) -> Vec<crate::selection::PlainRow> {
+    let mut rows = Vec::new();
+    for _ in 0..USER_PROMPT_PAD_ROWS {
+        rows.push(crate::selection::PlainRow {
+            skip: true,
+            ..Default::default()
+        });
+    }
+    for (_, joiner) in user_wrapped(text, width) {
+        rows.push(crate::selection::PlainRow {
+            indent: USER_PROMPT_GUTTER as u16,
+            joiner: joiner.map(String::into_boxed_str),
+            ..Default::default()
+        });
+    }
+    for _ in 0..USER_PROMPT_PAD_ROWS {
+        rows.push(crate::selection::PlainRow {
+            skip: true,
+            ..Default::default()
+        });
+    }
+    rows
 }
 
 /// Render one transcript item to styled lines (no leading separator).
@@ -1322,6 +1391,25 @@ fn completion_lines(
 
 /// Push `text` wrapped, with `prefix` on the first line and blank alignment on
 /// continuations.
+/// Copy rows for one [`push_prefixed`] block: the glyph is a gutter, the
+/// wrapped text is semantic.
+pub(crate) fn prefixed_copy_rows(
+    prefix: &str,
+    text: &str,
+    width: usize,
+) -> Vec<crate::selection::PlainRow> {
+    let prefix_cols = UnicodeWidthStr::width(prefix);
+    let inner = width.saturating_sub(prefix_cols).max(1);
+    crate::render::text::wrap_with_joiners(text, inner)
+        .into_iter()
+        .map(|(_, joiner)| crate::selection::PlainRow {
+            indent: prefix_cols as u16,
+            joiner: joiner.map(String::into_boxed_str),
+            ..Default::default()
+        })
+        .collect()
+}
+
 fn push_prefixed(
     out: &mut Vec<Line<'static>>,
     prefix: &str,

@@ -190,19 +190,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // viewport (splash is not cached on transcript version).
     state.conv.rect = Some((content.x, content.y, content.width, content.height));
 
-    let (all, _hits, _commands, _anchor, item_spans, _sources) = state.conversation_build(width);
+    let (all, _hits, _commands, _anchor, item_spans, _sources, copy) =
+        state.conversation_build(width);
     // Plain text only backs mouse selection / clipboard. Rebuild it from this
     // frame's lines while a selection is live; otherwise clear it (the mouse-down
     // path calls `ensure_conversation_plain`, which rebuilds against current
     // content on demand) so idle frames skip an O(lines) clone per repaint.
     if state.conv.selection.is_active() {
-        let (plain, layout) = crate::conversation::build::plain_projection(
-            &all,
-            &item_spans,
-            state.transcript.items(),
-        );
-        state.conv.plain = plain;
-        state.conv.plain_layout = layout;
+        state.conv.plain = all.iter().map(crate::selection::line_to_plain).collect();
+        state.conv.plain_layout = copy.as_ref().clone();
         state.conv.plain_width = width;
     } else if !state.conv.plain.is_empty() {
         state.conv.plain.clear();
@@ -672,7 +668,7 @@ mod tests {
         let width = crate::conversation::geometry::content_rect(AREA).width as usize;
         let height = crate::conversation::geometry::content_rect(AREA).height as usize;
 
-        let (projection, _, _, _, _, _) = state.conversation_build(width);
+        let (projection, _, _, _, _, _, _) = state.conversation_build(width);
         let total = projection.len();
         let widths: Vec<usize> = projection.iter().map(Line::width).collect();
         let max_scroll = crate::conversation::geometry::max_scroll(total, height);
@@ -687,7 +683,7 @@ mod tests {
                 None => baseline = Some(text),
             }
 
-            let (again, _, _, _, _, _) = state.conversation_build(width);
+            let (again, _, _, _, _, _, _) = state.conversation_build(width);
             assert!(
                 std::rc::Rc::ptr_eq(&projection, &again),
                 "an animation frame must not invalidate the projection at {ms}ms"
