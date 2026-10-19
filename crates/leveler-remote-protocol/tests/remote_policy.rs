@@ -416,6 +416,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
+            "background_user_shell",
+            ClientCommand::BackgroundUserShell {
+                session_id: session(),
+                execution_id: leveler_client_protocol::UserShellId::new("ush-1"),
+            },
+            false,
+        ),
+        (
             // A background task outlives the turn, and remote gets no user
             // shell at all.
             "cancel_background_task",
