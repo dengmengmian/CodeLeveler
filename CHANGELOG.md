@@ -4,6 +4,29 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [1.0.20] - 2026-10-19
+
+Shell commands become a first-class inline surface, their complete output stays
+reachable, and a user's turn reads as one full-width band.
+
+### Added
+
+- Shell Mode: `!` on an empty composer is a mode marker, with offline Tab completion for files, directories and PATH executables, a scrolling candidate menu driven by keyboard, pointer and wheel, and one inline record per command. Each record carries a status rail, `$ command`, stdout/stderr provenance, a live tail and measured duration; stopping is available from both the record and the live activity row, and `Ctrl+C` cancels exactly that execution
+- Complete shell output is retained: the exact stdout/stderr and the arrival-order combined stream are written to per-execution capture files, and `/output` or `/copy output` reach the full result. The in-TUI viewer indexes the capture and renders only the visible window, so a 50 MiB result costs the same per frame as a small one; rows can be selected and copied with tabs preserved and soft wraps rejoined
+- `Ctrl+B` hands a running command to the existing background registry with the same execution id, process and process group. Output, exit code and duration stay continuous, the transfer is durable, and a cold restore reports an orphan without a terminal fact as unknown rather than running
+
+### Changed
+
+- A user's turn is one full-width background band: the dark theme uses the existing quiet `#171A1E` step above the `#111315` canvas, the soft-blue `❯` opens the first row, and short and long messages share the same width. The band is exactly as tall as the message; there is no identity label, border or divider, and AI prose stays on the canvas
+- Local commands render inline in the conversation. The separate Shell Details screen is removed; `Ctrl+O` reaches the latest execution, and a submitted command returns the viewport to the live edge
+- Selected transcript text is copied from the authored source rather than the painted glyphs: `❯`, status rails, list markers and code fences never reach the clipboard
+- The background-wait row's marker animates with the shared 120 ms spinner while the runtime reports the wait target running; reduced motion keeps it static
+
+### Fixed
+
+- Long shell output no longer keeps only a 1 MiB tail as its terminal fact; the complete capture is retained and remains reachable after folding
+- Background user-shell protocol types and their exported schemas stay current, and remote policy classifies `background_user_shell` explicitly
+
 ## [1.0.19] - 2026-10-19
 
 Web search becomes a capability independent of the conversation model.
@@ -15,25 +38,16 @@ Web search becomes a capability independent of the conversation model.
 
 ### Changed
 
-- User prompts render as one full-width, quiet background band (`#171A1E` in the dark theme) with a soft-blue `❯`; short and long messages share the same width, the band is only as tall as the message, and copying still returns the authored text
 - Only `[web.search]` enables search. The legacy `LEVELER_SEARCH_API_KEY` fallback is removed
 - A configured search whose credential variable is unset is logged at warn level, naming the variable, instead of a debug line the default filter never wrote
 - A Homebrew-managed install no longer replaces itself in the Cellar: the start-up updater and `leveler update` defer to `brew upgrade leveler`, while `--check` stays read-only. Script and manual installs keep self-updating
+- The TUI's bottom state strip is four independent cells — runtime status, the running background count (`后台 2 ↗`), active issues (`⚠ 后台失败 1 ↗`, or a failed turn named in full as `✕ …`), and the plan indicator — each built from its own owner's real state, each painted range its own click target (jobs list / issue page / plan page). A background task's raw command no longer sits on the footer and a failed task no longer raises a standing banner: the failure is an active issue while its exit code and output stay on the task's own page, and looking at one marks it read without clearing it. Issue state derives from the runtime's own `Error` status and the background projection; an ordinary tool failure stays in the execution timeline
+- The TUI's bottom chrome spends one row on the turn's state: the runtime status keeps the live label, elapsed time and tool/token counts on the left, and the plan indicator sits on the right of the same row — its own violet identity, a breathing dot while the turn runs, a static green ✓ when declared complete, red ✕ on failure, muted ○ for a last record. Plan progress is stated once (the runtime line no longer repeats the current step), and the whole indicator, arrow included, is the click/Enter target for the Plan page
 
 ### Fixed
 
 - The TUI shows the first search result instead of the external-data marker
 - Dogfood coverage persists this run's layer artifacts before taking the pre-RC verdict, so a passed L1 test is no longer reported as "L1 did not run for this candidate"; evidence that declares another candidate is refused
-
-## [Unreleased]
-
-### Changed
-
-- The TUI's bottom state strip is four independent cells — runtime status, the running background count (`后台 2 ↗`), active issues (`⚠ 后台失败 1 ↗`, or a failed turn named in full as `✕ …`), and the plan indicator — each built from its own owner's real state, each painted range its own click target (jobs list / issue page / plan page). A background task's raw command no longer sits on the footer and a failed task no longer raises a standing banner: the failure is an active issue while its exit code and output stay on the task's own page, and looking at one marks it read without clearing it. Issue state derives from the runtime's own `Error` status and the background projection; an ordinary tool failure stays in the execution timeline
-
-### Changed
-
-- The TUI's bottom chrome spends one row on the turn's state: the runtime status keeps the live label, elapsed time and tool/token counts on the left, and the plan indicator sits on the right of the same row — its own violet identity, a breathing dot while the turn runs, a static green ✓ when declared complete, red ✕ on failure, muted ○ for a last record. Plan progress is stated once (the runtime line no longer repeats the current step), and the whole indicator, arrow included, is the click/Enter target for the Plan page
 
 ## [1.0.15] - 2026-10-13
 
