@@ -2316,11 +2316,11 @@ mod tests {
             } else if stage == "done" {
                 assert!(!rows.iter().any(|row| row.contains("reasoning line")));
             }
-            // The prompt's band owns one padding row above its body, so the
-            // text opens on the next row — still flush with the viewport top.
+            // The band is exactly as tall as the message: the text opens on
+            // the first row of the viewport.
             assert_eq!(
                 first_row,
-                top as usize + 1,
+                top as usize,
                 "{stage}: first message must start at viewport top:\n{}",
                 rows.join("\n")
             );
@@ -2329,7 +2329,7 @@ mod tests {
                 crate::conversation::geometry::screen_to_content(&state, x, first_row as u16)
                     .unwrap()
                     .row,
-                1,
+                0,
                 "the text row is the prompt's first body row"
             );
         }
@@ -2905,11 +2905,11 @@ mod tests {
                 break;
             }
         }
-        // The prompt's band owns one padding row at the content top; the
-        // marker opens the first body row directly under it.
+        // The band is exactly as tall as the message; the marker opens its
+        // first body row at the content top.
         assert_eq!(
             first_marker_y,
-            Some(cy + 1),
+            Some(cy),
             "scrolled-to-top prompt starts at the content top, not the header"
         );
         for x in 0..buf.area.width {

@@ -112,13 +112,13 @@ fn paint_live_shell_rail(
     }
 }
 
-/// Paint the user prompt's card and marker over the projection.
+/// Paint the user prompt's band and marker over the projection.
 ///
-/// Both are decoration: the card is one left-aligned surface at a fixed width
-/// for every prompt, and the marker is one glyph in the card's reserved
-/// gutter. Line content, selection columns, wrapping and clipboard text are
-/// exactly what the build produced — copy cannot pick up either. Selected
-/// cells keep their own background.
+/// Both are decoration: the band fills the Transcript content width for every
+/// prompt, and the marker is one glyph in the band's reserved gutter. Line
+/// content, selection columns, wrapping and clipboard text are exactly what
+/// the build produced — copy cannot pick up either. Selected cells keep their
+/// own background.
 fn paint_user_prompt_decoration(
     frame: &mut Frame,
     state: &AppState,
@@ -127,14 +127,14 @@ fn paint_user_prompt_decoration(
     content: Rect,
 ) {
     use crate::render::transcript_lines::{
-        USER_PROMPT_HPAD, USER_PROMPT_MARKER, USER_PROMPT_PAD_ROWS, user_prompt_width,
+        USER_PROMPT_HPAD, USER_PROMPT_MARKER, user_prompt_width,
     };
 
     if content.width == 0 || content.height == 0 {
         return;
     }
     let theme = &state.theme;
-    // NO_COLOR paints no surfaces, so there is no card to draw; the marker
+    // NO_COLOR paints no surfaces, so there is no band to draw; the marker
     // alone has to distinguish the prompt from agent prose.
     let band = (!theme.is_monochrome() && theme.surface.prompt != Color::Reset)
         .then_some(theme.surface.prompt);
@@ -167,8 +167,8 @@ fn paint_user_prompt_decoration(
                 }
             }
         }
-        // The first body row follows the prompt's top padding row.
-        let marker_row = start + USER_PROMPT_PAD_ROWS;
+        // The marker opens the prompt's first body row.
+        let marker_row = start;
         if marker_row >= scroll && marker_row < window_end && marker_row < end {
             let y = content.y + (marker_row - scroll) as u16;
             let marker_x = content.x + USER_PROMPT_HPAD as u16;
@@ -507,15 +507,11 @@ mod tests {
                 );
             }
         }
-        let (first, last) = card.expect("prompt card");
-        let card_width = (last - first + 1) as usize;
-        assert!(
-            card_width * 100 >= c.width as usize * 95,
-            "the card must fill at least 95% of the reading width"
-        );
-        assert!(
-            card_width <= c.width as usize,
-            "the card must never overflow the reading width"
+        let (first, last) = card.expect("prompt band");
+        assert_eq!(
+            last - first + 1,
+            c.width,
+            "the band fills the full reading width"
         );
         for row in a0..a1 {
             let y = painted_y(&state, row, height, total);
@@ -549,11 +545,11 @@ mod tests {
         assert_eq!(marks.len(), 1, "one marker per prompt: {marks:?}");
         assert_eq!(
             marks[0],
-            (c.x + 1, painted_y(&state, u0 + 1, height, total)),
-            "the marker is padded inside the card on the first body row"
+            (c.x + 1, painted_y(&state, u0, height, total)),
+            "the marker is padded inside the band on the first body row"
         );
         // Continuation rows are indented by exactly the gutter width.
-        let y = painted_y(&state, u0 + 2, height, total);
+        let y = painted_y(&state, u0 + 1, height, total);
         for x in c.x..c.x + 3 {
             assert_eq!(
                 buffer[(x, y)].symbol(),
@@ -595,34 +591,18 @@ mod tests {
         let c = content();
         let first = painted_y(&state, u0, height, total);
         let last = painted_y(&state, u1 - 1, height, total);
-        let mut right = None;
         for y in first..=last {
             assert_eq!(buffer[(c.x, y)].bg, band, "visible prompt row {y}");
             let row_right = (c.x..c.x + c.width)
                 .filter(|x| buffer[(*x, y)].bg == band)
                 .next_back()
-                .expect("card row");
+                .expect("band row");
             assert_eq!(
-                right.get_or_insert(row_right),
-                &row_right,
-                "one card width on every visible row"
-            );
-            let width = (row_right - c.x + 1) as usize;
-            assert!(
-                width * 100 >= c.width as usize * 95,
-                "the prompt card fills at least 95% of the reading width"
-            );
-            assert!(
-                width <= c.width as usize,
-                "the prompt card never overflows the reading width"
+                row_right - c.x + 1,
+                c.width,
+                "the prompt band fills the full reading width"
             );
         }
-        let right = right.expect("visible card rows");
-        assert_eq!(
-            buffer[(right + 1, first)].bg,
-            canvas,
-            "the row ends outside the card"
-        );
         assert_eq!(buffer[(c.x, first - 1)].bg, canvas, "row above is clean");
         assert_eq!(buffer[(c.x, last + 1)].bg, canvas, "row below is clean");
     }
