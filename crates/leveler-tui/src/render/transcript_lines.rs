@@ -281,8 +281,25 @@ pub fn paint_reasoning_rail(
     }
 }
 
-/// The user's own turn: a bold heading bar plus bold body, which marks it apart
-/// from the assistant's `●` bullet and normal-weight prose.
+/// Columns reserved before every prompt row: the `❯` marker and its gap.
+/// The marker itself is painted by the conversation viewport, not written
+/// into the line, so copied text never contains it.
+pub(crate) const USER_PROMPT_GUTTER: usize = 2;
+/// One column kept clear on the right so wrapped glyphs never touch the band.
+const USER_PROMPT_RIGHT_PAD: usize = 1;
+/// Blank rows painted inside the band above and below the body.
+pub(crate) const USER_PROMPT_PAD_ROWS: usize = 1;
+/// The prompt's leading icon.
+pub(crate) const USER_PROMPT_MARKER: &str = "❯";
+const USER_PROMPT_INDENT: &str = "  ";
+
+/// The user's own turn: a marker gutter, one blank row of band padding above
+/// and below, and the user's text at primary ink.
+///
+/// The `❯` marker and the background band are painted over this projection by
+/// the conversation viewport. Keeping them out of the line means wrapping,
+/// selection columns, URL hit-testing and clipboard text all see exactly the
+/// user's own bytes — decoration can never be copied.
 ///
 /// One implementation on purpose. The conversation paints this path, and
 /// `item_render` (driven by the presentation tests) paints it too; two copies
@@ -293,19 +310,25 @@ pub(crate) fn push_user_turn(
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
-    // The bar and the primary ink already separate the user's turn from the
-    // assistant's `●` prose. Weight is not doing that job, and bold body text
-    // costs legibility across a whole conversation.
     let ink = Style::default().fg(theme.text.primary);
-    let mut wrapped = wrap(text, width.saturating_sub(2).max(1));
+    let inner = width
+        .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
+        .max(1);
+    let mut wrapped = wrap(text, inner);
     if wrapped.is_empty() {
         wrapped.push(String::new());
     }
+    for _ in 0..USER_PROMPT_PAD_ROWS {
+        out.push(Line::from(""));
+    }
     for line in wrapped {
         out.push(Line::from(vec![
-            Span::styled("▌ ", ink),
+            Span::raw(USER_PROMPT_INDENT),
             Span::styled(line, ink),
         ]));
+    }
+    for _ in 0..USER_PROMPT_PAD_ROWS {
+        out.push(Line::from(""));
     }
 }
 
@@ -1687,6 +1710,57 @@ mod tests {
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The prompt owns a marker gutter and one blank row above and below.
+    /// The `❯` itself is paint-time decoration: line content is only the
+    /// indent plus the user's own text, so copying can never pick it up.
+    #[test]
+    fn a_user_turn_reserves_a_marker_gutter_and_vertical_padding() {
+        let theme = Theme::dark();
+        let t = Locale::Zh.text();
+        let lines = item_render(&TranscriptItem::User("hello".into()), &theme, 40, false, t);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text, vec!["", "  hello", ""], "prompt rows");
+        assert!(
+            !text.iter().any(|row| row.contains('❯')),
+            "the marker is painted, never line content: {text:?}"
+        );
+    }
+
+    /// Every visual row starts after the same gutter, including an empty
+    /// logical line and wrapped continuations.
+    #[test]
+    fn every_user_row_starts_after_the_marker_gutter() {
+        let theme = Theme::dark();
+        let t = Locale::Zh.text();
+        let lines = item_render(
+            &TranscriptItem::User("alpha\n\nbeta".into()),
+            &theme,
+            20,
+            false,
+            t,
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text, vec!["", "  alpha", "  ", "  beta", ""], "prompt rows");
+    }
+
+    /// The body wraps inside the band: the gutter is reserved and one column
+    /// stays clear on the right so glyphs never touch the band edge.
+    #[test]
+    fn a_wrapped_prompt_keeps_its_right_padding() {
+        let theme = Theme::dark();
+        let t = Locale::Zh.text();
+        let text = "这是一段足够长的用户输入，用来确认窄终端下自动换行仍然留出右边距。";
+        let lines = item_render(&TranscriptItem::User(text.into()), &theme, 20, false, t);
+        for row in &lines {
+            let width = unicode_width::UnicodeWidthStr::width(line_text(row).as_str());
+            assert!(
+                width <= 19,
+                "row must stay inside the band: {:?}",
+                line_text(row)
+            );
+        }
     }
 
     #[test]

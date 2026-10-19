@@ -415,7 +415,7 @@ fn conversation_messages_use_prompt_and_bullet_without_role_labels() {
     );
 
     let text = render_at(100, 24, &mut state);
-    assert!(text.contains("▌ 请检查项目"), "{text}");
+    assert!(text.contains("❯ 请检查项目"), "{text}");
     assert!(text.contains("开始检查"), "{text}");
     assert!(!text.lines().any(|line| line.trim() == "User"), "{text}");
     assert!(
@@ -1311,8 +1311,10 @@ fn a_silent_tool_group_leaves_no_hole() {
         .iter()
         .filter(|l| l.trim().is_empty())
         .count();
+    // The prompt's own band padding accounts for one row; a silent tool that
+    // failed to collapse would add another on top of the item gap.
     assert!(
-        blanks <= 1,
+        blanks <= 2,
         "a silent tool must not leave {blanks} blank rows between prompt and answer\n{text}"
     );
 }

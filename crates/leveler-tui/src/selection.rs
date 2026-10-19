@@ -79,8 +79,26 @@ impl TextSelection {
     }
 }
 
-/// Extract plain text for a selection from absolute content lines.
-pub fn extract_selected_text(plain_lines: &[String], sel: &TextSelection) -> String {
+/// How one painted conversation row maps to copyable text.
+///
+/// A user prompt owns a marker gutter (painted decoration) and one blank row
+/// above and below its body. `indent` names the gutter columns that must
+/// never be copied; `skip` marks a row that carries no text at all. The row's
+/// plain text itself stays aligned with the screen, so selection columns and
+/// URL hit-testing keep working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlainRow {
+    pub indent: u16,
+    pub skip: bool,
+}
+
+/// Extract plain text for a selection from absolute content lines, honoring
+/// each row's [`PlainRow`] layout. Rows without an entry are ordinary text.
+pub fn extract_selected_text_with_layout(
+    plain_lines: &[String],
+    layout: &[PlainRow],
+    sel: &TextSelection,
+) -> String {
     let Some((start, end)) = sel.range() else {
         return String::new();
     };
@@ -91,19 +109,32 @@ pub fn extract_selected_text(plain_lines: &[String], sel: &TextSelection) -> Str
     let start_row = start.row.min(last);
     let end_row = end.row.min(last);
     let mut out = String::new();
+    let mut wrote_row = false;
     for row in start_row..=end_row {
+        let row_layout = layout.get(row).copied().unwrap_or_default();
+        // A padding row carries no text: it neither copies nor contributes a
+        // newline between the real rows around it.
+        if row_layout.skip {
+            continue;
+        }
         let line = plain_lines.get(row).map(String::as_str).unwrap_or("");
-        let from = if row == start_row { start.col } else { 0 };
+        let from =
+            (if row == start_row { start.col } else { 0 }).max(usize::from(row_layout.indent));
         let to = if row == end_row {
             end.col
         } else {
             UnicodeWidthStr::width(line)
         };
-        let slice = slice_display_cols(line, from, to);
-        if row > start_row {
+        let slice = if to > from {
+            slice_display_cols(line, from, to)
+        } else {
+            String::new()
+        };
+        if wrote_row {
             out.push('\n');
         }
         out.push_str(&slice);
+        wrote_row = true;
     }
     out
 }
@@ -247,7 +278,10 @@ mod tests {
         sel.begin(TextPos { row: 0, col: 6 });
         sel.extend(TextPos { row: 0, col: 11 });
         sel.finish();
-        assert_eq!(extract_selected_text(&lines, &sel), "world");
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &[], &sel),
+            "world"
+        );
     }
 
     #[test]
@@ -256,7 +290,10 @@ mod tests {
         let mut sel = TextSelection::default();
         sel.begin(TextPos { row: 0, col: 1 });
         sel.extend(TextPos { row: 2, col: 2 });
-        assert_eq!(extract_selected_text(&lines, &sel), "aa\nbbb\ncc");
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &[], &sel),
+            "aa\nbbb\ncc"
+        );
     }
 
     #[test]
@@ -265,7 +302,68 @@ mod tests {
         let mut sel = TextSelection::default();
         sel.begin(TextPos { row: 0, col: 5 });
         sel.extend(TextPos { row: 0, col: 1 });
-        assert_eq!(extract_selected_text(&lines, &sel), "bcde");
+        assert_eq!(extract_selected_text_with_layout(&lines, &[], &sel), "bcde");
+    }
+
+    /// A prompt's marker gutter is decoration: selecting the whole band must
+    /// not copy its columns, and its vertical padding rows are not text.
+    #[test]
+    fn copying_a_prompt_drops_its_gutter_and_padding_rows() {
+        let lines = vec![
+            "".to_string(),
+            "  alpha".to_string(),
+            "  ".to_string(),
+            "  beta".to_string(),
+            "".to_string(),
+        ];
+        let layout = vec![
+            PlainRow {
+                indent: 0,
+                skip: true,
+            },
+            PlainRow {
+                indent: 2,
+                skip: false,
+            },
+            PlainRow {
+                indent: 2,
+                skip: false,
+            },
+            PlainRow {
+                indent: 2,
+                skip: false,
+            },
+            PlainRow {
+                indent: 0,
+                skip: true,
+            },
+        ];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos { row: 4, col: 8 });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "alpha\n\nbeta"
+        );
+    }
+
+    /// The gutter is also dropped when a drag starts inside it.
+    #[test]
+    fn a_drag_starting_in_the_gutter_copies_only_body_text() {
+        let lines = vec!["  hello".to_string()];
+        let layout = vec![PlainRow {
+            indent: 2,
+            skip: false,
+        }];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos { row: 0, col: 7 });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "hello"
+        );
     }
 
     #[test]

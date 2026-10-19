@@ -1407,7 +1407,7 @@ pub(crate) fn is_conversation_visible(call: &ToolCallBlock) -> bool {
     }
 }
 
-/// The transcript's first-level execution anchor: `▌` user, `●` agent, `›`
+/// The transcript's first-level execution anchor: `❯` user, `●` agent, `›`
 /// tool. It says a tool ran here — never a status, a fold state or a cursor.
 pub(crate) const TOOL_ANCHOR: &str = "\u{203a}";
 
@@ -3280,7 +3280,7 @@ fn append_call_detail(
 /// row (a Thought's `◆`, a tool group's `›`/`▸`) own the content baseline, and
 /// what a fold reveals sits one level inside. The group's summary row itself is
 /// painted at the baseline — `›` is the conversation's first-level execution
-/// anchor, exactly like `▌` for the user and `●` for the agent — so a tool can
+/// anchor, exactly like `❯` for the user and `●` for the agent — so a tool can
 /// never read as a child of the Thought above it.
 pub(crate) const ACTIVITY_INDENT: &str = "  ";
 
@@ -4115,7 +4115,7 @@ mod tests {
         assert!(!lines[0].contains('\u{2514}'), "no tree: {lines:?}");
     }
 
-    /// `›` opens every tool row: `▌` user, `●` agent, `›` tool. The muted `·`
+    /// `›` opens every tool row: `❯` user, `●` agent, `›` tool. The muted `·`
     /// bullet that used to sit there marked a successful read the same way a
     /// blank did, and read as a piece of punctuation rather than as the one
     /// place the transcript says "a tool ran here".
@@ -5448,7 +5448,7 @@ mod tests {
         assert!(group_has_disclosure(&shell), "commands fold on their own");
     }
 
-    /// The transcript's first-level anchors all sit at the same column: `▌` for
+    /// The transcript's first-level anchors all sit at the same column: `❯` for
     /// the user, `●` for the agent, `◆` for a Thought and `›` for a tool group.
     /// A tool is a SIBLING of the Thought above it, never its child; only a
     /// fold's children step in one level.

@@ -23,6 +23,10 @@ use serde_json::{Value, json};
 
 const W: usize = 100;
 
+/// One user prompt in the projection: a band padding row, the text, and the
+/// closing band padding row.
+const PROMPT_ROWS: usize = 3;
+
 fn opened_bare() -> AppState {
     let mut s = AppState::new(
         Theme::no_color(),
@@ -386,7 +390,11 @@ fn multiline_reasoning_paints_while_live_and_leaves_no_row_when_settled() {
     assert!(live_hits.iter().any(|(_, item)| *item == thought_index(&s)));
     reasoning_done(&mut s, 16000);
     assert_eq!(thoughts(&s)[0].duration_ms, Some(16000));
-    assert_eq!(lines(&s).len(), 1, "a settled Thought leaves no row");
+    assert_eq!(
+        lines(&s).len(),
+        PROMPT_ROWS,
+        "a settled Thought leaves no row"
+    );
     let (_, hits) = build_conversation_lines_with_hits(&s, W);
     assert!(!hits.iter().any(|(_, item)| *item == thought_index(&s)));
 }
@@ -410,7 +418,7 @@ fn long_reasoning_toggles_while_live_and_leaves_no_row_when_settled() {
     assert_eq!(thoughts(&s)[0].text, raw);
     assert_eq!(
         lines(&s).len(),
-        1,
+        PROMPT_ROWS,
         "a settled Thought leaves no row, whatever the stored display was"
     );
 }
@@ -992,7 +1000,7 @@ fn completed_thought_disappears_without_a_disclosure_hit_or_blank_gap() {
     reasoning_done(&mut s, 500);
     let hidden_item = thought_index(&s);
     let (painted, hits) = build_conversation_lines_with_hits(&s, W);
-    assert_eq!(painted.len(), 1, "only the user prompt remains");
+    assert_eq!(painted.len(), PROMPT_ROWS, "only the user prompt remains");
     assert!(!hits.iter().any(|(_, item)| *item == hidden_item));
     read(&mut s, "t1", "README.md");
     settle_group(&mut s);

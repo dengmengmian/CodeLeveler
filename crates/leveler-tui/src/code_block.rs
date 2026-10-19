@@ -428,7 +428,9 @@ pub(crate) mod visibility_fixtures {
                     let mut x = content.x;
                     while x < content.right() {
                         let symbol = buffer[(x, y)].symbol();
-                        text.push_str(symbol);
+                        // The prompt marker is painted decoration, not part of
+                        // the projection this matrix compares against.
+                        text.push_str(if symbol == "❯" { " " } else { symbol });
                         x += symbol.width().max(1) as u16;
                     }
                     assert_eq!(

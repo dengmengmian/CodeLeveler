@@ -60,6 +60,18 @@ impl AppState {
         self.item_span(index, width).map(|(start, _)| start)
     }
 
+    /// The copy projection for the current conversation build: exact screen
+    /// text plus per-row decoration layout. Built from the same memoized lines
+    /// the viewport paints, so a selection can never describe a different
+    /// layout than the one on screen.
+    pub(crate) fn conversation_plain(
+        &self,
+        width: usize,
+    ) -> (Vec<String>, Vec<crate::selection::PlainRow>) {
+        let (lines, _, _, _, spans, _) = self.conversation_build(width);
+        plain_projection(&lines, &spans, self.transcript.items())
+    }
+
     /// The memoized build: lines, disclosure hit rows, command rows, the
     /// last Final answer's start line, and every item's line span.
     #[allow(clippy::type_complexity)]
@@ -175,6 +187,47 @@ pub fn build_conversation_lines_with_hits(
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let (lines, hits, _, _, _, _) = build_conversation(state, width);
     (lines, hits)
+}
+
+/// Painted lines plus the copy layout that belongs to them.
+///
+/// Only a real user prompt carries decoration: its first and last
+/// [`USER_PROMPT_PAD_ROWS`](crate::render::transcript_lines::USER_PROMPT_PAD_ROWS)
+/// rows are band padding, and its body rows begin after the marker gutter.
+/// Everything else is ordinary text.
+pub(crate) fn plain_projection(
+    lines: &[Line<'static>],
+    item_spans: &[(usize, usize)],
+    items: &[TranscriptItem],
+) -> (Vec<String>, Vec<crate::selection::PlainRow>) {
+    let plain = lines.iter().map(crate::selection::line_to_plain).collect();
+    let mut layout = vec![crate::selection::PlainRow::default(); lines.len()];
+    let pad = crate::render::transcript_lines::USER_PROMPT_PAD_ROWS;
+    let indent = crate::render::transcript_lines::USER_PROMPT_GUTTER as u16;
+    for (index, item) in items.iter().enumerate() {
+        if !matches!(item, TranscriptItem::User(_)) {
+            continue;
+        }
+        let Some(&(start, end)) = item_spans.get(index) else {
+            continue;
+        };
+        if start >= end || start >= lines.len() {
+            continue;
+        }
+        let end = end.min(lines.len());
+        let body_start = (start + pad).min(end);
+        let body_end = end.saturating_sub(pad).max(body_start);
+        for row in &mut layout[start..body_start] {
+            row.skip = true;
+        }
+        for row in &mut layout[body_end..end] {
+            row.skip = true;
+        }
+        for row in &mut layout[body_start..body_end] {
+            row.indent = indent;
+        }
+    }
+    (plain, layout)
 }
 
 /// Build the conversation, its disclosure hit rows, and its command rows in
@@ -311,7 +364,8 @@ fn build_conversation(
             final_anchor = Some(out.len());
         }
         // Message types are distinguished by shape, not role headings:
-        // `▌` user prompt, `●` agent prose, status glyphs for tool activity.
+        // the `❯` prompt band, `●` agent prose, status glyphs for tool
+        // activity. The mark itself is painted by the viewport.
         //
         let cacheable = memoizable_item(item, state);
         // Observation for the streaming-frame cost: how much of a long
@@ -644,6 +698,7 @@ pub(crate) fn reveal_command_receipt(state: &mut AppState, item: usize, call: us
     {
         state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
         state.conv.plain.clear();
+        state.conv.plain_layout.clear();
         state.conv.plain_width = 0;
     }
 }
@@ -666,6 +721,7 @@ pub(crate) fn toggle_span_receipt(state: &mut AppState, item: usize, call: usize
     };
     state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
     state.conv.plain.clear();
+    state.conv.plain_layout.clear();
     state.conv.plain_width = 0;
     super::interaction::restore_reading_anchor(state, reading);
     Some(expanded)
@@ -703,6 +759,7 @@ pub(crate) fn toggle_process_fold(state: &mut AppState, item: usize) -> Option<b
     // The plain-text projection backs selection and URL hit-testing; the fold
     // changed the lines under it, so it must be rebuilt on next use.
     state.conv.plain.clear();
+    state.conv.plain_layout.clear();
     state.conv.plain_width = 0;
     Some(expanded)
 }
