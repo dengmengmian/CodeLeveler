@@ -653,11 +653,20 @@ fn blocked_wait_lines(
         String::new()
     };
     let headline = crate::wait_status::headline(view, t);
-    let text = truncate_to_width(&format!("{WAIT_MARKER} {turn_mode}{headline}"), width);
-    let rest = text.strip_prefix(WAIT_MARKER).unwrap_or(&text);
+    // A live wait is a running state, so its marker advances on the same
+    // time-based clock as every other live surface. Time, not frames: a burst
+    // of background output repaints many frames and must not spin it faster.
+    // Reduced motion keeps the static marker and loses no fact.
+    let marker = if state.live_animation {
+        SPINNER[(state.motion_clock.as_millis() / 120) as usize % SPINNER.len()]
+    } else {
+        WAIT_MARKER
+    };
+    let text = truncate_to_width(&format!("{marker} {turn_mode}{headline}"), width);
+    let rest = text.strip_prefix(marker).unwrap_or(&text);
     vec![Line::from(vec![
         Span::styled(
-            WAIT_MARKER.to_string(),
+            marker.to_string(),
             Style::default().fg(theme.accent.primary),
         ),
         Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
@@ -1623,6 +1632,7 @@ mod tests {
     fn status_strip_names_a_background_wait_without_a_task_row() {
         use crate::state::BackgroundTaskChrome;
         let mut state = test_state();
+        state.live_animation = true;
         state.status = RuntimeStatus::Busy;
         state.elapsed_secs = 54;
         state.background_task_labels.insert(
@@ -1646,7 +1656,7 @@ mod tests {
             "the task row left the strip: {text}"
         );
         assert!(!text.contains('↗'), "the row affordance left too: {text}");
-        assert!(text.contains(WAIT_MARKER), "{text}");
+        assert!(text.contains(SPINNER[0]), "{text}");
         for line in text.lines() {
             if line.contains("等待任务") {
                 assert!(line.contains("等待后台任务"), "{text}");
@@ -1654,6 +1664,125 @@ mod tests {
         }
         assert!(!text.contains("可能卡住"), "{text}");
         assert!(!text.contains("最近活动"), "{text}");
+    }
+
+    /// A wait on a live background task is a RUNNING state, so its leading
+    /// marker advances on the shared motion clock — the same time-based
+    /// drumbeat as every other live surface. Only the marker may change: the
+    /// label, the elapsed time and the row width stay fixed, so the strip
+    /// cannot jump while the spinner turns.
+    #[test]
+    fn a_background_wait_spinner_animates_with_the_motion_clock() {
+        use crate::state::BackgroundTaskChrome;
+        let mut state = test_state();
+        state.live_animation = true;
+        state.status = RuntimeStatus::Busy;
+        state.elapsed_secs = 50;
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome::running("cargo test --workspace", 0),
+        );
+        state.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("w1"),
+            "wait_task".into(),
+            serde_json::json!({ "task_id": "bg-2" }).to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+
+        let mut frames = Vec::new();
+        for ms in [0u64, 120, 240, 360, 480] {
+            state.motion_clock = std::time::Duration::from_millis(ms);
+            let line = busy_line(&state);
+            let marker = line.chars().next().unwrap_or_default().to_string();
+            assert!(
+                SPINNER.contains(&marker.as_str()),
+                "the wait marker must be a spinner frame at {ms}ms: {line:?}"
+            );
+            assert!(line.contains("等待后台任务"), "{line}");
+            frames.push(line);
+        }
+        for pair in frames.windows(2) {
+            assert_ne!(pair[0], pair[1], "the spinner must advance every tick");
+            let rest = |line: &String| line.chars().skip(1).collect::<String>();
+            assert_eq!(
+                rest(&pair[0]),
+                rest(&pair[1]),
+                "only the running indicator may change: {pair:?}"
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(pair[0].as_str()),
+                UnicodeWidthStr::width(pair[1].as_str()),
+                "the row must not change width: {pair:?}"
+            );
+        }
+    }
+
+    /// Reduced motion keeps the fact and drops the animation: the static
+    /// marker stays put across the same clock.
+    #[test]
+    fn a_background_wait_marker_is_static_when_motion_is_off() {
+        use crate::state::BackgroundTaskChrome;
+        let mut state = test_state();
+        state.live_animation = false;
+        state.status = RuntimeStatus::Busy;
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome::running("cargo test --workspace", 0),
+        );
+        state.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("w1"),
+            "wait_task".into(),
+            serde_json::json!({ "task_id": "bg-2" }).to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+
+        let mut lines = Vec::new();
+        for ms in [0u64, 120, 240] {
+            state.motion_clock = std::time::Duration::from_millis(ms);
+            lines.push(busy_line(&state));
+        }
+        assert!(lines[0].starts_with(WAIT_MARKER), "{:?}", lines[0]);
+        assert_eq!(lines[0], lines[1]);
+        assert_eq!(lines[1], lines[2]);
+    }
+
+    /// A terminal background task is not a running wait: once the runtime
+    /// reports the exit, the row no longer claims it is waiting on it.
+    #[test]
+    fn a_terminal_background_task_leaves_the_running_wait() {
+        use crate::state::BackgroundTaskChrome;
+        let mut state = test_state();
+        state.live_animation = true;
+        state.status = RuntimeStatus::Busy;
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome {
+                ok: Some(true),
+                exit_code: Some(0),
+                ..BackgroundTaskChrome::running("cargo test --workspace", 0)
+            },
+        );
+        state.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("w1"),
+            "wait_task".into(),
+            serde_json::json!({ "task_id": "bg-2" }).to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+
+        let text = status_text(&state);
+        assert!(
+            !text.contains("等待后台任务"),
+            "a terminal task must not keep a running wait: {text}"
+        );
     }
 
     #[test]
