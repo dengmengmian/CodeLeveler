@@ -1220,6 +1220,10 @@ async fn a_cold_runtime_restores_terminal_shell_history_with_output() {
         .expect("the complete capture survives the cold runtime");
     let combined = std::fs::read(std::path::PathBuf::from(location).join("combined.log"))
         .expect("capture file survives");
+    // The capture is byte-exact: the platform shell's own newline is retained.
+    #[cfg(windows)]
+    assert_eq!(combined, b"COLD-MARK\r\n");
+    #[cfg(not(windows))]
     assert_eq!(combined, b"COLD-MARK\n");
     assert!(snap.active_background_tasks.is_empty());
 }
