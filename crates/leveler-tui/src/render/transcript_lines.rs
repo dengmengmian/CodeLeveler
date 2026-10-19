@@ -318,39 +318,31 @@ pub fn paint_reasoning_rail(
     }
 }
 
-/// Columns reserved before every prompt row: the card's left padding, the `❯`
+/// Columns reserved before every prompt row: the band's left padding, the `❯`
 /// marker, and the blank column between the marker and the body text.
 /// The marker itself is painted by the conversation viewport, not written
 /// into the line, so copied text never contains it.
 pub(crate) const USER_PROMPT_GUTTER: usize = 3;
-/// Blank columns between the card edge and its content.
+/// Blank columns between the band edge and its content.
 pub(crate) const USER_PROMPT_HPAD: usize = 1;
-/// The card's share of the content area. The same width for every prompt,
-/// short or long: the card is the message's container, not a text bubble.
-/// The wrap and the paint both derive it from this one number.
-pub(crate) const USER_PROMPT_WIDTH_PERCENT: usize = 96;
 /// One column kept clear on the right so wrapped glyphs never touch the edge.
 const USER_PROMPT_RIGHT_PAD: usize = 1;
-/// Blank rows painted inside the card above and below the body.
-pub(crate) const USER_PROMPT_PAD_ROWS: usize = 1;
 /// The prompt's leading icon.
 pub(crate) const USER_PROMPT_MARKER: &str = "❯";
 const USER_PROMPT_INDENT: &str = "   ";
 
-/// The prompt card's width at this content width: 96% of the reading area,
-/// rounded up so the result never drops below the 95% visual target, with a
-/// floor that keeps the marker usable on very narrow terminals.
+/// The prompt band's width: the full Transcript content width, the same for
+/// every message. The wrap and the paint both use this, so a short prompt and
+/// a long one share one left and one right edge.
 pub(crate) fn user_prompt_width(content_width: usize) -> usize {
-    let percent = content_width.saturating_mul(USER_PROMPT_WIDTH_PERCENT);
-    let target = percent.saturating_add(99) / 100;
-    let floor = (USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD).min(content_width);
-    target.max(floor).min(content_width)
+    content_width
 }
 
-/// The user's own turn: a marker gutter, one blank row of card padding above
-/// and below, and the user's text at primary ink.
+/// The user's own turn: a marker gutter and the user's text at primary ink.
+/// The band is exactly as tall as the message; the inter-item gap supplies
+/// the breathing room.
 ///
-/// The `❯` marker and the card surface are painted over this projection by
+/// The `❯` marker and the band surface are painted over this projection by
 /// the conversation viewport. Keeping them out of the line means wrapping,
 /// selection columns, URL hit-testing and clipboard text all see exactly the
 /// user's own bytes — decoration can never be copied.
@@ -365,17 +357,11 @@ pub(crate) fn push_user_turn(
     out: &mut Vec<Line<'static>>,
 ) {
     let ink = Style::default().fg(theme.text.primary);
-    for _ in 0..USER_PROMPT_PAD_ROWS {
-        out.push(Line::from(""));
-    }
     for (line, _) in user_wrapped(text, width) {
         out.push(Line::from(vec![
             Span::raw(USER_PROMPT_INDENT),
             Span::styled(line, ink),
         ]));
-    }
-    for _ in 0..USER_PROMPT_PAD_ROWS {
-        out.push(Line::from(""));
     }
 }
 
@@ -392,26 +378,14 @@ fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
     wrapped
 }
 
-/// Copy policy for [`push_user_turn`]: band padding rows are display-only and
-/// the marker gutter is decoration; every body row is the user's own text.
+/// Copy policy for [`push_user_turn`]: the marker gutter is decoration and
+/// every painted row is the user's own text.
 pub(crate) fn user_copy_rows(text: &str, width: usize) -> Vec<crate::selection::PlainRow> {
     let mut rows = Vec::new();
-    for _ in 0..USER_PROMPT_PAD_ROWS {
-        rows.push(crate::selection::PlainRow {
-            skip: true,
-            ..Default::default()
-        });
-    }
     for (_, joiner) in user_wrapped(text, width) {
         rows.push(crate::selection::PlainRow {
             indent: USER_PROMPT_GUTTER as u16,
             joiner: joiner.map(String::into_boxed_str),
-            ..Default::default()
-        });
-    }
-    for _ in 0..USER_PROMPT_PAD_ROWS {
-        rows.push(crate::selection::PlainRow {
-            skip: true,
             ..Default::default()
         });
     }
@@ -1918,12 +1892,12 @@ mod tests {
     /// The `❯` itself is paint-time decoration: line content is only the
     /// indent plus the user's own text, so copying can never pick it up.
     #[test]
-    fn a_user_turn_reserves_a_marker_gutter_and_vertical_padding() {
+    fn a_user_turn_reserves_a_marker_gutter_without_extra_padding() {
         let theme = Theme::dark();
         let t = Locale::Zh.text();
         let lines = item_render(&TranscriptItem::User("hello".into()), &theme, 40, false, t);
         let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(text, vec!["", "   hello", ""], "prompt rows");
+        assert_eq!(text, vec!["   hello"], "prompt rows");
         assert!(
             !text.iter().any(|row| row.contains('❯')),
             "the marker is painted, never line content: {text:?}"
@@ -1944,16 +1918,12 @@ mod tests {
             t,
         );
         let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(
-            text,
-            vec!["", "   alpha", "   ", "   beta", ""],
-            "prompt rows"
-        );
+        assert_eq!(text, vec!["   alpha", "   ", "   beta"], "prompt rows");
     }
 
-    /// The body wraps inside the card: the marker gutter is reserved, the
-    /// card is capped at its share of the content width, and one column stays
-    /// clear on the right so glyphs never touch the card edge.
+    /// The body wraps inside the band: the marker gutter is reserved, the
+    /// band fills the content width, and one column stays clear on the right
+    /// so glyphs never touch the band edge.
     #[test]
     fn a_wrapped_prompt_keeps_its_right_padding() {
         let theme = Theme::dark();
@@ -1965,7 +1935,7 @@ mod tests {
             let width = unicode_width::UnicodeWidthStr::width(line_text(row).as_str());
             assert!(
                 width <= widest,
-                "row must stay inside the card: {:?}",
+                "row must stay inside the band: {:?}",
                 line_text(row)
             );
         }

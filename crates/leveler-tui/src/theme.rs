@@ -458,7 +458,9 @@ impl Theme {
                 elevated: rgb(0x1D2126),
                 input: rgb(0x15181C),
                 selection: rgb(0x253345),
-                prompt: rgb(0x2B313A),
+                // The existing `panel` step: a quiet band just above the
+                // canvas, not a card competing with the prose.
+                prompt: rgb(0x171A1E),
             },
             text: TextColors {
                 primary: rgb(0xE7E9EC),
@@ -536,9 +538,9 @@ impl Theme {
                 elevated: rgb(0xF0F2F5),
                 input: rgb(0xFFFFFF),
                 selection: rgb(0xDCEBFF),
-                // The light counterpart of the dark prompt card: a soft
-                // blue-grey step below the canvas, never a highlight.
-                prompt: rgb(0xDFE5EC),
+                // The light counterpart of the dark band: the existing panel
+                // step just above the canvas, never a highlight.
+                prompt: rgb(0xFFFFFF),
             },
             text: TextColors {
                 primary: rgb(0x20242A),
@@ -613,7 +615,7 @@ impl Theme {
                 elevated: rgb(0x0A0A0A),
                 input: rgb(0x000000),
                 selection: rgb(0x003366),
-                prompt: rgb(0x222222),
+                prompt: rgb(0x1A1A1A),
             },
             text: TextColors {
                 primary: rgb(0xFFFFFF),
@@ -1133,19 +1135,25 @@ mod tests {
         );
     }
 
-    /// The prompt card must read as its own surface: a visible step away from
-    /// the canvas without approaching the brightness of body text.
+    /// The prompt band is a quiet step above the canvas: visible as one
+    /// continuous region, never bright enough to become a card.
     #[test]
-    fn the_prompt_surface_is_visibly_distinct_from_the_canvas() {
+    fn the_prompt_surface_is_a_visible_but_quiet_step_above_the_canvas() {
         for theme in [Theme::dark(), Theme::light(), Theme::high_contrast()] {
+            let prompt = relative_luminance(theme.surface.prompt).expect("fixed palettes are RGB");
+            let canvas = relative_luminance(theme.surface.canvas).expect("fixed palettes are RGB");
+            assert!(
+                prompt > canvas,
+                "{}: the prompt band must be brighter than the canvas",
+                theme.id.as_str()
+            );
             let ratio = contrast_ratio(theme.surface.prompt, theme.surface.canvas)
                 .expect("fixed palettes are RGB");
             assert!(
-                ratio >= 1.15,
-                "{}: prompt/canvas contrast {ratio:.2} is too close",
+                ratio <= 1.25,
+                "{}: prompt/canvas contrast {ratio:.2} is too card-like",
                 theme.id.as_str()
             );
-            assert_ne!(theme.surface.prompt, theme.surface.canvas);
         }
     }
 

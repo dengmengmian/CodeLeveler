@@ -23,9 +23,9 @@ use serde_json::{Value, json};
 
 const W: usize = 100;
 
-/// One user prompt in the projection: a band padding row, the text, and the
-/// closing band padding row.
-const PROMPT_ROWS: usize = 3;
+/// One user prompt in the projection: the band is exactly as tall as the
+/// message.
+const PROMPT_ROWS: usize = 1;
 
 fn opened_bare() -> AppState {
     let mut s = AppState::new(

@@ -1,8 +1,8 @@
-//! User prompt identity: one left-aligned card + one `❯` marker for real user
+//! User prompt identity: one left-aligned band + one `❯` marker for real user
 //! input, and nothing else.
 //!
 //! These paint the FULL workbench and read the cells the terminal receives.
-//! The marker and card are paint-time decoration, so the assertions are made
+//! The marker and band are paint-time decoration, so the assertions are made
 //! against the painted buffer, never against the projection text.
 
 use leveler_client_protocol::{
@@ -131,18 +131,14 @@ fn content_of(state: &AppState) -> (u16, u16, u16, u16) {
     state.conv.rect.expect("conversation rect published")
 }
 
-/// The card width every prompt must share at this content width: 96% of the
-/// reading area, rounded up, clamped to the content rect.
-fn expected_card_width(state: &AppState) -> u16 {
-    let (_, _, width, _) = content_of(state);
-    let target = (width as usize * 96).div_ceil(100);
-    let floor = 4.min(width as usize);
-    target.max(floor).min(width as usize) as u16
+/// The band every prompt must share: the full Transcript content width.
+fn expected_band_width(state: &AppState) -> u16 {
+    content_of(state).2
 }
 
-/// The painted card's left/right columns on one screen row. `None` when the
+/// The painted band's left/right columns on one screen row. `None` when the
 /// row is canvas.
-fn card_span(state: &AppState, buffer: &Buffer, y: u16) -> Option<(u16, u16)> {
+fn band_span(state: &AppState, buffer: &Buffer, y: u16) -> Option<(u16, u16)> {
     let (x, _, width, _) = content_of(state);
     let band = state.theme.surface.prompt;
     let mut first = None;
@@ -156,15 +152,15 @@ fn card_span(state: &AppState, buffer: &Buffer, y: u16) -> Option<(u16, u16)> {
     first.zip(last)
 }
 
-/// Assert one prompt card row: the card starts at the content's left edge,
+/// Assert one prompt band row: the band starts at the content's left edge,
 /// its cells are contiguous, and every column outside it stays on the canvas.
-fn assert_card_at(state: &AppState, buffer: &Buffer, y: u16) -> (u16, u16) {
+fn assert_band_at(state: &AppState, buffer: &Buffer, y: u16) -> (u16, u16) {
     let (x, _, width, _) = content_of(state);
     let band = state.theme.surface.prompt;
     let canvas = state.theme.surface.canvas;
-    let span = card_span(state, buffer, y)
-        .unwrap_or_else(|| panic!("row {y} carries no prompt card: {:?}", row_text(buffer, y)));
-    assert_eq!(span.0, x, "the card is left-aligned at the content edge");
+    let span = band_span(state, buffer, y)
+        .unwrap_or_else(|| panic!("row {y} carries no prompt band: {:?}", row_text(buffer, y)));
+    assert_eq!(span.0, x, "the band is left-aligned at the content edge");
     for col in span.0..=span.1 {
         if covered_by_wide(buffer, col, y) {
             continue;
@@ -172,7 +168,7 @@ fn assert_card_at(state: &AppState, buffer: &Buffer, y: u16) -> (u16, u16) {
         assert_eq!(
             buffer[(col, y)].bg,
             band,
-            "row {y} column {col} must carry the card: {:?}",
+            "row {y} column {col} must carry the band: {:?}",
             row_text(buffer, y)
         );
     }
@@ -180,7 +176,7 @@ fn assert_card_at(state: &AppState, buffer: &Buffer, y: u16) -> (u16, u16) {
         assert_eq!(
             buffer[(col, y)].bg,
             canvas,
-            "row {y} column {col} outside the card must stay on the canvas: {:?}",
+            "row {y} column {col} outside the band must stay on the canvas: {:?}",
             row_text(buffer, y)
         );
     }
@@ -210,15 +206,15 @@ fn markers(buffer: &Buffer) -> Vec<(u16, u16)> {
         .collect()
 }
 
-/// The rows of the card the prompt is painted on, top to bottom.
-fn card_rows(state: &AppState, buffer: &Buffer) -> Vec<u16> {
+/// The rows of the band the prompt is painted on, top to bottom.
+fn band_rows(state: &AppState, buffer: &Buffer) -> Vec<u16> {
     let (_, y, _, height) = content_of(state);
     (y..y + height)
-        .filter(|row| card_span(state, buffer, *row).is_some())
+        .filter(|row| band_span(state, buffer, *row).is_some())
         .collect()
 }
 
-/// Resume (the snapshot path) paints the card on real user input only:
+/// Resume (the snapshot path) paints the band on real user input only:
 /// a compaction summary and a runtime notice ride `UiRole::User` but are not
 /// user input, and neither is assistant prose.
 #[test]
@@ -242,7 +238,7 @@ fn resumed_history_bands_only_real_user_input() {
     let answer_row = row_of(&buffer, "Agent 回答正文");
     let notice_row = row_of(&buffer, "Runtime notice body");
 
-    assert_card_at(&s, &buffer, user_row);
+    assert_band_at(&s, &buffer, user_row);
     assert_canvas_at(&s, &buffer, summary_row);
     assert_canvas_at(&s, &buffer, answer_row);
     assert_canvas_at(&s, &buffer, notice_row);
@@ -253,14 +249,14 @@ fn resumed_history_bands_only_real_user_input() {
     assert_eq!(
         marks[0].0,
         x + 1,
-        "the marker is padded one cell inside the card edge"
+        "the marker is padded one cell inside the band edge"
     );
 }
 
-/// Two user turns keep separate cards; the agent prose between them stays on
+/// Two user turns keep separate bands; the agent prose between them stays on
 /// the canvas. A user's prompt never absorbs the adjacent answer.
 #[test]
-fn two_turns_keep_separate_cards_and_no_agent_row_inherits_one() {
+fn two_turns_keep_separate_bands_and_no_agent_row_inherits_one() {
     let mut s = opened(vec![
         message("u1", UiRole::User, "第一轮用户输入"),
         message("a1", UiRole::Assistant, "第一轮回答"),
@@ -274,7 +270,7 @@ fn two_turns_keep_separate_cards_and_no_agent_row_inherits_one() {
     ] {
         let u = row_of(&buffer, user);
         let a = row_of(&buffer, answer);
-        assert_card_at(&s, &buffer, u);
+        assert_band_at(&s, &buffer, u);
         assert_canvas_at(&s, &buffer, a);
         // Every row between the prompt text and the answer text is either the
         // prompt's own padding (banded) or the inter-item gap (canvas); no
@@ -284,7 +280,7 @@ fn two_turns_keep_separate_cards_and_no_agent_row_inherits_one() {
     assert_eq!(markers(&buffer).len(), 2, "one marker per user turn");
 }
 
-/// The live path (a newly submitted message) paints the same card as resumed
+/// The live path (a newly submitted message) paints the same band as resumed
 /// history, so the style cannot be lost across a reconnect.
 #[test]
 fn a_live_prompt_matches_resumed_history() {
@@ -300,9 +296,9 @@ fn a_live_prompt_matches_resumed_history() {
     let resumed_buffer = paint(&mut resumed, 100, 40);
     let live_row = row_of(&live_buffer, "同一句话");
     let resumed_row = row_of(&resumed_buffer, "同一句话");
-    let live_span = assert_card_at(&live, &live_buffer, live_row);
-    let resumed_span = assert_card_at(&resumed, &resumed_buffer, resumed_row);
-    assert_eq!(live_span, resumed_span, "live and resumed cards must match");
+    let live_span = assert_band_at(&live, &live_buffer, live_row);
+    let resumed_span = assert_band_at(&resumed, &resumed_buffer, resumed_row);
+    assert_eq!(live_span, resumed_span, "live and resumed bands must match");
     assert_eq!(
         row_text(&live_buffer, live_row),
         row_text(&resumed_buffer, resumed_row),
@@ -310,38 +306,38 @@ fn a_live_prompt_matches_resumed_history() {
     );
 }
 
-/// A multiline prompt keeps one card through its blank line and wraps, and the
+/// A multiline prompt keeps one band through its blank line and wraps, and the
 /// full text stays readable at the acceptance widths.
 #[test]
-fn a_multiline_prompt_keeps_one_card_at_every_width() {
+fn a_multiline_prompt_keeps_one_band_at_every_width() {
     let text =
         "第一行中文 😀\n\n第三行 with English\nhttps://example.com/a/very/long/path/that/wraps";
     let mut s = opened(vec![message("u1", UiRole::User, text)]);
     for (width, height) in [(120u16, 40u16), (80, 24), (48, 20)] {
         let buffer = paint(&mut s, width, height);
         let (x, _, _, _) = content_of(&s);
-        let expected = expected_card_width(&s);
+        let expected = expected_band_width(&s);
         let first = row_of(&buffer, "第一行中文");
         let blank = first + 1;
         let third = row_of(&buffer, "第三行 with English");
         assert!(blank < third, "the explicit blank line is preserved");
-        // The whole card, including its vertical padding rows, is banded.
+        // The whole message, including its internal blank line, is banded.
         let mut span = None;
-        for y in first - 1..=third {
-            let row_span = assert_card_at(&s, &buffer, y);
+        for y in first..=third {
+            let row_span = assert_band_at(&s, &buffer, y);
             if let Some(expected) = span {
-                assert_eq!(row_span, expected, "one card width on every row");
+                assert_eq!(row_span, expected, "one band width on every row");
             } else {
                 span = Some(row_span);
             }
         }
-        let span = span.expect("card rows");
+        let span = span.expect("band rows");
         assert_eq!(
             span.1 - span.0 + 1,
             expected,
-            "{width}x{height}: every prompt card shares one width"
+            "{width}x{height}: every prompt band shares one width"
         );
-        // The card is the content's left block, never the workspace gutter.
+        // The band is the content's left block, never the workspace gutter.
         assert_eq!(span.0, x);
         assert_ne!(buffer[(x - 1, first)].bg, s.theme.surface.prompt);
         let marks = markers(&buffer);
@@ -353,34 +349,34 @@ fn a_multiline_prompt_keeps_one_card_at_every_width() {
     }
 }
 
-/// A short message uses the same card as a long one: the card is the
+/// A short message uses the same band as a long one: the band is the
 /// message's container, never a text-sized bubble.
 #[test]
-fn a_short_prompt_fills_the_same_card_as_a_long_one() {
+fn a_short_prompt_fills_the_same_band_as_a_long_one() {
     let mut s = opened(vec![
         message("u1", UiRole::User, "hi"),
         message("a1", UiRole::Assistant, "短答"),
         message("u2", UiRole::User, &format!("long {}", "word ".repeat(40))),
     ]);
     let buffer = paint(&mut s, 100, 40);
-    let expected = expected_card_width(&s);
+    let expected = expected_band_width(&s);
     let short_y = row_of(&buffer, "❯ hi");
     let long_y = row_of(&buffer, "long word");
-    let (short_left, short_right) = assert_card_at(&s, &buffer, short_y);
-    let (long_left, long_right) = assert_card_at(&s, &buffer, long_y);
+    let (short_left, short_right) = assert_band_at(&s, &buffer, short_y);
+    let (long_left, long_right) = assert_band_at(&s, &buffer, long_y);
     assert_eq!(
         short_left, long_left,
-        "both cards start at the content edge"
+        "both bands start at the content edge"
     );
     assert_eq!(
         short_right - short_left + 1,
         expected,
-        "a short prompt takes the full card"
+        "a short prompt takes the full band"
     );
     assert_eq!(
         long_right - long_left + 1,
         expected,
-        "a long prompt takes the same card"
+        "a long prompt takes the same band"
     );
     assert_eq!(
         row_text(&buffer, short_y).trim(),
@@ -389,57 +385,52 @@ fn a_short_prompt_fills_the_same_card_as_a_long_one() {
     );
 }
 
-/// A long unbroken message fills the same card and every character survives.
+/// A long unbroken message fills the same band and every character survives.
 #[test]
-fn a_long_prompt_fills_the_card_without_truncation() {
+fn a_long_prompt_fills_the_band_without_truncation() {
     let text = "Z".repeat(200);
     let mut s = opened(vec![message("u1", UiRole::User, &text)]);
     let buffer = paint(&mut s, 120, 40);
-    let expected = expected_card_width(&s);
-    let rows = card_rows(&s, &buffer);
-    assert!(rows.len() >= 3, "the message must wrap: {rows:?}");
+    let expected = expected_band_width(&s);
+    let rows = band_rows(&s, &buffer);
+    assert!(rows.len() >= 2, "the message must wrap: {rows:?}");
     let mut painted = 0usize;
     for &y in &rows {
-        let (left, right) = card_span(&s, &buffer, y).expect("card");
+        let (left, right) = band_span(&s, &buffer, y).expect("band");
         assert_eq!(
             right - left + 1,
             expected,
-            "row {y}: every prompt card shares one width"
+            "row {y}: every prompt band shares one width"
         );
         painted += row_text(&buffer, y).chars().filter(|c| *c == 'Z').count();
     }
     assert_eq!(painted, text.len(), "no character may be dropped");
     assert_eq!(
-        row_text(&buffer, rows[0]).trim(),
-        "",
-        "the card's top padding row carries no text"
-    );
-    assert_eq!(
         markers(&buffer).len(),
         1,
         "one marker per prompt, on the first body row"
     );
-    assert_eq!(markers(&buffer)[0].1, rows[1]);
+    assert_eq!(markers(&buffer)[0].1, rows[0]);
 }
 
 /// At the narrow acceptance width, mixed-width text stays complete and the
-/// card keeps its single fixed width.
+/// band keeps its single fixed width.
 #[test]
 fn a_narrow_terminal_keeps_mixed_width_text_complete() {
     let tail = "Z".repeat(90);
     let text = format!("中文 English 😀 {tail}");
     let mut s = opened(vec![message("u1", UiRole::User, &text)]);
     let buffer = paint(&mut s, 48, 20);
-    let expected = expected_card_width(&s);
-    let rows = card_rows(&s, &buffer);
+    let expected = expected_band_width(&s);
+    let rows = band_rows(&s, &buffer);
     assert!(!rows.is_empty(), "the prompt must be visible");
     let mut painted = String::new();
     for &y in &rows {
-        let (left, right) = card_span(&s, &buffer, y).expect("card");
+        let (left, right) = band_span(&s, &buffer, y).expect("band");
         assert_eq!(
             right - left + 1,
             expected,
-            "row {y}: every prompt card shares one width"
+            "row {y}: every prompt band shares one width"
         );
         painted.push_str(&row_text(&buffer, y));
     }
@@ -454,14 +445,14 @@ fn a_narrow_terminal_keeps_mixed_width_text_complete() {
 }
 
 /// The `❯` is the prompt's only decoration: soft accent ink, padded inside
-/// the card, with no identity label, border or divider.
+/// the band, with no identity label, border or divider.
 #[test]
 fn the_marker_is_soft_blue_and_carries_no_identity_text() {
     let mut s = opened(vec![message("u1", UiRole::User, "hello there")]);
     let buffer = paint(&mut s, 100, 40);
     let (x, _, _, _) = content_of(&s);
     let y = row_of(&buffer, "❯");
-    let (left, right) = assert_card_at(&s, &buffer, y);
+    let (left, right) = assert_band_at(&s, &buffer, y);
     assert_eq!(left, x);
     let marker = &buffer[(left + 1, y)];
     assert_eq!(marker.symbol(), "❯");
@@ -469,40 +460,43 @@ fn the_marker_is_soft_blue_and_carries_no_identity_text() {
         marker.fg, s.theme.accent.secondary,
         "the marker wears the soft accent ink"
     );
-    assert_eq!(marker.bg, s.theme.surface.prompt, "inside the card");
+    assert_eq!(marker.bg, s.theme.surface.prompt, "inside the band");
     assert_eq!(
         buffer[(left + 2, y)].symbol(),
         " ",
         "one blank column between the marker and the body"
     );
     assert_eq!(buffer[(left + 3, y)].symbol(), "h");
-    for (screen_row, text) in [(y - 1, ""), (y, "❯ hello there")] {
-        assert_eq!(row_text(&buffer, screen_row).trim(), text);
-    }
-    let card_text = format!("{}{}", row_text(&buffer, y - 1), row_text(&buffer, y));
+    assert_eq!(row_text(&buffer, y).trim(), "❯ hello there");
+    assert_eq!(
+        buffer[(left, y - 1)].bg,
+        s.theme.surface.canvas,
+        "the inter-item gap stays on the canvas"
+    );
+    let band_text = row_text(&buffer, y);
     for label in ["You", "User", "你", "用户"] {
         assert!(
-            !card_text.contains(label),
+            !band_text.contains(label),
             "identity label {label:?} leaked"
         );
     }
     for border in ["─", "━", "│", "┃", "┌", "┐", "└", "┘"] {
         assert!(
-            !card_text.contains(border),
-            "card must not draw a border/divider: {card_text:?}"
+            !band_text.contains(border),
+            "band must not draw a border/divider: {band_text:?}"
         );
     }
     assert_eq!(
         right - left + 1,
-        expected_card_width(&s),
-        "the card keeps its fixed width for a short message"
+        expected_band_width(&s),
+        "the band fills the reading width for a short message"
     );
 }
 
 /// Resizing cannot leave paint from the previous width behind: each size
-/// repaints a card that fits its own content rect.
+/// repaints a band that fits its own content rect.
 #[test]
-fn resize_repaints_the_card_to_the_new_content_rect() {
+fn resize_repaints_the_band_to_the_new_content_rect() {
     let mut s = opened(vec![message("u1", UiRole::User, "宽度变化")]);
     for (width, height) in [(120u16, 40u16), (80, 24), (48, 20), (120, 40)] {
         let buffer = paint(&mut s, width, height);
@@ -511,17 +505,14 @@ fn resize_repaints_the_card_to_the_new_content_rect() {
         assert_eq!(x, gutter, "left edge follows the workspace gutter");
         assert_eq!(x + w, width - gutter, "and so does the right edge");
         let row = row_of(&buffer, "宽度变化");
-        let (left, right) = assert_card_at(&s, &buffer, row);
+        let (left, right) = assert_band_at(&s, &buffer, row);
         assert_eq!(left, x);
         assert_eq!(
             right - left + 1,
-            expected_card_width(&s),
-            "the card is 95-100% of this content width"
+            w,
+            "the band fills this content width exactly"
         );
-        assert!(
-            (right - left + 1) as usize <= w as usize,
-            "the card never overflows the content"
-        );
+        assert_eq!(right, x + w - 1, "the band meets the content's right edge");
         assert_eq!(markers(&buffer), vec![(x + 1, row)]);
     }
 }
