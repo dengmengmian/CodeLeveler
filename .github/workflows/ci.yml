@@ -23,7 +23,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Pinned: `ubuntu-latest` began migrating to Ubuntu 26 on 2026-10-19,
+        # and that image lost communication with the server during the
+        # workspace test step. Return to the moving label once the image is
+        # stable on the runner fleet.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -134,7 +138,7 @@ jobs:
   # conformance, which is the part a host change can silently break.
   mobile:
     name: leveler-mobile · analyze · test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: apps/leveler-mobile
@@ -165,7 +169,7 @@ jobs:
   # silently past the web client again.
   web-ui:
     name: leveler-web UI · contract · typecheck · test · build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: crates/leveler-web/web
@@ -195,7 +199,7 @@ jobs:
 
   supply-chain:
     name: deny · audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
