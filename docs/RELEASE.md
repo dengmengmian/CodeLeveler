@@ -2,51 +2,37 @@
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-Web search is now a capability of its own: the search backend is selected
-independently of the conversation model, so the model that answers and the
-service that searches are two separate choices. This patch also fixes how the
-first result is shown and makes a missing search credential diagnosable.
+The terminal's local shell becomes a complete surface: `!` opens a real Shell
+Mode, every command keeps its full output, and a running command can move to
+the background without losing its process. The user's own turn also settles
+into one full-width background band.
 
-## Web search
+## Shell Mode
 
-- `[web.search]` in `~/.leveler/config.toml` is the only switch for `web_search`. The legacy `LEVELER_SEARCH_API_KEY` fallback is removed: without this section, search stays unavailable.
-- Two backends: the DeepSeek official Search API (`POST https://api.deepseek.com/v1/tools/search`) and Tavily.
-- The backend is independent of `[providers.*]` and `[models.*]`. Switching the conversation model, including to another vendor, does not change it, and a model provider's `base_url` is never reused as the search endpoint.
-- The credential is read only from the configured `api_key_env`. A model gateway key is never reused for search, the variable is scrubbed from child processes, and its value never reaches logs or tool output.
-- Each call is one HTTP request. It honors the configured timeout, does not retry, does not fall back to another provider, and does not start a model request.
-- Results carry title, URL, snippet, and publication date. The TUI shows the first result instead of an external-data marker.
+- `!` on an empty composer is a mode marker, never command text. The mode has its own prompt and accent.
+- Offline Tab completion covers files, directories and PATH executables. Ambiguous matches open a scrolling candidate menu driven by keyboard, pointer and wheel; accepting a candidate never executes it.
+- Each command is one inline record with a status rail, a `$ command` line, stdout/stderr provenance, a live tail and a measured duration. A finished long result keeps its named fold and opens fully on demand.
+- Stopping is available from both the record and the live activity row. `Ctrl+C` cancels exactly that execution; `Esc` and `Ctrl+B` never do.
 
-## Configuration
+## Complete output
 
-```toml
-[web.search]
-provider = "deepseek"                     # deepseek | tavily
-api_key_env = "LEVELER_OFFICIAL_SEARCH_KEY"
-base_url = "https://api.deepseek.com/v1/tools"
-max_results = 5
-timeout_ms = 15000
-```
+- The exact stdout/stderr and the arrival-order combined stream are retained in per-execution capture files, not a lossy 1 MiB tail.
+- `/output` opens the complete capture in a windowed page; `/copy output` copies it cleanly. The page indexes the capture off the paint loop and renders only the visible window, so a 50 MiB result costs the same per frame as a small one.
+- Rows can be selected and copied with tabs preserved and soft wraps rejoined. Capture directories are `0700` and files `0600`, and a persisted capture is validated against the local shell-output root before it is opened.
 
-Export `LEVELER_OFFICIAL_SEARCH_KEY` in the environment the app starts from.
-Keep the key out of the repository and out of the TOML file. If the variable is
-unset, `web_search` stays unavailable, the model and every other feature keep
-working, and `~/.leveler/leveler.log` records a warning naming the variable.
+## Background handoff
 
-## Terminal
+- `Ctrl+B` hands a running command to the existing background registry with the same execution id, process and process group. Nothing is re-spawned or re-run: output, exit code and duration stay continuous.
+- The transfer is durable. A cold restore reports a completed execution, or an orphan without a terminal fact as unknown — never as still running.
 
-- The user's own turn renders as one full-width background band: the dark theme uses a quiet `#171A1E` step above the `#111315` canvas, the soft-blue `❯` opens the first row, and the message body keeps primary ink. Short and long messages share the same width, the band is exactly as tall as the message, and there is no identity label, border or divider.
-- Selecting the band still copies the authored text exactly; the background, marker and gutter never reach the clipboard.
+## Conversation band
 
-## Updates
-
-- A Homebrew-managed install no longer replaces itself in the Cellar. The start-up updater and `leveler update` defer to `brew upgrade leveler`, so the formula's record and the installed file stay in agreement; `leveler update --check` remains a read-only check. Installations from the install script or a manual copy keep their existing self-update behaviour.
-
-## Qualification
-
-- The Dogfood coverage audit now persists this run's layer artifacts before taking the pre-RC verdict. A test that L1 passed is no longer reported as "L1 did not run for this candidate".
-- Coverage evidence is bound to the candidate named on the audit command line: a run directory that declares another candidate is refused instead of credited.
+- The user's own turn is one full-width background band. The dark theme uses the existing quiet `#171A1E` step above the `#111315` canvas; the light theme uses `#FFFFFF`, high contrast `#1A1A1A`.
+- The soft-blue `❯` opens the first row, the body keeps primary ink, and short and long messages share the same left and right edges. The band is exactly as tall as the message; there is no identity label, border, divider or extra vertical padding.
+- Selecting the band still copies the authored source. The background, marker, status rails and other painted glyphs never reach the clipboard.
 
 ## Fixes
 
-- The TUI renders the first search result instead of the external-data marker.
-- A configured search whose credential variable is unset is logged at warn level (it was debug, which the default filter never wrote).
+- The background-wait row's marker animates with the shared 120 ms spinner while the wait target is running; reduced motion keeps it static.
+- Background user-shell protocol types and their exported schemas stay current, and remote policy classifies `background_user_shell` explicitly.
+- Two capture integration fixtures now create a real state root, so the `/output` and `/copy output` validation is exercised against the same shape production writes.
