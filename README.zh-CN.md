@@ -262,13 +262,13 @@ TUI 中点击底部的后台任务摘要（`↗`）打开列表，点击任务�
   ```toml
   [web.search]
   provider = "deepseek"          # deepseek | tavily
-  api_key_env = "DEEPSEEK_API_KEY"
+  api_key_env = "LEVELER_SEARCH_API_KEY"
   max_results = 5
   timeout_ms = 15000
   # base_url = "https://api.deepseek.com/v1/tools"
   ```
 
-  DeepSeek 搜索每次工具调用只请求一次 `POST https://api.deepseek.com/v1/tools/search`，不产生辅助模型请求。任意已配置模型都可以使用它，切换模型不会改变搜索后端。模型 Provider 的 `base_url` 不会被当作搜索端点。当前支持的搜索 Provider 是 `deepseek` 和 `tavily`。只有该配置段能启用搜索：没有它，`web_search` 不可用，残留的 `LEVELER_SEARCH_API_KEY` 也不会把它打开。`web_search` 只发起一次 HTTP 请求，遵守配置的超时，不重试，也不会改走浏览器自动化。
+  DeepSeek 搜索每次工具调用只请求一次 `POST https://api.deepseek.com/v1/tools/search`，不产生辅助模型请求。任意已配置模型都可以使用它，切换模型不会改变搜索后端。模型 Provider 的 `base_url` 不会被当作搜索端点。当前支持的搜索 Provider 是 `deepseek` 和 `tavily`。只有该配置段能启用搜索：没有它，`web_search` 不可用；仅设置 `LEVELER_SEARCH_API_KEY` 不会自动打开搜索（旧的隐式回退已移除）。`web_search` 只发起一次 HTTP 请求，遵守配置的超时，不重试，也不会改走浏览器自动化。
 
 TUI 的 `/web` 和界面中打开的链接仍然使用操作系统默认浏览器。
 

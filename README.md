@@ -278,13 +278,13 @@ Each goal starts with the base coding tools. The model loads optional capabiliti
   ```toml
   [web.search]
   provider = "deepseek"          # deepseek | tavily
-  api_key_env = "DEEPSEEK_API_KEY"
+  api_key_env = "LEVELER_SEARCH_API_KEY"
   max_results = 5
   timeout_ms = 15000
   # base_url = "https://api.deepseek.com/v1/tools"
   ```
 
-  DeepSeek search calls `POST https://api.deepseek.com/v1/tools/search` once per tool call, with no auxiliary model request. Any configured model can use it, and switching models never changes the search provider. A model provider's `base_url` is never reused as the search endpoint. Supported search providers are `deepseek` and `tavily`. This section is the only way to enable search: without it, `web_search` is unavailable, and a leftover `LEVELER_SEARCH_API_KEY` does not turn it on. `web_search` performs one HTTP request, honors the configured timeout, and does not retry or fall back to browser automation.
+  DeepSeek search calls `POST https://api.deepseek.com/v1/tools/search` once per tool call, with no auxiliary model request. Any configured model can use it, and switching models never changes the search provider. A model provider's `base_url` is never reused as the search endpoint. Supported search providers are `deepseek` and `tavily`. This section is the only way to enable search: without it, `web_search` is unavailable, and setting `LEVELER_SEARCH_API_KEY` alone does not turn it on (the legacy implicit fallback was removed). `web_search` performs one HTTP request, honors the configured timeout, and does not retry or fall back to browser automation.
 
 TUI `/web` and links opened from the UI still use the operating system's default browser.
 
