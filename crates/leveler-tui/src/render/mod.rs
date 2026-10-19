@@ -12,155 +12,6 @@ use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tool_cell::render_tools_screen;
 
-/// Shell Details: one user shell execution — status, live runtime, source,
-/// cwd, the user's exact command (never the `sh -c` wrapper), and the bounded
-/// output tail. A Secondary Surface like every other Detail Page: Esc backs
-/// out, `x` stops a running one, and the body sits on the shared content
-/// gutter.
-fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
-    use crate::transcript::UserShellStatus;
-    let t = state.t();
-    let hint = if state
-        .focused_user_shell()
-        .is_some_and(|s| s.status == UserShellStatus::Running)
-    {
-        t.shell_hint_running
-    } else {
-        t.shell_hint_done
-    };
-    let page = crate::secondary::SecondaryPage {
-        title: t.shell_details_title,
-        status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint,
-    };
-    let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
-    let theme = &state.theme;
-    let body = layout.content;
-    if body.width == 0 || body.height == 0 {
-        return;
-    }
-    let lines = shell_detail_lines(state, body.width as usize, theme, t);
-    // Keep the tail visible by default; PgUp/PgDn (screen_scroll) pages back.
-    let height = body.height as usize;
-    let max_scroll = lines.len().saturating_sub(height);
-    let scroll = state.screen_scroll.min(max_scroll);
-    let offset = max_scroll.saturating_sub(scroll);
-    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
-    frame.render_widget(Paragraph::new(visible), body);
-}
-
-/// The Shell Details body, without chrome.
-fn shell_detail_lines(
-    state: &AppState,
-    width: usize,
-    theme: &Theme,
-    t: &crate::i18n::UiText,
-) -> Vec<Line<'static>> {
-    use crate::transcript::UserShellStatus;
-    let dim = Style::default().fg(theme.text.muted);
-    let text_style = Style::default().fg(theme.text.primary);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let Some(shell) = state.focused_user_shell() else {
-        lines.push(Line::from(Span::styled(t.shell_no_output.to_string(), dim)));
-        return lines;
-    };
-    let (status_text, status_style) = match shell.status {
-        UserShellStatus::Running => (
-            t.shell_status_running,
-            Style::default().fg(theme.accent.primary),
-        ),
-        UserShellStatus::Success => (
-            t.shell_status_success,
-            Style::default().fg(theme.status.success),
-        ),
-        UserShellStatus::Failed => (
-            t.shell_status_failed,
-            Style::default().fg(theme.status.warning),
-        ),
-        UserShellStatus::Cancelled => (t.shell_status_cancelled, dim),
-        UserShellStatus::Unknown => (
-            t.shell_status_unknown,
-            Style::default().fg(theme.status.warning),
-        ),
-    };
-    let runtime_secs = match shell.duration_ms {
-        Some(ms) => ms / 1000,
-        None => (state.elapsed_secs as i64 - shell.started_elapsed_secs).max(0) as u64,
-    };
-    let runtime = if runtime_secs >= 60 {
-        format!("{}m {:02}s", runtime_secs / 60, runtime_secs % 60)
-    } else {
-        format!("{runtime_secs}s")
-    };
-    const FIELD_LABEL_WIDTH: usize = 12;
-    let field = |label: &str, value: Span<'static>| {
-        Line::from(vec![
-            Span::styled(
-                crate::render::text::pad_display(label, FIELD_LABEL_WIDTH),
-                dim,
-            ),
-            value,
-        ])
-    };
-    lines.push(field(
-        t.shell_status_label,
-        Span::styled(status_text.to_string(), status_style),
-    ));
-    lines.push(field(
-        t.shell_runtime_label,
-        Span::styled(runtime, text_style),
-    ));
-    lines.push(field(
-        t.shell_source_label,
-        Span::styled(t.shell_source_user.to_string(), text_style),
-    ));
-    // Both fields are one unwrapped row, so anything past the edge is gone.
-    // Cut them ourselves and mark it: a value that merely ends mid-path reads
-    // as the whole value. A path keeps its tail — that is what names it — and
-    // a command keeps its head, which is what it does.
-    let value_width = width.saturating_sub(FIELD_LABEL_WIDTH + 1).max(4);
-    lines.push(field(
-        t.shell_cwd_label,
-        Span::styled(text::elide_head(&shell.cwd, value_width), text_style),
-    ));
-    lines.push(field(
-        t.shell_command_label,
-        Span::styled(truncate_display(&shell.command, value_width), text_style),
-    ));
-    if let Some(code) = shell.exit_code {
-        lines.push(field(
-            t.shell_exit_label,
-            Span::styled(
-                code.to_string(),
-                if code == 0 {
-                    Style::default().fg(theme.status.success)
-                } else {
-                    Style::default().fg(theme.status.warning)
-                },
-            ),
-        ));
-    }
-    lines.push(Line::from(""));
-    lines.push(section_line(t.shell_output_label, theme));
-    if shell.output_truncated {
-        lines.push(detail_line(t.shell_truncated.to_string(), dim, width));
-    }
-    if shell.output.trim().is_empty() {
-        lines.push(detail_line(t.shell_no_output.to_string(), dim, width));
-    } else {
-        for raw in shell.output.lines() {
-            let line = sanitize_terminal_line(raw);
-            lines.push(detail_line(
-                line,
-                Style::default().fg(theme.text.secondary),
-                width,
-            ));
-        }
-    }
-    lines
-}
 /// Whether the child behind this activity was stopped at a bound rather than
 /// failing. Reads the typed stop, never the summary prose: `Incomplete`,
 /// `Budget`, `Cancelled` and `Lost` are all "did not finish", and only a
@@ -1381,7 +1232,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Diff => render_diff_screen(frame, area, state),
         Screen::Sessions => render_sessions_screen(frame, area, state),
         Screen::Remote => render_remote_screen(frame, area, state),
-        Screen::Shell => render_shell_screen(frame, area, state),
         Screen::Activity => render_activity_screen(frame, area, state),
         Screen::ActivityList => render_background_list_screen(frame, area, state),
         Screen::Team => render_team_screen(frame, area, state),
@@ -2492,56 +2342,12 @@ mod tests {
         out
     }
 
-    /// Shell Details answers "where did this run" and "what exactly ran". Both
-    /// fields were pushed as one unwrapped span, so ratatui clipped them at the
-    /// right edge with no mark — and for a path the clipped-off tail is the
-    /// part that identifies it. A real `!git diff --stat` showed
-    /// `目录  /private/tmp/.../b6daaffb-de00-45ce-bd4d-8fcd3`, which reads as a
-    /// complete directory and is not one.
-    #[test]
-    fn shell_details_marks_a_cut_path_and_keeps_its_tail() {
-        let mut state = test_state();
-        let cwd = "/private/tmp/agent-501/-Users-example-Develop-app-codeleveler/\
-                   b6daaffb-de00-45ce-bd4d-b457-f1fd58344a9c/scratchpad/h-inv";
-        crate::reducer::reduce(
-            &mut state,
-            crate::action::Action::Runtime(
-                leveler_client_protocol::RuntimeEvent::UserShellStarted {
-                    execution_id: leveler_core::UserShellId::new("ush-1"),
-                    command: format!("git {} --stat", "verylongsubcommand".repeat(6)),
-                    cwd: cwd.into(),
-                },
-            ),
-        );
-        state.active_screen = Screen::Shell;
-        let screen = render_text(&mut state, 80, 30);
-        let dir = screen
-            .lines()
-            .find(|l| l.contains("目录"))
-            .expect("the cwd field is on screen")
-            .to_string();
-        assert!(dir.contains('…'), "the cut is unmarked: {dir:?}");
-        assert!(
-            dir.contains("h-inv"),
-            "the tail is what names the directory: {dir:?}"
-        );
-        let cmd = screen
-            .lines()
-            .find(|l| l.contains("命令"))
-            .expect("the command field is on screen")
-            .to_string();
-        assert!(cmd.contains('…'), "the cut is unmarked: {cmd:?}");
-    }
-
-    /// A full-screen view answers every keystroke itself — Esc backs out, `x`
-    /// stops a shell, j/k scroll — so nothing typed reaches the composer. It
-    /// was still drawn under them: on Shell Details a whole task can be typed
-    /// with no echo and Enter does nothing, because the box is not an input
-    /// there. An overlay already takes the composer's slot for this reason.
+    /// A full-screen view answers every keystroke itself — Esc backs out,
+    /// j/k scroll — so nothing typed reaches the composer. An overlay already
+    /// takes the composer's slot for this reason.
     #[test]
     fn a_full_screen_view_does_not_draw_an_input_it_will_not_accept() {
         for screen in [
-            Screen::Shell,
             Screen::Tools,
             Screen::Diff,
             Screen::Help,

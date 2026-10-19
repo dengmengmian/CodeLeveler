@@ -1031,19 +1031,9 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                         return Vec::new();
                     }
                     Hit::Disclosure { item } => {
-                        // A user shell row opens its Details screen (running
-                        // or finished); tool groups / sub-agents toggle
-                        // inline. Same hit map, dispatch by item identity.
-                        if matches!(
-                            state.transcript.items().get(item),
-                            Some(crate::transcript::TranscriptItem::UserShell(_))
-                        ) {
-                            state.shell_screen_item = Some(item);
-                            state.active_screen = Screen::Shell;
-                            state.screen_scroll = 0;
-                        } else {
-                            interaction::toggle_fold(state, item);
-                        }
+                        // Every disclosure — tool group or user shell — folds
+                        // inline. One hit map, one interaction.
+                        interaction::toggle_fold(state, item);
                         state.conv.plain.clear();
                         interaction::clear_selection_drag(state);
                         state.conv.selection.clear();
@@ -1862,9 +1852,9 @@ fn ensure_command_selection(state: &mut AppState) {
     if state
         .command_selected
         .as_ref()
-        .is_none_or(|id| !candidates.iter().any(|(_, _, c)| c == id))
+        .is_none_or(|target| !candidates.iter().any(|c| &c.target == target))
     {
-        state.command_selected = Some(candidates[0].2.clone());
+        state.command_selected = Some(candidates[0].target.clone());
     }
     reveal_selected_command(state);
 }
@@ -1879,32 +1869,39 @@ fn select_command_delta(state: &mut AppState, delta: isize) {
     let current = state
         .command_selected
         .as_ref()
-        .and_then(|id| candidates.iter().position(|(_, _, c)| c == id))
+        .and_then(|target| candidates.iter().position(|c| &c.target == target))
         .unwrap_or(0);
     let next = if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
     } else {
         (current + delta as usize).min(candidates.len() - 1)
     };
-    state.command_selected = Some(candidates[next].2.clone());
+    state.command_selected = Some(candidates[next].target.clone());
     reveal_selected_command(state);
 }
 
 /// Keep the selected command visible before any keyboard action can stop it.
 fn reveal_selected_command(state: &mut AppState) {
-    let Some(id) = state.command_selected.clone() else {
+    let Some(target) = state.command_selected.clone() else {
         return;
     };
-    let Some((item, call)) = state.command_location(&id) else {
+    let Some((item, call)) = state.command_location(&target) else {
         return;
     };
-    crate::conversation::build::reveal_command_receipt(state, item, call);
     let width = crate::conversation::geometry::content_width(state);
-    let (_, _, commands, _, _, _) = state.conversation_build(width);
-    if let Some(hit) = commands
-        .iter()
-        .find(|hit| hit.item == item && hit.call == call && !hit.receipt)
-    {
+    let line = match call {
+        Some(call) => {
+            crate::conversation::build::reveal_command_receipt(state, item, call);
+            let (_, _, commands, _, _, _) = state.conversation_build(width);
+            commands
+                .iter()
+                .find(|hit| hit.item == item && hit.call == call && !hit.receipt)
+                .map(|hit| hit.line)
+        }
+        // A user shell is its own transcript item: its first row is the row.
+        None => state.item_start_line(item, width),
+    };
+    if let Some(line) = line {
         let height = crate::conversation::geometry::viewport_height(state);
         let top = crate::conversation::geometry::effective_scroll(
             state.conv.scroll,
@@ -1912,8 +1909,8 @@ fn reveal_selected_command(state: &mut AppState) {
             state.conversation_lines(width).len(),
             height,
         );
-        if hit.line < top || hit.line >= top + height {
-            state.conv.scroll = hit.line.saturating_sub(height / 2);
+        if line < top || line >= top + height {
+            state.conv.scroll = line.saturating_sub(height / 2);
             state.conv.auto_scroll = false;
         }
     }
@@ -1921,51 +1918,73 @@ fn reveal_selected_command(state: &mut AppState) {
 
 /// Toggle the focused command's output. Clicking its row does the same.
 fn toggle_selected_command(state: &mut AppState) {
-    let Some(id) = state.command_selected.clone() else {
+    let Some(target) = state.command_selected.clone() else {
         return;
     };
-    let Some((item, call)) = state.command_location(&id) else {
+    let Some((item, call)) = state.command_location(&target) else {
         state.command_selected = None;
         return;
     };
-    interaction::toggle_call(state, item, call);
+    match call {
+        Some(call) => {
+            interaction::toggle_call(state, item, call);
+        }
+        None => {
+            interaction::toggle_fold(state, item);
+        }
+    }
     state.conv.plain.clear();
 }
 
-/// Ask the runtime to stop ONE focused running command. The row says
+/// Ask the runtime to stop ONE focused running execution. The row says
 /// "stopping" from here on; only the runtime's terminal event says it stopped.
 ///
-/// The id is re-resolved against the current candidate set first, so a stale
-/// selection — a command that finished, or a turn that ended — stops nothing.
+/// The selection is re-resolved against the current candidate set first, so a
+/// stale pick — a command that finished, or a turn that ended — stops nothing.
 fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
     let Some(selected) = state.command_selected.clone() else {
         return Vec::new();
     };
-    let Some((_, _, id)) = state
+    let Some(candidate) = state
         .stoppable_commands()
         .into_iter()
-        .find(|(_, _, c)| c == &selected)
+        .find(|c| c.target == selected)
     else {
         state.command_selected = None;
         return Vec::new();
     };
-    if !state
-        .transcript
-        .set_tool_stop(&id, crate::transcript::StopRequest::Sent)
-    {
-        state.command_selected = None;
-        return Vec::new();
+    match candidate.target {
+        crate::state::CommandTarget::Call(id) => {
+            if !state
+                .transcript
+                .set_tool_stop(&id, crate::transcript::StopRequest::Sent)
+            {
+                state.command_selected = None;
+                return Vec::new();
+            }
+            // The stopped command leaves the candidate set; keep the focus on
+            // the next one rather than dropping the user back to the composer
+            // mid-batch.
+            ensure_command_selection(state);
+            if state.command_selected.is_none() && state.workbench_focus == WorkbenchFocus::Command
+            {
+                state.workbench_focus = WorkbenchFocus::Input;
+            }
+            vec![Effect::Send(ClientCommand::CancelToolCall {
+                session_id: state.session_id.clone(),
+                call_id: id,
+            })]
+        }
+        crate::state::CommandTarget::UserShell(id) => {
+            // The row stays selected until its terminal event; the runtime's
+            // second refusal is already a no-op, so no local "sent" flag is
+            // invented here.
+            vec![Effect::Send(ClientCommand::CancelUserShell {
+                session_id: state.session_id.clone(),
+                execution_id: id,
+            })]
+        }
     }
-    // The stopped command leaves the candidate set; keep the focus on the next
-    // one rather than dropping the user back to the composer mid-batch.
-    ensure_command_selection(state);
-    if state.command_selected.is_none() && state.workbench_focus == WorkbenchFocus::Command {
-        state.workbench_focus = WorkbenchFocus::Input;
-    }
-    vec![Effect::Send(ClientCommand::CancelToolCall {
-        session_id: state.session_id.clone(),
-        call_id: id,
-    })]
 }
 
 /// Ctrl+O opens or closes the latest tool receipt and its member details.
@@ -2562,7 +2581,7 @@ mod disclosure_tests {
     }
 
     #[test]
-    fn user_shell_row_click_opens_its_details_not_a_toggle() {
+    fn user_shell_row_click_toggles_its_output_in_place() {
         let mut s = test_state();
         three_groups(&mut s);
         s.transcript.push_user_shell_started(
@@ -2587,14 +2606,27 @@ mod disclosure_tests {
         click(&mut s, 3, row);
         assert_eq!(
             s.active_screen,
-            crate::screen::Screen::Shell,
-            "a user shell row opens Shell Details"
+            crate::screen::Screen::Conversation,
+            "a user shell expands inline, never on a second surface"
         );
-        assert_eq!(s.shell_screen_item, Some(item), "focused on THAT execution");
+        let TranscriptItem::UserShell(shell) = &s.transcript.items()[item] else {
+            panic!("user shell item expected");
+        };
+        assert!(shell.expanded, "the click opened THAT execution");
         assert!(
             expanded_flags(&s).iter().all(|(_, e)| !e),
             "no tool group was toggled by the shell click"
         );
+
+        // The same row now folds it back.
+        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
+        let (line, _) = *hits.iter().find(|(_, i)| *i == item).unwrap();
+        let row = screen_row_of(&s, line);
+        click(&mut s, 3, row);
+        let TranscriptItem::UserShell(shell) = &s.transcript.items()[item] else {
+            panic!("user shell item expected");
+        };
+        assert!(!shell.expanded, "the second click folded it again");
     }
 
     #[test]

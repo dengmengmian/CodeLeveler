@@ -49,9 +49,6 @@ pub struct DisclosurePresentation {
     /// this when it IS authoritative (a single execution) — this renderer
     /// will show whatever it is given.
     pub duration_ms: Option<u64>,
-    /// First meaningful error line, shown under the folded row so a failure
-    /// never requires expanding to notice.
-    pub first_error: Option<String>,
 }
 
 /// The header row: `▸ label · 1.2s`, `▾ ✗ label · 2 failed`. The whole row is
@@ -140,30 +137,10 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
 
 /// A duration as the rest of the activity stream writes it: `1.2s` under a
 /// minute, `2m03s` past it. Seconds only — the row never claims milliseconds.
-fn format_duration(ms: u64) -> String {
+pub(crate) fn format_duration(ms: u64) -> String {
     if ms < 60_000 {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000)
     }
-}
-
-/// The folded form: the header row plus, for failures, the first meaningful
-/// error line riding along underneath.
-pub fn collapsed_lines(
-    p: &DisclosurePresentation,
-    theme: &Theme,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let mut out = vec![header_line(p, theme, width)];
-    if let Some(err) = &p.first_error {
-        out.push(Line::from(vec![
-            Span::styled("  └ ".to_string(), Style::default().fg(theme.text.muted)),
-            Span::styled(
-                truncate_display(err, width.saturating_sub(4)),
-                Style::default().fg(theme.status.warning),
-            ),
-        ]));
-    }
-    out
 }

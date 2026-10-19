@@ -1216,7 +1216,8 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
 }
 
 /// Route `!command`: enters input history (like slash commands), never the
-/// conversation or the model; opens Shell Details immediately.
+/// conversation or the model. Its execution block joins the conversation
+/// timeline when the runtime reports it started.
 fn submit_user_shell(state: &mut AppState, cmd: String) -> Vec<Effect> {
     if cmd.trim().is_empty() {
         // Bare `!`: keep the composer content so the user can continue
@@ -1236,8 +1237,9 @@ fn submit_user_shell(state: &mut AppState, cmd: String) -> Vec<Effect> {
         return Vec::new();
     }
     state.composer.take();
-    // The Details screen opens now; UserShellStarted fills it in.
-    state.active_screen = crate::screen::Screen::Shell;
+    // The command and its result are transcript rows now. A reader who had
+    // scrolled into history must see the row it just created and its output.
+    crate::conversation::interaction::jump_to_live_edge(state);
     vec![Effect::Send(
         leveler_client_protocol::ClientCommand::RunUserShell {
             session_id: state.session_id.clone(),

@@ -354,7 +354,7 @@ pub fn item_render(
             sub_agent_lines(block, theme, wrap_width, &mut out, t, 0)
         }
         TranscriptItem::UserShell(shell) => {
-            out.extend(user_shell_lines(shell, theme, wrap_width, t, 0));
+            out.extend(user_shell_lines(shell, theme, wrap_width, t, 0, false));
         }
         TranscriptItem::Plan(plan) => historical_plan_lines(plan, theme, wrap_width, &mut out, t),
         TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out, t),
@@ -1319,19 +1319,34 @@ fn push_prefixed(
     }
 }
 
+/// Rows of a finished local command kept visible before its result is folded.
+const USER_SHELL_PREVIEW_ROWS: usize = 6;
+/// Body indent: output belongs to the command row above it.
+const USER_SHELL_INDENT: &str = "  ";
+
 /// User shell presentation adapter: one execution block → the shared
 /// disclosure language. Clearly marked as USER-initiated ("Run (user)"), so
-/// it can never read as an agent tool call; running shows a live `◌` row.
+/// it can never read as an agent tool call.
+///
+/// The row is inline, not a drill-down: a local command is user-authored
+/// output, so its result lives in the conversation beside the command that
+/// produced it. Collapsed shows a bounded tail (plus the failure's own error
+/// line); expanded shows every retained row, wrapped, so nothing is cut off
+/// at the right edge.
 pub(crate) fn user_shell_lines(
     shell: &crate::transcript::UserShellBlock,
     theme: &Theme,
     wrap_width: usize,
     t: &crate::i18n::UiText,
     now_elapsed_secs: u64,
+    focused: bool,
 ) -> Vec<Line<'static>> {
     use crate::transcript::UserShellStatus;
+    let width = wrap_width.max(1);
     let mut out = Vec::new();
     let label = format!("{} {}", t.user_shell_run_label, shell.command);
+    let lines: Vec<&str> = shell.output.lines().collect();
+
     if shell.status == UserShellStatus::Running {
         let elapsed = (now_elapsed_secs as i64 - shell.started_elapsed_secs).max(0);
         let suffix = if elapsed > 0 {
@@ -1339,16 +1354,35 @@ pub(crate) fn user_shell_lines(
         } else {
             String::new()
         };
+        // The Command focus marker is the same `→` every focused command row
+        // wears; otherwise the live row keeps its own `◌`.
+        let opener = if focused { "→ " } else { "◌ " };
         out.push(Line::from(vec![
-            Span::styled("◌ ".to_string(), Style::default().fg(theme.accent.primary)),
             Span::styled(
-                crate::render::truncate_display(&label, wrap_width.saturating_sub(8)),
+                opener.to_string(),
+                Style::default().fg(theme.accent.primary),
+            ),
+            Span::styled(
+                crate::render::truncate_display(&label, width.saturating_sub(8)),
                 Style::default().fg(theme.text.primary),
             ),
             Span::styled(suffix, Style::default().fg(theme.text.muted)),
         ]));
+        if shell.expanded {
+            push_shell_command_detail(&mut out, shell, &label, width, theme);
+            if shell.output_truncated {
+                push_shell_marker(&mut out, t.shell_truncated, theme, width);
+            }
+            push_shell_output(&mut out, &lines, width, theme);
+        } else {
+            if shell.output_truncated {
+                push_shell_marker(&mut out, t.shell_truncated, theme, width);
+            }
+            push_shell_tail(&mut out, &lines, width, theme, t, true);
+        }
         return out;
     }
+
     let failed = shell.status == UserShellStatus::Failed;
     let label = match shell.status {
         UserShellStatus::Cancelled => format!("{label} · {}", t.user_shell_cancelled),
@@ -1356,7 +1390,7 @@ pub(crate) fn user_shell_lines(
         _ => label,
     };
     let presentation = crate::presentation::disclosure::DisclosurePresentation {
-        label,
+        label: label.clone(),
         failed: usize::from(failed),
         failed_suffix: shell
             .exit_code
@@ -1368,44 +1402,145 @@ pub(crate) fn user_shell_lines(
         expanded: shell.expanded,
         // A user shell is a direct invocation, never a running stage header.
         running: false,
-        // A user shell row opens Shell Details (its own screen) rather than
-        // expanding inline, so it carries the drill-down marker, not the
-        // inline `▸/▾`.
-        drill_down: true,
+        // The result expands inline; there is no second surface to drill into.
+        drill_down: false,
         duration_ms: shell.duration_ms,
-        first_error: (!shell.expanded && failed)
-            .then(|| {
-                shell
-                    .output
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .map(str::to_string)
-            })
-            .flatten(),
     };
-    if !shell.expanded {
-        return crate::presentation::disclosure::collapsed_lines(&presentation, theme, wrap_width);
-    }
-    out.push(crate::presentation::disclosure::header_line(
-        &presentation,
-        theme,
-        wrap_width,
-    ));
-    if shell.output_truncated {
-        out.push(Line::from(Span::styled(
-            format!("  {}", t.shell_truncated),
+    let mut header = crate::presentation::disclosure::header_line(&presentation, theme, width);
+    // A user command's runtime is a measured fact even below the sub-100ms
+    // floor the shared header uses to keep agent clock noise off the row.
+    if let Some(ms) = shell.duration_ms.filter(|ms| *ms < 100) {
+        header.spans.push(Span::styled(
+            format!(
+                " · {}",
+                crate::presentation::disclosure::format_duration(ms)
+            ),
             Style::default().fg(theme.text.muted),
-        )));
+        ));
     }
-    for raw in shell.output.lines() {
+    out.push(header);
+
+    if shell.expanded {
+        push_shell_command_detail(&mut out, shell, &label, width, theme);
+        if shell.output_truncated {
+            push_shell_marker(&mut out, t.shell_truncated, theme, width);
+        }
+        push_shell_output(&mut out, &lines, width, theme);
+        return out;
+    }
+    if shell.output_truncated {
+        push_shell_marker(&mut out, t.shell_truncated, theme, width);
+    }
+    if failed {
+        let error = crate::activity_stream::shell_failure_line(&shell.output).or_else(|| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+        });
+        if let Some(error) = error {
+            let room = width.saturating_sub(4).max(1);
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{USER_SHELL_INDENT}└ "),
+                    Style::default().fg(theme.text.muted),
+                ),
+                Span::styled(
+                    crate::render::truncate_display(&error, room),
+                    Style::default().fg(theme.status.warning),
+                ),
+            ]));
+        }
+    } else {
+        push_shell_tail(&mut out, &lines, width, theme, t, false);
+    }
+    out
+}
+
+/// The compact result tail under a collapsed command row: what just happened,
+/// with the folded row count named rather than silently dropped.
+fn push_shell_tail(
+    out: &mut Vec<Line<'static>>,
+    lines: &[&str],
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+    live: bool,
+) {
+    let rows = if live {
+        crate::activity_stream::LIVE_TAIL_ROWS
+    } else {
+        USER_SHELL_PREVIEW_ROWS
+    };
+    let start = lines.len().saturating_sub(rows);
+    if start > 0 {
+        let marker = t.command_output_hidden.replace("{}", &start.to_string());
+        push_shell_marker(out, &marker, theme, width);
+    }
+    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
+    for raw in &lines[start..] {
         let line = crate::render::sanitize_terminal_line(raw);
         out.push(Line::from(Span::styled(
-            crate::render::truncate_display(&format!("  {line}"), wrap_width),
+            format!(
+                "{USER_SHELL_INDENT}{}",
+                crate::render::truncate_display(&line, room)
+            ),
             Style::default().fg(theme.text.secondary),
         )));
     }
-    out
+}
+
+/// The full retained output, wrapped so a long row stays readable instead of
+/// being cut at the right edge.
+fn push_shell_output(out: &mut Vec<Line<'static>>, lines: &[&str], width: usize, theme: &Theme) {
+    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
+    for raw in lines {
+        let line = crate::render::sanitize_terminal_line(raw);
+        for row in wrap(&line, room) {
+            out.push(Line::from(Span::styled(
+                if row.is_empty() {
+                    String::new()
+                } else {
+                    format!("{USER_SHELL_INDENT}{row}")
+                },
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
+    }
+}
+
+/// When the one-line header cannot carry the exact command (it was cut, or it
+/// contains a newline), the expanded body prints it in full.
+fn push_shell_command_detail(
+    out: &mut Vec<Line<'static>>,
+    shell: &crate::transcript::UserShellBlock,
+    label: &str,
+    width: usize,
+    theme: &Theme,
+) {
+    let header_room = width.saturating_sub(16);
+    if !shell.command.contains('\n') && UnicodeWidthStr::width(label) <= header_room {
+        return;
+    }
+    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
+    for row in wrap(&format!("$ {}", shell.command), room) {
+        out.push(Line::from(Span::styled(
+            format!("{USER_SHELL_INDENT}{row}"),
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+}
+
+fn push_shell_marker(out: &mut Vec<Line<'static>>, text: &str, theme: &Theme, width: usize) {
+    let room = width.saturating_sub(USER_SHELL_INDENT.len()).max(1);
+    out.push(Line::from(Span::styled(
+        format!(
+            "{USER_SHELL_INDENT}{}",
+            crate::render::truncate_display(text, room)
+        ),
+        Style::default().fg(theme.text.muted),
+    )));
 }
 
 #[cfg(test)]
@@ -1414,7 +1549,7 @@ mod tests {
     use super::*;
     use crate::i18n::Locale;
     use crate::theme::Theme;
-    use crate::transcript::{AssistantKind, ToolCallBlock, ToolGroupBlock};
+    use crate::transcript::{AssistantKind, ToolCallBlock, ToolGroupBlock, UserShellStatus};
     use leveler_client_protocol::ToolCallId;
 
     fn line_text(line: &Line<'_>) -> String {
@@ -1466,38 +1601,191 @@ mod tests {
             started_elapsed_secs: 0,
             expanded: false,
         };
-        let row: String = user_shell_lines(&shell, &Theme::no_color(), 80, Locale::Zh.text(), 0)
-            .iter()
-            .map(line_text)
-            .collect();
+        let row: String =
+            user_shell_lines(&shell, &Theme::no_color(), 80, Locale::Zh.text(), 0, false)
+                .iter()
+                .map(line_text)
+                .collect();
         assert!(row.contains("状态未知"), "{row:?}");
         assert!(!row.contains('✗') && !row.contains("已取消"), "{row:?}");
     }
 
-    /// A user shell row opens its own Details screen, so it carries the
-    /// drill-down marker `↗`, not the inline `▸/▾` a tool group expands with.
-    /// The same glyph must not mean two different things.
+    /// A user shell is an inline execution, not a drill-down surface: its row
+    /// carries the same `▸/▾` fold marker every other conversation block uses.
     #[test]
-    fn a_user_shell_row_advertises_drill_down_not_inline_expand() {
-        use crate::transcript::{UserShellBlock, UserShellStatus};
-        let shell = UserShellBlock {
-            id: leveler_core::UserShellId::new("ush-2"),
-            command: "cargo test".into(),
+    fn a_user_shell_row_advertises_inline_expand() {
+        let shell = shell_block(UserShellStatus::Success, "ok", false);
+        let rows = shell_rows(&shell, 80);
+        assert!(rows[0].contains('▸'), "{rows:?}");
+        assert!(!rows[0].contains('↗'), "{rows:?}");
+    }
+
+    /// Every finished local command carries the runtime's measured duration,
+    /// including one below the shared header's 100ms noise floor.
+    #[test]
+    fn a_fast_user_shell_still_reports_its_measured_duration() {
+        let mut shell = shell_block(UserShellStatus::Success, "ok\n", false);
+        shell.duration_ms = Some(99);
+        let rows = shell_rows(&shell, 80);
+        assert!(rows[0].contains("0.1s"), "{rows:?}");
+    }
+
+    /// A local command is user-authored output, not agent exploration: its
+    /// result is visible in the conversation without opening anything.
+    #[test]
+    fn a_finished_user_shell_shows_its_output_inline_by_default() {
+        let shell = shell_block(
+            UserShellStatus::Success,
+            "On branch main\nYour branch is up to date.\n\nnothing to commit, working tree clean\n",
+            false,
+        );
+        let rows = shell_rows(&shell, 80);
+        let text = rows.join("\n");
+        assert!(text.contains("On branch main"), "{text}");
+        assert!(
+            text.contains("nothing to commit, working tree clean"),
+            "{text}"
+        );
+    }
+
+    /// While the command runs, its live tail is in the conversation — the row
+    /// updates in place instead of accumulating a second result elsewhere.
+    #[test]
+    fn a_running_user_shell_shows_a_live_tail() {
+        let mut shell = shell_block(
+            UserShellStatus::Running,
+            "Compiling leveler-runtime\nCompiling leveler-tui\n\nrunning 128 tests\n",
+            false,
+        );
+        shell.duration_ms = None;
+        let rows = shell_rows_at(&shell, 80, 3);
+        let text = rows.join("\n");
+        assert!(text.contains("running 128 tests"), "{text}");
+        assert!(text.contains("3s"), "live elapsed is shown: {text}");
+    }
+
+    /// A long result keeps its tail visible by default and says how many rows
+    /// are folded away — the cut is disclosed, never silent.
+    #[test]
+    fn a_collapsed_user_shell_marks_the_lines_it_is_not_showing() {
+        let output: String = (1..=20).map(|n| format!("line-{n:02}\n")).collect();
+        let shell = shell_block(UserShellStatus::Success, &output, false);
+        let rows = shell_rows(&shell, 80);
+        let text = rows.join("\n");
+        assert!(text.contains("line-20"), "tail stays visible: {text}");
+        assert!(text.contains("未显示"), "the folded rows are named: {text}");
+    }
+
+    /// Expanded is the full retained record: every line, and long lines wrap
+    /// instead of being cut at the right edge.
+    #[test]
+    fn expanding_a_user_shell_keeps_every_retained_line_and_wraps_long_ones() {
+        let long = "字".repeat(120);
+        let mut output: String = (1..=30).map(|n| format!("row-{n:02}\n")).collect();
+        output.push_str(&long);
+        output.push('\n');
+        let mut shell = shell_block(UserShellStatus::Success, &output, true);
+        shell.duration_ms = Some(1_500);
+        let rows = shell_rows(&shell, 48);
+        let text = rows.join("\n");
+        for n in 1..=30 {
+            assert!(text.contains(&format!("row-{n:02}")), "missing row-{n:02}");
+        }
+        // Rows carry their body indent; the content itself must survive whole.
+        let joined: String = rows.join("").replace(' ', "");
+        assert!(
+            joined.contains(&long),
+            "the long line is wrapped, not truncated: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| UnicodeWidthStr::width(r.as_str()) <= 48),
+            "a row overruns the terminal: {rows:?}"
+        );
+    }
+
+    /// A failed command states its exit code and the line that says what broke
+    /// without requiring the reader to expand it first.
+    #[test]
+    fn a_failed_user_shell_shows_exit_and_error_without_expanding() {
+        let mut shell = shell_block(
+            UserShellStatus::Failed,
+            "running 128 tests\nassertion failed: expected Completed\n",
+            false,
+        );
+        shell.exit_code = Some(101);
+        let rows = shell_rows(&shell, 80);
+        let text = rows.join("\n");
+        assert!(text.contains("exit 101"), "{text}");
+        assert!(text.contains("assertion failed"), "{text}");
+    }
+
+    /// The header is a one-line summary; expanding reveals the exact command,
+    /// wrapped, so a long or multi-line command is never cut off for good.
+    #[test]
+    fn a_long_command_is_fully_visible_when_expanded() {
+        let command = format!(
+            "cargo test --package leveler-tui --test reducer -- --nocapture {}",
+            "arg".repeat(40)
+        );
+        let mut shell = shell_block(UserShellStatus::Success, "ok\n", true);
+        shell.command = command.clone();
+        let rows = shell_rows(&shell, 48);
+        let joined: String = rows.join("").replace(' ', "");
+        assert!(
+            joined.contains(&command.replace(' ', "")),
+            "the exact command is not reachable: {rows:?}"
+        );
+    }
+
+    /// A command that printed nothing is its header alone: no invented marker
+    /// row, no empty output section.
+    #[test]
+    fn a_user_shell_with_no_output_is_only_its_header() {
+        let shell = shell_block(UserShellStatus::Success, "", false);
+        let rows = shell_rows(&shell, 80);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    fn shell_block(
+        status: UserShellStatus,
+        output: &str,
+        expanded: bool,
+    ) -> crate::transcript::UserShellBlock {
+        crate::transcript::UserShellBlock {
+            id: leveler_core::UserShellId::new("ush-render"),
+            command: "git status".into(),
             cwd: "/repo".into(),
-            status: UserShellStatus::Success,
-            output: "ok".into(),
+            status,
+            output: output.into(),
             output_truncated: false,
             exit_code: Some(0),
-            duration_ms: Some(1_000),
+            duration_ms: Some(200),
             started_elapsed_secs: 0,
-            expanded: false,
-        };
-        let row: String = user_shell_lines(&shell, &Theme::no_color(), 80, Locale::Zh.text(), 0)
-            .iter()
-            .map(line_text)
-            .collect();
-        assert!(row.contains('↗'), "{row:?}");
-        assert!(!row.contains('▸') && !row.contains('▾'), "{row:?}");
+            expanded,
+        }
+    }
+
+    fn shell_rows(shell: &crate::transcript::UserShellBlock, width: usize) -> Vec<String> {
+        shell_rows_at(shell, width, 0)
+    }
+
+    fn shell_rows_at(
+        shell: &crate::transcript::UserShellBlock,
+        width: usize,
+        now_elapsed_secs: u64,
+    ) -> Vec<String> {
+        user_shell_lines(
+            shell,
+            &Theme::no_color(),
+            width,
+            Locale::Zh.text(),
+            now_elapsed_secs,
+            false,
+        )
+        .iter()
+        .map(line_text)
+        .collect()
     }
 
     // ---- Assistant prose is communication: never folded ----

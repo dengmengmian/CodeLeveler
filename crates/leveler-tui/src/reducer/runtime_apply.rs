@@ -29,7 +29,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             if ours
                 && session_id == state.session_id
                 && !state.is_busy()
-                && state.shell_screen_item.is_none()
+                && !state.transcript.has_running_user_shell()
                 && !entries.is_empty()
             {
                 replay_history(state, entries, omitted_turns);
@@ -833,9 +833,8 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 cwd,
                 state.elapsed_secs as i64,
             );
-            // Focus the Details screen on this execution (the `!` submit
-            // already switched to it).
-            state.shell_screen_item = state.transcript.user_shell_index(&execution_id);
+            // The block is in the conversation now; its output and terminal
+            // event update the same row in place.
         }
         RuntimeEvent::UserShellOutput {
             execution_id,
@@ -861,6 +860,19 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 duration_ms,
                 crate::transcript::UserShellStatus::from_wire(&status),
             );
+            // The Command focus exists to stop and open a RUNNING execution.
+            // Once this one ends it is no longer a candidate, so the keys go
+            // back to the composer instead of Enter toggling a settled row.
+            if state.command_selected.as_ref()
+                == Some(&crate::state::CommandTarget::UserShell(
+                    execution_id.clone(),
+                ))
+            {
+                state.command_selected = None;
+                if state.workbench_focus == crate::state::WorkbenchFocus::Command {
+                    state.workbench_focus = crate::state::WorkbenchFocus::Input;
+                }
+            }
         }
         RuntimeEvent::ContextCompacted { from, to } => {
             // The measured transcript was replaced. The runtime drops its own
@@ -1879,7 +1891,6 @@ fn apply_session_with(
     state.transcript.classify_replayed_history();
     // User shell executions (history + a still-running one) survive
     // reconnect via the snapshot; blocks are rebuilt in order.
-    state.shell_screen_item = None;
     for shell in &session.user_shells {
         let running = shell.status == "running";
         // Back-date the start (possibly below zero) so the live runtime
@@ -1903,8 +1914,6 @@ fn apply_session_with(
                 shell.elapsed_secs * 1000,
                 crate::transcript::UserShellStatus::from_wire(&shell.status),
             );
-        } else {
-            state.shell_screen_item = state.transcript.user_shell_index(&shell.id);
         }
     }
     if let Some(report) = session.completion_report {

@@ -1245,7 +1245,6 @@ fn disclosure_presentation(
             running: true,
             drill_down: false,
             duration_ms: None,
-            first_error: None,
         };
     }
     // A command that ran without the network it needed lacks a permission;
@@ -1284,7 +1283,6 @@ fn disclosure_presentation(
         running: false,
         drill_down: false,
         duration_ms,
-        first_error: (!expanded).then(|| first_error_line(visible)).flatten(),
     }
 }
 
@@ -1397,20 +1395,6 @@ fn group_duration_ms(visible: &[&ToolCallBlock]) -> Option<u64> {
         total = total.saturating_add(burst_max.get(&id).copied().unwrap_or(0));
     }
     Some(total)
-}
-
-/// The first meaningful error line of a failed call, for the collapsed row.
-fn first_error_line(visible: &[&ToolCallBlock]) -> Option<String> {
-    visible
-        .iter()
-        .find(|c| c.status == ToolStatus::Failed && !needs_network_permission(c))
-        .and_then(|c| c.preview.as_deref())
-        .and_then(|p| {
-            p.lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(str::to_string)
-        })
 }
 
 /// Whether a completed/running call may appear as its own Conversation unit.
@@ -3179,7 +3163,7 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
 /// first line that reports a failure (`error…`, `FAIL`, `✗`, `panic`), else the
 /// first thing it printed — never a [`is_runtime_note`] row, which says how the
 /// command ran rather than why it failed. Color escapes are removed.
-fn shell_failure_line(preview: &str) -> Option<String> {
+pub(crate) fn shell_failure_line(preview: &str) -> Option<String> {
     let content: Vec<String> = preview
         .lines()
         .map(|l| strip_color(l).trim().to_string())

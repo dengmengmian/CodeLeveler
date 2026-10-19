@@ -1386,6 +1386,18 @@ impl TranscriptState {
             .position(|item| matches!(item, TranscriptItem::UserShell(shell) if &shell.id == id))
     }
 
+    /// Whether a local command is still executing. A history replay must not
+    /// replace the transcript under a live execution.
+    pub fn has_running_user_shell(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                item,
+                TranscriptItem::UserShell(shell)
+                    if shell.status == UserShellStatus::Running
+            )
+        })
+    }
+
     /// Whether a transcript entry can be folded at all.
     pub fn is_foldable_at(&self, index: usize) -> bool {
         self.items.get(index).is_some_and(is_foldable_item)
@@ -1511,6 +1523,18 @@ impl TranscriptState {
     /// follows the Thought makes every tool body unreachable from the keyboard.
     pub fn last_tool_group_index(&self) -> Option<usize> {
         (0..self.items.len()).rposition(|i| matches!(self.items[i], TranscriptItem::ToolGroup(_)))
+    }
+
+    /// The latest execution block — an agent tool group or a user-typed
+    /// `!command`. Both are inline disclosures; Ctrl+O reaches whichever one
+    /// is the newest on screen.
+    pub fn last_execution_index(&self) -> Option<usize> {
+        (0..self.items.len()).rposition(|i| {
+            matches!(
+                self.items[i],
+                TranscriptItem::ToolGroup(_) | TranscriptItem::UserShell(_)
+            )
+        })
     }
 
     /// Classify replayed history, where no live event order survives: inside

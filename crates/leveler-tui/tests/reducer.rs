@@ -9031,9 +9031,9 @@ fn bang_routes_to_user_shell_and_never_the_model() {
         ),
         "{effects:?}"
     );
-    // Details opens immediately; input history keeps it; the conversation
-    // and model history never see it.
-    assert_eq!(s.active_screen, Screen::Shell);
+    // The command joins the conversation timeline in place. Nothing opens a
+    // second surface; input history keeps it; the model history never sees it.
+    assert_eq!(s.active_screen, Screen::Conversation);
     assert!(s.composer.history().iter().any(|h| h == "!echo hi"));
     assert!(
         !s.transcript
@@ -9042,6 +9042,29 @@ fn bang_routes_to_user_shell_and_never_the_model() {
             .any(|i| matches!(i, TranscriptItem::User(text) if text.contains("echo"))),
         "a shell command must not enter the conversation"
     );
+}
+
+#[test]
+fn submitting_a_local_command_returns_to_the_live_edge() {
+    let mut s = opened();
+    s.transcript.push_user("earlier turn".into());
+    for n in 0..40 {
+        s.transcript.push_note(format!("history {n}"));
+    }
+    // The reader scrolled back into history; running a command must show the
+    // row it creates rather than appending it below the viewport.
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 0;
+    typed(&mut s, "!echo hi");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RunUserShell { .. })]
+        ),
+        "{effects:?}"
+    );
+    assert!(s.conv.auto_scroll, "the new command is followed live");
 }
 
 #[test]
@@ -9097,6 +9120,14 @@ fn user_shell_lifecycle_updates_the_block() {
     );
     reduce(
         &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-1"),
+            stream: "stderr".into(),
+            chunk: "warning from stderr\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
         Action::Runtime(RuntimeEvent::UserShellExited {
             execution_id: leveler_core::UserShellId::new("ush-1"),
             exit_code: Some(0),
@@ -9113,18 +9144,185 @@ fn user_shell_lifecycle_updates_the_block() {
     );
     assert_eq!(shell.duration_ms, Some(4200));
     assert!(
-        shell.output.contains("red line") && !shell.output.contains('\u{1b}'),
-        "ANSI stripped before buffering: {:?}",
+        shell.output.contains("red line")
+            && shell.output.contains("warning from stderr")
+            && !shell.output.contains('\u{1b}'),
+        "stdout and stderr both survive, ANSI stripped: {:?}",
         shell.output
     );
 }
 
 #[test]
-fn shell_details_x_cancels_only_a_running_shell() {
+fn a_fast_local_command_renders_exactly_one_block() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-fast", "git status");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-fast"),
+            exit_code: Some(0),
+            duration_ms: 12,
+            status: "success".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert_eq!(
+        screen.matches("用户执行 git status").count(),
+        1,
+        "one execution, one row: {screen}"
+    );
+    assert!(
+        screen.contains("0.0s"),
+        "the measured runtime is on the row: {screen}"
+    );
+    assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+#[test]
+fn two_local_commands_stay_separate_ordered_blocks() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-1", "echo first");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-1"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    shell_started(&mut s, "ush-2", "echo second");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-2"),
+            stream: "stdout".into(),
+            chunk: "second output\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-2"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    let first = screen.find("用户执行 echo first").expect("first row");
+    let second = screen.find("用户执行 echo second").expect("second row");
+    assert!(first < second, "transcript order is execution order");
+    assert!(screen.contains("second output"), "{screen}");
+    assert_eq!(screen.matches("用户执行").count(), 2, "{screen}");
+}
+
+#[test]
+fn a_long_local_result_stays_reachable_at_every_terminal_size() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-layout", "cargo test");
+    let mut chunk = String::new();
+    for n in 1..=80 {
+        chunk.push_str(&format!("row-{n:02} {}\n", "字".repeat(20)));
+    }
+    chunk.push_str("TAILMARK\n");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-layout"),
+            stream: "stdout".into(),
+            chunk,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-layout"),
+            exit_code: Some(0),
+            duration_ms: 2_300,
+            status: "success".into(),
+        }),
+    );
+    for (w, h) in [(120, 40), (80, 24), (48, 20)] {
+        let screen = rendered(&mut s, w, h);
+        assert!(screen.contains("cargo test"), "{w}x{h}: {screen}");
+        assert!(
+            screen.contains("TAILMARK"),
+            "{w}x{h}: the tail of the result is not reachable: {screen}"
+        );
+        assert!(
+            !screen.contains('�'),
+            "{w}x{h}: a split wide glyph reached the terminal"
+        );
+    }
+}
+
+#[test]
+fn a_running_user_shell_shows_its_live_output_in_the_conversation() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-live", "cargo test");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-live"),
+            stream: "stdout".into(),
+            chunk: "Compiling leveler-runtime\nrunning 128 tests\n".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("用户执行"), "{screen}");
+    assert!(screen.contains("cargo test"), "{screen}");
+    assert!(
+        screen.contains("running 128 tests"),
+        "live output stays in place: {screen}"
+    );
+    assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+#[test]
+fn a_finished_user_shell_keeps_its_output_and_exit_code_in_the_conversation() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-fail", "cargo test");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-fail"),
+            stream: "stderr".into(),
+            chunk: "running 128 tests\nassertion failed: expected Completed\n".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-fail"),
+            exit_code: Some(101),
+            duration_ms: 8_200,
+            status: "failed".into(),
+        }),
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert!(screen.contains("assertion failed"), "{screen}");
+    assert!(screen.contains("exit 101"), "{screen}");
+    assert!(
+        screen.contains("8.2s"),
+        "the measured duration is shown: {screen}"
+    );
+    assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+#[test]
+fn tab_reaches_a_running_user_shell_and_x_stops_it_inline() {
     let mut s = opened();
     shell_started(&mut s, "ush-run", "sleep 30");
-    s.active_screen = Screen::Shell;
-    let effects = reduce(&mut s, key(KeyCode::Char('x')));
+    // Input → Conversation → Command (the running shell is the only candidate).
+    reduce(&mut s, key(KeyCode::Tab));
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(
+        s.workbench_focus,
+        leveler_tui::state::WorkbenchFocus::Command,
+        "Tab must reach the running local command"
+    );
+    let effects = reduce(&mut s, raw_char('x'));
     assert!(
         matches!(
             effects.as_slice(),
@@ -9133,7 +9331,7 @@ fn shell_details_x_cancels_only_a_running_shell() {
         ),
         "{effects:?}"
     );
-    // Finished shell: x is inert.
+    // A finished shell is no longer a stop candidate.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::UserShellExited {
@@ -9143,12 +9341,48 @@ fn shell_details_x_cancels_only_a_running_shell() {
             status: "cancelled".into(),
         }),
     );
-    s.active_screen = Screen::Shell;
-    let effects = reduce(&mut s, key(KeyCode::Char('x')));
-    assert!(effects.is_empty(), "{effects:?}");
-    // Esc backs out without any cancel.
-    let effects = reduce(&mut s, key(KeyCode::Esc));
-    assert!(effects.is_empty());
+    assert!(s.stoppable_commands().is_empty());
+    assert_eq!(
+        s.workbench_focus,
+        leveler_tui::state::WorkbenchFocus::Input,
+        "a settled shell gives the keys back to the composer"
+    );
+    assert!(s.command_selected.is_none());
+    assert!(reduce(&mut s, raw_char('x')).is_empty());
+}
+
+#[test]
+fn ctrl_o_expands_the_latest_user_shell_in_place() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-o", "git diff");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-o"),
+            stream: "stdout".into(),
+            chunk: (1..=20).map(|n| format!("diff-line-{n:02}\n")).collect(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-o"),
+            exit_code: Some(0),
+            duration_ms: 120,
+            status: "success".into(),
+        }),
+    );
+    reduce(&mut s, ctrl('o'));
+    let idx = s
+        .transcript
+        .user_shell_index(&leveler_core::UserShellId::new("ush-o"))
+        .unwrap();
+    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
+        panic!("shell block expected");
+    };
+    assert!(shell.expanded, "Ctrl+O opens the latest execution");
+    let screen = rendered(&mut s, 100, 40);
+    assert!(screen.contains("diff-line-20"), "{screen}");
     assert_eq!(s.active_screen, Screen::Conversation);
 }
 
@@ -9200,11 +9434,30 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
         shells[1].status,
         leveler_tui::transcript::UserShellStatus::Running
     );
-    let focused = s.focused_user_shell().expect("running shell focused");
-    assert_eq!(focused.command, "sleep 60");
+    let running = shells
+        .iter()
+        .find(|s| s.status == leveler_tui::transcript::UserShellStatus::Running)
+        .expect("running shell restored");
+    assert_eq!(running.command, "sleep 60");
     assert!(
-        (s.elapsed_secs as i64 - focused.started_elapsed_secs) >= 21,
+        (s.elapsed_secs as i64 - running.started_elapsed_secs) >= 21,
         "elapsed survives reconnect"
+    );
+    // The restored live command is still a keyboard-stoppable execution.
+    reduce(&mut s, key(KeyCode::Tab));
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(
+        s.workbench_focus,
+        leveler_tui::state::WorkbenchFocus::Command
+    );
+    let effects = reduce(&mut s, raw_char('x'));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::CancelUserShell { execution_id, .. })]
+                if execution_id.as_str() == "ush-live"
+        ),
+        "{effects:?}"
     );
 }
 
@@ -10533,7 +10786,7 @@ fn a_child_detail_returns_to_the_team_page() {
 }
 
 /// In a running child's detail, `x` stops exactly that child; Esc only
-/// leaves. Back and stop are different actions, as in Shell Details.
+/// leaves. Back and stop are different actions, as on a running command row.
 #[test]
 fn x_in_a_running_child_detail_cancels_that_child_only() {
     let mut s = child_detail_state(leveler_tui::multi_agent::ChildStatus::Running);

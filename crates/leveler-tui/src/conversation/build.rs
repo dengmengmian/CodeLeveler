@@ -96,6 +96,7 @@ impl AppState {
             elapsed_secs: self.elapsed_secs,
             fold_version: self.conv.fold_version,
             focused_command: self.focused_command().cloned(),
+            focused_user_shell: self.focused_user_shell_id().cloned(),
             question_card_open: self.question_card_open(),
         };
         if let Some((k, lines, hits, commands, anchor, starts, sources)) =
@@ -415,9 +416,9 @@ fn build_conversation(
                     ));
                 }
                 TranscriptItem::UserShell(shell) => {
-                    // Every user shell row is a click target: click opens its
-                    // Shell Details (running or finished) — the reducer
-                    // dispatches by item type, geometry stays untouched.
+                    // Every user shell row is a click target: click folds its
+                    // output inline (running or finished) — the same hit map
+                    // every other disclosure uses, geometry stays untouched.
                     hits.push((out.len(), idx));
                     out.extend(crate::render::user_shell_lines(
                         shell,
@@ -425,6 +426,7 @@ fn build_conversation(
                         width,
                         t,
                         state.elapsed_secs,
+                        state.focused_user_shell_id() == Some(&shell.id),
                     ));
                 }
                 _ => unreachable!("non-cacheable item handled above"),
@@ -595,11 +597,12 @@ impl crate::conversation::ConversationView {
     }
 }
 
-/// Resolve the latest tool group to the receipt currently folding it.
+/// Resolve the latest execution (tool group or user command) to the receipt
+/// currently folding it, when it is part of a process run.
 /// Mouse clicks keep their exact item, while the keyboard must open the
 /// containing process run instead of toggling a hidden member.
 pub(crate) fn keyboard_expand_target(state: &AppState) -> Option<usize> {
-    let latest = state.transcript.last_tool_group_index()?;
+    let latest = state.transcript.last_execution_index()?;
     let plan = plan_process_folds(state.transcript.items());
     Some(
         plan.owner[latest]
