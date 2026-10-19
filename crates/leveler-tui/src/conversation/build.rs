@@ -2714,12 +2714,8 @@ mod semantic_copy_tests {
     #[test]
     fn prompt_leading_indentation_and_internal_spaces_survive() {
         let mut s = dark_state();
-        s.transcript
-            .push_user("  前导空格\n正常行 a  b   c".into());
-        assert_eq!(
-            copy_item(&s, 60, 0),
-            "  前导空格\n正常行 a  b   c"
-        );
+        s.transcript.push_user("  前导空格\n正常行 a  b   c".into());
+        assert_eq!(copy_item(&s, 60, 0), "  前导空格\n正常行 a  b   c");
     }
 
     #[test]
