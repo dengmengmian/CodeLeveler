@@ -1168,7 +1168,7 @@ pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub(crate) use transcript_lines::{
     USER_SHELL_STOP_ZONE, paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail,
-    turn_end_marker, user_shell_lines,
+    turn_end_marker, user_shell_lines_with_copy,
 };
 pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,

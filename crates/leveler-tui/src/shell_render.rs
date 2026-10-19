@@ -93,6 +93,37 @@ fn stream_at(marks: &[OutputMark], offset: usize) -> bool {
         .is_some_and(|mark| mark.stderr)
 }
 
+/// The clean plain-text projection of raw captured output for Copy Output.
+///
+/// ANSI/VT style sequences are removed and other control characters are
+/// neutralized, while `\r` overwrites are resolved exactly as the terminal
+/// view resolves them. Tabs, real `│`/`$`/`▏` glyphs, code indentation and
+/// every printable Unicode character survive verbatim: this is the source
+/// content, not a cleaned-up rendering of it.
+pub fn copy_text(raw: &str) -> String {
+    let clean = leveler_core::sanitize_terminal_output_preserving_layout(raw);
+    let mut out = render_output(&clean, &[])
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if clean.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Read the complete combined capture for an execution. The caller advertises
+/// a directory only after every sidecar reports a finished copy, so a missing
+/// file here is a real error (pruned or removed), never a cue to copy a
+/// partial tail instead.
+pub fn read_complete_capture(directory: &std::path::Path) -> Result<String, String> {
+    let path = directory.join("combined.log");
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("完整输出不可用 ({}): {error}", path.display()))?;
+    Ok(copy_text(&String::from_utf8_lossy(&bytes)))
+}
+
 /// A bounded suffix of output suitable for a live/collapsed preview. Starts at
 /// a line boundary so a multibyte character is never split.
 pub fn tail_source(output: &str, max_bytes: usize) -> &str {
@@ -191,5 +222,35 @@ mod tests {
     fn tail_source_starts_on_a_line_boundary() {
         let text = "aaa\nbbb\nccc\n";
         assert_eq!(tail_source(text, 8), "ccc\n");
+    }
+
+    #[test]
+    fn copy_text_keeps_source_glyphs_and_strips_only_style() {
+        let raw = "\u{1b}[32m│ name │ value │\u{1b}[0m\n\
+                   \tSELECT s.id,\n\
+                   \u{1b}[31m▏\u{1b}[0m real ▏ glyph\n\
+                   $\n+\n-\n@@\n";
+        let copied = copy_text(raw);
+        assert_eq!(
+            copied, "│ name │ value │\n\tSELECT s.id,\n▏ real ▏ glyph\n$\n+\n-\n@@\n",
+            "the visual/content glyphs are source text; only ANSI is removed"
+        );
+        assert!(!copied.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn copy_text_resolves_carriage_return_progress() {
+        assert_eq!(
+            copy_text("progress 10%\rprogress 100%\ndone\n"),
+            "progress 100%\ndone\n"
+        );
+    }
+
+    #[test]
+    fn copy_text_preserves_blank_lines_and_a_trailing_newline() {
+        assert_eq!(copy_text("a\n\nb\n"), "a\n\nb\n");
+        assert_eq!(copy_text("\n"), "\n");
+        assert_eq!(copy_text(""), "");
+        assert_eq!(copy_text("no newline"), "no newline");
     }
 }

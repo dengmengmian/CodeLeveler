@@ -965,8 +965,18 @@ impl EventBridge {
                 exit_code,
                 duration_ms,
                 status,
+                full_output,
                 ..
             } => {
+                // The complete capture is its own fact, emitted before the
+                // terminal one. A client copies from it; it never scrapes a
+                // path out of output text.
+                if let Some(directory) = full_output {
+                    let _ = self.events.send(RuntimeEvent::UserShellCaptureReady {
+                        execution_id: execution_id.clone(),
+                        directory,
+                    });
+                }
                 let _ = self.events.send(RuntimeEvent::UserShellExited {
                     execution_id,
                     exit_code,
@@ -3528,6 +3538,7 @@ mod projection_equivalence {
                 status: "success".into(),
                 output_tail: String::new(),
                 output_truncated: false,
+                full_output: None,
             },
         ]);
         assert_eq!(

@@ -12,6 +12,28 @@ pub fn sanitize_terminal_output(input: &str) -> String {
     neutralize_controls(&without_escapes)
 }
 
+/// Remove ANSI/VT escape sequences but keep the layout controls a copy must
+/// preserve: newline, tab and carriage return. Every other control character
+/// becomes a space, so the result cannot drive the terminal.
+///
+/// This is the plain-text projection for copying captured output. It is not
+/// the display projection: the renderer expands tabs to cells on its own.
+pub fn sanitize_terminal_output_preserving_layout(input: &str) -> String {
+    let without_escapes = strip_ansi_escapes(input);
+    without_escapes
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\t' | '\r') {
+                c
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Strip CSI / OSC / simple ESC sequences. Also drops orphaned CSI tails of the
 /// form `[0-9;]*[A-Za-z]` that appear when ESC was already replaced by a space.
 fn strip_ansi_escapes(input: &str) -> String {
@@ -896,5 +918,17 @@ mod tests {
     #[test]
     fn tail_truncation_with_zero_budget_yields_marker_only() {
         assert_eq!(truncate_tail_bytes("abc", 0, "[cut]"), "[cut]");
+    }
+
+    #[test]
+    fn copy_projection_keeps_layout_controls_and_real_glyphs() {
+        let raw = "\u{1b}[31m│ name │ value │\u{1b}[0m\r\ttabbed\n▏ SELECT 1;";
+        let clean = sanitize_terminal_output_preserving_layout(raw);
+        assert_eq!(clean, "│ name │ value │\r\ttabbed\n▏ SELECT 1;");
+        assert!(!clean.contains('\u{1b}'));
+        assert!(
+            clean.contains('\t'),
+            "a tab is source layout, not a terminal control to erase"
+        );
     }
 }

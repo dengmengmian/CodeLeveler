@@ -919,6 +919,56 @@
       }
     },
     {
+      "description": "The runtime's authoritative retained view of a user shell's output. It REPLACES the client's accumulated live chunks: the bounded live channel may have dropped bytes, so appending would preserve a hole. Emitted before the terminal event when the live view could be lossy (and always when a background execution finishes).",
+      "type": "object",
+      "required": [
+        "execution_id",
+        "output_tail",
+        "output_truncated",
+        "type"
+      ],
+      "properties": {
+        "execution_id": {
+          "$ref": "#/definitions/UserShellId"
+        },
+        "output_tail": {
+          "type": "string"
+        },
+        "output_truncated": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "user_shell_output_replaced"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The exact on-disk capture of a user shell execution is complete. `directory` holds `stdout.log`, `stderr.log` and `combined.log`. Clients use it for \"Copy Output\"; it is never inferred from painted text. Emitted before the terminal event, and only when every stream's sidecar reports a finished copy — an unfinished capture is never advertised.",
+      "type": "object",
+      "required": [
+        "directory",
+        "execution_id",
+        "type"
+      ],
+      "properties": {
+        "directory": {
+          "type": "string"
+        },
+        "execution_id": {
+          "$ref": "#/definitions/UserShellId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "user_shell_capture_ready"
+          ]
+        }
+      }
+    },
+    {
       "description": "A user shell execution ended. `status` is `success | failed | cancelled`; `exit_code` is `None` when the process was killed or never spawned.",
       "type": "object",
       "required": [
@@ -4203,6 +4253,56 @@
               "type": "string",
               "enum": [
                 "user_shell_output"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The runtime's authoritative retained view of a user shell's output. It REPLACES the client's accumulated live chunks: the bounded live channel may have dropped bytes, so appending would preserve a hole. Emitted before the terminal event when the live view could be lossy (and always when a background execution finishes).",
+          "type": "object",
+          "required": [
+            "execution_id",
+            "output_tail",
+            "output_truncated",
+            "type"
+          ],
+          "properties": {
+            "execution_id": {
+              "$ref": "#/definitions/UserShellId"
+            },
+            "output_tail": {
+              "type": "string"
+            },
+            "output_truncated": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "user_shell_output_replaced"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The exact on-disk capture of a user shell execution is complete. `directory` holds `stdout.log`, `stderr.log` and `combined.log`. Clients use it for \"Copy Output\"; it is never inferred from painted text. Emitted before the terminal event, and only when every stream's sidecar reports a finished copy — an unfinished capture is never advertised.",
+          "type": "object",
+          "required": [
+            "directory",
+            "execution_id",
+            "type"
+          ],
+          "properties": {
+            "directory": {
+              "type": "string"
+            },
+            "execution_id": {
+              "$ref": "#/definitions/UserShellId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "user_shell_capture_ready"
               ]
             }
           }
@@ -8145,6 +8245,13 @@
             "null"
           ],
           "format": "int32"
+        },
+        "full_output": {
+          "description": "The directory holding this execution's complete raw capture (`stdout.log`, `stderr.log`, `combined.log`) once the copy finished. A client reads the copy for \"Copy Output\"; it never parses display text to find it. `None` while the execution runs (the capture is still being written) or when the host could not complete one.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "$ref": "#/definitions/UserShellId"

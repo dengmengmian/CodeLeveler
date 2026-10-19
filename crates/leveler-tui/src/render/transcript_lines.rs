@@ -1472,9 +1472,31 @@ pub(crate) fn user_shell_lines(
     now: std::time::Duration,
     focused: bool,
 ) -> Vec<Line<'static>> {
+    user_shell_lines_with_copy(shell, theme, wrap_width, t, now, focused).0
+}
+
+/// [`user_shell_lines`] plus the semantic copy policy for every painted row.
+///
+/// The rail, the `$` prompt, the two-space body indent and every status row
+/// are display chrome: copy strips them. Output rows keep their exact source
+/// text (including a real `│`, `$`, `▏`, `+` or `-`); a screen-wrap
+/// continuation row rejoins with no injected newline.
+pub(crate) fn user_shell_lines_with_copy(
+    shell: &crate::transcript::UserShellBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &crate::i18n::UiText,
+    now: std::time::Duration,
+    focused: bool,
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
     use crate::transcript::UserShellStatus;
     let width = wrap_width.max(1);
     let mut out = Vec::new();
+    let mut copy: Vec<crate::selection::PlainRow> = Vec::new();
+    let skip = || crate::selection::PlainRow {
+        skip: true,
+        ..Default::default()
+    };
     let status_color = shell_color(shell.status, theme);
     let rail_style = Style::default().fg(status_color);
     let rail = if focused { "→ " } else { USER_SHELL_RAIL };
@@ -1586,13 +1608,16 @@ pub(crate) fn user_shell_lines(
         ));
     }
     out.push(clip_spans(header, width));
+    copy.push(skip());
 
     // The exact command always has its own `$` line, wrapped, so the header
     // never has to be the place the full command lives.
-    push_shell_command_rows(&mut out, shell, rail_style, theme, width);
+    push_shell_command_rows(&mut out, &mut copy, shell, rail_style, theme, width);
     if !shell.output.is_empty() {
         out.push(Line::from(Span::styled(rail.to_string(), rail_style)));
-        push_shell_output_rows(&mut out, shell, rail_style, theme, t, width);
+        // The blank rail row is a visual separator, not an output line.
+        copy.push(skip());
+        push_shell_output_rows(&mut out, &mut copy, shell, rail_style, theme, t, width);
     }
     if shell.status == UserShellStatus::Failed {
         // The failure summary stays visible even when the (folded) output is
@@ -1602,6 +1627,7 @@ pub(crate) fn user_shell_lines(
         {
             push_shell_body(
                 &mut out,
+                &mut copy,
                 rail,
                 rail_style,
                 &error,
@@ -1613,6 +1639,7 @@ pub(crate) fn user_shell_lines(
         if let Some(code) = shell.exit_code {
             push_shell_body(
                 &mut out,
+                &mut copy,
                 rail,
                 rail_style,
                 &format!("exit code {code}"),
@@ -1624,7 +1651,7 @@ pub(crate) fn user_shell_lines(
             );
         }
     }
-    out
+    (out, copy)
 }
 
 fn shell_color(status: crate::transcript::UserShellStatus, theme: &Theme) -> ratatui::style::Color {
@@ -1642,6 +1669,7 @@ fn shell_color(status: crate::transcript::UserShellStatus, theme: &Theme) -> rat
 
 fn push_shell_command_rows(
     out: &mut Vec<Line<'static>>,
+    copy: &mut Vec<crate::selection::PlainRow>,
     shell: &crate::transcript::UserShellBlock,
     rail_style: Style,
     theme: &Theme,
@@ -1655,9 +1683,16 @@ fn push_shell_command_rows(
     } else {
         shell.command.clone()
     };
+    // Rail + body indent + the `$ `/continuation marker. Every command row is
+    // authored text after those display columns.
+    let indent =
+        UnicodeWidthStr::width(USER_SHELL_RAIL) + UnicodeWidthStr::width(USER_SHELL_INDENT) + 2;
     let mut first = true;
     for logical in command.split('\n') {
-        for row in crate::shell_render::wrap_terminal_line(logical, room) {
+        for (row_index, row) in crate::shell_render::wrap_terminal_line(logical, room)
+            .into_iter()
+            .enumerate()
+        {
             let lead = if first { "$ " } else { "  " };
             first = false;
             out.push(Line::from(vec![
@@ -1667,12 +1702,21 @@ fn push_shell_command_rows(
                     Style::default().fg(theme.text.secondary),
                 ),
             ]));
+            copy.push(crate::selection::PlainRow {
+                indent: indent as u16,
+                // A screen wrap of one command line rejoins with nothing; a
+                // new logical line (row_index == 0) copies a newline.
+                joiner: (row_index > 0).then(|| "".to_string().into_boxed_str()),
+                ..Default::default()
+            });
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_shell_output_rows(
     out: &mut Vec<Line<'static>>,
+    copy: &mut Vec<crate::selection::PlainRow>,
     shell: &crate::transcript::UserShellBlock,
     rail_style: Style,
     theme: &Theme,
@@ -1710,6 +1754,7 @@ fn push_shell_output_rows(
         };
         push_shell_body(
             out,
+            copy,
             USER_SHELL_RAIL,
             rail_style,
             &marker,
@@ -1718,20 +1763,11 @@ fn push_shell_output_rows(
             theme,
         );
     }
-    if shell.output_truncated {
-        push_shell_body(
-            out,
-            USER_SHELL_RAIL,
-            rail_style,
-            t.shell_truncated,
-            Style::default().fg(theme.text.muted),
-            width,
-            theme,
-        );
-    }
     let room = width
         .saturating_sub(UnicodeWidthStr::width(USER_SHELL_RAIL) + USER_SHELL_INDENT.len())
         .max(1);
+    let body_indent =
+        UnicodeWidthStr::width(USER_SHELL_RAIL) + UnicodeWidthStr::width(USER_SHELL_INDENT);
     for line in lines {
         let text = crate::render::sanitize_terminal_line(&line.text);
         let bg = if line.stderr {
@@ -1740,7 +1776,10 @@ fn push_shell_output_rows(
             theme.surface.input
         };
         let style = Style::default().fg(theme.text.secondary).bg(bg);
-        for row in crate::shell_render::wrap_terminal_line(&text, room) {
+        for (row_index, row) in crate::shell_render::wrap_terminal_line(&text, room)
+            .into_iter()
+            .enumerate()
+        {
             let line = if row.is_empty() {
                 Line::from(Span::styled(USER_SHELL_RAIL.to_string(), rail_style))
             } else {
@@ -1750,13 +1789,44 @@ fn push_shell_output_rows(
                 ])
             };
             out.push(line);
+            copy.push(crate::selection::PlainRow {
+                // An empty output line is painted as the rail alone; two
+                // columns still copy as an empty line, preserving the newline.
+                indent: if row.is_empty() {
+                    UnicodeWidthStr::width(USER_SHELL_RAIL) as u16
+                } else {
+                    body_indent as u16
+                },
+                joiner: (row_index > 0).then(|| "".to_string().into_boxed_str()),
+                ..Default::default()
+            });
         }
+    }
+    // The pointer belongs at the live edge, after the tail the reader is
+    // actually looking at. Above the output it scrolls away with the head it
+    // describes.
+    if shell.output_truncated {
+        let marker = match shell.full_output.as_deref() {
+            Some(directory) => t.shell_full_output_at.replace("{}", directory),
+            None => t.shell_truncated.to_string(),
+        };
+        push_shell_body(
+            out,
+            copy,
+            USER_SHELL_RAIL,
+            rail_style,
+            &marker,
+            Style::default().fg(theme.text.muted),
+            width,
+            theme,
+        );
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn push_shell_body(
     out: &mut Vec<Line<'static>>,
+    copy: &mut Vec<crate::selection::PlainRow>,
     rail: &str,
     rail_style: Style,
     text: &str,
@@ -1772,6 +1842,11 @@ fn push_shell_body(
             Span::styled(rail.to_string(), rail_style),
             Span::styled(format!("{USER_SHELL_INDENT}{row}"), style),
         ]));
+        // Status, fold and truncation rows are display-only.
+        copy.push(crate::selection::PlainRow {
+            skip: true,
+            ..Default::default()
+        });
     }
 }
 
@@ -1910,6 +1985,7 @@ mod tests {
             output: String::new(),
             output_marks: Vec::new(),
             output_truncated: false,
+            full_output: None,
             exit_code: None,
             duration_ms: Some(2_000),
             started_motion_ms: 0,
@@ -2119,6 +2195,7 @@ mod tests {
             output: output.into(),
             output_marks: Vec::new(),
             output_truncated: false,
+            full_output: None,
             exit_code: Some(0),
             duration_ms: Some(200),
             started_motion_ms: 0,

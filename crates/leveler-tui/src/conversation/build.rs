@@ -492,22 +492,16 @@ fn build_conversation(
                     // output inline (running or finished) — the same hit map
                     // every other disclosure uses, geometry stays untouched.
                     hits.push((out.len(), idx));
-                    let base = out.len();
-                    out.extend(crate::render::user_shell_lines(
+                    let (lines, rows) = crate::render::user_shell_lines_with_copy(
                         shell,
                         theme,
                         width,
                         t,
                         state.motion_clock,
                         state.focused_user_shell_id() == Some(&shell.id),
-                    ));
-                    copy.extend(std::iter::repeat_n(
-                        crate::selection::PlainRow {
-                            skip: true,
-                            ..Default::default()
-                        },
-                        out.len() - base,
-                    ));
+                    );
+                    out.extend(lines);
+                    copy.extend(rows);
                 }
                 _ => unreachable!("non-cacheable item handled above"),
             }
@@ -920,7 +914,13 @@ fn memoizable_item(item: &TranscriptItem, state: &AppState) -> bool {
                         || state.focused_command() == Some(&call.id)
                 })
         }
-        TranscriptItem::SubAgent(_) | TranscriptItem::UserShell(_) => false,
+        TranscriptItem::SubAgent(_) => false,
+        // A finished shell is immutable: it reads neither the motion clock
+        // nor a focus marker (only running executions can be focused). Its
+        // full, auto-expanded output is wrapped once and then reused — without
+        // this, every earlier large result is re-wrapped on every frame of the
+        // next command and a 10 MiB run becomes quadratic.
+        TranscriptItem::UserShell(shell) => shell.status.is_terminal(),
         _ => true,
     }
 }
@@ -995,6 +995,20 @@ fn render_cacheable_unit(
         TranscriptItem::Note(text) => {
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
             copy = prefixed_copy_rows("◆ ", text, width);
+        }
+        TranscriptItem::UserShell(shell) => {
+            // The header stays the inline fold/open target.
+            hits.push((0, 0));
+            let (lines, rows) = crate::render::user_shell_lines_with_copy(
+                shell,
+                theme,
+                width,
+                t,
+                state.motion_clock,
+                state.focused_user_shell_id() == Some(&shell.id),
+            );
+            out.extend(lines);
+            copy = rows;
         }
         other => out.extend(item_render(other, theme, width, state.tools_expanded, t)),
     }
@@ -2750,5 +2764,172 @@ mod semantic_copy_tests {
             all.contains("回答一。\n\n- 列表项\n\necho ok\nprintf done"),
             "{all:?}"
         );
+    }
+
+    fn push_shell(state: &mut AppState, command: &str, output: &str) -> usize {
+        let id = leveler_core::UserShellId::new("ush-copy");
+        state.transcript.push_user_shell_started(
+            id.clone(),
+            command.to_string(),
+            "/repo".into(),
+            0,
+        );
+        state
+            .transcript
+            .append_user_shell_output(&id, output, false);
+        state.transcript.complete_user_shell(
+            &id,
+            Some(0),
+            120,
+            crate::transcript::UserShellStatus::Success,
+        );
+        state.transcript.user_shell_index(&id).expect("shell block")
+    }
+
+    /// Selecting a shell record copies the command, then the output's own
+    /// text. The status header, the rail and the `$` prompt marker are
+    /// display chrome; a real `│`, `$` or `▏` inside the output survives.
+    #[test]
+    fn a_shell_record_copies_content_without_rail_prompt_or_status() {
+        let mut s = dark_state();
+        let index = push_shell(
+            &mut s,
+            "printf 'x'",
+            "│ name │ value │\n$ literal\n  indented\n▏ sql\n",
+        );
+        let copied = copy_item(&s, 80, index);
+        assert_eq!(
+            copied,
+            "printf 'x'\n│ name │ value │\n$ literal\n  indented\n▏ sql"
+        );
+        assert!(!copied.contains("Ran (user)"), "{copied:?}");
+        assert!(!copied.contains("│ printf"), "the rail is not copied");
+    }
+
+    /// The SQL case that started this: a `▏` in the code is source text and
+    /// survives, while any renderer-owned gutter is still stripped.
+    #[test]
+    fn a_sql_code_block_keeps_a_real_bar_glyph_and_strips_the_visual_gutter() {
+        let mut s = dark_state();
+        answer(
+            &mut s,
+            "```sql\n▏ SELECT s.id,\n       s.scope,\n  FROM repo_review_skill s;\n```",
+        );
+        let copied = copy_item(&s, 80, 0);
+        assert_eq!(
+            copied,
+            "▏ SELECT s.id,\n       s.scope,\n  FROM repo_review_skill s;"
+        );
+    }
+
+    /// A diff's `+`, `-` and `@@` are payload, not decoration.
+    #[test]
+    fn a_diff_copy_keeps_add_remove_and_hunk_markers() {
+        let mut s = dark_state();
+        answer(&mut s, "```diff\n@@ -1 +1 @@\n-old line\n+new line\n```");
+        let copied = copy_item(&s, 80, 0);
+        assert_eq!(copied, "@@ -1 +1 @@\n-old line\n+new line");
+    }
+
+    /// The complete-capture pointer is metadata: painted, never copied.
+    #[test]
+    fn the_full_output_pointer_is_painted_but_never_copied() {
+        let mut s = dark_state();
+        let id = leveler_core::UserShellId::new("ush-full");
+        s.transcript
+            .push_user_shell_started(id.clone(), "seq 1 1000000".into(), "/repo".into(), 0);
+        s.transcript
+            .append_user_shell_output(&id, "TAIL-ONLY\n", false);
+        s.transcript
+            .set_user_shell_full_output(&id, Some("/state/capture".into()));
+        s.transcript.mark_user_shell_output_truncated(&id);
+        s.transcript.complete_user_shell(
+            &id,
+            Some(0),
+            10,
+            crate::transcript::UserShellStatus::Success,
+        );
+        let index = s.transcript.user_shell_index(&id).expect("shell");
+        let (plain, _) = s.conversation_plain(80);
+        let painted: String = plain.join("\n");
+        assert!(
+            painted.contains("完整输出: /state/capture"),
+            "the pointer is visible: {painted:?}"
+        );
+        let copied = copy_item(&s, 80, index);
+        assert_eq!(copied, "seq 1 1000000\nTAIL-ONLY");
+        assert!(
+            !copied.contains("完整输出"),
+            "metadata never enters a selection copy"
+        );
+    }
+
+    /// A screen wrap of one terminal line is one source line: copy rejoins it
+    /// with no invented newline.
+    #[test]
+    fn wrapped_shell_output_copies_one_logical_line() {
+        let mut s = dark_state();
+        let long = "abcdefghij".repeat(20);
+        let index = push_shell(&mut s, "run", &format!("{long}\n"));
+        for width in [80usize, 40, 24] {
+            let copied = copy_item(&s, width, index);
+            assert_eq!(copied, format!("run\n{long}"), "width {width}");
+        }
+    }
+
+    /// A finished execution opens in full: the first line is reachable
+    /// without an extra click, and no automatic fold marker hides it.
+    #[test]
+    fn a_long_shell_result_keeps_the_named_fold_instead_of_burying_the_chat() {
+        let mut s = dark_state();
+        let output: String = (0..100).map(|i| format!("line-{i:03}\n")).collect();
+        let index = push_shell(&mut s, "seq 0 99", &output);
+        let crate::transcript::TranscriptItem::UserShell(shell) = &s.transcript.items()[index]
+        else {
+            panic!("shell expected");
+        };
+        assert!(
+            !shell.expanded,
+            "a long finished result keeps the established fold"
+        );
+        let (plain, _) = s.conversation_plain(80);
+        assert!(
+            !plain.iter().any(|line| line.contains("line-000")),
+            "the folded head is not painted"
+        );
+        assert!(
+            plain.iter().any(|line| line.contains("line-099")),
+            "the tail is painted"
+        );
+        assert!(
+            plain.iter().any(|line| line.contains("更早的输出已折叠")),
+            "the fold is named, never silent"
+        );
+    }
+
+    /// A user's explicit collapse is a choice, not something completion may
+    /// override.
+    #[test]
+    fn completion_does_not_reopen_a_user_pinned_collapse() {
+        let mut s = dark_state();
+        let index = push_shell(&mut s, "seq 0 2", "0\n1\n2\n");
+        // The helper completes first; pin the fold afterwards, exactly as a
+        // click does, then complete a second time.
+        assert!(
+            s.transcript
+                .set_item_display(index, crate::fold::DisplayMode::Collapsed)
+        );
+        let id = leveler_core::UserShellId::new("ush-copy");
+        s.transcript.complete_user_shell(
+            &id,
+            Some(0),
+            120,
+            crate::transcript::UserShellStatus::Success,
+        );
+        let crate::transcript::TranscriptItem::UserShell(shell) = &s.transcript.items()[index]
+        else {
+            panic!("shell expected");
+        };
+        assert!(!shell.expanded, "the user's fold stays");
     }
 }

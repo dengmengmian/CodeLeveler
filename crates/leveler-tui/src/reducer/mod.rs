@@ -269,6 +269,28 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Action::UserShellOutputCopied(result) => {
+            state.notification = Some(match result {
+                Ok((receipt, count)) => Notification {
+                    level: NotificationLevel::Info,
+                    message: clipboard_notice(&receipt, count, state.locale),
+                },
+                Err(message) => Notification {
+                    level: NotificationLevel::Warning,
+                    message,
+                },
+            });
+            Vec::new()
+        }
+        Action::OutputPagerFinished(result) => {
+            if let Err(message) = result {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message,
+                });
+            }
+            Vec::new()
+        }
         Action::EffectCompleted(completion) => {
             apply_effect_completion(state, completion);
             Vec::new()

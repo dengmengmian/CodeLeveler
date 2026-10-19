@@ -1321,7 +1321,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(delivered, format!("[stdout] {}Z", "0".repeat(2000)));
+        // Pipe reads split wherever the kernel gives them; each chunk carries
+        // its own `[stdout] ` tag. The contract is the payload and its order,
+        // not the chunk framing.
+        let payload = delivered.replace("[stdout] ", "");
+        assert_eq!(payload, format!("{}Z", "0".repeat(2000)));
     }
 
     /// The context, the ONE background registry, and the command runtime built

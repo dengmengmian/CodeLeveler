@@ -12,6 +12,7 @@
 //! process-tree termination as agent shell execution apply.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -29,6 +30,130 @@ use leveler_execution::{OutputStream, ProcessError, ProcessOutput};
 pub(crate) const OUTPUT_TAIL_CAP: usize = 1024 * 1024;
 /// Completed executions kept per session for reconnect/history.
 const HISTORY_CAP: usize = 16;
+/// Exact raw-stream captures kept per session. Each execution has one
+/// directory; pruning runs before a new execution starts, so a capture that
+/// is still being written (the current one) is never a candidate. Both a
+/// count and a byte budget bound what a long session can retain.
+const OUTPUT_KEEP: usize = 32;
+const OUTPUT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The directory that holds one execution's exact stdout/stderr streams.
+pub(crate) fn output_directory(
+    state_dir: &Path,
+    session_id: &SessionId,
+    id: &UserShellId,
+) -> PathBuf {
+    state_dir
+        .join("shell-output")
+        .join(session_id.as_str())
+        .join(id.as_str())
+}
+
+/// The directory of a COMPLETE capture, or `None` when any stream's sidecar
+/// is missing or reports an unfinished copy. The caller must never advertise
+/// bytes the capture does not hold.
+pub(crate) fn complete_output_directory(directory: &Path) -> Option<String> {
+    for stream in ["stdout", "stderr", "combined"] {
+        let meta = std::fs::read_to_string(directory.join(format!("{stream}.meta.json"))).ok()?;
+        if !meta.contains("\"complete\":true") {
+            return None;
+        }
+    }
+    Some(directory.display().to_string())
+}
+
+/// The last `cap` bytes of a COMPLETE combined capture.
+///
+/// The background registry's retained log tags every chunk with
+/// `[stdout] `/`[stderr] `; that is a registry presentation, not the user
+/// shell's output. Replacing a finished record from the exact capture keeps
+/// the raw bytes (and their arrival order) without leaking those tags.
+pub(crate) fn complete_capture_tail(directory: &Path, cap: usize) -> Option<(String, bool)> {
+    complete_output_directory(directory)?;
+    let path = directory.join("combined.log");
+    let mut file = std::fs::File::open(&path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(cap as u64);
+    {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read;
+        file.read_to_end(&mut bytes).ok()?;
+    }
+    // The cut can land inside a multi-byte character. Drop the partial one
+    // instead of rendering a replacement glyph at the head of the record.
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.strip_prefix('\u{FFFD}').unwrap_or(&text).to_string();
+    Some((text, start > 0))
+}
+
+/// Prepare one execution's capture directory, pruning older ones first.
+pub(crate) fn prepare_output_directory(
+    state_dir: &Path,
+    session_id: &SessionId,
+    id: &UserShellId,
+) -> PathBuf {
+    let session_dir = state_dir.join("shell-output").join(session_id.as_str());
+    prune_output_directories(&session_dir, id, OUTPUT_KEEP);
+    output_directory(state_dir, session_id, id)
+}
+
+/// Keep the newest `keep` capture directories (plus the one about to start),
+/// and drop the oldest until the session's captures fit the byte budget.
+fn prune_output_directories(session_dir: &Path, current: &UserShellId, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return;
+    };
+    let mut directories: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| entry.file_name().to_string_lossy() != current.as_str())
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            let path = entry.path();
+            // A capture without both sidecars is still being written (the
+            // current execution) or died before finishing. Never unlink a
+            // live writer's file; only an abandoned one older than a week is
+            // eligible.
+            let complete = ["stdout", "stderr"]
+                .iter()
+                .all(|stream| path.join(format!("{stream}.meta.json")).is_file());
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            if !complete && age < std::time::Duration::from_secs(7 * 24 * 60 * 60) {
+                return None;
+            }
+            Some((modified, directory_bytes(&path), path))
+        })
+        .collect();
+    directories.sort_by_key(|(modified, _, _)| *modified);
+    let mut remaining = directories.len();
+    let mut total: u64 = directories.iter().map(|(_, bytes, _)| *bytes).sum();
+    for (_, bytes, path) in directories {
+        if remaining <= keep && total <= OUTPUT_TOTAL_BYTES {
+            break;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        remaining = remaining.saturating_sub(1);
+        total = total.saturating_sub(bytes);
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
 
 /// Bounded tail buffer with an honest truncation flag.
 #[derive(Debug, Default)]
@@ -83,6 +208,10 @@ struct BackgroundShell {
     shell: UiUserShell,
     started: Instant,
     tail: OutputTail,
+    /// The capture directory started in the foreground and continued by the
+    /// adopted reader tasks. Exposed only once its sidecars report a complete
+    /// copy.
+    capture_dir: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -243,6 +372,7 @@ impl UserShellStore {
         session_id: &SessionId,
         id: &UserShellId,
         task_id: String,
+        capture_dir: PathBuf,
     ) -> Option<BackgroundedActive> {
         let mut inner = self.inner.lock().unwrap();
         let shells = inner.get_mut(session_id)?;
@@ -262,10 +392,12 @@ impl UserShellStore {
                 exit_code: None,
                 output_tail: output.clone(),
                 output_truncated,
+                full_output: None,
                 task_id: Some(task_id),
             },
             started: active.started,
             tail: active.tail,
+            capture_dir,
         });
         Some(BackgroundedActive {
             reply: active.background_request,
@@ -327,6 +459,7 @@ impl UserShellStore {
             exit_code,
             output_tail,
             output_truncated,
+            full_output: complete_output_directory(&background.capture_dir),
             task_id: None,
         };
         shells.history.push_back(shell.clone());
@@ -372,6 +505,7 @@ impl UserShellStore {
         exit_code: Option<i32>,
         status: &str,
         authoritative: Option<&str>,
+        full_output: Option<String>,
     ) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
         let shells = inner.get_mut(session_id)?;
@@ -391,6 +525,7 @@ impl UserShellStore {
                 exit_code,
                 output_tail,
                 output_truncated,
+                full_output,
                 task_id: None,
             });
             while shells.history.len() > HISTORY_CAP {
@@ -438,6 +573,7 @@ impl UserShellStore {
                 exit_code: None,
                 output_tail,
                 output_truncated,
+                full_output: None,
                 task_id: background.shell.task_id.clone(),
             });
         }
@@ -452,6 +588,7 @@ impl UserShellStore {
                 exit_code: None,
                 output_tail,
                 output_truncated,
+                full_output: None,
                 task_id: None,
             });
         }
@@ -505,6 +642,7 @@ pub(crate) async fn restore_from_events(
                     exit_code: None,
                     output_tail: String::new(),
                     output_truncated: false,
+                    full_output: None,
                     task_id: None,
                 });
             }
@@ -538,6 +676,7 @@ pub(crate) async fn restore_from_events(
                 status,
                 output_tail,
                 output_truncated,
+                full_output,
             } => {
                 if let Some(shell) = index
                     .get(&execution_id)
@@ -548,6 +687,7 @@ pub(crate) async fn restore_from_events(
                     shell.elapsed_secs = duration_ms / 1000;
                     shell.output_tail = output_tail;
                     shell.output_truncated = output_truncated;
+                    shell.full_output = full_output;
                     shell.task_id = None;
                 }
             }
@@ -654,6 +794,7 @@ mod tests {
             Some(0),
             "success",
             Some("1\n\n\u{2026}[15000 bytes dropped]\u{2026}\n1999\n2000\n"),
+            None,
         );
         let shell = store.snapshot(&session);
         assert_eq!(
@@ -682,7 +823,7 @@ mod tests {
             CancellationToken::new(),
         );
         store.append_output(&session, &id, "out\nerr\n");
-        store.finish(&session, &id, Some(0), "success", None);
+        store.finish(&session, &id, Some(0), "success", None, None);
         let shell = store.snapshot(&session);
         assert_eq!(shell[0].output_tail, "out\nerr\n");
     }
@@ -701,7 +842,7 @@ mod tests {
             CancellationToken::new(),
             CancellationToken::new(),
         );
-        store.finish(&session, &old, Some(0), "success", None);
+        store.finish(&session, &old, Some(0), "success", None, None);
         store.begin(
             &session,
             new.clone(),
@@ -728,7 +869,7 @@ mod tests {
             CancellationToken::new(),
         );
         store.append_output(&session, &a, "one\n");
-        store.finish(&session, &a, Some(0), "success", None);
+        store.finish(&session, &a, Some(0), "success", None, None);
         let b = UserShellId::new("b");
         store.begin(
             &session,
@@ -744,5 +885,67 @@ mod tests {
         assert_eq!(snap[0].output_tail, "one\n");
         assert_eq!(snap[1].status, "running");
         assert_eq!(snap[1].command, "sleep 9");
+    }
+
+    #[test]
+    fn a_capture_is_advertised_only_when_every_copy_reports_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        for stream in ["stdout", "stderr", "combined"] {
+            std::fs::write(
+                dir.path().join(format!("{stream}.meta.json")),
+                format!(r#"{{"stream":"{stream}","bytes":10,"complete":true}}"#),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            complete_output_directory(dir.path()).as_deref(),
+            Some(dir.path().to_string_lossy().as_ref())
+        );
+        std::fs::remove_file(dir.path().join("combined.meta.json")).unwrap();
+        assert!(
+            complete_output_directory(dir.path()).is_none(),
+            "a missing combined copy is never advertised as complete"
+        );
+        std::fs::write(
+            dir.path().join("stderr.meta.json"),
+            r#"{"stream":"stderr","bytes":0,"complete":false,"error":"disk full"}"#,
+        )
+        .unwrap();
+        assert!(
+            complete_output_directory(dir.path()).is_none(),
+            "an unfinished capture is never advertised as complete"
+        );
+    }
+
+    #[test]
+    fn output_pruning_keeps_the_newest_captures_and_the_current_one() {
+        let root = tempfile::tempdir().unwrap();
+        let session = SessionId::new("s1");
+        let session_dir = root.path().join("shell-output").join(session.as_str());
+        for index in 0..4 {
+            let id = UserShellId::new(format!("ush-{index}"));
+            let directory = output_directory(root.path(), &session, &id);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("stdout.log"), vec![b'x'; 8]).unwrap();
+            for stream in ["stdout", "stderr", "combined"] {
+                std::fs::write(
+                    directory.join(format!("{stream}.meta.json")),
+                    format!(r#"{{"stream":"{stream}","bytes":8,"complete":true}}"#),
+                )
+                .unwrap();
+            }
+        }
+        let current = UserShellId::new("current");
+        let current_dir = output_directory(root.path(), &session, &current);
+        std::fs::create_dir_all(&current_dir).unwrap();
+        std::fs::write(current_dir.join("stdout.log"), b"current").unwrap();
+
+        prune_output_directories(&session_dir, &current, 2);
+        let entries = std::fs::read_dir(&session_dir).unwrap().count();
+        assert_eq!(entries, 3, "kept captures are bounded");
+        assert!(
+            current_dir.exists(),
+            "the execution about to start is never pruned"
+        );
     }
 }
