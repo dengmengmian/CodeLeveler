@@ -537,7 +537,6 @@ fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
         (Screen::Doctor, "Doctor"),
         (Screen::Context, "Context"),
         (Screen::Clean, "Clean"),
-        (Screen::Shell, "Shell"),
         (Screen::Tools, "Tools"),
         (Screen::Diff, "Diff"),
         (Screen::Remote, "Remote"),

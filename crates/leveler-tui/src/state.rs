@@ -117,6 +117,26 @@ pub enum WorkbenchFocus {
     Background,
 }
 
+/// One keyboard-selectable execution in the transcript. A model tool call and
+/// a user-typed `!command` share the Command focus — both are stoppable rows
+/// with an output drawer, but their ids and cancel commands differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandTarget {
+    /// A running agent tool call, addressed by its protocol id.
+    Call(leveler_client_protocol::ToolCallId),
+    /// A user-typed local command, addressed by its execution id.
+    UserShell(leveler_core::UserShellId),
+}
+
+/// A stoppable execution and where it lives in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppableCommand {
+    pub item: usize,
+    /// Call index inside the item's `ToolGroup`; `None` for a user shell.
+    pub call: Option<usize>,
+    pub target: CommandTarget,
+}
+
 /// The `/remote` invite, as the screen shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteState {
@@ -434,8 +454,6 @@ pub struct AppState {
     pub workbench_focus: WorkbenchFocus,
     /// Last painted Input/composer rect for click-to-focus.
     pub input_rect: Option<(u16, u16, u16, u16)>,
-    /// Transcript index of the user shell the Shell Details screen shows.
-    pub shell_screen_item: Option<usize>,
     /// Which first-class activity the Activity Detail screen is showing.
     pub activity_open: Option<crate::activity::ActivityId>,
     /// Keyboard selection into [`crate::activity::summaries`], stable by id.
@@ -510,11 +528,11 @@ pub struct AppState {
     pub plan_hit: Option<(u16, u16, u16)>,
     /// Last-painted header goal hit (row, x_start, x_end).
     pub goal_hit: Option<(u16, u16, u16)>,
-    /// The running command row under the Command workbench focus, by the
-    /// execution's authoritative [`ToolCallId`]. Presentation only: the stop
-    /// path re-checks it against the live transcript before acting, so a
-    /// finished or replayed row can never be stopped by a stale reference.
-    pub command_selected: Option<leveler_client_protocol::ToolCallId>,
+    /// The running execution under the Command workbench focus. Presentation
+    /// only: the stop path re-checks it against the live transcript before
+    /// acting, so a finished or replayed row can never be stopped by a stale
+    /// reference.
+    pub command_selected: Option<CommandTarget>,
     /// Collapse the collaboration surface to its one-line compact row.
     /// View preference only — visibility itself is derived from team activity.
     pub collaboration_collapsed: bool,
@@ -707,7 +725,6 @@ impl AppState {
             conv: crate::conversation::ConversationView::default(),
             workbench_focus: WorkbenchFocus::Input,
             input_rect: None,
-            shell_screen_item: None,
             activity_open: None,
             activity_selected: None,
             activity_view: crate::activity::ActivityView::default(),
@@ -864,26 +881,56 @@ impl AppState {
         if self.workbench_focus != WorkbenchFocus::Command || !self.can_stop_commands() {
             return None;
         }
-        let id = self.command_selected.as_ref()?;
-        let (item, call) = self.command_location(id)?;
+        let CommandTarget::Call(id) = self.command_selected.as_ref()? else {
+            return None;
+        };
+        let (item, call) = self.call_location(id)?;
         self.command_is_stoppable(item, call).then_some(id)
     }
 
-    /// The running commands this client may stop, in transcript order, as
-    /// `(item, call, id)`. Empty unless [`Self::can_stop_commands`].
-    pub fn stoppable_commands(&self) -> Vec<(usize, usize, leveler_client_protocol::ToolCallId)> {
-        if !self.can_stop_commands() {
+    /// The user shell id that should wear the Command focus marker, when the
+    /// Command workbench focus is on a still-running `!command`.
+    pub fn focused_user_shell_id(&self) -> Option<&leveler_core::UserShellId> {
+        if self.workbench_focus != WorkbenchFocus::Command || !self.runtime_connected {
+            return None;
+        }
+        let CommandTarget::UserShell(id) = self.command_selected.as_ref()? else {
+            return None;
+        };
+        self.user_shell_is_stoppable(id).then_some(id)
+    }
+
+    /// The running executions this client may stop, in transcript order.
+    /// Agent calls need a live turn; a user shell is the turn — it only needs
+    /// a connected runtime.
+    pub fn stoppable_commands(&self) -> Vec<StoppableCommand> {
+        if !self.runtime_connected {
             return Vec::new();
         }
         let mut out = Vec::new();
         for (item, entry) in self.transcript.items().iter().enumerate() {
-            let crate::transcript::TranscriptItem::ToolGroup(group) = entry else {
-                continue;
-            };
-            for (call, block) in group.calls.iter().enumerate() {
-                if self.command_is_stoppable(item, call) {
-                    out.push((item, call, block.id.clone()));
+            match entry {
+                crate::transcript::TranscriptItem::ToolGroup(group) if self.is_busy() => {
+                    for (call, block) in group.calls.iter().enumerate() {
+                        if self.command_is_stoppable(item, call) {
+                            out.push(StoppableCommand {
+                                item,
+                                call: Some(call),
+                                target: CommandTarget::Call(block.id.clone()),
+                            });
+                        }
+                    }
                 }
+                crate::transcript::TranscriptItem::UserShell(shell)
+                    if shell.status == crate::transcript::UserShellStatus::Running =>
+                {
+                    out.push(StoppableCommand {
+                        item,
+                        call: None,
+                        target: CommandTarget::UserShell(shell.id.clone()),
+                    });
+                }
+                _ => {}
             }
         }
         out
@@ -905,8 +952,22 @@ impl AppState {
             && self.approval_gated_call() != Some(&block.id)
     }
 
-    /// The transcript location of a running command by its authoritative id.
-    pub fn command_location(
+    /// The transcript location of a Command-focus target: the item index and,
+    /// for an agent call, its index inside the group.
+    pub fn command_location(&self, target: &CommandTarget) -> Option<(usize, Option<usize>)> {
+        match target {
+            CommandTarget::Call(id) => self
+                .call_location(id)
+                .map(|(item, call)| (item, Some(call))),
+            CommandTarget::UserShell(id) => self
+                .transcript
+                .user_shell_index(id)
+                .map(|item| (item, None)),
+        }
+    }
+
+    /// The transcript location of a tool call by its authoritative id.
+    pub fn call_location(
         &self,
         id: &leveler_client_protocol::ToolCallId,
     ) -> Option<(usize, usize)> {
@@ -919,6 +980,22 @@ impl AppState {
             }
         }
         None
+    }
+
+    /// Whether a user shell is still running and the runtime is connected —
+    /// the same staleness rule agent calls use before a stop is offered.
+    fn user_shell_is_stoppable(&self, id: &leveler_core::UserShellId) -> bool {
+        if !self.runtime_connected {
+            return false;
+        }
+        let Some(item) = self.transcript.user_shell_index(id) else {
+            return false;
+        };
+        matches!(
+            self.transcript.items().get(item),
+            Some(crate::transcript::TranscriptItem::UserShell(shell))
+                if shell.status == crate::transcript::UserShellStatus::Running
+        )
     }
 
     /// The active model's context window in tokens (0 = unknown).
@@ -951,16 +1028,5 @@ impl AppState {
         self.cancel_armed = false;
         self.cancel_repeat_armed = false;
         self.quit_armed = false;
-    }
-}
-
-impl AppState {
-    /// The user shell block the Shell Details screen is focused on.
-    pub fn focused_user_shell(&self) -> Option<&crate::transcript::UserShellBlock> {
-        let index = self.shell_screen_item?;
-        match self.transcript.items().get(index)? {
-            crate::transcript::TranscriptItem::UserShell(shell) => Some(shell),
-            _ => None,
-        }
     }
 }

@@ -1132,7 +1132,11 @@ async fn maybe_coalesce_text_input(
     let Some(first_char) = plain_text_char(&key) else {
         return Action::Key(key);
     };
-    if state.overlay.is_some() || state.active_screen != Screen::Conversation {
+    // A coalesced burst ends in the composer. Only the composer may claim an
+    // ordinary character: another workbench focus binds letters itself (the
+    // Command focus stops with `x`), and turning that key into text before
+    // the reducer ran swallowed the binding.
+    if !coalescing_owns_key(state) {
         return Action::Key(key);
     }
 
@@ -1162,6 +1166,15 @@ async fn maybe_coalesce_text_input(
         }
     }
     Action::TextInput(text)
+}
+
+/// Whether this surface currently treats ordinary characters as composer
+/// text. The reducer owns every other letter binding, so it must receive the
+/// key event itself.
+fn coalescing_owns_key(state: &AppState) -> bool {
+    state.overlay.is_none()
+        && state.active_screen == Screen::Conversation
+        && state.workbench_focus == crate::state::WorkbenchFocus::Input
 }
 
 fn plain_text_char(key: &KeyEvent) -> Option<char> {
@@ -1229,6 +1242,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// A plain letter is composer text only while the composer owns the keys.
+    /// The Command focus binds `x` to stop; coalescing it into `TextInput`
+    /// before the reducer ran made the advertised key type an `x` instead.
+    #[test]
+    fn a_key_burst_is_only_composer_text_while_the_composer_owns_keys() {
+        let mut s = state();
+        assert!(super::coalescing_owns_key(&s));
+        s.workbench_focus = crate::state::WorkbenchFocus::Command;
+        assert!(
+            !super::coalescing_owns_key(&s),
+            "a contextual letter binding must reach the reducer"
+        );
+        s.workbench_focus = crate::state::WorkbenchFocus::Input;
+        s.active_screen = Screen::Help;
+        assert!(!super::coalescing_owns_key(&s));
+    }
 
     fn state() -> AppState {
         AppState::new(

@@ -194,59 +194,10 @@ pub(crate) fn pad_display(s: &str, width: usize) -> String {
     out
 }
 
-/// Cut `s` from the FRONT to at most `max` display columns, marking the cut
-/// with a leading ellipsis. The mirror of [`truncate_display`], for values
-/// whose tail is the informative end — a path is named by where it ends, so
-/// dropping `/scratchpad/h-inv` to keep `/private/tmp/agent-501/…` answers
-/// nothing.
-pub(crate) fn elide_head(s: &str, max: usize) -> String {
-    let flat: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if UnicodeWidthStr::width(flat.as_str()) <= max {
-        return flat;
-    }
-    let budget = max.saturating_sub(1); // reserve a column for '…'
-    let mut tail: Vec<char> = Vec::new();
-    let mut w = 0;
-    for ch in flat.chars().rev() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w + cw > budget {
-            break;
-        }
-        tail.push(ch);
-        w += cw;
-    }
-    let mut out = String::from("…");
-    out.extend(tail.iter().rev());
-    out
-}
-
 #[cfg(test)]
 mod pad_tests {
-    use super::{elide_head, pad_display};
+    use super::pad_display;
     use unicode_width::UnicodeWidthStr;
-
-    #[test]
-    fn a_cut_path_keeps_its_tail_and_says_it_was_cut() {
-        let out = elide_head("/a/very/long/prefix/scratchpad/h-inv", 20);
-        assert!(out.starts_with('…'), "{out:?}");
-        assert!(out.ends_with("h-inv"), "{out:?}");
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 20, "{out:?}");
-    }
-
-    #[test]
-    fn a_path_that_fits_is_left_alone() {
-        assert_eq!(elide_head("/repo", 20), "/repo");
-    }
-
-    #[test]
-    fn eliding_measures_by_width_not_char_count() {
-        let out = elide_head("前缀很长啊啊啊/仓库", 10);
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 10, "{out:?}");
-        assert!(out.ends_with("仓库"), "{out:?}");
-    }
 
     #[test]
     fn a_label_column_lines_up_across_scripts() {

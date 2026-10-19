@@ -10,7 +10,7 @@ use leveler_client_protocol::{
 
 use super::reduce;
 use crate::action::{Action, Effect, EffectCompletion};
-use crate::state::{AppState, Boot};
+use crate::state::{AppState, Boot, CommandTarget};
 use crate::transcript::{StopRequest, ToolStatus, TranscriptItem};
 
 fn state() -> AppState {
@@ -780,7 +780,10 @@ fn keyboard_focus_reveals_the_selected_command_before_stopping_it() {
     assert!(row_with(&s, "second-visible").is_none());
     assert!(plain(&s).iter().any(|l| l.contains("执行了 2 个命令")));
     focus_command(&mut s);
-    assert_eq!(s.command_selected, Some(ToolCallId::new("first")));
+    assert_eq!(
+        s.command_selected,
+        Some(CommandTarget::Call(ToolCallId::new("first")))
+    );
     assert!(
         row_with(&s, "→ ◌ $ echo first-visible").is_some(),
         "keyboard focus reveals the actual selected command: {:?}",
@@ -797,7 +800,10 @@ fn keyboard_focus_reveals_the_selected_command_before_stopping_it() {
         "focus does not change the output drawer"
     );
     key(&mut s, KeyCode::Down);
-    assert_eq!(s.command_selected, Some(ToolCallId::new("second")));
+    assert_eq!(
+        s.command_selected,
+        Some(CommandTarget::Call(ToolCallId::new("second")))
+    );
     assert!(
         row_with(&s, "→ ◌ $ echo second-visible").is_some(),
         "moving selection reveals the next command: {:?}",
@@ -845,7 +851,7 @@ fn a_command_is_not_stoppable_without_a_live_turn() {
     assert!(s.stoppable_commands().is_empty());
     assert!(s.focused_command().is_none());
     s.workbench_focus = crate::state::WorkbenchFocus::Command;
-    s.command_selected = Some(ToolCallId::new("c1"));
+    s.command_selected = Some(CommandTarget::Call(ToolCallId::new("c1")));
     let effects = key(&mut s, KeyCode::Char('x'));
     assert!(effects.is_empty(), "no live stop: {effects:?}");
     assert_eq!(call(&s, "c1").stop, StopRequest::None);
@@ -871,7 +877,10 @@ fn a_stale_selection_stops_nothing() {
     let mut s = state();
     start(&mut s, "c1");
     focus_command(&mut s);
-    assert_eq!(s.command_selected, Some(ToolCallId::new("c1")));
+    assert_eq!(
+        s.command_selected,
+        Some(CommandTarget::Call(ToolCallId::new("c1")))
+    );
     complete(&mut s, "c1", true, 10, Some(0), None);
     start(&mut s, "c2");
     let effects = key(&mut s, KeyCode::Char('x'));

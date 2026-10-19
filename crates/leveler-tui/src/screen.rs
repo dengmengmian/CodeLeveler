@@ -15,9 +15,6 @@ pub enum Screen {
     Sessions,
     /// The `/remote` invite: a QR to scan, and the fingerprint to compare.
     Remote,
-    /// One user shell execution (`!command`): status, runtime, command,
-    /// live output; Esc backs out, `x` stops a running one.
-    Shell,
     /// First-class Activity Detail (background task or child agent).
     /// Observational: Esc closes the viewer without cancelling the work.
     Activity,
@@ -1222,7 +1219,6 @@ mod reachability_tests {
             Screen::Diff => Some("Ctrl+D / `/diff` — screen_nav::open_diff_screen"),
             Screen::Sessions => Some("`/sessions` — screen_nav::open_sessions_screen"),
             Screen::Remote => Some("`/remote` — reducer/mod.rs"),
-            Screen::Shell => Some("`!command` — reducer/submit.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
             Screen::ActivityList => Some(
                 "clicking the strip's background cell or Enter under its focus — reducer/mod.rs",
@@ -1247,7 +1243,6 @@ mod reachability_tests {
             Screen::Diff,
             Screen::Sessions,
             Screen::Remote,
-            Screen::Shell,
             Screen::Activity,
             Screen::ActivityList,
             Screen::Team,

@@ -1449,9 +1449,10 @@ verified by deterministic tests and real dogfood — do not regress them:
   Closing a parent hides members while retaining explicit disclosure choices for
   reopening; new members start closed. Successful silent internal tools neither
   contribute to receipt counts nor delimit visible stages; their original records
-  and available output remain accessible through tool details. Ctrl+O retains its
-  existing scope of opening the latest tool group's details; it never substitutes
-  a Thought when no group exists or becomes a full-history toggle.
+  and available output remain accessible through tool details. Ctrl+O opens the
+  latest execution's details — a tool group or a user-typed `!command` — and
+  expands that block inline; it never substitutes a Thought when no execution
+  exists or becomes a full-history toggle.
 - **Progress prose and the Final are shown in full**: model text uses natural
   paragraphs without a `●` / `◆` prefix on every paragraph. The coding domain's
   communication contract and the model own progress content; the TUI never generates

@@ -173,26 +173,6 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 }
             }
         }
-        // Shell Details: Esc backs out (the shell keeps running); `x` stops
-        // exactly the shown execution — back and stop are different actions.
-        Screen::Shell => match key.code {
-            KeyCode::Esc => return back(state),
-            KeyCode::Char('x') | KeyCode::Char('X') => {
-                if let Some(shell) = state.focused_user_shell()
-                    && shell.status == crate::transcript::UserShellStatus::Running
-                {
-                    return vec![Effect::Send(
-                        leveler_client_protocol::ClientCommand::CancelUserShell {
-                            session_id: state.session_id.clone(),
-                            execution_id: shell.id.clone(),
-                        },
-                    )];
-                }
-            }
-            _ => {
-                scroll_screen_key(state, &key, true);
-            }
-        },
         Screen::Tools => {
             match key.code {
                 KeyCode::Esc => return back(state),
