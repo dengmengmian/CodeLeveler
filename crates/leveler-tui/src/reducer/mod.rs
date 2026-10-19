@@ -1074,6 +1074,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                         // is the contextual `x` on the keyboard-focused row.
                         interaction::toggle_call(state, item, call);
                         state.conv.plain.clear();
+                        state.conv.plain_layout.clear();
                         interaction::clear_selection_drag(state);
                         state.conv.selection.clear();
                         return Vec::new();
@@ -1108,6 +1109,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                         // folds inline. One hit map, one interaction.
                         interaction::toggle_fold(state, item);
                         state.conv.plain.clear();
+                        state.conv.plain_layout.clear();
                         interaction::clear_selection_drag(state);
                         state.conv.selection.clear();
                         return Vec::new();
@@ -1160,8 +1162,9 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                     }
                 } else {
                     interaction::ensure_plain(state);
-                    let text = crate::selection::extract_selected_text(
+                    let text = crate::selection::extract_selected_text_with_layout(
                         &state.conv.plain,
+                        &state.conv.plain_layout,
                         &state.conv.selection,
                     );
                     match crate::selection::copy_to_clipboard(&text) {
@@ -2074,6 +2077,7 @@ fn toggle_selected_command(state: &mut AppState) {
         }
     }
     state.conv.plain.clear();
+    state.conv.plain_layout.clear();
 }
 
 /// Ask the runtime to stop ONE focused running execution. The row says
@@ -2138,10 +2142,12 @@ fn toggle_current_expand(state: &mut AppState) {
             state.transcript.set_call_expanded(item, call, expanded);
         }
         state.conv.plain.clear();
+        state.conv.plain_layout.clear();
         state.conv.plain_width = 0;
     }
     state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
     state.conv.plain.clear();
+    state.conv.plain_layout.clear();
     state.conv.plain_width = 0;
 }
 
@@ -3234,6 +3240,7 @@ mod disclosure_tests {
         // Narrow the viewport — wraps change, the hit map must follow.
         s.conv.rect = Some((0, 2, 60, 30));
         s.conv.plain.clear();
+        s.conv.plain_layout.clear();
         s.conv.plain_width = 0;
         let hits = s.conversation_lines_and_hits(60).1;
         let (line_b, _) = *hits.iter().find(|(_, i)| *i == item_b).unwrap();

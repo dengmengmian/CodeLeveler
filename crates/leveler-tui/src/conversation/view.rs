@@ -163,6 +163,9 @@ pub struct ConversationView {
     /// Cached plain-text of conversation lines for the last render width
     /// (backs selection extraction and URL hit-testing).
     pub plain: Vec<String>,
+    /// Copy layout aligned 1:1 with `plain`: a prompt's marker gutter and
+    /// vertical padding are decoration and must not reach the clipboard.
+    pub(crate) plain_layout: Vec<crate::selection::PlainRow>,
     /// Content width used when `plain` was built.
     pub plain_width: usize,
     /// Memoized wrapped conversation lines + disclosure hit rows. Interior
@@ -197,6 +200,7 @@ impl Default for ConversationView {
             selection_edge_streak: 0,
             selection_last_mouse: None,
             plain: Vec::new(),
+            plain_layout: Vec::new(),
             plain_width: 0,
             cache: std::cell::RefCell::new(None),
             item_cache: std::cell::RefCell::new(ItemLineCache::default()),

@@ -78,8 +78,9 @@ pub fn ensure_plain(state: &mut AppState) {
     if state.conv.plain_width == width && !state.conv.plain.is_empty() {
         return;
     }
-    let lines = state.conversation_lines(width);
-    state.conv.plain = lines.iter().map(crate::selection::line_to_plain).collect();
+    let (plain, layout) = state.conversation_plain(width);
+    state.conv.plain = plain;
+    state.conv.plain_layout = layout;
     state.conv.plain_width = width;
 }
 
@@ -165,6 +166,7 @@ pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
     // The plain-text projection backs selection and URL hit-testing; the fold
     // changed the lines under it, so it must be rebuilt on next use.
     state.conv.plain.clear();
+    state.conv.plain_layout.clear();
     state.conv.plain_width = 0;
     Some(expanded)
 }
@@ -174,6 +176,7 @@ pub fn toggle_call(state: &mut AppState, item: usize, call: usize) -> Option<boo
     let expanded = state.transcript.toggle_call_at(item, call)?;
     restore_reading_anchor(state, anchor);
     state.conv.plain.clear();
+    state.conv.plain_layout.clear();
     state.conv.plain_width = 0;
     Some(expanded)
 }

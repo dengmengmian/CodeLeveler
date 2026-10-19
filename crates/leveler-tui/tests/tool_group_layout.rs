@@ -318,7 +318,7 @@ fn the_painted_screen_does_not_shift_when_the_group_closes() {
     // The prose above the group is the anchor: the distance from it is what a
     // reader perceives as "nothing moved".
     let gap =
-        |f: &[String], needle: &str| screen_row(f, needle) - screen_row(f, "▌ 先 check，再 test");
+        |f: &[String], needle: &str| screen_row(f, needle) - screen_row(f, "❯ 先 check，再 test");
     assert_eq!(
         gap(&f1, "▸ 正在执行 1 项 · 执行了 2 个命令"),
         gap(&f2, "▸ 执行了 2 个命令"),

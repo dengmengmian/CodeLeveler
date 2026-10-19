@@ -5,7 +5,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -112,6 +112,69 @@ fn paint_live_shell_rail(
     }
 }
 
+/// Paint the user prompt's band and marker over the projection.
+///
+/// Both are decoration: the band is a row-wide surface behind every line of
+/// the prompt's item span (vertical padding included), and the marker is one
+/// glyph in the reserved gutter. Line content, selection columns, wrapping and
+/// clipboard text are exactly what the build produced — copy cannot pick up
+/// either. Selected cells keep their own background.
+fn paint_user_prompt_decoration(
+    frame: &mut Frame,
+    state: &AppState,
+    item_spans: &[(usize, usize)],
+    scroll: usize,
+    content: Rect,
+) {
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    let theme = &state.theme;
+    // NO_COLOR paints no surfaces, so there is no band to draw; the marker
+    // alone has to distinguish the prompt from agent prose.
+    let band = (!theme.is_monochrome() && theme.surface.elevated != Color::Reset)
+        .then_some(theme.surface.elevated);
+    let selected = theme.surface.selection;
+    let window_end = scroll + content.height as usize;
+    let buf = frame.buffer_mut();
+    for (index, item) in state.transcript.items().iter().enumerate() {
+        let TranscriptItem::User(_) = item else {
+            continue;
+        };
+        let Some(&(start, end)) = item_spans.get(index) else {
+            continue;
+        };
+        if end <= scroll || start >= window_end {
+            continue;
+        }
+        if let Some(band) = band {
+            let band_style = Style::default().bg(band);
+            for row in start.max(scroll)..end.min(window_end) {
+                let y = content.y + (row - scroll) as u16;
+                for x in content.x..content.x + content.width {
+                    let Some(cell) = buf.cell_mut((x, y)) else {
+                        continue;
+                    };
+                    if cell.bg != selected {
+                        cell.set_style(band_style);
+                    }
+                }
+            }
+        }
+        // The first body row follows the prompt's top padding row.
+        let marker_row = start + crate::render::transcript_lines::USER_PROMPT_PAD_ROWS;
+        if marker_row >= scroll && marker_row < window_end && marker_row < end {
+            let y = content.y + (marker_row - scroll) as u16;
+            if let Some(cell) = buf.cell_mut((content.x, y)) {
+                cell.set_symbol(crate::render::transcript_lines::USER_PROMPT_MARKER);
+                if cell.bg != selected {
+                    cell.set_style(Style::default().fg(theme.text.secondary));
+                }
+            }
+        }
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = &state.theme;
     let content = crate::conversation::geometry::content_rect(area);
@@ -133,10 +196,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // path calls `ensure_conversation_plain`, which rebuilds against current
     // content on demand) so idle frames skip an O(lines) clone per repaint.
     if state.conv.selection.is_active() {
-        state.conv.plain = all.iter().map(crate::selection::line_to_plain).collect();
+        let (plain, layout) = crate::conversation::build::plain_projection(
+            &all,
+            &item_spans,
+            state.transcript.items(),
+        );
+        state.conv.plain = plain;
+        state.conv.plain_layout = layout;
         state.conv.plain_width = width;
     } else if !state.conv.plain.is_empty() {
         state.conv.plain.clear();
+        state.conv.plain_layout.clear();
         state.conv.plain_width = 0;
     }
 
@@ -193,6 +263,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ),
         content,
     );
+    paint_user_prompt_decoration(frame, state, &item_spans, scroll, content);
 
     // Scroll-to-bottom affordance: only when pinned away from live edge.
     // Hide while selecting/copying so the badge cannot cover or steal mouse
@@ -337,6 +408,189 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn content() -> Rect {
+        crate::conversation::geometry::content_rect(AREA)
+    }
+
+    /// The second cell of a wide glyph is covered by that glyph; the terminal
+    /// paints both columns with the glyph's style, so its own stored style is
+    /// never visible (and TestBackend leaves it untouched).
+    fn covered_by_wide(buffer: &Buffer, x: u16, y: u16) -> bool {
+        x > 0 && unicode_width::UnicodeWidthStr::width(buffer[(x - 1, y)].symbol()) > 1
+    }
+
+    /// Screen row for an absolute content row under this frame's scroll.
+    fn painted_y(state: &AppState, absolute: usize, height: usize, total: usize) -> u16 {
+        let scroll = crate::conversation::geometry::effective_scroll(
+            state.conv.scroll,
+            state.conv.auto_scroll,
+            total,
+            height,
+        );
+        content().y + (absolute - scroll) as u16
+    }
+
+    fn prompt_then_answer(state: &mut AppState) -> (usize, usize, usize, usize) {
+        state
+            .transcript
+            .push_user("第一行用户输入\n\n第三行用户输入".into());
+        let id = leveler_client_protocol::MessageId::new("a1");
+        state.transcript.begin_assistant(id.clone());
+        state.transcript.append_assistant(&id, "答复正文");
+        state.transcript.finish_assistant(&id);
+        let width = content().width as usize;
+        let (u0, u1) = state.item_span(0, width).expect("prompt span");
+        let (a0, a1) = state.item_span(1, width).expect("answer span");
+        (u0, u1, a0, a1)
+    }
+
+    /// A prompt owns one continuous band: every content column of every prompt
+    /// row, including its padding and internal blank line. The answer that
+    /// follows immediately returns to the canvas.
+    #[test]
+    fn a_user_prompt_paints_one_continuous_band_and_agent_prose_stays_on_canvas() {
+        let mut state = test_state();
+        let (u0, u1, a0, a1) = prompt_then_answer(&mut state);
+        let band = state.theme.surface.elevated;
+        let canvas = state.theme.surface.canvas;
+        let height = content().height as usize;
+        let total = state.conversation_lines(content().width as usize).len();
+        let buffer = paint(&mut state, 0);
+        let c = content();
+        for row in u0..u1 {
+            let y = painted_y(&state, row, height, total);
+            for x in c.x..c.x + c.width {
+                // A wide glyph owns the following cell; the terminal paints
+                // both columns with the glyph's style, so the covered cell's
+                // stored style is irrelevant (TestBackend leaves it alone).
+                if covered_by_wide(&buffer, x, y) {
+                    continue;
+                }
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    band,
+                    "prompt row {row} column {x} must carry the band"
+                );
+            }
+            for x in 0..c.x {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    band,
+                    "the band must not enter the workspace gutter"
+                );
+            }
+        }
+        for row in a0..a1 {
+            let y = painted_y(&state, row, height, total);
+            for x in c.x..c.x + c.width {
+                if covered_by_wide(&buffer, x, y) {
+                    continue;
+                }
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    canvas,
+                    "agent prose row {row} must stay on the canvas"
+                );
+            }
+        }
+    }
+
+    /// The `❯` is painted once, on the first text row inside the band; it is
+    /// not part of any line's text.
+    #[test]
+    fn the_prompt_marker_marks_only_the_first_prompt_row() {
+        let mut state = test_state();
+        let (u0, u1, _, _) = prompt_then_answer(&mut state);
+        let height = content().height as usize;
+        let total = state.conversation_lines(content().width as usize).len();
+        let buffer = paint(&mut state, 0);
+        let c = content();
+        let marks: Vec<(u16, u16)> = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer[(*x, *y)].symbol() == "❯")
+            .collect();
+        assert_eq!(marks.len(), 1, "one marker per prompt: {marks:?}");
+        assert_eq!(
+            marks[0],
+            (c.x, painted_y(&state, u0 + 1, height, total)),
+            "the marker sits in the gutter of the first body row"
+        );
+        // Continuation rows are indented by exactly the gutter width.
+        let y = painted_y(&state, u0 + 2, height, total);
+        assert_eq!(buffer[(c.x + 1, y)].symbol(), " ");
+        assert!(u1 > u0 + 2, "fixture must have a continuation row");
+    }
+
+    /// A partially visible prompt paints only its visible rows, and nothing
+    /// above its span receives the band.
+    #[test]
+    fn a_scrolled_prompt_band_clips_to_the_viewport() {
+        let mut state = test_state();
+        let id = leveler_client_protocol::MessageId::new("pre");
+        state.transcript.begin_assistant(id.clone());
+        state
+            .transcript
+            .append_assistant(&id, &"前言行。\n".repeat(12));
+        state.transcript.finish_assistant(&id);
+        state.transcript.push_user("行一\n行二\n行三".into());
+        let id = leveler_client_protocol::MessageId::new("post");
+        state.transcript.begin_assistant(id.clone());
+        state
+            .transcript
+            .append_assistant(&id, &"后续行。\n".repeat(12));
+        state.transcript.finish_assistant(&id);
+        let width = content().width as usize;
+        let (u0, u1) = state.item_span(1, width).expect("prompt span");
+        assert!(u0 > 4, "fixture must leave room above the prompt");
+        state.conv.auto_scroll = false;
+        state.conv.scroll = u0 - 4;
+        let band = state.theme.surface.elevated;
+        let canvas = state.theme.surface.canvas;
+        let height = content().height as usize;
+        let total = state.conversation_lines(width).len();
+        let buffer = paint(&mut state, 0);
+        let c = content();
+        let first = painted_y(&state, u0, height, total);
+        let last = painted_y(&state, u1 - 1, height, total);
+        for y in first..=last {
+            assert_eq!(buffer[(c.x, y)].bg, band, "visible prompt row {y}");
+            assert_eq!(buffer[(c.x + c.width - 1, y)].bg, band, "full width");
+        }
+        assert_eq!(buffer[(c.x, first - 1)].bg, canvas, "row above is clean");
+        assert_eq!(buffer[(c.x, last + 1)].bg, canvas, "row below is clean");
+    }
+
+    /// A light palette uses its own elevated surface, never the dark band.
+    #[test]
+    fn a_light_prompt_uses_the_light_surface_layer() {
+        let mut state = test_state();
+        state.theme = Theme::light();
+        let (u0, _, _, _) = prompt_then_answer(&mut state);
+        let height = content().height as usize;
+        let total = state.conversation_lines(content().width as usize).len();
+        let buffer = paint(&mut state, 0);
+        let c = content();
+        let y = painted_y(&state, u0, height, total);
+        assert_eq!(buffer[(c.x, y)].bg, Theme::light().surface.elevated);
+        assert_ne!(
+            buffer[(c.x, y)].bg,
+            Theme::dark().surface.elevated,
+            "the dark band must not leak into the light theme"
+        );
+    }
+
+    /// NO_COLOR has no band to paint, so the marker alone must still separate
+    /// the prompt from agent prose.
+    #[test]
+    fn no_color_falls_back_to_the_prompt_marker() {
+        let mut state = test_state();
+        state.theme = Theme::no_color();
+        let (u0, _, _, _) = prompt_then_answer(&mut state);
+        let buffer = paint(&mut state, 0);
+        assert!(buffer_text(&buffer).contains('❯'), "marker carries the cue");
+        let _ = u0;
     }
 
     /// Live reasoning paints in the conversation; a settled one leaves no row.

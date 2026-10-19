@@ -2296,9 +2296,11 @@ mod tests {
             } else if stage == "done" {
                 assert!(!rows.iter().any(|row| row.contains("reasoning line")));
             }
+            // The prompt's band owns one padding row above its body, so the
+            // text opens on the next row — still flush with the viewport top.
             assert_eq!(
                 first_row,
-                top as usize,
+                top as usize + 1,
                 "{stage}: first message must start at viewport top:\n{}",
                 rows.join("\n")
             );
@@ -2307,7 +2309,8 @@ mod tests {
                 crate::conversation::geometry::screen_to_content(&state, x, first_row as u16)
                     .unwrap()
                     .row,
-                0
+                1,
+                "the text row is the prompt's first body row"
             );
         }
     }
@@ -2873,7 +2876,7 @@ mod tests {
         let mut first_marker_y = None;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "▌") {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "❯") {
                     first_marker_y = Some(y);
                     break;
                 }
@@ -2882,15 +2885,17 @@ mod tests {
                 break;
             }
         }
+        // The prompt's band owns one padding row at the content top; the
+        // marker opens the first body row directly under it.
         assert_eq!(
             first_marker_y,
-            Some(cy),
-            "scrolled-to-top first glyph sits on the content top, not the header"
+            Some(cy + 1),
+            "scrolled-to-top prompt starts at the content top, not the header"
         );
         for x in 0..buf.area.width {
             let sym = buf.cell((x, cy - 1)).map(|c| c.symbol()).unwrap_or(" ");
             assert!(
-                sym != "▌" && !sym.starts_with('R'),
+                sym != "❯" && !sym.starts_with('R'),
                 "row above content must stay empty, col {x} is {sym:?}"
             );
         }
@@ -2925,7 +2930,7 @@ mod tests {
         let mut marker_x = None;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "▌") {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "❯") {
                     marker_x = Some(x);
                     break;
                 }
