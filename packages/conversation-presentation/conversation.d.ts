@@ -24,6 +24,7 @@ export interface ThoughtView {
   id: string;
   text: string;
   elapsedMs: number;
+  interrupted?: boolean;
   seq: number;
 }
 
@@ -77,6 +78,7 @@ export interface FoldedThought {
   elapsedMs: number;
   folded: true;
   body: string;
+  interrupted?: boolean;
   seq: number;
 }
 

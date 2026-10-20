@@ -141,6 +141,10 @@ export function applyEvent(state,event) {
     const status=turnTerminalFromEvent(event.type,next.messages,next.tools);
     next.lastTerminal=status;
     next.turnTerminals=[...(next.turnTerminals??[]),{seq:(next.nextSeq??0)-0.5,status}];
+    // A segment the runtime never completed is INTERRUPTED: kept and folded,
+    // never presented as finished. Terminalization must not discard it.
+    const unfinished=(next.reasoning||'').trim();
+    if(unfinished!=='')next.thoughts=[...next.thoughts,{id:`th-interrupted-${next.nextSeq++}`,text:unfinished,elapsedMs:0,interrupted:true,anchor:lastMessageId(next.messages),seq:next.reasoningSeq??next.nextSeq}];
     next.reasoning='';next.reasoningSuperseded=false;next.reasoningSeq=null;
   }
   return next;
@@ -161,6 +165,19 @@ export function clarificationAnswer(question,{picks=[],text=''}){
   if(kind==='multi'&&(picks.length<(question.min_choices??0)||picks.length>(question.max_choices??Infinity)))throw new Error(`请选择 ${question.min_choices??0} 至 ${question.max_choices??question.options?.length??0} 项`);
   return picks.length?picks.join(', '):'(none)';
 }
+/**
+ * A terminal resync rebuilds from durable history, which does not store a
+ * cancelled segment's partial reasoning. The live segment was a real runtime
+ * event; keep it (deduped by anchor+text) until the session is reopened.
+ */
+export function retainInterruptedThoughts(next,prior){
+ const kept=(prior?.thoughts??[]).filter(thought=>thought.interrupted===true);
+ if(!kept.length)return next;
+ const seen=new Set((next.thoughts??[]).map(thought=>`${thought.anchor??''}\u0000${thought.text}`));
+ const extra=kept.filter(thought=>!seen.has(`${thought.anchor??''}\u0000${thought.text}`));
+ return extra.length?{...next,thoughts:[...(next.thoughts??[]),...extra]}:next;
+}
+
 export function applySessionMetadata(state,snapshot){
   // SessionUpdated is metadata-only by the existing client protocol. A command
   // receipt is not a transcript checkpoint; live messages remain event-derived.

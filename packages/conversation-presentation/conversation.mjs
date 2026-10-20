@@ -268,6 +268,7 @@ export function foldedThoughts(thoughts) {
       body: thought.text,
       seq: thought.seq,
       ...(thought.anchor !== undefined ? { anchor: thought.anchor } : {}),
+      ...(thought.interrupted ? { interrupted: true } : {}),
     }));
 }
 

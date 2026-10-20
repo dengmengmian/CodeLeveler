@@ -2573,3 +2573,10 @@ body.home #permission {
   color: var(--muted);
   margin-left: 2px;
 }
+
+/* Live reasoning shows its newest lines only, like the terminal's tail; the
+   complete body is preserved by the folded Thought once the segment settles. */
+.thought.live .thought-body {
+  max-height: 4.8em;
+  overflow: hidden;
+}
