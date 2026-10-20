@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   copyText:text=>ipcRenderer.invoke('desktop:copy-text',text),
   filesList:request=>ipcRenderer.invoke('desktop:files-list',request),
   filesRead:request=>ipcRenderer.invoke('desktop:files-read',request),
+  filesImage:request=>ipcRenderer.invoke('desktop:files-image',request),
   openExternal:url=>ipcRenderer.invoke('desktop:open-external',url),
   openConfig:()=>ipcRenderer.invoke('desktop:open-config'),
   openInAppApps:()=>ipcRenderer.invoke('desktop:open-in-app-apps'),

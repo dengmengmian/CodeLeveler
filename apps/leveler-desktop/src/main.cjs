@@ -81,7 +81,7 @@ async function requestQuit(){
 }
 async function createWindow(){
   bridge=new Bridge(process.env.LEVELER_BINARY || path.resolve(__dirname,'../../../target/debug/leveler'),{onEvent:frame=>{if(frame.session_id===attachments.selected?.sessionId){if(frame.event==='snapshot')attachmentSession(frame.data);if(frame.event==='runtime'&&frame.data?.type==='session_updated')attachmentSession(frame.data.session);}attachments.observe(frame);if(window && !window.isDestroyed())window.webContents.send('desktop:event',frame);}});
-  window=new BrowserWindow({width:1280,height:820,minWidth:520,minHeight:600,title:'CodeLeveler',...(process.platform==='darwin'?{titleBarStyle:'hiddenInset',trafficLightPosition:{x:16,y:18},vibrancy:'sidebar',visualEffectState:'active',backgroundColor:'#00000000'}:{backgroundColor:'#f9fafb'}),webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false,webSecurity:true}});
+  window=new BrowserWindow({width:1280,height:820,minWidth:520,minHeight:520,title:'CodeLeveler',...(process.platform==='darwin'?{titleBarStyle:'hiddenInset',trafficLightPosition:{x:16,y:18},vibrancy:'sidebar',visualEffectState:'active',backgroundColor:'#00000000'}:{backgroundColor:'#f9fafb'}),webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false,webSecurity:true}});
   browser=new ManualBrowser({window,WebContentsView,session,shell,onState:state=>{if(window&&!window.isDestroyed())window.webContents.send('desktop:browser-event',state);}});
   window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   window.webContents.on('will-navigate',event=>event.preventDefault());
@@ -118,6 +118,11 @@ app.whenReady().then(async()=>{
     if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid file request');
     if(Object.keys(request).some(key=>!['sessionId','path'].includes(key)))throw new Error('Invalid file request');
     return withFileSlot(()=>workspaceFiles(request.sessionId).read(request.path));
+  });
+  handle('desktop:files-image',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid file request');
+    if(Object.keys(request).some(key=>!['sessionId','path'].includes(key)))throw new Error('Invalid file request');
+    return withFileSlot(()=>workspaceFiles(request.sessionId).readImage(request.path));
   });
   handle('desktop:copy-text',value=>copyText(value,clipboard));
   handle('desktop:open-external',async value=>{const url=new URL(text(value,'url'));if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('Invalid external URL');await shell.openExternal(url.href);return {ok:true};});

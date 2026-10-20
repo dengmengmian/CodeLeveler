@@ -13,6 +13,16 @@ function decode(text){
 function httpDestination(href){
  try{const url=new URL(decode(href));return ['https:','http:'].includes(url.protocol)&&!url.username&&!url.password?url.href:null;}catch{return null;}
 }
+/** Workspace-relative file links only; never an absolute path or another scheme. */
+function fileDestination(href){
+ const decoded=decode(href).trim();
+ if(!decoded||decoded.startsWith('#')||decoded.startsWith('/')||decoded.startsWith('//'))return null;
+ if(/^[a-z][a-z0-9+.-]*:/i.test(decoded))return null;
+ if(/\s/.test(decoded))return null;
+ if(/(^|\/)\.\.(\/|$)/.test(decoded))return null;
+ if(!/\.[A-Za-z0-9]{1,8}(?:#L\d+(?:-L?\d+)?)?$/.test(decoded))return null;
+ return decoded;
+}
 /** Render safe Markdown through a DOM allowlist. Navigation is an explicit caller callback.
  * @param {HTMLElement} container @param {string} text @param {{onLink?:(url:string)=>void}} [options] */
 export function renderMarkdown(container,text,options={}){
@@ -49,10 +59,18 @@ export function renderMarkdown(container,text,options={}){
     element=node('div');element.className='markdown-table';element.append(table);break;
    }
    case 'link':{
-    const href=httpDestination(token.href);if(!href){inline(parent,token);return;}
+    const href=httpDestination(token.href)??fileDestination(token.href);if(!href){inline(parent,token);return;}
     element=node(options.onLink?'button':'span');element.setAttribute('class','markdown-link');element.setAttribute('title',href);if(options.onLink){element.setAttribute('type','button');element.addEventListener('click',()=>options.onLink(href));}inline(element,token);break;
    }
-   case 'image':literal(parent,`[图片暂不支持：${decode(token.text)}]`);return;
+   case 'image':{
+    const src=fileDestination(token.href);
+    if(!src){literal(parent,`[图片暂不支持：${decode(token.text)}]`);return;}
+    element=node('span');element.setAttribute('class','markdown-image');element.setAttribute('data-src',src);element.setAttribute('data-alt',decode(token.text));
+    literal(element,`[图片：${decode(token.text)}]`);
+    options.onImage?.(element,src,decode(token.text));
+    if(!options.onImage&&options.onLink)element.addEventListener('click',()=>options.onLink(src));
+    break;
+   }
    case 'html':literal(parent,token.raw??token.text);return;
    default:literal(parent,token.raw??token.text);return;
   }

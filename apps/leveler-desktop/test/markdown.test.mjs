@@ -49,3 +49,16 @@ test('HTTP(S) links invoke an explicit callback only on activation; unsafe desti
  links[0].listeners.click();assert.deepEqual(opened,['https://example.com/docs']);
  assert.equal(tags(root,'a').length,0);
 });
+
+test('workspace-relative file links are recognized without turning escapes into links',()=>{
+ const root=render('[src](src/main.ts#L24) [readme](README.md) [abs](/etc/passwd) [up](../../secret.ts) [space](my%20file.ts) [protocol](file:///secret)');
+ const links=tags(root,'span').filter(n=>n.attributes.class==='markdown-link');
+ assert.deepEqual(links.map(n=>n.attributes.title),['src/main.ts#L24','README.md','my%20file.ts']);
+});
+test('local markdown images become inert placeholders carrying only a workspace path',()=>{
+ const root=render('![pixel](pixel.png) ![remote](https://example.com/a.png) ![escape](../a.png)');
+ const images=tags(root,'span').filter(n=>n.attributes.class==='markdown-image');
+ assert.equal(images.length,1);
+ assert.equal(images[0].attributes['data-src'],'pixel.png');
+ assert.equal(tags(root,'img').length,0);
+});

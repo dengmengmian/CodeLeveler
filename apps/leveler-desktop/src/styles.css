@@ -2491,3 +2491,36 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .files-error { display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: var(--error); font-size: 12px; line-height: 18px; }
 .files-error .button { flex: none; }
 .preview-truncated { padding: 8px 12px; border-top: .5px solid var(--border-l1); color: var(--text-tertiary); font-size: 11px; line-height: 17px; }
+
+/* Preview formats and code highlighting */
+.preview-image-frame { display: flex; min-height: 100%; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 16px; background: var(--bg-base); }
+.preview-image { max-width: 100%; max-height: calc(100% - 28px); object-fit: contain; border-radius: 8px; }
+.preview-image-meta { color: var(--text-tertiary); font-family: var(--font-code); font-size: 10px; }
+.preview-csv { padding: 8px 12px 16px; overflow: auto; }
+.preview-csv-table { border-collapse: collapse; min-width: 100%; font-family: var(--font-code); font-size: var(--code-font-size); line-height: calc(var(--code-font-size) + 7px); }
+.preview-csv-table th, .preview-csv-table td { max-width: 320px; padding: 4px 10px; border: .5px solid var(--border-l2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.preview-csv-table th { position: sticky; top: 0; background: var(--bg-module); color: var(--text-primary); font-weight: 500; }
+.preview-csv-table td { color: var(--text-secondary); }
+.tok-keyword { color: #a626a4; }
+.tok-string { color: #50a14f; }
+.tok-comment { color: #a0a1a7; font-style: italic; }
+.tok-number { color: #986801; }
+.tok-function { color: #4078f2; }
+.tok-punct { color: var(--text-secondary); }
+:root[data-theme="dark"] .tok-keyword { color: #c678dd; }
+:root[data-theme="dark"] .tok-string { color: #98c379; }
+:root[data-theme="dark"] .tok-comment { color: #7f848e; }
+:root[data-theme="dark"] .tok-number { color: #d19a66; }
+:root[data-theme="dark"] .tok-function { color: #61afef; }
+.preview-code-line.target-line { background: rgba(65, 118, 230, .13); }
+.tool-open-file {
+  display: inline-flex; height: 22px; align-items: center; gap: 4px; padding: 0 7px;
+  border: .5px solid var(--border-l3); border-radius: 6px; color: var(--text-secondary);
+  font-size: 10px; line-height: 16px;
+}
+.tool-open-file:hover { background: var(--hover); color: var(--text-primary); }
+.tool-read-head .tool-open-file, .tool-search-head .tool-open-file { margin-left: auto; }
+.tool-read-head .tool-open-file + .tool-copy, .tool-search-head .tool-open-file + .tool-copy { margin-left: 6px; }
+
+.markdown-image { color: var(--text-tertiary); font-size: 12px; }
+.preview-md-image { display: block; max-width: 100%; height: auto; margin: 8px 0; border-radius: 8px; }

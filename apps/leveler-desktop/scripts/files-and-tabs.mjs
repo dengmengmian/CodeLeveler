@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, symlink, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -15,10 +16,18 @@ const output = path.join(root, 'acceptance-output/round4-files');
 await mkdir(home);
 await mkdir(path.join(workspace, 'src', 'nested'), { recursive: true });
 await mkdir(path.join(workspace, 'empty'));
-await writeFile(path.join(workspace, 'README.md'), '# Files fixture\n\n真实 Markdown 内容。\n');
+await writeFile(path.join(workspace, 'README.md'), '# Files fixture\n\n真实 Markdown 内容。\n\n![pixel](pixel.png)\n');
 await writeFile(path.join(workspace, 'src', 'main.ts'), 'export const answer = 42;\n');
 await writeFile(path.join(workspace, 'src', 'nested', '中文 文件名.txt'), '含空格与中文的文件内容\n');
 await writeFile(path.join(workspace, 'large.txt'), 'large-line\n'.repeat(120000));
+await writeFile(path.join(workspace, 'data.json'), '{"name":"fixture","count":3}\n');
+await writeFile(path.join(workspace, 'config.yaml'), 'name: fixture\nitems:\n  - one\n');
+await writeFile(path.join(workspace, 'config.toml'), '[section]\nname = "fixture"\n');
+await writeFile(path.join(workspace, 'table.csv'), 'name,value\nalpha,1\n"beta, two",2\n');
+await writeFile(path.join(workspace, 'pixel.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
+await writeFile(path.join(workspace, 'broken.png'), 'not-a-png');
+await writeFile(path.join(workspace, 'doc.pdf'), '%PDF-1.4\n%%EOF\n');
+await writeFile(path.join(workspace, 'sample.docx'), 'not-a-real-docx');
 const outside = path.join(temporary, 'outside.txt');
 await writeFile(outside, 'OUTSIDE_SECRET\n');
 await symlink(outside, path.join(workspace, 'escape-link'));
@@ -27,7 +36,7 @@ const server = createServer(async (request, response) => {
   if (request.method === 'GET') { response.writeHead(200, { 'content-type': 'text/plain' }); response.end('fixture'); return; }
   for await (const _chunk of request) { /* drain */ }
   response.writeHead(200, { 'content-type': 'text/event-stream' });
-  response.write(`data: ${JSON.stringify({ id: 'tabs', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: { content: 'TAB_SEED_OK' }, finish_reason: null }] })}\n\n`);
+  response.write(`data: ${JSON.stringify({ id: 'tabs', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: { content: 'TAB_SEED_OK 打开 [main.ts](src/main.ts#L2)' }, finish_reason: null }] })}\n\n`);
   response.write(`data: ${JSON.stringify({ id: 'tabs', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
   response.end('data: [DONE]\n\n');
 });
@@ -121,21 +130,30 @@ try {
     }
     await page.waitForSelector('.files-view');
   };
+  const filesStart = Date.now();
   await openFilesTab();
   await page.waitForSelector('.files-row');
+  evidence.filesFirstLoadMs = Date.now() - filesStart;
   const rootNames = await page.locator('.files-row').evaluateAll(rows => rows.map(row => row.dataset.path));
   for (const expected of ['README.md', 'src', 'empty', 'large.txt', 'escape-link']) assert.ok(rootNames.includes(expected), `missing ${expected}`);
   evidence.filesRoot = rootNames;
 
+  const expandStart = Date.now();
   await mouseClick(page.locator('.files-row[data-path="src"]'));
   await page.waitForSelector('.files-row[data-path="src/main.ts"]');
+  evidence.filesExpandMs = Date.now() - expandStart;
   await mouseClick(page.locator('.files-row[data-path="src/nested"]'));
   await page.waitForFunction(() => [...document.querySelectorAll('.files-row')].some(row => row.dataset.path.includes('nested/') && row.dataset.path.endsWith('.txt')));
   evidence.expansion = true;
   evidence.unicodeNamePresent = true;
 
+  const markdownStart = Date.now();
   await mouseClick(page.locator('.files-row[data-path="README.md"]'));
   await page.waitForFunction(() => document.querySelector('.pane-body .markdown')?.textContent.includes('真实 Markdown 内容'));
+  await page.waitForSelector('.preview-md-image');
+  assert.equal(await page.locator('.preview-md-image').evaluate(image => image.naturalWidth), 1);
+  evidence.markdownImageInline = true;
+  evidence.markdownPreviewMs = Date.now() - markdownStart;
   const readme = await readFile(path.join(workspace, 'README.md'), 'utf8');
   assert.ok((await page.locator('.pane-body .markdown').textContent()).includes(readme.split('\n')[2]));
 
@@ -177,6 +195,68 @@ try {
   evidence.readOnly = true;
   await page.screenshot({ path: path.join(output, 'files-tree.png') });
 
+  // Format coverage: JSON/YAML/TOML, CSV, image, damaged image, PDF/Office UI_ONLY.
+  const openFromFiles = async filePath => {
+    await openFilesTab();
+    await page.waitForSelector(`.files-row[data-path=${JSON.stringify(filePath)}]`);
+    await mouseClick(page.locator(`.files-row[data-path=${JSON.stringify(filePath)}]`));
+  };
+  await openFromFiles('data.json');
+  await page.waitForSelector('.preview-code-line');
+  evidence.jsonPreview = await page.locator('.preview-code .tok-string').count() > 0;
+  await openFromFiles('config.yaml');
+  await page.waitForSelector('.preview-code-line');
+  evidence.yamlPreview = await page.locator('.preview-code-line').count() > 0;
+  await openFromFiles('config.toml');
+  await page.waitForSelector('.preview-code-line');
+  evidence.tomlPreview = true;
+  await openFromFiles('table.csv');
+  await page.waitForSelector('.preview-csv-table');
+  evidence.csvPreview = await page.locator('.preview-csv-table tbody tr').count();
+  assert.equal(evidence.csvPreview, 2);
+  await openFromFiles('pixel.png');
+  await page.waitForSelector('.preview-image');
+  evidence.imagePreview = await page.locator('.preview-image').evaluate(image => ({ width: image.naturalWidth, height: image.naturalHeight }));
+  assert.equal(evidence.imagePreview.width, 1);
+  await openFromFiles('broken.png');
+  await page.waitForFunction(() => /图片无法解码|不支持的图片格式/.test(document.querySelector('.preview-body')?.textContent ?? ''));
+  evidence.brokenImage = await page.locator('.preview-body').innerText();
+  await openFromFiles('doc.pdf');
+  await page.waitForFunction(() => document.querySelector('.preview-body')?.textContent.includes('PDF 预览尚未接入'));
+  await openFromFiles('sample.docx');
+  await page.waitForFunction(() => document.querySelector('.preview-body')?.textContent.includes('Office 预览尚未接入'));
+  evidence.pdfOfficeUiOnly = true;
+
+  // Conversation file link with line target; draft and transcript stay intact.
+  await openFilesTab();
+  await page.locator('#message').fill('DRAFT_SURVIVES_LINK');
+  const beforeLinkMessages = await page.locator('.message').count();
+  await mouseClick(page.locator('.message.assistant .markdown .markdown-link').filter({ hasText: 'main.ts' }).last());
+  await page.waitForSelector('.preview-code-line.target-line[data-line="2"]');
+  assert.equal(await page.locator('#message').inputValue(), 'DRAFT_SURVIVES_LINK');
+  assert.ok(await page.locator('.message').count() >= beforeLinkMessages);
+  evidence.chatFileLink = { lineTarget: true, draft: true, transcript: true };
+  await page.locator('#message').fill('');
+
+  // Current Git diff -> Review -> full file -> back to Review.
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['add', '.'], { cwd: workspace });
+  execFileSync('git', ['-c', 'user.email=fixture@example.test', '-c', 'user.name=Fixture', 'commit', '-qm', 'fixture'], { cwd: workspace });
+  await writeFile(path.join(workspace, 'README.md'), '# Files fixture\n\n真实 Markdown 内容。\n\nREVIEW_ADDED_LINE\n');
+  await page.locator('#message').fill('/diff');
+  await page.locator('#message').press('Enter');
+  await page.waitForSelector('.review-head');
+  await page.waitForFunction(() => [...document.querySelectorAll('.review-line.added')].some(line => line.textContent.includes('REVIEW_ADDED_LINE')));
+  evidence.reviewDiff = true;
+  await mouseClick(page.locator('.review-tools button[aria-label="打开完整文件"]'));
+  await page.waitForSelector('.preview-body .markdown');
+  await page.waitForFunction(() => document.querySelector('.preview-body')?.textContent.includes('REVIEW_ADDED_LINE'));
+  evidence.reviewToPreview = true;
+  await mouseClick(page.locator('.preview-toolbar button[aria-label="查看本轮改动"]'));
+  await page.waitForSelector('.review-head');
+  evidence.previewToReview = true;
+  await page.screenshot({ path: path.join(output, 'preview-review.png') });
+
   const closeTab = async title => {
     const tab = page.locator('.pane-tab').filter({ hasText: new RegExp(`^${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) }).first();
     await tab.waitFor();
@@ -208,6 +288,21 @@ try {
   await page.waitForSelector('.files-row[data-path="README.md"]');
   evidence.closeAndReopen = true;
 
+  // Dock: split panes and float a real preview, then dock it back.
+  const filesTabNow = page.locator('.pane-tab').filter({ hasText: /^文件$/ }).first();
+  await filesTabNow.click({ button: 'right' });
+  await page.getByRole('menuitem').filter({ hasText: '向右分栏' }).click();
+  await page.waitForFunction(() => document.querySelectorAll('.right-pane').length === 2);
+  evidence.splitPanes = true;
+  const previewTab = page.locator('.pane-tab').filter({ hasText: /^data\.json$/ }).first();
+  await previewTab.click({ button: 'right' });
+  await page.getByRole('menuitem').filter({ hasText: '浮动窗口' }).click();
+  await page.waitForSelector('.rightbar-float .preview-code-line');
+  evidence.floatPreview = true;
+  await page.locator('.rightbar-float button[aria-label="返回停靠区"]').click();
+  await page.waitForFunction(() => !document.querySelector('.rightbar-float'));
+  evidence.floatDocked = true;
+
   // No-workspace session keeps the honest empty state.
   const bare = await page.evaluate(async () => (await window.desktop.createTask(null, crypto.randomUUID())).session.id);
   await page.reload();
@@ -225,6 +320,26 @@ try {
   await openFilesTab();
   await page.waitForSelector('.files-row[data-path="README.md"]');
   evidence.sessionSwitch = true;
+
+  for (const [width, height] of [[1280, 820], [960, 600], [700, 520], [520, 600]]) {
+    await app.evaluate(({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0].setContentSize(size.width, size.height), { width, height });
+    await page.waitForFunction(width => innerWidth === width, width);
+    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    evidence.viewports ??= [];
+    evidence.viewports.push(viewport);
+    assert.equal(viewport.width, width);
+    assert.ok(Math.abs(viewport.height - height) <= 40, `viewport height ${viewport.height} vs ${height}`);
+    await openFilesTab();
+    await page.waitForSelector('.files-row[data-path="README.md"]');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    if (height <= 520) {
+      const seat = await page.locator('#composer-seat').boundingBox();
+      assert.ok(seat && seat.y + seat.height <= height + 1, `composer clipped at ${width}x${height}`);
+    }
+  }
+  evidence.responsive = true;
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1280, 820));
+  await page.waitForFunction(() => innerWidth === 1280);
 
   await app.close();
   app = await electron.launch({
@@ -246,8 +361,10 @@ try {
   }
   await openFilesTab();
   await page.waitForSelector('.files-row[data-path="README.md"]');
+  const restartStart = Date.now();
   await mouseClick(page.locator('.files-row[data-path="README.md"]'));
   await page.waitForFunction(() => document.querySelector('.pane-body .markdown')?.textContent.includes('真实 Markdown 内容'));
+  evidence.restartPreviewMs = Date.now() - restartStart;
   evidence.restart = true;
 
   assert.deepEqual(errors, []);

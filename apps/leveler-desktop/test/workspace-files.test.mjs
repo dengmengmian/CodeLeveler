@@ -82,3 +82,20 @@ test('workspace files cap large reads and refuse binary content', async () => {
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test('workspace files read real images as data URLs and reject non-images', async () => {
+  const { temporary, root } = await fixture();
+  try {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+    await writeFile(path.join(root, 'pixel.png'), png);
+    const files = new WorkspaceFiles({ root });
+    const image = await files.readImage('pixel.png');
+    assert.equal(image.mime, 'image/png');
+    assert.equal(image.size, png.length);
+    assert.ok(image.dataUrl.startsWith('data:image/png;base64,'));
+    await assert.rejects(() => files.readImage('README.md'), /不支持的图片格式/);
+    await assert.rejects(() => files.readImage('../outside.png'), /路径超出工作区/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
