@@ -10,7 +10,7 @@ import {
 } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null};
+  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[]};
   if (history.length > 0) {
     // The durable log is the conversation; the snapshot's `messages` are the
     // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
@@ -33,8 +33,10 @@ export function projectSnapshot(snapshot, history = []) {
   for (const tool of snapshot.active_tools ?? []) state = applyEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments});
   // The durable history's turn terminal is the runtime's own fact: without it a
   // reopened turn could not tell an answer from interim narration (Contract §I9).
-  const terminal = [...history].reverse().find(entry=>terminalEvents.has((entry.event??entry).type))?.event?.type;
+  const terminalEntry = [...history].reverse().find(entry=>terminalEvents.has((entry.event??entry).type));
+  const terminal = terminalEntry?.event?.type;
   if (terminal) state = {...state, lastTerminal: turnTerminalFromEvent(terminal, state.messages, state.tools)};
+
   state.approvals = (snapshot.pending_interactions ?? []).filter(i=>i.type==='approval').map(i=>i.request);
   state.clarifications = (snapshot.pending_interactions ?? []).filter(i=>i.type==='clarification').map(i=>i.request);
   return state;
@@ -89,6 +91,12 @@ export function applyEvent(state,event) {
   if(event.type==='assistant_message_completed'&&state.streamingMessageId===event.message_id)next.streamingMessageId=null;
   if(terminalEvents.has(event.type)||event.type==='assistant_attempt_reset')next.streamingMessageId=null;
   if(event.type==='plan_updated') next.plan=event.plan;
+  if(event.type==='turn_failed'){
+    const text=event.failure?.message||event.error||'Runtime 执行失败';
+    const anchor=event.anchor??[...next.messages].reverse().find(message=>message.role==='user')?.id??null;
+    const seq=event.seq??next.nextSeq++;
+    next.turnErrors=[...(state.turnErrors??[]),{id:`turn-error-${seq}`,text,anchor,seq}];
+  }
   if(event.type==='context_compacted'){
     // The compaction is a durable conversation fact, not only a toast: a
     // reopened session must still say where the context was re-based. The row

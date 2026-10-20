@@ -43,9 +43,10 @@ export function renderMarkdown(container,text,options={}){
     for(const item of token.items){const li=node('li');if(item.task)literal(li,item.checked?'☑ ':'☐ ');children(li,item.tokens);element.append(li);}break;
    }
    case 'table':{
-    element=node('table');const head=node('thead'),body=node('tbody'),header=node('tr');
+    const table=node('table');const head=node('thead'),body=node('tbody'),header=node('tr');
     for(const cell of token.header){const th=node('th');inline(th,cell);header.append(th);}head.append(header);
-    for(const row of token.rows){const tr=node('tr');for(const cell of row){const td=node('td');inline(td,cell);tr.append(td);}body.append(tr);}element.append(head,body);break;
+    for(const row of token.rows){const tr=node('tr');for(const cell of row){const td=node('td');inline(td,cell);tr.append(td);}body.append(tr);}table.append(head,body);
+    element=node('div');element.className='markdown-table';element.append(table);break;
    }
    case 'link':{
     const href=httpDestination(token.href);if(!href){inline(parent,token);return;}

@@ -1,5 +1,146 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><title>CodeLeveler</title><link rel="stylesheet" href="styles.css"></head>
-<body class="home"><div id="compact-drag" aria-hidden="true"></div><aside id="sidebar"><div class="sidebar-top-strip"><button id="sidebar-toggle" class="icon" aria-label="切换侧栏" data-tooltip="切换侧栏" data-keys="⌘ B">☰</button><button id="compact-new-task" class="icon" aria-label="新建任务" data-tooltip="新建任务" data-keys="⌘ N" hidden><span data-icon="newSession"></span></button></div><div class="brand"><span class="brand-mark">C</span><span class="sidebar-label">CodeLeveler <small id="desktop-version"></small></span></div><div class="sidebar-navigation"><button id="new-task"><span class="nav-symbol" data-icon="plus"></span><span class="sidebar-label">新建任务</span></button></div><div id="filter-menu" class="small-menu" hidden role="dialog" aria-label="筛选任务"><fieldset><legend>任务状态</legend><div id="status-filters"></div></fieldset><fieldset><legend>任务时间</legend><div id="time-filters"></div></fieldset><button id="filter-reset" type="button">重置筛选</button></div><div class="sidebar-heading"><button id="tasks-toggle" class="section-toggle" aria-expanded="true"><span class="sidebar-label">任务 <span id="task-count">(0)</span></span><span class="section-chevron" data-icon="chevron"></span></button><button id="refresh" class="icon" aria-label="刷新历史任务">↻</button></div><nav id="tasks" aria-label="历史任务"></nav><div class="sidebar-heading sidebar-label"><button id="spaces-toggle" class="section-toggle" aria-expanded="true"><span>空间 <span id="space-count">(0)</span></span><span class="section-chevron" data-icon="chevron"></span></button><div class="sidebar-heading-actions"><button id="search-toggle" class="icon" aria-label="搜索任务" data-tooltip="搜索任务">⌕</button><button id="task-filter" class="icon" aria-label="筛选任务" data-tooltip="筛选任务">☷</button><button id="space-add" class="icon" aria-label="打开本地文件夹">＋</button></div></div><section id="workspaces" class="sidebar-label" aria-label="工作区"></section><div class="sidebar-footer sidebar-label"><button id="settings-open" class="icon" aria-label="设置" data-tooltip="设置" data-keys="⌘ ,"><span data-icon="settings"></span><span class="sidebar-label">设置</span></button><label class="theme">外观 <select id="theme" aria-label="外观"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label></div></aside>
-<main><header><div><div class="title-row"><h1 id="title">新建任务</h1><button id="title-edit" class="icon secondary-action" aria-label="重命名当前任务" data-tooltip="重命名任务" hidden>✎</button><form id="title-form" hidden><label for="title-input" class="sr-only">任务标题</label><input id="title-input" maxlength="256" autocomplete="off"><button id="title-save" type="submit" aria-label="保存标题">✓</button><button id="title-cancel" type="button" aria-label="取消重命名">×</button></form></div><div id="rename-error" role="alert" hidden></div><div id="subtitle">直接聊天，或打开工作区</div></div><div class="header-actions"><button id="conversation-search-toggle" class="icon" aria-label="搜索对话内容" data-tooltip="搜索对话内容" data-keys="⌘ F" hidden>⌕</button><button id="task-history" class="icon" aria-label="查看历史提问" data-tooltip="历史提问" hidden>◷</button><span id="status" role="status">正在连接…</span><button id="workbench-toggle" class="icon" data-tooltip="右侧工作台" data-keys="⌘ ⇧ I" aria-label="切换右侧工作台">◫</button></div></header><div id="conversation-search-bar" hidden><input id="conversation-query" type="search" placeholder="搜索对话内容" aria-label="搜索对话内容"><span id="conversation-match-count" role="status">0 / 0</span><button id="conversation-find-prev" class="icon" type="button" aria-label="上一个匹配" data-tooltip="上一个匹配" data-keys="⇧ Enter">↑</button><button id="conversation-find-next" class="icon" type="button" aria-label="下一个匹配" data-tooltip="下一个匹配" data-keys="Enter">↓</button><button id="conversation-search-close" class="icon" type="button" aria-label="关闭对话搜索">×</button></div><div id="error" role="alert" hidden></div><section id="conversation" aria-label="对话"></section><section id="interactions" aria-label="待处理请求"></section><div id="composer-area"><h2 id="home-title">今天帮你做些什么？</h2><form id="composer"><label for="message" class="sr-only">消息</label><textarea id="message" rows="3" placeholder="输入问题，开始一个任务…"></textarea><div id="attachment-chips" aria-label="待发送附件"></div><div class="composer-bar"><div id="composer-left"><button type="button" id="attachment-add" class="icon" aria-label="添加附件" data-tooltip="添加文件">＋</button><button type="button" id="permission" aria-label="当前权限"><span data-icon="shield"></span><span id="permission-label">权限由 Runtime 决定</span></button></div><div><button type="button" id="cancel" hidden>停止</button><button type="button" id="model-picker" aria-haspopup="dialog"><span id="model-label" class="metadata">选择模型</span><span data-icon="chevron"></span></button><button type="submit" id="send" class="primary" aria-label="发送">↑</button></div></div></form><div id="workspace-tray"><button type="button" id="workspace-picker" aria-haspopup="dialog"><span data-icon="folder"></span><span id="workspace">选择工作空间</span><span data-icon="chevron"></span></button><button type="button" id="clear-folder" hidden aria-label="取消所选文件夹">×</button><button type="button" id="home-permission" aria-label="当前权限"></button></div><p id="composer-error" role="alert" hidden></p><p class="composer-hint">Enter 发送 · Shift + Enter 换行</p><div id="command-menu" class="composer-menu" hidden role="listbox" aria-label="命令候选"><div class="command-heading"><span>命令</span><span id="command-count"></span></div><div id="command-options"></div><p>↑↓ 选择 · Enter 插入 · 发送时执行 · Esc 关闭</p></div><div id="workspace-menu" class="composer-menu" hidden role="dialog" aria-label="选择工作空间"><input id="workspace-query" type="search" placeholder="搜索最近工作空间" aria-label="搜索最近工作空间"><div id="workspace-options"></div><button type="button" id="folder">打开本地文件夹…</button></div><div id="model-menu" class="composer-menu" hidden role="dialog" aria-label="选择模型"><div id="model-options"></div><p id="model-error" role="alert" hidden></p></div><div id="permission-menu" class="composer-menu" hidden role="dialog" aria-label="当前权限"><p id="permission-description"></p><div id="permission-options"></div><p id="permission-error" role="alert" hidden></p></div></div></main>
-<div id="task-menu" class="task-menu" hidden role="menu" aria-label="任务操作"><button id="task-menu-rename" role="menuitem" type="button">重命名</button><button id="task-menu-archive" role="menuitem" type="button" data-tooltip="从默认列表隐藏，保留完整对话">归档</button><p>归档保留完整对话</p></div><div id="task-history-popup" hidden role="dialog" aria-label="历史提问"><div class="history-heading"><strong>历史提问</strong><button id="task-history-close" class="icon" type="button" aria-label="关闭历史提问">×</button></div><div id="task-history-content"></div></div><div id="workbench-backdrop" hidden></div><aside id="workbench" aria-label="右侧工作台"><div id="resize-handle" role="separator" aria-label="调整工作台宽度" aria-orientation="vertical" tabindex="0"></div><div class="workbench-header"><button id="workbench-overview" class="workbench-tab" type="button" role="tab" aria-label="概览" aria-selected="true"><span data-icon="compass"></span><span class="workbench-tab-label">概览</span></button><div id="workbench-tabs" role="tablist" aria-label="工作台视图"></div><div id="browser-tabs" role="tablist" aria-label="浏览器标签"></div><button id="browser-new" class="icon" aria-label="新建浏览器标签">＋</button><div class="workbench-toolbar-end"><button id="workbench-expand" class="icon" aria-label="展开工作台" data-tooltip="展开工作台" aria-pressed="false">⤢</button><button id="workbench-close" class="icon" aria-label="收起工作台" data-tooltip="收起工作台">▹</button></div></div><div id="workbench-body"><section id="overview-pane" aria-label="概览上下文"><select id="workbench-view" aria-label="概览内容"><option value="overview">概览</option></select><div id="workbench-content"></div></section><section id="browser" hidden><form id="browser-navigation"><button type="button" id="browser-back" class="icon" aria-label="后退" data-tooltip="后退">←</button><button type="button" id="browser-forward" class="icon" aria-label="前进" data-tooltip="前进">→</button><input id="browser-url" aria-label="网页地址" placeholder="输入网址"><button type="button" id="browser-reload" class="icon" aria-label="刷新网页" data-tooltip="刷新网页">↻</button><button type="button" id="browser-external" class="icon" aria-label="在系统浏览器打开" data-tooltip="在系统浏览器打开">↗</button></form><p class="browser-notice">手动浏览器 · 尚未与 Agent 浏览器绑定</p><p id="browser-status" role="status" hidden></p><div id="browser-error" role="alert" hidden></div><div id="browser-surface"><div class="browser-empty"><h3>打开一个网页</h3><p>在上方输入公开网址，或新建标签。</p></div></div></section></div></aside><dialog id="settings-dialog" aria-labelledby="settings-title"><div class="settings-header"><h2 id="settings-title">设置</h2><button id="settings-close" class="icon" aria-label="关闭设置"><span data-icon="close"></span></button></div><div class="settings-layout"><nav id="settings-nav" aria-label="设置分类"></nav><section id="settings-content" aria-label="设置内容"></section></div></dialog><dialog id="archive-dialog" aria-labelledby="archive-title"><h2 id="archive-title">归档任务？</h2><p>归档后将从任务列表隐藏，会话记录保留。</p><p class="archive-note">当前桌面未提供恢复归档的入口。</p><div id="archive-error" role="alert" hidden></div><div class="archive-actions"><button id="archive-cancel" type="button">取消</button><button id="archive-confirm" type="button">归档</button></div></dialog><dialog id="search-dialog" aria-labelledby="search-title"><div class="search-dialog-header"><h2 id="search-title" class="sr-only">搜索任务与工作空间</h2><label for="task-search" class="sr-only">搜索任务与工作空间</label><span aria-hidden="true" data-icon="search"></span><input id="task-search" type="search" placeholder="搜索任务与工作空间…" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="search-results"><button id="search-close" class="icon" type="button" aria-label="关闭搜索">×</button></div><div id="search-results" role="listbox" aria-label="搜索结果"></div><div class="search-dialog-footer">↑↓ 选择 <span>Enter 打开</span><span>Esc 关闭</span></div></dialog><script type="module" src="renderer.mjs"></script></body></html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<title>CodeLeveler</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body class="home">
+<div id="app-frame" class="app-frame">
+  <aside id="sidebar" class="sidebar" aria-label="导航">
+    <div class="sidebar-topstrip">
+      <button id="sidebar-toggle" class="icon-button sidebar-toggle" type="button" aria-label="收起侧边栏" data-tooltip="收起侧边栏" data-keys="⌥ ⌘ B"></button>
+    </div>
+    <div class="sidebar-brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-identity">
+        <span class="brand-name">CodeLeveler</span>
+        <span class="brand-version" id="brand-version"></span>
+      </span>
+    </div>
+    <button id="new-session" class="new-session" type="button" aria-label="新建会话">
+      <span class="new-session-content"></span>
+      <span class="new-session-shortcut"><kbd>⌘</kbd><kbd>N</kbd></span>
+    </button>
+    <nav class="sidebar-panels" aria-label="全局面板">
+      <button id="nav-plugins" class="panel-row" type="button" data-panel="plugins"></button>
+      <button id="nav-automation" class="panel-row" type="button" data-panel="automation"></button>
+    </nav>
+    <div class="sidebar-workspaces">
+      <div class="workspace-section-head">
+        <span class="section-label">工作区</span>
+        <div class="section-actions">
+          <button id="session-search" class="icon-button" type="button" aria-label="搜索会话" data-tooltip="搜索会话" data-keys="⌘ F"></button>
+          <button id="view-options" class="icon-button" type="button" aria-label="视图选项" data-tooltip="视图选项"></button>
+          <button id="add-workspace" class="icon-button" type="button" aria-label="添加工作区" data-tooltip="添加工作区"></button>
+        </div>
+      </div>
+      <div id="workspace-list" class="workspace-list" role="tree" aria-label="工作区与会话"></div>
+    </div>
+    <div class="sidebar-footer">
+      <button id="account-menu" class="account-row" type="button" aria-label="账号菜单">
+        <span class="account-icon"></span>
+        <span class="account-label">更多</span>
+      </button>
+    </div>
+  </aside>
+
+  <main id="main" class="main">
+    <div id="leading-seat" class="leading-seat" hidden>
+      <button id="leading-toggle" class="icon-button" type="button" aria-label="打开侧边栏" data-tooltip="打开侧边栏" data-keys="⌥ ⌘ B"></button>
+      <button id="leading-new" class="icon-button" type="button" aria-label="新建会话" data-tooltip="新建会话" data-keys="⌘ N"></button>
+    </div>
+    <button id="floating-right-toggle" class="icon-button floating-right-toggle" type="button" aria-label="打开右侧边栏" data-tooltip="打开侧边栏" data-keys="⌥ ⌘ B"></button>
+
+    <header id="conversation-header" class="conversation-header" hidden>
+      <div class="conversation-heading">
+        <h1 id="conversation-title"></h1>
+        <span id="conversation-status" class="conversation-status" role="status"></span>
+      </div>
+      <div class="header-actions">
+        <span id="header-preset" class="header-preset">标准模式</span>
+        <button id="header-right-toggle" class="icon-button" type="button" aria-label="打开右侧边栏" data-tooltip="打开侧边栏" data-keys="⌥ ⌘ B"></button>
+      </div>
+    </header>
+
+    <div id="find-bar" class="find-bar" hidden>
+      <span class="find-icon"></span>
+      <input id="find-input" type="search" placeholder="搜索对话内容" aria-label="搜索对话内容" autocomplete="off">
+      <span id="find-count" class="find-count" role="status">0 / 0</span>
+      <button id="find-prev" class="icon-button" type="button" aria-label="上一个匹配" data-tooltip="上一个匹配" data-keys="⇧ Enter"></button>
+      <button id="find-next" class="icon-button" type="button" aria-label="下一个匹配" data-tooltip="下一个匹配" data-keys="Enter"></button>
+      <button id="find-close" class="icon-button" type="button" aria-label="关闭搜索"></button>
+    </div>
+
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <div id="conversation-scroll" class="conversation-scroll">
+      <div id="conversation" class="conversation" aria-label="对话"></div>
+    </div>
+
+    <div id="entry-page" class="entry-page" hidden></div>
+
+    <div id="composer-seat" class="composer-seat">
+      <div id="takeover" class="takeover" hidden></div>
+      <div id="composer-stack" class="composer-stack">
+        <div id="home-hero" class="home-hero">
+          <span id="hero-mark" class="hero-mark" aria-hidden="true"></span>
+          <span class="hero-title">探索未至之境</span>
+          <span class="preview-badge">预览版</span>
+        </div>
+        <div id="home-context" class="home-context">
+          <button id="workspace-picker" class="context-trigger" type="button" aria-label="选择工作区"></button>
+          <button id="preset-picker" class="context-trigger" type="button" aria-label="选择 Agent 预设" data-tooltip="选择新任务使用的 Agent 预设"></button>
+        </div>
+        <div id="composer-card" class="composer-card">
+          <div class="composer-input-wrap">
+            <textarea id="message" class="composer-input" rows="1" placeholder="描述你想要构建的内容, / 调用指令, @ 文件或对话" aria-label="消息"></textarea>
+          </div>
+          <div id="attachment-chips" class="attachment-chips" aria-label="待发送附件" hidden></div>
+          <div class="composer-row">
+            <button id="attachment-add" class="composer-round" type="button" aria-label="添加文件或调用指令" data-tooltip="添加文件或调用指令"></button>
+            <button id="permission-picker" class="composer-trigger" type="button" aria-label="访问模式"></button>
+            <button id="plan-mode" class="composer-trigger plan-mode" type="button" aria-label="计划模式" data-tooltip="计划模式（未接入）"></button>
+            <div class="composer-spacer"></div>
+            <button id="model-picker" class="composer-trigger model-trigger" type="button" aria-haspopup="menu"></button>
+            <button id="send" class="send-button" type="button" aria-label="发送"></button>
+            <button id="stop" class="send-button stop-button" type="button" aria-label="停止" data-tooltip="停止当前回合" hidden></button>
+          </div>
+        </div>
+        <div id="context-stats" class="context-stats" hidden></div>
+        <p id="composer-error" class="composer-error" role="alert" hidden></p>
+      </div>
+    </div>
+  </main>
+
+  <div id="right-resize" class="right-resize" role="separator" aria-label="调整右侧边栏宽度" aria-orientation="vertical" tabindex="0" hidden></div>
+  <aside id="rightbar" class="rightbar" aria-label="右侧边栏" hidden>
+    <div id="right-panes" class="right-panes"></div>
+  </aside>
+</div>
+
+<dialog id="settings-dialog" class="settings-modal" aria-labelledby="settings-title">
+  <div class="settings-shell">
+    <div class="settings-body">
+      <nav class="settings-nav" aria-label="设置分类">
+        <h2 id="settings-title">设置</h2>
+        <div id="settings-nav-list" class="settings-nav-list"></div>
+      </nav>
+      <div class="settings-main">
+        <header class="settings-head">
+          <div class="settings-head-actions">
+            <button id="settings-open-config" class="button ghost small" type="button">打开配置文件</button>
+            <button id="settings-close" class="icon-button" type="button" aria-label="关闭"></button>
+          </div>
+        </header>
+        <section id="settings-content" class="settings-content" aria-label="设置内容"></section>
+      </div>
+    </div>
+  </div>
+</dialog>
+
+<script type="module" src="renderer.mjs"></script>
+</body>
+</html>
