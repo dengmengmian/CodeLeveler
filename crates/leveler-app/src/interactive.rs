@@ -6218,54 +6218,101 @@ fn spawn_force_retire_drain(runtime: &InProcessRuntimeClient) {
 
 #[async_trait]
 impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
-    fn supports_terminal(&self) -> bool { cfg!(unix) && self.app.layout.primary_workspace().is_some() }
-    async fn terminal(&self, request: leveler_client_protocol::TerminalRequest) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
+    fn supports_terminal(&self) -> bool {
+        cfg!(unix) && self.app.layout.primary_workspace().is_some()
+    }
+    async fn terminal(
+        &self,
+        request: leveler_client_protocol::TerminalRequest,
+    ) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
         use leveler_client_protocol::TerminalOperation;
         use leveler_execution::command::PtySize;
         request.validate().map_err(ClientError::Runtime)?;
         if self.app.layout.primary_workspace().is_none() {
-            return Err(ClientError::Runtime("integrated terminals require a workspace".into()));
+            return Err(ClientError::Runtime(
+                "integrated terminals require a workspace".into(),
+            ));
         }
         // Hydrates durable settings and validates this session's canonical source.
         let config = self.runtime_config(&request.session_id).await?;
-        let id=format!("host-{}",request.terminal_id.replace('-',""));
-        let owner=request.session_id.as_str();
-        let registry=self.app.background_tasks();
-        let observation=match request.operation {
-            TerminalOperation::Create {cols,rows} => {
-                let (_,mut process,_) = self.app.user_shell_execution(config.mode,config.sandbox,"").map_err(|e|ClientError::Runtime(e.to_string()))?;
-                let shell=self.app.environment.var("SHELL").filter(|s|std::path::Path::new(s).is_absolute() && std::path::Path::new(s).is_file()).unwrap_or_else(|| "/bin/zsh".into());
-                process.program=shell;
-                process.args=vec!["-l".into()];
-                process.pty=Some(PtySize{cols,rows});
-                process.unrestricted_execution=config.mode == leveler_execution::PermissionProfile::FullAccess;
-                registry.create_terminal(&id,process,owner).await.map_err(ClientError::Runtime)?
-            },
-            TerminalOperation::Write {data} => {
-                registry.terminal_write(&id,owner,data).await.map_err(ClientError::Runtime)?;
+        let id = format!("host-{}", request.terminal_id.replace('-', ""));
+        let owner = request.session_id.as_str();
+        let registry = self.app.background_tasks();
+        let observation = match request.operation {
+            TerminalOperation::Create { cols, rows } => {
+                let (_, mut process, _) = self
+                    .app
+                    .user_shell_execution(config.mode, config.sandbox, "")
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let shell = self
+                    .app
+                    .environment
+                    .var("SHELL")
+                    .filter(|s| {
+                        std::path::Path::new(s).is_absolute() && std::path::Path::new(s).is_file()
+                    })
+                    .unwrap_or_else(|| "/bin/zsh".into());
+                process.program = shell;
+                process.args = vec!["-l".into()];
+                process.pty = Some(PtySize { cols, rows });
+                process.unrestricted_execution =
+                    config.mode == leveler_execution::PermissionProfile::FullAccess;
+                registry
+                    .create_terminal(&id, process, owner)
+                    .await
+                    .map_err(ClientError::Runtime)?
+            }
+            TerminalOperation::Write { data } => {
+                registry
+                    .terminal_write(&id, owner, data)
+                    .await
+                    .map_err(ClientError::Runtime)?;
                 return Ok(None);
-            },
-            TerminalOperation::Resize {cols,rows} => {
-                registry.terminal_resize(&id,owner,PtySize{cols,rows}).await.map_err(ClientError::Runtime)?;
+            }
+            TerminalOperation::Resize { cols, rows } => {
+                registry
+                    .terminal_resize(&id, owner, PtySize { cols, rows })
+                    .await
+                    .map_err(ClientError::Runtime)?;
                 return Ok(None);
-            },
-            TerminalOperation::Observe {cursor,max_bytes} => registry.terminal_observe(&id,owner,cursor,max_bytes).await.map_err(ClientError::Runtime)?,
+            }
+            TerminalOperation::Observe { cursor, max_bytes } => registry
+                .terminal_observe(&id, owner, cursor, max_bytes)
+                .await
+                .map_err(ClientError::Runtime)?,
             TerminalOperation::Close => {
-                registry.kill_owned(&id,owner).await.map_err(ClientError::Runtime)?;
-                registry.terminal_observe(&id,owner,0,65536).await.map_err(ClientError::Runtime)?
+                registry
+                    .kill_owned(&id, owner)
+                    .await
+                    .map_err(ClientError::Runtime)?;
+                registry
+                    .terminal_observe(&id, owner, 0, 65536)
+                    .await
+                    .map_err(ClientError::Runtime)?
             }
         };
-        let snapshot=observation.snapshot;
+        let snapshot = observation.snapshot;
         Ok(Some(leveler_client_protocol::TerminalState {
-            terminal_id:request.terminal_id,shell:snapshot.program,cwd:snapshot.cwd.display().to_string(),
-            status:match snapshot.status {
+            terminal_id: request.terminal_id,
+            shell: snapshot.program,
+            cwd: snapshot.cwd.display().to_string(),
+            status: match snapshot.status {
                 leveler_execution::BackgroundTaskStatus::Running => "running",
                 leveler_execution::BackgroundTaskStatus::Killing => "killing",
                 leveler_execution::BackgroundTaskStatus::Exited => "exited",
                 leveler_execution::BackgroundTaskStatus::Killed => "killed",
                 leveler_execution::BackgroundTaskStatus::Unknown => "unknown",
-            }.into(),exit_code:snapshot.exit_code,pid:snapshot.pid,
-            cols:observation.cols,rows:observation.rows,output_start:observation.output_start,output_end:observation.output_end,next_cursor:observation.next_cursor,data:observation.data,truncated:observation.truncated,
+            }
+            .into(),
+            exit_code: snapshot.exit_code,
+            pid: snapshot.pid,
+            cols: observation.cols,
+            rows: observation.rows,
+            output_start: observation.output_start,
+            output_end: observation.output_end,
+            next_cursor: observation.next_cursor,
+            data: observation.data,
+            truncated: observation.truncated,
         }))
     }
 

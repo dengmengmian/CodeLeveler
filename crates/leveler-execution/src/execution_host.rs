@@ -112,9 +112,22 @@ enum Request {
         #[serde(default)]
         unrestricted: bool,
     },
-    TerminalWrite { id: String, owner: String, data: Vec<u8> },
-    TerminalResize { id: String, owner: String, size: crate::command::PtySize },
-    TerminalObserve { id: String, owner: String, cursor: u64, max_bytes: usize },
+    TerminalWrite {
+        id: String,
+        owner: String,
+        data: Vec<u8>,
+    },
+    TerminalResize {
+        id: String,
+        owner: String,
+        size: crate::command::PtySize,
+    },
+    TerminalObserve {
+        id: String,
+        owner: String,
+        cursor: u64,
+        max_bytes: usize,
+    },
     Observe {
         id: String,
         owner: String,
@@ -603,29 +616,72 @@ impl ExecutionHostClient {
         }
     }
     pub fn require_terminal(&self) -> Result<(), String> {
-        for capability in ["terminal.pty", "terminal.input", "terminal.resize", "terminal.raw-observe"] {
+        for capability in [
+            "terminal.pty",
+            "terminal.input",
+            "terminal.resize",
+            "terminal.raw-observe",
+        ] {
             if !self.ready.capabilities.iter().any(|c| c == capability) {
-                return Err(format!("Unsupported: Execution Host missing {capability}; existing services preserved"));
+                return Err(format!(
+                    "Unsupported: Execution Host missing {capability}; existing services preserved"
+                ));
             }
         }
         Ok(())
     }
     pub async fn terminal_write(&self, id: &str, owner: &str, data: Vec<u8>) -> Result<(), String> {
         self.require_terminal()?;
-        match self.call(Request::TerminalWrite { id: id.into(), owner: owner.into(), data }).await? {
-            Reply::Acknowledged => Ok(()), _ => Err("invalid terminal write reply".into()),
+        match self
+            .call(Request::TerminalWrite {
+                id: id.into(),
+                owner: owner.into(),
+                data,
+            })
+            .await?
+        {
+            Reply::Acknowledged => Ok(()),
+            _ => Err("invalid terminal write reply".into()),
         }
     }
-    pub async fn terminal_resize(&self, id: &str, owner: &str, size: crate::command::PtySize) -> Result<(), String> {
+    pub async fn terminal_resize(
+        &self,
+        id: &str,
+        owner: &str,
+        size: crate::command::PtySize,
+    ) -> Result<(), String> {
         self.require_terminal()?;
-        match self.call(Request::TerminalResize { id: id.into(), owner: owner.into(), size }).await? {
-            Reply::Acknowledged => Ok(()), _ => Err("invalid terminal resize reply".into()),
+        match self
+            .call(Request::TerminalResize {
+                id: id.into(),
+                owner: owner.into(),
+                size,
+            })
+            .await?
+        {
+            Reply::Acknowledged => Ok(()),
+            _ => Err("invalid terminal resize reply".into()),
         }
     }
-    pub async fn terminal_observe(&self, id: &str, owner: &str, cursor: u64, max_bytes: usize) -> Result<crate::background::TerminalObservation, String> {
+    pub async fn terminal_observe(
+        &self,
+        id: &str,
+        owner: &str,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> Result<crate::background::TerminalObservation, String> {
         self.require_terminal()?;
-        match self.call(Request::TerminalObserve { id: id.into(), owner: owner.into(), cursor, max_bytes }).await? {
-            Reply::TerminalObservation(value) => Ok(value), _ => Err("invalid terminal observation reply".into()),
+        match self
+            .call(Request::TerminalObserve {
+                id: id.into(),
+                owner: owner.into(),
+                cursor,
+                max_bytes,
+            })
+            .await?
+        {
+            Reply::TerminalObservation(value) => Ok(value),
+            _ => Err("invalid terminal observation reply".into()),
         }
     }
     pub async fn spawn(
@@ -642,7 +698,9 @@ impl ExecutionHostClient {
         // explicit stop — so a Runtime service must not be refused (or silently
         // fall back to a runtime-local process) just because the persistent
         // owner has not been upgraded yet.
-        if request.pty.is_some() { self.require_terminal().map_err(SpawnError::Rejected)?; }
+        if request.pty.is_some() {
+            self.require_terminal().map_err(SpawnError::Rejected)?;
+        }
         let lifetime = hosted_wire_lifetime(self.peer_major, lifetime);
         match self
             .call(Request::Spawn {
@@ -1142,9 +1200,17 @@ impl Host {
                 self.registry.terminal_resize(&local, &owner, size).await?;
                 Ok(Reply::Acknowledged)
             }
-            Request::TerminalObserve { id, owner, cursor, max_bytes } => {
+            Request::TerminalObserve {
+                id,
+                owner,
+                cursor,
+                max_bytes,
+            } => {
                 let local = self.local(&id, &owner, false).await?;
-                let mut value = self.registry.terminal_observe(&local, &owner, cursor, max_bytes).await?;
+                let mut value = self
+                    .registry
+                    .terminal_observe(&local, &owner, cursor, max_bytes)
+                    .await?;
                 value.snapshot.id = id;
                 Ok(Reply::TerminalObservation(value))
             }
@@ -1236,7 +1302,16 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
         capabilities: REQUIRED_CAPABILITIES
             .iter()
             .copied()
-            .chain(if cfg!(unix) { vec!["terminal.pty", "terminal.input", "terminal.resize", "terminal.raw-observe"] } else { vec![] })
+            .chain(if cfg!(unix) {
+                vec![
+                    "terminal.pty",
+                    "terminal.input",
+                    "terminal.resize",
+                    "terminal.raw-observe",
+                ]
+            } else {
+                vec![]
+            })
             .map(|s| s.to_string())
             .collect(),
     };
