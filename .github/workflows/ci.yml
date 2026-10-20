@@ -30,9 +30,12 @@ jobs:
       matrix:
         # Pinned: `ubuntu-latest` began migrating to Ubuntu 26 on 2026-10-19,
         # and that image lost communication with the server during the
-        # workspace test step. Return to the moving label once the image is
-        # stable on the runner fleet.
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        # workspace test step. `ubuntu-24.04` then lost it inside the Linux
+        # app-test shard on consecutive runs — no log, and the step ran past
+        # its own timeout — while the same shard passed on it hours earlier.
+        # 22.04 is the stable image; return to the moving label once the newer
+        # images hold a full run.
+        os: [ubuntu-22.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
