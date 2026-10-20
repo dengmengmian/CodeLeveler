@@ -1,33 +1,174 @@
-import {SNAPSHOT_VERSIONED_COMMANDS} from '../src/command-policy.gen.mjs';
-// Commands/Settings UI acceptance: isolated real Runtime, test-only HTTP provider.
-// No skills catalog API or installed-skill claim; no user tasks/config modified.
-import {_electron as electron} from 'playwright';
+// Settings and command-surface acceptance on the real Electron shell.
+// Test-only provider; isolated HOME/workspace; every assertion is driven by a
+// real pointer/keyboard operation, not a renderer function call.
+import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
-import {createServer} from 'node:http';
-import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
-import {fileURLToPath} from 'node:url';
+import { createServer } from 'node:http';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-const root=fileURLToPath(new URL('..',import.meta.url)),tmp=await mkdtemp('/tmp/leveler-desktop-command-settings-'),home=path.join(tmp,'home'),workspace=path.join(tmp,'workspace'),output=path.join(root,'acceptance-output/desktop');await mkdir(home);await mkdir(workspace);await mkdir(output,{recursive:true});let calls=0;const server=createServer(async(req,res)=>{if(req.method==='GET'){res.writeHead(200,{'content-type':'text/html'});res.end('<title>Settings Native Fixture</title><body>REAL_SETTINGS_NATIVE</body>');return;}let raw='';for await(const c of req)raw+=c;const body=JSON.parse(raw);calls++;if(!(body.tools??[]).length){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{message:{role:'assistant',content:'{"candidates":[]}'},finish_reason:'stop'}]}));return;}res.writeHead(200,{'content-type':'text/event-stream'});for(const [delta,finish] of [[{content:'REAL_COMMAND_SETTINGS_RESPONSE'},null],[{},'stop']])res.write('data: '+JSON.stringify({id:'settings',object:'chat.completion.chunk',created:1,model:'fixture',choices:[{index:0,delta,finish_reason:finish}]})+'\n\n');res.end('data: [DONE]\n\n');});await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+server.address().port,config=`default_model="fixture/first"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="${base}"\napi_key="test-only"\n[models.first]\nprovider="fixture"\nmodel_id="first"\ncontext_window=131072\n[models.second]\nprovider="fixture"\nmodel_id="second"\ncontext_window=131072\n`;await writeFile(path.join(home,'config.toml'),config,{mode:0o600});let app,page,id;const errors=[],evidence={scope:'Commands/Settings UI + isolated real Runtime; no skills API/installation; HTTP provider and native-folder chooser test seams'};
-async function deliver(command){const observed=SNAPSHOT_VERSIONED_COMMANDS.includes(command.type)?await page.evaluate(id=>window.desktop.snapshot(id),id):null;const expected_version=observed?observed.last_sequence??0:null;return page.evaluate(({id,command,expected_version})=>window.desktop.deliver({command_id:crypto.randomUUID(),session_id:id,expected_version,issued_at:new Date().toISOString(),command:{...command,session_id:id}}),{id,command,expected_version});}
-async function capture(name){await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));await page.screenshot();const bytes=await app.evaluate(async({BrowserWindow})=>(await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));await writeFile(path.join(output,name+'.png'),Buffer.from(bytes,'base64'));}
-async function bounds(selector){return page.locator(selector).evaluate(n=>{const r=n.getBoundingClientRect();return {top:r.top,bottom:r.bottom,left:r.left,right:r.right,height:innerHeight,width:innerWidth};});}
-async function assertClip(selector){const r=await bounds(selector);assert.ok(r.top>=0&&r.left>=0&&r.right<=r.width&&r.bottom<=r.height,JSON.stringify(r));return r;}
-// UI cases are appended once the author's final selectors and behavior are ready.
-async function openSettings(section='appearance'){await page.locator('#settings-open').click();await page.waitForFunction(()=>document.querySelector('#settings-dialog').open);await page.locator(`[data-settings-section="${section}"]`).click();}
-async function readSection(section){await page.locator(`[data-settings-section="${section}"]`).click();await page.locator('#settings-read').click();await page.waitForFunction(()=>document.querySelector('.settings-results .settings-query-status')?.dataset.queryStatus==='confirmed');return page.locator('.settings-results').textContent();}
-try{app=await electron.launch({args:[root,'--user-data-dir='+path.join(tmp,'profile')],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_BINARY:process.env.LEVELER_BINARY??path.resolve(root,'../../target/debug/leveler'),LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await app.firstWindow();page.setDefaultTimeout(12000);page.on('pageerror',e=>errors.push(e.message));await page.waitForFunction(()=>window.desktop&&!!document.querySelector('#new-session'));await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1600,1000));await page.evaluate(()=>{globalThis.__uiSettingsEvents=[];window.desktop.onEvent(f=>globalThis.__uiSettingsEvents.push(f));});
-await page.locator('#workbench-close').click();if(process.env.LEVELER_COMMANDS_ONLY){await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(680,460));await page.waitForFunction(()=>innerWidth===680);}await page.locator('#message').fill('/');assert.equal(await page.locator('#command-menu').isVisible(),true);assert.ok(await page.locator('[data-command-id]').count()>2);const firstCandidate=await page.locator('#message').getAttribute('aria-activedescendant');await page.keyboard.press('ArrowDown');assert.notEqual(await page.locator('#message').getAttribute('aria-activedescendant'),firstCandidate);await page.keyboard.press('ArrowUp');assert.equal(await page.locator('#message').getAttribute('aria-activedescendant'),firstCandidate);evidence.arrow_up_down_actual_candidate_selection=true;await assertClip('#command-menu');await capture(process.env.LEVELER_COMMANDS_ONLY?'commands-narrow':'commands-home');await page.keyboard.press('Escape');assert.equal(await page.locator('#command-menu').isVisible(),false);assert.equal(await page.locator('#message').inputValue(),'/');await page.locator('#message').fill('/se');assert.equal(await page.locator('[data-command-id]').count(),1);await page.keyboard.press('ArrowDown');await page.keyboard.press('Enter');assert.equal(await page.locator('#message').inputValue(),'/settings');assert.equal(await page.locator('#command-menu').isVisible(),false);assert.equal(await page.locator('#settings-dialog').evaluate(n=>n.open),false);await page.keyboard.press('Enter');await page.waitForFunction(()=>document.querySelector('#settings-dialog').open);assert.equal((await page.evaluate(()=>window.desktop.listTasks())).tasks.length,0);assert.equal(calls,0);await page.keyboard.press('Escape');evidence.command_selection_inserts_token_then_explicit_execution=true;
-for(const text of ['/unknown','/unknown actual-argument','/settings actual-argument']){await page.locator('#message').fill(text);await page.keyboard.press('Escape');await page.locator('#send').click();assert.equal(await page.locator('#message').inputValue(),text);assert.equal(calls,0);assert.equal((await page.evaluate(()=>window.desktop.listTasks())).tasks.length,0);assert.ok(await page.locator('#composer-error').textContent());}evidence.unknown_and_unsupported_arguments_not_model=true;
-await page.locator('#message').fill('/settings');await page.locator('#message').dispatchEvent('keydown',{key:'Enter',code:'Enter',isComposing:true,keyCode:229});assert.equal(await page.locator('#settings-dialog').evaluate(n=>n.open),false);assert.equal(await page.locator('#message').inputValue(),'/settings');evidence.ime_does_not_execute=true;
-if(!process.env.LEVELER_COMMANDS_ONLY){
-await page.locator('#message').fill('Home settings draft');await openSettings('memory');assert.equal(await page.locator('#settings-read').isDisabled(),true);assert.equal((await page.evaluate(()=>window.desktop.listTasks())).tasks.length,0);await page.locator('[data-settings-section="appearance"]').click();await page.locator('#settings-theme').selectOption('dark');assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');await page.locator('#settings-theme').selectOption('light');await page.keyboard.press('Escape');assert.equal(await page.locator('#message').inputValue(),'Home settings draft');evidence.home_no_session_read_disabled_no_implicit_task=true;
-await page.locator('#home-permission').click();await page.waitForFunction(()=>document.querySelector('#permission-menu').hidden===false);await page.keyboard.press('Escape');id=(await page.evaluate(()=>window.desktop.listTasks())).tasks[0].id;
-await openSettings('session');assert.match(await page.locator('#settings-session-facts').textContent(),/first/);await page.getByRole('button',{name:'在会话中切换模型',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#model-menu').hidden===false);await page.locator('#model-options').getByRole('button',{name:'second',exact:true}).click();await page.waitForFunction(async id=>(await window.desktop.snapshot(id)).model.model==='second',id);await openSettings('session');assert.match(await page.locator('#settings-session-facts').textContent(),/second/);await page.getByRole('button',{name:'在会话中调整权限',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#permission-menu').hidden===false);await page.locator('[data-permission-mode="request_approval"]').click();await page.waitForFunction(async id=>(await window.desktop.snapshot(id)).mode==='request_approval',id);await openSettings('session');assert.match(await page.locator('#settings-session-facts').textContent(),/受限/);assert.equal(await page.locator('#message').inputValue(),'Home settings draft');evidence.actual_session_model_permission_draft=true;
-assert.match(await readSection('agents'),/default/);await page.locator('[data-agent-name="default"]').click();await page.waitForFunction(()=>document.querySelectorAll('.settings-results .settings-query-status[data-query-status="confirmed"]').length>1);assert.match(await readSection('context'),/尚无上次模型请求/);await readSection('observability');await readSection('memory');const memory=await page.evaluate(()=>globalThis.__uiSettingsEvents.find(f=>f.data?.type==='memory_list').data);assert.ok(memory.memory_dir.startsWith(tmp+path.sep));const broken=path.join(memory.memory_dir,'active/broken.json');await mkdir(path.dirname(broken),{recursive:true});await writeFile(broken,'not JSON');const before=await page.locator('.settings-results').textContent();await page.locator('#settings-read').click();await page.waitForFunction(()=>globalThis.__uiSettingsEvents.some(f=>f.data?.type==='notification'&&f.data.message.startsWith('memory list failed:')));await page.waitForFunction(()=>document.querySelector('.settings-results .settings-query-status')?.dataset.queryStatus==='unknown',null,{timeout:18000});assert.match(await page.locator('.settings-results').textContent(),/活动记忆/);assert.match(before,/活动记忆/);assert.match(await page.locator('.settings-results').textContent(),/未关联|无法关联|Warning|警告|通知/);await capture('settings-memory-warning');await rm(broken);await page.locator('#settings-read').click();await page.waitForFunction(()=>document.querySelector('.settings-results .settings-query-status')?.dataset.queryStatus==='confirmed');evidence.query_facts_actual_and_memory_failure_preserves_previous=true;
-await page.keyboard.press('Escape');assert.equal((await deliver({type:'archive_session'})).ok,true);const bad=path.join(home,'state/projects/ui-corrupt-fixture');await mkdir(bad,{recursive:true});await writeFile(path.join(bad,'sessions.db'),'not SQLite');await openSettings('archives');await page.locator('#settings-read-archives').click();await page.waitForFunction(()=>document.querySelector('.settings-results .settings-query-status')?.dataset.queryStatus==='confirmed');assert.equal(await page.getByRole('button',{name:'打开保留记录',exact:true}).count(),1);assert.match(await page.locator('.settings-results').textContent(),/来源读取失败/);await capture('settings-archives-source-error');evidence.archives_real_record_and_source_errors=true;
-await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(520,600));await page.waitForFunction(()=>innerWidth===520&&innerHeight===600);await page.waitForFunction(()=>!document.getAnimations().some(a=>a.playState==='running'));evidence.narrow_dialog=await assertClip('#settings-dialog');assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await capture('settings-narrow');await page.keyboard.press('Escape');const focus=await page.evaluate(()=>{const n=document.activeElement,r=n.getBoundingClientRect();return {tag:n.tagName,id:n.id,visible:r.width>0&&r.height>0};});assert.notEqual(focus.tag,'BODY');assert.equal(focus.visible,true);evidence.narrow_focus_restore=focus;
-// Observe the selected real native view, preserving its identity while Settings overlays it.
-await app.evaluate((_,modulePath)=>{const {ManualBrowser}=process.getBuiltinModule('module').createRequire(modulePath)(modulePath),original=ManualBrowser.prototype.add;globalThis.__settingsNative={ManualBrowser,original};ManualBrowser.prototype.add=function(){globalThis.__settingsNative.manager=this;return original.call(this);};},path.join(root,'src/browser.cjs'));await page.locator('#workbench-toggle').click();await page.locator('#browser-new').click();await page.waitForFunction(()=>document.querySelectorAll('#browser-tabs [data-tab-id]').length===1);await page.locator('#browser-url').fill(base+'/native');await page.locator('#browser-url').press('Enter');await page.waitForFunction(async()=>{const s=await window.desktop.browserState();return s.tabs.some(t=>t.title==='Settings Native Fixture'&&!t.loading);});await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1600,1000));await page.waitForFunction(()=>innerWidth===1600&&document.body.dataset.sidebarBand==='wide');await page.waitForFunction(()=>!document.querySelector('#sidebar').getAnimations().some(a=>a.playState==='running'));if(await page.evaluate(()=>document.body.classList.contains('sidebar-collapsed')))await page.locator('#sidebar-toggle').click();await page.waitForFunction(()=>!document.querySelector('#sidebar').getAnimations().some(a=>a.playState==='running'));await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().width>250);const nativeBefore=await app.evaluate(async()=>{const m=globalThis.__settingsNative.manager,t=m.tabs.get(m.selectedId);return {id:t.id,wc:t.view.webContents.id,visible:t.view.getVisible(),body:await t.view.webContents.executeJavaScript('document.body.textContent')};});assert.equal(nativeBefore.visible,true);assert.match(nativeBefore.body,/REAL_SETTINGS_NATIVE/);await openSettings('diagnostics');await page.waitForFunction(()=>document.querySelector('#settings-dialog').open);await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));await app.evaluate(async()=>{await new Promise(r=>setImmediate(r));});const nativeHidden=await app.evaluate(()=>{const m=globalThis.__settingsNative.manager,t=m.tabs.get(m.selectedId);return {id:t.id,wc:t.view.webContents.id,visible:t.view.getVisible()};});assert.equal(nativeHidden.id,nativeBefore.id);assert.equal(nativeHidden.wc,nativeBefore.wc);assert.equal(nativeHidden.visible,false);assert.match(await page.locator('#settings-content').textContent(),/尚不能读取独立技能目录/);await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.querySelector('#settings-dialog').open);await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));await app.evaluate(async()=>{await new Promise(r=>setImmediate(r));});assert.equal(await app.evaluate(()=>{const m=globalThis.__settingsNative.manager;return m.tabs.get(m.selectedId).view.getVisible();}),true);evidence.native_view_hidden_restored_same_identity={id:nativeBefore.id,wc:nativeBefore.wc};evidence.skills_catalog_explicitly_unavailable=true;
+
+const root = fileURLToPath(new URL('..', import.meta.url));
+const temporary = await mkdtemp('/tmp/leveler-desktop-commands-settings-');
+const home = path.join(temporary, 'home');
+const workspace = path.join(temporary, 'workspace');
+const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, 'acceptance-output/desktop');
+await mkdir(home, { recursive: true });
+await mkdir(workspace, { recursive: true });
+await mkdir(output, { recursive: true });
+await writeFile(path.join(workspace, 'a.txt'), 'alpha\n');
+const server = createServer(async (request, response) => {
+  for await (const _chunk of request) { /* drain */ }
+  response.writeHead(200, { 'content-type': 'text/event-stream' });
+  response.write(`data: ${JSON.stringify({ id: 'settings', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'SETTINGS_OK' }, finish_reason: null }] })}\n\n`);
+  response.write(`data: ${JSON.stringify({ id: 'settings', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+  response.end('data: [DONE]\n\n');
+});
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+await writeFile(path.join(home, 'config.toml'), `default_model="fixture/m"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="http://127.0.0.1:${server.address().port}"\napi_key="test-only"\n[models.m]\nprovider="fixture"\nmodel_id="m"\ncontext_window=131072\n[models.n]\nprovider="fixture"\nmodel_id="n"\ncontext_window=131072\n`, { mode: 0o600 });
+
+const evidence = { scope: 'real Electron + real Runtime; test-only SSE provider and native-folder chooser seam' };
+const settings = () => page.evaluate(() => JSON.parse(localStorage.getItem('codeleveler.settings.v1') || '{}'));
+let app;
+let page;
+const errors = [];
+const openSettings = async () => {
+  await page.keyboard.press('Meta+,');
+  await page.waitForSelector('#settings-dialog[open]');
+};
+const closeSettings = async () => {
+  await page.locator('#settings-close').click();
+  await page.waitForFunction(() => !document.querySelector('#settings-dialog[open]'));
+};
+const chooseMenu = async (rowText, option) => {
+  const row = page.locator('.setting-row').filter({ hasText: rowText }).first();
+  await row.locator('button').first().click();
+  await page.locator('.menu .menu-item').filter({ hasText: option }).first().click();
+};
+try {
+  app = await electron.launch({
+    args: [root, `--user-data-dir=${path.join(temporary, 'profile')}`],
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, LEVELER_HOME: home, LEVELER_CONFIG_DIR: undefined, LEVELER_BINARY: process.env.LEVELER_BINARY ?? path.resolve(root, '../../target/debug/leveler'), LEVELER_DAEMON_IDLE_TIMEOUT_SECS: '10' },
+  });
+  page = await app.firstWindow();
+  page.setDefaultTimeout(15000);
+  page.on('pageerror', error => errors.push(error.message));
+  await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && document.querySelector('#brand-version')?.textContent.startsWith('v'));
+  await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
+  await page.locator('#add-workspace').click();
+  await page.waitForSelector('.directory-picker-modal[open]');
+  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: '使用系统选择器' }).click();
+  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
+  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).click();
+  await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
+  await page.locator('#message').fill('settings probe');
+  await page.locator('#send').click();
+  await page.waitForFunction(() => document.querySelector('.message.assistant .markdown')?.textContent.includes('SETTINGS_OK'));
+  const sessionId = await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
+
+  // Settings controls are real pointer operations; dropdowns must be inside
+  // the modal dialog's top layer or the pointer never reaches them.
+  await openSettings();
+  await page.locator('.theme-card').filter({ hasText: '深色' }).click();
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark');
+  await page.locator('.theme-card').filter({ hasText: '浅色' }).click();
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'light');
+  const fontBefore = await page.locator('.font-stepper-value').first().innerText();
+  await page.locator('.font-stepper-arrow[aria-label="增大字号"]').first().click();
+  const fontAfter = await page.locator('.font-stepper-value').first().innerText();
+  assert.notEqual(fontBefore, fontAfter);
+  await page.locator('.font-expander').first().click();
+  await page.locator('input[aria-label="文本字体"]').fill('Menlo, monospace');
+  await page.locator('input[aria-label="文本字体"]').press('Enter');
+  await chooseMenu('权限', '完全权限');
+  await chooseMenu('工作步骤展示', '详细');
+  await chooseMenu('工作步骤收起时机', '下次有新消息时');
+  await chooseMenu('网页链接默认打开方式', '默认浏览器');
+  await chooseMenu('繁忙时的发送行为', '插话发送');
+  await chooseMenu('性能与用量', '简洁');
+  let saved = await settings();
+  assert.equal(saved.defaultPermission, 'full_access');
+  assert.equal(saved.workSteps, 'detailed');
+  assert.equal(saved.collapseAfter, 'next');
+  assert.equal(saved.linkOpen, 'system');
+  assert.equal(saved.busySend, 'steer');
+  assert.equal(saved.performance, 'compact');
+  assert.equal(saved.textFontFamily, 'Menlo, monospace');
+  evidence.settings_controls = saved;
+  await page.getByRole('button', { name: '编辑快捷键' }).click();
+  assert.ok(await page.locator('.menu .menu-item').count() >= 8);
+  await page.keyboard.press('Escape');
+  await page.locator('#settings-nav-list button').filter({ hasText: '模型' }).click();
+  const useModel = page.locator('.provider-row button').filter({ hasText: '使用' }).first();
+  await useModel.click();
+  await page.waitForFunction(async id => (await window.desktop.snapshot(id)).model.model === 'n', sessionId);
+  evidence.model_switch = (await page.evaluate(id => window.desktop.snapshot(id), sessionId)).model;
+  await page.locator('#settings-nav-list button').filter({ hasText: '内置插件' }).click();
+  assert.match(await page.locator('#settings-content').innerText(), /未提供插件目录/);
+  await page.locator('#settings-nav-list button').filter({ hasText: 'Agent 预设' }).click();
+  await page.waitForFunction(() => document.querySelector('#settings-content')?.innerText.includes('code-architect'));
+  await page.getByRole('button', { name: '查看配置' }).first().click();
+  await page.waitForSelector('.preset-dialog[open]');
+  await page.locator('.preset-dialog .modal-head button').click();
+  assert.equal(await page.getByRole('button', { name: '设为默认' }).first().isDisabled(), true);
+  await closeSettings();
+  await page.reload();
+  await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && document.querySelector('#brand-version')?.textContent.startsWith('v'));
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'light');
+  saved = await settings();
+  assert.equal(saved.defaultPermission, 'full_access');
+  assert.equal(saved.busySend, 'steer');
+  evidence.settings_persisted_after_reload = true;
+
+  // The same anchor opens the view menu repeatedly; each selection must
+  // survive. A stale outside-click listener used to swallow every menu after
+  // the first.
+  await page.locator('.session-row').first().click();
+  await page.waitForFunction(() => document.querySelector('#conversation-status')?.textContent !== '连接 Runtime…');
+  for (const [option, key, value] of [['按工作区树', 'groupMode', 'tree'], ['平铺', 'groupMode', 'flat'], ['名称', 'sortMode', 'name'], ['创建时间', 'sortMode', 'created']]) {
+    await page.locator('#view-options').click();
+    await page.waitForSelector('.menu');
+    await page.locator('.menu .menu-item').filter({ hasText: option }).first().click();
+    assert.equal((await settings())[key], value, `${option} did not persist`);
+  }
+  evidence.repeated_view_menu = 'tree/flat/name/created';
+  await page.locator('#view-options').click();
+  await page.waitForSelector('.menu');
+  await page.locator('.menu .menu-item').filter({ hasText: '按工作区' }).first().click();
+  await page.locator('#view-options').click();
+  await page.waitForSelector('.menu');
+  await page.locator('.menu .menu-item').filter({ hasText: '最近更新' }).first().click();
+  for (let index = 0; index < 2; index += 1) {
+    await page.locator('#header-more').click();
+    await page.waitForSelector('.menu');
+    assert.ok(await page.locator('.menu .menu-item').count() >= 2);
+    await page.keyboard.press('Escape');
+  }
+  evidence.repeated_header_menu = true;
+
+  // Slash commands are keyboard-driven and must operate on the same session.
+  await page.locator('#message').fill('/diff');
+  await page.waitForFunction(() => document.querySelector('#command-popover'));
+  await page.locator('#message').press('Enter');
+  await page.waitForSelector('.review-head, .review-status', { timeout: 15000 });
+  evidence.slash_diff = true;
+  await page.locator('#message').fill('@');
+  await page.waitForFunction(() => document.querySelector('#at-popover'));
+  assert.match(await page.locator('#at-popover').innerText(), /尚未接入/);
+  await page.locator('#message').press('Escape');
+  await page.waitForFunction(() => !document.querySelector('#at-popover'));
+  evidence.at_reference_is_explicit_ui_only = true;
+  assert.deepEqual(errors, []);
+  evidence.page_errors = errors;
+  evidence.passed = true;
+  await writeFile(path.join(output, 'commands-settings-evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
+  console.log(JSON.stringify(evidence, null, 2));
+} catch (error) {
+  Object.assign(evidence, { passed: false, error: error.message, page_errors: errors });
+  if (page && !page.isClosed()) await page.screenshot({ path: path.join(output, 'commands-settings-failure.png') }).catch(() => {});
+  await writeFile(path.join(output, 'commands-settings-evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
+  throw error;
+} finally {
+  if (app) await app.evaluate(({ app }) => app.exit(0)).catch(() => {});
+  await new Promise(resolve => server.close(resolve));
 }
-assert.equal(await readFile(path.join(home,'config.toml'),'utf8'),config);assert.equal(calls,0);assert.deepEqual(errors,[]);Object.assign(evidence,{global_config_unchanged:true,provider_calls:calls,page_errors:errors,passed:true});
-}catch(error){Object.assign(evidence,{passed:false,error:error.message,page_errors:errors});if(page&&!page.isClosed())await capture('commands-settings-failure').catch(()=>{});throw error;}finally{if(app){await app.evaluate(()=>{const seam=globalThis.__settingsNative;if(seam)seam.ManualBrowser.prototype.add=seam.original;});await app.close();}await new Promise(r=>server.close(r));await writeFile(path.join(output,process.env.LEVELER_COMMANDS_ONLY?'commands-interaction-evidence.json':'commands-settings-evidence.json'),JSON.stringify(evidence,null,2)+'\n');console.log(JSON.stringify(evidence,null,2));}

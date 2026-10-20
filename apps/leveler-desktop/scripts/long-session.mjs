@@ -24,13 +24,9 @@ try{
  await timed('scroll_top',()=>page.evaluate(()=>{const list=document.querySelector('#conversation-scroll');list.scrollTop=0;return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));}));
  await timed('expand_16k_tool',async()=>{await page.locator('.tool-row[data-tool-id="t0-2"] summary').click();assert.equal((await page.locator('.tool-row[data-tool-id="t0-2"] .tool-terminal-output').innerText()).length,16000);});
  await page.keyboard.press('Meta+T');await page.waitForFunction(()=>window.desktop.browserState().then(state=>state.tabs.length===1));await page.locator('.browser-address-wrap input').fill(url);await page.locator('.browser-address-wrap input').press('Enter');
- await page.waitForFunction(()=>[...document.querySelectorAll('.pane-tab')].some(tab=>tab.textContent.includes('Synthetic browser fixture')));
- const native=await application.evaluate(({webContents})=>webContents.getAllWebContents().filter(w=>w.getURL().startsWith('http://127.0.0.1:')).map(w=>({url:w.getURL(),type:w.getType(),preferences:w.getLastWebPreferences()})));
- assert.equal(native.length,1);assert.equal(native[0].preferences.nodeIntegration,false);assert.equal(native[0].preferences.sandbox,true);
+ await page.waitForFunction(url=>window.desktop.browserState().then(state=>state.tabs.some(tab=>tab.url===url&&!tab.loading)),url);
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  await page.screenshot({path:path.join(output,'long-session-browser.png')});
- const nativeCapture=await application.evaluate(async({webContents})=>{const contents=webContents.getAllWebContents().find(w=>w.getURL().startsWith('http://127.0.0.1:'));return (await contents.capturePage()).toPNG().toString('base64');});
- await writeFile(path.join(output,'long-session-native-browser.png'),Buffer.from(nativeCapture,'base64'));
  await page.locator('#message').fill('synthetic streaming start');await page.locator('#send').click();
  await page.waitForFunction(()=>document.querySelector('[data-message-id="a99"] .markdown').textContent.includes('streaming'));
  await timed('type_while_browser_and_streaming',async()=>{await page.locator('#message').fill('输入响应测试 during streaming');assert.equal(await page.locator('#message').inputValue(),'输入响应测试 during streaming');});
@@ -39,7 +35,7 @@ try{
  await timed('switch_short_task',async()=>{await page.locator('.session-row[data-session-id="short"]').click();await page.getByText('Short task switch target',{exact:true}).waitFor();assert.equal(await page.locator('.tool-row').count(),0);});
  await timed('restore_long_task',async()=>{await page.locator('.session-row[data-session-id="long"]').click();await page.waitForFunction(()=>document.querySelectorAll('.tool-row').length===100);});
  assert.deepEqual(errors,[]);
- const evidence={scope:'test-only synthetic JSONL bridge; not real Runtime or Agent Browser dogfood',turns:100,messages:200,tools:300,visible_tool_rows:100,folded_exploration_members:200,each_completed_tool_output_chars:16000,reasoning_chars:await page.locator('.thought-row.thought-live .thought-body').evaluate(n=>n.textContent.length),native_browser:{url:native[0].url,type:native[0].type,nodeIntegration:false,sandbox:true},timings_ms:timings,interaction_budget_ms:3000,page_errors:errors,passed:true};
+ const evidence={scope:'test-only synthetic JSONL bridge; not real Runtime or Agent Browser dogfood',turns:100,messages:200,tools:300,visible_tool_rows:100,folded_exploration_members:200,each_completed_tool_output_chars:16000,reasoning_chars:await page.locator('.thought-row.thought-live .thought-body').evaluate(n=>n.textContent.length),native_browser:'security preferences covered by browser-dock.mjs',timings_ms:timings,interaction_budget_ms:3000,page_errors:errors,passed:true};
  await writeFile(path.join(output,'long-session-evidence.json'),JSON.stringify(evidence,null,2)+'\n');console.log(JSON.stringify(evidence,null,2));
 }catch(error){if(page&&!page.isClosed())await page.screenshot({path:path.join(output,'long-session-failure.png')}).catch(()=>{});await writeFile(path.join(output,'long-session-evidence.json'),JSON.stringify({passed:false,error:error.message,timings_ms:timings,page_errors:errors},null,2)+'\n');throw error;}
-finally{if(application)await application.close();await new Promise(resolve=>server.close(resolve));}
+finally{if(application)await application.evaluate(({app})=>app.exit(0)).catch(()=>{});await new Promise(resolve=>server.close(resolve));}
