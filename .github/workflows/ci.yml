@@ -151,7 +151,13 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 25
         env:
-          RUST_TEST_THREADS: "2"
+          # This shard compiles and links the most test binaries at once. Two
+          # consecutive ubuntu-24.04 runners lost communication inside it with
+          # no log, and the host says CPU/memory starvation can cause that.
+          # Bound both link parallelism and test concurrency so a heavy run
+          # stays inside the step and a real failure leaves a log.
+          RUST_TEST_THREADS: "1"
+          CARGO_BUILD_JOBS: "2"
         run: cargo test -p leveler-app --all-features --locked --no-fail-fast
 
       - name: Test (linux · tui)
