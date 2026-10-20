@@ -211,3 +211,13 @@ test('durable TaskCancelled renders cancellation while publishing progress remai
  assert.equal(turnTerminalFromEvent('task_cancelled',[],[]),'cancelled');
  assert.equal(turnTerminalFromEvent('turn_finalizing',[],[]),null);
 });
+
+import { thoughtDuration } from '../src/presentation.mjs';
+test('thoughtDuration uses the terminal thresholds',()=>{
+ assert.equal(thoughtDuration(0),'<0.1s');
+ assert.equal(thoughtDuration(99),'<0.1s');
+ assert.equal(thoughtDuration(100),'0.1s');
+ assert.equal(thoughtDuration(643),'0.6s');
+ assert.equal(thoughtDuration(999),'1.0s');
+ assert.equal(thoughtDuration(15000),'15s');
+});
