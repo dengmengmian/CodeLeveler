@@ -68,6 +68,15 @@ let titleComposing = false;
 let findMatches = [];
 let findSelected = 0;
 let sidebarQuery = '';
+let contentSearch = { query: '', status: 'idle', results: [], scanned: 0, total: 0 };
+let contentSearchSeq = 0;
+let contentSearchTimer = null;
+const chosenWorkspaces = new Map();
+function workspaceKey(path) {
+  if (typeof path !== 'string') return path;
+  return path.replace(/^\/(tmp|var|etc)\//, '/private/$1/');
+}
+const clarificationReplies = new Map();
 let entryPage = null;
 let settingsSection = 'general';
 let fontSettingsOpen = false;
@@ -101,6 +110,9 @@ let queuedMessages = [];
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
 let pendingSubmit = false;
+// Transient retry status: the runtime marks these as ephemeral, so they sit in
+// the running row rather than creating a transcript item.
+let modelRetry = null;
 const attachmentDrafts = new Map();
 const renderedSources = new WeakMap();
 const openThoughts = new Set();
@@ -375,10 +387,27 @@ function renderSidebar() {
   const visible = visibleTasks();
   const mode = settings.groupMode ?? 'workspace';
   if (sidebarQuery) {
-    if (!visible.length) list.append(el('p', 'workspace-empty', '无匹配会话'));
-    list.append(el('p', 'sidebar-search-note', '全文搜索未接入；当前匹配标题与工作区。'));
-    for (const task of visible.slice(0, 20)) list.append(sessionRow(task, null));
-    if (visible.length > 20) list.append(el('p', 'sidebar-search-note', `仅显示前 20 条结果，请缩小搜索范围。`));
+    const q = sidebarQuery.trim().toLowerCase();
+    const titleMatches = visible.slice(0, 20);
+    if (titleMatches.length) {
+      list.append(el('p', 'sidebar-search-note', '会话'));
+      for (const task of titleMatches) list.append(sessionRow(task, null));
+    }
+    if (visible.length > 20) list.append(el('p', 'sidebar-search-note', `标题匹配仅显示前 20 条，请缩小搜索范围。`));
+    if (contentSearch.query === q) {
+      if (contentSearch.status === 'searching') {
+        list.append(el('p', 'sidebar-search-note', `正在搜索会话内容…（${contentSearch.scanned}/${contentSearch.total}）`));
+      } else if (contentSearch.status === 'done') {
+        if (contentSearch.results.length) {
+          list.append(el('p', 'sidebar-search-note', '内容'));
+          for (const result of contentSearch.results) list.append(contentResultRow(result));
+        }
+        list.append(el('p', 'sidebar-search-note', '内容搜索仅覆盖当前会话；其他会话内容未读取。'));
+      }
+    }
+    if (!titleMatches.length && contentSearch.query === q && contentSearch.status === 'done' && !contentSearch.results.length) {
+      list.append(el('p', 'workspace-empty', '无匹配会话'));
+    }
     return;
   }
   let groups = [];
@@ -470,8 +499,8 @@ function renderSidebar() {
           anchor: more, width: 240, align: 'end',
           items: [
             { label: '复制工作区路径', icon: 'copy', onSelect: () => copyText(api, group.path) },
-            { label: '重命名工作区', icon: 'edit', disabled: true, title: 'Runtime 未提供工作区重命名命令' },
-            { label: '删除工作区', icon: 'trash', disabled: true, title: 'Runtime 未提供工作区删除命令' },
+            { label: '重命名工作区', icon: 'edit', disabled: true, badge: '未接入', title: 'Runtime 未提供工作区重命名命令' },
+            { label: '删除工作区', icon: 'trash', disabled: true, badge: '未接入', title: 'Runtime 未提供工作区删除命令' },
           ],
         });
       });
@@ -525,6 +554,41 @@ function renderSidebar() {
     }
     list.append(section);
   }
+}
+
+function contentResultRow(result) {
+  const row = el('button', 'sidebar-content-result');
+  row.type = 'button';
+  row.append(el('span', 'sidebar-content-title', result.title || '当前会话'), el('span', 'session-snippet', result.snippet));
+  row.addEventListener('click', () => {
+    const node = [...document.querySelectorAll('#conversation [data-message-id]')].find(item => item.dataset.messageId === result.messageId);
+    node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    node?.classList.add('flash');
+    setTimeout(() => node?.classList.remove('flash'), 1200);
+  });
+  return row;
+}
+
+function runContentSearch(query) {
+  const q = query.trim().toLowerCase();
+  contentSearchSeq += 1;
+  if (!q) {
+    contentSearch = { query: '', status: 'idle', results: [], scanned: 0, total: 0 };
+    return;
+  }
+  const results = [];
+  const title = current?.session?.title || '当前会话';
+  for (const message of current?.messages ?? []) {
+    const text = String(message.text ?? '');
+    const at = text.toLowerCase().indexOf(q);
+    if (at < 0) continue;
+    const start = Math.max(0, at - 40);
+    const end = Math.min(text.length, at + q.length + 60);
+    results.push({ messageId: message.id, title, snippet: `${start ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}` });
+    if (results.length >= 20) break;
+  }
+  contentSearch = { query: q, status: 'done', results, scanned: current ? 1 : 0, total: current ? 1 : 0 };
+  renderSidebar();
 }
 
 function toggleGroup(key) {
@@ -779,7 +843,7 @@ function openAccountMenu(anchor) {
     items: [
       { label: '设置', icon: 'settings', shortcut: '⌘ ,', onSelect: () => openSettings('general') },
       { label: '意见反馈', icon: 'feedback', onSelect: openFeedbackDialog },
-      { label: '登录', icon: 'user', disabled: true, title: '当前版本未接入登录' },
+      { label: '登录', icon: 'user', disabled: true, badge: '未接入', title: '当前版本未接入登录' },
     ],
   });
 }
@@ -830,8 +894,19 @@ function openSidebarSearch() {
   input.setAttribute('aria-label', '搜索会话名称');
   label.replaceWith(input);
   input.focus();
-  input.addEventListener('input', () => { sidebarQuery = input.value; renderSidebar(); });
-  const close = () => { sidebarQuery = ''; input.replaceWith(label); renderSidebar(); };
+  input.addEventListener('input', () => {
+    sidebarQuery = input.value;
+    renderSidebar();
+    clearTimeout(contentSearchTimer);
+    contentSearchTimer = setTimeout(() => runContentSearch(sidebarQuery), 250);
+  });
+  const close = () => {
+    sidebarQuery = '';
+    contentSearchSeq += 1;
+    contentSearch = { query: '', status: 'idle', results: [], scanned: 0, total: 0 };
+    input.replaceWith(label);
+    renderSidebar();
+  };
   input.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(); } });
   input.addEventListener('blur', () => { if (!input.value) close(); });
 }
@@ -906,8 +981,14 @@ function openJobsPopover(anchor) {
         copy.append(el('span', 'header-agent-meta', `运行中 · ${formatJobDuration(elapsed)}`));
         const stop = el('button', 'header-job-stop', '停止');
         stop.type = 'button';
-        stop.disabled = true;
-        stop.title = '桌面桥接尚未开放后台任务停止命令';
+        stop.disabled = loading;
+        stop.title = '停止后台任务';
+        stop.addEventListener('click', () => action(async () => {
+          stop.disabled = true;
+          await deliver({ type: 'cancel_background_task', session_id: current.session.id, task_id: job.task_id });
+          closePopover();
+          toast('已请求停止后台任务', { tone: 'info', holdMs: 2200 });
+        }));
         head.append(dot, copy, stop);
         row.append(head);
         if (job.output) {
@@ -936,7 +1017,7 @@ function openJobsPopover(anchor) {
           node.append(row);
         }
       }
-      node.append(el('div', 'header-popover-note', '实时输出与停止操作受当前桌面桥接能力限制。'));
+      node.append(el('div', 'header-popover-note', '输出为 Runtime 报告的增量；停止只终止该后台任务，不影响当前回合。'));
     },
   });
 }
@@ -965,7 +1046,7 @@ function ensureHeaderActions() {
     openMenu({
       anchor: headerMenuButton, align: 'end', width: 240,
       items: [
-        { label: '下载 Session 日志', icon: 'download', disabled: true, title: 'Runtime 未提供 Session 打包导出接口' },
+        { label: '下载 Session 日志', icon: 'download', disabled: true, badge: '未接入', title: 'Runtime 未提供 Session 打包导出接口' },
         { label: '反馈', icon: 'feedback', onSelect: openFeedbackDialog },
       ],
     });
@@ -1197,7 +1278,7 @@ function appLeading(app) {
 }
 
 async function openInApp(path, appId, { action = 'open', remember = false } = {}) {
-  if (!path || !appId || openInAppState.busy) return;
+  if (!path || (!appId && action !== 'default') || openInAppState.busy) return;
   openInAppState.busy = true;
   renderOpenInAppControls();
   if (rightbarOpen) renderRightbar();
@@ -1236,6 +1317,7 @@ function openInAppMenu(anchor, path, kind) {
     }
     if (kind === 'file') {
       items.push({ divider: true });
+      items.push({ label: '使用系统默认应用', icon: 'external', onSelect: () => openInApp(path, null, { action: 'default' }) });
       items.push({ label: '显示文件位置', icon: 'folder', onSelect: () => openInApp(path, apps[0]?.id ?? 'finder', { action: 'reveal' }) });
     }
   }
@@ -1535,6 +1617,7 @@ function messageRow(existing, message) {
       if (images > 4) imageRow.append(el('span', 'message-image-more', `+${images - 4}`));
     }
     if (images <= 0 && imageRow) imageRow.remove();
+    renderUserExtras(row, message);
   } else if (kind === 'assistant') {
     const body = row.querySelector('.markdown');
     if (renderedSources.get(body) !== message.text) {
@@ -1551,6 +1634,61 @@ function messageRow(existing, message) {
     }
   }
   return row;
+}
+
+function renderUserExtras(row, message) {
+  const replyQuestion = clarificationReplies.get(String(message.text ?? '')) ?? null;
+  const files = Array.isArray(message.files) ? message.files : [];
+  const references = Array.isArray(message.references) ? message.references : [];
+  const time = typeof message.time === 'string' ? message.time : typeof message.created_at === 'string' ? message.created_at : null;
+  const signature = JSON.stringify([time, files, references, replyQuestion]);
+  let extras = row.querySelector('.user-extras');
+  if (!extras) {
+    extras = el('div', 'user-extras');
+    row.append(extras);
+  }
+  if (extras.dataset.signature === signature) return;
+  extras.dataset.signature = signature;
+  extras.replaceChildren();
+  if (replyQuestion) {
+    const reply = el('div', 'question-reply');
+    const toggle = el('button', 'question-reply-toggle', '回答先前等待中的问题');
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', 'false');
+    const detail = el('div', 'question-reply-detail', String(replyQuestion));
+    detail.hidden = true;
+    toggle.addEventListener('click', () => {
+      detail.hidden = !detail.hidden;
+      toggle.setAttribute('aria-expanded', String(!detail.hidden));
+    });
+    reply.append(toggle, detail);
+    extras.append(reply);
+  }
+  for (const file of files) {
+    const card = el('div', 'message-file-card');
+    const name = String(file?.name ?? file?.path ?? '附件');
+    const extension = name.includes('.') ? name.split('.').pop().slice(0, 8).toUpperCase() : '';
+    const size = Number(file?.size_bytes ?? 0);
+    card.title = name;
+    card.append(
+      iconNode('fileText', { size: 22 }),
+      el('span', 'message-file-body', `${name}`),
+      el('span', 'message-file-meta', [extension, size ? `${Math.max(1, Math.round(size / 1024))} KB` : ''].filter(Boolean).join(' · ')),
+    );
+    extras.append(card);
+  }
+  if (references.length) {
+    const chips = el('div', 'message-refs');
+    for (const reference of references) {
+      const label = String(reference?.label ?? reference?.path ?? reference?.name ?? '引用');
+      chips.append(el('span', 'message-ref-chip', label));
+    }
+    extras.append(chips);
+  }
+  if (time) {
+    const at = new Date(time);
+    if (Number.isFinite(at.getTime())) extras.append(el('time', 'message-time', at.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })));
+  }
 }
 
 function openImagePreview(count) {
@@ -1736,6 +1874,9 @@ function toolKind(name) {
   if (/write|edit|patch/.test(value)) return 'edit';
   if (/web_(search|fetch)|fetch_web|search_web/.test(value)) return 'web';
   if (/grep|search|find|glob|list/.test(value)) return 'search';
+  if (/subagent|delegate/.test(value)) return 'subagent';
+  if (/^job_|background_task/.test(value)) return 'job';
+  if (/goal/.test(value)) return 'goal';
   if (/todo|plan/.test(value)) return 'todo';
   if (/present|deliver/.test(value)) return 'deliver';
   return 'generic';
@@ -1885,14 +2026,101 @@ function renderToolDetails(row, id) {
     if (!patch) card.append(el('pre', 'tool-output', output || '（无输出）'));
   } else if (kind === 'search') {
     card = el('div', 'tool-search-card');
+    const digest = searchDigest(output);
     const head = el('div', 'tool-search-head');
-    head.append(el('span', undefined, '搜索结果'), toolCopyButton(output));
-    card.append(head, el('pre', 'tool-search-output', output || '（无结果）'));
+    head.append(iconNode(tool.name === 'glob' || tool.name === 'find_files' ? 'search' : 'search', { size: 14 }));
+    head.append(el('span', 'tool-search-title', toolLabel(tool)));
+    head.append(el('span', 'tool-search-summary', digest ? `${digest.matches} 处匹配 · ${digest.files} 个文件` : output ? '搜索结果' : '无结果'));
+    head.append(toolCopyButton(output));
+    card.append(head, el('pre', 'tool-search-output', output || '无结果'));
   } else if (kind === 'web') {
     card = el('div', 'tool-web-card');
+    const data = parseToolJson(output);
     const head = el('div', 'tool-web-head');
-    head.append(el('span', undefined, typeof args?.url === 'string' ? args.url : typeof args?.query === 'string' ? args.query : '网页结果'));
-    card.append(head, el('pre', 'tool-web-output', output || '（无内容）'));
+    const title = tool.name === 'web_fetch' ? '网页获取' : '网页搜索';
+    head.append(iconNode('globe', { size: 14 }), el('span', 'tool-web-title', title));
+    const target = typeof args?.url === 'string' ? args.url : typeof args?.query === 'string' ? args.query : '';
+    if (target) head.append(el('span', 'tool-web-target', target));
+    card.append(head);
+    const sources = Array.isArray(data?.sources) ? data.sources : [];
+    if (sources.length) {
+      const list = el('div', 'tool-web-sources');
+      for (const source of sources.slice(0, 8)) {
+        const row = el('button', 'tool-web-source');
+        row.type = 'button';
+        row.append(el('span', 'tool-web-source-title', String(source.title ?? source.url ?? '来源')), el('span', 'tool-web-source-url', String(source.url ?? '')));
+        if (source.snippet) row.append(el('span', 'tool-web-source-snippet', String(source.snippet)));
+        if (typeof source.url === 'string' && /^https?:/i.test(source.url)) row.addEventListener('click', () => openMessageLink(source.url));
+        list.append(row);
+      }
+      card.append(list);
+    } else {
+      card.append(el('pre', 'tool-web-output', output || '（无内容）'));
+    }
+  } else if (kind === 'goal') {
+    card = el('div', 'tool-details-card');
+    const data = parseToolJson(output);
+    const title = { create_goal: '创建目标', get_goal: '查看目标', update_goal: '更新目标' }[tool.name] ?? '目标';
+    const head = el('div', 'tool-details-head');
+    head.append(iconNode('compass', { size: 14 }), el('span', undefined, title));
+    card.append(head);
+    if (data && typeof data === 'object') {
+      const objective = data.objective ?? data.goal?.objective ?? args?.objective;
+      if (objective) card.append(el('div', 'tool-details-primary', String(objective)));
+      const rows = [];
+      const status = data.status ?? data.goal?.status;
+      if (status) rows.push(['状态', String(status)]);
+      const rounds = data.rounds_started ?? data.roundsStarted ?? data.goal?.rounds_started;
+      const max = data.max_goal_rounds ?? data.maxGoalRounds ?? data.goal?.max_goal_rounds;
+      if (rounds !== undefined || max !== undefined) rows.push(['执行轮次', `${rounds ?? '?'} / ${max ?? '?'}`]);
+      const blocked = data.blocked_reason?.message ?? data.blockedReason?.message ?? data.goal?.blocked_reason?.message;
+      if (blocked) rows.push(['受阻原因', String(blocked)]);
+      for (const [label, value] of rows) {
+        const row = el('div', 'tool-details-row');
+        row.append(el('span', 'tool-details-label', label), el('span', 'tool-details-value', value));
+        card.append(row);
+      }
+      if (!objective && !rows.length) card.append(el('pre', 'tool-output', output || '没有目标'));
+    } else card.append(el('pre', 'tool-output', output || '没有目标'));
+  } else if (kind === 'subagent') {
+    card = el('div', 'tool-details-card');
+    const head = el('div', 'tool-details-head');
+    head.append(iconNode('bot', { size: 14 }), el('span', undefined, '创建子智能体'));
+    card.append(head);
+    const started = /started (background )?subagent(?: job)? (\S+)/i.exec(output);
+    if (started) {
+      const receipt = el('div', 'tool-receipt');
+      receipt.append(el('span', 'tool-receipt-mark', '已启动'), el('span', 'tool-details-label', started[1] ? '任务 ID' : '智能体 ID'), el('span', 'tool-details-value', started[2]));
+      card.append(receipt);
+    } else {
+      card.append(el('div', 'tool-details-primary', String(args?.prompt ?? args?.task ?? '子智能体')));
+      card.append(el('pre', 'tool-output', output || '（无回复）'));
+    }
+  } else if (kind === 'job') {
+    card = el('div', 'tool-details-card');
+    const titles = { job_list: '查看后台任务', job_output: '读取任务输出', job_kill: '取消后台任务' };
+    const head = el('div', 'tool-details-head');
+    head.append(iconNode('clock', { size: 14 }), el('span', undefined, titles[tool.name] ?? '后台任务'));
+    card.append(head);
+    const status = /\[status:\s*([a-z_]+)\]/i.exec(output);
+    if (status) card.append(el('span', 'tool-job-status', `状态：${status[1]}`));
+    if (tool.name === 'job_kill') {
+      const receipt = el('div', 'tool-receipt');
+      receipt.append(el('span', 'tool-receipt-mark', tool.status === 'success' ? '已取消' : '未确认'));
+      card.append(receipt);
+    }
+    card.append(el('pre', 'tool-output', output || '（无输出）'));
+  } else if (kind === 'deliver') {
+    card = el('div', 'tool-deliver-card');
+    const head = el('div', 'tool-details-head');
+    head.append(iconNode('upload', { size: 14 }), el('span', undefined, '交付文件'));
+    head.append(el('span', 'tool-deliver-status', { running: '正在交付', success: '已交付', failed: '交付失败' }[tool.status] ?? '准备交付'));
+    card.append(head);
+    const files = (Array.isArray(args?.files) ? args.files : []).map(file => typeof file === 'string' ? file : file?.path).filter(Boolean);
+    if (typeof args?.path === 'string') files.unshift(args.path);
+    for (const file of files.slice(0, 4)) card.append(el('div', 'tool-deliver-file', String(file)));
+    if (files.length > 4) card.append(el('div', 'tool-deliver-more', `其余 ${files.length - 4} 个文件`));
+    if (output) card.append(el('pre', 'tool-output', output));
   } else if (kind === 'todo' && (Array.isArray(args?.todos) || Array.isArray(args?.items) || Array.isArray(args?.steps))) {
     card = el('div', 'tool-todo-card');
     const items = args.todos ?? args.items ?? args.steps;
@@ -1920,6 +2148,19 @@ function renderToolDetails(row, id) {
 
 function parseToolJson(output) {
   try { return JSON.parse(String(output ?? '')); } catch { return null; }
+}
+
+function searchDigest(output) {
+  const lines = String(output ?? '').split('\n').filter(line => line.trim() !== '');
+  const files = new Set();
+  let matches = 0;
+  for (const line of lines) {
+    const located = /^([^:\n]+):(\d+)(?::|\s)/.exec(line);
+    if (located) { files.add(located[1]); matches += 1; continue; }
+    if (/^[^:\n]+\.[A-Za-z0-9]+$/.test(line.trim())) files.add(line.trim());
+  }
+  if (!matches && !files.size) return null;
+  return { matches: matches || lines.length, files: files.size };
 }
 
 const workflowStatusLabels = {
@@ -2152,6 +2393,47 @@ function openPlanReviewPanel() {
   close.focus();
 }
 
+function presentedFiles() {
+  const out = [];
+  const seen = new Set();
+  for (const tool of current?.tools ?? []) {
+    if (toolKind(tool.name) !== 'deliver') continue;
+    const args = toolArgs(tool) ?? {};
+    const files = Array.isArray(args.files) ? [...args.files] : [];
+    if (typeof args.path === 'string') files.unshift(args.path);
+    for (const file of files) {
+      const path = typeof file === 'string' ? file : file?.path;
+      if (typeof path !== 'string' || !path || seen.has(path)) continue;
+      seen.add(path);
+      out.push({ path, status: tool.status });
+    }
+  }
+  return out;
+}
+
+function presentedFilesCard() {
+  const files = presentedFiles();
+  if (!files.length) return null;
+  const wrap = el('div', 'presented-files-card');
+  wrap.dataset.key = 'presented-files';
+  for (const file of files.slice(0, 4)) {
+    const row = el('button', 'presented-file');
+    row.type = 'button';
+    const icon = el('span', 'presented-file-icon');
+    icon.append(iconNode('fileText', { size: 18 }));
+    const body = el('span', 'presented-file-body');
+    body.append(
+      el('span', 'presented-file-name', file.path.split(/[\\/]/).filter(Boolean).at(-1) ?? file.path),
+      el('span', 'presented-file-status', { running: '正在交付', success: '在侧边栏预览', failed: '交付失败' }[file.status] ?? '已请求打开'),
+    );
+    row.append(icon, body);
+    row.addEventListener('click', () => openRightbarTab('deliverables'));
+    wrap.append(row);
+  }
+  if (files.length > 4) wrap.append(el('div', 'presented-file-more', `其余 ${files.length - 4} 个文件`));
+  return wrap;
+}
+
 function deliveredCard() {
   const report = current?.session?.completion_report ?? current?.completionReport;
   if (!report) return null;
@@ -2275,6 +2557,7 @@ function renderConversation() {
     const position = anchorNode ? nodes.indexOf(anchorNode) + 1 : nodes.length;
     nodes.splice(position, 0, host);
   }
+  const maxTokens = maxTokensNode(); if (maxTokens) nodes.push(maxTokens);
   const running = current.status === 'running';
   if (running) {
     runStartedAt ??= Date.now();
@@ -2303,6 +2586,7 @@ function renderConversation() {
   for (const shell of current.session.user_shells ?? []) nodes.push(userShellNode(shell));
   const plan = planCard(); if (plan) nodes.push(plan);
   const delivered = deliveredCard(); if (delivered) nodes.push(delivered);
+  const presented = presentedFilesCard(); if (presented) nodes.push(presented);
   const changed = changedFilesCard(); if (changed) nodes.push(changed);
   const usage = usageNode(); if (usage) nodes.push(usage);
   const keep = new Set(nodes);
@@ -2314,6 +2598,19 @@ function renderConversation() {
   updateScrollBottom();
 }
 
+function maxTokensNode() {
+  if (current?.lastTerminal !== 'truncated') return null;
+  const row = el('div', 'turn-max-tokens-row');
+  row.dataset.key = 'max-tokens';
+  const copy = el('div', 'turn-max-tokens-copy');
+  copy.append(
+    el('span', 'turn-max-tokens-title', '已达到输出 token 上限'),
+    el('span', 'turn-max-tokens-text', '回答被截断，已有输出保留在对话中。发送“继续”可让模型接着输出。'),
+  );
+  row.append(el('span', 'turn-max-tokens-dot'), copy);
+  return row;
+}
+
 function turnErrorNode(error) {
   const row = el('div', 'turn-error-row');
   row.dataset.key = `turn-error:${error.id}`;
@@ -2323,7 +2620,8 @@ function turnErrorNode(error) {
 
 function runningLabel() {
   const elapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
-  return elapsed >= 1 ? `深度求索中，用时 ${elapsed}s ···` : '深度求索中 ···';
+  const base = elapsed >= 1 ? `深度求索中，用时 ${elapsed}s ···` : '深度求索中 ···';
+  return modelRetry ? `${base} 正在重试模型请求（${modelRetry.attempt}/${modelRetry.max}）` : base;
 }
 
 function usageNode() {
@@ -3113,12 +3411,21 @@ function renderInteractions() {
   for (const request of current?.approvals ?? []) {
     const card = el('div', 'interaction-card approval-card');
     card.append(el('h3', undefined, '等待审批'));
+    if (request.tool) card.append(el('div', 'approval-tool', request.tool));
     card.append(el('p', undefined, request.summary ?? ''));
     if (request.command) card.append(el('div', 'interaction-command', request.command));
     if (request.risks?.length) {
       const risks = el('ul', 'interaction-risks');
       for (const risk of request.risks) risks.append(el('li', undefined, risk));
       card.append(risks);
+    }
+    if (request.grant) {
+      const details = el('details', 'interaction-details');
+      details.append(
+        el('summary', undefined, '技术详情'),
+        el('pre', undefined, JSON.stringify({ tool: request.tool, grant: request.grant }, null, 2)),
+      );
+      card.append(details);
     }
     const actions = el('div', 'interaction-actions');
     for (const decision of approvalDecisions(request)) {
@@ -3176,6 +3483,10 @@ function renderInteractions() {
       const answer = request.questions?.length
         ? fields.map(({ question }, index) => `${question.header || question.question}: ${answers[index]}`).join('\n')
         : answers[0];
+      for (const [index, value] of answers.entries()) {
+        const question = request.questions?.[index]?.question ?? request.question ?? '';
+        clarificationReplies.set(String(value ?? ''), question);
+      }
       await deliver({ type: 'answer_clarification', request_id: request.id, answer });
       await refreshMetadata();
     }));
@@ -3312,6 +3623,7 @@ function selectWorkspace(folder) {
     $('conversation').replaceChildren();
   }
   selection = folder;
+  if (folder?.path) chosenWorkspaces.set(workspaceKey(folder.path), folder);
   currentSource = null;
   $('message').value = text;
   drafts.set('new-session', text);
@@ -3559,7 +3871,6 @@ async function createTask() {
   if (draftText) {
     $('message').value = draftText;
     resizeComposer();
-    drafts.set(current.session.id, draftText);
     drafts.delete('new-session');
   }
   await refreshTasks();
@@ -3576,12 +3887,14 @@ async function createTask() {
 }
 
 async function createTaskInWorkspace(path) {
-  const folder = await api.chooseRecentWorkspace(path);
+  const draftText = drafts.get('new-session') ?? '';
+  const folder = chosenWorkspaces.get(workspaceKey(path)) ?? await api.chooseRecentWorkspace(path);
   if (!folder) return;
   selection = folder;
   current = null;
   history = [];
-  $('message').value = drafts.get('new-session') ?? '';
+  $('message').value = draftText;
+  drafts.set('new-session', draftText);
   $('conversation').replaceChildren();
   await createTask();
 }
@@ -4103,7 +4416,6 @@ function splitRightbar() {
   renderRightbar();
 }
 function toggleRightbarFullscreen() {
-  if (innerWidth < 768) { closeRightbar(); return; }
   rightbarExpanded = !rightbarExpanded;
   persistRightbar();
   renderRightbar();
@@ -4713,7 +5025,18 @@ function scheduleBrowserSurface() {
     .filter(node => node.getClientRects().length)
     .map(node => ({ node, tab: rightbarTabs[node.dataset.browserTab] }))
     .filter(item => item.tab && browserTabData(item.tab)?.id === browserData.selectedId);
-  const active = candidates[0] ?? null;
+  let active = candidates[0] ?? null;
+  if (!active) {
+    // A stale browser-state event can clear a tab's native id after the
+    // manager already selected a replacement. One visible browser surface and
+    // one selected native tab are the same view; re-bind instead of hiding it.
+    const surfaces = [...document.querySelectorAll('.browser-surface')].filter(node => node.getClientRects().length);
+    const selected = browserData?.tabs?.find(item => item.id === browserData.selectedId);
+    if (surfaces.length === 1 && selected) {
+      const tab = rightbarTabs[surfaces[0].dataset.browserTab];
+      if (tab?.kind === 'browser') { tab.browserId = selected.id; active = { node: surfaces[0], tab }; }
+    }
+  }
   const data = active?.tab ? browserTabData(active.tab) : null;
   const dialogsOpen = [...document.querySelectorAll('dialog')].some(dialog => dialog.open);
   const menusOpen = !!document.querySelector('.menu');
@@ -5012,7 +5335,8 @@ function previewView(tab) {
 
 function deliverablesView() {
   const report = current?.session?.completion_report ?? current?.completionReport;
-  if (!report) {
+  const presented = presentedFiles();
+  if (!report && !presented.length) {
     const empty = el('div', 'right-empty');
     const mark = el('span', 'empty-icon'); mark.append(iconNode('archive', { size: 48, stroke: 1.1 }));
     empty.append(mark, el('h3', undefined, '暂无交付内容'), el('p', undefined, '当前 Runtime 不暴露交付物/产物列表，桌面不会伪造文件卡片。'));
@@ -5037,8 +5361,25 @@ function deliverablesView() {
   );
   card.append(icon, copy);
   const note = el('div', 'deliverable-note');
-  note.append(el('span', undefined, 'Runtime 只提供聚合统计，没有交付文件清单；不会伪造文件名或预览。'));
+  note.append(el('span', undefined, report
+    ? 'Runtime 只提供变更聚合统计；以下文件来自本轮真实交付工具调用。'
+    : '以下文件来自本轮真实交付工具调用；Runtime 未提供变更聚合。'));
   view.append(card, note);
+  if (presented.length) {
+    const list = el('div', 'presented-files-card');
+    for (const file of presented) {
+      const row = el('button', 'presented-file');
+      row.type = 'button';
+      const icon = el('span', 'presented-file-icon');
+      icon.append(iconNode('fileText', { size: 18 }));
+      const body = el('span', 'presented-file-body');
+      body.append(el('span', 'presented-file-name', file.path), el('span', 'presented-file-status', { running: '正在交付', success: '已交付', failed: '交付失败' }[file.status] ?? '已请求打开'));
+      row.append(icon, body);
+      row.addEventListener('click', () => openPreviewForPath(file.path));
+      list.append(row);
+    }
+    view.append(list);
+  }
   return view;
 }
 
@@ -5381,7 +5722,7 @@ function renderGeneralSettings(content) {
   group.append(settingRow('权限', '选择新会话的默认权限模式', menuControl(settings.defaultPermission, PERMISSION_MODES.map(([value, label]) => ({ value, label })), value => {
     settings.defaultPermission = value; saveSettings(); toast('默认权限已更新', { tone: 'success', holdMs: 1600 });
   }, { label: '权限' })));
-  group.append(settingRow('语言', '', menuControl('zh-CN', [{ value: 'zh-CN', label: '中文' }], () => {}, { label: '语言' })));
+  group.append(settingRow('语言', '当前仅提供中文；语言切换未接入', menuControl('zh-CN', [{ value: 'zh-CN', label: '中文' }], () => {}, { label: '语言' })));
   const themeRow = el('div', 'setting-row appearance-row');
   const themeCopy = el('div', 'setting-copy');
   themeCopy.append(el('div', 'setting-label', '外观'));
@@ -5479,6 +5820,15 @@ function renderModelSettings(content) {
       const card = el('div', 'settings-card');
       const head = el('div', 'provider-row');
       head.append(el('span', 'provider-name', provider));
+      const actions = el('div', 'provider-actions');
+      for (const label of ['编辑', '删除']) {
+        const button = el('button', 'button ghost small', label);
+        button.type = 'button';
+        button.disabled = true;
+        button.title = 'Runtime 未提供 Provider 编辑接口';
+        actions.append(button);
+      }
+      head.append(actions);
       card.append(head);
       for (const model of list) {
         const row = el('div', 'provider-row');
@@ -5498,15 +5848,32 @@ function renderModelSettings(content) {
     }
   }
   const card = el('div', 'settings-card');
-  card.append(el('h3', undefined, '添加模型提供商'), el('p', undefined, 'Provider、密钥与 Base URL 的写入接口尚未接入桌面。'), unconnected());
-  const add = el('button', 'button secondary', '添加模型提供商');
-  add.type = 'button'; add.disabled = true;
+  card.append(el('h3', undefined, '添加模型提供商'), el('p', undefined, 'Provider、密钥与 Base URL 的写入接口尚未接入桌面。'));
+  const add = el('button', 'button secondary small', '添加 Provider');
+  add.type = 'button';
+  add.disabled = true;
+  add.title = 'Runtime 未提供 Provider 写入接口';
   card.append(add);
+  card.append(el('p', 'settings-note', '自定义 Base URL、协议与模型行同样未接入；当前只读展示 Runtime 已加载的模型。'));
+  card.append(unconnected());
   content.append(card);
 }
 
 function renderPluginSettings(content) {
   content.append(el('h2', 'settings-title-large', '内置插件'));
+  const toolbar = el('div', 'plugin-toolbar');
+  const search = el('input', 'settings-input plugin-search');
+  search.type = 'search';
+  search.placeholder = '搜索插件';
+  search.disabled = true;
+  search.title = '当前 Runtime 未提供插件目录';
+  search.setAttribute('aria-label', '搜索插件');
+  const filter = el('button', 'button ghost small', '全部');
+  filter.type = 'button';
+  filter.disabled = true;
+  filter.title = '当前 Runtime 未提供插件分类';
+  toolbar.append(search, filter);
+  content.append(toolbar);
   const card = el('div', 'settings-card');
   card.append(el('h3', undefined, '当前 Runtime 未提供插件目录'));
   card.append(el('p', undefined, 'CodeLeveler 的工具与能力由 Runtime 内置，桌面桥接层没有可读取的插件清单或启停接口。这里不会展示伪造的插件开关。'));
@@ -5546,7 +5913,11 @@ function renderPresetSettings(content) {
     const usage = el('button', 'button ghost small', '如何使用');
     usage.type = 'button';
     usage.addEventListener('click', () => openPresetDialog(agent, 'usage'));
-    tags.append(view, usage);
+    const makeDefault = el('button', 'button ghost small', '设为默认');
+    makeDefault.type = 'button';
+    makeDefault.disabled = true;
+    makeDefault.title = 'Runtime 未提供预设默认切换接口';
+    tags.append(view, usage, makeDefault);
     card.append(tags);
     content.append(card);
   }
@@ -5615,7 +5986,12 @@ function renderEntryPage() {
     copy.append(el('h1', undefined, '插件'), el('p', undefined, '扩展 CodeLeveler 的工具与界面。'));
     const action = el('button', 'button secondary', '安装插件');
     action.type = 'button'; action.disabled = true; action.title = '当前版本未接入插件安装';
-    const wrap = el('div', 'settings-actions'); wrap.append(action);
+    const caret = el('button', 'button secondary entry-split-caret');
+    caret.type = 'button'; caret.disabled = true; caret.title = '当前版本未接入插件安装';
+    caret.setAttribute('aria-label', '插件安装选项');
+    caret.append(iconNode('chevronDown', { size: 12 }));
+    const split = el('div', 'entry-split'); split.append(action, caret);
+    const wrap = el('div', 'settings-actions'); wrap.append(split);
     head.append(copy, wrap);
     page.append(head);
     const search = el('div', 'entry-search');
@@ -5643,13 +6019,32 @@ function renderEntryPage() {
     const wrap = el('div', 'settings-actions'); wrap.append(action);
     head.append(copy, wrap);
     page.append(head);
+    const search = el('div', 'entry-search');
+    search.append(iconNode('search', { size: 15 }));
+    const input = el('input');
+    input.placeholder = '搜索自动化任务';
+    input.disabled = true;
+    input.title = '当前版本未接入调度接口';
+    input.setAttribute('aria-label', '搜索自动化任务');
+    search.append(input);
+    page.append(search);
+    const tabs = el('div', 'entry-tabs');
+    for (const [label, selected] of [['全部', true], ['已启用', false], ['已结束', false]]) {
+      const tab = el('button', 'entry-tab', label);
+      tab.type = 'button';
+      tab.disabled = true;
+      tab.title = '当前版本未接入调度接口';
+      tab.setAttribute('aria-selected', String(selected));
+      tabs.append(tab);
+    }
+    page.append(tabs);
     const card = el('div', 'entry-card');
     card.append(el('h2', undefined, '调度接口尚未接入'), el('p', undefined, 'CodeLeveler Runtime 暴露了 schedule 工具与事件，但桌面桥接层没有列表/创建/取消接口。这里不会展示伪造的计划记录。'));
     page.append(card);
     const empty = el('div', 'entry-empty');
     const mark = el('span', 'empty-mark');
     mark.append(iconNode('automation', { size: 44, stroke: 1.1 }));
-    empty.append(mark, document.createTextNode('暂无自动化任务'));
+    empty.append(mark, document.createTextNode('还没有自动化任务，在会话中创建的任务会显示在这里'));
     page.append(empty);
   }
   host.replaceChildren(page);
@@ -5758,6 +6153,7 @@ api.onEvent(frame => {
   if (event.type === 'agents_loaded') return;
   const pendingDiff = current.diffQuery?.status === 'pending' && event.query_id === current.diffQuery.id;
   current = applyEvent(current, event);
+  modelRetry = event.type === 'model_retrying' ? { attempt: event.attempt ?? 0, max: event.max_attempts ?? 0 } : null;
   if (terminalEvents.has(event.type)) { pendingSubmit = false; setTimeout(flushQueuedMessage, 0); }
   if (terminalEvents.has(event.type) && current?.session?.repository) {
     const attemptDiff = (attempt = 0) => {
