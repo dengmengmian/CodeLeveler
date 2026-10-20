@@ -11,44 +11,46 @@ const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-o
 await mkdir(output,{recursive:true});
 const marker=`desktop-acceptance-${Date.now()}`;
 let application,page;
-async function launch(){application=await electron.launch({args:[root,`--user-data-dir=${path.join(output,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined}});page=await application.firstWindow();page.setDefaultTimeout(60000);await page.waitForFunction(()=>window.desktop&&document.querySelector('#refresh')?.disabled===false);}
+async function launch(){application=await electron.launch({args:[root,`--user-data-dir=${path.join(output,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined}});page=await application.firstWindow();page.setDefaultTimeout(60000);await page.waitForFunction(()=>window.desktop&&document.querySelector('#new-session')&&!document.querySelector('#new-session').disabled&&document.querySelector('#brand-version')?.textContent.startsWith('v'));}
 async function runtimeInfo(){return page.evaluate(()=>window.desktop.runtimeInfo());}
 async function closeWindow(){const processExit=application.process();await page.evaluate(()=>window.close());await new Promise((resolve,reject)=>{if(processExit.exitCode!==null)return resolve();const timer=setTimeout(()=>reject(new Error('Desktop did not exit after its window closed')),10000);processExit.once('exit',()=>{clearTimeout(timer);resolve();});});application=null;}
 function ownerEpoch(dbPath,sessionId){const db=new DatabaseSync(dbPath,{readOnly:true});try{return db.prepare('SELECT id, owner_epoch, owner_boot_id FROM tasks WHERE session_id = ? ORDER BY id').all(sessionId).map(row=>({...row}));}finally{db.close();}}
 try{
   await launch();
   assert.deepEqual(await page.evaluate(()=>({require:typeof window.require,process:typeof window.process})),{require:'undefined',process:'undefined'});
-  await page.locator('#new-task').click();await page.locator('#home-permission').click();await page.waitForFunction(()=>!document.querySelector('#permission-menu').hidden);await page.keyboard.press('Escape');
-  await page.waitForFunction(()=>document.querySelector('.task.selected')&&!document.querySelector('#refresh').disabled);
-  const sessionId=await page.locator('.task.selected').getAttribute('data-session-id');
-  assert.equal(await page.locator('#workspace').innerText(),'选择工作空间');
+  await page.locator('#new-session').click();
+  await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]'));
+  await page.locator('#permission-picker').click();await page.waitForFunction(()=>document.querySelector('.menu'));await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.querySelector('.menu'));
+  await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
+  const sessionId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
+  assert.match(await page.locator('#workspace-picker').innerText(),/选择工作区/);
   await page.locator('#message').fill(`请只回复这段文字，不调用任何工具：${marker}`);
   await page.locator('#message').press('Enter');
-  await page.waitForFunction(marker=>Array.from(document.querySelectorAll('.message.assistant .body')).some(n=>n.textContent.includes(marker)),marker,{timeout:180000});
-  await page.waitForFunction(()=>document.querySelector('#status').textContent==='已回答'||document.querySelector('#status').textContent==='已完成',null,{timeout:180000});
+  await page.waitForFunction(marker=>Array.from(document.querySelectorAll('.message.assistant .markdown')).some(n=>n.textContent.includes(marker)),marker,{timeout:180000});
+  await page.waitForFunction(()=>['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent),null,{timeout:180000});
   const before=await runtimeInfo();assert.ok(before.pid>0);assert.ok(before.runtime_id);
   const task=(await page.evaluate(()=>window.desktop.listTasks())).tasks.find(t=>t.id===sessionId);
   assert.equal(task.primary_workspace,null);
   const snapshotBefore=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);assert.equal(snapshotBefore.repository,null);
   const epochsBefore=ownerEpoch(task.source_id,sessionId);assert.ok(epochsBefore.length>0);
-  const answerBefore=await page.locator('.message.assistant .body').allTextContents();
+  const answerBefore=await page.locator('.message.assistant .markdown').allTextContents();
   await page.screenshot({path:path.join(output,'before-close.png')});
   // Switch through a second real session, so history buttons and state reset are exercised.
-  await page.locator('#new-task').click();await page.locator('#home-permission').click();await page.waitForFunction(()=>!document.querySelector('#permission-menu').hidden);await page.keyboard.press('Escape');await page.waitForFunction(id=>document.querySelector('.task.selected')?.dataset.sessionId!==id&&!document.querySelector('#refresh').disabled,sessionId);
-  await page.locator(`.task[data-session-id="${sessionId}"]`).click();
-  await page.waitForFunction(id=>document.querySelector('.task.selected')?.dataset.sessionId===id&&!document.querySelector('#refresh').disabled,sessionId);
+  await page.locator('#new-session').click();await page.waitForFunction(id=>document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId!==id&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…',sessionId);
+  await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();
+  await page.waitForFunction(id=>document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId===id&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…',sessionId);
   assert.equal(await page.locator('.message.user').count(),1);
   await closeWindow();
   process.kill(before.pid,0); // Actual OS liveness after Desktop and bridge exit.
   await launch();
-  await page.locator(`.task[data-session-id="${sessionId}"]`).click();
-  await page.waitForFunction(marker=>Array.from(document.querySelectorAll('.message.assistant .body')).some(n=>n.textContent.includes(marker)),marker);
+  await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();
+  await page.waitForFunction(marker=>Array.from(document.querySelectorAll('.message.assistant .markdown')).some(n=>n.textContent.includes(marker)),marker);
   const after=await runtimeInfo();const snapshotAfter=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);assert.equal(snapshotAfter.repository,null);assert.equal(snapshotAfter.task_status,snapshotBefore.task_status);assert.deepEqual(snapshotAfter.task_terminal,snapshotBefore.task_terminal);
   assert.equal(after.pid,before.pid);assert.equal(after.runtime_id,before.runtime_id);
   assert.deepEqual(ownerEpoch(task.source_id,sessionId),epochsBefore);
   assert.equal(await page.locator('.message.user').count(),1);
-  assert.deepEqual(await page.locator('.message.assistant .body').allTextContents(),answerBefore);
-  assert.equal(await page.locator('#workspace').innerText(),'选择工作空间');
+  assert.deepEqual(await page.locator('.message.assistant .markdown').allTextContents(),answerBefore);
+  assert.match(await page.locator('#workspace-picker').innerText(),/选择工作区/);
   await page.screenshot({path:path.join(output,'after-reopen.png')});
   await page.setViewportSize({width:700,height:520});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false);

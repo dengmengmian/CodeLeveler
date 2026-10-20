@@ -2,6 +2,8 @@ const { app, BrowserWindow, WebContentsView, Menu, ipcMain, dialog, protocol, ne
 const path=require('node:path');
 const { pathToFileURL }=require('node:url');
 const { randomUUID }=require('node:crypto');
+const { existsSync }=require('node:fs');
+const os=require('node:os');
 const { Bridge }=require('./bridge.cjs');
 const { validateEnvelope }=require('./security.cjs');
 const { ManualBrowser }=require('./browser.cjs');
@@ -31,7 +33,7 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','styles.css','command-policy.gen.mjs']);
+  const assets=new Set(['index.html','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs']);
   protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
@@ -39,6 +41,8 @@ app.whenReady().then(async()=>{
   handle('desktop:info',()=>bridge.request('runtime_info'));
   handle('desktop:app-info',()=>({version:app.getVersion()}));
   handle('desktop:copy-text',value=>copyText(value,clipboard));
+  handle('desktop:open-external',async value=>{const url=new URL(text(value,'url'));if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('Invalid external URL');await shell.openExternal(url.href);return {ok:true};});
+  handle('desktop:open-config',async()=>{const base=process.env.LEVELER_HOME??path.join(os.homedir(),'.leveler');const file=path.join(base,'config.toml');if(!existsSync(file))throw new Error('配置文件不存在');const error=await shell.openPath(file);if(error)throw new Error(error);return {ok:true};});
   handle('desktop:recent-folder',path=>recentWorkspaces.select(path));
   handle('desktop:attachment',sessionId=>attachments.choose(text(sessionId,'session')));
   handle('desktop:discard-upload',value=>{if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==2||!Object.hasOwn(value,'sessionId')||!Object.hasOwn(value,'importId'))throw new Error('Invalid upload discard');return attachments.discard(text(value.sessionId,'session'),text(value.importId,'import'));});

@@ -1,10 +1,10 @@
 // Cross-surface contract for context statistics — desktop conformance.
 //
-// The desktop context page is part of the single-file renderer, which installs
+// The desktop context meter is part of the single-file renderer, which installs
 // its DOM at import time and therefore cannot be imported under `node --test`.
 // Its contract is pinned two ways instead:
 //
-//   1. the page must read exactly the runtime `ContextAccounting` fields the
+//   1. the meter must read exactly the runtime `ContextAccounting` fields the
 //      shared corpus carries and must never derive its own percentage;
 //   2. the corpus itself must stay internally consistent with the semantics
 //      every surface renders (projected input over the effective input
@@ -25,12 +25,12 @@ const corpusDir = path.join(repoRoot, 'testdata', 'context_statistics', 'v1');
 
 const renderer = readFileSync(path.join(desktopRoot, 'src', 'renderer.mjs'), 'utf8');
 
-/** The `settingsSection==='context'` branch of `renderSettingsRead`. */
+/** The composer context meter: the reference-owned surface for accounting. */
 function contextBlock() {
-  const start = renderer.indexOf("settingsSection==='context'");
-  assert.ok(start >= 0, 'the desktop context page no longer exists');
-  const end = renderer.indexOf('settingsSection===', start + 1);
-  assert.ok(end > start, 'cannot delimit the desktop context page');
+  const start = renderer.indexOf('function contextMeterPanel()');
+  assert.ok(start >= 0, 'the desktop context meter no longer exists');
+  const end = renderer.indexOf('\nfunction ', start + 1);
+  assert.ok(end > start, 'cannot delimit the desktop context meter');
   return renderer.slice(start, end);
 }
 

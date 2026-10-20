@@ -21,56 +21,57 @@ async function cleanupRuntimes(){
  if(!primaryError&&cleanup.some(result=>!result.normal_idle_exit_observed))throw new Error('Isolated Runtime cleanup unproven; no signal sent');
 }
 try{
- application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await application.firstWindow();page.on('pageerror',error=>{pageErrors.push(error.message);console.error('RENDERER_ERROR',error.message);});page.on('console',message=>console.error('RENDERER_CONSOLE',message.type(),message.text()));page.on('response',response=>{resourceResponses.push({status:response.status(),url:response.url()});if(response.status()>=400)console.error('RESOURCE_FAILURE',response.status(),response.url());});application.process().stderr.on('data',chunk=>console.error('ELECTRON_STDERR',String(chunk)));page.setDefaultTimeout(15000);await page.waitForLoadState('domcontentloaded');assert.deepEqual(resourceResponses.filter(response=>response.status>=400),[],'actual renderer imports must be served');await page.waitForFunction(()=>window.desktop&&document.querySelector('#refresh')?.disabled===false&&document.querySelector('#desktop-version')?.textContent.startsWith('v'));
+ application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await application.firstWindow();page.on('pageerror',error=>{pageErrors.push(error.message);console.error('RENDERER_ERROR',error.message);});page.on('console',message=>console.error('RENDERER_CONSOLE',message.type(),message.text()));page.on('response',response=>{resourceResponses.push({status:response.status(),url:response.url()});if(response.status()>=400)console.error('RESOURCE_FAILURE',response.status(),response.url());});application.process().stderr.on('data',chunk=>console.error('ELECTRON_STDERR',String(chunk)));page.setDefaultTimeout(15000);await page.waitForLoadState('domcontentloaded');assert.deepEqual(resourceResponses.filter(response=>response.status>=400),[],'actual renderer imports must be served');await page.waitForFunction(()=>window.desktop&&document.querySelector('#new-session')&&document.querySelector('#brand-version')?.textContent.startsWith('v'));
  await writeFile(path.join(output,'renderer-assets-evidence.json'),JSON.stringify({resource_responses:resourceResponses,renderer_initialized:true},null,2)+'\n');
  // Explicit fixture seam in Electron Main, not in app code or Renderer.
  await application.evaluate(({dialog},folder)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[folder]});},workspace);
- await page.locator('#space-add').click();await page.waitForFunction(()=>document.querySelector('#workspace').textContent.includes('workspace'));
+ await page.locator('#add-workspace').click();await page.waitForFunction(()=>document.querySelector('#workspace-picker').textContent.includes('workspace'));
  await page.locator('#message').fill('fixture-interactions: read fixture.txt and propose removing scratch; I will deny approval.');await page.locator('#message').press('Enter');
  await page.getByRole('button',{name:'拒绝',exact:true}).waitFor();
- const sessionId=await page.locator('.task.selected').getAttribute('data-session-id');ownedSessions.add(sessionId);await rememberRuntime();
+ const sessionId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');ownedSessions.add(sessionId);await rememberRuntime();
  const liveUserCount=await page.locator('.message.user').count();
  const snapshotWaiting=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);
  await writeFile(path.join(output,'waiting-message-evidence.json'),JSON.stringify({snapshot_messages:snapshotWaiting.messages.map(m=>({role:m.role,text:m.text})),live_user_count:liveUserCount},null,2)+'\n');
  assert.equal(liveUserCount,1,'live accepted user message must remain while waiting for approval');
  assert.equal(await page.getByText('任务已创建。输入第一条消息开始对话。',{exact:true}).count(),0);
  assert.equal(snapshotWaiting.messages.filter(m=>m.role==='user').length,1);
- assert.equal(await page.locator('#status').innerText(),'等待你处理');
+ assert.equal(await page.locator('#conversation-status').innerText(),'等待你处理');
  assert.equal(snapshotWaiting.repository,await realpath(workspace));
  const pending=snapshotWaiting.pending_interactions.find(interaction=>interaction.type==='approval');assert.ok(pending);
  assert.equal(await readFile(path.join(workspace,'scratch','keep.txt'),'utf8'),'must-survive-denial');
- assert.match(await page.locator('.tool[data-tool-id="fixture-consent"] summary').innerText(),/等待审批/);
+ assert.match(await page.locator('.tool-row[data-tool-id="fixture-consent"] .tool-summary').innerText(),/等待审批/);
  if(pending.request.requires_human_consent){assert.equal(await page.getByRole('button',{name:'本会话允许',exact:true}).count(),0);assert.equal(await page.getByRole('button',{name:'始终允许',exact:true}).count(),0);}
  assert.equal(await page.getByRole('button',{name:'允许一次',exact:true}).isEnabled(),true);
- const readTool=page.locator('.tool[data-tool-id="fixture-read"]');await readTool.waitFor();assert.equal(await page.locator('.progress-label').count(),1,'one process stream per turn');assert.ok(await page.locator('.assistant-progress').count()>=1,'interim narration is process prose');await readTool.locator('summary').click();await readTool.locator('.tool-output').waitFor();assert.match(await readTool.innerText(),/desktop-real-tool-evidence/);
+ const readTool=page.locator('.tool-row[data-tool-id="fixture-read"]');await readTool.waitFor();assert.equal(await page.locator('.process-label').count(),1,'one process stream per turn');assert.ok(await page.locator('.message.narration').count()>=1,'interim narration is process prose');await readTool.locator('.tool-summary').click();await readTool.locator('.tool-read-card').waitFor();assert.match(await readTool.innerText(),/desktop-real-tool-evidence/);
  await page.screenshot({path:path.join(output,'workspace-live-approval.png')});
  await page.getByRole('button',{name:'拒绝',exact:true}).click();
- await page.waitForFunction(()=>document.querySelector('#status').textContent==='已回答'||document.querySelector('#status').textContent==='已完成');
- await page.waitForFunction(()=>document.querySelector('#refresh').disabled===false&&document.querySelector('#interactions').children.length===0);
+ await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent==='已回答'||document.querySelector('#conversation-status').textContent==='已完成');
+ await page.waitForFunction(()=>document.querySelector('#takeover').children.length===0);
  const settled=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);assert.equal(settled.pending_interactions.length,0);assert.equal(await readFile(path.join(workspace,'scratch','keep.txt'),'utf8'),'must-survive-denial');assert.deepEqual(fixture.errors,[]);
- assert.match(await page.locator('.tool[data-tool-id="fixture-consent"]').innerText(),/失败/);
+ assert.equal(await page.locator('.tool-row[data-tool-id="fixture-consent"]').getAttribute('data-status'),'failed');
  // History replay must restore tool evidence, never resurrect resolved consent buttons.
- await page.locator('#new-task').click();await page.waitForFunction(()=>document.body.classList.contains('home')&&!document.querySelector('#refresh').disabled);
- await page.locator(`.task[data-session-id="${sessionId}"]`).click();await page.waitForFunction(()=>document.querySelector('.tool[data-tool-id="fixture-read"]'));
+ await page.locator('#new-session').click();await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]')&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
+ await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();await page.waitForFunction(()=>document.querySelector('.tool-row[data-tool-id="fixture-read"]'));
 // Regression: reopening a workspace session renders the workbench while the
 // open action still holds `loading`; once idle the diff action must be enabled.
-await page.waitForFunction(()=>document.querySelector('#status').textContent!=='连接 Runtime…');
-assert.equal(await page.locator('#overview-changes').evaluate(n=>n.disabled),false,'diff action must be enabled after reopening a workspace session');
- await page.locator('.tool[data-tool-id="fixture-read"] summary').click();await page.locator('.tool[data-tool-id="fixture-read"] .tool-output').waitFor();assert.match(await page.locator('.tool[data-tool-id="fixture-read"]').innerText(),/desktop-real-tool-evidence/);
+await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
+await page.locator('#message').fill('/diff');await page.locator('#message').press('Enter');await page.waitForSelector('.review-head, .review-status',{timeout:15000});
+const processGroup=page.locator('.process-group').filter({has:page.locator('.tool-row[data-tool-id="fixture-read"]')}).first();if(await processGroup.count()&&!(await processGroup.evaluate(n=>n.open)))await processGroup.locator('.process-heading').click();
+const reopenedRead=page.locator('.tool-row[data-tool-id="fixture-read"]');if(!(await reopenedRead.evaluate(n=>n.open)))await reopenedRead.locator('.tool-summary').click();await page.locator('.tool-row[data-tool-id="fixture-read"] .tool-read-card').waitFor();assert.match(await page.locator('.tool-row[data-tool-id="fixture-read"]').innerText(),/desktop-real-tool-evidence/);
  assert.equal(await page.getByRole('button',{name:'拒绝',exact:true}).count(),0);
- assert.equal(await page.locator('.message.assistant .body').last().innerText(),'fixture-interactions-complete');
+ assert.equal(await page.locator('.message.assistant .markdown').last().innerText(),'fixture-interactions-complete');
  await page.screenshot({path:path.join(output,'workspace-tool-history.png')});
  // The provider holds a real model response open until cancellation. UI text
  // submission after interruption must continue the same logical task.
- await page.locator('#new-task').click();await page.waitForFunction(()=>document.body.classList.contains('home')&&!document.querySelector('#refresh').disabled);
+ await page.locator('#new-session').click();await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]')&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
  await page.locator('#message').fill('fixture-turn-hold');await page.locator('#message').press('Enter');
  await page.getByText('fixture-held-answer',{exact:true}).waitFor();
- const interruptedId=await page.locator('.task.selected').getAttribute('data-session-id');ownedSessions.add(interruptedId);
+ const interruptedId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');ownedSessions.add(interruptedId);
  const interruptSource=await page.evaluate(async id=>(await window.desktop.listTasks()).tasks.find(task=>task.id===id).source_id,interruptedId);await rememberRuntime();
  const originalTask=rows(interruptSource,'SELECT * FROM tasks WHERE session_id = ?',interruptedId)[0];assert.ok(originalTask.owner_boot_id);
  const originalTurn=rows(interruptSource,'SELECT * FROM turns WHERE session_id = ? ORDER BY ordinal',interruptedId)[0];const originalPayload=JSON.parse(originalTurn.payload);assert.equal(originalPayload.objective.primary,'fixture-turn-hold');
  const cancelTurn=await deliver(interruptedId,'cancel_current_turn');assert.equal(cancelTurn.ok,true);
- const interrupted=await waitStatus(interruptedId,'interrupted');assert.equal(interrupted.task_terminal.outcome,'interrupted');await page.waitForFunction(()=>document.querySelector('#status').textContent==='已中断'&&document.querySelector('#send').getAttribute('aria-label')!=='停止');
+ const interrupted=await waitStatus(interruptedId,'interrupted');assert.equal(interrupted.task_terminal.outcome,'interrupted');await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent==='已中断'&&document.querySelector('#send').getAttribute('aria-label')!=='停止');
  assert.equal(rows(interruptSource,'SELECT COUNT(*) AS count FROM turns WHERE session_id = ?',interruptedId)[0].count,1);
  assert.equal(rows(interruptSource,'SELECT owner_boot_id FROM tasks WHERE session_id = ?',interruptedId)[0].owner_boot_id,null);
  const beforeResume=agentRequests();
@@ -87,9 +88,9 @@ assert.equal(await page.locator('#overview-changes').evaluate(n=>n.disabled),fal
  assert.equal(resumePayload.initiating_message.role,'user');assert.match(JSON.stringify(resumePayload.initiating_message),/继续，fixture-turn-resume/);
  // CancelTask closes a different task and must reject later resume without
  // admitting a turn or reaching the provider.
- await page.locator('#new-task').click();await page.waitForFunction(()=>document.body.classList.contains('home')&&!document.querySelector('#refresh').disabled);
+ await page.locator('#new-session').click();await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]')&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
  await page.locator('#message').fill('fixture-turn-hold');await page.locator('#message').press('Enter');await page.getByText('fixture-held-answer',{exact:true}).waitFor();
- const cancelledId=await page.locator('.task.selected').getAttribute('data-session-id');ownedSessions.add(cancelledId);assert.equal((await deliver(cancelledId,'cancel_task')).ok,true);
+ const cancelledId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');ownedSessions.add(cancelledId);assert.equal((await deliver(cancelledId,'cancel_task')).ok,true);
  const cancelled=await waitStatus(cancelledId,'cancelled');assert.equal(cancelled.task_terminal.outcome,'cancelled');
  const beforeRejectedResume=agentRequests();const rejectedResume=await deliver(cancelledId,'resume_task','继续，fixture-turn-resume');assert.equal(rejectedResume.ok,false);
  assert.equal(agentRequests(),beforeRejectedResume);
@@ -97,23 +98,23 @@ assert.equal(await page.locator('#overview-changes').evaluate(n=>n.disabled),fal
  assert.equal(rows(interruptSource,'SELECT owner_boot_id FROM tasks WHERE session_id = ?',cancelledId)[0].owner_boot_id,null);
  await writeFile(path.join(output,'cancel-resume-evidence.json'),JSON.stringify({interrupted_session_id:interruptedId,task_before:originalTask.id,task_after:resumedTask.id,interrupted_terminal:interrupted.task_terminal,resume_turn_count:2,resume_turn_kind:resumeTurns[1].kind,resume_payload:resumePayload,original_payload:originalPayload,provider_requests_before_resume:beforeResume,provider_requests_after_resume:beforeResume+1,cancelled_session_id:cancelledId,cancelled_terminal:cancelled.task_terminal,rejected_resume:rejectedResume,no_turn_or_provider_after_rejected_resume:true,source_id:interruptSource},null,2)+'\n');
  // A cancelled waiter is expired. Its identity cannot settle a newer waiter.
- await page.waitForFunction(()=>document.querySelector('#status').textContent==='已取消');
+ await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent==='已取消');
  async function workspaceApproval(){
-  await page.locator('#new-task').click();await page.waitForFunction(()=>document.body.classList.contains('home')&&!document.querySelector('#refresh').disabled);
-  await page.locator('#space-add').click();await page.waitForFunction(()=>document.querySelector('#workspace').textContent.includes('workspace'));
+  await page.locator('#new-session').click();await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]')&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
+  await page.locator('#add-workspace').click();await page.waitForFunction(()=>document.querySelector('#workspace-picker').textContent.includes('workspace'));
   await page.locator('#message').fill('fixture-expired-approval: read fixture.txt and propose removing scratch');await page.locator('#message').press('Enter');
   await page.getByRole('button',{name:'拒绝',exact:true}).waitFor();await rememberRuntime();
-  const id=await page.locator('.task.selected').getAttribute('data-session-id');ownedSessions.add(id);const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),id);const waiter=snapshot.pending_interactions.find(interaction=>interaction.type==='approval');assert.ok(waiter);return {id,request_id:waiter.request.id};
+  const id=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');ownedSessions.add(id);const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),id);const waiter=snapshot.pending_interactions.find(interaction=>interaction.type==='approval');assert.ok(waiter);return {id,request_id:waiter.request.id};
  }
  async function staleReply(id,request_id){return page.evaluate(({id,request_id})=>window.desktop.deliver({command_id:crypto.randomUUID(),session_id:id,expected_version:null,issued_at:new Date().toISOString(),command:{type:'approval_decision',request_id,decision:'approve_once'}}),{id,request_id});}
- const expired=await workspaceApproval();await page.locator('#cancel').click();await waitStatus(expired.id,'interrupted');
- await page.waitForFunction(()=>document.querySelector('#status').textContent==='已中断'&&document.querySelector('#interactions').children.length===0);
+ const expired=await workspaceApproval();assert.equal((await deliver(expired.id,'cancel_current_turn')).ok,true);await waitStatus(expired.id,'interrupted');
+ await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent==='已中断'&&document.querySelector('#takeover').children.length===0);
  const expiredReply=await staleReply(expired.id,expired.request_id);assert.equal(expiredReply.ok,false);assert.match(expiredReply.error.message,/pending|expired|active|待处理|失效/);
  const newer=await workspaceApproval();assert.notEqual(newer.request_id,expired.request_id);
  const beforeStale=agentRequests();const staleAgainstNew=await staleReply(newer.id,expired.request_id);assert.equal(staleAgainstNew.ok,false);
  const stillPending=await page.evaluate(id=>window.desktop.snapshot(id),newer.id);assert.equal(stillPending.pending_interactions.find(interaction=>interaction.type==='approval').request.id,newer.request_id);
  assert.equal(agentRequests(),beforeStale);assert.equal(await readFile(path.join(workspace,'scratch','keep.txt'),'utf8'),'must-survive-denial');
- await page.getByRole('button',{name:'拒绝',exact:true}).click();await waitStatus(newer.id,'answered');await page.waitForFunction(()=>document.querySelector('#interactions').children.length===0);
+ await page.getByRole('button',{name:'拒绝',exact:true}).click();await waitStatus(newer.id,'answered');await page.waitForFunction(()=>document.querySelector('#takeover').children.length===0);
  assert.equal(await readFile(path.join(workspace,'scratch','keep.txt'),'utf8'),'must-survive-denial');
  await writeFile(path.join(output,'expired-approval-evidence.json'),JSON.stringify({expired_waiter:expired,expired_reply:expiredReply,new_waiter:newer,stale_against_new:staleAgainstNew,new_waiter_retained:true,stale_reply_no_provider_call:true,actual_new_denial_preserved_file:true},null,2)+'\n');
  assert.deepEqual(pageErrors,[]);assert.deepEqual(fixture.errors,[]);
@@ -122,7 +123,7 @@ assert.equal(await page.locator('#overview-changes').evaluate(n=>n.disabled),fal
  primaryError=error;await writeFile(path.join(output,'failure-evidence.json'),JSON.stringify({error:error.message,resource_responses:resourceResponses},null,2)+'\n');
  if(page&&!page.isClosed()){
   await page.screenshot({path:path.join(output,'interactions-failure.png')});
-  const id=await page.locator('.task.selected').getAttribute('data-session-id').catch(()=>null);
+  const id=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id').catch(()=>null);
   if(ownedSessions.has(id)){
    const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),id);
    if(['running','waiting_user'].includes(snapshot.task_status)){assert.equal((await deliver(id,'cancel_current_turn')).ok,true);await waitStatus(id,'interrupted');}
