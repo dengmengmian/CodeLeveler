@@ -20,8 +20,8 @@ c-perm = "check -p leveler-execution -p leveler-agent -p leveler-cli -p leveler-
 dod-test = "test --workspace"
 dod-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
 
-# Manual byte cap: 20000 means 20 GB, not 20k files. The .rcgu.o pile that
-# makes deps lookups stall is removed by scripts/sweep-debug-artifacts.sh.
+# Manual byte cap: 20000 means 20 GB, not 20k files. Run it when the deps
+# directory grows large enough to slow down rustc.
 sweep-target = "sweep --maxsize 20000"
 
 # Windows gives the main thread a 1 MB stack where Unix gives 8 MB, and that
