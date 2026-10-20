@@ -1381,10 +1381,11 @@ async fn a_cold_runtime_reports_an_orphaned_background_shell_as_unknown() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Simulate the runtime generation dying with the process. The local
     // registry no longer exists, so nothing could truthfully keep it Running.
-    // Kill the group the command was actually spawned into (the sandbox
-    // wrapper is its leader on Linux), never an assumed group id.
+    // Stop the shell itself. Cleanup never needs a process group, and a wrong
+    // group id is the runner's entire process tree; the orphaned child exits
+    // on its own.
     let _ = std::process::Command::new("kill")
-        .args(["-9", &format!("-{}", process_group_of(pid))])
+        .args(["-9", &pid.to_string()])
         .status();
 
     let app = std::sync::Arc::new(Application::assemble(layout).unwrap());
