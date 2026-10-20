@@ -2,7 +2,7 @@
 
 Electron 是桌面壳。任务、对话、工具、审批和持久化来自现有 Rust Runtime。Renderer 通过 sandbox preload 的固定 IPC 方法访问 Main，Main 只启动 `leveler desktop-bridge` JSONL 客户端。Runtime 的 discovery、spawn、adopt、revive 和 handoff 复用 Rust Runtime Host。
 
-本版本按 DeepSeek Harness Desktop `0.2.1-rc.2`（参考 HEAD `687f282e`）的实际界面重新实现 Desktop 外壳与交互；视觉规格来自对参考 Electron 的真实截图、DOM 几何和计算样式，源码由 CodeLeveler 独立编写。详细对照、差异和未验证项见 [docs/DESKTOP_UI_PARITY.md](../../docs/DESKTOP_UI_PARITY.md)。
+本版本按 DeepSeek Harness Desktop `0.2.1-rc.2`（参考 HEAD `687f282e`）的实际界面重新实现 Desktop 外壳与交互；视觉规格来自对参考 Electron 的真实截图、DOM 几何和计算样式，源码由 CodeLeveler 独立编写。对照截图与验收证据在 `acceptance-output/ui-parity-round2-2026-10-20/`（忽略目录）。
 
 ```sh
 cargo build -p leveler-cli --bin leveler
