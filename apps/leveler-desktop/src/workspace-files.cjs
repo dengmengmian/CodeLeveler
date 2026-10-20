@@ -4,11 +4,13 @@
 // The Main process owns the root: it comes from a Runtime snapshot, never from
 // the renderer. Every request is resolved against that canonical root and then
 // re-checked after symlink resolution, so a link cannot widen the boundary.
-const { promises: fsp } = require('node:fs');
+const { promises: fsp, constants } = require('node:fs');
 const path = require('node:path');
 
 const MAX_ENTRIES = 500;
 const MAX_READ_BYTES = 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
 const MAX_PATH_LENGTH = 4096;
 
 class WorkspaceFiles {
@@ -78,12 +80,31 @@ class WorkspaceFiles {
     return { path: entry.relative, entries, truncated: names.length > MAX_ENTRIES };
   }
 
+  async readImage(relative) {
+    const entry = await this.realEntry(relative);
+    const stat = await fsp.stat(entry.absolute);
+    if (!stat.isFile()) throw new Error('不是普通文件');
+    if (stat.size > MAX_IMAGE_BYTES) throw new Error('图片超过 20 MiB');
+    const handle = await fsp.open(entry.absolute, READ_FLAGS);
+    let content;
+    try { content = await handle.readFile(); } finally { await handle.close(); }
+    const mime = imageMime(content);
+    if (!mime) throw new Error('不支持的图片格式');
+    return {
+      path: entry.relative,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      mime,
+      dataUrl: `data:${mime};base64,${content.toString('base64')}`,
+    };
+  }
+
   async read(relative) {
     const entry = await this.realEntry(relative);
     const stat = await fsp.stat(entry.absolute);
     if (!stat.isFile()) throw new Error('不是普通文件');
     const length = Math.min(stat.size, MAX_READ_BYTES);
-    const handle = await fsp.open(entry.absolute, 'r');
+    const handle = await fsp.open(entry.absolute, READ_FLAGS);
     try {
       const buffer = Buffer.alloc(length);
       const { bytesRead } = await handle.read(buffer, 0, length, 0);
@@ -118,4 +139,12 @@ class WorkspaceFiles {
   }
 }
 
-module.exports = { WorkspaceFiles, MAX_ENTRIES, MAX_READ_BYTES };
+function imageMime(content) {
+  if (content.length >= 8 && content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (content.length >= 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) return 'image/jpeg';
+  if (content.length >= 6 && (content.subarray(0, 6).toString('ascii') === 'GIF87a' || content.subarray(0, 6).toString('ascii') === 'GIF89a')) return 'image/gif';
+  if (content.length >= 12 && content.subarray(0, 4).toString('ascii') === 'RIFF' && content.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return null;
+}
+
+module.exports = { WorkspaceFiles, MAX_ENTRIES, MAX_READ_BYTES, MAX_IMAGE_BYTES };

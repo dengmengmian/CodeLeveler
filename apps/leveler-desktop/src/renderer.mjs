@@ -2016,6 +2016,30 @@ function toolNode(existing, tool) {
   return row;
 }
 
+function toolFilePath(tool) {
+  const args = toolArgs(tool) ?? {};
+  for (const key of ['path', 'file', 'file_path']) if (typeof args[key] === 'string' && args[key]) return args[key];
+  const target = String(toolTarget(tool) ?? '');
+  if (/\.[A-Za-z0-9]{1,8}$/.test(target)) return target;
+  const located = /^([^\n:]+\.[A-Za-z0-9]{1,8}):\d+/.exec(String(displayPreview(tool) ?? ''));
+  return located ? located[1] : null;
+}
+
+function toolFileButton(tool, label = '打开文件') {
+  const path = toolFilePath(tool);
+  if (!path || path.startsWith('/') || /^https?:/i.test(path)) return null;
+  const button = el('button', 'tool-open-file', label);
+  button.type = 'button';
+  button.title = `在 Preview 中打开 ${path}`;
+  button.append(iconNode('file', { size: 12 }), el('span', undefined, label));
+  button.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    openPreviewForPath(path);
+  });
+  return button;
+}
+
 function renderToolDetails(row, id) {
   const tool = current?.tools.find(item => item.id === id);
   if (!tool) return;
@@ -2054,6 +2078,8 @@ function renderToolDetails(row, id) {
     card = el('div', 'tool-read-card');
     const head = el('div', 'tool-read-head');
     head.append(iconNode('eye', { size: 14 }), el('span', undefined, `显示 ${output ? output.split('\n').length : 0} 行`));
+    const openFile = toolFileButton(tool);
+    if (openFile) head.append(openFile);
     const pre = el('pre', 'tool-read-pre');
     const content = output.split('\n');
     for (const [index, line] of content.entries()) {
@@ -2065,6 +2091,8 @@ function renderToolDetails(row, id) {
   } else if (kind === 'edit') {
     card = patch ? renderConfirmedDiff(tool, patch) : el('div', 'tool-edit-card');
     if (!patch) card.append(el('pre', 'tool-output', output || '（无输出）'));
+    const openFile = toolFileButton(tool);
+    if (openFile) card.append(openFile);
   } else if (kind === 'search') {
     card = el('div', 'tool-search-card');
     const digest = searchDigest(output);
@@ -2072,6 +2100,8 @@ function renderToolDetails(row, id) {
     head.append(iconNode(tool.name === 'glob' || tool.name === 'find_files' ? 'search' : 'search', { size: 14 }));
     head.append(el('span', 'tool-search-title', toolLabel(tool)));
     head.append(el('span', 'tool-search-summary', digest ? `${digest.matches} 处匹配 · ${digest.files} 个文件` : output ? '搜索结果' : '无结果'));
+    const openFile = toolFileButton(tool);
+    if (openFile) head.append(openFile);
     head.append(toolCopyButton(output));
     card.append(head, el('pre', 'tool-search-output', output || '无结果'));
   } else if (kind === 'web') {
@@ -3745,6 +3775,7 @@ function commandCatalog() {
     ['commands', 'goal', '目标', false, 'compass', '未接入', 'Runtime 没有长期目标编辑接口'],
     ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
+    ['commands', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区'],
     ['commands', 'compact', '压缩', session, 'archive', null, null],
     ['commands', 'permission', '权限', session, 'shield', null, null],
     ['commands', 'model', '模型', session, 'layers', null, null],
@@ -3845,6 +3876,12 @@ async function executeCommand(id) {
   composerError('');
   controls();
   if (id === 'feedback') { openFeedbackDialog(); return; }
+  if (id === 'diff') {
+    if (!current?.session.repository) { composerError('当前会话没有工作区'); return; }
+    openRightbarTab('changes');
+    requestDiff();
+    return;
+  }
   if (id === 'permission') { openPermissionMenu($('permission-picker')); return; }
   if (id === 'model') { openModelMenu($('model-picker')); return; }
   if (id === 'compact') {
@@ -4140,7 +4177,30 @@ async function uploadAttachment(previous = null) {
 
 /* ---------------------------------------------------------------- message */
 
+function localFileReference(value) {
+  const text = String(value ?? '');
+  if (!text || /^[a-z][a-z0-9+.-]*:/i.test(text) || text.startsWith('#') || text.startsWith('/')) return null;
+  const match = /^([^#]+?)(?:#L(\d+)(?:-L?(\d+))?)?$/.exec(text);
+  if (!match) return null;
+  let path;
+  try { path = decodeURIComponent(match[1]); } catch { path = match[1]; }
+  path = path.replace(/^\.\//, '');
+  if (!path || !/\.[A-Za-z0-9]{1,8}$/.test(path)) return null;
+  return { path, line: Number(match[2]) || null, lineEnd: Number(match[3]) || Number(match[2]) || null };
+}
+
+function openLocalReference(reference) {
+  if (!reference) return false;
+  if (!current?.session?.repository) {
+    toast('当前会话没有工作区，无法打开文件', { tone: 'info', holdMs: 2600 });
+    return true;
+  }
+  openPreviewForPath(reference.path, reference.path.split(/[\\/]/).filter(Boolean).at(-1), { line: reference.line, lineEnd: reference.lineEnd });
+  return true;
+}
+
 async function openMessageLink(url) {
+  if (openLocalReference(localFileReference(url))) return;
   if (settings.linkOpen === 'system') {
     try { await api.openExternal(url); }
     catch (error) { toast(`无法打开链接：${error.message}`, { tone: 'error', holdMs: 4000 }); }
@@ -5283,18 +5343,20 @@ function parsePatch(patch) {
   return out;
 }
 
-function reviewLineNode(line) {
+function reviewLineNode(line, language = 'text') {
   const node = el('div', `review-line ${line.kind}`);
+  const text = el('span', 'text');
+  appendHighlighted(text, line.text, language);
   node.append(
     el('span', 'ln', line.old === null ? '' : String(line.old)),
     el('span', 'ln', line.next === null ? '' : String(line.next)),
     el('span', 'marker', line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ''),
-    el('span', 'text', line.text),
+    text,
   );
   return node;
 }
 
-function reviewSplit(lines) {
+function reviewSplit(lines, language = 'text') {
   const blocks = [];
   for (const line of lines) {
     if (line.kind === 'meta') continue;
@@ -5310,10 +5372,12 @@ function reviewSplit(lines) {
       return node;
     }
     const number = side === 'left' ? line.old : line.next;
+    const text = el('span', 'text');
+    appendHighlighted(text, line.text, language);
     node.append(
       el('span', 'ln', number === null ? '' : String(number)),
       el('span', 'marker', line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ''),
-      el('span', 'text', line.text),
+      text,
     );
     return node;
   };
@@ -5373,6 +5437,9 @@ function changesView(tab) {
   if (selected) counts.append(el('span', 'add', `+${selected.added}`), el('span', 'del', `−${selected.removed}`));
   head.append(counts);
   const tools = el('div', 'review-tools');
+  const copyPatch = iconButton('copy', '复制完整 diff', { size: 15, tooltip: '复制完整 diff' });
+  copyPatch.disabled = !selected?.patch;
+  copyPatch.addEventListener('click', () => { if (selected?.patch) void copyText(api, selected.patch); });
   const split = iconButton('columns', '切换左右对比', { size: 15, tooltip: '切换左右对比' });
   split.setAttribute('aria-pressed', String(mode === 'split'));
   split.addEventListener('click', () => { tab.mode = mode === 'split' ? 'unified' : 'split'; persistRightbar(); renderRightbar(); });
@@ -5386,7 +5453,7 @@ function changesView(tab) {
   refresh.disabled = current?.diffQuery?.status === 'pending';
   refresh.addEventListener('click', requestDiff);
   const openApp = el('div', 'open-in-app-pane');
-  tools.append(split, wrap, open, refresh, openApp);
+  tools.append(copyPatch, split, wrap, open, refresh, openApp);
   if (selected?.path) renderOpenInAppInto(openApp, selected.path, 'file');
   head.append(tools);
   view.append(head);
@@ -5404,9 +5471,10 @@ function changesView(tab) {
   else if (!selected.patch) body.append(el('div', 'review-status', '当前快照未包含补丁正文。完整内容请查看对话中的已确认改动。'));
   else {
     const lines = parsePatch(selected.patch);
+    const language = previewLanguage(selected.path);
     const oneSided = !lines.some(line => line.kind === 'removed') || !lines.some(line => line.kind === 'added');
     if (mode === 'split' && !oneSided) {
-      const splitView = reviewSplit(lines);
+      const splitView = reviewSplit(lines, language);
       body.append(splitView);
       requestAnimationFrame(() => {
         const halves = [...splitView.querySelectorAll('.review-half')];
@@ -5421,7 +5489,7 @@ function changesView(tab) {
       });
     } else {
       const diff = el('div', 'review-diff');
-      for (const line of lines.slice(0, 5000)) diff.append(reviewLineNode(line));
+      for (const line of lines.slice(0, 5000)) diff.append(reviewLineNode(line, language));
       body.append(diff);
       if (lines.length > 5000) body.append(el('div', 'review-status', `变更较大，仅显示前 5000 行（共 ${lines.length} 行）。`));
     }
@@ -5430,15 +5498,144 @@ function changesView(tab) {
   return view;
 }
 
+const PREVIEW_LANGUAGES = {
+  rs: 'rust', ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
+  json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml', py: 'python', go: 'go', sh: 'shell', bash: 'shell',
+  css: 'css', html: 'html', htm: 'html', sql: 'sql',
+};
+const PREVIEW_LANGUAGE_LABELS = {
+  rust: 'Rust', typescript: 'TypeScript', javascript: 'JavaScript', json: 'JSON', yaml: 'YAML', toml: 'TOML',
+  python: 'Python', go: 'Go', shell: 'Shell', css: 'CSS', html: 'HTML', sql: 'SQL', text: '纯文本',
+};
+
+function previewLanguage(path) {
+  const extension = String(path ?? '').split('.').pop()?.toLowerCase() ?? '';
+  return PREVIEW_LANGUAGES[extension] ?? 'text';
+}
+
 function previewRenderers(path) {
   const extension = String(path ?? '').split('.').pop()?.toLowerCase() ?? '';
-  if (['md', 'markdown'].includes(extension)) return [{ id: 'markdown', label: 'Markdown' }, { id: 'text', label: '纯文本' }];
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'svg'].includes(extension)) return [{ id: 'image', label: '图片' }];
+  const language = previewLanguage(path);
+  if (['md', 'markdown'].includes(extension)) return [{ id: 'markdown', label: 'Markdown' }, { id: 'code', label: '原始内容' }];
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(extension)) return [{ id: 'image', label: '图片' }];
+  if (['bmp', 'ico', 'svg'].includes(extension)) return [{ id: 'image', label: '图片' }];
   if (extension === 'pdf') return [{ id: 'pdf', label: 'PDF' }];
-  if (['xlsx', 'xls', 'csv', 'tsv'].includes(extension)) return [{ id: 'excel', label: '表格' }, { id: 'text', label: '纯文本' }];
+  if (['csv', 'tsv'].includes(extension)) return [{ id: 'csv', label: '表格' }, { id: 'code', label: '原始内容' }];
+  if (['xlsx', 'xls'].includes(extension)) return [{ id: 'excel', label: '表格' }];
   if (['doc', 'docx', 'ppt', 'pptx'].includes(extension)) return [{ id: 'office', label: 'Office' }];
-  if (['html', 'htm'].includes(extension)) return [{ id: 'html', label: 'HTML' }, { id: 'text', label: '纯文本' }];
-  return [{ id: 'code', label: '代码' }, { id: 'text', label: '纯文本' }];
+  if (['html', 'htm'].includes(extension)) return [{ id: 'code', label: 'HTML' }, { id: 'text', label: '纯文本' }];
+  return [{ id: 'code', label: PREVIEW_LANGUAGE_LABELS[language] ?? '代码' }, { id: 'text', label: '纯文本' }];
+}
+
+const CODE_KEYWORDS = {
+  rust: ['as', 'async', 'await', 'break', 'const', 'continue', 'crate', 'dyn', 'else', 'enum', 'extern', 'false', 'fn', 'for', 'if', 'impl', 'in', 'let', 'loop', 'match', 'mod', 'move', 'mut', 'pub', 'ref', 'return', 'self', 'Self', 'static', 'struct', 'super', 'trait', 'true', 'type', 'unsafe', 'use', 'where', 'while'],
+  typescript: ['abstract', 'as', 'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue', 'declare', 'default', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'false', 'finally', 'for', 'from', 'function', 'if', 'implements', 'import', 'in', 'instanceof', 'interface', 'let', 'new', 'null', 'private', 'protected', 'public', 'readonly', 'return', 'static', 'super', 'switch', 'this', 'throw', 'true', 'try', 'type', 'typeof', 'undefined', 'var', 'void', 'while', 'yield'],
+  python: ['and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'None', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield'],
+  go: ['break', 'case', 'chan', 'const', 'continue', 'default', 'defer', 'else', 'fallthrough', 'for', 'func', 'go', 'goto', 'if', 'import', 'interface', 'map', 'package', 'range', 'return', 'select', 'struct', 'switch', 'type', 'var'],
+  shell: ['case', 'do', 'done', 'elif', 'else', 'esac', 'fi', 'for', 'function', 'if', 'in', 'then', 'until', 'while'],
+  sql: ['and', 'as', 'by', 'create', 'delete', 'from', 'group', 'having', 'insert', 'into', 'join', 'limit', 'not', 'null', 'on', 'or', 'order', 'select', 'set', 'table', 'update', 'values', 'where'],
+  css: ['important', 'media', 'import', 'supports'],
+  html: [],
+  json: ['true', 'false', 'null'],
+  yaml: ['true', 'false', 'null', 'yes', 'no'],
+  toml: ['true', 'false'],
+};
+
+function appendHighlighted(parent, text, language = 'text') {
+  if (!text) return parent;
+  const keywords = new Set(CODE_KEYWORDS[language] ?? []);
+  const hashComments = ['yaml', 'toml', 'python', 'shell'].includes(language);
+  let index = 0;
+  while (index < text.length) {
+    const rest = text.slice(index);
+    const string = /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/.exec(rest);
+    if (string) {
+      parent.append(el('span', 'tok-string', string[0]));
+      index += string[0].length;
+      continue;
+    }
+    if ((language !== 'html' && rest.startsWith('//')) || (hashComments && rest.startsWith('#')) || (language === 'sql' && rest.startsWith('--'))) {
+      parent.append(el('span', 'tok-comment', rest));
+      break;
+    }
+    const number = /^(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)/.exec(rest);
+    if (number) {
+      parent.append(el('span', 'tok-number', number[0]));
+      index += number[0].length;
+      continue;
+    }
+    const word = /^[A-Za-z_$][\w$]*/.exec(rest);
+    if (word) {
+      const value = word[0];
+      const after = text.slice(index + value.length);
+      let cls = '';
+      if (keywords.has(value)) cls = 'tok-keyword';
+      else if (/^\s*\(/.test(after)) cls = 'tok-function';
+      parent.append(cls ? el('span', cls, value) : document.createTextNode(value));
+      index += value.length;
+      continue;
+    }
+    const punctuation = /^[{}()\[\];,.:=+\-*/<>!&|?]+/.exec(rest);
+    if (punctuation) {
+      parent.append(el('span', 'tok-punct', punctuation[0]));
+      index += punctuation[0].length;
+      continue;
+    }
+    const char = text[index];
+    parent.append(document.createTextNode(char));
+    index += 1;
+  }
+  return parent;
+}
+
+function parseDelimited(content, delimiter) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+  const text = String(content ?? '');
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') { field += '"'; index += 1; }
+      else if (char === '"') quoted = false;
+      else field += char;
+    } else if (char === '"') quoted = true;
+    else if (char === delimiter) { row.push(field); field = ''; }
+    else if (char === '\n') {
+      row.push(field); field = '';
+      if (row.length > 1 || row[0] !== '') rows.push(row);
+      row = [];
+    } else if (char !== '\r') field += char;
+    if (rows.length >= 500) break;
+  }
+  if (field !== '' || row.length) { row.push(field); if (row.length > 1 || row[0] !== '') rows.push(row); }
+  return rows.slice(0, 500).map(cells => cells.slice(0, 50));
+}
+
+function previewCsvBody(content, path) {
+  const delimiter = String(path ?? '').toLowerCase().endsWith('.tsv') ? '\t' : ',';
+  const rows = parseDelimited(content, delimiter);
+  const wrap = el('div', 'preview-csv');
+  if (!rows.length) {
+    wrap.append(el('div', 'review-status', '文件没有可显示的行'));
+    return wrap;
+  }
+  const table = el('table', 'preview-csv-table');
+  const head = el('thead');
+  const headRow = el('tr');
+  for (const cell of rows[0]) headRow.append(el('th', undefined, cell));
+  head.append(headRow);
+  const body = el('tbody');
+  for (const row of rows.slice(1)) {
+    const tr = el('tr');
+    for (let index = 0; index < rows[0].length; index += 1) tr.append(el('td', undefined, row[index] ?? ''));
+    body.append(tr);
+  }
+  table.append(head, body);
+  wrap.append(table);
+  if (rows.length >= 500) wrap.append(el('div', 'preview-truncated', '表格较大，仅显示前 500 行、50 列。'));
+  return wrap;
 }
 
 function previewCodeBody(content, path) {
@@ -5446,17 +5643,14 @@ function previewCodeBody(content, path) {
   const lines = String(content).split('\n');
   const banner = el('div', 'preview-code-banner');
   banner.append(el('span', undefined, String(path ?? '').split('.').pop()?.toLowerCase() || 'text'));
-  const copy = el('button', 'preview-code-copy');
-  copy.type = 'button';
-  copy.setAttribute('aria-label', '复制');
-  copy.append(iconNode('copy', { size: 16 }));
-  copy.addEventListener('click', () => copyText(api, content));
-  banner.append(copy);
   const pre = el('pre', 'preview-code-pre');
   const code = el('code');
   for (const [index, line] of lines.entries()) {
     const row = el('span', 'preview-code-line');
-    row.append(el('span', 'preview-line-number', String(index + 1)), el('span', 'preview-line-text', line));
+    row.dataset.line = String(index + 1);
+    const text = el('span', 'preview-line-text');
+    appendHighlighted(text, line, previewLanguage(path));
+    row.append(el('span', 'preview-line-number', String(index + 1)), text);
     code.append(row);
   }
   pre.append(code);
@@ -5465,21 +5659,34 @@ function previewCodeBody(content, path) {
 }
 
 function previewIsText(renderer) {
-  return ['markdown', 'code', 'text'].includes(renderer);
+  return ['markdown', 'code', 'text', 'csv'].includes(renderer);
+}
+
+function previewIsImage(renderer) {
+  return renderer === 'image';
 }
 
 async function loadPreview(tab, { force = false } = {}) {
   const sessionId = current?.session?.id;
-  if (!tab || tab.kind !== 'preview' || !sessionId || !previewIsText(tab.renderer)) return;
+  if (!tab || tab.kind !== 'preview' || !sessionId) return;
+  if (!previewIsText(tab.renderer) && !previewIsImage(tab.renderer)) return;
   if (tab.loading) return;
-  if (!force && tab.content !== undefined && tab.loadedPath === tab.path) return;
+  if (!force && tab.loadedPath === tab.path && (previewIsImage(tab.renderer) ? tab.image !== undefined : tab.content !== undefined)) return;
   tab.loading = true;
   tab.error = null;
   if (rightbarOpen) renderRightbar();
   try {
-    const result = await api.filesRead({ sessionId, path: tab.path });
-    tab.content = result.text;
-    tab.truncated = result.truncated === true;
+    if (previewIsImage(tab.renderer)) {
+      const result = await api.filesImage({ sessionId, path: tab.path });
+      tab.image = result.dataUrl;
+      tab.imageMime = result.mime;
+      tab.content = undefined;
+    } else {
+      const result = await api.filesRead({ sessionId, path: tab.path });
+      tab.content = result.text;
+      tab.truncated = result.truncated === true;
+      tab.image = undefined;
+    }
     tab.loadedPath = tab.path;
     tab.loading = false;
   } catch (error) {
@@ -5489,12 +5696,35 @@ async function loadPreview(tab, { force = false } = {}) {
   if (rightbarOpen) renderRightbar();
 }
 
-function openPreviewForPath(path, title = null) {
+function openPreviewForPath(path, title = null, target = {}) {
   if (!path) return null;
   const renderers = previewRenderers(path);
-  const tab = openRightbarTab('preview', { path, title: title ?? String(path).split(/[\\/]/).pop() ?? '预览', renderer: renderers[0].id, renderers, content: undefined, error: null, loadedPath: undefined });
+  const existing = Object.values(rightbarTabs).find(item => item.kind === 'preview' && item.path === path);
+  const preferredRenderer = target.line && renderers.some(item => item.id === 'code') ? 'code' : existing?.renderer ?? renderers[0].id;
+  const tab = openRightbarTab('preview', { path, title: title ?? String(path).split(/[\\/]/).pop() ?? '预览', renderer: preferredRenderer, renderers: existing?.renderers ?? renderers, content: existing?.content, image: existing?.image, error: existing?.error ?? null, loadedPath: existing?.loadedPath, truncated: existing?.truncated });
+  tab.targetLine = Number(target.line) || null;
+  tab.targetLineEnd = Number(target.lineEnd) || tab.targetLine;
+  tab.targetKind = target.kind ?? null;
+  // An explicit open is also the user's refresh action: re-read even when the
+  // tab already holds content, so a changed file cannot show a stale cache.
+  if (existing) tab.loadedPath = undefined;
   void loadPreview(tab);
   return tab;
+}
+
+function previewDiffFile(path) {
+  const normalized = String(path ?? '').replace(/^\.\//, '');
+  return (current?.diff?.files ?? []).find(file => file.path === normalized) ?? null;
+}
+
+function previewUnavailable(label, path) {
+  const empty = el('div', 'right-empty');
+  const mark = el('span', 'empty-icon'); mark.append(iconNode('file', { size: 48, stroke: 1.1 }));
+  empty.append(mark, el('h3', undefined, `${label} 预览尚未接入`), el('p', undefined, '当前只读文件桥接未提供该格式的渲染能力，请用系统应用打开。'));
+  const openHost = el('div', 'open-in-app-unpreviewable');
+  empty.append(openHost);
+  renderOpenInAppInto(openHost, path, 'file');
+  return empty;
 }
 
 function previewView(tab) {
@@ -5519,25 +5749,35 @@ function previewView(tab) {
   }));
   const wrap = iconButton('wrap', '自动换行', { size: 15, tooltip: tab.wrap ? '关闭自动换行' : '自动换行' });
   wrap.setAttribute('aria-pressed', String(!!tab.wrap));
+  wrap.hidden = !previewIsText(selected.id) || selected.id === 'csv';
   wrap.addEventListener('click', () => { tab.wrap = !tab.wrap; persistRightbar(); renderRightbar(); });
+  const copy = iconButton('copy', '复制文件内容', { size: 15, tooltip: '复制文件内容' });
+  copy.disabled = !previewIsText(selected.id) || tab.content === undefined;
+  copy.addEventListener('click', async () => {
+    if (tab.content === undefined) return;
+    const ok = await copyText(api, tab.content, { quiet: true, showFailure: true });
+    toast(ok ? '已复制文件内容' : '复制失败', { tone: ok ? 'success' : 'error', holdMs: 1600 });
+  });
+  const diffFile = previewDiffFile(path);
+  const review = iconButton('diff', '查看本轮改动', { size: 15, tooltip: '查看本轮改动' });
+  review.hidden = !diffFile;
+  review.addEventListener('click', () => {
+    const changes = openRightbarTab('changes');
+    if (!changes) return;
+    changes.selected = diffFile.path;
+    persistRightbar();
+    renderRightbar();
+  });
   const reload = iconButton('refresh', '重新读取文件', { size: 15, tooltip: '重新读取文件' });
-  reload.disabled = !previewIsText(selected.id);
+  reload.disabled = !previewIsText(selected.id) && !previewIsImage(selected.id);
   reload.addEventListener('click', () => void loadPreview(tab, { force: true }));
   const open = el('div', 'open-in-app-pane');
-  toolbar.append(pathNode, renderer, wrap, reload, open);
+  toolbar.append(pathNode, renderer, wrap, copy, review, reload, open);
   renderOpenInAppInto(open, path, 'file');
   const body = el('div', `preview-body${tab.wrap ? ' wrap' : ''}`);
-  if (!previewIsText(selected.id)) {
-    const empty = el('div', 'right-empty');
-    const mark = el('span', 'empty-icon'); mark.append(iconNode('file', { size: 48, stroke: 1.1 }));
-    empty.append(mark, el('h3', undefined, `${selected.label} 预览尚未接入`), el('p', undefined, '当前只读文件桥接仅提供 UTF-8 文本；图片、PDF、Office 等格式请用系统应用打开。'));
-    const openHost = el('div', 'open-in-app-unpreviewable');
-    empty.append(openHost);
-    renderOpenInAppInto(openHost, path, 'file');
-    body.append(empty);
-  } else if (tab.loading || tab.content === undefined) {
+
+  const loadingState = () => {
     if (!tab.loading && !tab.error) void loadPreview(tab);
-    body.append(el('div', 'review-status', tab.error ? '' : '正在读取文件…'));
     if (tab.error) {
       const status = el('div', 'review-status error');
       status.append(el('span', undefined, tab.error));
@@ -5545,17 +5785,62 @@ function previewView(tab) {
       retry.type = 'button';
       retry.addEventListener('click', () => void loadPreview(tab, { force: true }));
       status.append(retry);
-      body.replaceChildren(status);
+      return status;
     }
-  } else {
-    if (selected.id === 'markdown') {
-      const markdown = el('div', 'markdown');
-      renderMarkdown(markdown, tab.content, { onLink: openMessageLink });
-      addCodeActions(markdown);
-      body.append(markdown);
-    } else if (selected.id === 'code') body.append(previewCodeBody(tab.content, path));
-    else body.append(el('pre', undefined, tab.content));
-    if (tab.truncated) body.append(el('div', 'preview-truncated', '文件超过 1 MiB，仅显示开头 1 MiB。'));
+    return el('div', 'review-status', previewIsImage(selected.id) ? '正在读取图片…' : '正在读取文件…');
+  };
+
+  if (previewIsImage(selected.id)) {
+    if (tab.loading || tab.image === undefined) body.append(loadingState());
+    else {
+      const image = el('img', 'preview-image');
+      image.src = tab.image;
+      image.alt = path.split(/[\\/]/).filter(Boolean).at(-1) ?? '图片预览';
+      image.addEventListener('error', () => {
+        body.replaceChildren(el('div', 'review-status error', '图片无法解码或已损坏'));
+      });
+      const frame = el('div', 'preview-image-frame');
+      frame.append(image, el('div', 'preview-image-meta', `${tab.imageMime ?? ''} · ${selected.label}`));
+      body.append(frame);
+    }
+  } else if (!previewIsText(selected.id)) {
+    body.append(previewUnavailable(selected.label, path));
+  } else if (tab.loading || tab.content === undefined || (tab.error && !tab.content)) {
+    body.append(loadingState());
+  } else if (selected.id === 'markdown') {
+    const markdown = el('div', 'markdown');
+    renderMarkdown(markdown, tab.content, {
+      onLink: openMessageLink,
+      onImage: (placeholder, src) => {
+        const reference = localFileReference(src);
+        if (!reference || !current?.session?.id) return;
+        api.filesImage({ sessionId: current.session.id, path: reference.path }).then(result => {
+          const image = el('img', 'preview-md-image');
+          image.src = result.dataUrl;
+          image.alt = placeholder.dataset.alt ?? reference.path;
+          placeholder.replaceWith(image);
+        }).catch(() => {
+          placeholder.textContent = `[图片无法加载：${placeholder.dataset.alt ?? reference.path}]`;
+        });
+      },
+    });
+    addCodeActions(markdown);
+    body.append(markdown);
+  } else if (selected.id === 'csv') body.append(previewCsvBody(tab.content, path));
+  else if (selected.id === 'code') body.append(previewCodeBody(tab.content, path));
+  else body.append(el('pre', undefined, tab.content));
+  if (tab.truncated) body.append(el('div', 'preview-truncated', '文件超过 1 MiB，仅显示开头 1 MiB。'));
+
+  if (tab.targetLine) {
+    requestAnimationFrame(() => {
+      const target = body.querySelector(`.preview-code-line[data-line="${tab.targetLine}"]`);
+      if (!target) return;
+      const end = Math.max(tab.targetLine, Math.min(tab.targetLineEnd ?? tab.targetLine, tab.targetLine + 200));
+      for (let line = tab.targetLine; line <= end; line += 1) {
+        body.querySelector(`.preview-code-line[data-line="${line}"]`)?.classList.add('target-line');
+      }
+      target.scrollIntoView({ block: 'center' });
+    });
   }
   view.append(toolbar, body);
   return view;

@@ -345,12 +345,23 @@ export function confirmDialog({ title, body, confirm = '确认', cancel = '取�
     const cancelButton = el('button', 'button secondary', cancel);
     const confirmButton = el('button', `button ${danger ? 'danger' : 'primary'}`, confirm);
     cancelButton.type = 'button'; confirmButton.type = 'button';
-    cancelButton.addEventListener('click', () => { dialog.close(); resolve(false); });
-    confirmButton.addEventListener('click', () => { dialog.close(); resolve(true); });
+    const focusableTarget = () => {
+      const visible = node => {
+        if (!node || node === document.body || !node.isConnected) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && !node.closest('[inert]');
+      };
+      return [document.querySelector('#message'), document.querySelector('#new-session')].find(visible) ?? null;
+    };
+    // Restore synchronously on the closing path: a caller may read focus on the
+    // very next task, before the dialog's asynchronous close event is delivered.
+    const restoreFocus = () => focusableTarget()?.focus();
+    cancelButton.addEventListener('click', () => { dialog.close(); restoreFocus(); resolve(false); });
+    confirmButton.addEventListener('click', () => { dialog.close(); restoreFocus(); resolve(true); });
     actions.append(cancelButton, confirmButton);
     form.append(head, text, actions);
     dialog.append(form);
-    dialog.addEventListener('cancel', event => { event.preventDefault(); dialog.close(); resolve(false); });
+    dialog.addEventListener('cancel', event => { event.preventDefault(); dialog.close(); restoreFocus(); resolve(false); });
     document.body.append(dialog);
     dialog.showModal();
     window.dispatchEvent(new Event('ui-overlay-change'));
@@ -372,7 +383,12 @@ export function confirmDialog({ title, body, confirm = '确认', cancel = '取�
       };
       queueMicrotask(restore);
       setTimeout(restore, 0);
-      setTimeout(restore, 60);
+      let attempts = 0;
+      const settle = setInterval(() => {
+        restore();
+        attempts += 1;
+        if (attempts >= 6) clearInterval(settle);
+      }, 80);
       window.dispatchEvent(new Event('ui-overlay-change'));
     }, { once: true });
   });
