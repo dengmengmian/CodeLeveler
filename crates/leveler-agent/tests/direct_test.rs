@@ -3999,3 +3999,128 @@ async fn progressive_demand_exposes_memory_skills_and_delegation() {
         vec!["memory", "multi_agent", "skills"]
     );
 }
+
+/// The completion gate is wired, not just a pure predicate: a `complete`
+/// that cites a command the runtime never ran is refused, and the model can
+/// then declare the honest alternative.
+#[tokio::test]
+async fn a_completion_that_cites_an_unrun_command_is_refused_then_not_applicable_is_accepted() {
+    let h = harness(vec![
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "done",
+                "verification": {
+                    "status": "passed",
+                    "detail": "go test ./..."
+                }
+            }),
+        ),
+        tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "done",
+                "verification": {
+                    "status": "not_applicable",
+                    "detail": "read-only investigation for this fixture"
+                }
+            }),
+        ),
+    ])
+    .await;
+    let s = spec(&h);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push((kind, detail));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert!(
+        intercepted
+            .iter()
+            .any(|(kind, detail)| kind == "verification_refused" && detail.contains("never ran")),
+        "the unrun citation must be refused with the fact: {intercepted:?}"
+    );
+    assert_eq!(report.completion_warnings.len(), 1);
+    assert!(
+        report.completion_warnings[0].contains("without executable verification"),
+        "{:?}",
+        report.completion_warnings
+    );
+}
+
+/// A failed verification is hard evidence: neither a bare `complete` nor a
+/// `not_applicable` declaration can close the goal over it.
+#[tokio::test]
+async fn a_failed_verification_cannot_be_closed_as_complete() {
+    let (program, args, script_name, script) = if cfg!(windows) {
+        (
+            "cmd",
+            vec!["/c", "verify.cmd"],
+            "verify.cmd",
+            "exit /b 1\r\n",
+        )
+    } else {
+        ("sh", vec!["./verify.sh"], "verify.sh", "exit 1\n")
+    };
+    let h = harness_with(
+        vec![
+            tool_call(
+                "v1",
+                "run_command",
+                serde_json::json!({
+                    "program": program,
+                    "args": args,
+                    "reason": "run the acceptance check"
+                }),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "done",
+                    "verification": {"status": "not_applicable", "detail": "treat it as done"}
+                }),
+            ),
+            tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({"status": "blocked", "summary": "acceptance check fails"}),
+            ),
+        ],
+        PermissionProfile::Assisted,
+        move |dir| std::fs::write(dir.join(script_name), script).unwrap(),
+    )
+    .await;
+    let s = spec(&h);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Blocked,
+        "a failing verification cannot resolve as complete: {report:?}"
+    );
+    assert_eq!(report.stop_reason, StopReason::Blocked);
+}

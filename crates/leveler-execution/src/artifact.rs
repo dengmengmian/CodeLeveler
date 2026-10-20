@@ -31,9 +31,14 @@ impl ArtifactStore {
     /// content deduplicates to the same path and is not rewritten.
     ///
     /// Secrets are redacted before hashing/writing so artifacts never store
-    /// raw API keys or Authorization headers.
+    /// raw API keys or Authorization headers. The redaction is the
+    /// value-position aware one (`sanitize_model_visible`), not the old
+    /// whole-line keyword scrubber: an artifact is command output the model
+    /// reads back, so rewriting `let password = config.password;` into
+    /// `let password = [REDACTED];` is irreversible corruption of the only
+    /// copy of that output.
     pub fn write_text(&self, content: &str) -> std::io::Result<ArtifactRef> {
-        let content = leveler_core::redact_secrets(content);
+        let content = leveler_core::sanitize_model_visible(content).0;
         let sha256 = hex(&Sha256::digest(content.as_bytes()));
         std::fs::create_dir_all(&self.root)?;
         let path = self.root.join(format!("{sha256}.txt"));
@@ -99,6 +104,22 @@ mod tests {
         let stored = std::fs::read_to_string(&art.path).unwrap();
         assert!(!stored.contains("sk-abcdefghijklmnop1234"), "{stored}");
         assert!(stored.contains("[REDACTED]"), "{stored}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An artifact is command output the model may read back. Ordinary source
+    /// code that mentions a credential word must survive byte-identical; only
+    /// the credential VALUE is redacted. The old whole-line keyword scrubber
+    /// rewrote `let password = config.password;` — irreversible corruption of
+    /// the artifact's only copy.
+    #[test]
+    fn source_code_in_an_artifact_is_not_rewritten() {
+        let root = tmp();
+        let store = ArtifactStore::new(&root);
+        let source = "pub struct Creds {\n    pub password: String,\n}\n\nfn load(config: &Config) -> String {\n    let password = config.password;\n    password\n}\n";
+        let art = store.write_text(source).unwrap();
+        let stored = std::fs::read_to_string(&art.path).unwrap();
+        assert_eq!(stored, source, "artifact code was rewritten");
         std::fs::remove_dir_all(&root).ok();
     }
 

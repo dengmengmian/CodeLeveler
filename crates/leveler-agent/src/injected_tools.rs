@@ -142,7 +142,12 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             same rule: when only PART of the stated objective is satisfiable, \
             delivering that part while quietly exempting the rest — with or \
             without a rationalization — is still a false completion. Blocked, \
-            naming which part cannot be satisfied and why.",
+            naming which part cannot be satisfied and why. \
+            `complete` needs `verification`: `passed` with the commands you \
+            actually ran, one per line in `detail` (checked against the \
+            runtime's execution record, after your last change), or \
+            `not_applicable` with the reason in `detail`. A failed test or \
+            build cannot be closed as complete.",
     );
     ToolDefinition {
         name: UPDATE_GOAL_TOOL.to_string(),
@@ -162,6 +167,21 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 "next_step": {
                     "type": "string",
                     "description": "Optional concrete follow-up for the user. Omit this field when no genuine next step remains; never copy or paraphrase the conversation merely to fill it."
+                },
+                "verification": {
+                    "type": "object",
+                    "description": "For complete: what the runtime can check.",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["passed", "not_applicable"]
+                        },
+                        "detail": {
+                            "type": "string",
+                            "description": "For passed: commands you ran, one per line (e.g. \"go test ./...\"). For not_applicable: why no executable check exists."
+                        }
+                    },
+                    "required": ["status", "detail"]
                 }
             },
             "required": ["status", "summary"]
@@ -938,12 +958,13 @@ mod scope_fidelity_tests {
         }
     }
 
-    /// Verification productionized after the three-arm experiment: the
-    /// description demands a truthful claim about the current workspace state
-    /// and nothing more. A mandatory proof tool (or a last-edit proof rule)
-    /// here would be a completion gate the harness deliberately does not have.
+    /// The completion gate is mechanical and command-shaped, not a named
+    /// proof tool: the model chooses what verifies its objective, and the
+    /// runtime only checks that the cited command ran and passed after the
+    /// last change. No specific tool name is mandated, and no wording may
+    /// pretend the harness itself knows the work is good.
     #[test]
-    fn update_goal_does_not_mandate_a_proof_tool() {
+    fn update_goal_does_not_mandate_a_named_proof_tool() {
         let def = super::update_goal_tool_definition();
         for banned in [
             "PROVEN",
@@ -953,7 +974,7 @@ mod scope_fidelity_tests {
         ] {
             assert!(
                 !def.description.contains(banned),
-                "verification must stay evidence, not a completion gate: `{banned}`"
+                "verification must stay evidence, not a named proof tool: `{banned}`"
             );
         }
         for needle in [
@@ -961,6 +982,8 @@ mod scope_fidelity_tests {
             "false completion",
             "`blocked`",
             "against the current workspace state",
+            "verification",
+            "execution record",
         ] {
             assert!(
                 def.description.contains(needle),

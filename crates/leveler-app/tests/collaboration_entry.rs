@@ -630,3 +630,151 @@ async fn headless_chat_allows_the_workspace_write_plan_refuses() {
         "a chat turn has no read-only overlay: an ordinary workspace write is not held for approval"
     );
 }
+
+/// A tool call that keeps the turn busy long enough for a steer to arrive.
+/// Platform-native on purpose: the test must not depend on a Unix `sleep`
+/// binary that Windows CI does not have.
+fn slow_tool_call() -> MockResponse {
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/c", "ping -n 2 127.0.0.1 > nul"])
+    } else {
+        ("sh", vec!["-c", "sleep 1"])
+    };
+    let arguments = serde_json::json!({
+        "program": program,
+        "args": args,
+        "reason": "hold the turn open so the steer has a running turn to land in"
+    });
+    sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "c-slow",
+            "type": "function",
+            "function": {"name": "run_command", "arguments": arguments.to_string()}
+        }]}}]})
+        .to_string(),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+    ])
+}
+
+/// The real incident's entry path: a client sends the literal `/goal <task>`
+/// as an ordinary message. The runtime must parse it, write the durable goal
+/// axis, and run a Goal turn — the command cannot be a per-client feature.
+#[tokio::test]
+async fn submit_message_goal_command_enters_goal_mode_from_any_client() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, server, app, client) = harness(vec![goal_complete_tool_call(), text("done")]).await;
+    let session = client
+        .create_session(request("chat first", CollaborationMode::Chat))
+        .await
+        .unwrap()
+        .session
+        .id;
+    assert_eq!(collaboration_of(&app, &session).await, "chat");
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "/goal now drive it".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "goal",
+        "`/goal <task>` sent as plain text must still write the durable axis"
+    );
+    let bodies = server.request_bodies().await;
+    assert!(
+        bodies.iter().any(|body| body.contains("\"update_goal\"")),
+        "the turn must run the Goal executor: {bodies:?}"
+    );
+    assert!(
+        bodies[0].contains("now drive it"),
+        "the objective must reach the model: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("/goal now drive it"),
+        "the command word must not be sent to the model: {}",
+        bodies[0]
+    );
+}
+
+/// The exact accident: `/goal` typed while a turn is already running. The
+/// terminal forwards it as a steer; the runtime must upgrade THAT turn to Goal
+/// instead of injecting the literal command and letting the run stop at its
+/// next stage summary.
+#[tokio::test]
+async fn steering_goal_command_upgrades_the_running_chat_turn() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, server, app, client) = harness(vec![
+        slow_tool_call(),
+        goal_complete_tool_call(),
+        text("done"),
+    ])
+    .await;
+    let session = client
+        .create_session(request("chat first", CollaborationMode::Chat))
+        .await
+        .unwrap()
+        .session
+        .id;
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "start chat work".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    // The first model request has been answered; the turn is inside the slow
+    // tool call, so a steer queued now is drained at the next round.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.request_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first model request never reached the provider"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: session.clone(),
+            content: "/goal drive the goal now".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    assert_eq!(collaboration_of(&app, &session).await, "goal");
+    let bodies = server.request_bodies().await;
+    assert!(
+        bodies
+            .iter()
+            .skip(1)
+            .any(|body| body.contains("\"update_goal\"")),
+        "the RUNNING turn must gain the goal surface: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .skip(1)
+            .any(|body| body.contains("drive the goal now")),
+        "the declaration must be injected as the user's text: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .all(|body| !body.contains("/goal drive the goal now")),
+        "the command word must never reach the model: {bodies:?}"
+    );
+}

@@ -199,6 +199,14 @@ test('leading slash names with unsupported arguments stay local while filesystem
  assert.equal(slashIntent('// comment',commands).kind,'message');
 });
 
+test('/goal with an objective is runtime-owned: it is sent as text, never answered by a client-side command',async()=>{
+ const {slashIntent}=await import('../src/presentation.mjs');
+ const commands=[{id:'goal',label:'目标',enabled:true}];
+ assert.equal(slashIntent('/goal 完成运营端全覆盖',commands).kind,'message');
+ assert.equal(slashIntent('/goal',commands).kind,'blocked');
+ assert.equal(slashIntent('/goal status',commands).kind,'message');
+});
+
 test('the public Settings shortcut opens once and respects composition and an existing modal without replacing its focus',async()=>{
  const {activateSettingsShortcut}=await import('../src/presentation.mjs');let opens=0;const open=()=>opens++;
  assert.equal(activateSettingsShortcut({composing:false,modalOpen:false,settingsOpen:false},open),true);

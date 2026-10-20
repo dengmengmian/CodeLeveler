@@ -631,6 +631,11 @@ pub struct InProcessRuntimeClient {
     /// Text the user sent while a turn was already running, per session.
     /// Drained by the agent loop at the top of each round.
     steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    /// A `/goal` declaration that arrived while a turn was already running.
+    /// The durable axis is written first; this is the in-flight handoff that
+    /// lets the RUNNING executor pick the declaration up at its next round
+    /// instead of finishing as Chat and making the user type `继续`.
+    goal_steering: Arc<Mutex<HashMap<SessionId, Arc<Mutex<GoalSteer>>>>>,
     /// The cancellation handle of every child running in a session's turn,
     /// by child id, so a user can stop one child without stopping the turn.
     child_cancels: ChildCancels,
@@ -792,11 +797,25 @@ impl Drop for InFlightDelivery {
     }
 }
 
+/// In-flight `/goal` state for one session.
+///
+/// `requested` survives for the rest of the running turn: once a goal is
+/// declared, the executor must keep the goal contract for every later round
+/// of that turn. `pending` holds declarations not yet injected; the executor
+/// drains it at the top of a round, which also persists the text as a normal
+/// user-input row.
+#[derive(Default)]
+struct GoalSteer {
+    requested: bool,
+    pending: Vec<String>,
+}
+
 /// Drains one session's steering queue for the agent loop, and holds the
 /// session's running children's cancellation handles.
 struct SessionSteering {
     session_id: SessionId,
     queues: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    goal: Arc<Mutex<GoalSteer>>,
     children: ChildCancels,
     tool_calls: ChildCancels,
 }
@@ -809,6 +828,25 @@ impl leveler_agent::SteeringSource for SessionSteering {
             .get_mut(&self.session_id)
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    fn goal_requested(&self) -> bool {
+        self.goal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requested
+    }
+
+    fn take_goal_declaration(&self) -> Option<String> {
+        let mut goal = self
+            .goal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if goal.pending.is_empty() {
+            None
+        } else {
+            Some(goal.pending.remove(0))
+        }
     }
 
     fn child_started(&self, id: &str, cancel: CancellationToken) {
@@ -1170,6 +1208,7 @@ impl InProcessRuntimeClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
             steering: Arc::new(Mutex::new(HashMap::new())),
+            goal_steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
             tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
             auxiliary_assists: Arc::new(AuxiliaryAssists::default()),
@@ -1690,6 +1729,20 @@ impl InProcessRuntimeClient {
         {
             SessionEditResult::Conflict(_) => return Ok(false),
             SessionEditResult::Applied(_) => {}
+        }
+        // Leaving Goal mode through the general axis command must also drop
+        // the in-flight declaration. Otherwise a Goal declared while a turn
+        // ran would keep `goal_requested()` true and upgrade a LATER Chat turn
+        // — a second, invisible writer for the axis.
+        if let ClientCommand::SetProductAxes { collaboration, .. } = command
+            && collaboration == "chat"
+        {
+            let goal = self.goal_state_for(session_id);
+            let mut goal = goal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            goal.requested = false;
+            goal.pending.clear();
         }
         if matches!(
             command,
@@ -2420,9 +2473,21 @@ impl InProcessRuntimeClient {
         Arc::new(SessionSteering {
             session_id: session_id.clone(),
             queues: self.steering.clone(),
+            goal: self.goal_state_for(session_id),
             children: self.child_cancels.clone(),
             tool_calls: self.tool_call_cancels.clone(),
         })
+    }
+
+    /// The one in-flight `/goal` slot for a session, shared between the
+    /// command handler that writes it and the running executor that drains it.
+    fn goal_state_for(&self, session_id: &SessionId) -> Arc<Mutex<GoalSteer>> {
+        self.goal_steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .clone()
     }
 
     fn clarifier(
@@ -2923,6 +2988,122 @@ impl InProcessRuntimeClient {
         accepted_rx
     }
 
+    /// Start (or re-open) Goal mode from `/goal <task>`.
+    ///
+    /// The durable axis is written before the turn starts, so ordinary
+    /// submissions after it — and after a resume — stay in the goal profile
+    /// until an explicit `/goal clear` flips the axis back. This is the
+    /// runtime's single mapping; no client carries its own goal flag.
+    async fn run_goal_turn(
+        &self,
+        session_id: SessionId,
+        content: String,
+    ) -> Result<(), ClientError> {
+        // A client that sends the explicit command while a turn already runs
+        // must get the same upgrade as a text steer. Refusing with "session is
+        // busy" would make Goal entry depend on which command shape a client
+        // happened to send.
+        if self.active.is_running(&session_id) {
+            return self.steer_into_goal(session_id, content).await;
+        }
+        let config = self.runtime_config(&session_id).await?;
+        if config.collaboration != leveler_lifecycle::CollaborationMode::Goal.as_str() {
+            self.persist_turn_collaboration(
+                &session_id,
+                leveler_lifecycle::CollaborationMode::Goal.as_str(),
+            )
+            .await?;
+            if let Ok(session) = self.snapshot(&session_id).await {
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::SessionUpdated { session });
+            }
+        }
+        let config = self.runtime_config(&session_id).await?;
+        let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
+        let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
+        await_turn_acceptance(accepted).await
+    }
+
+    /// Hand a `/goal <task>` declaration to the turn that is already running.
+    ///
+    /// Writing the axis alone would leave the running Chat executor to finish
+    /// on its next stage summary, and the user would have to say `继续` — the
+    /// exact behavior this path exists to remove. The declaration is queued
+    /// for the executor, which turns Goal mode on at its next round, injects
+    /// the user's text as an ordinary user row, and continues until
+    /// `update_goal(complete|blocked)`.
+    async fn steer_into_goal(
+        &self,
+        session_id: SessionId,
+        task: String,
+    ) -> Result<(), ClientError> {
+        self.persist_turn_collaboration(
+            &session_id,
+            leveler_lifecycle::CollaborationMode::Goal.as_str(),
+        )
+        .await?;
+        {
+            let goal = self.goal_state_for(&session_id);
+            let mut goal = goal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            goal.requested = true;
+            goal.pending.push(task);
+        }
+        let events = self.events_for(&session_id);
+        if let Ok(session) = self.snapshot(&session_id).await {
+            let _ = events.send(RuntimeEvent::SessionUpdated { session });
+        }
+        let _ = events.send(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "已切换到 Goal 模式 · 当前这一轮会继续到目标达成或阻塞".to_string(),
+        });
+        Ok(())
+    }
+
+    /// `/goal clear`: the explicit way back to Chat.
+    async fn clear_goal_axis(&self, session_id: SessionId) -> Result<(), ClientError> {
+        self.persist_turn_collaboration(
+            &session_id,
+            leveler_lifecycle::CollaborationMode::Chat.as_str(),
+        )
+        .await?;
+        {
+            let goal = self.goal_state_for(&session_id);
+            let mut goal = goal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            goal.requested = false;
+            goal.pending.clear();
+        }
+        let events = self.events_for(&session_id);
+        if let Ok(session) = self.snapshot(&session_id).await {
+            let _ = events.send(RuntimeEvent::SessionUpdated { session });
+        }
+        let _ = events.send(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "已退出 Goal 模式 · 后续消息按 Chat 处理".to_string(),
+        });
+        Ok(())
+    }
+
+    async fn goal_status(&self, session_id: SessionId) -> Result<(), ClientError> {
+        let config = self.runtime_config(&session_id).await?;
+        let label = if config.collaboration == leveler_lifecycle::CollaborationMode::Goal.as_str() {
+            "Goal"
+        } else {
+            "Chat"
+        };
+        let _ = self
+            .events_for(&session_id)
+            .send(RuntimeEvent::Notification {
+                level: leveler_client_protocol::NotificationLevel::Info,
+                message: format!("当前协作模式：{label}"),
+            });
+        Ok(())
+    }
+
     /// Route an ordinary user message: memory commands, the vision gate, then
     /// a chat/content or goal turn chosen by the session's collaboration axis.
     async fn handle_submit_message(
@@ -2938,6 +3119,26 @@ impl InProcessRuntimeClient {
         // model.
         if attachments.is_empty() && self.handle_direct_memory_message(&session_id, &content) {
             return Ok(());
+        }
+        // `/goal` is product semantics, not a client feature. A client that
+        // does not parse slash commands (Desktop, an older build, a steering
+        // message) still reaches the same durable axis and the same executor
+        // profile through this one parse.
+        if attachments.is_empty()
+            && let Some(command) = leveler_client_protocol::parse_goal_command(&content)
+        {
+            use leveler_client_protocol::GoalCommand;
+            return match command {
+                GoalCommand::Run(task) if self.active.is_running(&session_id) => {
+                    self.steer_into_goal(session_id, task).await
+                }
+                GoalCommand::Run(task) => self.run_goal_turn(session_id, task).await,
+                GoalCommand::Clear => self.clear_goal_axis(session_id).await,
+                GoalCommand::Status => self.goal_status(session_id).await,
+                GoalCommand::Usage => Err(ClientError::Runtime(
+                    "用法: /goal <任务>（/goal clear 返回 Chat，/goal status 查看模式）".into(),
+                )),
+            };
         }
         let config = self.runtime_config(&session_id).await?;
         // The TUI asks the user about this first, but the reducer is one
@@ -4563,32 +4764,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::RunGoal {
                 session_id,
                 content,
-            } => {
-                let mut config = self.runtime_config(&session_id).await?;
-                // `/goal <task>` is a durable product-axis decision, not a
-                // one-turn override. Write the session row to `goal` before
-                // the turn starts so ordinary submissions after it — and after
-                // a resume — stay in the goal profile until an explicit
-                // `/goal clear` or `/collab chat` flips the axis back. This is
-                // the runtime's single mapping for every client; no client
-                // carries its own goal flag.
-                if config.collaboration != leveler_lifecycle::CollaborationMode::Goal.as_str() {
-                    config.collaboration = leveler_lifecycle::CollaborationMode::Goal
-                        .as_str()
-                        .to_string();
-                    self.persist_turn_collaboration(&session_id, &config.collaboration)
-                        .await?;
-                    if let Ok(session) = self.snapshot(&session_id).await {
-                        let _ = self
-                            .events_for(&session_id)
-                            .send(RuntimeEvent::SessionUpdated { session });
-                    }
-                }
-                let config = self.runtime_config(&session_id).await?;
-                let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
-                let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
-                await_turn_acceptance(accepted).await
-            }
+            } => self.run_goal_turn(session_id, content).await,
             ClientCommand::RunDevelop {
                 session_id,
                 content,
@@ -4731,6 +4907,22 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
             } => {
                 if self.active.is_running(&session_id) {
+                    // A steer is also an input surface for `/goal`. The
+                    // terminal already forwards it here when the user types
+                    // `/goal` during a turn; every other client reaches the
+                    // same branch by sending the text as a steer.
+                    if let Some(command) = leveler_client_protocol::parse_goal_command(&content) {
+                        use leveler_client_protocol::GoalCommand;
+                        return match command {
+                            GoalCommand::Run(task) => self.steer_into_goal(session_id, task).await,
+                            GoalCommand::Clear => self.clear_goal_axis(session_id).await,
+                            GoalCommand::Status => self.goal_status(session_id).await,
+                            GoalCommand::Usage => Err(ClientError::Runtime(
+                                "用法: /goal <任务>（/goal clear 返回 Chat，/goal status 查看模式）"
+                                    .into(),
+                            )),
+                        };
+                    }
                     self.steering
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7238,6 +7430,7 @@ mod child_cancel_tests {
         let steering = SessionSteering {
             session_id: session.clone(),
             queues: Arc::new(Mutex::new(HashMap::new())),
+            goal: Arc::new(Mutex::new(GoalSteer::default())),
             children: children.clone(),
             tool_calls: Arc::new(Mutex::new(HashMap::new())),
         };

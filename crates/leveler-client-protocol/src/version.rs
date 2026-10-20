@@ -129,7 +129,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":14},"body":{"type":"quit"},"capabilities":["optional_workspace"]}"#
+            r#"{"protocol":{"major":1,"minor":15},"body":{"type":"quit"},"capabilities":["optional_workspace"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();
