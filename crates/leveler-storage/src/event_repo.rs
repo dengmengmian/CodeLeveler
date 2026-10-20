@@ -788,6 +788,50 @@ mod tests {
         leveler_core::clear_session_secrets(session.as_str());
     }
 
+    /// R011 accident regression: the registered value is also a project name.
+    /// A durable row must keep the source path byte-identical while still
+    /// scrubbing the credential's standalone occurrence. Resume reloads this
+    /// row into the model, so a rewritten path here becomes a path the agent
+    /// writes into source.
+    #[tokio::test]
+    async fn registered_secret_does_not_rewrite_source_paths() {
+        let (db, session) = db_with_session().await;
+        let secret = "devorder";
+        leveler_core::clear_session_secrets(session.as_str());
+        leveler_core::register_session_secrets(
+            session.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: secret.to_string(),
+                key: "password".to_string(),
+            }],
+        );
+
+        let import = "coreerr \"github.com/dengmengmian/devorder/internal/core/errors\"";
+        let payload = serde_json::json!({
+            "type": "tool_result",
+            "payload": {
+                "text": format!("{import}\nthe database password is {secret}")
+            }
+        })
+        .to_string();
+        let record = EventRepository::new(&db)
+            .append(&session, None, "tool_result", &payload, leveler_core::now())
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&record.payload).unwrap();
+        let text = value["payload"]["text"].as_str().unwrap();
+        assert!(
+            text.contains(import),
+            "a source path was rewritten in durable storage: {text}"
+        );
+        assert!(
+            text.contains("the database password is [REDACTED]"),
+            "the credential's standalone occurrence must still be scrubbed: {text}"
+        );
+        leveler_core::clear_session_secrets(session.as_str());
+    }
+
     /// A secret registered for one session must not be scrubbed out of a
     /// different session's rows — the registry is session-scoped.
     #[tokio::test]

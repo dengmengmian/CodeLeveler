@@ -50,10 +50,10 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         let cmd = state.composer.canonical_text();
         return submit_user_shell(state, cmd);
     }
-    let text = state.composer.text().trim().to_string();
+    let raw = state.composer.text().trim().to_string();
     // A picture is a message. Only an empty composer with nothing staged is
     // not one.
-    if text.is_empty() && state.pending_attachments.is_empty() {
+    if raw.is_empty() && state.pending_attachments.is_empty() {
         return Vec::new();
     }
     // A FIRST LINE starting with a KNOWN `/command` is a local slash command,
@@ -62,7 +62,20 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     // silently degrade `/goal` into a chat message; R004 F1-adjacent). The
     // unknown-`/xxx` guard keeps its single-line scope so a typo or path-like
     // multiline message is never swallowed.
-    if let Some(rest) = text.strip_prefix('/') {
+    //
+    // A LARGE paste is represented in the buffer by `[Pasted: N lines]`, so
+    // the command prefix lives only in the canonical text. Detecting on the
+    // raw buffer alone let a pasted `/goal ...` blob become a Chat message
+    // whose first line was the literal command — the same degradation this
+    // branch exists to prevent, one threshold higher.
+    let canonical;
+    let command_text = if raw.starts_with('/') {
+        raw.as_str()
+    } else {
+        canonical = state.composer.canonical_text();
+        canonical.trim()
+    };
+    if let Some(rest) = command_text.strip_prefix('/') {
         let name = rest
             .lines()
             .next()
@@ -78,7 +91,6 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             // `take()` returns the canonical content (paste chips expanded);
             // slash ARGUMENTS must come from it, not from the raw buffer, or
             // a pasted goal/question degrades to its placeholder (R004 F1).
-            // Detection above stays on the raw single-line presentation.
             let expanded = state.composer.take();
             let expanded = expanded.trim();
             let rest_expanded = expanded.strip_prefix('/').unwrap_or(expanded);
@@ -87,7 +99,7 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         // Reserve unknown-command feedback for SINGLE-LINE command-shaped
         // typos such as `/hlep`. Absolute paths (`/Users/...`), file names,
         // and multiline slash-prefixed prose are ordinary messages.
-        if !text.contains('\n') && looks_like_unknown_slash_command(name) {
+        if !command_text.contains('\n') && looks_like_unknown_slash_command(name) {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
                 message: format!("未知命令: /{name}（内容已保留，/help 查看命令）"),

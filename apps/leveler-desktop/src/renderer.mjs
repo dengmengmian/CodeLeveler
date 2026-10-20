@@ -3822,7 +3822,7 @@ function commandCatalog() {
   const session = !!current;
   const entries = [
     ['add', 'file', '文件', true, 'paperclip', null, null],
-    ['commands', 'goal', '目标', false, 'compass', '未接入', 'Runtime 没有长期目标编辑接口'],
+    ['commands', 'goal', '目标', true, 'compass', null, null],
     ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
     ['commands', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区'],
@@ -3922,6 +3922,7 @@ async function executeCommand(id) {
   if (!command?.enabled) { composerError(command?.reason ?? '命令当前不可用'); return; }
   closeComposerPopovers();
   if (id === 'file') { composerError(''); controls(); uploadAttachment(); return; }
+  if (id === 'goal') { $('message').value = '/goal '; $('message').focus(); return; }
   $('message').value = '';
   composerError('');
   controls();

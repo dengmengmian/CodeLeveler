@@ -120,6 +120,39 @@ enum CommitFailure {
     Infrastructure(ToolError),
 }
 
+/// Read the committed bytes back and compare them with what the patch said it
+/// wrote. The CAS already proves the pre-image; this proves the post-image.
+/// Without it a reported success means "the call did not error", not "the
+/// change is on disk" — the distinction the R011 transcript got wrong.
+async fn verify_written(path: &PathBuf, expected: &str) -> Result<(), ToolError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(_) => Err(ToolError::Io(format!(
+            "write verification failed for {}: the file does not match the content this patch \
+             committed — a concurrent writer may have replaced it",
+            path.display()
+        ))),
+        Err(error) => Err(ToolError::Io(format!(
+            "write verification failed for {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+async fn verify_removed(path: &PathBuf) -> Result<(), ToolError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ToolError::Io(format!(
+            "delete verification failed for {}: the path still exists after the commit",
+            path.display()
+        ))),
+        Err(error) => Err(ToolError::Io(format!(
+            "delete verification failed for {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailure> {
     match op {
         Op::Replace {
@@ -420,6 +453,9 @@ impl Tool for ApplyPatchTool {
         let mut ops = Vec::new();
         let mut summary = Vec::new();
         let mut modified = Vec::new();
+        // Update hunks that matched but produced the same bytes. Reported in
+        // the result, never counted as a modification.
+        let mut no_change: Vec<String> = Vec::new();
         // Where each file's change actually landed. A hunk is located by
         // content, so only the applier knows its line numbers — the patch text
         // the model wrote carries none, and a presenter must never re-derive
@@ -541,14 +577,10 @@ impl Tool for ApplyPatchTool {
                             )));
                         }
                     };
-                    located.push((
-                        path.clone(),
-                        move_to.clone().unwrap_or_else(|| path.clone()),
-                        hunks,
-                    ));
 
                     match move_to {
                         Some(dest) => {
+                            located.push((path.clone(), dest.clone(), hunks));
                             let dest_resolved = match context
                                 .execution_workspace()?
                                 .resolve_for_write(&dest, &scope)
@@ -584,17 +616,48 @@ impl Tool for ApplyPatchTool {
                             modified.push(dest);
                         }
                         None => {
-                            ops.push(Op::Replace {
-                                path: resolved,
-                                expected: existing,
-                                content: updated,
-                            });
-                            summary.push(format!("M {path}"));
-                            modified.push(path);
+                            // A hunk whose removed and added lines are
+                            // identical matched the file and wrote the same
+                            // bytes back. "Applied patch" was true but
+                            // incomplete: the caller read it as "the file
+                            // changed", then re-read an unchanged file and
+                            // concluded the tool lied. Say what happened,
+                            // and do not count the path as modified.
+                            if updated == existing {
+                                summary.push(format!("M {path} (no change)"));
+                                no_change.push(path);
+                            } else {
+                                located.push((path.clone(), path.clone(), hunks));
+                                ops.push(Op::Replace {
+                                    path: resolved,
+                                    expected: existing,
+                                    content: updated,
+                                });
+                                summary.push(format!("M {path}"));
+                                modified.push(path);
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // Nothing to commit: every Update matched the file but its removed and
+        // added lines were identical. Reporting a plain success here is the
+        // "applied, but unchanged" trap — the model reads success, re-reads
+        // the same bytes, and concludes the tool lied or the write raced.
+        if ops.is_empty() && !no_change.is_empty() {
+            return Ok(ToolOutput::ok(format!(
+                "Patch matched but changed nothing:\n{}\n\
+                 No file was modified. The hunk's removed and added lines are identical; \
+                 if you expected a change, re-read the file and rebuild the patch against \
+                 what is there now.",
+                summary.join("\n")
+            ))
+            .with_metadata(serde_json::json!({
+                "modified_files": [],
+                "no_change": no_change,
+            })));
         }
 
         // Enforce the caller's per-step file cap (spec §17). Unlimited by
@@ -660,6 +723,23 @@ impl Tool for ApplyPatchTool {
                         CommitFailure::Infrastructure(error) => Err(error),
                     };
                 }
+            }
+        }
+
+        // Post-write verification. Every commit reported success; read the
+        // result back before saying so. A mismatch is NOT rolled back: a
+        // concurrent writer owns the file now, and restoring our bytes over
+        // theirs is exactly the clobber the CAS exists to prevent. It is
+        // reported as an infrastructure failure, never as success.
+        for operation in &applied {
+            match operation {
+                Applied::Replaced { path, after, .. }
+                | Applied::Created {
+                    path,
+                    content: after,
+                    ..
+                } => verify_written(path, after).await?,
+                Applied::Removed { path, .. } => verify_removed(path).await?,
             }
         }
 
@@ -1314,6 +1394,46 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
             "fn a() {}\nfn b() { todo!() }\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The R011 transcript: a patch whose `-` and `+` lines were identical
+    /// reported "Applied patch", the file was unchanged, and the model
+    /// concluded the tool had lied. A no-op is a fact about the patch and has
+    /// to be stated as one.
+    #[tokio::test]
+    async fn an_identical_replace_reports_no_change_instead_of_applied() {
+        let (context, dir) = ctx();
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n fn a() {}\n-fn b() {}\n+fn b() {}\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("changed nothing"),
+            "the result must say no file changed: {}",
+            out.content
+        );
+        assert!(
+            !out.content.starts_with("Applied patch"),
+            "a no-op must not claim a change: {}",
+            out.content
+        );
+        assert_eq!(
+            out.metadata["modified_files"],
+            serde_json::json!([]),
+            "an unchanged path is not a modified file"
+        );
+        assert_eq!(out.metadata["no_change"], serde_json::json!(["src/lib.rs"]));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            "fn a() {}\nfn b() {}\n"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -465,10 +465,62 @@ pub fn scrub_registered_secrets(session: &str, text: &str) -> String {
     let mut out = text.to_string();
     for value in values {
         if out.contains(value.as_str()) {
-            out = out.replace(value.as_str(), SECRET_PLACEHOLDER);
+            out = scrub_standalone(&out, value);
         }
     }
     out
+}
+
+/// Replace `value` only where it stands alone.
+///
+/// The registry exists to catch a credential the model repeated in prose.
+/// Its exact-value match is not an identity proof: a local database password
+/// can be the project name (`password=devorder`), and rewriting every
+/// occurrence then corrupts Go import paths, file names and identifiers in
+/// the durable transcript — which resume replays to the model, so the agent
+/// reads `[REDACTED]` where a module path belongs and writes it into source.
+///
+/// A match inside a longer path/identifier token is a different token, so it
+/// is left byte-identical. A standalone occurrence — prose, `KEY=value`, a
+/// quoted assignment — is still scrubbed.
+fn scrub_standalone(text: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(rel) = text[cursor..].find(value) {
+        let start = cursor + rel;
+        let end = start + value.len();
+        out.push_str(&text[cursor..start]);
+        if is_inside_token(text, start, end) {
+            out.push_str(&text[start..end]);
+        } else {
+            out.push_str(SECRET_PLACEHOLDER);
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Whether `text[start..end]` continues a path/identifier token on either
+/// side. `.` counts as a token character only when it joins two word
+/// characters (`my.devorder`), not when it ends a sentence (`is devorder.`).
+fn is_inside_token(text: &str, start: usize, end: usize) -> bool {
+    fn word(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '\\')
+    }
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    let before_dot = before == Some('.')
+        && text[..start - 1]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    let after_dot = after == Some('.')
+        && text[end + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    before.is_some_and(word) || after.is_some_and(word) || before_dot || after_dot
 }
 
 /// Drop a session's registered values. Called when the session ends.
@@ -710,6 +762,53 @@ mod tests {
         );
         clear_session_secrets(a);
         clear_session_secrets(b);
+    }
+
+    /// The R011 accident: a low-entropy password that is also a project name
+    /// (`password=devorder`) registered the shared word, and the durable
+    /// scrubber then rewrote every Go import path through the project. The
+    /// value is a secret only at the position it was detected in; an exact
+    /// match that is part of a longer path/identifier is a different token.
+    #[test]
+    fn registered_values_do_not_rewrite_paths_or_identifiers() {
+        let session = "sess-path-identity";
+        clear_session_secrets(session);
+        register_session_secrets(
+            session,
+            &[DetectedSecret {
+                value: "devorder".into(),
+                key: "password".into(),
+            }],
+        );
+
+        for intact in [
+            "\tcoreerr \"github.com/dengmengmian/devorder/internal/core/errors\"",
+            "github.com/dengmengmian/devorder",
+            "cmd/devorder-app",
+            "my_devorder_service",
+            "github.com/dengmengmian/devorder.git",
+            "my.devorder",
+            r"C:\src\devorder\internal",
+        ] {
+            assert_eq!(
+                scrub_registered_secrets(session, intact),
+                intact,
+                "a path/identifier was rewritten: {intact:?}"
+            );
+        }
+
+        for redacted in [
+            "the database password is devorder",
+            "dbname=devorder",
+            "password: \"devorder\"",
+            "devorder",
+        ] {
+            assert!(
+                scrub_registered_secrets(session, redacted).contains(SECRET_PLACEHOLDER),
+                "a standalone credential occurrence must still be scrubbed: {redacted:?}"
+            );
+        }
+        clear_session_secrets(session);
     }
 
     /// Short values are never registered — scrubbing them everywhere would

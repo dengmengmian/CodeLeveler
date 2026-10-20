@@ -96,7 +96,7 @@ export function focusRestoreIndex(candidates,overlay){return candidates.findInde
 
 /** @typedef {{id:string,label:string,enabled:boolean,reason?:string}} PaletteCommand */
 /** @param {string} text @param {PaletteCommand[]} commands */
-export function slashIntent(text,commands){const match=/^\/([a-z-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());if(!match)return {kind:'message'};const command=commands.find(item=>item.id===match[1]);if(!command)return {kind:'blocked',reason:'没有匹配的命令，请选择候选或修改输入。'};if(match[2])return {kind:'blocked',reason:'此命令不接受参数。请选择命令后发送，使用打开的控件完成操作。'};if(!command.enabled)return {kind:'blocked',reason:command.reason??'此命令当前不可用'};return {kind:'action',id:command.id};}
+export function slashIntent(text,commands){const match=/^\/([a-z-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());if(!match)return {kind:'message'};if(match[1]==='goal')return match[2]?{kind:'message'}:{kind:'blocked',reason:'用法：/goal <目标>'};const command=commands.find(item=>item.id===match[1]);if(!command)return {kind:'blocked',reason:'没有匹配的命令，请选择候选或修改输入。'};if(match[2])return {kind:'blocked',reason:'此命令不接受参数。请选择命令后发送，使用打开的控件完成操作。'};if(!command.enabled)return {kind:'blocked',reason:command.reason??'此命令当前不可用'};return {kind:'action',id:command.id};}
 /** @param {string} text @param {PaletteCommand[]} commands */
 export function commandCandidates(text,commands){const match=/^\/([a-z-]*)$/.exec(text.trim());return match?commands.filter(item=>item.id.startsWith(match[1])):[];}
 

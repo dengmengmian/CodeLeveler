@@ -351,6 +351,7 @@ fn report_from_agent_outcome(
     )
     .with_stop_detail(outcome.stop_detail);
     report.execution_duration_ms = execution_duration_ms;
+    report.completion_warnings = outcome.completion_warnings;
     report
 }
 

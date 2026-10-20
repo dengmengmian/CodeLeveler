@@ -785,8 +785,12 @@ async fn progressive_initial_surface_inventory() {
         "capability discovery exceeded its budget"
     );
     assert_eq!(initial.tools.len(), 18, "pinned initial surface grew");
+    // 7000 (was 6800): the Goal completion contract now carries the
+    // mechanical `verification` evidence field the runtime checks. That is
+    // ~100 tokens on a surface already pinned; the alternative — a completion
+    // claim the harness cannot check at all — costs more than it saves.
     assert!(
-        schema_tokens <= 6800,
+        schema_tokens <= 7000,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());

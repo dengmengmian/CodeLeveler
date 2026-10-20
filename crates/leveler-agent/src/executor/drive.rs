@@ -174,6 +174,15 @@ pub(crate) struct Drive<'a> {
     finalization_started: bool,
     ledger: EvidenceLedger,
     closeout_budget: CloseoutBudget,
+    /// Command executions this drive observed, chronological and bounded.
+    /// Used only by the Goal completion gate: a cited command must match one
+    /// of these facts, and a failed test/build is hard evidence against
+    /// `update_goal(complete)`.
+    verification_runs: Vec<super::goal_verification::VerificationRun>,
+    /// Facts the terminal must carry even though the Goal resolved: accepted
+    /// completions with no executable verification. Read by the engine and
+    /// persisted on `TaskFinished.warnings`.
+    completion_warnings: Vec<String>,
     decode_retries: u32,
     length_continuations: u32,
     continued_text: String,
@@ -357,7 +366,7 @@ impl Executor {
             tools.push(report_finding_tool_definition());
         }
         // Goal mode: the model resolves the objective explicitly.
-        if self.policy.goal_mode {
+        if self.goal_mode() {
             tools.push(update_goal_tool_definition());
         }
 
@@ -555,6 +564,8 @@ impl Executor {
             // Unified closeout nudge budget shared by every quiet-round
             // mechanism (goal resolution, empty answer).
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
+            verification_runs: Vec::new(),
+            completion_warnings: Vec::new(),
             decode_retries: 0,
             length_continuations: 0,
             continued_text: String::new(),
@@ -1450,6 +1461,22 @@ impl AgentHarness for Drive<'_> {
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
         self.refresh_capability_surface("model_requested");
+        // A `/goal <task>` declared while this turn already ran. The runtime
+        // has already persisted the axis; this is the in-flight half. Inject
+        // the user's text as an ordinary user row (so resume replays it) and
+        // rebuild the tool table: `update_goal` must be advertised from this
+        // round on, not only from the next turn.
+        if let Some(source) = &self.executor.steering
+            && let Some(declaration) = source.take_goal_declaration()
+        {
+            let tools = self.executor.request_tool_definitions();
+            if tools != self.tools {
+                self.tools = tools;
+            }
+            let message = Message::user_input(declaration);
+            self.sink.append(std::slice::from_ref(&message)).await?;
+            messages.push(message);
+        }
         // Mid-turn user input goes in at the top of the round, before the
         // model is asked anything: a correction that arrives after the work
         // is done is worthless. Empty is the normal case.
@@ -1852,7 +1879,7 @@ impl AgentHarness for Drive<'_> {
             // ends `Stalled` — never as a success.
             let has_final_text = !self.last_text.trim().is_empty();
             let action = decide(&CloseoutInput {
-                goal_mode: self.executor.policy.goal_mode,
+                goal_mode: self.executor.goal_mode(),
                 has_final_text,
                 cancelled: cancellation.is_cancelled(),
                 can_continue: has_next_model_step,
@@ -1868,7 +1895,7 @@ impl AgentHarness for Drive<'_> {
             tracing::info!(
                 model_steps,
                 ?action,
-                goal_mode = self.executor.policy.goal_mode,
+                goal_mode = self.executor.goal_mode(),
                 has_final_text,
                 budget_remaining = self.closeout_budget.remaining(),
                 no_progress_streak = self.progress.no_progress_streak,
@@ -1949,7 +1976,7 @@ impl AgentHarness for Drive<'_> {
             // closeout reason so an engine continuation knows what the
             // previous turn stalled on.
             let (stop_reason, stop_detail) =
-                if self.executor.policy.goal_mode && self.progress.human_boundary_seen() {
+                if self.executor.goal_mode() && self.progress.human_boundary_seen() {
                     // User said no, model went quiet without resolving the
                     // goal. That is blocked, not a stall — and it is reported
                     // as such, since nothing re-drives a turn on its own.
@@ -1961,7 +1988,7 @@ impl AgentHarness for Drive<'_> {
                         StopReason::Blocked,
                         Some("user denied a required permission; goal left unresolved".to_string()),
                     )
-                } else if self.executor.policy.goal_mode {
+                } else if self.executor.goal_mode() {
                     // One no-progress tick per stalled drive so Engine
                     // continue_active_goal cannot open unbounded turns.
                     self.progress.note_no_progress_round(model_steps);
@@ -2274,7 +2301,7 @@ impl AgentHarness for Drive<'_> {
             // Goal mode: the model explicitly resolves the objective. Record
             // the resolution; the run ends after this round's results are
             // committed (so the transcript stays well-formed).
-            if self.executor.policy.goal_mode && call.name == UPDATE_GOAL_TOOL {
+            if self.executor.goal_mode() && call.name == UPDATE_GOAL_TOOL {
                 // Surface the resolution so the TUI/JSONL shows the goal being
                 // closed (special tools otherwise skip the ToolCall event).
                 (self.observer)(AgentEvent::ToolCall {
@@ -2380,6 +2407,79 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
+                // A completion claim is not sole evidence. The model's own
+                // verification field is checked against this drive's command
+                // record; a failed test/build cannot be closed as complete,
+                // and a changed workspace must name either a command that
+                // actually passed after the change or an explicit
+                // `not_applicable` reason. No semantic judgement is made here.
+                if reason == StopReason::Completed {
+                    let claim = match super::goal_verification::parse_claim(&call.arguments) {
+                        Ok(claim) => claim,
+                        Err(message) => {
+                            (self.observer)(AgentEvent::GoalIntercepted {
+                                kind: "invalid_verification".to_string(),
+                                detail: message.clone(),
+                            });
+                            (self.observer)(AgentEvent::ToolResult {
+                                exit_code: None,
+                                stop: None,
+                                execution_status: None,
+                                id: call.id.as_str().to_string(),
+                                name: UPDATE_GOAL_TOOL.to_string(),
+                                is_error: true,
+                                preview: preview(&message),
+                                applied_diff: None,
+                            });
+                            results[index] = Some(ContentPart::ToolResult {
+                                result: ToolResultContent {
+                                    call_id: call.id,
+                                    content: message,
+                                    is_error: true,
+                                },
+                            });
+                            continue;
+                        }
+                    };
+                    let modified = !self.progress.cumulative_modified_paths.is_empty()
+                        || !self.modified_files.is_empty();
+                    match super::goal_verification::decide(
+                        &claim,
+                        &self.verification_runs,
+                        self.ledger.total_mutation_ops,
+                        modified,
+                    ) {
+                        super::goal_verification::VerificationDecision::Accept { warning } => {
+                            if let Some(warning) = warning {
+                                self.completion_warnings.push(warning);
+                            }
+                        }
+                        super::goal_verification::VerificationDecision::Refuse(message) => {
+                            (self.observer)(AgentEvent::GoalIntercepted {
+                                kind: "verification_refused".to_string(),
+                                detail: message.clone(),
+                            });
+                            (self.observer)(AgentEvent::ToolResult {
+                                exit_code: None,
+                                stop: None,
+                                execution_status: None,
+                                id: call.id.as_str().to_string(),
+                                name: UPDATE_GOAL_TOOL.to_string(),
+                                is_error: true,
+                                preview: preview(&message),
+                                applied_diff: None,
+                            });
+                            results[index] = Some(ContentPart::ToolResult {
+                                result: ToolResultContent {
+                                    call_id: call.id,
+                                    content: message,
+                                    is_error: true,
+                                },
+                            });
+                            continue;
+                        }
+                    }
+                }
                 // The plan is the model's declared progress, not a completion
                 // authority: the runtime can see that a step is still
                 // `pending`, but not whether that step is still required to
@@ -3332,6 +3432,24 @@ impl AgentHarness for Drive<'_> {
                 push_unique_path(&mut self.scoped_paths, path);
             }
 
+            // Mechanical verification fact. Recorded after the call's own
+            // mutation note, so "passed after the last change" compares the
+            // right sequence number.
+            if let Some(label) =
+                super::goal_verification::command_label(&call.name, &call.arguments)
+            {
+                self.verification_runs
+                    .push(super::goal_verification::VerificationRun {
+                        label,
+                        ok: !is_error,
+                        model_step: model_steps,
+                        mutation_ops: self.ledger.total_mutation_ops,
+                    });
+                if self.verification_runs.len() > 64 {
+                    self.verification_runs.remove(0);
+                }
+            }
+
             results[index] = Some(ContentPart::ToolResult {
                 result: ToolResultContent {
                     call_id: call.id,
@@ -4034,7 +4152,7 @@ impl AgentHarness for Drive<'_> {
             self.flush_epoch(rt);
 
             self.settle_finalization_dependencies(rt, messages).await?;
-            return Ok(Flow::Stop(AgentOutcome::drive_result(
+            let mut outcome = AgentOutcome::drive_result(
                 final_text,
                 model_steps,
                 self.modified_files.clone(),
@@ -4042,7 +4160,9 @@ impl AgentHarness for Drive<'_> {
                 None,
                 &self.progress,
                 &self.objective,
-            )));
+            );
+            outcome.completion_warnings = std::mem::take(&mut self.completion_warnings);
+            return Ok(Flow::Stop(outcome));
         }
 
         // A step limit tripped this round: results are committed, stop now.

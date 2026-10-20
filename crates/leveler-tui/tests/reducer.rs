@@ -6311,6 +6311,26 @@ fn slash_goal_runs_explicit_goal_command() {
 }
 
 #[test]
+fn slash_goal_while_busy_steers_the_running_turn_with_the_command_verbatim() {
+    // The runtime owns `/goal` parsing on the steer path. The client must send
+    // the command text unchanged (not strip it, not invent a second axis
+    // flag): that is what lets a Goal declared mid-turn upgrade the RUNNING
+    // executor instead of being injected as literal prose.
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    typed(&mut s, "/goal 继续完成运营端");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit { command: ClientCommand::SteerCurrentTurn { content, .. }, .. }]
+                if content == "/goal 继续完成运营端"
+        ),
+        "busy `/goal` must steer the runtime-owned command: {effects:?}"
+    );
+}
+
+#[test]
 fn slash_goal_requires_a_goal() {
     let mut s = opened();
     typed(&mut s, "/goal");
@@ -7378,14 +7398,27 @@ fn tab_toggles_workbench_focus_and_arrows_diverge() {
     );
     assert!(!s.conv.auto_scroll);
 
-    // The live header goal is now its own focus stop; the next Tab returns to
-    // Input when there is no plan, command, or activity row.
-    reduce(&mut s, key(KeyCode::Tab));
-    assert_eq!(s.workbench_focus, WorkbenchFocus::Goal);
+    // This is a Chat session: a live goal is the only thing that adds a Goal
+    // stop, and Chat does not carry one. The next Tab returns to Input.
     reduce(&mut s, key(KeyCode::Tab));
     assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
     reduce(&mut s, key(KeyCode::Up));
     assert_eq!(s.composer.text(), "历史任务");
+}
+
+/// The Goal stop exists only when the session actually carries a Goal; the
+/// Chat default above must not invent one.
+#[test]
+fn tab_reaches_the_goal_stop_in_goal_mode() {
+    use leveler_tui::state::WorkbenchFocus;
+    let mut s = opened();
+    typed(&mut s, "/goal 历史任务");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.collaboration, "goal");
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Conversation);
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Goal);
 }
 
 #[test]
@@ -10424,6 +10457,42 @@ fn slash_goal_with_small_multiline_paste_still_runs_a_goal() {
         ),
         "multiline /goal must stay a goal: {effects:?}"
     );
+}
+
+/// The same contract one threshold higher: a LARGE paste is represented by
+/// `[Pasted: N lines]`, so the command prefix exists only in the canonical
+/// text. Detecting on the raw buffer alone turned this into a Chat message
+/// whose first line was the literal `/goal ...` — the exact degradation the
+/// small-paste test above guards against.
+#[test]
+fn slash_goal_with_large_paste_still_runs_a_goal() {
+    let mut s = opened();
+    let objective = format!(
+        "/goal 重新设计报价模型\n{}",
+        (1..=6)
+            .map(|i| format!("第{i}行要求：保留全部约束"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    reduce(&mut s, Action::Paste(objective.clone()));
+    assert!(
+        s.composer.text().contains("[Pasted:"),
+        "precondition: the whole command became a chip: {}",
+        s.composer.text()
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let submitted = match effects.as_slice() {
+        [
+            Effect::Submit {
+                command: ClientCommand::RunGoal { content, .. },
+                ..
+            },
+        ] => content,
+        other => panic!("large pasted /goal must still be a goal: {other:?}"),
+    };
+    assert!(submitted.starts_with("重新设计报价模型"), "{submitted}");
+    assert!(submitted.contains("第6行要求"), "{submitted}");
+    assert!(!submitted.contains("/goal"), "{submitted}");
 }
 
 /// The unknown-command guard keeps its old scope: multiline text starting with

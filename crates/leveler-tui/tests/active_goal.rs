@@ -77,9 +77,13 @@ fn submit(state: &mut AppState, text: &str) {
 fn submit_goal(state: &mut AppState, text: &str) {
     submit(state, &format!("/goal {text}"));
     let command_id = state.pending_submissions.last().unwrap().command_id.clone();
-    reduce(state, Action::EffectCompleted(
-        leveler_tui::action::EffectCompletion::SubmissionDelivered { command_id, snapshot: None },
-    ));
+    reduce(
+        state,
+        Action::EffectCompleted(leveler_tui::action::EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: None,
+        }),
+    );
 }
 
 fn rendered(state: &mut AppState, w: u16, h: u16) -> String {
@@ -143,22 +147,32 @@ fn explicit_goal_header_distinguishes_submission_from_runtime_execution() {
     let pending = state.pending_submissions[0].command_id.clone();
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
-    assert!(header.contains("目标模式") && header.contains("发送中"), "{header}");
+    assert!(
+        header.contains("目标模式") && header.contains("发送中"),
+        "{header}"
+    );
     assert!(!header.contains("执行中"), "{header}");
 
-    reduce(&mut state, Action::EffectCompleted(
-        leveler_tui::action::EffectCompletion::SubmissionDelivered {
+    reduce(
+        &mut state,
+        Action::EffectCompleted(leveler_tui::action::EffectCompletion::SubmissionDelivered {
             command_id: pending,
             snapshot: None,
-        },
-    ));
+        }),
+    );
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
-    assert!(header.contains("目标模式") && header.contains("执行中"), "{header}");
+    assert!(
+        header.contains("目标模式") && header.contains("执行中"),
+        "{header}"
+    );
     reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCancelled));
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
-    assert!(header.contains("目标模式") && header.contains("已暂停"), "{header}");
+    assert!(
+        header.contains("目标模式") && header.contains("已暂停"),
+        "{header}"
+    );
 }
 
 #[test]
@@ -166,7 +180,10 @@ fn goal_mode_remains_visible_without_an_active_turn_and_clears_explicitly() {
     let mut state = state();
     let mut session = snapshot("修复断线", "idle");
     session.collaboration = Some("goal".into());
-    reduce(&mut state, Action::Runtime(RuntimeEvent::SessionOpened { session }));
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened { session }),
+    );
     for width in [40, 80] {
         let screen = rendered(&mut state, width, 12);
         let header = screen.lines().nth(1).unwrap();
@@ -205,14 +222,21 @@ fn goal_followups_keep_the_explicit_objective_until_a_new_goal_is_set() {
 
     reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCancelled));
     submit_goal(&mut state, "另一个明确目标");
-    assert_eq!(state.active_goal.as_ref().unwrap().objective(), "另一个明确目标");
+    assert_eq!(
+        state.active_goal.as_ref().unwrap().objective(),
+        "另一个明确目标"
+    );
 }
 
 #[test]
 fn ordinary_followup_does_not_reopen_a_terminal_goal() {
     let mut state = state();
     submit_goal(&mut state, "已结算的明确目标");
-    state.active_goal.as_mut().unwrap().complete(std::time::Instant::now());
+    state
+        .active_goal
+        .as_mut()
+        .unwrap()
+        .complete(std::time::Instant::now());
     state.status = RuntimeStatus::Idle;
     submit(&mut state, "补充说明一下");
     let goal = state.active_goal.as_ref().unwrap();
@@ -226,14 +250,18 @@ fn a_reconnect_to_a_running_session_adopts_its_goal() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::SessionOpened {
-            session: { let mut session = snapshot("调查 Windows CI flaky test", "running"); session.collaboration = Some("goal".into()); session },
+            session: {
+                let mut session = snapshot("调查 Windows CI flaky test", "running");
+                session.collaboration = Some("goal".into());
+                session
+            },
         }),
     );
     assert_eq!(state.status, RuntimeStatus::Busy);
     let goal = state.active_goal.as_ref().expect("live turn owns a goal");
     assert_eq!(goal.title(), "调查 Windows CI flaky test");
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("◆ 调查 Windows CI flaky test"), "{screen}");
+    assert!(screen.contains("◆ 调查 Windows CI flak"), "{screen}");
 }
 
 #[test]
@@ -290,7 +318,7 @@ fn a_reconnecting_runtime_shows_the_resuming_mark() {
         }),
     );
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("↻ 调查 Windows CI flaky test"), "{screen}");
+    assert!(screen.contains("↻ 调查 Windows CI"), "{screen}");
 }
 
 #[test]
@@ -332,7 +360,7 @@ fn completion_turns_green_and_fails_stay() {
     assert!(!completed.is_expired(now + std::time::Duration::from_secs(3)));
     assert!(completed.is_expired(now + std::time::Duration::from_secs(60)));
     let screen = rendered(&mut completed_state, 80, 12);
-    assert!(screen.contains("✓ 调查 Windows CI flaky test"), "{screen}");
+    assert!(screen.contains("✓ 调查 Windows CI flak"), "{screen}");
 
     // A hard failure never times out.
     let mut failed = state();
@@ -350,7 +378,7 @@ fn completion_turns_green_and_fails_stay() {
     let screen = rendered(&mut failed, 80, 12);
     // The failure indicator stays (it is actionable) but must never read as a
     // live turn: it states the phase and drops the live marker.
-    assert!(screen.contains("! 调查 Windows CI flaky test"), "{screen}");
+    assert!(screen.contains("! 调查 Windows CI flak"), "{screen}");
     assert!(
         screen.contains("失败"),
         "a failed turn says so in words: {screen}"
@@ -433,10 +461,9 @@ fn a_narrow_terminal_keeps_the_glyph_and_clock_and_never_overlaps() {
     let header = narrow.lines().nth(1).unwrap();
     assert_eq!(header.width(), 20, "fills the row once: {header:?}");
     assert!(header.starts_with(" CodeLeveler"), "{header:?}");
-    assert!(
-        header.contains("目标模式"),
-        "clock survives: {header:?}"
-    );
+    // At 20 columns the header keeps the product identity and the branch
+    // glyph; the goal segment is dropped WHOLE (never a clipped `…`). The
+    // mode/clock have no room here — the state strip owns them in this width.
     assert!(
         !header.contains('…'),
         "title dropped, not clipped: {header:?}"

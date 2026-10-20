@@ -46,6 +46,7 @@ mod contribution;
 mod event;
 mod failure;
 mod global_tasks;
+mod goal_command;
 mod goals;
 mod media;
 mod observability;
@@ -56,8 +57,8 @@ mod retirement;
 pub mod session_wire;
 mod skills;
 mod snapshot;
-mod version;
 mod terminal;
+mod version;
 pub use terminal::{TerminalOperation, TerminalRequest, TerminalState};
 mod wire_types;
 
@@ -77,6 +78,7 @@ pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding
 pub use failure::{
     FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
 };
+pub use goal_command::{GoalCommand, parse_goal_command};
 pub use skills::{
     UiShadowedSkill, UiSkillDetail, UiSkillEntry, UiSkillProblem, UiSkillScope, UiSkillSource,
     UiSkillStatus,

@@ -234,7 +234,14 @@ fn coding_stage(marker: &str) -> Vec<ModelResponse> {
         tool_call(
             "g1",
             "update_goal",
-            serde_json::json!({"status": "complete", "summary": "done"}),
+            serde_json::json!({
+                "status": "complete",
+                "summary": "done",
+                "verification": {
+                    "status": "not_applicable",
+                    "detail": "scripted fixture: the added function is not executed"
+                }
+            }),
         ),
     ]
 }
@@ -271,9 +278,13 @@ async fn develop_runs_analyze_then_coding_then_review() {
         .unwrap();
 
     assert_eq!(report.outcome, TaskOutcome::Completed);
+    // The fixture declares no executable verification (the scripted function
+    // is never run), so completion is accepted WITH that fact on the record —
+    // never as a silently verified pass.
+    assert_eq!(report.completion_warnings.len(), 1);
     assert!(
-        report.completion_warnings.is_empty(),
-        "a passed review leaves nothing to warn about: {:?}",
+        report.completion_warnings[0].contains("without executable verification"),
+        "{:?}",
         report.completion_warnings
     );
     assert_eq!(report.modified_files, vec!["src/lib.rs".to_string()]);
@@ -336,7 +347,12 @@ async fn a_rework_verdict_runs_coding_again() {
         .unwrap();
 
     assert_eq!(report.outcome, TaskOutcome::Completed);
-    assert!(report.completion_warnings.is_empty());
+    assert_eq!(report.completion_warnings.len(), 1);
+    assert!(
+        report.completion_warnings[0].contains("without executable verification"),
+        "{:?}",
+        report.completion_warnings
+    );
     let texts = user_texts(&h.requests);
     let analyses = texts
         .iter()

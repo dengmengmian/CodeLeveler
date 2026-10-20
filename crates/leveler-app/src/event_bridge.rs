@@ -2422,6 +2422,7 @@ mod bridge_tests {
             budget_exhaustion: None,
             progress: Default::default(),
             objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
+            completion_warnings: Vec::new(),
         }
     }
 

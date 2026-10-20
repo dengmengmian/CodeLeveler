@@ -4,6 +4,7 @@ mod agent_spawn;
 pub mod closeout;
 mod dispatch;
 mod drive;
+mod goal_verification;
 mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
@@ -816,6 +817,10 @@ pub struct AgentOutcome {
     pub progress: ProgressLedger,
     /// Active objective used for this drive (host-pinned).
     pub objective: ObjectiveAnchor,
+    /// Completion facts that must travel with the terminal: an accepted Goal
+    /// closed without executable verification, for example. The engine copies
+    /// these onto `TaskFinished.warnings`; they are never a success claim.
+    pub completion_warnings: Vec<String>,
 }
 
 impl AgentOutcome {
@@ -842,6 +847,7 @@ impl AgentOutcome {
             budget_exhaustion: None,
             progress: progress.clone(),
             objective: objective.clone(),
+            completion_warnings: Vec::new(),
         }
     }
 
@@ -866,6 +872,7 @@ impl AgentOutcome {
             budget_exhaustion: Some(exhaustion),
             progress: progress.clone(),
             objective: objective.clone(),
+            completion_warnings: Vec::new(),
         }
     }
 }
@@ -1363,6 +1370,20 @@ pub trait SteeringSource: Send + Sync {
     /// Take everything queued since the last call. Returning empty is the
     /// normal case and must be cheap.
     fn take_pending(&self) -> Vec<String>;
+
+    /// Whether this turn has been declared a Goal mid-flight. The runtime
+    /// writes it when `/goal <task>` arrives while the turn already runs; the
+    /// executor reads it through [`Executor::goal_mode`] so the turn is driven
+    /// to `update_goal`, not finished at its next stage summary.
+    fn goal_requested(&self) -> bool {
+        false
+    }
+
+    /// Take one Goal objective declared mid-turn. The loop injects it as a
+    /// normal user-input row, which is also what makes it durable for resume.
+    fn take_goal_declaration(&self) -> Option<String> {
+        None
+    }
 
     /// A delegated child started (or resumed) in this turn; `cancel` stops
     /// that child alone. A host that lets its user cancel one child keeps the
@@ -2000,6 +2021,17 @@ impl Executor {
         self
     }
 
+    /// Whether this turn is a Goal now.
+    ///
+    /// The static policy covers a turn that started as a Goal. A turn that
+    /// started as Chat becomes one when the user declares `/goal <task>`
+    /// mid-flight: the runtime marks the steering source, and every reader of
+    /// this flag — tool surface, system prompt, closeout — follows the same
+    /// answer from the next round on.
+    pub(crate) fn goal_mode(&self) -> bool {
+        self.policy.goal_mode || self.steering.as_ref().is_some_and(|s| s.goal_requested())
+    }
+
     /// Build a sub-agent that reuses this agent's runtime, tools, model, and
     /// permissions, but runs silently on its own fresh conversation with a
     /// wall-clock safety budget and one deeper nesting level.
@@ -2442,7 +2474,7 @@ impl Executor {
                 format!("\n\n{brief}"),
             ));
         }
-        if self.policy.goal_mode {
+        if self.goal_mode() {
             // The lifecycle contract only. How the work is done stays with the model.
             let goal_prompt = String::from(
                 "\n\nGOAL MODE: this turn uses Goal mode.\n\
@@ -3054,7 +3086,7 @@ impl Executor {
         let request = text_of(&content);
         // Active objective is THIS message — never the first user in `prior`.
         let objective = self.seeded_objective.clone().unwrap_or_else(|| {
-            if self.policy.goal_mode {
+            if self.goal_mode() {
                 ObjectiveAnchor::from_session_goal(&request)
             } else {
                 ObjectiveAnchor::from_user_message(&request)
