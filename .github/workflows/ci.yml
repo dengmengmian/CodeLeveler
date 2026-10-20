@@ -150,19 +150,11 @@ jobs:
       # shard that killed it; a single workspace step could only say
       # "Test". The shards are also the released features first, so a
       # regression in the new surfaces is located without guessing.
-      - name: Test (linux · app)
-        if: runner.os == 'Linux'
-        timeout-minutes: 25
-        env:
-          # This shard compiles and links the most test binaries at once. Two
-          # consecutive ubuntu-24.04 runners lost communication inside it with
-          # no log, and the host says CPU/memory starvation can cause that.
-          # Bound both link parallelism and test concurrency so a heavy run
-          # stays inside the step and a real failure leaves a log.
-          RUST_TEST_THREADS: "1"
-          CARGO_BUILD_JOBS: "2"
-        run: cargo test -p leveler-app --all-features --locked --no-fail-fast
-
+      #
+      # `leveler-app` runs as its own matrix job (`app-linux`): it was the
+      # only shard whose runner vanished, twice, with no log and past its
+      # own timeout. Splitting its test targets across runners both bounds
+      # each runner's work and names the targets a hostile one took down.
       - name: Test (linux · tui)
         if: runner.os == 'Linux'
         timeout-minutes: 25
@@ -193,6 +185,68 @@ jobs:
         env:
           RUST_TEST_THREADS: "2"
         run: cargo test --workspace --all-features --locked --no-fail-fast
+
+  # `leveler-app` is the largest test crate: 39 integration targets plus the
+  # lib. On Ubuntu it twice took its runner down with no log and no step
+  # timeout, while every other shard stayed healthy. Four runners, each with a
+  # slice of the targets, bound the work and turn "the app shard died" into the
+  # exact target list that died. macOS and Windows still run the whole suite.
+  app-linux:
+    name: app tests (linux · shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Linux sandbox runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+          bwrap --ro-bind / / true
+
+      - name: App test shard
+        timeout-minutes: 20
+        env:
+          RUST_TEST_THREADS: "1"
+          CARGO_BUILD_JOBS: "2"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          mapfile -t targets < <(ls crates/leveler-app/tests/*.rs | xargs -n1 basename | sed 's/\.rs$//')
+          total=${#targets[@]}
+          per=$(( (total + 3) / 4 ))
+          start=$(( SHARD * per ))
+          args=()
+          for ((i = start; i < start + per && i < total; i++)); do
+            args+=(--test "${targets[$i]}")
+          done
+          if [ "$SHARD" = "0" ]; then
+            args+=(--lib)
+          fi
+          echo "shard $SHARD targets (of $total): ${args[*]}"
+          cargo test -p leveler-app --all-features --locked --no-fail-fast "${args[@]}"
 
   # The phone client. It is Dart, so it cannot ride the Rust job. Analyze and
   # test only: CI has no simulator, and building the app needs one platform
