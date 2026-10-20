@@ -629,6 +629,19 @@ Runtime Host 的 detached 接入、跨来源连接和 revive，以及现有客�
 进程编排或业务状态。关窗只断开 bridge，不取消回合或关闭 Runtime；Runtime 保留
 既有空闲回收策略。Desktop Main 与 Rust bridge 接受现有 `CancelTask` / `ResumeTask` 命令并绑定当前会话；续写内容有界，取消与恢复的生命周期判定仍由 App / Harness owner 负责。
 
+桌面交互式终端复用同一个 Execution Host、BackgroundTaskRegistry 和
+CommandRunner。PTY 的进程、输入、尺寸、原始输出和退出事实由宿主执行权威拥有；
+Application 校验会话归属并冻结创建时的实际执行策略，桌面只传递有界输入、尺寸
+和输出游标，不在 Electron 中启动另一套 Shell。终端与 Agent 回合独立，输入不进入
+模型对话；Full 保持 unrestricted，其他模式保留实际可执行的宿主边界，不能把
+打开终端扩张成无限制授权。缺少 PTY 能力、工作区或平台支持时明确拒绝。
+
+终端创建使用稳定标识避免重连重复启动；输入结果未知时禁止自动重发。切换会话
+或隐藏面板只断开展示，恢复时观察同一终端。输出使用宿主原始字节游标，留存不足
+明确标记截断。Ctrl+C 写入 PTY，由终端驱动通知前台作业；关闭标签才停止所属
+进程树，确认退出后释放标签。正常退出桌面关闭本客户端创建的终端，断线本身
+不能伪造退出事实。旧宿主缺少所需能力时不得悄悄切换为本地进程。
+
 ### 无工作区与全局历史的精确契约
 
 Session、TaskEngine 和 Runtime 只有一套实现。Session 的 `repository` 是持久的 optional primary workspace。已有项目为 `Some(path)`，No Workspace 为 `None`。Application state 始终存在；执行工作目录由执行能力和授权决定。三者不能通过 HOME、启动 cwd、上次项目或内部 scratch 路径互相替代。

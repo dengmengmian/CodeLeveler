@@ -370,7 +370,10 @@ fn hovering_an_item_offers_send_and_delete_and_clicking_send_sends_that_item() {
     let mut s = state();
     stage_three(&mut s);
     let lines = render(&mut s, 100, 40);
-    assert!(row_of(&lines, "发送 · 删除").is_none(), "clean by default");
+    assert!(
+        row_of(&lines, "发送 · 编辑 · 删除").is_none(),
+        "clean by default"
+    );
     let row = row_of(&lines, "› 如果失败先不要修改配置").unwrap() as u16;
     reduce(
         &mut s,
@@ -383,10 +386,10 @@ fn hovering_an_item_offers_send_and_delete_and_clicking_send_sends_that_item() {
     );
     let lines = render(&mut s, 100, 40);
     let hovered = &lines[row as usize];
-    assert!(hovered.contains("发送 · 删除"), "{hovered:?}");
-    let col =
-        unicode_width::UnicodeWidthStr::width(&hovered[..hovered.find("发送 · 删除").unwrap()])
-            as u16;
+    assert!(hovered.contains("发送 · 编辑 · 删除"), "{hovered:?}");
+    let col = unicode_width::UnicodeWidthStr::width(
+        &hovered[..hovered.find("发送 · 编辑 · 删除").unwrap()],
+    ) as u16;
     let effects = reduce(
         &mut s,
         Action::Mouse(MouseEvent {

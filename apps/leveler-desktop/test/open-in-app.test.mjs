@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {createRequire} from 'node:module';
 
 const require=createRequire(import.meta.url);
-const {resolveTarget,installedCatalog}=require('../src/open-in-app.cjs');
+const {resolveTarget,installedCatalog,applicationIcon}=require('../src/open-in-app.cjs');
 
 test('open-in-app resolves a real path only inside a registered workspace root',()=>{
   const base=realpathSync(mkdtempSync(join(tmpdir(),'leveler-open-')));
@@ -37,4 +37,26 @@ test('open-in-app catalog lists installed applications only and keeps Finder fir
     '/System/Library/CoreServices/Finder.app',
     '/Applications/Visual Studio Code.app',
   ]);
+});
+
+// Exercise the real macOS icon decoder: getFileIcon(.app) returns the same
+// generic bundle image for these applications, despite their distinct icons.
+test('macOS application icons use each bundle resource instead of the generic bundle icon', {skip:process.platform!=='darwin'}, async()=>{
+  const catalog=installedCatalog();
+  const icons=await Promise.all(catalog.map(candidate=>applicationIcon(candidate.path)));
+  assert.ok(icons.length>=2);
+  for(const icon of icons)assert.match(icon,/^data:image\/png;base64,iVBOR/);
+  assert.equal(new Set(icons).size,icons.length);
+});
+
+test('macOS application icons reject missing metadata and resources outside the bundle', {skip:process.platform!=='darwin'}, async()=>{
+  const bundle=mkdtempSync(join(tmpdir(),'leveler-icon-bundle-'));
+  const contents=join(bundle,'Contents');
+  mkdirSync(contents);
+  try{
+    for(const metadata of [{},{CFBundleIconFile:'../outside.icns'},{CFBundleIconFile:'/outside.icns'},{CFBundleIconFile:'missing'}]){
+      writeFileSync(join(contents,'Info.plist'),JSON.stringify(metadata));
+      await assert.rejects(applicationIcon(bundle));
+    }
+  }finally{rmSync(bundle,{recursive:true,force:true});}
 });

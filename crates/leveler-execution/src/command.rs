@@ -52,9 +52,17 @@ pub fn credential_env_names_from(
     names
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct PtySize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// A request to run one program with explicit arguments.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProcessRequest {
+    #[serde(default)]
+    pub pty: Option<PtySize>,
     pub program: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
@@ -330,6 +338,7 @@ fn default_process_network_scope() -> crate::NetworkScope {
 impl ProcessRequest {
     pub fn new(program: impl Into<String>, args: Vec<String>, cwd: PathBuf) -> Self {
         Self {
+            pty: None,
             program: program.into(),
             args,
             cwd,
@@ -1520,11 +1529,25 @@ impl CommandRunner {
             apply_sandbox_environment(&mut cmd, paths);
         }
 
+        #[cfg(not(unix))]
+        if request.pty.is_some() {
+            return Err(ProcessError::SandboxPolicy("Unsupported: PTY terminals on this platform".into()));
+        }
         #[cfg(unix)]
         {
+            let pty = if let Some(size) = request.pty {
+                if size.cols == 0 || size.rows == 0 || size.cols > 1000 || size.rows > 1000 {
+                    return Err(ProcessError::SandboxPolicy("invalid PTY size".into()));
+                }
+                let winsize = nix::pty::Winsize { ws_row: size.rows, ws_col: size.cols, ws_xpixel: 0, ws_ypixel: 0 };
+                let descriptors = nix::pty::openpty(Some(&winsize), None).map_err(|e| ProcessError::Io { program: request.program.clone(), source: e.into() })?;
+                crate::pty::attach(&mut cmd, descriptors.slave).map_err(|source| ProcessError::Io { program: request.program.clone(), source })?;
+                cmd.env("TERM", "xterm-256color").env_remove("NO_COLOR").env_remove("FORCE_COLOR").env_remove("CLICOLOR").env_remove("CLICOLOR_FORCE");
+                Some(crate::pty::PtyMaster::new(descriptors.master).map_err(|source| ProcessError::Io { program: request.program.clone(), source })?)
+            } else { None };
             // Own process group so the whole subtree (child and grandchildren)
             // can be terminated on timeout, cancel, or registry drop.
-            cmd.process_group(0);
+            if pty.is_none() { cmd.process_group(0); }
             set_parent_death_signal(&mut cmd);
             let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {
                 program: request.program.clone(),
@@ -1537,8 +1560,9 @@ impl CommandRunner {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             Ok(ManagedProcess {
+                pty,
                 child,
-                identity: ProcessIdentity { pgid: pid as i32 },
+                identity: ProcessIdentity { pgid: pid as i32, terminal: request.pty.is_some() },
                 stdout,
                 stderr,
                 sandbox_paths,
@@ -1711,6 +1735,8 @@ pub struct ProcessIdentity {
     /// Unix process group id (every spawn uses `process_group(0)`).
     #[cfg(unix)]
     pgid: i32,
+    #[cfg(unix)]
+    terminal: bool,
     /// Windows process id for `taskkill /T` tree kill.
     #[cfg(not(unix))]
     pid: u32,
@@ -1736,6 +1762,7 @@ impl ProcessIdentity {
         {
             use nix::sys::signal::{Signal, killpg};
             use nix::unistd::Pid;
+            if self.terminal { self.signal_terminal_session(Signal::SIGKILL); }
             let _ = killpg(Pid::from_raw(self.pgid), Signal::SIGKILL);
         }
         #[cfg(windows)]
@@ -1755,13 +1782,28 @@ impl ProcessIdentity {
             use nix::sys::signal::{Signal, killpg};
             use nix::unistd::Pid;
             let group = Pid::from_raw(self.pgid);
+            if self.terminal { self.signal_terminal_session(Signal::SIGTERM); }
             let _ = killpg(group, Signal::SIGTERM);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if self.terminal { self.signal_terminal_session(Signal::SIGKILL); }
             let _ = killpg(group, Signal::SIGKILL);
         }
         #[cfg(windows)]
         {
             self.kill_tree();
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal_terminal_session(self, signal: nix::sys::signal::Signal) {
+        match crate::pty::session_members(self.pgid) {
+            Ok(members) => for pid in members {
+                // Revalidate after enumeration; a recycled PID is not our authority.
+                if nix::unistd::getsid(Some(pid)).is_ok_and(|sid| sid.as_raw() == self.pgid) {
+                    let _ = nix::sys::signal::kill(pid, signal);
+                }
+            },
+            Err(error) => tracing::error!(session = self.pgid, %error, "cannot inspect terminal process session"),
         }
     }
 
@@ -1777,6 +1819,9 @@ impl ProcessIdentity {
     pub async fn group_gone(self) -> bool {
         #[cfg(unix)]
         {
+            if self.terminal {
+                return crate::pty::session_members(self.pgid).is_ok_and(|members| members.is_empty());
+            }
             process_group_gone(self.pgid, std::time::Duration::ZERO).await
         }
         #[cfg(not(unix))]
@@ -1793,6 +1838,8 @@ impl ProcessIdentity {
 /// lease lives exactly as long as the process unless the caller takes it.
 pub struct ManagedProcess {
     #[cfg(unix)]
+    pty: Option<std::sync::Arc<crate::pty::PtyMaster>>,
+    #[cfg(unix)]
     child: tokio::process::Child,
     #[cfg(windows)]
     child: Box<dyn process_wrap::tokio::TokioChildWrapper>,
@@ -1807,6 +1854,8 @@ pub struct ManagedProcess {
 }
 
 impl ManagedProcess {
+    #[cfg(unix)]
+    pub(crate) fn take_pty(&mut self) -> Option<std::sync::Arc<crate::pty::PtyMaster>> { self.pty.take() }
     pub fn identity(&self) -> ProcessIdentity {
         self.identity
     }
@@ -6747,6 +6796,30 @@ mod managed_runner_tests {
         let status = proc.wait().await.expect("wait");
         assert!(status.success(), "{status:?}");
         assert_eq!(out.trim(), "managed-ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_request_is_a_real_terminal() {
+        let dir = ws();
+        let mut req = ProcessRequest::new("/bin/sh", vec!["-c".into(), "test -t 0 && test -t 1 && stty size".into()], dir.path().to_path_buf());
+        req.unrestricted_execution = true;
+        let mut value = serde_json::to_value(req).unwrap();
+        value["pty"] = serde_json::json!({"cols": 91, "rows": 37});
+        let req = serde_json::from_value(value).unwrap();
+        let mut process = CommandRunner::new().spawn(&req).await.expect("spawn");
+        let master = process.take_pty().expect("PTY master");
+        let reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            let mut bytes = [0u8; 1024];
+            while let Ok(n) = master.read(&mut bytes).await {
+                if n == 0 { break; }
+                output.extend_from_slice(&bytes[..n]);
+            }
+            output
+        });
+        assert!(tokio::time::timeout(Duration::from_secs(5), process.wait()).await.expect("PTY exit deadline").unwrap().success(), "PTY request must attach a real terminal to stdin/stdout");
+        assert!(String::from_utf8_lossy(&reader.await.unwrap()).contains("37 91"));
     }
 
     /// The transcript env contract: a color-capable `TERM` must never leak

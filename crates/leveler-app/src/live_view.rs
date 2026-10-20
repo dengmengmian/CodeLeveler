@@ -173,6 +173,7 @@ mod tests {
                 description: "inspect lifecycle".to_string(),
                 status: leveler_client_protocol::PlanStepStatus::Running,
             }],
+            state: Default::default(),
         }
     }
 
@@ -383,7 +384,10 @@ mod task_cancel_cleanup_tests {
         views.apply(
             &session,
             &RuntimeEvent::PlanUpdated {
-                plan: UiPlan { steps: Vec::new() },
+                plan: UiPlan {
+                    steps: Vec::new(),
+                    state: Default::default(),
+                },
             },
         );
         views.apply(
@@ -422,7 +426,10 @@ mod task_cancel_cleanup_tests {
         views.apply(
             &session_id,
             &RuntimeEvent::PlanUpdated {
-                plan: UiPlan { steps: Vec::new() },
+                plan: UiPlan {
+                    steps: Vec::new(),
+                    state: Default::default(),
+                },
             },
         );
         views.apply(&session_id, &RuntimeEvent::ContextUsage { accounting });

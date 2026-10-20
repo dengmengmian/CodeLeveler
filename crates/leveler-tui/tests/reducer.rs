@@ -3032,6 +3032,7 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
             description: "run tests".to_string(),
             status: leveler_client_protocol::PlanStepStatus::Running,
         }],
+        state: Default::default(),
     });
     snap.checkpoints = vec![UiCheckpoint {
         id: leveler_client_protocol::CheckpointId::new("cp-1"),
@@ -4670,6 +4671,7 @@ fn plan_events_update_state() {
                     description: "定位代码".into(),
                     status: PlanStepStatus::Running,
                 }],
+                state: Default::default(),
             },
         }),
     );
@@ -4700,6 +4702,7 @@ fn successive_plan_events_advance_the_mirrored_plan() {
                 status: statuses[2],
             },
         ],
+        state: Default::default(),
     };
     let mut s = opened();
     for statuses in [
@@ -4766,6 +4769,7 @@ fn plan_summary_opens_a_full_plan_page_with_keyboard_and_returns_with_esc() {
                 status: PlanStepStatus::Pending,
             },
         ],
+        state: Default::default(),
     });
 
     let workbench = rendered(&mut s, 100, 30);
@@ -4821,6 +4825,7 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
                 },
             })
             .collect(),
+        state: Default::default(),
     });
 
     let workbench = rendered(&mut s, 100, 24);
@@ -10033,6 +10038,7 @@ fn a_plan_transition_is_on_screen_in_the_next_frame() {
                         status: c,
                     },
                 ],
+                state: Default::default(),
             },
         })
     };
@@ -10082,6 +10088,7 @@ fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
                         status: P::Pending,
                     },
                 ],
+                state: Default::default(),
             },
         }),
     );
@@ -10132,6 +10139,7 @@ fn the_parent_advancing_after_a_child_settles_projects_normally() {
                         status: b,
                     },
                 ],
+                state: Default::default(),
             },
         })
     };
@@ -10184,6 +10192,7 @@ fn stale_open_plan(s: &mut AppState) {
                         _ => step(i, P::Pending),
                     })
                     .collect(),
+                state: Default::default(),
             },
         }),
     );
@@ -10223,6 +10232,7 @@ fn a_completed_plan_disappears_when_the_turn_ends() {
                         status: P::Skipped,
                     },
                 ],
+                state: Default::default(),
             },
         }),
     );
@@ -11519,6 +11529,7 @@ fn plan_of(steps: &[(&str, PlanStepStatus)]) -> UiPlan {
                 status: *status,
             })
             .collect(),
+        state: Default::default(),
     }
 }
 

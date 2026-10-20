@@ -1,9 +1,9 @@
 //! 待发送 — what the user wrote while a turn runs and has not sent yet.
 //!
-//! Bottom control state, never conversation truth. An item leaves this list in
-//! exactly two ways: the runtime admits it (and it becomes a user message in
-//! the conversation), or the user deletes it while it is still unsent. The
-//! list is a FIFO continuation queue: once the runtime is ready for the next
+//! Bottom control state, never conversation truth. An item leaves this list
+//! when the runtime admits it (and it becomes a user message in the
+//! conversation), or the user deletes it or takes it back for editing while
+//! it is still unsent. The list is a FIFO continuation queue: once the runtime is ready for the next
 //! turn its head is submitted automatically, oldest first, one at a time
 //! (`reducer::submit::drain_pending_input`). Sending reuses the ordinary
 //! turn-input delivery (`pending_submissions`, one `CommandId`, at-least-once
@@ -87,6 +87,7 @@ pub struct PendingInputHit {
     pub row: u16,
     pub index: Option<usize>,
     pub send: Option<(u16, u16)>,
+    pub edit: Option<(u16, u16)>,
     pub delete: Option<(u16, u16)>,
 }
 
@@ -172,7 +173,10 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
         // only while it is still unsent.
         let (right, actions) = if active && item.is_unsent() {
             (
-                format!("{} · {}", t.pending_input_send, t.pending_input_delete),
+                format!(
+                    "{} · {} · {}",
+                    t.pending_input_send, t.pending_input_edit, t.pending_input_delete
+                ),
                 true,
             )
         } else {
@@ -207,19 +211,27 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             row,
             index: Some(index),
             send: None,
+            edit: None,
             delete: None,
         };
         if actions {
             let x = area.x + (used + ITEM_ACTION_GAP) as u16;
             let send_w = UnicodeWidthStr::width(t.pending_input_send) as u16;
             let sep_w = UnicodeWidthStr::width(" · ") as u16;
+            let edit_w = UnicodeWidthStr::width(t.pending_input_edit) as u16;
             let delete_w = UnicodeWidthStr::width(t.pending_input_delete) as u16;
-            hit.send = Some((x, x + send_w));
-            hit.delete = Some((x + send_w + sep_w, x + send_w + sep_w + delete_w));
+            hit.send = Some((x, x + send_w)).filter(|&(_, end)| end <= area.right());
+            let edit_x = x + send_w + sep_w;
+            hit.edit = Some((edit_x, edit_x + edit_w)).filter(|&(_, end)| end <= area.right());
+            let delete_x = edit_x + edit_w + sep_w;
+            hit.delete =
+                Some((delete_x, delete_x + delete_w)).filter(|&(_, end)| end <= area.right());
             spans.push(Span::styled(
                 t.pending_input_send.to_string(),
                 Style::default().fg(theme.accent.primary),
             ));
+            spans.push(Span::styled(" · ", muted));
+            spans.push(Span::styled(t.pending_input_edit.to_string(), muted));
             spans.push(Span::styled(" · ", muted));
             spans.push(Span::styled(t.pending_input_delete.to_string(), muted));
         } else {
@@ -239,6 +251,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             row: area.y + lines.len() as u16,
             index: None,
             send: None,
+            edit: None,
             delete: None,
         });
         lines.push(Line::from(Span::styled(
@@ -263,6 +276,10 @@ mod tests {
 
     /// Render one selected item at `width` and return where its actions land.
     fn actions_at(text: &str, width: u16) -> PendingInputHit {
+        actions_at_locale(text, width, crate::i18n::Locale::En)
+    }
+
+    fn actions_at_locale(text: &str, width: u16, locale: crate::i18n::Locale) -> PendingInputHit {
         let mut state = AppState::new(
             crate::theme::Theme::no_color(),
             crate::state::Boot {
@@ -273,7 +290,7 @@ mod tests {
                 draft_path: None,
                 history_path: None,
                 context_window: 200_000,
-                locale: crate::i18n::Locale::En,
+                locale,
                 untrusted_config: Vec::new(),
                 model_notice: None,
                 thinking: None,
@@ -322,5 +339,28 @@ mod tests {
             hit.delete.is_some_and(|(_, de)| de <= x + 40),
             "delete stays part of the same bounded cluster"
         );
+    }
+
+    #[test]
+    fn edit_hit_fits_between_send_and_delete_in_both_languages() {
+        for locale in [crate::i18n::Locale::En, crate::i18n::Locale::Zh] {
+            let hit = actions_at_locale(&"长内容".repeat(40), 40, locale);
+            let send = hit.send.unwrap();
+            let edit = hit
+                .edit
+                .expect("edit remains visible at a narrow terminal width");
+            let delete = hit.delete.unwrap();
+            assert!(send.1 < edit.0 && edit.1 < delete.0 && delete.1 <= 40);
+            let clipped = actions_at_locale("long text", 10, locale);
+            for span in [clipped.send, clipped.edit, clipped.delete]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    span.1 <= 10,
+                    "clipped actions must not be clickable outside the panel"
+                );
+            }
+        }
     }
 }

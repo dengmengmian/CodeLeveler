@@ -254,7 +254,29 @@ impl Drop for KillOnDrop {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TerminalObservation {
+    pub snapshot: BackgroundTaskSnapshot,
+    pub cols: u16,
+    pub rows: u16,
+    pub output_start: u64,
+    pub output_end: u64,
+    pub next_cursor: u64,
+    pub data: Vec<u8>,
+    pub truncated: bool,
+}
+
+#[cfg(unix)]
+struct TerminalIo {
+    master: Arc<crate::pty::PtyMaster>,
+    size: crate::command::PtySize,
+    bytes: std::collections::VecDeque<u8>,
+    end: u64,
+}
+
 struct TaskInner {
+    #[cfg(unix)]
+    terminal: Option<TerminalIo>,
     id: String,
     /// Which session started this task, when known. Daemon-scoped tasks have
     /// no owner. Session-owned task cleanup follows `lifetime`; runtime shutdown
@@ -655,6 +677,86 @@ impl BackgroundTaskRegistry {
         Ok(())
     }
 
+    /// Create an idempotent, session-owned PTY in the persistent Execution Host.
+    pub async fn create_terminal(&self, id: &str, request: ProcessRequest, owner: &str) -> Result<TerminalObservation, String> {
+        if request.pty.is_none() { return Err("terminal requires PTY dimensions".into()); }
+        let config = self.execution_host.clone().ok_or("persistent execution is not configured")?;
+        let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
+        client.require_terminal()?;
+        self.journal()?.prepare_with_scope(id, owner, owner, None, request.write_scope.clone()).await?;
+        let task = match client.spawn(id, request, owner, owner, BackgroundTaskLifetime::Session).await {
+            Ok(task) => task,
+            Err(crate::execution_host::SpawnError::Rejected(error)) => {
+                self.journal()?.abandon_prepared(id)?;
+                return Err(error);
+            }
+            Err(crate::execution_host::SpawnError::OutcomeUnknown(error)) => return Err(error),
+        };
+        self.monitor_hosted(task)?;
+        client.terminal_observe(id, owner, 0, 64 * 1024).await
+    }
+
+    pub async fn terminal_write(&self, id: &str, owner: &str, data: Vec<u8>) -> Result<(), String> {
+        if data.len() > 64 * 1024 { return Err("terminal input exceeds 64 KiB".into()); }
+        if self.execution_host.is_some() {
+            return self.host_client().await?.terminal_write(id, owner, data).await;
+        }
+        #[cfg(unix)]
+        {
+            let state = self.inner.lock().await;
+            let task = state.tasks.get(id).ok_or("unknown terminal")?;
+            if task.owner_scope.as_deref() != Some(owner) { return Err("terminal belongs to another session".into()); }
+            if task.status != BackgroundTaskStatus::Running { return Err("terminal is not running".into()); }
+            let master = task.terminal.as_ref().ok_or("task is not a terminal")?.master.clone();
+            drop(state);
+            // A failed write may already have delivered a prefix. Never replay it.
+            return master.write(&data).await.map_err(|e| format!("terminal input outcome unknown: {e}"));
+        }
+        #[cfg(not(unix))]
+        Err("Unsupported: PTY terminals on this platform".into())
+    }
+
+    pub async fn terminal_resize(&self, id: &str, owner: &str, size: crate::command::PtySize) -> Result<(), String> {
+        if size.cols == 0 || size.rows == 0 || size.cols > 1000 || size.rows > 1000 { return Err("invalid PTY size".into()); }
+        if self.execution_host.is_some() {
+            return self.host_client().await?.terminal_resize(id, owner, size).await;
+        }
+        #[cfg(unix)]
+        {
+            let mut state = self.inner.lock().await;
+            let task = state.tasks.get_mut(id).ok_or("unknown terminal")?;
+            if task.owner_scope.as_deref() != Some(owner) { return Err("terminal belongs to another session".into()); }
+            if task.status != BackgroundTaskStatus::Running { return Err("terminal is not running".into()); }
+            let terminal = task.terminal.as_mut().ok_or("task is not a terminal")?;
+            terminal.master.resize(size).map_err(|e| e.to_string())?;
+            terminal.size = size;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        Err("Unsupported: PTY terminals on this platform".into())
+    }
+
+    pub async fn terminal_observe(&self, id: &str, owner: &str, cursor: u64, max_bytes: usize) -> Result<TerminalObservation, String> {
+        if max_bytes == 0 || max_bytes > 64 * 1024 { return Err("terminal read size must be 1..65536".into()); }
+        if self.execution_host.is_some() {
+            return self.host_client().await?.terminal_observe(id, owner, cursor, max_bytes).await;
+        }
+        #[cfg(unix)]
+        {
+            let state = self.inner.lock().await;
+            let task = state.tasks.get(id).ok_or("unknown terminal")?;
+            if task.owner_scope.as_deref() != Some(owner) { return Err("terminal belongs to another session".into()); }
+            let terminal = task.terminal.as_ref().ok_or("task is not a terminal")?;
+            if cursor > terminal.end { return Err("terminal cursor beyond output end".into()); }
+            let start = terminal.end - terminal.bytes.len() as u64;
+            let position = cursor.max(start);
+            let data: Vec<u8> = terminal.bytes.iter().skip((position - start) as usize).take(max_bytes).copied().collect();
+            return Ok(TerminalObservation { snapshot: snapshot(task), cols: terminal.size.cols, rows: terminal.size.rows, output_start: start, output_end: terminal.end, next_cursor: position + data.len() as u64, data, truncated: cursor < start });
+        }
+        #[cfg(not(unix))]
+        Err("Unsupported: PTY terminals on this platform".into())
+    }
+
     async fn spawn_hosted(
         &self,
         request: ProcessRequest,
@@ -888,12 +990,16 @@ impl BackgroundTaskRegistry {
             hook.reached.notify_one();
             hook.release.notified().await;
         }
+        #[cfg(unix)]
+        let pty = reservation.process_mut().take_pty();
         let identity = reservation.process_mut().identity();
         let pid = process_identity_pid(&identity);
         let stdout = reservation.process_mut().take_stdout();
         let stderr = reservation.process_mut().take_stderr();
         let sandbox_scratch = reservation.process_mut().take_sandbox_scratch();
         let log_pumps_remaining = u8::from(stdout.is_some()) + u8::from(stderr.is_some());
+        #[cfg(unix)]
+        let log_pumps_remaining = log_pumps_remaining + u8::from(pty.is_some());
         let done = Arc::new(Notify::new());
         let reg = self.inner.clone();
         // Weak: must not keep KillOnDrop alive past registry handle drop.
@@ -906,6 +1012,8 @@ impl BackgroundTaskRegistry {
         st.tasks.insert(
             id.clone(),
             TaskInner {
+                #[cfg(unix)]
+                terminal: None,
                 id: id.clone(),
                 owner_scope: owner_scope.map(str::to_string),
                 writer_scope: writer_scope.to_string(),
@@ -947,6 +1055,13 @@ impl BackgroundTaskRegistry {
         drop(st);
 
         let log_cancel = CancellationToken::new();
+        #[cfg(unix)]
+        if let Some(master) = pty {
+            if let Some(task) = self.inner.lock().await.tasks.get_mut(&id) {
+                task.terminal = Some(TerminalIo { master: master.clone(), size: request.pty.expect("PTY size"), bytes: Default::default(), end: 0 });
+            }
+            spawn_terminal_pump(reg.clone(), tid.clone(), master, self.lifecycle_events.clone(), log_cancel.clone());
+        }
         spawn_log_pump(
             reg.clone(),
             tid.clone(),
@@ -1097,6 +1212,8 @@ impl BackgroundTaskRegistry {
             st.tasks.insert(
                 id.clone(),
                 TaskInner {
+                    #[cfg(unix)]
+                    terminal: None,
                     id: id.clone(),
                     owner_scope: spec.owner_scope.clone(),
                     writer_scope: spec.writer_scope.clone(),
@@ -2124,6 +2241,45 @@ fn prune_terminal_tasks(state: &mut RegistryState) {
     }
 }
 
+#[cfg(unix)]
+fn spawn_terminal_pump(reg: Arc<Mutex<RegistryState>>, id: String, master: Arc<crate::pty::PtyMaster>, events: broadcast::Sender<BackgroundTaskEvent>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut bytes = [0u8; 8192];
+        loop {
+            let read = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                read = master.read(&mut bytes) => read,
+            };
+            match read {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut state = reg.lock().await;
+                    if let Some(task) = state.tasks.get_mut(&id) {
+                        if let Some(terminal) = &mut task.terminal {
+                            terminal.bytes.extend(&bytes[..n]);
+                            terminal.end += n as u64;
+                            let excess = terminal.bytes.len().saturating_sub(MAX_LOG_BYTES);
+                            terminal.bytes.drain(..excess);
+                            task.changed.notify_waiters();
+                        }
+                    }
+                }
+                // PTY masters signal EIO after their final slave closes.
+                Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => break,
+                Err(_) => break,
+            }
+        }
+        let mut state = reg.lock().await;
+        if let Some(task) = state.tasks.get_mut(&id) {
+            task.log_pumps_remaining = task.log_pumps_remaining.saturating_sub(1);
+            if finalize_if_drained(task) {
+                let _ = events.send(BackgroundTaskEvent::Exited { owner_scope: task.owner_scope.clone(), task: snapshot(task) });
+            }
+        }
+    });
+}
+
 fn spawn_log_pump<R>(
     reg: Arc<Mutex<RegistryState>>,
     tid: String,
@@ -2962,6 +3118,8 @@ mod tests {
             state.tasks.insert(
                 id.clone(),
                 TaskInner {
+                    #[cfg(unix)]
+                    terminal: None,
                     id,
                     owner_scope: None,
                     writer_scope: "parent".into(),
@@ -3001,6 +3159,8 @@ mod tests {
             state.tasks.insert(
                 id.into(),
                 TaskInner {
+                    #[cfg(unix)]
+                    terminal: None,
                     id: id.into(),
                     owner_scope: None,
                     writer_scope: "parent".into(),
@@ -3055,6 +3215,8 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch");
         let scratch_path = scratch.path().to_path_buf();
         let mut task = TaskInner {
+            #[cfg(unix)]
+            terminal: None,
             id: "done".into(),
             owner_scope: None,
             writer_scope: "parent".into(),
@@ -3096,6 +3258,8 @@ mod tests {
     #[tokio::test]
     async fn killing_a_reaped_group_waits_for_settlement_without_signalling() {
         let task = TaskInner {
+            #[cfg(unix)]
+            terminal: None,
             id: "done".into(),
             owner_scope: Some("owner".into()),
             writer_scope: "parent".into(),

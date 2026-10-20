@@ -70,9 +70,13 @@ pub fn dismiss(state: &mut AppState) {
 }
 
 /// Offer a runtime-generated prediction only while its idle-input window is
-/// still untouched. `offer` keeps the composer-empty guard authoritative.
+/// still untouched and a conversation exists. `offer` keeps the composer-empty
+/// guard authoritative.
 pub fn offer_generated(state: &mut AppState, text: &str) {
-    if state.prompt_suggestion_allowed && state.prompt_suggestion.is_none() {
+    if state.prompt_suggestion_allowed
+        && state.prompt_suggestion.is_none()
+        && !crate::splash::conversation_is_empty(state)
+    {
         offer(state, text);
     }
 }

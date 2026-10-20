@@ -1335,6 +1335,27 @@ protocol, without duplicating process orchestration or business state.
 Closing Desktop disconnects the bridge without cancelling turns or stopping
 Runtime; Runtime retains its existing idle reclamation policy. Desktop Main and the Rust bridge accept the existing `CancelTask` / `ResumeTask` commands bound to the selected session, with bounded continuation content. App / Harness owners retain cancellation and recovery lifecycle authority.
 
+Desktop interactive terminals reuse the same Execution Host,
+BackgroundTaskRegistry, and CommandRunner. The host execution authority owns
+the PTY process, input, dimensions, raw output, and exit facts. Application
+validates session ownership and freezes the actual execution policy at creation;
+Desktop only forwards bounded input, dimensions, and output cursors. Electron
+does not launch another shell execution path. Terminals are independent of Agent
+turns and their input does not enter the model conversation. Full remains
+unrestricted; other modes retain enforceable host boundaries. Opening a terminal
+does not grant unrestricted authority. Missing PTY capabilities, workspaces, or
+platform support fail explicitly.
+
+Creation uses a stable identity so reconnect cannot launch a duplicate. Input
+with an unknown outcome is never automatically resent. Switching sessions or
+hiding a pane only detaches presentation; recovery observes the same terminal.
+Output uses host raw-byte cursors and explicitly marks retention gaps. Ctrl+C is
+written to the PTY so the terminal driver signals its foreground job. Closing a
+tab stops its process tree and confirms exit before releasing the tab. Normal
+Desktop exit closes terminals created by that client; disconnection alone is
+not an exit fact. An older host lacking required capabilities must not trigger
+a silent fallback to a local process.
+
 ### 13.2.1 Optional Workspace and Global History Contracts
 
 Session, TaskEngine, and Runtime retain one implementation. A Session's durable `repository` is its optional primary workspace: existing projects remain `Some(path)` and No Workspace is `None`. Application state always exists; execution working directories depend on capability and authorization. HOME, startup cwd, the previous project, and internal scratch paths cannot substitute for any of these facts.

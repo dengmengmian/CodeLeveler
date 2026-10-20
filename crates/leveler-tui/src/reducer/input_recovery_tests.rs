@@ -147,6 +147,7 @@ fn input_recovery_search_mouse_cannot_send_covered_pending_input() {
         row: 20,
         index: Some(0),
         send: Some((0, 10)),
+        edit: None,
         delete: None,
     });
     key(&mut s, KeyCode::Char('r'), KeyModifiers::CONTROL);
@@ -231,4 +232,165 @@ fn input_recovery_update_panel_cannot_open_an_invisible_search() {
     s.update = Some(crate::update::UpdateView::new());
     key(&mut s, KeyCode::Char('r'), KeyModifiers::CONTROL);
     assert!(s.history_search.is_none());
+}
+
+#[test]
+fn pending_edit_returns_unsent_text_to_composer_without_sending() {
+    for pending_state in [
+        crate::pending_inputs::PendingInputState::Queued,
+        crate::pending_inputs::PendingInputState::Failed("refused".into()),
+    ] {
+        let mut s = state();
+        s.status = RuntimeStatus::Busy;
+        let mut item =
+            crate::pending_inputs::PendingInput::queued("中文\n继续编辑", s.session_id.clone());
+        item.state = pending_state;
+        s.pending_inputs.push(item);
+        s.workbench_focus = WorkbenchFocus::Pending;
+        assert!(key(&mut s, KeyCode::Char('e'), KeyModifiers::NONE).is_empty());
+        assert_eq!(s.composer.canonical_text(), "中文\n继续编辑");
+        assert!(s.pending_inputs.is_empty());
+        assert!(s.pending_submissions.is_empty());
+        assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
+        reduce(&mut s, Action::TextInput("！".into()));
+        assert!(key(&mut s, KeyCode::Enter, KeyModifiers::NONE).is_empty());
+        assert_eq!(s.pending_inputs[0].text, "中文\n继续编辑！");
+        assert!(s.pending_inputs[0].is_queued());
+    }
+}
+
+#[test]
+fn pending_edit_preserves_existing_draft_and_queue() {
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    s.composer.replace("已有草稿");
+    s.pending_inputs
+        .push(crate::pending_inputs::PendingInput::queued(
+            "队列内容",
+            s.session_id.clone(),
+        ));
+    s.workbench_focus = WorkbenchFocus::Pending;
+    assert!(key(&mut s, KeyCode::Char('e'), KeyModifiers::NONE).is_empty());
+    assert_eq!(s.composer.text(), "已有草稿");
+    assert_eq!(s.pending_inputs[0].text, "队列内容");
+    assert!(s.notification.is_some());
+}
+
+#[test]
+fn pending_edit_cannot_take_inflight_or_other_session_input() {
+    use crate::pending_inputs::{PendingInput, PendingInputState};
+    for pending_state in [
+        PendingInputState::Submitting(CommandId::new("sent")),
+        PendingInputState::DeliveryUnknown(CommandId::new("sent")),
+    ] {
+        let mut s = state();
+        s.status = RuntimeStatus::Busy;
+        let mut item = PendingInput::queued("已发送", s.session_id.clone());
+        item.state = pending_state;
+        s.pending_inputs.push(item.clone());
+        s.workbench_focus = WorkbenchFocus::Pending;
+        assert!(key(&mut s, KeyCode::Char('e'), KeyModifiers::NONE).is_empty());
+        assert!(s.composer.is_empty());
+        assert_eq!(s.pending_inputs, vec![item]);
+    }
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    s.pending_inputs
+        .push(PendingInput::queued("其他会话", SessionId::new("other")));
+    s.workbench_focus = WorkbenchFocus::Pending;
+    assert!(key(&mut s, KeyCode::Char('e'), KeyModifiers::NONE).is_empty());
+    assert!(s.composer.is_empty());
+    assert_eq!(s.pending_inputs.len(), 1);
+}
+
+#[test]
+fn pending_edit_resets_shell_mode_and_preserves_other_queue_entries() {
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    s.input_mode = crate::shell_mode::InputMode::Shell;
+    s.pending_inputs
+        .push(crate::pending_inputs::PendingInput::queued(
+            "首条",
+            s.session_id.clone(),
+        ));
+    s.pending_inputs
+        .push(crate::pending_inputs::PendingInput::queued(
+            "编辑这条",
+            s.session_id.clone(),
+        ));
+    s.pending_selected = 1;
+    s.pending_hover = Some(1);
+    s.workbench_focus = WorkbenchFocus::Pending;
+    key(&mut s, KeyCode::Char('e'), KeyModifiers::NONE);
+    assert_eq!(s.input_mode, crate::shell_mode::InputMode::Normal);
+    assert_eq!(s.composer.text(), "编辑这条");
+    assert_eq!(s.pending_inputs[0].text, "首条");
+    assert_eq!(s.pending_selected, 0);
+    assert_eq!(s.pending_hover, None);
+}
+
+#[test]
+fn pending_edit_mouse_returns_text_and_clears_stale_hits() {
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    s.pending_inputs
+        .push(crate::pending_inputs::PendingInput::queued(
+            "鼠标取回",
+            s.session_id.clone(),
+        ));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    s.workbench_focus = WorkbenchFocus::Pending;
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            crate::pending_inputs::render(frame, area, &mut s, 24);
+        })
+        .unwrap();
+    let hit = s.pending_hits[0];
+    let (column, _) = hit.edit.expect("selected item shows edit action");
+    assert!(
+        reduce(
+            &mut s,
+            Action::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: hit.row,
+                modifiers: KeyModifiers::NONE,
+            })
+        )
+        .is_empty()
+    );
+    assert_eq!(s.composer.text(), "鼠标取回");
+    assert!(s.pending_inputs.is_empty());
+    assert!(s.pending_hits.is_empty());
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
+}
+
+#[test]
+fn pending_edit_preserves_attachment_only_draft() {
+    use leveler_client_protocol::{AttachmentId, AttachmentKind, AttachmentRef};
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    let attachment = AttachmentRef {
+        id: AttachmentId::new("draft-image"),
+        kind: AttachmentKind::Image,
+        name: "draft.png".into(),
+        mime_type: "image/png".into(),
+        size_bytes: 1,
+        sha256: "hash".into(),
+        width: Some(1),
+        height: Some(1),
+    };
+    s.pending_attachments.push(attachment.clone());
+    s.pending_inputs
+        .push(crate::pending_inputs::PendingInput::queued(
+            "待编辑",
+            s.session_id.clone(),
+        ));
+    s.workbench_focus = WorkbenchFocus::Pending;
+    super::submit::edit_pending_input(&mut s, 0);
+    assert!(s.composer.is_empty());
+    assert_eq!(s.pending_attachments, vec![attachment]);
+    assert_eq!(s.pending_inputs.len(), 1);
+    assert!(s.notification.is_some());
 }

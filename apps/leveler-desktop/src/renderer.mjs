@@ -1,3 +1,4 @@
+import { DesktopTerminals } from './terminal.mjs';
 import { renderMarkdown } from './markdown.mjs';
 import {
   modelLabel, workspaceLabel, toolLabel, toolTarget, browserActivity, sourceErrorSummary,
@@ -56,6 +57,12 @@ let loading = false;
 let busy = 0;
 let opening = 0;
 let uncertain = null;
+// Connection is transport truth from Main, never inferred from task status.
+let connectionState = { state: 'connecting' };
+// Highest durable sequence already applied. A reconnect snapshot is a
+// request/response that can be older than events already streamed to this
+// page; an older snapshot must never replace newer state.
+let lastEventSeq = -1;
 let pendingCreation = null;
 let runStartedAt = null;
 let runClockTimer = null;
@@ -153,22 +160,7 @@ function loadSettings() {
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* optional */ }
 }
-const VIEW_KEY = 'codeleveler.views.v1';
 const OPEN_APP_KEY = 'codeleveler.open-in-app.v1';
-function savedView(sessionId) {
-  try {
-    const stored = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}');
-    return stored && stored[sessionId] === 'trajectory' ? 'trajectory' : 'chat';
-  } catch { return 'chat'; }
-}
-function rememberView(sessionId, view) {
-  if (!sessionId) return;
-  try {
-    const stored = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}');
-    stored[sessionId] = view;
-    localStorage.setItem(VIEW_KEY, JSON.stringify(stored));
-  } catch { /* optional */ }
-}
 function savedOpenApp() {
   try { return localStorage.getItem(OPEN_APP_KEY) || null; } catch { return null; }
 }
@@ -216,13 +208,14 @@ function controls() {
   const uploads = uploadPending();
   const hasContent = $('message').value.trim() !== '' || attachments().some(item => item.status === 'ready');
   const running = ['running', 'waiting_user'].includes(current?.status);
-  const frozen = loading || !!uncertain || uploads;
+  const offline = connectionState.state !== 'connected';
+  const frozen = loading || !!uncertain || uploads || offline;
   $('send').disabled = frozen || !hasContent;
   $('attachment-add').disabled = frozen;
   $('model-picker').disabled = frozen;
   $('permission-picker').disabled = frozen;
   $('workspace-picker').disabled = frozen;
-  $('new-session').disabled = loading || uploads;
+  $('new-session').disabled = loading || uploads || offline;
   $('leading-new').disabled = $('new-session').disabled;
   $('stop').hidden = !running;
   $('stop').disabled = loading;
@@ -234,6 +227,34 @@ function controls() {
   $('conversation-status').textContent = loading ? '连接 Runtime…'
     : current ? (current.approvals.length || current.clarifications.length
       ? '等待你处理' : current.activity || LABELS[current.status] || current.status) : '';
+}
+
+// One visible state, sourced from the bridge's real transport lifecycle.
+function applyConnection(frame) {
+  connectionState = { ...frame };
+  const banner = $('connection-banner');
+  if (banner) {
+    if (frame.state === 'connected') {
+      banner.hidden = true;
+      banner.replaceChildren();
+      if (frame.resumed) toast('已重新连接 Runtime', { tone: 'success', holdMs: 2200 });
+    } else {
+      const text = frame.state === 'connecting' ? '正在连接 Runtime…'
+        : frame.state === 'restoring' ? '连接已恢复，正在恢复会话…'
+        : frame.state === 'restore_failed' ? `会话恢复失败：${frame.message ?? '未知错误'}`
+        : frame.state === 'failed' ? (frame.message ?? '无法连接 Runtime')
+        : `连接已断开，正在重连${frame.attempt ? `（第 ${frame.attempt} 次）` : ''}…`;
+      banner.replaceChildren(el('span', 'connection-text', text));
+      if (frame.state === 'failed' || frame.state === 'restore_failed') {
+        const retry = el('button', 'button secondary', '重试');
+        retry.type = 'button';
+        retry.addEventListener('click', () => action(() => api.reconnect()));
+        banner.append(retry);
+      }
+      banner.hidden = false;
+    }
+  }
+  controls();
 }
 
 async function action(callback, { onError = null, clearGlobal = true } = {}) {
@@ -1107,7 +1128,6 @@ function installViewTabs() {
       return;
     }
     activeView = next;
-    rememberView(current.session.id, next);
     renderHeader();
     renderConversation();
     renderTrajectory();
@@ -1481,16 +1501,19 @@ function renderComposerDocks() {
     dock.append(head);
     host.append(dock);
   }
-  const steps = current.plan?.steps ?? [];
+  // The dock is current work. A completed or interrupted plan stays readable
+  // in the plan view, but must not look like an active checklist.
+  const planState = current.plan?.state ?? 'active';
+  const steps = planState === 'active' ? (current.plan?.steps ?? []) : [];
   if (steps.length) {
     const done = steps.filter(step => step.status === 'done').length;
     const dock = el('details', 'composer-dock todo-dock');
     const summary = el('summary', 'composer-dock-head');
-    summary.append(el('span', undefined, `任务 ${done}/${steps.length}`), el('span', 'composer-dock-meta', steps.find(step => step.status === 'in_progress')?.description ?? ''));
+    summary.append(el('span', undefined, `任务 ${done}/${steps.length}`), el('span', 'composer-dock-meta', steps.find(step => step.status === 'running')?.description ?? ''));
     dock.append(summary);
     for (const step of steps) {
       const row = el('div', 'composer-dock-row');
-      row.append(el('span', `composer-step-mark ${step.status}`, step.status === 'done' ? '✓' : step.status === 'in_progress' ? '●' : '○'), el('span', 'composer-dock-text', step.description));
+      row.append(el('span', `composer-step-mark ${step.status}`, step.status === 'done' ? '✓' : step.status === 'running' ? '●' : '○'), el('span', 'composer-dock-text', step.description));
       dock.append(row);
     }
     host.append(dock);
@@ -2443,7 +2466,8 @@ function planCard() {
   const icon = el('span', 'plan-card-icon');
   icon.append(iconNode('list', { size: 20 }));
   const copy = el('span', 'plan-card-copy');
-  copy.append(el('span', 'plan-card-title', '执行计划'), el('span', 'plan-card-desc', `${done} / ${steps.length} 步骤已完成`));
+  const planStateLabel = current?.plan?.state === 'completed' ? '（已完成）' : current?.plan?.state === 'interrupted' ? '（已中断）' : '';
+  copy.append(el('span', 'plan-card-title', `执行计划${planStateLabel}`), el('span', 'plan-card-desc', `${done} / ${steps.length} 步骤已完成`));
   main.append(icon, copy, el('span', 'plan-card-open', '打开'));
   main.addEventListener('click', () => openRightbarTab('plan'));
   const review = el('button', 'plan-review-open', '审阅');
@@ -3961,7 +3985,8 @@ async function createTask() {
   uncertain = null;
   currentSource = result.source_id ?? null;
   current = attachExtras(projectSnapshot(result.session), result.session);
-  activeView = savedView(current.session.id);
+  lastEventSeq = result.session.last_sequence ?? 0;
+  activeView = 'chat';
   liveTrajectory = [];
   liveTurnStartAt = null;
   liveTurnClosed = false;
@@ -4018,7 +4043,8 @@ async function openTask(task) {
   if (task.primary_workspace) foldedGroups.delete(task.primary_workspace);
   currentSource = result.source_id ?? task.source_id;
   current = attachExtras(projectSnapshot(result.session), result.session);
-  activeView = savedView(current.session.id);
+  lastEventSeq = result.session.last_sequence ?? 0;
+  activeView = 'chat';
   liveTrajectory = [];
   liveTurnStartAt = null;
   liveTurnClosed = false;
@@ -4097,6 +4123,12 @@ async function refreshSnapshot() {
 async function loadHistory() {
   if (!current) return;
   await deliver({ type: 'query_session_history', session_id: current.session.id, query_id: crypto.randomUUID() });
+}
+
+// A reconnect snapshot carries messages the old replay buffer never saw.
+// Rebuild from the snapshot now, then replace it with the fresh durable log.
+function reloadHistory() {
+  loadHistory().catch(error => toast(`历史加载失败：${error.message}`, { tone: 'error', holdMs: 4000 }));
 }
 
 async function deliver(command, envelope = commandEnvelope(current.session.id, command, current.session.last_sequence ?? 0)) {
@@ -4501,10 +4533,15 @@ function closeRightbar() {
   renderRightbar();
   scheduleBrowserSurface();
 }
-function closeTab(pane, tabId) {
+async function closeTab(pane, tabId) {
   const index = pane.tabs.indexOf(tabId);
   if (index < 0) return;
   const closing = rightbarTabs[tabId];
+  if (closing?.kind === 'terminal') {
+    try { await terminals.close(closing, rightbarSessionKey); }
+    catch (error) { toast(error.message, { tone: 'warning' }); return; }
+    if (rightbarTabs[tabId] !== closing) return;
+  }
   closeNativeBrowserTab(closing);
   pane.tabs.splice(index, 1);
   delete rightbarTabs[tabId];
@@ -4844,8 +4881,13 @@ function dockFloat(float) {
   void selectBrowserTab(rightbarTabs[float.tabId]);
 }
 
-function removeFloat(float) {
+async function removeFloat(float) {
   const closing = rightbarTabs[float.tabId];
+  if (closing?.kind === 'terminal') {
+    try { await terminals.close(closing, rightbarSessionKey); }
+    catch (error) { toast(error.message, { tone: 'warning' }); return; }
+    if (rightbarTabs[float.tabId] !== closing) return;
+  }
   closeNativeBrowserTab(closing);
   rightbarFloats = rightbarFloats.filter(item => item !== float);
   delete rightbarTabs[float.tabId];
@@ -4870,7 +4912,7 @@ function updateRightbarButtons() {
 function renderTabView(tab, pane) {
   if (tab.kind === 'start') return startView(tab);
   if (tab.kind === 'files') return filesView(tab);
-  if (tab.kind === 'terminal') return terminalView();
+  if (tab.kind === 'terminal') return terminalView(tab);
   if (tab.kind === 'browser') return browserView(tab, pane);
   if (tab.kind === 'changes') return changesView(tab);
   if (tab.kind === 'preview') return previewView(tab);
@@ -4899,21 +4941,6 @@ function startView(tab) {
     const text = el('span', 'start-card-text');
     text.append(el('span', 'start-card-title', title), el('span', 'start-card-desc', description));
     button.append(iconWrap, text, el('span', 'start-card-shortcut', shortcut));
-    if (kind === 'terminal') {
-      const chevron = el('span', 'start-card-chevron');
-      chevron.append(iconNode('chevronDown', { size: 14 }));
-      chevron.addEventListener('click', event => {
-        event.stopPropagation();
-        openMenu({
-          anchor: chevron, width: 200, align: 'end',
-          items: [
-            { label: 'zsh', disabled: true, title: '桌面桥接未提供 Shell 列表' },
-            { label: 'bash', disabled: true, title: '桌面桥接未提供 Shell 列表' },
-          ],
-        });
-      });
-      button.append(chevron);
-    }
     button.addEventListener('click', onClick);
     return button;
   };
@@ -4924,7 +4951,7 @@ function startView(tab) {
     renderRightbar();
   };
   cards.append(card('files', 'folder', 'folder', '工作区文件', '浏览会话工作区的文件', '⌘ P', () => launch('files'), '桌面桥接没有目录读取接口'));
-  cards.append(card('terminal', 'terminal', 'terminal', '新建终端', '在会话工作区运行命令', '⌃ `', () => launch('terminal'), '桌面桥接没有交互式 PTY'));
+  cards.append(card('terminal', 'terminal', 'terminal', '新建终端', '在会话工作区运行命令', '⌃ `', () => launch('terminal')));
   cards.append(card('browser', 'globe', 'globe', '浏览器', '浏览网页', '⌘ T', () => launch('browser')));
   guide.append(mark, cards);
   return guide;
@@ -5107,18 +5134,10 @@ function filesView() {
   return view;
 }
 
-function terminalView() {
-  const view = el('div', 'terminal-view');
-  const screen = el('div', 'terminal-screen');
-  const box = el('div', 'terminal-offline');
-  const mark = el('span', 'terminal-offline-icon');
-  mark.append(iconNode('terminal', { size: 36, stroke: 1.1 }));
-  box.append(mark, el('h3', undefined, '交互式终端尚未接入'));
-  box.append(el('p', undefined, '桌面桥接没有可安全复用的 PTY。Agent 命令仍在对话中执行并展示完整输出。'));
-  screen.append(box);
-  const status = el('div', 'terminal-status');
-  status.append(el('span', 'terminal-status-detail', '没有可用 Shell'));
-  view.append(screen, status);
+const terminals = new DesktopTerminals(api, () => { persistRightbar(); renderRightbar(); });
+function terminalView(tab) {
+  const view = terminals.view(tab, current?.session);
+  persistRightbar();
   return view;
 }
 
@@ -5966,7 +5985,8 @@ function planView() {
     return empty;
   }
   const view = el('div', 'plan-view');
-  view.append(el('h2', 'plan-title', '计划'));
+  const stateLabel = current?.plan?.state === 'completed' ? '（已完成）' : current?.plan?.state === 'interrupted' ? '（已中断）' : '';
+  view.append(el('h2', 'plan-title', `计划${stateLabel}`));
   for (const step of steps) {
     const row = el('div', 'plan-step-row');
     row.dataset.planStatus = step.status;
@@ -6637,6 +6657,32 @@ function consumeSettingsEvent(frame) {
 
 api.onEvent(frame => {
   consumeSettingsEvent(frame);
+  if (frame.event === 'connection') { applyConnection(frame); return; }
+  if (frame.event === 'restored') {
+    // The Main process reopened the confirmed session after a bridge loss.
+    // Apply the fresh snapshot; history stays authoritative and is reloaded.
+    const result = frame.data ?? {};
+    const session = result.session;
+    if (!session?.id) return;
+    currentSource = result.source_id ?? currentSource;
+    history = [];
+    current = attachExtras(projectSnapshot(session, history), session);
+    lastEventSeq = session.last_sequence ?? 0;
+    activeView = 'chat';
+    liveTrajectory = [];
+    liveTurnStartAt = null;
+    liveTurnClosed = false;
+    trajectorySelectedId = null;
+    trajectoryNodeLimit = 50;
+    trajectoryRange = null;
+    trajectoryViewport = null;
+    $('message').value = drafts.get(session.id) ?? $('message').value;
+    render();
+    applyConnection({ event: 'connection', state: 'connected', resumed: true });
+    reloadHistory();
+    refreshTasks();
+    return;
+  }
   if (attachmentEarly && frame.session_id === attachmentEarly.sessionId && frame.event === 'runtime'
     && ['attachment_added', 'attachment_processing_failed'].includes(frame.data?.type)
     && frame.data.command_id && !attachmentEarly.events.some(event => event.command_id === frame.data.command_id)) {
@@ -6663,6 +6709,8 @@ api.onEvent(frame => {
   }
   if (frame.session_id !== current?.session.id) return;
   if (frame.event === 'snapshot') {
+    if ((frame.data.last_sequence ?? -1) < lastEventSeq) return;
+    lastEventSeq = Math.max(lastEventSeq, frame.data.last_sequence ?? 0);
     const prior = current;
     const diffQuery = current?.diffQuery;
     const diffError = current?.diffError;
@@ -6683,26 +6731,35 @@ api.onEvent(frame => {
   if (frame.event !== 'runtime') return;
   const event = frame.data;
   recordLiveTrajectory(event);
+  if (typeof event.seq === 'number') lastEventSeq = Math.max(lastEventSeq, event.seq);
   if (event.type === 'session_history_loaded') {
     history = event.entries ?? [];
     liveTrajectory = [];
     const restored = retainInterruptedThoughts(projectSnapshot(current.session, history), current);
-    current = { ...current, messages: restored.messages, tools: restored.tools, thoughts: restored.thoughts, lastTerminal: restored.lastTerminal ?? current.lastTerminal, turnErrors: restored.turnErrors ?? [] };
+    current = { ...current, messages: restored.messages, tools: restored.tools, thoughts: restored.thoughts, lastTerminal: restored.lastTerminal ?? current.lastTerminal, turnErrors: restored.turnErrors ?? [], plan: restored.plan ?? current.plan };
     renderConversation();
     if (activeView === 'trajectory') renderTrajectory();
     return;
   }
   if (event.type === 'session_opened') {
+    if ((event.session.last_sequence ?? -1) < lastEventSeq) return;
+    lastEventSeq = Math.max(lastEventSeq, event.session.last_sequence ?? 0);
     const priorContext = current?.contextUsage ?? null;
+    // The stale replay buffer predates whatever forced the reconnect; the
+    // snapshot is the newer truth. Reload the durable log right after.
+    history = [];
     current = attachExtras(projectSnapshot(event.session, history), event.session);
     current.contextUsage = priorContext;
     liveTrajectory = [];
     liveTurnStartAt = null;
     liveTurnClosed = false;
     render();
+    reloadHistory();
+    refreshTasks();
     return;
   }
   if (event.type === 'session_updated') {
+    if ((event.session.last_sequence ?? -1) < lastEventSeq) return;
     current = attachExtras(applySessionMetadata(current, event.session), event.session);
     renderHeader();
     renderComposerMeta();
@@ -6855,6 +6912,7 @@ function boot() {
   applyTheme();
   applyContentFont();
   api.appInfo?.().then(info => { $('brand-version').textContent = `v${info.version}`; }).catch(() => {});
+  api.connectionStatus?.().then(applyConnection).catch(() => {});
   api.onBrowserState(data => {
     browserData = data;
     for (const tab of Object.values(rightbarTabs)) {
@@ -7011,6 +7069,17 @@ function boot() {
       if (preferred) openInApp(current.session.repository, preferred.id, { remember: true });
       else toast('本地打开应用尚未就绪', { tone: 'info', holdMs: 2400 });
     }
+    if (event.ctrlKey && event.code === 'Backquote') {
+      event.preventDefault();
+      ensureRightbarSession();
+      const existing = Object.values(rightbarTabs).find(tab => tab.kind === 'terminal');
+      if (existing) {
+        const pane = rightbarPanes.find(item => item.tabs.includes(existing.id));
+        if (pane) { pane.activeId = existing.id; rightbarActivePane = pane.id; }
+        openRightbar();
+      } else openRightbarTab('terminal');
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'n') { event.preventDefault(); newSession(); }
     if ((event.metaKey || event.ctrlKey) && event.key === '/') { event.preventDefault(); showShortcuts(); }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'w') {
@@ -7075,6 +7144,7 @@ async function submitComposer(complement = false) {
   if (intent.kind === 'action') { executeCommand(intent.id); return; }
   if (intent.kind === 'blocked') { composerError(intent.reason); return; }
   const refs = attachments().filter(item => item.status === 'ready').map(item => item.attachment);
+  if (connectionState.state !== 'connected') { composerError('连接已断开，消息未发送；正在重连'); return; }
   if ((!content && !refs.length) || loading || uncertain || uploadPending()) return;
   const unsupported = attachmentSubmissionError(refs);
   if (unsupported) { composerError(unsupported); return; }

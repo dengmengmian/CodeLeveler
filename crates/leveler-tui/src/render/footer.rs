@@ -840,8 +840,11 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         t.shell_completion_menu_hint.to_string()
     } else if state.workbench_focus == crate::state::WorkbenchFocus::Pending {
         format!(
-            "Enter {} · Delete {} · Esc {}",
-            t.pending_input_send, t.pending_input_delete, t.hint_back_to_input
+            "Enter {} · e {} · Delete {} · Esc {}",
+            t.pending_input_send,
+            t.pending_input_edit,
+            t.pending_input_delete,
+            t.hint_back_to_input
         )
     } else if !state.pending_inputs.is_empty() {
         // Held input outlives the turn it was written during: while that turn

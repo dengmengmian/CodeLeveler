@@ -74,6 +74,14 @@ test('plan updates and metadata come only from runtime projections',()=>{
  assert.equal(state.plan.steps[0].status,'done');
  assert.equal(applySessionMetadata(state,{...snapshot,plan:null}).plan,null);
 });
+test('plan lifecycle survives restore and only a live update becomes active',()=>{
+ let state=projectSnapshot({...snapshot,plan:{steps:[{index:0,description:'Read',status:'done'}],state:'completed'}});
+ assert.equal(state.plan.state,'completed');
+ state=applyEvent(state,{type:'plan_updated',plan:{steps:[{index:0,description:'Next',status:'running'}]}});
+ assert.equal(state.plan.state,'active');
+ state=applySessionMetadata(state,{...snapshot,plan:{steps:[{index:0,description:'Done',status:'done'}],state:'interrupted'}});
+ assert.equal(state.plan.state,'interrupted');
+});
 test('history tools retain their message boundary across multiple turns',()=>{
  const state=projectSnapshot({...snapshot,messages:[...snapshot.messages,{id:'a1',role:'assistant',text:'first'},{id:'u2',role:'user',text:'second'},{id:'a2',role:'assistant',text:'second answer'}]},[
  {event:{type:'user_message_added',message:{id:'u1'}}},

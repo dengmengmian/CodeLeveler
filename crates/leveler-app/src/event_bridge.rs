@@ -32,6 +32,7 @@ pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
                 },
             })
             .collect(),
+        state: Default::default(),
     }
 }
 

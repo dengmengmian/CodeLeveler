@@ -1,5 +1,6 @@
 use leveler_client_protocol::{
-    NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, UiRole, UiSessionSnapshot,
+    NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, UiPlanState, UiRole,
+    UiSessionSnapshot,
 };
 
 use crate::overlay::Overlay;
@@ -1833,11 +1834,16 @@ fn apply_session_with(
     }
 
     // Snapshot `plan` is live-view state. Adopt it only while the runtime says
-    // this session is actually running; idle/terminal history is rebuilt from
-    // durable events below, through the same reducer as the live stream.
-    state.plan = (state.status == RuntimeStatus::Busy)
-        .then_some(session.plan)
-        .flatten();
+    // this session is actually running and the plan belongs to the open epoch;
+    // idle/terminal history is rebuilt from durable events below, through the
+    // same reducer as the live stream.
+    state.plan = (state.status == RuntimeStatus::Busy
+        && session
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.state == UiPlanState::Active))
+    .then_some(session.plan)
+    .flatten();
     state.diff = session.diff.clone();
     if state
         .diff

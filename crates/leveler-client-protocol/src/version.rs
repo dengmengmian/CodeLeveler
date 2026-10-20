@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 14,
+    // 1.15: `UiPlan.state` (optional on decode; additive).
+    minor: 15,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
