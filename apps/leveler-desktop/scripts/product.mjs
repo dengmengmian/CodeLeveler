@@ -127,10 +127,16 @@ try {
   const firstId = first.selectedId;
   await page.waitForFunction(id => window.desktop.browserState().then(state => state.tabs.some(tab => tab.id === id && tab.title === 'Workbench test' && !tab.loading)), firstId);
   const isolation = await application.evaluate(async ({ webContents }, url) => {
-    const contents = webContents.getAllWebContents().find(contents => contents.getURL().startsWith(url));
-    if (!contents) throw new Error(`Real Browser contents missing: ${webContents.getAllWebContents().map(contents => contents.getURL()).join(', ')}`);
-    const prefs = contents.getLastWebPreferences();
-    return { prefs: { sandbox: prefs.sandbox, contextIsolation: prefs.contextIsolation, nodeIntegration: prefs.nodeIntegration, preload: prefs.preload ?? null }, probes: await contents.executeJavaScript(`({desktop:typeof window.desktop,leveler:typeof window.leveler,require:typeof window.require,process:typeof window.process})`) };
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const contents = webContents.getAllWebContents().find(contents => contents.getURL().startsWith(url));
+      if (contents) {
+        const prefs = contents.getLastWebPreferences();
+        return { prefs: { sandbox: prefs.sandbox, contextIsolation: prefs.contextIsolation, nodeIntegration: prefs.nodeIntegration, preload: prefs.preload ?? null }, probes: await contents.executeJavaScript(`({desktop:typeof window.desktop,leveler:typeof window.leveler,require:typeof window.require,process:typeof window.process})`) };
+      }
+      if (Date.now() >= deadline) throw new Error(`Real Browser contents missing: ${webContents.getAllWebContents().map(contents => contents.getURL()).join(', ')}`);
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }, baseURL);
   assert.deepEqual(isolation.probes, { desktop: 'undefined', leveler: 'undefined', require: 'undefined', process: 'undefined' });
   assert.equal(isolation.prefs.sandbox, true); assert.equal(isolation.prefs.contextIsolation, true); assert.equal(isolation.prefs.nodeIntegration, false); assert.ok(!isolation.prefs.preload);
@@ -196,8 +202,12 @@ try {
     check();
   }));
   await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1280, 860));
+  await page.waitForFunction(()=>innerWidth===1280&&document.body.dataset.sidebarBand==='wide');
+  await page.waitForFunction(()=>!document.querySelector('#sidebar').getAnimations().some(animation=>animation.playState==='running'));
   await application.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
   if(await page.evaluate(()=>document.body.classList.contains('sidebar-collapsed')))await page.locator('#sidebar-toggle').click();
+  await page.waitForFunction(()=>!document.querySelector('#sidebar').getAnimations().some(animation=>animation.playState==='running'));
+  await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().width>250);
   await page.locator('#space-add').click();
   await page.waitForFunction(() => document.querySelector('#workspace').textContent.includes('workspace')&&!document.querySelector('#refresh').disabled);
   await page.locator('#message').fill('fixture-interactions: read fixture.txt and propose removing scratch; I will deny approval.');

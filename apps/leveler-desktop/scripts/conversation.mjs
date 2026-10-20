@@ -12,7 +12,7 @@ if(process.env.LEVELER_CONVERSATION_SCENARIO==='full-execution'){await import('.
 const root=fileURLToPath(new URL('..',import.meta.url));
 const temporary=await mkdtemp('/tmp/leveler-desktop-conversation-'),home=path.join(temporary,'home');await mkdir(home);
 const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-output/desktop');await mkdir(output,{recursive:true});
-const literalCode='const sample = "<script>window.__markdownExecuted = true</script>";\nconsole.log(sample);';
+const literalCode='const sample = "<script>window.__markdownExecuted = true</script>";\nconst padding = "'+'x'.repeat(120)+'";\nconsole.log(sample);';
 let rich='',providerCalls=0,imageRequests=0,documentRequests=0,streamWrites=0;const providerErrors=[];
 const server=createServer(async(request,response)=>{
  try{
@@ -57,7 +57,7 @@ try{
  assert.equal(await page.evaluate(()=>typeof window.__markdownExecuted),'undefined');assert.equal(imageRequests,0);
  const badLinks=await body.locator('a[href]').evaluateAll(nodes=>nodes.map(n=>n.getAttribute('href')).filter(href=>!/^https?:\/\//i.test(href)));assert.deepEqual(badLinks,[]);
  await capture('conversation-rich-markdown');
- await application.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(700,860));await page.waitForFunction(()=>innerWidth===700);
+ await application.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(700,860));await page.waitForFunction(()=>innerWidth===700&&document.body.classList.contains('workbench-overlay'));await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  const narrow=await page.evaluate(()=>({mainOverflow:document.documentElement.scrollWidth>innerWidth,codeOverflow:getComputedStyle(document.querySelector('.message.assistant pre')).overflowX,tableOverflow:getComputedStyle(document.querySelector('.message.assistant table')).overflowX,codeScrolls:document.querySelector('.message.assistant pre').scrollWidth>document.querySelector('.message.assistant pre').clientWidth,tableScrolls:document.querySelector('.message.assistant table').scrollWidth>document.querySelector('.message.assistant table').clientWidth}));assert.equal(narrow.mainOverflow,false);assert.equal(narrow.codeOverflow,'auto');assert.equal(narrow.tableOverflow,'auto');assert.equal(narrow.codeScrolls,true);assert.equal(narrow.tableScrolls,true);evidence.narrow=narrow;await body.locator('table').evaluate(n=>n.scrollIntoView({block:'center'}));await capture('conversation-rich-narrow');await application.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1280,860));
  // UI copy actions must put the actual content on the operating-system clipboard.
  await application.evaluate(async({clipboard,ClipboardItem})=>{const saved=[];for(const item of await clipboard.read()){const data=Object.create(null);for(const type of item.types)data[type]=await item.getType(type);saved.push(new ClipboardItem(data));}globalThis.__conversationClipboard=saved;});clipboardCaptured=true;
