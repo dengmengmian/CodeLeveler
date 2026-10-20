@@ -162,10 +162,17 @@ pub struct AttachmentBytes {
 /// contract when a daemon owns session creation.
 #[async_trait]
 pub trait LocalRuntimeService: InteractiveRuntimeClient {
-    fn supports_terminal(&self) -> bool { false }
+    fn supports_terminal(&self) -> bool {
+        false
+    }
     /// Direct terminal I/O; older runtimes explicitly reject this capability.
-    async fn terminal(&self, _request: leveler_client_protocol::TerminalRequest) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
-        Err(ClientError::Runtime("integrated terminals are unsupported by this runtime".into()))
+    async fn terminal(
+        &self,
+        _request: leveler_client_protocol::TerminalRequest,
+    ) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
+        Err(ClientError::Runtime(
+            "integrated terminals are unsupported by this runtime".into(),
+        ))
     }
 
     /// A no-workspace source may only serve peers that negotiated nullable snapshots.
@@ -872,12 +879,22 @@ mod transport {
                 )
                 .await
             }
-            WireRequest::TerminalSupported => send_response(&mut stream, WireResponse::TerminalSupported(transport_trusted && runtime.supports_terminal())).await,
+            WireRequest::TerminalSupported => {
+                send_response(
+                    &mut stream,
+                    WireResponse::TerminalSupported(
+                        transport_trusted && runtime.supports_terminal(),
+                    ),
+                )
+                .await
+            }
             WireRequest::Terminal(request) => {
                 let result = if transport_trusted {
                     runtime.terminal(request).await
                 } else {
-                    Err(ClientError::Runtime("integrated terminals require trusted local access".into()))
+                    Err(ClientError::Runtime(
+                        "integrated terminals require trusted local access".into(),
+                    ))
                 };
                 send_result(&mut stream, result.map(WireResponse::Terminal)).await
             }
@@ -1325,19 +1342,34 @@ mod transport {
     /// delegates to the inherent method of the same name.
     #[async_trait]
     impl LocalRuntimeService for LocalSocketRuntimeClient {
-        async fn terminal(&self, request: leveler_client_protocol::TerminalRequest) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
+        async fn terminal(
+            &self,
+            request: leveler_client_protocol::TerminalRequest,
+        ) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
             request.validate().map_err(ClientError::Runtime)?;
-            if self.client_kind == ClientKind::Remote { return Err(ClientError::Runtime("integrated terminals require a local interactive client".into())); }
+            if self.client_kind == ClientKind::Remote {
+                return Err(ClientError::Runtime(
+                    "integrated terminals require a local interactive client".into(),
+                ));
+            }
             // A read-only negotiation precedes every mutation; legacy peers
             // cannot accidentally accept a write before reporting unsupported.
             match self.request(WireRequest::TerminalSupported).await {
-                Ok(WireResponse::TerminalSupported(true)) => {},
-                Ok(WireResponse::TerminalSupported(false)) | Err(TransportError::PeerClosed) => return Err(ClientError::Runtime("integrated terminals are unsupported by this runtime".into())),
+                Ok(WireResponse::TerminalSupported(true)) => {}
+                Ok(WireResponse::TerminalSupported(false)) | Err(TransportError::PeerClosed) => {
+                    return Err(ClientError::Runtime(
+                        "integrated terminals are unsupported by this runtime".into(),
+                    ));
+                }
                 Ok(WireResponse::Error(error)) => return Err(error.into_client_error()),
                 Ok(response) => return Err(unexpected_response(response)),
                 Err(error) => return Err(transport_client_error(error)),
             }
-            match self.request(WireRequest::Terminal(request)).await.map_err(transport_client_error)? {
+            match self
+                .request(WireRequest::Terminal(request))
+                .await
+                .map_err(transport_client_error)?
+            {
                 WireResponse::Terminal(state) => Ok(state),
                 WireResponse::Error(error) => Err(error.into_client_error()),
                 response => Err(unexpected_response(response)),
@@ -2357,28 +2389,68 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_capability_negotiation_rejects_unsupported_runtime_and_remote_clients() {
-        use leveler_client_protocol::{TerminalRequest,TerminalOperation};
-        let dir=tempfile::tempdir().unwrap();
-        let path=dir.path().join("terminal.sock");
-        let runtime=Arc::new(TestRuntime::new());
-        let server=LocalSocketServer::bind(&path,runtime).await.unwrap();
-        let shutdown=CancellationToken::new();
+        use leveler_client_protocol::{TerminalOperation, TerminalRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+        let shutdown = CancellationToken::new();
         tokio::spawn(server.serve(shutdown.clone()));
-        let request=TerminalRequest{session_id:SessionId::new("s"),terminal_id:"12345678-1234-1234-1234-123456789abc".into(),operation:TerminalOperation::Create{cols:80,rows:24}};
-        let local=LocalSocketRuntimeClient::connect_as(&path,ClientKind::LocalInteractive).await.unwrap();
-        assert!(local.terminal(request.clone()).await.unwrap_err().to_string().contains("unsupported"));
-        let remote=LocalSocketRuntimeClient::connect_as(&path,ClientKind::Remote).await.unwrap();
-        assert!(remote.terminal(request).await.unwrap_err().to_string().contains("local interactive"));
+        let request = TerminalRequest {
+            session_id: SessionId::new("s"),
+            terminal_id: "12345678-1234-1234-1234-123456789abc".into(),
+            operation: TerminalOperation::Create { cols: 80, rows: 24 },
+        };
+        let local = LocalSocketRuntimeClient::connect_as(&path, ClientKind::LocalInteractive)
+            .await
+            .unwrap();
+        assert!(
+            local
+                .terminal(request.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+        let remote = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        assert!(
+            remote
+                .terminal(request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("local interactive")
+        );
         shutdown.cancel();
     }
 
     #[test]
     fn terminal_input_is_never_automatically_replayed() {
-        use leveler_client_protocol::{TerminalRequest,TerminalOperation};
-        let make=|operation| WireRequest::Terminal(TerminalRequest{session_id: SessionId::new("s"),terminal_id:"12345678-1234-1234-1234-123456789abc".into(),operation});
-        assert!(!make(TerminalOperation::Write{data:vec![b'x']}).safe_to_retry_after_transport_failure());
-        assert!(make(TerminalOperation::Create{cols:80,rows:24}).safe_to_retry_after_transport_failure());
-        assert!(make(TerminalOperation::Observe{cursor:0,max_bytes:1024}).safe_to_retry_after_transport_failure());
+        use leveler_client_protocol::{TerminalOperation, TerminalRequest};
+        let make = |operation| {
+            WireRequest::Terminal(TerminalRequest {
+                session_id: SessionId::new("s"),
+                terminal_id: "12345678-1234-1234-1234-123456789abc".into(),
+                operation,
+            })
+        };
+        assert!(
+            !make(TerminalOperation::Write { data: vec![b'x'] })
+                .safe_to_retry_after_transport_failure()
+        );
+        assert!(
+            make(TerminalOperation::Create { cols: 80, rows: 24 })
+                .safe_to_retry_after_transport_failure()
+        );
+        assert!(
+            make(TerminalOperation::Observe {
+                cursor: 0,
+                max_bytes: 1024
+            })
+            .safe_to_retry_after_transport_failure()
+        );
     }
 
     #[test]
