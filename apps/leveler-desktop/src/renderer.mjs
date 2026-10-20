@@ -66,6 +66,11 @@ function controls(){
   $('permission').disabled=loading||!!uncertain||uploadPending;$('home-permission').disabled=loading||!!uncertain||uploadPending;
   for(const id of ['title-save','title-cancel','title-input','title-edit','task-history','archive-confirm','task-menu-rename','task-menu-archive','search-toggle'])$(id).disabled=loading||!!uncertain||uploadPending;
   $('archive-cancel').disabled=loading;
+  // Workbench actions are recreated by renderWorkbench, which can run while a
+  // terminal refresh still holds `loading`. Re-assert the one enabled truth
+  // here so an idle session never leaves "读取工作区变更" stuck disabled.
+  const diffActionDisabled=loading||!!uncertain||current?.diffQuery?.status==='pending';
+  for(const id of ['overview-changes','diff-refresh','diff-retry'])if($(id))$(id).disabled=diffActionDisabled;
   for(const button of document.querySelectorAll('#settings-content button[data-session-action]'))button.disabled=!current||loading||!!uncertain||uploadPending;
   const retry=document.querySelector('#interactions [data-retry]');if(retry)retry.disabled=loading;
   $('status').textContent=loading?'连接 Runtime…':current?(current.approvals.length||current.clarifications.length?'等待你处理':current.activity||labels[current.status]||current.status):'未连接';
@@ -131,6 +136,9 @@ function renderConversation(){
 }
 function decorateMessage(row,message){
  if(messageKind(message)==='notice'){row.querySelector('.role').textContent=messageRoleLabel(message);row.querySelector('.message-actions')?.remove();}
+ // The runtime reports how many images a message carried; without this a
+ // picture-only message would read as an empty row. The text never holds a path.
+ if(message.role==='user'&&Number(message.images??0)>0&&!row.querySelector('.message-images'))row.querySelector('.body').after(el('div',`图片 × ${message.images}`,'message-images'));
  if(message.role==='assistant'&&messageKind(message)!=='notice'){const role=row.querySelector('.role');if(!role.querySelector('.assistant-mark')){role.replaceChildren(el('span','C','assistant-mark'),el('span','CodeLeveler'),el('span','','message-stream-state'));}role.querySelector('.message-stream-state').textContent=current.streamingMessageId===message.id?'正在生成':'';}
  if(['user','assistant'].includes(messageKind(message))&&!row.querySelector('.message-actions')){const actions=el('div',undefined,'message-actions');const button=el('button','复制','message-copy');button.prepend(svgIcon('copy'));button.dataset.copyMessage=message.id;button.setAttribute('aria-label','复制消息');button.addEventListener('click',()=>copyText(current?.messages.find(item=>item.id===message.id)?.text??'',button));actions.append(button);row.append(actions);}
 }

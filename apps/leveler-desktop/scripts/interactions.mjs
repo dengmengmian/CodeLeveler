@@ -52,6 +52,10 @@ try{
  // History replay must restore tool evidence, never resurrect resolved consent buttons.
  await page.locator('#new-task').click();await page.waitForFunction(()=>document.body.classList.contains('home')&&!document.querySelector('#refresh').disabled);
  await page.locator(`.task[data-session-id="${sessionId}"]`).click();await page.waitForFunction(()=>document.querySelector('.tool[data-tool-id="fixture-read"]'));
+// Regression: reopening a workspace session renders the workbench while the
+// open action still holds `loading`; once idle the diff action must be enabled.
+await page.waitForFunction(()=>document.querySelector('#status').textContent!=='连接 Runtime…');
+assert.equal(await page.locator('#overview-changes').evaluate(n=>n.disabled),false,'diff action must be enabled after reopening a workspace session');
  await page.locator('.tool[data-tool-id="fixture-read"] summary').click();await page.locator('.tool[data-tool-id="fixture-read"] .tool-output').waitFor();assert.match(await page.locator('.tool[data-tool-id="fixture-read"]').innerText(),/desktop-real-tool-evidence/);
  assert.equal(await page.getByRole('button',{name:'拒绝',exact:true}).count(),0);
  assert.equal(await page.locator('.message.assistant .body').last().innerText(),'fixture-interactions-complete');
