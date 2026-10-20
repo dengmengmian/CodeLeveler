@@ -83,7 +83,7 @@ async function screenshot(name) {
 async function browserState() { return page.evaluate(() => window.desktop.browserState()); }
 async function browser(command) { return page.evaluate(command => window.desktop.browserCommand(command), command); }
 async function settled() {
-  await page.waitForFunction(() => ['已回答', '已完成'].includes(document.querySelector('#status').textContent) && !document.querySelector('#refresh').disabled, null, { timeout: 60000 });
+  await page.waitForFunction(() => ['已回答', '已完成'].includes(document.querySelector('#status').textContent) && !!document.querySelector('#new-session'), null, { timeout: 60000 });
 }
 async function send(content) {
   await page.locator('#message').fill(content); await page.locator('#message').press('Enter'); await settled();
@@ -209,7 +209,7 @@ try {
   await page.waitForFunction(()=>!document.querySelector('#sidebar').getAnimations().some(animation=>animation.playState==='running'));
   await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().width>250);
   await page.locator('#space-add').click();
-  await page.waitForFunction(() => document.querySelector('#workspace').textContent.includes('workspace')&&!document.querySelector('#refresh').disabled);
+  await page.waitForFunction(() => document.querySelector('#workspace').textContent.includes('workspace')&&!!document.querySelector('#new-session'));
   await page.locator('#message').fill('fixture-interactions: read fixture.txt and propose removing scratch; I will deny approval.');
   await page.locator('#message').press('Enter');
   await page.getByRole('button', { name: '拒绝', exact: true }).waitFor();

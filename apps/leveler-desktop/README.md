@@ -30,32 +30,32 @@ npm start
 | --- | --- |
 | **CONNECTED** | 会话创建/打开/恢复、历史与流式消息、Reasoning、专用工具卡片（命令/读取/编辑/搜索/网页/待办/通用）、审批、用户问题、模型切换、权限模式、重命名、分叉、归档、Git 变更与 diff、原生隔离 Browser、Browser 浮窗/全屏/多标签/系统浏览器打开、图片附件、上下文统计、Plan、子智能体只读状态、后台任务状态、字体设置、系统浏览器链接、打开配置文件、`对话 / 轨迹` view tabs、Trajectory 账本与检查器、Open In App（会话头 / Files / Preview / Review / 交付）、独立 `···` 菜单、参考命令菜单。 |
 | **UI_ONLY** | Files 文件树、Document Preview（可打开但无文件读取）、交互式 Terminal、Deliverables 文件清单、插件目录与插件市场、自动化任务调度、语言、快捷键编辑器、排队发送 UI、Session Log 上传/下载、添加模型 Provider、Agent 预设切换、置顶 / 取消归档、@ 文件/会话引用、登录 / 意见反馈提交。 |
-| **NOT_VERIFIED** | 真实模型 Provider 下的工具链、审批与长会话（本轮真实 Provider 仅验收了普通对话/resume）；Windows 运行、macOS 原生全屏、真实 IME 长文本、原生窗口级截图对比。 |
+| **NOT_VERIFIED** | Windows 运行、macOS 原生全屏、真实 IME 长文本、原生窗口级截图对比；真实子智能体对话嵌入、计划持久化。 |
 
-本轮真实 Electron 已观测：会话创建/打开、消息、Reasoning、工具调用与专用卡片、审批拒绝/取消、取消/resume、diff、Plan、Browser 导航/浮窗/全屏/外部打开、上下文统计、右栏分栏/浮窗/全屏、`对话 / 轨迹` 切换、Trajectory 账本/时间线/检查器、Open In App 菜单与记住选择、`···` 菜单、参考命令菜单、反馈弹窗、真实 Fork。真实 Provider 验收覆盖新建、发送、流式回复、会话切换、关闭/重启同 Runtime 复用和窄窗；工具/审批/长会话仍使用测试 Provider 或合成桥接。
+本轮真实 Electron 已观测：会话创建/打开、消息、Reasoning、工具调用与专用卡片、审批、取消/resume、diff/Review、Plan 卡、Browser 导航/浮窗/全屏/外部打开、上下文统计、右栏分栏/浮窗/全屏、`对话 / 轨迹` 切换、Trajectory 账本/时间线/检查器/分页/区间、Open In App 菜单与记住选择、`···` 菜单、参考命令菜单、反馈弹窗、真实 Fork。真实 Provider（deepseek-flash / glm-5.3）验收覆盖工具调用、跨 Provider 模型切换、需批准外部写入审批、完全权限零审批、取消、关闭/重启 Resume 和权限切换。
 
 UI_ONLY 功能不伪造数据或成功结果：列表为空时显示 Runtime 未提供接口，动作禁用或明确提示「未接入」。
 
 ## 验证
 
 ```sh
-npm test                # 状态、IPC、安全、展示投影、Trajectory、Open In App；当前 135 项通过
+npm test                # 状态、IPC、安全、展示投影、Trajectory、Open In App；当前 136 项通过
 npm run build           # 原生 JS 语法检查
 npm run typecheck       # strict checkJs
 npm run lint            # ESLint
 ```
 
-真实验收使用隔离 `LEVELER_HOME`。本轮全量覆盖矩阵在 [docs/DESKTOP_UI_MATRIX.md](../../docs/DESKTOP_UI_MATRIX.md)，真实 Electron 证据（header tabs、Trajectory、Open In App、`···`、命令菜单、反馈）在 `acceptance-output/ui-coverage-2026-10-20/`（忽略目录）。已通过的新 UI 脚本：`test:acceptance`（真实 Provider）、`test:interactions`、`test:conversation`、`test:composer`、`test:long-session`、`test:session-actions`、`settings-queries`、`upload-deadline`、`views`，以及新增 `scripts/browser-dock.mjs`、`scripts/ui-capture.mjs`。
+真实验收使用隔离 `LEVELER_HOME`。本轮全量覆盖矩阵在 [docs/DESKTOP_UI_MATRIX.md](../../docs/DESKTOP_UI_MATRIX.md)，真实 Electron 证据（header tabs、Trajectory、Open In App、`···`、命令菜单、反馈）在 `acceptance-output/ui-coverage-2026-10-20/`（忽略目录）；Round 3 的浅/深色、窄窗与像素对比在 `acceptance-output/ui-coverage-2026-10-20/round3/`。当前 UI 脚本位于 `scripts/`；本轮实际运行 `composer.mjs`（通过附件/草稿/模型/权限等检查，停在权限菜单关闭后原生 Browser surface 未恢复）、`responsive-theme.mjs`（迁移后停在确认框关闭后的焦点可见性断言）、`responsive-long-home.mjs`（见下）。未重跑的脚本不能视为本轮通过。
 
-仍绑定旧 UI 的其他脚本（`product`、`browser-native`、`commands-settings`、`project-interactions`、`responsive-long-home`、`responsive-theme`、`settings-branches`、`sidebar-compact`、`workbench`、`conversation-runtime`）尚未迁移，不能作为本版本回归证据。`test:acceptance` 的真实 Provider 验收覆盖普通对话与 Runtime 复用，不覆盖真实模型下的工具链、审批和长会话。
+十个旧脚本已统一迁移 readiness（`#new-session`）；`responsive-long-home` 已完整迁移并通过（680×600、100 行草稿、16 个真实附件、横向 chip rail、草稿保留、零 Provider 调用）；`responsive-theme` 还迁移了主题卡、composer、菜单、侧栏、归档确认框与右栏 browser，但停在确认框关闭后的焦点可见性断言。其余脚本仍依赖已删除的旧 DOM/Workbench，不能作为回归证据。
 
 ## 已知限制
 
 - Files / Preview / Terminal / Deliverables 没有 Desktop bridge 的独立目录读取、文件读取、PTY 或交付物清单接口；界面完整呈现，但数据来源为真实的未接入状态，不生成假数据。
 - 工具卡片覆盖命令、读取、编辑、搜索、网页、待办和通用 IN/OUT；Browser 工具按参考走通用卡片。
 - Conversation 头部已覆盖标题、Agent 预设、`对话 / 轨迹` view tabs、Open In App、`···` 与右栏开关；祖先面包屑、子智能体血缘和部分参考 header slot 仍未实现（见矩阵 MISSING）。
-- Trajectory 的历史 Token 用量、绝对墙钟、Provider TTFT 与工具 Schema 不在 Runtime durable log 中，界面显示「不可用」而不是补零；历史分页/虚拟滚动与时间区间拖拽尚未实现。
+- Trajectory 的历史 Token 用量、绝对墙钟、Provider TTFT 与工具 Schema 不在 Runtime durable log 中，界面显示「不可用」而不是补零；已实现 50 条尾部窗口分页和时间区间拖拽，虚拟滚动未实现。
 - 右栏浮窗支持 Files/Changes/Plan/Preview/Subagent/Browser；Browser 浮窗、全屏和多标签已用真实 `WebContentsView` 验收。
 - 参考项目的部分动效（侧栏收起序列、右栏滑入、hero 动画等）尚未逐项对齐。
 - Open In App 使用安装目录中的应用清单与记住的选择；应用目录与打开路径仅 macOS 实测，Windows/Linux 会隐藏该入口。文件场景不查询每个后缀的 OS 默认关联，「显示文件位置」按真实文件执行。反馈弹窗可打开，但提交通道未接入。
-- 真实 Provider 只完成了普通对话/resume 验收；工具链、审批和长会话仍使用测试 Provider 或合成桥接。
+- 真实 Provider 已完成工具调用、审批、取消、Resume、模型与权限切换验收；跨 Provider 行为和长会话的完整链路仍需在发布门禁中复核。

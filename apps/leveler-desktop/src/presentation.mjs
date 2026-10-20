@@ -26,7 +26,7 @@ export function relativeActivity(time,now=Date.now()){
  const value=Date.parse(time??'');if(!Number.isFinite(value))return '';const minutes=Math.max(0,Math.floor((now-value)/60000));if(minutes<1)return '刚刚';if(minutes<60)return `${minutes} 分钟前`;const hours=Math.floor(minutes/60);if(hours<24)return `${hours} 小时前`;return `${Math.floor(hours/24)} 天前`;
 }
 /** @param {string|undefined} mode @returns {string} */
-export function permissionLabel(mode){const labels=/** @type {Record<string,string>} */ ({full_access:'完全开放',assisted:'自动权限',request_approval:'受限权限'});return labels[mode??'']??'权限由 Runtime 决定';}
+export function permissionLabel(mode){const labels=/** @type {Record<string,string>} */ ({full_access:'完全权限',assisted:'工作区内修改',request_approval:'需批准'});return labels[mode??'']??'权限由 Runtime 决定';}
 /** @param {{primary_workspace?:string|null}[]} tasks @param {string} [query] */
 export function recentWorkspaces(tasks,query=''){
  const paths=[...new Set(tasks.map(task=>task.primary_workspace).filter(/** @returns {path is string} */ path=>typeof path==='string'&&!!path))];return paths.map(path=>({path,name:workspaceLabel(path)})).filter(workspace=>workspace.name.toLowerCase().includes(query.trim().toLowerCase()));

@@ -150,7 +150,7 @@ try {
     page.on('websocket', socket => socket.on('framereceived', frame => { try { wire.push(JSON.parse(frame.payload)); } catch {} })); await page.goto(url); await page.locator('.composer textarea').waitFor();
   } else {
     application = await electron.launch({ args: [path.join(source, 'apps/leveler-desktop'), `--user-data-dir=${path.join(temp, 'electron-profile')}`], env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, LEVELER_HOME: home, LEVELER_CONFIG_DIR: undefined, LEVELER_BINARY: binary, LEVELER_DAEMON_IDLE_TIMEOUT_SECS: '10' } }); page = await application.firstWindow(); report.renderer_started = true;
-    await page.waitForFunction(() => window.desktop && document.querySelector('#refresh')?.disabled === false);
+    await page.waitForFunction(() => window.desktop && !!document.querySelector('#new-session'));
     await application.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, workspace); await page.locator('#space-add').click(); await page.waitForFunction(() => document.querySelector('#status').textContent === '未连接');
     await page.evaluate(() => { window.__presentationWire = []; window.desktop.onEvent(frame => window.__presentationWire.push(frame)); });
   }

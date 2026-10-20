@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {projectTrajectory,searchTrajectory,buildTimeline} from '../src/trajectory.mjs';
+import {projectTrajectory,searchTrajectory,buildTimeline,trajectoryWindow} from '../src/trajectory.mjs';
 
 const entry=(turn_elapsed_ms,event,turn_start=false)=>({turn_elapsed_ms,turn_start,event});
 
@@ -93,4 +93,16 @@ test('trajectory turn numbers are one-based and contiguous across the recorded l
   ]);
   assert.deepEqual(projected.turns.map(turn=>turn.index),[1,2]);
   assert.deepEqual(projected.records.map(record=>record.turn),[1,2]);
+});
+
+
+test('ledger window stays anchored at the newest records and reports older pages',()=>{
+  const records=Array.from({length:120},(_,index)=>({id:String(index)}));
+  const tail=trajectoryWindow(records,50);
+  assert.equal(tail.total,120);
+  assert.equal(tail.hasOlder,true);
+  assert.equal(tail.records.length,50);
+  assert.equal(tail.records[0].id,'70');
+  assert.equal(tail.records.at(-1).id,'119');
+  assert.deepEqual(trajectoryWindow(records.slice(0,10),50),{records:records.slice(0,10),total:10,hasOlder:false});
 });
