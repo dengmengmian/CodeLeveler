@@ -2,11 +2,13 @@ const { app, BrowserWindow, WebContentsView, Menu, ipcMain, dialog, protocol, ne
 const path=require('node:path');
 const { pathToFileURL }=require('node:url');
 const { randomUUID }=require('node:crypto');
-const { existsSync }=require('node:fs');
+const { existsSync,realpathSync,statSync }=require('node:fs');
+const { spawn }=require('node:child_process');
 const os=require('node:os');
 const { Bridge }=require('./bridge.cjs');
 const { validateEnvelope }=require('./security.cjs');
 const { ManualBrowser }=require('./browser.cjs');
+const { installedCatalog,resolveTarget }=require('./open-in-app.cjs');
 const { RecentWorkspaceSelection,taskListOptions }=require('./workspace-selection.cjs');
 const { AttachmentIngress }=require('./attachment-ingress.cjs');
 const { copyText }=require('./clipboard-write.cjs');
@@ -14,6 +16,11 @@ const { settingsMenuItem }=require('./settings-menu.cjs');
 protocol.registerSchemesAsPrivileged([{scheme:'leveler-desktop',privileges:{standard:true,secure:true,supportFetchAPI:true}}]);
 let window,bridge,browser;const folders=new Map();
 let selectedSource=null;
+const allowedRoots=new Set();
+const appIcons=new Map();
+function addRoot(value){if(typeof value!=='string'||!value||value.length>4096)return;try{allowedRoots.add(realpathSync(value));}catch{/* a missing root is not an authorized path */}}
+function trackSnapshot(snapshot){if(snapshot&&typeof snapshot.repository==='string')addRoot(snapshot.repository);}
+async function appIcon(bundle){if(appIcons.has(bundle))return appIcons.get(bundle);let icon=null;try{const image=await app.getFileIcon(bundle,{size:'small'});if(!image.isEmpty())icon=image.toDataURL();}catch{}appIcons.set(bundle,icon);return icon;}
 const attachments=new AttachmentIngress({pickFile:async()=>{const result=await dialog.showOpenDialog(window,{title:'上传附件',properties:['openFile']});return result.canceled?null:result.filePaths[0]??null;},deliver:envelope=>bridge.request('deliver',{envelope})});
 function attachmentSession(snapshot){if(selectedSource&&snapshot?.id)attachments.activate({sourceId:selectedSource,sessionId:snapshot.id,vision:snapshot.vision===true});}
 const recentWorkspaces=new RecentWorkspaceSelection(folders);
@@ -33,7 +40,7 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs']);
+  const assets=new Set(['index.html','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs']);
   protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
@@ -47,10 +54,12 @@ app.whenReady().then(async()=>{
   handle('desktop:attachment',sessionId=>attachments.choose(text(sessionId,'session')));
   handle('desktop:discard-upload',value=>{if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==2||!Object.hasOwn(value,'sessionId')||!Object.hasOwn(value,'importId'))throw new Error('Invalid upload discard');return attachments.discard(text(value.sessionId,'session'),text(value.importId,'import'));});
   handle('desktop:folder',async()=>{const result=await dialog.showOpenDialog(window,{title:'选择 Workspace 文件夹',properties:['openDirectory']});if(result.canceled)return null;const id=randomUUID();folders.set(id,result.filePaths[0]);return {id,path:result.filePaths[0]};});
-  handle('desktop:create',async selection=>{let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create',{goal:''});attachmentSession(result.session);return result;});
-  handle('desktop:create-identified',async ({selection,requestId})=>{if(typeof requestId!=='string'||!requestId)throw new Error('identified creation requires request_id');let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create_identified',{goal:'',request_id:requestId});attachmentSession(result.session);return result;});
-  handle('desktop:open',async task=>{if(!task||typeof task!=='object')throw new Error('Invalid task');attachments.activate(null);const result=await bridge.request('open',{source_id:text(task.source_id,'source'),session_id:text(task.id,'session')});selectedSource=result.source_id;attachmentSession(result.session);return result;});
-  handle('desktop:snapshot',async sessionId=>{const snapshot=await bridge.request('snapshot',{session_id:text(sessionId,'session')});attachmentSession(snapshot);return snapshot;});
+  handle('desktop:create',async selection=>{let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create',{goal:''});addRoot(workspace);trackSnapshot(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:create-identified',async ({selection,requestId})=>{if(typeof requestId!=='string'||!requestId)throw new Error('identified creation requires request_id');let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create_identified',{goal:'',request_id:requestId});addRoot(workspace);trackSnapshot(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:open',async task=>{if(!task||typeof task!=='object')throw new Error('Invalid task');attachments.activate(null);const result=await bridge.request('open',{source_id:text(task.source_id,'source'),session_id:text(task.id,'session')});selectedSource=result.source_id;trackSnapshot(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:snapshot',async sessionId=>{const snapshot=await bridge.request('snapshot',{session_id:text(sessionId,'session')});trackSnapshot(snapshot);attachmentSession(snapshot);return snapshot;});
+  handle('desktop:open-in-app-apps',async()=>{const apps=installedCatalog();return Promise.all(apps.map(async app=>({...app,icon:await appIcon(app.path)})));});
+  handle('desktop:open-in-app',async value=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid open request');const keys=Object.keys(value);if(keys.some(key=>!['path','appId','action'].includes(key)))throw new Error('Invalid open request');const action=value.action;if(!['open','reveal'].includes(action))throw new Error('Invalid open action');const target=resolveTarget(value.path,[...allowedRoots]);if(action==='reveal'){if(statSync(target).isDirectory()){const error=await shell.openPath(target);if(error)throw new Error(error);}else shell.showItemInFolder(target);return {ok:true};}const appId=text(value.appId,'application');const catalog=installedCatalog();const selected=catalog.find(candidate=>candidate.id===appId);if(!selected)throw new Error('应用不可用');if(selected.id==='finder'){const error=await shell.openPath(target);if(error)throw new Error(error);return {ok:true};}const child=spawn('/usr/bin/open',['-a',selected.path,target],{detached:true,stdio:'ignore'});child.unref();return {ok:true};});
   handle('desktop:deliver',envelope=>{validateEnvelope(envelope,(sessionId,ref)=>attachments.authorize(sessionId,ref));if(envelope.command.type==='submit_message'&&envelope.command.attachments?.length&&attachments.selected?.vision!==true)throw new Error('当前模型不支持图片，请切换到视觉模型或移除附件');return bridge.request('deliver',{envelope}).then(()=>({ok:true}),error=>({ok:false,error:{message:error.message,kind:error.kind ?? 'outcome_unknown'}}));});
   handle('desktop:browser-state',()=>browser.state());
   handle('desktop:browser-command',command=>browser.command(command));

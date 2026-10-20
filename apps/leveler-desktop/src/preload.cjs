@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   copyText:text=>ipcRenderer.invoke('desktop:copy-text',text),
   openExternal:url=>ipcRenderer.invoke('desktop:open-external',url),
   openConfig:()=>ipcRenderer.invoke('desktop:open-config'),
+  openInAppApps:()=>ipcRenderer.invoke('desktop:open-in-app-apps'),
+  openInApp:request=>ipcRenderer.invoke('desktop:open-in-app',request),
   createTask:(selection,requestId)=>ipcRenderer.invoke('desktop:create-identified',{selection,requestId}),
   openTask:task=>ipcRenderer.invoke('desktop:open',task),
   snapshot:sessionId=>ipcRenderer.invoke('desktop:snapshot',sessionId),

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
 <title>CodeLeveler</title>
 <link rel="stylesheet" href="styles.css">
 </head>
@@ -55,13 +55,21 @@
     <button id="floating-right-toggle" class="icon-button floating-right-toggle" type="button" aria-label="打开右侧边栏" data-tooltip="打开侧边栏" data-keys="⌥ ⌘ B"></button>
 
     <header id="conversation-header" class="conversation-header" hidden>
-      <div class="conversation-heading">
-        <h1 id="conversation-title"></h1>
-        <span id="conversation-status" class="conversation-status" role="status"></span>
+      <div class="conversation-head-row">
+        <div class="conversation-heading">
+          <h1 id="conversation-title"></h1>
+          <span id="header-preset" class="header-preset">标准模式</span>
+          <span id="conversation-status" class="conversation-status" role="status"></span>
+        </div>
+        <div class="header-actions">
+          <div id="open-in-app" class="header-open-in-app" hidden></div>
+          <button id="header-more" class="icon-button" type="button" aria-label="更多操作" data-tooltip="更多操作" aria-haspopup="menu" aria-expanded="false"></button>
+          <button id="header-right-toggle" class="icon-button" type="button" aria-label="打开右侧边栏" data-tooltip="打开侧边栏" data-keys="⌥ ⌘ B"></button>
+        </div>
       </div>
-      <div class="header-actions">
-        <span id="header-preset" class="header-preset">标准模式</span>
-        <button id="header-right-toggle" class="icon-button" type="button" aria-label="打开右侧边栏" data-tooltip="打开侧边栏" data-keys="⌥ ⌘ B"></button>
+      <div id="view-tabs" class="view-tabs" role="tablist" aria-label="会话视图" hidden>
+        <button class="view-tab" type="button" role="tab" data-view="chat" aria-selected="true">对话</button>
+        <button class="view-tab" type="button" role="tab" data-view="trajectory" aria-selected="false">轨迹</button>
       </div>
     </header>
 
@@ -79,6 +87,8 @@
     <div id="conversation-scroll" class="conversation-scroll">
       <div id="conversation" class="conversation" aria-label="对话"></div>
     </div>
+
+    <div id="trajectory-root" class="trajectory-root" aria-label="轨迹" hidden></div>
 
     <div id="entry-page" class="entry-page" hidden></div>
 

@@ -84,3 +84,15 @@ test('existing task cancellation and continuation stay bounded to the selected s
  for(const content of ['',null,42,'a'.repeat(100001)])assert.throws(()=>security.validateEnvelope(envelope({type:'resume_task',session_id:'s1',content})));
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'resume_task',session_id:'s1',content:'a'.repeat(100000)})));
 });
+
+test('fork accepts only the selected session and carries no versioned authority',()=>{
+ const fork={type:'fork_session',session_id:'s1'};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(fork)));
+ for(const fields of [{session_id:'s2'},{session_id:''},{session_id:' '},{session_id:null},{name:'copy'},{expected_version:0}])assert.throws(()=>security.validateEnvelope(envelope({...fork,...fields})));
+});
+
+test('compaction is a selected-session command with no versioned authority',()=>{
+ const command={type:'compact_context',session_id:'s1'};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
+ for(const fields of [{session_id:'s2'},{session_id:' '},{content:'x'},{expected_version:1}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
+});

@@ -14,6 +14,7 @@ import {
   beginDiffQuery, expireDiffQuery, retainInterruptedThoughts,
 } from './state.mjs';
 import { brandMark, fileIcon } from './icons.mjs';
+import { projectTrajectory, searchTrajectory, buildTimeline, formatDuration } from './trajectory.mjs';
 import {
   el, iconNode, iconButton, installTooltips, toast, openMenu, closeMenu, confirmDialog,
   copyText, unconnected, trapTab,
@@ -73,6 +74,19 @@ let headerMenuButton = null;
 let headerSubagentButton = null;
 let headerJobsButton = null;
 let wideSidebarCollapsed = false;
+let activeView = 'chat';
+let liveTrajectory = [];
+let liveTurnStartAt = null;
+let liveTurnClosed = false;
+let trajectoryQuery = '';
+let trajectoryActualDuration = false;
+let trajectoryCollapseTurns = false;
+let trajectoryCollapseCalls = false;
+let trajectorySelectedId = null;
+let trajectoryDetailTab = 'overview';
+let trajectoryDetailWidth = 340;
+let trajectoryPinned = true;
+let openInAppState = { apps: null, loading: false, error: null, preferred: null };
 
 const drafts = new Map();
 const attachmentDrafts = new Map();
@@ -114,6 +128,28 @@ function loadSettings() {
 }
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* optional */ }
+}
+const VIEW_KEY = 'codeleveler.views.v1';
+const OPEN_APP_KEY = 'codeleveler.open-in-app.v1';
+function savedView(sessionId) {
+  try {
+    const stored = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}');
+    return stored && stored[sessionId] === 'trajectory' ? 'trajectory' : 'chat';
+  } catch { return 'chat'; }
+}
+function rememberView(sessionId, view) {
+  if (!sessionId) return;
+  try {
+    const stored = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}');
+    stored[sessionId] = view;
+    localStorage.setItem(VIEW_KEY, JSON.stringify(stored));
+  } catch { /* optional */ }
+}
+function savedOpenApp() {
+  try { return localStorage.getItem(OPEN_APP_KEY) || null; } catch { return null; }
+}
+function rememberOpenApp(appId) {
+  try { localStorage.setItem(OPEN_APP_KEY, appId); } catch { /* optional */ }
 }
 function resolvedTheme() {
   return settings.theme === 'system'
@@ -356,13 +392,29 @@ function openSessionMenu(task, anchor) {
     items: [
       { label: '置顶', icon: 'pin', disabled: true, badge: '未接入' },
       { label: '重命名', icon: 'edit', onSelect: () => action(async () => { await openTask(task); beginTitleEdit(); }) },
-      { label: 'Fork 会话', icon: 'fork', disabled: true, badge: '未接入' },
+      { label: '分叉会话', icon: 'fork', onSelect: () => action(() => forkTask(task)) },
       archived
         ? { label: '取消归档', icon: 'archive', disabled: true, badge: '未接入' }
         : { label: '归档', icon: 'archive', onSelect: () => archiveTask(task) },
       { label: '复制会话 ID', icon: 'copy', onSelect: () => copyText(api, task.id) },
     ],
   });
+}
+
+async function forkTask(task) {
+  const known = new Set(tasks.map(item => item.id));
+  await deliver({
+    type: 'fork_session',
+    session_id: task.id,
+  }, commandEnvelope(task.id, { type: 'fork_session', session_id: task.id }, null));
+  await refreshTasks();
+  const created = tasks.find(item => !known.has(item.id));
+  if (!created) {
+    toast('分叉已提交，但任务列表尚未返回副本；请刷新后查看', { tone: 'warning', holdMs: 4200 });
+    return;
+  }
+  toast('已创建分叉会话', { tone: 'success', holdMs: 1800 });
+  await openTask(created);
 }
 
 async function archiveTask(task) {
@@ -456,33 +508,86 @@ function openSidebarSearch() {
 
 function ensureHeaderActions() {
   if (headerMenuButton) return;
-  headerSubagentButton = iconButton('bot', '子智能体', { size: 16, tooltip: '子智能体' });
-  headerJobsButton = iconButton('clock', '后台任务', { size: 16, tooltip: '后台任务' });
-  headerMenuButton = iconButton('more', '会话操作', { size: 16, tooltip: '会话操作' });
-  const actions = $('conversation-header').querySelector('.header-actions');
-  const right = $('header-right-toggle');
-  actions.insertBefore(headerSubagentButton, right);
-  actions.insertBefore(headerJobsButton, right);
-  actions.insertBefore(headerMenuButton, right);
-  headerSubagentButton.addEventListener('click', () => openRightbarTab('subagent'));
-  headerJobsButton.addEventListener('click', event => openJobsMenu(event.currentTarget));
+  headerMenuButton = $('header-more');
+  headerMenuButton.append(iconNode('more', { size: 16 }));
   headerMenuButton.addEventListener('click', () => {
     if (!current) return;
     openMenu({
       anchor: headerMenuButton, align: 'end', width: 240,
       items: [
-        { label: '搜索对话', icon: 'search', shortcut: '⌘ F', onSelect: openFind },
-        { label: '历史提问', icon: 'history', onSelect: () => openHistoryMenu(headerMenuButton) },
-        { divider: true },
-        { label: '重命名', icon: 'edit', onSelect: beginTitleEdit },
-        { label: '置顶', icon: 'pin', disabled: true, badge: '未接入' },
-        { label: 'Fork 会话', icon: 'fork', disabled: true, badge: '未接入' },
-        { divider: true },
-        { label: '归档', icon: 'archive', onSelect: archiveCurrent },
-        { label: '复制会话 ID', icon: 'copy', onSelect: () => copyText(api, current.session.id) },
+        { label: '下载 Session 日志', icon: 'download', disabled: true, badge: '未接入', title: 'Runtime 未提供 Session 打包导出接口' },
+        { label: '反馈', icon: 'feedback', onSelect: openFeedbackDialog },
       ],
     });
   });
+  const actions = $('conversation-header').querySelector('.header-actions');
+  headerJobsButton = iconButton('clock', '后台任务', { size: 16, tooltip: '后台任务' });
+  headerSubagentButton = iconButton('bot', '子智能体', { size: 16, tooltip: '子智能体' });
+  actions.insertBefore(headerSubagentButton, headerMenuButton);
+  actions.insertBefore(headerJobsButton, headerMenuButton);
+  headerSubagentButton.addEventListener('click', () => openRightbarTab('subagent'));
+  headerJobsButton.addEventListener('click', event => openJobsMenu(event.currentTarget));
+  for (const tab of document.querySelectorAll('#view-tabs [data-view]')) {
+    tab.addEventListener('click', () => {
+      activeView = tab.dataset.view === 'trajectory' ? 'trajectory' : 'chat';
+      if (current) rememberView(current.session.id, activeView);
+      renderHeader();
+      renderConversation();
+      renderTrajectory();
+      controls();
+    });
+  }
+}
+
+function feedbackCategories() {
+  return ['任务结果', '指令理解与遵循', '产品功能与交互', '稳定性和速度', '资源使用与费用', '安全隐私与权限', '其他'];
+}
+
+function openFeedbackDialog() {
+  if (document.querySelector('.feedback-modal')) return;
+  const overlay = el('div', 'feedback-overlay');
+  overlay.setAttribute('role', 'presentation');
+  const dialog = el('div', 'feedback-modal');
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-label', '提交反馈');
+  const head = el('div', 'feedback-head');
+  head.append(el('h2', undefined, '提交反馈'));
+  const close = iconButton('close', '关闭反馈', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const chips = el('div', 'feedback-chips');
+  const selected = new Set();
+  for (const category of feedbackCategories()) {
+    const chip = el('button', 'feedback-chip', category);
+    chip.type = 'button';
+    chip.setAttribute('aria-pressed', 'false');
+    chip.addEventListener('click', () => {
+      if (selected.has(category)) selected.delete(category); else selected.add(category);
+      chip.setAttribute('aria-pressed', String(selected.has(category)));
+    });
+    chips.append(chip);
+  }
+  const detail = el('textarea', 'feedback-detail');
+  detail.rows = 5;
+  detail.placeholder = '填写详情以帮助我们改进体验，提交内容会包括当前对话的日志';
+  detail.setAttribute('aria-label', '反馈详情');
+  const submit = el('button', 'button primary feedback-submit', '提交');
+  submit.type = 'button';
+  submit.addEventListener('click', () => {
+    // No feedback channel is connected to this Runtime. Never report a
+    // successful submission for a message nothing received.
+    toast('反馈通道尚未接入当前 Runtime', { tone: 'info', holdMs: 3200 });
+  });
+  dialog.append(head, chips, detail, submit);
+  overlay.append(dialog);
+  overlay.addEventListener('mousedown', event => { if (event.target === overlay) overlay.remove(); });
+  close.addEventListener('click', () => overlay.remove());
+  const onKey = event => {
+    if (event.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', onKey, true); }
+  };
+  document.addEventListener('keydown', onKey, true);
+  document.body.append(overlay);
+  detail.focus();
 }
 
 function openJobsMenu(anchor) {
@@ -549,18 +654,151 @@ function renderHeader() {
   document.body.classList.toggle('blank-session', home);
   $('conversation-header').hidden = home || pageOpen;
   $('floating-right-toggle').hidden = !home || pageOpen || rightbarOpen;
+  const tabs = $('view-tabs');
+  if (tabs) {
+    tabs.hidden = home || pageOpen || !current;
+    for (const tab of tabs.querySelectorAll('[data-view]')) {
+      tab.setAttribute('aria-selected', String(tab.dataset.view === activeView));
+    }
+  }
   if (!current) {
     if (!titleEditing) $('conversation-title').textContent = '新建会话';
     $('conversation-status').textContent = '';
+    renderOpenInAppControls();
     return;
   }
   if (!titleEditing) $('conversation-title').textContent = current.session.goal || '新建会话';
+  // The reference header carries no status sentence; runtime state is shown in
+  // the transcript and the composer. Keep the element for assistive tech only.
   $('conversation-status').textContent = current.approvals.length || current.clarifications.length
     ? '等待你处理' : current.activity || LABELS[current.status] || current.status;
   $('conversation-status').dataset.tone = current.status === 'failed' ? 'error'
     : current.status === 'running' ? 'active' : current.approvals.length || current.clarifications.length ? 'waiting' : '';
+  $('conversation-status').hidden = true;
   if (headerSubagentButton) headerSubagentButton.hidden = !(current.children?.length);
   if (headerJobsButton) headerJobsButton.hidden = !(current.backgroundTasks?.length);
+  renderOpenInAppControls();
+}
+
+/* ---------------------------------------------------------- open in app */
+
+function ensureOpenInApps() {
+  if (openInAppState.loading || openInAppState.apps) return;
+  openInAppState.loading = true;
+  openInAppState.preferred ??= savedOpenApp();
+  api.openInAppApps().then(apps => {
+    openInAppState = { ...openInAppState, apps: Array.isArray(apps) ? apps : [], loading: false, error: null };
+  }, error => {
+    openInAppState = { ...openInAppState, apps: [], loading: false, error: error?.message ?? '无法获取应用列表' };
+  }).finally(() => {
+    renderOpenInAppControls();
+    if (rightbarOpen) renderRightbar();
+  });
+}
+
+function appLeading(app) {
+  if (app?.icon) {
+    const image = el('img', 'open-app-icon');
+    image.src = app.icon;
+    image.alt = '';
+    image.width = 16;
+    image.height = 16;
+    return image;
+  }
+  return iconNode('external', { size: 14 });
+}
+
+async function openInApp(path, appId, { action = 'open', remember = false } = {}) {
+  if (!path || !appId || openInAppState.busy) return;
+  openInAppState.busy = true;
+  renderOpenInAppControls();
+  if (rightbarOpen) renderRightbar();
+  try {
+    await api.openInApp({ path, appId, action });
+    if (action === 'open' && remember) {
+      openInAppState.preferred = appId;
+      rememberOpenApp(appId);
+    }
+    renderOpenInAppControls();
+    if (rightbarOpen) renderRightbar();
+  } catch (error) {
+    toast(action === 'reveal' ? '无法显示文件位置，请重试' : '打开失败，请重试', { tone: 'warning', holdMs: 3200 });
+  } finally {
+    openInAppState.busy = false;
+    renderOpenInAppControls();
+    if (rightbarOpen) renderRightbar();
+  }
+}
+
+function openInAppMenu(anchor, path, kind) {
+  ensureOpenInApps();
+  const apps = openInAppState.apps ?? [];
+  const preferred = apps.find(app => app.id === openInAppState.preferred)?.id ?? apps[0]?.id ?? null;
+  const items = [];
+  if (openInAppState.loading) items.push({ label: '正在读取应用…', disabled: true });
+  else if (openInAppState.error) items.push({ label: '无法获取应用列表', disabled: true, title: openInAppState.error });
+  else {
+    for (const app of apps) {
+      items.push({
+        label: app.id === preferred ? `${app.name}（默认）` : app.name,
+        image: app.icon ?? undefined,
+        checked: app.id === preferred,
+        onSelect: () => openInApp(path, app.id, { remember: kind === 'directory' }),
+      });
+    }
+    if (kind === 'file') {
+      items.push({ divider: true });
+      items.push({ label: '显示文件位置', icon: 'folder', onSelect: () => openInApp(path, apps[0]?.id ?? 'finder', { action: 'reveal' }) });
+    }
+  }
+  openMenu({ anchor, items, align: 'end', width: 220 });
+}
+
+function absoluteOpenPath(value) {
+  if (!value) return null;
+  if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)) return value;
+  const root = current?.session.repository;
+  if (!root) return null;
+  const separator = root.includes('\\') ? '\\' : '/';
+  return `${root.replace(/[\\/]+$/, '')}${separator}${value.replace(/^[\\/]+/, '')}`;
+}
+
+function renderOpenInAppInto(host, value, kind) {
+  if (!host) return;
+  const path = absoluteOpenPath(value);
+  if (!path) { host.hidden = true; host.replaceChildren(); return; }
+  ensureOpenInApps();
+  host.hidden = false;
+  host.replaceChildren();
+  const apps = openInAppState.apps;
+  if (!openInAppState.loading && apps && apps.length === 0) { host.hidden = true; return; }
+  const preferred = apps?.find(app => app.id === openInAppState.preferred) ?? apps?.[0] ?? null;
+  const primary = el('button', 'open-app-primary');
+  primary.type = 'button';
+  primary.disabled = openInAppState.loading || !!openInAppState.busy || !preferred;
+  primary.setAttribute('aria-label', preferred ? `用 ${preferred.name} 打开` : '正在读取应用');
+  primary.dataset.tooltip = preferred ? `用 ${preferred.name} 打开` : '正在读取应用';
+  primary.append(preferred ? appLeading(preferred) : iconNode('external', { size: 14 }));
+  primary.addEventListener('click', () => {
+    if (preferred) openInApp(path, preferred.id, { remember: kind === 'directory' });
+  });
+  host.append(primary);
+  if ((apps?.length ?? 0) > 1 || kind === 'file') {
+    const more = el('button', 'open-app-more');
+    more.type = 'button';
+    more.setAttribute('aria-label', '更多打开方式');
+    more.setAttribute('aria-haspopup', 'menu');
+    more.dataset.tooltip = '更多打开方式';
+    more.append(iconNode('chevronDown', { size: 10 }));
+    more.disabled = openInAppState.loading || !!openInAppState.busy;
+    more.addEventListener('click', () => openInAppMenu(more, path, kind));
+    host.append(more);
+  }
+}
+
+function renderOpenInAppControls() {
+  const path = current?.session.repository || null;
+  renderOpenInAppInto($('open-in-app'), path, 'directory');
 }
 
 /* --------------------------------------------------------------- composer */
@@ -657,6 +895,7 @@ function render() {
   renderComposerMeta();
   renderContextMeter();
   renderConversation();
+  renderTrajectory();
   renderInteractions();
   renderRightbar();
   controls();
@@ -1308,6 +1547,413 @@ function usageNode() {
   return row;
 }
 
+/* ------------------------------------------------------------- trajectory */
+
+const TRAJECTORY_LIVE_ONLY = new Set([
+  'token_usage', 'context_usage', 'context_loaded', 'agent_activity', 'command_progress',
+  'notification', 'session_opened', 'session_updated', 'session_history_loaded',
+  'agents_loaded', 'agent_loaded', 'agent_mutated', 'global_tasks_loaded',
+  'observability_loaded', 'session_list', 'runtime_ready', 'model_retrying',
+  'turn_finalizing', 'plan_updated', 'diff_updated', 'diff_failed', 'attachment_added',
+  'attachment_processing_failed', 'prompt_suggestion', 'away_summary', 'project_rules_loaded',
+  'context_updated', 'background_tasks_reconciled', 'memory_list', 'memory_recalled',
+  'memory_changed', 'goal_recap_created', 'unfinished_goals_loaded', 'child_contribution_loaded',
+]);
+const TRAJECTORY_TERMINALS = new Set([
+  'turn_completed_with_warnings', 'turn_truncated', 'turn_incomplete', 'turn_failed',
+  'session_completed',
+]);
+
+function recordLiveTrajectory(event) {
+  if (!current || !event) return;
+  if (event.type === 'session_history_loaded') { liveTrajectory = []; liveTurnStartAt = null; liveTurnClosed = false; return; }
+  if (TRAJECTORY_LIVE_ONLY.has(event.type)) return;
+  const startsTurn = event.type === 'user_message_added' && (liveTurnClosed || liveTrajectory.length === 0);
+  if (event.type === 'user_message_added' && liveTurnClosed) {
+    liveTrajectory = [];
+    liveTurnStartAt = null;
+    liveTurnClosed = false;
+  }
+  if (liveTurnStartAt === null) liveTurnStartAt = Date.now();
+  liveTrajectory.push({
+    turn_elapsed_ms: Math.max(0, Date.now() - liveTurnStartAt),
+    turn_start: startsTurn,
+    event,
+  });
+  if (TRAJECTORY_TERMINALS.has(event.type)) liveTurnClosed = true;
+  if (activeView === 'trajectory') scheduleTrajectory();
+}
+
+let trajectoryPaintPending = false;
+function scheduleTrajectory() {
+  if (trajectoryPaintPending) return;
+  trajectoryPaintPending = true;
+  requestAnimationFrame(() => {
+    trajectoryPaintPending = false;
+    if (activeView === 'trajectory') renderTrajectory();
+  });
+}
+
+function trajectoryProjection() {
+  return projectTrajectory([...history, ...liveTrajectory], { usage: current?.usage });
+}
+
+function trajectorySummary(record) {
+  if (record.kind === 'tool') {
+    const args = String(record.arguments ?? '').replace(/\s+/g, ' ').trim();
+    const result = String(record.preview ?? '').replace(/\s+/g, ' ').trim();
+    return `${record.toolName || '工具'} ${args}`.trim() + (result ? `  →  ${result}` : '');
+  }
+  if (record.kind === 'assistant') return record.text;
+  return record.text;
+}
+
+function ensureTrajectoryDom() {
+  const root = $('trajectory-root');
+  if (root.dataset.ready === '1') return root;
+  root.replaceChildren();
+  const toolbar = el('div', 'trajectory-toolbar');
+  toolbar.setAttribute('role', 'toolbar');
+  toolbar.setAttribute('aria-label', '轨迹工具栏');
+  const actions = el('div', 'trajectory-actions');
+  const duration = el('button', 'trajectory-toggle');
+  duration.type = 'button';
+  duration.dataset.trajectoryAction = 'duration';
+  duration.setAttribute('aria-label', '使用实际时长');
+  duration.append(iconNode('clock', { size: 13 }), el('span', undefined, '时长'));
+  duration.addEventListener('click', () => {
+    trajectoryActualDuration = !trajectoryActualDuration;
+    renderTrajectory();
+  });
+  const turns = el('button', 'trajectory-action');
+  turns.type = 'button';
+  turns.dataset.trajectoryAction = 'turns';
+  turns.addEventListener('click', () => {
+    trajectoryCollapseTurns = !trajectoryCollapseTurns;
+    renderTrajectory();
+  });
+  const calls = el('button', 'trajectory-action');
+  calls.type = 'button';
+  calls.dataset.trajectoryAction = 'calls';
+  calls.addEventListener('click', () => {
+    trajectoryCollapseCalls = !trajectoryCollapseCalls;
+    renderTrajectory();
+  });
+  actions.append(duration, turns, calls);
+  const search = el('label', 'trajectory-search');
+  search.append(iconNode('search', { size: 12 }));
+  const input = el('input');
+  input.type = 'search';
+  input.id = 'trajectory-search';
+  input.placeholder = '搜索轨迹';
+  input.setAttribute('aria-label', '搜索轨迹');
+  input.addEventListener('input', () => { trajectoryQuery = input.value; renderTrajectory(); });
+  search.append(input);
+  toolbar.append(actions, search);
+  const timeline = el('div', 'trajectory-timeline');
+  timeline.setAttribute('aria-label', '时间线概览；水平拖动可聚焦事件');
+  const body = el('div', 'trajectory-body');
+  const ledger = el('div', 'trajectory-ledger');
+  ledger.tabIndex = 0;
+  ledger.addEventListener('scroll', () => {
+    trajectoryPinned = ledger.scrollHeight - ledger.scrollTop - ledger.clientHeight < 80;
+  });
+  const separator = el('div', 'trajectory-detail-resize');
+  separator.setAttribute('role', 'separator');
+  separator.setAttribute('aria-label', '调整事件详情宽度');
+  separator.setAttribute('aria-orientation', 'vertical');
+  separator.tabIndex = 0;
+  separator.hidden = true;
+  const detail = el('div', 'trajectory-detail');
+  detail.hidden = true;
+  body.append(ledger, separator, detail);
+  root.append(toolbar, timeline, body);
+  separator.addEventListener('pointerdown', event => {
+    if (detail.hidden) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = trajectoryDetailWidth;
+    separator.setPointerCapture(event.pointerId);
+    const move = moveEvent => {
+      trajectoryDetailWidth = Math.max(240, Math.min(Math.round(root.clientWidth * 0.6), startWidth + startX - moveEvent.clientX));
+      detail.style.width = `${trajectoryDetailWidth}px`;
+    };
+    const up = () => {
+      separator.removeEventListener('pointermove', move);
+      separator.removeEventListener('pointerup', up);
+    };
+    separator.addEventListener('pointermove', move);
+    separator.addEventListener('pointerup', up);
+  });
+  root.dataset.ready = '1';
+  return root;
+}
+
+function renderTrajectoryTimeline(host, records) {
+  host.replaceChildren();
+  const timeline = buildTimeline(records, trajectoryActualDuration);
+  const lanes = [['input', '输入'], ['model', '模型'], ['tool', '工具']];
+  for (const [laneId, label] of lanes) {
+    const row = el('div', 'trajectory-lane');
+    row.append(el('span', 'trajectory-lane-label', label));
+    const track = el('div', 'trajectory-lane-track');
+    for (const item of timeline.items.filter(entry => entry.lane === laneId)) {
+      const bar = el('span', 'trajectory-bar');
+      bar.dataset.kind = item.kind;
+      bar.style.left = `${(item.start / timeline.total) * 100}%`;
+      bar.style.width = `${Math.max(0.8, ((item.end - item.start) / timeline.total) * 100)}%`;
+      const record = records.find(entry => entry.id === item.id);
+      bar.title = record ? `${record.label} · ${formatDuration(record.startedMs) ?? '计时不可用'}` : '';
+      track.append(bar);
+    }
+    row.append(track);
+    host.append(row);
+  }
+}
+
+function trajectoryDetailTabs(record) {
+  if (record.kind === 'tool') return [['overview', '概述'], ['payload', '参数'], ['result', '结果'], ['schema', 'Schema'], ['timing', '计时']];
+  if (record.kind === 'assistant') return [['overview', '概述'], ['preview', '预览'], ['raw', '原始内容']];
+  return [['overview', '概述'], ['raw', '原始内容']];
+}
+
+function detailCodeBlock(text, { empty = '不可用' } = {}) {
+  if (!text) return el('div', 'trajectory-detail-empty', empty);
+  const pre = el('pre', 'trajectory-code');
+  pre.textContent = text;
+  return pre;
+}
+
+function detailRow(label, value, { tone = '' } = {}) {
+  const row = el('div', 'trajectory-detail-row');
+  row.append(el('span', 'trajectory-detail-label', label));
+  const cell = el('span', 'trajectory-detail-value', value);
+  if (tone) cell.dataset.tone = tone;
+  row.append(cell);
+  return row;
+}
+
+function renderTrajectoryDetail(host, record, projection) {
+  if (!record) { host.hidden = true; return; }
+  const root = $('trajectory-root');
+  host.hidden = false;
+  host.style.width = `${trajectoryDetailWidth}px`;
+  const separator = root.querySelector('.trajectory-detail-resize');
+  if (separator) separator.hidden = false;
+  const head = el('div', 'trajectory-detail-head');
+  const title = el('div', 'trajectory-detail-title');
+  title.append(el('span', 'trajectory-detail-kind', record.label));
+  title.append(el('span', 'trajectory-detail-context', `第 ${record.turn} 轮${record.request ? ` · 请求 #${record.request}` : ''}`));
+  const close = iconButton('close', '关闭详情', { size: 15, tooltip: '关闭详情' });
+  close.addEventListener('click', () => {
+    trajectorySelectedId = null;
+    renderTrajectory();
+  });
+  head.append(title, close);
+  const tabs = el('div', 'trajectory-detail-tabs');
+  const tabsSpec = trajectoryDetailTabs(record);
+  if (!tabsSpec.some(([id]) => id === trajectoryDetailTab)) trajectoryDetailTab = 'overview';
+  for (const [id, label] of tabsSpec) {
+    const button = el('button', 'trajectory-detail-tab', label);
+    button.type = 'button';
+    button.setAttribute('role', 'tab');
+    button.setAttribute('aria-selected', String(trajectoryDetailTab === id));
+    button.addEventListener('click', () => { trajectoryDetailTab = id; renderTrajectory(); });
+    tabs.append(button);
+  }
+  const body = el('div', 'trajectory-detail-body');
+  const usage = record.usage;
+  if (trajectoryDetailTab === 'overview') {
+    body.append(detailRow('类型', record.label));
+    body.append(detailRow('状态', record.status === 'success' ? '已完成' : record.status === 'failed' ? '失败' : record.status === 'running' ? '进行中' : record.status === 'stopped' ? '已停止' : record.status === 'interrupted' ? '已中断' : record.status || '未知'));
+    if (record.kind === 'tool') {
+      body.append(detailRow('工具', record.toolName || '不可用'));
+      body.append(el('h3', 'trajectory-detail-heading', '参数'));
+      body.append(detailCodeBlock(record.arguments, { empty: '参数不可用' }));
+      body.append(el('h3', 'trajectory-detail-heading', '结果'));
+      body.append(detailCodeBlock(record.preview, { empty: '结果不可用' }));
+    } else {
+      if (record.kind === 'user') body.append(detailRow('图片', String(record.images ?? 0)));
+      body.append(detailRow('Token 用量', usage ? `输入 ${usage.input ?? '?'} · 输出 ${usage.output ?? '?'}${usage.cached ? ` · 缓存 ${usage.cached}` : ''}` : '不可用（Runtime 未持久化用量）'));
+      body.append(detailRow('时长', formatDuration(record.durationMs) ?? '不可用'));
+      body.append(el('h3', 'trajectory-detail-heading', '预览'));
+      const markdown = el('div', 'markdown trajectory-detail-markdown');
+      renderMarkdown(markdown, record.text || '（无文本）', { onLink: openMessageLink });
+      body.append(markdown);
+    }
+    body.append(el('h3', 'trajectory-detail-heading', '请求计时'));
+    const timing = el('div', 'trajectory-detail-timing');
+    timing.append(
+      detailRow('轮内偏移', formatDuration(record.startedMs) ?? '不可用'),
+      detailRow('总时长', formatDuration(record.durationMs) ?? '不可用'),
+      detailRow('首 token 延迟', record.kind === 'assistant' ? (formatDuration(record.ttftMs) ?? '不可用') : '不适用于此记录'),
+      detailRow('生成', record.kind === 'assistant' ? (formatDuration(record.durationMs) ?? '不可用') : '不适用于此记录'),
+      detailRow('吞吐量', usage && record.durationMs ? '不可用（Runtime 未记录生成 token 时间）' : '不可用'),
+    );
+    body.append(timing);
+  } else if (trajectoryDetailTab === 'payload') {
+    body.append(detailCodeBlock(record.arguments, { empty: '参数不可用' }));
+  } else if (trajectoryDetailTab === 'result') {
+    body.append(detailCodeBlock(record.preview, { empty: '结果不可用' }));
+  } else if (trajectoryDetailTab === 'schema') {
+    body.append(el('div', 'trajectory-detail-empty', 'Schema 不可用：Runtime 未记录工具 schema'));
+  } else if (trajectoryDetailTab === 'timing') {
+    body.append(
+      detailRow('开始时间', `${formatDuration(record.startedMs) ?? '不可用'}（轮内偏移）`),
+      detailRow('总时长', formatDuration(record.durationMs) ?? '不可用'),
+      detailRow('首 token 延迟', formatDuration(record.ttftMs) ?? '不可用'),
+      detailRow('生成', record.kind === 'assistant' ? (formatDuration(record.durationMs) ?? '不可用') : '不适用'),
+    );
+  } else if (trajectoryDetailTab === 'preview') {
+    const markdown = el('div', 'markdown trajectory-detail-markdown');
+    renderMarkdown(markdown, record.text || '（无文本）', { onLink: openMessageLink });
+    body.append(markdown);
+  } else if (trajectoryDetailTab === 'raw') {
+    body.append(detailCodeBlock(JSON.stringify({
+      kind: record.kind, subtype: record.subtype, status: record.status,
+      text: record.text, tool: record.toolName, arguments: record.arguments,
+      result: record.preview, usage: record.usage, timing: {
+        startedMs: record.startedMs, durationMs: record.durationMs, ttftMs: record.ttftMs,
+      },
+    }, null, 2), { empty: '原始内容不可用' }));
+  }
+  host.replaceChildren(head, tabs, body);
+}
+
+function renderTrajectory() {
+  const root = ensureTrajectoryDom();
+  const active = !!current && !isHome() && $('entry-page').hidden && activeView === 'trajectory';
+  root.hidden = !active;
+  $('conversation-scroll').hidden = active;
+  if (!active) {
+    const separator = root.querySelector('.trajectory-detail-resize');
+    if (separator) separator.hidden = true;
+    return;
+  }
+  const projection = trajectoryProjection();
+  const records = projection.records;
+  const duration = root.querySelector('[data-trajectory-action="duration"]');
+  duration.setAttribute('aria-pressed', String(trajectoryActualDuration));
+  duration.title = trajectoryActualDuration ? '使用等宽时长' : '使用实际时长';
+  const turns = root.querySelector('[data-trajectory-action="turns"]');
+  turns.setAttribute('aria-label', trajectoryCollapseTurns ? '展开所有轮次' : '收起所有轮次');
+  turns.setAttribute('aria-pressed', String(trajectoryCollapseTurns));
+  turns.replaceChildren(iconNode(trajectoryCollapseTurns ? 'plus' : 'minus', { size: 11 }), el('span', undefined, '轮次'));
+  const calls = root.querySelector('[data-trajectory-action="calls"]');
+  calls.setAttribute('aria-label', trajectoryCollapseCalls ? '展开所有调用' : '收起所有调用');
+  calls.setAttribute('aria-pressed', String(trajectoryCollapseCalls));
+  calls.replaceChildren(iconNode(trajectoryCollapseCalls ? 'plus' : 'minus', { size: 11 }), el('span', undefined, '调用'));
+  const search = root.querySelector('#trajectory-search');
+  if (search.value !== trajectoryQuery) search.value = trajectoryQuery;
+  renderTrajectoryTimeline(root.querySelector('.trajectory-timeline'), records);
+  const ledger = root.querySelector('.trajectory-ledger');
+  const matches = searchTrajectory(records, trajectoryQuery);
+  const filtering = trajectoryQuery.trim() !== '';
+  const table = el('table', 'trajectory-table');
+  const colgroup = el('colgroup');
+  const eventCol = el('col', 'trajectory-event-column');
+  const contentCol = el('col');
+  colgroup.append(eventCol, contentCol);
+  table.append(colgroup);
+  const tbody = el('tbody');
+  const selected = records.find(record => record.id === trajectorySelectedId) ?? null;
+  if (!selected && trajectorySelectedId) trajectorySelectedId = null;
+  let rendered = 0;
+  const systemVisible = !filtering;
+  if (systemVisible) {
+    const row = el('tr', 'trajectory-row trajectory-system-row');
+    row.dataset.kind = 'system';
+    const typeCell = el('td', 'trajectory-type-cell');
+    const chip = el('span', 'trajectory-kind', '系统');
+    chip.dataset.kind = 'context';
+    typeCell.append(chip);
+    const contentCell = el('td', 'trajectory-content-cell');
+    contentCell.append(el('span', 'trajectory-summary', '初始系统提示词 · 不可用：Runtime 未记录系统提示词'));
+    row.append(typeCell, contentCell);
+    tbody.append(row);
+  }
+  for (const turn of projection.turns) {
+    const visible = turn.records.filter(record => !filtering || matches.has(record.id));
+    if (filtering && visible.length === 0) continue;
+    const group = el('tr', 'trajectory-group-row');
+    const groupCell = el('td');
+    groupCell.colSpan = 2;
+    const groupButton = el('button', 'trajectory-group-toggle');
+    groupButton.type = 'button';
+    groupButton.setAttribute('aria-expanded', String(!trajectoryCollapseTurns));
+    groupButton.append(el('span', 'trajectory-turn-label', `第 ${turn.index} 轮`));
+    if (trajectoryCollapseTurns) groupButton.append(el('span', 'trajectory-turn-summary', `${visible.length} 条记录`));
+    groupButton.addEventListener('click', () => { trajectoryCollapseTurns = !trajectoryCollapseTurns; renderTrajectory(); });
+    groupCell.append(groupButton);
+    group.append(groupCell);
+    tbody.append(group);
+    if (trajectoryCollapseTurns) continue;
+    for (const record of visible) {
+      if (trajectoryCollapseCalls && record.kind === 'tool') continue;
+      const row = el('tr', 'trajectory-row');
+      row.dataset.id = record.id;
+      row.dataset.kind = record.kind;
+      if (record.id === trajectorySelectedId) row.setAttribute('aria-selected', 'true');
+      const typeCell = el('td', 'trajectory-type-cell');
+      if (record.request) {
+        const requestButton = el('button', 'trajectory-request-button', `#${record.request}`);
+        requestButton.type = 'button';
+        requestButton.setAttribute('aria-label', `请求 #${record.request}`);
+        requestButton.title = `请求 #${record.request}`;
+        requestButton.addEventListener('click', event => {
+          event.stopPropagation();
+          trajectorySelectedId = record.id;
+          trajectoryDetailTab = 'overview';
+          renderTrajectory();
+        });
+        typeCell.append(requestButton);
+      }
+      const chip = el('span', 'trajectory-kind', record.label);
+      chip.dataset.kind = record.kind;
+      typeCell.append(chip);
+      const contentCell = el('td', 'trajectory-content-cell');
+      contentCell.append(el('span', 'trajectory-summary', trajectorySummary(record) || '（空）'));
+      if (record.kind === 'tool' && record.status !== 'success') contentCell.append(el('span', 'trajectory-status', record.status === 'running' ? '运行中' : record.status === 'failed' ? '失败' : record.status === 'stopped' ? '已停止' : '未知'));
+      row.append(typeCell, contentCell);
+      row.addEventListener('click', () => {
+        trajectorySelectedId = record.id;
+        trajectoryDetailTab = 'overview';
+        renderTrajectory();
+      });
+      tbody.append(row);
+      rendered += 1;
+    }
+  }
+  if (filtering && rendered === 0) {
+    const row = el('tr', 'trajectory-empty-row');
+    const cell = el('td');
+    cell.colSpan = 2;
+    cell.textContent = '无匹配记录';
+    row.append(cell);
+    tbody.append(row);
+  }
+  if (!records.length) {
+    const row = el('tr', 'trajectory-empty-row');
+    const cell = el('td');
+    cell.colSpan = 2;
+    cell.textContent = '暂无轨迹记录。Runtime 还没有为这个会话记录事件。';
+    row.append(cell);
+    tbody.append(row);
+  }
+  table.append(tbody);
+  const scrollTop = ledger.scrollTop;
+  ledger.replaceChildren(table);
+  if (trajectoryPinned) ledger.scrollTop = ledger.scrollHeight;
+  else ledger.scrollTop = scrollTop;
+  const detailHost = root.querySelector('.trajectory-detail');
+  renderTrajectoryDetail(detailHost, selected, projection);
+  if (!selected) {
+    detailHost.hidden = true;
+    const separator = root.querySelector('.trajectory-detail-resize');
+    if (separator) separator.hidden = true;
+  }
+}
+
 /* ----------------------------------------------------------- interactions */
 
 function renderInteractions() {
@@ -1517,34 +2163,36 @@ function openPermissionMenu(anchor) {
 function commandCatalog() {
   const frozen = loading || !!uncertain || uploadPending();
   const session = !!current;
-  return [
-    ['new', '新建会话', true, 'plus'],
-    ['find', '搜索对话', session, 'search'],
-    ['rename', '重命名会话', session, 'edit'],
-    ['diff', '查看工作区变更', !!current?.session.repository, 'diff'],
-    ['agents', '查看智能体目录', session, 'bot'],
-    ['memory', '查看项目记忆', session, 'brain'],
-    ['context', '查看上下文统计', session, 'layers'],
-    ['observability', '查看运行观测', session, 'pulse'],
-    ['settings', '打开设置', true, 'settings'],
-  ].map(([id, label, available, icon]) => ({
-    id, label, icon, enabled: available && !frozen,
-    reason: frozen ? '请先处理当前未完成操作' : id === 'diff' ? '需要当前会话的工作区' : '请先选择或新建会话',
+  const entries = [
+    ['add', 'file', '文件', session, 'paperclip', null, null],
+    ['commands', 'goal', '目标', false, 'compass', '未接入', 'Runtime 没有长期目标编辑接口'],
+    ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
+    ['commands', 'feedback', '反馈', true, 'feedback', null, null],
+    ['commands', 'compact', '压缩', session, 'archive', null, null],
+    ['commands', 'permission', '权限', session, 'shield', null, null],
+    ['commands', 'model', '模型', session, 'layers', null, null],
+    ['commands', 'export', '下载日志', false, 'download', '未接入', 'Runtime 未提供 Session 打包导出接口'],
+  ];
+  return entries.map(([group, id, label, available, icon, badge, reason]) => ({
+    group, id, label, icon, badge,
+    enabled: available && !frozen,
+    reason: frozen ? '请先处理当前未完成操作' : reason ?? '请先选择或新建会话',
   }));
 }
 
-function openSlashMenu() {
-  const value = $('message').value;
-  const commands = commandCatalog();
-  const candidates = /^\/[a-z-]*$/.test(value.trim()) ? commandCandidates(value, commands) : [];
+function openCommandMenu(candidates = commandCatalog()) {
   $('command-popover')?.remove();
   if (!candidates.length) return;
   const node = el('div', 'menu command-popover');
   node.id = 'command-popover';
   node.dataset.selected = candidates.find(item => item.enabled)?.id ?? candidates[0].id;
   node.setAttribute('role', 'listbox');
-  node.append(el('div', 'menu-heading', '命令'));
+  let group = null;
   for (const command of candidates) {
+    if (command.group !== group) {
+      group = command.group;
+      node.append(el('div', 'menu-heading', group === 'add' ? '添加' : '指令'));
+    }
     const button = el('button', 'menu-item');
     button.type = 'button';
     button.dataset.commandId = command.id;
@@ -1553,10 +2201,10 @@ function openSlashMenu() {
     button.append(iconNode(command.icon ?? 'command', { size: 14 }), el('span', 'menu-label', command.label));
     if (!command.enabled) {
       button.disabled = true;
-      button.append(unconnected());
+      button.append(unconnected(command.badge ?? undefined));
       button.title = command.reason ?? '当前不可用';
     }
-    button.addEventListener('click', () => insertCommand(command.id));
+    button.addEventListener('click', () => executeCommand(command.id));
     node.append(button);
   }
   node.append(el('div', 'menu-note', '↑↓ 选择 · Enter 执行 · Esc 关闭'));
@@ -1565,6 +2213,14 @@ function openSlashMenu() {
   node.style.left = `${Math.round(card.left + 8)}px`;
   node.style.top = `${Math.round(card.top - node.getBoundingClientRect().height - 4)}px`;
   node.style.width = `${Math.min(360, card.width - 16)}px`;
+}
+
+function openSlashMenu() {
+  const value = $('message').value;
+  const candidates = /^\/[a-z-]*$/.test(value.trim())
+    ? commandCandidates(value, commandCatalog())
+    : [];
+  openCommandMenu(candidates);
 }
 
 function openAtMenu() {
@@ -1608,11 +2264,18 @@ async function executeCommand(id) {
   closeComposerPopovers();
   composerError('');
   controls();
-  if (id === 'new') { newSession(); return; }
-  if (id === 'find') { openFind(); return; }
-  if (id === 'rename') { beginTitleEdit(); return; }
-  if (id === 'diff') { openRightbarTab('changes'); return; }
-  openSettings(id === 'settings' ? 'general' : id === 'agents' ? 'presets' : 'general');
+  if (id === 'file') { uploadAttachment(); return; }
+  if (id === 'feedback') { openFeedbackDialog(); return; }
+  if (id === 'permission') { openPermissionMenu($('permission-picker')); return; }
+  if (id === 'model') { openModelMenu($('model-picker')); return; }
+  if (id === 'compact') {
+    action(async () => {
+      await deliver({ type: 'compact_context', session_id: current.session.id });
+      toast('已请求压缩上下文', { tone: 'info', holdMs: 2200 });
+    });
+    return;
+  }
+  composerError(command.reason ?? '命令当前不可用');
 }
 
 /* --------------------------------------------------------------- lifecycle */
@@ -1631,6 +2294,11 @@ function newSession() {
   current = null;
   history = [];
   uncertain = null;
+  activeView = 'chat';
+  liveTrajectory = [];
+  liveTurnStartAt = null;
+  liveTurnClosed = false;
+  trajectorySelectedId = null;
   $('message').value = drafts.get('new-session') ?? '';
   $('conversation').replaceChildren();
   render();
@@ -1646,6 +2314,11 @@ async function createTask() {
   uncertain = null;
   currentSource = result.source_id ?? null;
   current = attachExtras(projectSnapshot(result.session), result.session);
+  activeView = savedView(current.session.id);
+  liveTrajectory = [];
+  liveTurnStartAt = null;
+  liveTurnClosed = false;
+  trajectorySelectedId = null;
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
@@ -1687,6 +2360,11 @@ async function openTask(task) {
   if (task.primary_workspace) foldedGroups.delete(task.primary_workspace);
   currentSource = result.source_id ?? task.source_id;
   current = attachExtras(projectSnapshot(result.session), result.session);
+  activeView = savedView(current.session.id);
+  liveTrajectory = [];
+  liveTurnStartAt = null;
+  liveTurnClosed = false;
+  trajectorySelectedId = null;
   $('message').value = drafts.get(current.session.id) ?? '';
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
@@ -2539,12 +3217,9 @@ function filesView() {
   pathNode.title = path;
   const refresh = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
   refresh.addEventListener('click', () => { renderRightbar(); toast('桌面桥接没有目录读取接口', { tone: 'info', holdMs: 2400 }); });
-  const open = el('button', 'file-open-split');
-  open.type = 'button';
-  open.disabled = true;
-  open.title = '未接入：桌面桥接没有工作区打开接口';
-  open.append(iconNode('external', { size: 13 }), el('span', undefined, '用访达打开'), iconNode('chevronDown', { size: 10 }));
+  const open = el('div', 'open-in-app-pane');
   toolbar.append(pathNode, unconnected(), refresh, open);
+  renderOpenInAppInto(open, path, 'directory');
   const body = el('div', 'files-body');
   if (!path) {
     const state = el('div', 'files-empty');
@@ -2921,7 +3596,9 @@ function changesView(tab) {
   const refresh = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
   refresh.disabled = current?.diffQuery?.status === 'pending';
   refresh.addEventListener('click', requestDiff);
-  tools.append(split, wrap, open, refresh);
+  const openApp = el('div', 'open-in-app-pane');
+  tools.append(split, wrap, open, refresh, openApp);
+  if (selected?.path) renderOpenInAppInto(openApp, selected.path, 'file');
   head.append(tools);
   view.append(head);
   const body = el('div', 'review-body');
@@ -3029,12 +3706,9 @@ function previewView(tab) {
   wrap.addEventListener('click', () => { tab.wrap = !tab.wrap; persistRightbar(); renderRightbar(); });
   const reload = iconButton('refresh', '重新读取文件', { size: 15, tooltip: '重新读取文件' });
   reload.addEventListener('click', () => toast('桌面桥接没有文件读取接口', { tone: 'info', holdMs: 2400 }));
-  const open = el('button', 'file-open-split');
-  open.type = 'button';
-  open.disabled = true;
-  open.title = '未接入：桌面桥接没有文件打开接口';
-  open.append(iconNode('external', { size: 13 }), el('span', undefined, '打开'), iconNode('chevronDown', { size: 10 }));
+  const open = el('div', 'open-in-app-pane');
   toolbar.append(pathNode, renderer, wrap, reload, open);
+  renderOpenInAppInto(open, path, 'file');
   const body = el('div', `preview-body${tab.wrap ? ' wrap' : ''}`);
   if (tab.content) {
     if (selected.id === 'markdown') {
@@ -3048,6 +3722,9 @@ function previewView(tab) {
     const empty = el('div', 'right-empty');
     const mark = el('span', 'empty-icon'); mark.append(iconNode('file', { size: 48, stroke: 1.1 }));
     empty.append(mark, el('h3', undefined, '文件预览尚未接入'), el('p', undefined, '桌面桥接没有文件读取接口，无法在应用内安全打开工作区文件。'), unconnected());
+    const openHost = el('div', 'open-in-app-unpreviewable');
+    empty.append(openHost);
+    renderOpenInAppInto(openHost, path, 'file');
     body.append(empty);
   }
   view.append(toolbar, body);
@@ -3063,6 +3740,14 @@ function deliverablesView() {
     return empty;
   }
   const view = el('div', 'deliverable-list');
+  if (current?.session.repository) {
+    const toolbar = el('div', 'view-toolbar deliverable-toolbar');
+    toolbar.append(el('div', 'toolbar-path', '工作区'));
+    const open = el('div', 'open-in-app-pane');
+    toolbar.append(open);
+    renderOpenInAppInto(open, current.session.repository, 'directory');
+    view.append(toolbar);
+  }
   const card = el('div', 'deliverable-summary-card');
   const icon = el('span', 'delivered-icon');
   icon.append(iconNode('archive', { size: 20 }));
@@ -3593,17 +4278,23 @@ api.onEvent(frame => {
   }
   if (frame.event !== 'runtime') return;
   const event = frame.data;
+  recordLiveTrajectory(event);
   if (event.type === 'session_history_loaded') {
     history = event.entries ?? [];
+    liveTrajectory = [];
     const restored = retainInterruptedThoughts(projectSnapshot(current.session, history), current);
     current = { ...current, messages: restored.messages, tools: restored.tools, thoughts: restored.thoughts, lastTerminal: restored.lastTerminal ?? current.lastTerminal, turnErrors: restored.turnErrors ?? [] };
     renderConversation();
+    if (activeView === 'trajectory') renderTrajectory();
     return;
   }
   if (event.type === 'session_opened') {
     const priorContext = current?.contextUsage ?? null;
     current = attachExtras(projectSnapshot(event.session, history), event.session);
     current.contextUsage = priorContext;
+    liveTrajectory = [];
+    liveTurnStartAt = null;
+    liveTurnClosed = false;
     render();
     return;
   }
@@ -3753,7 +4444,10 @@ function boot() {
   $('model-picker').addEventListener('click', event => openModelMenu(event.currentTarget));
   $('permission-picker').addEventListener('click', event => openPermissionMenu(event.currentTarget));
   $('plan-mode').addEventListener('click', () => toast('计划模式切换尚未接入', { tone: 'info', holdMs: 2400 }));
-  $('attachment-add').addEventListener('click', () => uploadAttachment());
+  $('attachment-add').addEventListener('click', () => {
+    if (document.querySelector('#command-popover')) closeComposerPopovers();
+    else openCommandMenu();
+  });
   $('send').addEventListener('click', () => submitComposer(false));
   $('stop').addEventListener('click', () => action(() => deliver({ type: 'cancel_current_turn', session_id: current.session.id })));
   $('header-right-toggle').addEventListener('click', () => (rightbarOpen ? closeRightbar() : openRightbar()));
@@ -3844,8 +4538,16 @@ function boot() {
     }
     if (event.key === 'Escape') {
       closeComposerPopovers();
+      if (trajectorySelectedId) { trajectorySelectedId = null; renderTrajectory(); }
       if (!$('find-bar').hidden) closeFind();
       if (document.body.classList.contains('sidebar-open')) { document.body.classList.remove('sidebar-open'); layout(); }
+    }
+    if ((event.metaKey || event.ctrlKey) && event.altKey && event.key.toLowerCase() === 'o' && current?.session.repository) {
+      event.preventDefault();
+      const apps = openInAppState.apps ?? [];
+      const preferred = apps.find(app => app.id === openInAppState.preferred) ?? apps[0];
+      if (preferred) openInApp(current.session.repository, preferred.id, { remember: true });
+      else toast('本地打开应用尚未就绪', { tone: 'info', holdMs: 2400 });
     }
     if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'n') { event.preventDefault(); newSession(); }
     if ((event.metaKey || event.ctrlKey) && event.key === ',') { event.preventDefault(); openSettings('general'); }
