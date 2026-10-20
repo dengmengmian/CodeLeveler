@@ -5,7 +5,7 @@ export default [
     files: ['src/**/*.{mjs,cjs}', 'scripts/**/*.mjs', 'test/**/*.{mjs,cjs}'],
     languageOptions: {
       ecmaVersion: 'latest',
-      globals: readonly('process Buffer console URL Response setTimeout clearTimeout setInterval clearInterval setImmediate structuredClone crypto fetch AbortController TextDecoder'),
+      globals: readonly('process Buffer console URL Response setTimeout clearTimeout setInterval clearInterval setImmediate structuredClone crypto fetch AbortController TextDecoder WebSocket'),
     },
     rules: {
       'no-undef': 'error', 'no-unreachable': 'error', 'no-dupe-args': 'error',

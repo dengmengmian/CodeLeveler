@@ -1,6 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 // No generic invoke/send or Electron event is exposed to the page.
 contextBridge.exposeInMainWorld('desktop',Object.freeze({
+  // Static host fact for platform chrome (traffic-light clearance, vibrancy).
+  platform:process.platform,
   listTasks:options=>ipcRenderer.invoke('desktop:list',options),
   chooseFolder:()=>ipcRenderer.invoke('desktop:folder'),
   chooseAttachment:sessionId=>ipcRenderer.invoke('desktop:attachment',sessionId),

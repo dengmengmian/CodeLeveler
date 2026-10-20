@@ -198,9 +198,14 @@ export function permissionConfirmed(current,sessionId,mode){return current?.sess
 
 export function workbenchLayout({viewport,sidebarWidth,width=360,docked=true,expanded=false}){
  if(expanded)return {overlay:false,width:viewport,showContext:viewport>=560};
- const overlay=!docked||viewport-sidebarWidth-360<480;
- const maximum=overlay?Math.max(1,viewport-56):Math.max(360,viewport-sidebarWidth-480);
- const actual=Math.min(Math.max(360,width),Math.min(700,maximum));
+ // Geometry follows the reference right panel: 300px floor, 400px protected
+ // centre, at most 70% of the frame, and an overlay that never exceeds the
+ // viewport minus the 56px rail.
+ const centerMinimum=400,rightMinimum=300;
+ const available=viewport-sidebarWidth-centerMinimum;
+ const overlay=!docked||available<rightMinimum;
+ const maximum=overlay?Math.max(1,viewport-56):Math.min(Math.max(1,available),Math.round(viewport*0.7));
+ const actual=Math.min(Math.max(rightMinimum,width),Math.max(1,maximum));
  return {overlay,width:actual,showContext:actual>=560};
 }
 
