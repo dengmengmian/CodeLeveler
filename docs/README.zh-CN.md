@@ -7,5 +7,6 @@
 | [架构说明](ARCHITECTURE.zh-CN.md) | CodeLeveler 怎么分层：模型、领域、运行时、能力，以及谁有资格改你的机器 |
 | [自定义 Agent](AGENT_EXTENSIBILITY.zh-CN.md) | 怎样用 `agent.yaml` 和 `instructions.md` 添加项目或用户 Agent |
 | [发布说明](RELEASE.zh-CN.md) | 这一版有什么、没有什么 |
+| [桌面 UI 覆盖矩阵](DESKTOP_UI_MATRIX.md) | DeepSeek Harness Desktop 每个入口与 CodeLeveler Desktop 的逐项对照、状态与证据 |
 
 安装和日常使用见 [仓库 README](../README.zh-CN.md)。版本记录见 [更新日志](../CHANGELOG.zh-CN.md)。
