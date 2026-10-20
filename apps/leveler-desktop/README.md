@@ -45,7 +45,7 @@ npm run typecheck       # strict checkJs
 npm run lint            # ESLint
 ```
 
-真实验收使用隔离 `LEVELER_HOME`、Electron profile 与 workspace。本轮结果与完整矩阵见 [docs/DESKTOP_DOGFOOD_2026-10-20.md](../../docs/DESKTOP_DOGFOOD_2026-10-20.md)；UI Parity 矩阵见 [docs/DESKTOP_UI_MATRIX.md](../../docs/DESKTOP_UI_MATRIX.md)。
+真实验收使用隔离 `LEVELER_HOME`、Electron profile 与 workspace。
 
 当前 `scripts/` 验收入口全部通过：`interactions`、`conversation`、`files-and-tabs`、`composer`、`session-actions`、`settings-queries`、`commands-settings`、`settings-branches`、`project-interactions`、`sidebar-compact`、`responsive-theme`、`responsive-long-home`、`upload-deadline`、`views`、`browser-dock`、`browser-native`、`product`、`long-session`（合成渲染）、`background-tasks`、`recovery`、`ui-capture`，以及真实 Provider 的 `acceptance` 与 `real-provider-files`。`workbench.mjs` 已标记 SUPERSEDED 并直接运行 `files-and-tabs.mjs`。`conversation-runtime.mjs` 是 release/RC 资格通道，要求干净候选与按 HEAD 构建的二进制，不属于日常验收。
 

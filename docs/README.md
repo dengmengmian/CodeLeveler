@@ -7,6 +7,5 @@ Chinese: [`README.zh-CN.md`](README.zh-CN.md)
 | [Architecture](ARCHITECTURE.md) | How CodeLeveler is layered: model, domain, runtime, capabilities, and who is allowed to change your machine |
 | [Custom agents](AGENT_EXTENSIBILITY.md) | How to add a project or user agent with `agent.yaml` and `instructions.md` |
 | [Release notes](RELEASE.md) | What this release includes, and what it does not |
-| [Desktop UI coverage matrix](DESKTOP_UI_MATRIX.md) | Every DeepSeek Harness Desktop entry checked against CodeLeveler Desktop, with status and evidence |
 
 Install and everyday use are in the [root README](../README.md). Version history is in the [changelog](../CHANGELOG.md).
