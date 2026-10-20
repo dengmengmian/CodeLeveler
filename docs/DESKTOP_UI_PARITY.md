@@ -122,7 +122,7 @@ Files 目录树；Preview 文件读取/渲染数据；交互式 Terminal/PTY；D
 - 收口提交：`207a459 desktop: close remaining reference UI gaps`
 - 报告/README 单独提交（见最终回复的 SHA）。
 - 未创建分支、未 push、未发版。
-- 工作区仍有其他并行改动的 `.cargo/config.toml`、仓库根 `README.md`、`.github/workflows/sync-atomgit.yml` 和 `scripts/sweep-debug-artifacts.sh` 删除，未纳入本轮提交。
+- 工作区仍有其他并行改动的 `.cargo/config.toml`、`.github/workflows/sync-atomgit.yml` 和 `scripts/sweep-debug-artifacts.sh` 删除，未纳入本轮提交。
 
 ## 剩余优先级
 
