@@ -25,7 +25,7 @@ try{
  await writeFile(path.join(output,'renderer-assets-evidence.json'),JSON.stringify({resource_responses:resourceResponses,renderer_initialized:true},null,2)+'\n');
  // Explicit fixture seam in Electron Main, not in app code or Renderer.
  await application.evaluate(({dialog},folder)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[folder]});},workspace);
- await page.locator('#add-workspace').click();await page.waitForFunction(()=>document.querySelector('#workspace-picker').textContent.includes('workspace'));
+ await page.locator('#add-workspace').click();await page.waitForSelector('.directory-picker-modal[open]');await page.locator('.directory-picker-modal .button.primary').filter({hasText:'使用系统选择器'}).click();await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');await page.locator('.directory-picker-modal .button.primary').filter({hasText:/^打开$/}).click();await page.waitForFunction(()=>document.querySelector('#workspace-picker').textContent.includes('workspace'));
  await page.locator('#message').fill('fixture-interactions: read fixture.txt and propose removing scratch; I will deny approval.');await page.locator('#message').press('Enter');
  await page.getByRole('button',{name:'拒绝',exact:true}).waitFor();
  const sessionId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');ownedSessions.add(sessionId);await rememberRuntime();
@@ -101,7 +101,7 @@ const reopenedRead=page.locator('.tool-row[data-tool-id="fixture-read"]');if(!(a
  await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent==='已取消');
  async function workspaceApproval(){
   await page.locator('#new-session').click();await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]')&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
-  await page.locator('#add-workspace').click();await page.waitForFunction(()=>document.querySelector('#workspace-picker').textContent.includes('workspace'));
+  await page.locator('#add-workspace').click();await page.waitForSelector('.directory-picker-modal[open]');await page.locator('.directory-picker-modal .button.primary').filter({hasText:'使用系统选择器'}).click();await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');await page.locator('.directory-picker-modal .button.primary').filter({hasText:/^打开$/}).click();await page.waitForFunction(()=>document.querySelector('#workspace-picker').textContent.includes('workspace'));
   await page.locator('#message').fill('fixture-expired-approval: read fixture.txt and propose removing scratch');await page.locator('#message').press('Enter');
   await page.getByRole('button',{name:'拒绝',exact:true}).waitFor();await rememberRuntime();
   const id=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');ownedSessions.add(id);const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),id);const waiter=snapshot.pending_interactions.find(interaction=>interaction.type==='approval');assert.ok(waiter);return {id,request_id:waiter.request.id};

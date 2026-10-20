@@ -16,8 +16,8 @@ test('real tool names and command arguments have useful product labels',()=>{
  assert.equal(toolLabel({name:'shell_command'}),'运行命令');
  assert.equal(toolLabel({name:'list_files'}),'查看目录');
  assert.equal(toolLabel({name:'find_files'}),'查找文件');
- assert.equal(toolLabel({name:'web_search'}),'搜索网页');
- assert.equal(toolLabel({name:'web_fetch'}),'读取网页');
+ assert.equal(toolLabel({name:'web_search'}),'网页搜索');
+ assert.equal(toolLabel({name:'web_fetch'}),'网页获取');
  assert.equal(toolTarget({arguments:JSON.stringify({program:'cargo',args:['test','-p','leveler-app']})}),'cargo test -p leveler-app');
 });
 test('Agent browser activity is an observed tool report, never a manual browser binding',()=>{

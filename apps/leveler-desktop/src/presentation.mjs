@@ -9,7 +9,7 @@ import * as shared from '../../../packages/conversation-presentation/conversatio
 
 /** @typedef {{id?:string,name?:string,arguments?:string|Record<string,unknown>,preview?:string,status?:string}} ToolProjection */
 /** @type {Record<string,string>} */
-const toolNames={read_file:'查看文件',read:'查看文件',grep:'搜索内容',search:'搜索内容',glob:'查找文件',find_files:'查找文件',list_files:'查看目录',list_directory:'查看目录',bash:'运行命令',run_command:'运行命令',shell:'运行命令',shell_command:'运行命令',write_file:'写入文件',edit_file:'修改文件',apply_patch:'修改文件',web_search:'搜索网页',web_fetch:'读取网页',browser_navigate:'浏览网页',browser_click:'操作网页'};
+const toolNames={read_file:'查看文件',read:'查看文件',grep:'搜索文件内容',search:'搜索文件内容',glob:'查找文件',find_files:'查找文件',list_files:'查看目录',list_directory:'查看目录',bash:'运行命令',run_command:'运行命令',shell:'运行命令',shell_command:'运行命令',write_file:'写入文件',edit_file:'修改文件',apply_patch:'修改文件',web_search:'网页搜索',web_fetch:'网页获取',browser_navigate:'浏览网页',browser_click:'操作网页'};
 /** @param {ToolProjection} tool @returns {string} */
 export function toolLabel(tool){return toolNames[tool.name??'']??(tool.name?.startsWith('browser_')?'浏览器操作':'执行工具');}
 /** @param {ToolProjection} tool @returns {string} */

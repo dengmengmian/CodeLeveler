@@ -231,6 +231,7 @@ export function openPopover({ anchor, width = 336, align = 'start', className = 
 export function closeMenu() {
   if (!activeMenu) return;
   const hadFocus = activeMenu.node.contains(document.activeElement);
+  if (activeMenu.onDocKey) document.removeEventListener('keydown', activeMenu.onDocKey, true);
   activeMenu.node.remove();
   window.dispatchEvent(new Event('ui-overlay-change'));
   activeMenu.anchor?.setAttribute('aria-expanded', 'false');
@@ -288,7 +289,14 @@ export function openMenu({ anchor, items, align = 'start', width = 220, side = '
   }
   document.body.append(node);
   window.dispatchEvent(new Event('ui-overlay-change'));
-  activeMenu = { node, anchor, restoreFocus: false };
+  const onDocKey = event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    closeMenu();
+    anchor.focus();
+  };
+  document.addEventListener('keydown', onDocKey, true);
+  activeMenu = { node, anchor, restoreFocus: false, onDocKey };
   anchor.setAttribute('aria-expanded', 'true');
   const rect = anchor.getBoundingClientRect();
   const box = node.getBoundingClientRect();
@@ -355,7 +363,16 @@ export function confirmDialog({ title, body, confirm = '确认', cancel = '取�
         return rect.width > 0 && rect.height > 0 && !node.closest('[inert]');
       };
       const target = [document.querySelector('#message'), document.querySelector('#new-session')].find(focusable);
-      queueMicrotask(() => target?.focus());
+      const restore = () => {
+        // Menu/popover close handlers may restore focus to an anchor that the
+        // dialog's action just removed; never leave focus on a detached or
+        // zero-size control.
+        if (focusable(document.activeElement)) return;
+        target?.focus();
+      };
+      queueMicrotask(restore);
+      setTimeout(restore, 0);
+      setTimeout(restore, 60);
       window.dispatchEvent(new Event('ui-overlay-change'));
     }, { once: true });
   });
