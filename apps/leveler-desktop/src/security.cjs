@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_memory','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','fork_session','compact_context']);
+const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_memory','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','fork_session','compact_context','cancel_background_task']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -24,6 +24,7 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(command.type==='resume_task'&&!string(command.content,100000))throw new Error('Invalid continuation');
   }
   if(command.type==='cancel_current_turn'&&command.session_id!==envelope.session_id)throw new Error('Invalid cancellation');
+  if(command.type==='cancel_background_task'&&(!exactKeys(command,['type','session_id','task_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.task_id)))throw new Error('Invalid background task cancellation');
   if(command.type==='approval_decision'&&(!string(command.request_id)||!decisions.has(command.decision)))throw new Error('Invalid approval decision');
   if(command.type==='answer_clarification'&&(!string(command.request_id)||typeof command.answer!=='string'||command.answer.length>100000))throw new Error('Invalid clarification');
   if(command.type==='query_session_history'&&command.session_id!==envelope.session_id)throw new Error('Invalid history query');

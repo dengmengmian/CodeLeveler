@@ -85,6 +85,12 @@ test('existing task cancellation and continuation stay bounded to the selected s
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'resume_task',session_id:'s1',content:'a'.repeat(100000)})));
 });
 
+test('background task cancellation is bounded to the selected session and exact task',()=>{
+ const command={type:'cancel_background_task',session_id:'s1',task_id:'host-1'};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
+ for(const fields of [{session_id:'s2'},{session_id:''},{session_id:' '},{task_id:''},{task_id:' '},{task_id:null},{task_id:42},{pid:1},{signal:'SIGKILL'},{expected_version:1}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
+});
+
 test('fork accepts only the selected session and carries no versioned authority',()=>{
  const fork={type:'fork_session',session_id:'s1'};
  assert.doesNotThrow(()=>security.validateEnvelope(envelope(fork)));

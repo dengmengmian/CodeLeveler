@@ -689,8 +689,17 @@ function sessionRow(task, group = null) {
   row.addEventListener('dblclick', event => {
     event.preventDefault();
     event.stopPropagation();
-    if (loading || uncertain) return;
-    beginSidebarRename(task, title);
+    // The first click of a double click may be opening this (inactive) task,
+    // which sets `loading`; retry after that settles and re-query the live
+    // title node because opening re-renders the sidebar.
+    const begin = () => {
+      if (loading || uncertain) { setTimeout(begin, 50); return; }
+      const liveRow = [...document.querySelectorAll('#workspace-list .session-row')]
+        .find(node => node.dataset.sessionId === task.id);
+      const liveTitle = liveRow?.querySelector('.session-title');
+      if (liveTitle) beginSidebarRename(task, liveTitle);
+    };
+    begin();
   });
   row.addEventListener('keydown', event => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -756,6 +765,11 @@ function beginSidebarRename(task, titleNode) {
         await api.deliver(commandEnvelope(task.id, command, snapshot.last_sequence ?? 0));
         await refreshTasks();
         if (current?.session.id === task.id) await refreshMetadata();
+        // The task index can trail the confirmed rename by one refresh. The
+        // Runtime accepted this exact title; show it now rather than leaving
+        // the old title until an unrelated refresh.
+        const renamed = tasks.find(item => item.id === task.id);
+        if (renamed && renamed.title !== name) renamed.title = name;
         renderSidebar();
         toast('标题已更新', { tone: 'success', holdMs: 1600 });
       });
@@ -961,63 +975,75 @@ function formatJobDuration(ms) {
   return `${Math.floor(minutes / 60)}小时${minutes % 60}分`;
 }
 
+let jobsPopoverState = null;
+const expandedJobs = new Set();
+function renderJobsInto(node) {
+  node.replaceChildren();
+  const jobs = current?.backgroundTasks ?? [];
+  const settled = current?.settledBackgroundTasks ?? [];
+  node.append(el('div', 'header-popover-title', '后台任务'));
+  if (jobs.length) node.append(el('div', 'header-popover-subtitle', '进行中'));
+  if (!jobs.length && !settled.length) node.append(el('div', 'header-popover-empty', '暂无后台任务'));
+  for (const job of jobs) {
+    const row = el('div', 'header-job-row');
+    const head = el('div', 'header-job-head');
+    const dot = el('span', 'header-state-dot');
+    dot.dataset.state = 'running';
+    const copy = el('span', 'header-agent-copy');
+    copy.append(el('span', 'header-agent-name', [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id));
+    const elapsed = job.elapsed_ms ?? (job.started_at ? Date.now() - job.started_at : 0);
+    copy.append(el('span', 'header-agent-meta', `运行中 · ${formatJobDuration(elapsed)}`));
+    const stop = el('button', 'header-job-stop', '停止');
+    stop.type = 'button';
+    stop.disabled = loading;
+    stop.title = '停止后台任务';
+    stop.addEventListener('click', () => action(async () => {
+      stop.disabled = true;
+      await deliver({ type: 'cancel_background_task', session_id: current.session.id, task_id: job.task_id });
+      closePopover();
+      toast('已请求停止后台任务', { tone: 'info', holdMs: 2200 });
+    }));
+    head.append(dot, copy, stop);
+    row.append(head);
+    if (job.output) {
+      const toggle = el('button', 'header-job-output-toggle', '查看输出');
+      toggle.type = 'button';
+      const output = el('pre', 'header-job-output', job.output);
+      output.hidden = !expandedJobs.has(job.task_id);
+      toggle.textContent = output.hidden ? '查看输出' : '收起输出';
+      toggle.addEventListener('click', () => {
+        if (expandedJobs.has(job.task_id)) expandedJobs.delete(job.task_id); else expandedJobs.add(job.task_id);
+        renderJobsInto(node);
+      });
+      row.append(toggle, output);
+    }
+    node.append(row);
+  }
+  if (settled.length) {
+    const header = el('div', 'header-popover-subtitle', `已结束 ${settled.length}`);
+    node.append(header);
+    for (const job of [...settled].reverse()) {
+      const row = el('div', 'header-job-row settled');
+      const head = el('div', 'header-job-head');
+      const dot = el('span', 'header-state-dot');
+      dot.dataset.state = job.status === 'failed' ? 'failed' : 'done';
+      const copy = el('span', 'header-agent-copy');
+      copy.append(el('span', 'header-agent-name', [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id));
+      copy.append(el('span', 'header-agent-meta', job.status === 'failed' ? '已失败' : '已完成'));
+      head.append(dot, copy);
+      row.append(head);
+      node.append(row);
+    }
+  }
+  node.append(el('div', 'header-popover-note', '输出为 Runtime 报告的增量；停止只终止该后台任务，不影响当前回合。'));
+}
+
 function openJobsPopover(anchor) {
   openPopover({
     anchor, width: 400, align: 'end', className: 'jobs-popover',
     render: node => {
-      const jobs = current?.backgroundTasks ?? [];
-      const settled = current?.settledBackgroundTasks ?? [];
-      node.append(el('div', 'header-popover-title', '后台任务'));
-      if (jobs.length) node.append(el('div', 'header-popover-subtitle', '进行中'));
-      if (!jobs.length && !settled.length) node.append(el('div', 'header-popover-empty', '暂无后台任务'));
-      for (const job of jobs) {
-        const row = el('div', 'header-job-row');
-        const head = el('div', 'header-job-head');
-        const dot = el('span', 'header-state-dot');
-        dot.dataset.state = 'running';
-        const copy = el('span', 'header-agent-copy');
-        copy.append(el('span', 'header-agent-name', [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id));
-        const elapsed = job.elapsed_ms ?? (job.started_at ? Date.now() - job.started_at : 0);
-        copy.append(el('span', 'header-agent-meta', `运行中 · ${formatJobDuration(elapsed)}`));
-        const stop = el('button', 'header-job-stop', '停止');
-        stop.type = 'button';
-        stop.disabled = loading;
-        stop.title = '停止后台任务';
-        stop.addEventListener('click', () => action(async () => {
-          stop.disabled = true;
-          await deliver({ type: 'cancel_background_task', session_id: current.session.id, task_id: job.task_id });
-          closePopover();
-          toast('已请求停止后台任务', { tone: 'info', holdMs: 2200 });
-        }));
-        head.append(dot, copy, stop);
-        row.append(head);
-        if (job.output) {
-          const toggle = el('button', 'header-job-output-toggle', '查看输出');
-          toggle.type = 'button';
-          const output = el('pre', 'header-job-output', job.output);
-          output.hidden = true;
-          toggle.addEventListener('click', () => { output.hidden = !output.hidden; toggle.textContent = output.hidden ? '查看输出' : '收起输出'; });
-          row.append(toggle, output);
-        }
-        node.append(row);
-      }
-      if (settled.length) {
-        const header = el('div', 'header-popover-subtitle', `已结束 ${settled.length}`);
-        node.append(header);
-        for (const job of [...settled].reverse()) {
-          const row = el('div', 'header-job-row settled');
-          const head = el('div', 'header-job-head');
-          const dot = el('span', 'header-state-dot');
-          dot.dataset.state = job.status === 'failed' ? 'failed' : 'done';
-          const copy = el('span', 'header-agent-copy');
-          copy.append(el('span', 'header-agent-name', [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id));
-          copy.append(el('span', 'header-agent-meta', job.status === 'failed' ? '已失败' : '已完成'));
-          head.append(dot, copy);
-          row.append(head);
-          node.append(row);
-        }
-      }
-      node.append(el('div', 'header-popover-note', '输出为 Runtime 报告的增量；停止只终止该后台任务，不影响当前回合。'));
+      jobsPopoverState = { node, anchor };
+      renderJobsInto(node);
     },
   });
 }
@@ -4056,7 +4082,13 @@ async function refreshSnapshot() {
   const prior = current;
   const diffQuery = current.diffQuery;
   const diffError = current.diffError;
+  const settledBackgroundTasks = current.settledBackgroundTasks ?? [];
+  const priorBackgroundTasks = current.backgroundTasks ?? [];
   current = attachExtras(retainInterruptedThoughts(projectSnapshot(snapshot, history), prior), snapshot);
+  current.settledBackgroundTasks = settledBackgroundTasks;
+  const activeJobs = snapshot.active_background_tasks ?? [];
+  const activeIds = new Set(activeJobs.map(job => job.task_id));
+  current.backgroundTasks = [...activeJobs, ...priorBackgroundTasks.filter(job => !activeIds.has(job.task_id))];
   current.diffQuery = diffQuery;
   if (!snapshot.diff) current.diffError = diffError;
   render();
@@ -4102,7 +4134,9 @@ function renderAttachments() {
       uploading: '选择 / 上传中…', queued: '正在处理…', unknown: '上传结果未知', failed: '上传失败',
       ready: item.attachment?.kind === 'image' ? '已上传' : '已上传 · 当前不能发送给模型',
     }[item.status];
-    const problem = item.error?.message ? attachmentErrorPresentation(item.error.message) : null;
+    // An unknown outcome may still have uploaded successfully. Showing the
+    // definite failure wording here would claim a result nobody observed.
+    const problem = item.status === 'unknown' ? null : item.error?.message ? attachmentErrorPresentation(item.error.message) : null;
     const name = item.attachment?.name ?? '附件';
     const icon = el('span', 'attachment-icon');
     icon.append(fileIcon(name));
@@ -4826,6 +4860,11 @@ function updateRightbarButtons() {
     button.dataset.tooltip = rightbarOpen ? '收起侧边栏' : '打开侧边栏';
     button.setAttribute('aria-label', rightbarOpen ? '收起右侧边栏' : '打开右侧边栏');
   }
+  // The floating control exists only for the home surface with the dock
+  // closed. Its hidden state must follow open/close immediately: otherwise
+  // closing the dock leaves the pointer without any reopen control, and
+  // opening it leaves a duplicate button floating over the dock.
+  $('floating-right-toggle').hidden = !isHome() || !$('entry-page').hidden || rightbarOpen;
 }
 
 function renderTabView(tab, pane) {
@@ -5173,7 +5212,11 @@ function closeNativeBrowserTab(tab) {
 }
 
 function browserView(tab, pane = null) {
-  if (!tab.browserId && !tab.creating) void ensureBrowserTab(tab).then(() => { if (rightbarOpen) renderRightbar(); });
+  if (!tab.browserId && !tab.creating) void ensureBrowserTab(tab).then(() => {
+    // Creation re-renders the toolbar once. Do not replace an address field
+    // the person is already typing into.
+    if (rightbarOpen && !document.activeElement?.closest?.('.browser-address-wrap')) renderRightbar();
+  });
   if (pane && rightbarActivePane === pane.id && tab.browserId && tab.browserId !== browserData.selectedId) {
     queueMicrotask(() => selectBrowserTab(tab));
   }
@@ -5202,7 +5245,15 @@ function browserView(tab, pane = null) {
     if (!url) return;
     tab.addressDraft = undefined;
     tab.addressDirty = false;
-    browserCommand(data ? 'navigate' : 'new', { url }, tab);
+    tab.navigating = true;
+    // A fresh tab creates its native view on mount. Navigating immediately
+    // must wait for that creation and reuse it; issuing `new` again would
+    // leave an orphan about:blank tab and split the selection.
+    const run = () => browserCommand(browserTabData(tab) ? 'navigate' : 'new', { url }, tab);
+    const finish = tab.creating
+      ? ensureBrowserTab(tab).then(() => { if (browserTabData(tab)) return run(); })
+      : run();
+    void Promise.resolve(finish).finally(() => { delete tab.navigating; });
   };
   address.addEventListener('input', () => { tab.addressDraft = address.value; tab.addressDirty = true; });
   address.addEventListener('keydown', event => {
@@ -5211,8 +5262,16 @@ function browserView(tab, pane = null) {
     navigateAddress();
   });
   address.addEventListener('blur', () => {
-    if (!tab.addressDirty) tab.addressDraft = undefined;
+    // A state-driven re-render replaces this input, which also fires blur.
+    // That is not the person leaving the field; discarding the draft there
+    // would overwrite what they are typing with the current page URL.
+    if (!address.isConnected || tab.navigating) return;
+    // Leaving the field without submitting restores the address of the page
+    // that is actually loaded; the draft belongs only to the focused edit.
+    tab.addressDraft = undefined;
     tab.addressDirty = false;
+    const live = browserTabData(tab);
+    address.value = live?.url && live.url !== 'about:blank' ? live.url : '';
   });
   const go = el('button', 'browser-go');
   go.type = 'button';
@@ -5285,7 +5344,10 @@ function scheduleBrowserSurface() {
     const selected = browserData?.tabs?.find(item => item.id === browserData.selectedId);
     if (surfaces.length === 1 && selected) {
       const tab = rightbarTabs[surfaces[0].dataset.browserTab];
-      if (tab?.kind === 'browser') { tab.browserId = selected.id; active = { node: surfaces[0], tab }; }
+      // Only repair a tab that still has a native id the latest state no
+      // longer knows. A tab with no id is still creating its own view, and
+      // adopting the current selection would steal another tab's page.
+      if (tab?.kind === 'browser' && !tab.creating && tab.browserId && !browserTabData(tab)) { tab.browserId = selected.id; active = { node: surfaces[0], tab }; }
     }
   }
   const data = active?.tab ? browserTabData(active.tab) : null;
@@ -5791,7 +5853,7 @@ function previewView(tab) {
   };
 
   if (previewIsImage(selected.id)) {
-    if (tab.loading || tab.image === undefined) body.append(loadingState());
+    if (tab.loading || tab.image === undefined || tab.error) body.append(loadingState());
     else {
       const image = el('img', 'preview-image');
       image.src = tab.image;
@@ -5805,7 +5867,7 @@ function previewView(tab) {
     }
   } else if (!previewIsText(selected.id)) {
     body.append(previewUnavailable(selected.label, path));
-  } else if (tab.loading || tab.content === undefined || (tab.error && !tab.content)) {
+  } else if (tab.loading || tab.content === undefined || tab.error) {
     body.append(loadingState());
   } else if (selected.id === 'markdown') {
     const markdown = el('div', 'markdown');
@@ -6605,7 +6667,13 @@ api.onEvent(frame => {
     const diffQuery = current?.diffQuery;
     const diffError = current?.diffError;
     const priorContext = current?.contextUsage ?? null;
+    const settledBackgroundTasks = current?.settledBackgroundTasks ?? [];
+    const priorBackgroundTasks = current?.backgroundTasks ?? [];
     current = attachExtras(projectSnapshot(frame.data, history), frame.data);
+    current.settledBackgroundTasks = settledBackgroundTasks;
+    const activeJobs = frame.data.active_background_tasks ?? [];
+    const activeIds = new Set(activeJobs.map(job => job.task_id));
+    current.backgroundTasks = [...activeJobs, ...priorBackgroundTasks.filter(job => !activeIds.has(job.task_id))];
     current.contextUsage = priorContext;
     current.diffQuery = diffQuery;
     if (!frame.data.diff) current.diffError = diffError;
@@ -6657,6 +6725,7 @@ api.onEvent(frame => {
   if (event.type.startsWith('background_task_')) {
     current = applyBackgroundEvent(current, event);
     renderHeader();
+    if (jobsPopoverState?.node.isConnected) renderJobsInto(jobsPopoverState.node);
     return;
   }
   if (event.type === 'notification') {
@@ -6732,9 +6801,18 @@ function applyBackgroundEvent(state, event) {
   }
   if (event.type === 'background_task_exited') {
     const exiting = jobs.find(task => task.task_id === event.task_id);
-    const settled = exiting
-      ? [...(state.settledBackgroundTasks ?? []), { ...exiting, status: event.ok === false ? 'failed' : 'completed', finished_at: Date.now() }].slice(-20)
-      : (state.settledBackgroundTasks ?? []);
+    // A snapshot refresh can drop the active row before this event arrives.
+    // The exit event itself is the authority for the terminal fact.
+    const record = exiting ?? { task_id: event.task_id, program: '', args: [], started_at: Date.now() };
+    const settled = [...(state.settledBackgroundTasks ?? []), {
+      ...record,
+      status: event.ok === false ? 'failed' : 'completed',
+      finished_at: Date.now(),
+      output: event.output ?? record.output ?? '',
+      exit_code: event.exit_code,
+      duration_ms: event.duration_ms,
+      stopped: event.stopped === true,
+    }].slice(-20);
     return { ...state, backgroundTasks: jobs.filter(task => task.task_id !== event.task_id), settledBackgroundTasks: settled };
   }
   return { ...state, backgroundTasks: jobs };
@@ -6785,12 +6863,28 @@ function boot() {
       if (!found) { tab.browserId = null; continue; }
       tab.title = found.url && found.url !== 'about:blank' ? browserChrome(found).title : '浏览器';
     }
-    if (rightbarOpen) renderRightbar(); else scheduleBrowserSurface();
+    if (rightbarOpen) {
+      // Native state can arrive while the address field is focused. Re-render
+      // there would destroy the input and the keystrokes in it.
+      if (document.activeElement?.closest?.('.browser-address-wrap')) {
+        // Keep the field alive, but still publish the native title in the
+        // pane strip so the tab does not look stale.
+        for (const node of document.querySelectorAll('.pane-tab[data-tab-id]')) {
+          const record = rightbarTabs[node.dataset.tabId];
+          const title = node.querySelector('.tab-title');
+          if (record?.kind === 'browser' && title) title.textContent = record.title;
+        }
+        scheduleBrowserSurface();
+      } else renderRightbar();
+    } else scheduleBrowserSurface();
   });
   api.onOpenSettings?.(() => openSettings('general'));
   api.onQuitInspect?.(() => {
     const active = status => ['running', 'waiting_user'].includes(status);
-    const busy = loading || uncertain || uploadPending() || queuedMessages.length > 0
+    // `loading` also covers passive refreshes that follow a completed turn;
+    // it is not evidence that a task would be interrupted. Only a submit in
+    // flight, an uncertain delivery, queued work, uploads or live tasks are.
+    const busy = pendingSubmit || uncertain || uploadPending() || queuedMessages.length > 0
       || (current ? active(current.status) : false)
       || tasks.some(task => active(task.status));
     api.quitInspectResult?.(busy);
@@ -7000,6 +7094,10 @@ async function submitComposer(complement = false) {
     }
     if (steer) {
       await deliver({ type: 'steer_current_turn', session_id: current.session.id, content });
+      // A steer is queued for the running turn's next model call; no message
+      // event acknowledges it immediately. Say so instead of silently
+      // clearing the composer as if the text had been submitted as a turn.
+      toast('已插话：将在当前回合的下一次模型调用中送达', { tone: 'info', holdMs: 2800 });
     } else {
       await deliver({ type: 'submit_message', session_id: current.session.id, content, attachments: refs });
       pendingSubmit = true;
