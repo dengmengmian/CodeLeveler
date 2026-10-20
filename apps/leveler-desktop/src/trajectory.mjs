@@ -289,6 +289,14 @@ export function projectTrajectory(entries, options = {}) {
   };
 }
 
+/** Return the tail window of a ledger, anchored at the newest record. */
+export function trajectoryWindow(records, limit) {
+  const total = records.length;
+  const size = Number.isInteger(limit) && limit > 0 ? limit : 50;
+  if (total <= size) return { records, total, hasOlder: false };
+  return { records: records.slice(-size), total, hasOlder: true };
+}
+
 /** Return the ids whose recorded text, arguments, result, or tool name match the query. */
 export function searchTrajectory(records, query) {
   const needle = String(query ?? '').trim().toLowerCase();

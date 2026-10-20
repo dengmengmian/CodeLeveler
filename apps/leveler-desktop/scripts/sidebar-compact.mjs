@@ -149,7 +149,7 @@ try {
   await page.locator('#compact-new-task').click();
   await page.waitForFunction(count => window.desktop.listTasks().then(index => index.tasks.length > count), before);
   assert.equal((await state('520-after-new')).compact, true);
-  await page.waitForFunction(() => !document.querySelector('#refresh').disabled && !document.querySelector('#new-task').disabled);
+  await page.waitForFunction(() => !!document.querySelector('#new-session') && !document.querySelector('#new-task').disabled);
   const beforeKey = (await page.evaluate(() => window.desktop.listTasks())).tasks.length;
   await page.keyboard.press('Meta+n');
   await page.waitForFunction(count => window.desktop.listTasks().then(index => index.tasks.length > count), beforeKey);

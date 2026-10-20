@@ -173,12 +173,13 @@ let activeMenu = null;
 
 export function closeMenu() {
   if (!activeMenu) return;
+  const hadFocus = activeMenu.node.contains(document.activeElement);
   activeMenu.node.remove();
   window.dispatchEvent(new Event('ui-overlay-change'));
   activeMenu.anchor?.setAttribute('aria-expanded', 'false');
   const { restoreFocus, anchor } = activeMenu;
   activeMenu = null;
-  if (restoreFocus && anchor?.isConnected) anchor.focus();
+  if ((restoreFocus || hadFocus) && anchor?.isConnected) anchor.focus();
 }
 
 /**
@@ -288,7 +289,17 @@ export function confirmDialog({ title, body, confirm = '确认', cancel = '取�
     dialog.showModal();
     window.dispatchEvent(new Event('ui-overlay-change'));
     cancelButton.focus();
-    dialog.addEventListener('close', () => { dialog.remove(); window.dispatchEvent(new Event('ui-overlay-change')); }, { once: true });
+    dialog.addEventListener('close', () => {
+      dialog.remove();
+      const focusable = node => {
+        if (!node || node === document.body || !node.isConnected) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && !node.closest('[inert]');
+      };
+      const target = [document.querySelector('#message'), document.querySelector('#new-session')].find(focusable);
+      queueMicrotask(() => target?.focus());
+      window.dispatchEvent(new Event('ui-overlay-change'));
+    }, { once: true });
   });
 }
 

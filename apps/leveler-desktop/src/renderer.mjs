@@ -14,7 +14,7 @@ import {
   beginDiffQuery, expireDiffQuery, retainInterruptedThoughts,
 } from './state.mjs';
 import { brandMark, fileIcon } from './icons.mjs';
-import { projectTrajectory, searchTrajectory, buildTimeline, formatDuration } from './trajectory.mjs';
+import { projectTrajectory, searchTrajectory, buildTimeline, formatDuration, trajectoryWindow } from './trajectory.mjs';
 import {
   el, iconNode, iconButton, installTooltips, toast, openMenu, closeMenu, confirmDialog,
   copyText, unconnected, trapTab,
@@ -40,9 +40,9 @@ const TAB_ICON = {
   browser: 'globe', changes: 'diff', plan: 'list', deliverables: 'archive', subagent: 'bot',
 };
 const PERMISSION_MODES = [
-  ['full_access', '完全开放 · Full'],
-  ['assisted', '自动权限 · Auto'],
-  ['request_approval', '受限权限 · Restricted'],
+  ['full_access', '完全权限'],
+  ['assisted', '工作区内修改'],
+  ['request_approval', '需批准'],
 ];
 
 let tasks = [];
@@ -84,8 +84,11 @@ let trajectoryCollapseTurns = false;
 let trajectoryCollapseCalls = false;
 let trajectorySelectedId = null;
 let trajectoryDetailTab = 'overview';
-let trajectoryDetailWidth = 340;
+let trajectoryDetailWidth = 380;
 let trajectoryPinned = true;
+let trajectoryNodeLimit = 50;
+let trajectoryRange = null;
+let trajectoryRangeDrag = null;
 let openInAppState = { apps: null, loading: false, error: null, preferred: null };
 
 const drafts = new Map();
@@ -454,8 +457,8 @@ function openAccountMenu(anchor) {
     anchor, width: 220, side: 'top',
     items: [
       { label: '设置', icon: 'settings', shortcut: '⌘ ,', onSelect: () => openSettings('general') },
-      { label: '意见反馈', icon: 'feedback', disabled: true, badge: '未接入' },
-      { label: '登录', icon: 'user', disabled: true, badge: '未接入' },
+      { label: '意见反馈', icon: 'feedback', onSelect: openFeedbackDialog },
+      { label: '登录', icon: 'user', disabled: true, title: '当前版本未接入登录' },
     ],
   });
 }
@@ -515,11 +518,13 @@ function ensureHeaderActions() {
     openMenu({
       anchor: headerMenuButton, align: 'end', width: 240,
       items: [
-        { label: '下载 Session 日志', icon: 'download', disabled: true, badge: '未接入', title: 'Runtime 未提供 Session 打包导出接口' },
+        { label: '下载 Session 日志', icon: 'download', disabled: true, title: 'Runtime 未提供 Session 打包导出接口' },
         { label: '反馈', icon: 'feedback', onSelect: openFeedbackDialog },
       ],
     });
   });
+  const preset = $('header-preset');
+  if (preset && !preset.querySelector('svg')) preset.replaceChildren(iconNode('shield', { size: 14 }), el('span', undefined, '标准模式'));
   const actions = $('conversation-header').querySelector('.header-actions');
   headerJobsButton = iconButton('clock', '后台任务', { size: 16, tooltip: '后台任务' });
   headerSubagentButton = iconButton('bot', '子智能体', { size: 16, tooltip: '子智能体' });
@@ -778,7 +783,9 @@ function renderOpenInAppInto(host, value, kind) {
   primary.disabled = openInAppState.loading || !!openInAppState.busy || !preferred;
   primary.setAttribute('aria-label', preferred ? `用 ${preferred.name} 打开` : '正在读取应用');
   primary.dataset.tooltip = preferred ? `用 ${preferred.name} 打开` : '正在读取应用';
-  primary.append(preferred ? appLeading(preferred) : iconNode('external', { size: 14 }));
+  if (openInAppState.busy) primary.append(el('span', 'open-app-spinner'));
+  else if (openInAppState.loading) primary.classList.add('loading');
+  else primary.append(preferred ? appLeading(preferred) : iconNode('external', { size: 14 }));
   primary.addEventListener('click', () => {
     if (preferred) openInApp(path, preferred.id, { remember: kind === 'directory' });
   });
@@ -822,11 +829,11 @@ function renderComposerMeta() {
   const permission = $('permission-picker');
   permission.replaceChildren(
     iconNode(mode === 'full_access' ? 'shieldCheck' : 'shield', { size: 14 }),
-    el('span', 'trigger-label', mode ? permissionLabel(mode) : '自动权限'),
+    el('span', 'trigger-label', mode ? permissionLabel(mode) : '工作区内修改'),
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
   permission.dataset.tooltip = '访问模式';
-  permission.setAttribute('aria-label', `访问模式，当前：${mode ? permissionLabel(mode) : '自动权限'}`);
+  permission.setAttribute('aria-label', `访问模式，当前：${mode ? permissionLabel(mode) : '工作区内修改'}`);
   const model = current?.session.model;
   $('model-picker').replaceChildren(
     el('span', 'trigger-label', modelLabel(model) || '请选择模型'),
@@ -1560,8 +1567,8 @@ const TRAJECTORY_LIVE_ONLY = new Set([
   'memory_changed', 'goal_recap_created', 'unfinished_goals_loaded', 'child_contribution_loaded',
 ]);
 const TRAJECTORY_TERMINALS = new Set([
-  'turn_completed_with_warnings', 'turn_truncated', 'turn_incomplete', 'turn_failed',
-  'session_completed',
+  'turn_completed', 'turn_completed_with_warnings', 'turn_answered', 'turn_cancelled',
+  'task_cancelled', 'turn_truncated', 'turn_incomplete', 'turn_failed', 'session_completed',
 ]);
 
 function recordLiveTrajectory(event) {
@@ -1620,7 +1627,7 @@ function ensureTrajectoryDom() {
   duration.type = 'button';
   duration.dataset.trajectoryAction = 'duration';
   duration.setAttribute('aria-label', '使用实际时长');
-  duration.append(iconNode('clock', { size: 13 }), el('span', undefined, '时长'));
+  duration.append(iconNode('clock', { size: 16 }), el('span', undefined, '时长'));
   duration.addEventListener('click', () => {
     trajectoryActualDuration = !trajectoryActualDuration;
     renderTrajectory();
@@ -1645,13 +1652,62 @@ function ensureTrajectoryDom() {
   const input = el('input');
   input.type = 'search';
   input.id = 'trajectory-search';
-  input.placeholder = '搜索轨迹';
+  input.placeholder = '搜索';
   input.setAttribute('aria-label', '搜索轨迹');
   input.addEventListener('input', () => { trajectoryQuery = input.value; renderTrajectory(); });
   search.append(input);
   toolbar.append(actions, search);
   const timeline = el('div', 'trajectory-timeline');
   timeline.setAttribute('aria-label', '时间线概览；水平拖动可聚焦事件');
+  const range = el('div', 'trajectory-range');
+  range.hidden = true;
+  timeline.append(range);
+  const fractionAt = clientX => {
+    const track = timeline.querySelector('.trajectory-lane-track');
+    if (!track) return 0;
+    const rect = track.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+  };
+  const updateRange = (startFraction, endFraction) => {
+    const total = Number(timeline.dataset.total) || 1;
+    const low = Math.min(startFraction, endFraction);
+    const high = Math.max(startFraction, endFraction);
+    trajectoryRange = high - low < 0.002 ? null : { start: low * total, end: high * total };
+    range.hidden = trajectoryRange === null;
+    if (trajectoryRange) {
+      const track = timeline.querySelector('.trajectory-lane-track');
+      const trackRect = track.getBoundingClientRect();
+      const hostRect = timeline.getBoundingClientRect();
+      range.style.left = `${trackRect.left - hostRect.left + low * trackRect.width}px`;
+      range.style.width = `${Math.max(2, (high - low) * trackRect.width)}px`;
+    }
+    applyTrajectoryRange();
+  };
+  timeline.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    if (event.target.closest('.trajectory-range')) return;
+    event.preventDefault();
+    trajectoryRangeDrag = fractionAt(event.clientX);
+    timeline.setPointerCapture(event.pointerId);
+    updateRange(trajectoryRangeDrag, trajectoryRangeDrag);
+  });
+  timeline.addEventListener('pointermove', event => {
+    if (trajectoryRangeDrag === null) return;
+    updateRange(trajectoryRangeDrag, fractionAt(event.clientX));
+  });
+  const endDrag = event => {
+    if (trajectoryRangeDrag === null) return;
+    updateRange(trajectoryRangeDrag, fractionAt(event.clientX));
+    trajectoryRangeDrag = null;
+  };
+  timeline.addEventListener('pointerup', endDrag);
+  timeline.addEventListener('pointercancel', endDrag);
+  timeline.addEventListener('contextmenu', event => {
+    event.preventDefault();
+    trajectoryRange = null;
+    range.hidden = true;
+    applyTrajectoryRange();
+  });
   const body = el('div', 'trajectory-body');
   const ledger = el('div', 'trajectory-ledger');
   ledger.tabIndex = 0;
@@ -1690,8 +1746,9 @@ function ensureTrajectoryDom() {
 }
 
 function renderTrajectoryTimeline(host, records) {
-  host.replaceChildren();
+  for (const child of [...host.querySelectorAll('.trajectory-lane')]) child.remove();
   const timeline = buildTimeline(records, trajectoryActualDuration);
+  host.dataset.total = String(timeline.total);
   const lanes = [['input', '输入'], ['model', '模型'], ['tool', '工具']];
   for (const [laneId, label] of lanes) {
     const row = el('div', 'trajectory-lane');
@@ -1700,8 +1757,10 @@ function renderTrajectoryTimeline(host, records) {
     for (const item of timeline.items.filter(entry => entry.lane === laneId)) {
       const bar = el('span', 'trajectory-bar');
       bar.dataset.kind = item.kind;
+      bar.dataset.start = String(item.start);
+      bar.dataset.end = String(item.end);
       bar.style.left = `${(item.start / timeline.total) * 100}%`;
-      bar.style.width = `${Math.max(0.8, ((item.end - item.start) / timeline.total) * 100)}%`;
+      bar.style.width = `max(2px, calc(${((item.end - item.start) / timeline.total) * 100}% - 2px))`;
       const record = records.find(entry => entry.id === item.id);
       bar.title = record ? `${record.label} · ${formatDuration(record.startedMs) ?? '计时不可用'}` : '';
       track.append(bar);
@@ -1711,9 +1770,51 @@ function renderTrajectoryTimeline(host, records) {
   }
 }
 
+function applyTrajectoryRange() {
+  const root = $('trajectory-root');
+  if (!root) return;
+  const total = Number(root.querySelector('.trajectory-timeline')?.dataset.total) || 1;
+  const overlay = root.querySelector('.trajectory-range');
+  if (overlay) {
+    overlay.hidden = trajectoryRange === null;
+    if (trajectoryRange) {
+      const timeline = root.querySelector('.trajectory-timeline');
+      const track = timeline?.querySelector('.trajectory-lane-track');
+      if (timeline && track) {
+        const trackRect = track.getBoundingClientRect();
+        const hostRect = timeline.getBoundingClientRect();
+        const low = Math.max(0, Math.min(trajectoryRange.start, trajectoryRange.end) / total);
+        const high = Math.min(1, Math.max(trajectoryRange.start, trajectoryRange.end) / total);
+        overlay.style.left = `${trackRect.left - hostRect.left + low * trackRect.width}px`;
+        overlay.style.width = `${Math.max(2, (high - low) * trackRect.width)}px`;
+      }
+    }
+  }
+  for (const row of root.querySelectorAll('.trajectory-row[data-start]')) {
+    const start = Number(row.dataset.start);
+    const end = Number(row.dataset.end);
+    row.toggleAttribute('data-outside', !!trajectoryRange && (end < trajectoryRange.start || start > trajectoryRange.end));
+  }
+  for (const bar of root.querySelectorAll('.trajectory-bar')) {
+    const start = Number(bar.dataset.start);
+    const end = Number(bar.dataset.end);
+    bar.toggleAttribute('data-outside', !!trajectoryRange && (end < trajectoryRange.start || start > trajectoryRange.end));
+  }
+}
+
 function trajectoryDetailTabs(record) {
-  if (record.kind === 'tool') return [['overview', '概述'], ['payload', '参数'], ['result', '结果'], ['schema', 'Schema'], ['timing', '计时']];
-  if (record.kind === 'assistant') return [['overview', '概述'], ['preview', '预览'], ['raw', '原始内容']];
+  if (record.kind === 'tool') {
+    const tabs = [['overview', '概述'], ['payload', '参数'], ['result', '结果']];
+    if (record.appliedDiff) tabs.push(['diff', '差异']);
+    tabs.push(['schema', 'Schema'], ['timing', '计时']);
+    return tabs;
+  }
+  if (record.kind === 'assistant') {
+    const tabs = [['overview', '概述'], ['preview', '预览']];
+    if (record.usage) tabs.push(['usage', '用量']);
+    tabs.push(['raw', '原始内容']);
+    return tabs;
+  }
   return [['overview', '概述'], ['raw', '原始内容']];
 }
 
@@ -1743,7 +1844,7 @@ function renderTrajectoryDetail(host, record, projection) {
   const head = el('div', 'trajectory-detail-head');
   const title = el('div', 'trajectory-detail-title');
   title.append(el('span', 'trajectory-detail-kind', record.label));
-  title.append(el('span', 'trajectory-detail-context', `第 ${record.turn} 轮${record.request ? ` · 请求 #${record.request}` : ''}`));
+  title.append(el('span', 'trajectory-detail-context', `第 ${record.turn} 轮${record.request ? ` · 第 ${record.request} 步` : ''}`));
   const close = iconButton('close', '关闭详情', { size: 15, tooltip: '关闭详情' });
   close.addEventListener('click', () => {
     trajectorySelectedId = null;
@@ -1764,24 +1865,21 @@ function renderTrajectoryDetail(host, record, projection) {
   const body = el('div', 'trajectory-detail-body');
   const usage = record.usage;
   if (trajectoryDetailTab === 'overview') {
-    body.append(detailRow('类型', record.label));
-    body.append(detailRow('状态', record.status === 'success' ? '已完成' : record.status === 'failed' ? '失败' : record.status === 'running' ? '进行中' : record.status === 'stopped' ? '已停止' : record.status === 'interrupted' ? '已中断' : record.status || '未知'));
+    const layer = record.kind === 'user' ? '用户消息' : record.kind === 'tool' || record.kind === 'assistant' ? '助手消息' : record.kind === 'context' ? '上下文' : record.label;
+    body.append(detailRow('层级', layer));
+    body.append(detailRow('状态', trajectoryStatusLabel(record.status)));
     if (record.kind === 'tool') {
-      body.append(detailRow('工具', record.toolName || '不可用'));
-      body.append(el('h3', 'trajectory-detail-heading', '参数'));
-      body.append(detailCodeBlock(record.arguments, { empty: '参数不可用' }));
-      body.append(el('h3', 'trajectory-detail-heading', '结果'));
-      body.append(detailCodeBlock(record.preview, { empty: '结果不可用' }));
+      body.append(trajectorySection('参数', detailCodeBlock(record.arguments, { empty: '参数不可用' })));
+      body.append(trajectorySection('结果', detailCodeBlock(record.preview, { empty: '结果不可用' })));
+      body.append(trajectorySection('Schema', el('div', 'trajectory-detail-empty', 'Schema 不可用：Runtime 未记录工具 schema')));
     } else {
       if (record.kind === 'user') body.append(detailRow('图片', String(record.images ?? 0)));
       body.append(detailRow('Token 用量', usage ? `输入 ${usage.input ?? '?'} · 输出 ${usage.output ?? '?'}${usage.cached ? ` · 缓存 ${usage.cached}` : ''}` : '不可用（Runtime 未持久化用量）'));
       body.append(detailRow('时长', formatDuration(record.durationMs) ?? '不可用'));
-      body.append(el('h3', 'trajectory-detail-heading', '预览'));
       const markdown = el('div', 'markdown trajectory-detail-markdown');
       renderMarkdown(markdown, record.text || '（无文本）', { onLink: openMessageLink });
-      body.append(markdown);
+      body.append(trajectorySection('预览', markdown));
     }
-    body.append(el('h3', 'trajectory-detail-heading', '请求计时'));
     const timing = el('div', 'trajectory-detail-timing');
     timing.append(
       detailRow('轮内偏移', formatDuration(record.startedMs) ?? '不可用'),
@@ -1790,11 +1888,24 @@ function renderTrajectoryDetail(host, record, projection) {
       detailRow('生成', record.kind === 'assistant' ? (formatDuration(record.durationMs) ?? '不可用') : '不适用于此记录'),
       detailRow('吞吐量', usage && record.durationMs ? '不可用（Runtime 未记录生成 token 时间）' : '不可用'),
     );
-    body.append(timing);
+    body.append(trajectorySection('请求计时', timing));
   } else if (trajectoryDetailTab === 'payload') {
     body.append(detailCodeBlock(record.arguments, { empty: '参数不可用' }));
   } else if (trajectoryDetailTab === 'result') {
     body.append(detailCodeBlock(record.preview, { empty: '结果不可用' }));
+  } else if (trajectoryDetailTab === 'diff') {
+    body.append(detailCodeBlock(record.appliedDiff, { empty: '差异不可用' }));
+  } else if (trajectoryDetailTab === 'usage') {
+    const value = record.usage;
+    if (!value) body.append(el('div', 'trajectory-detail-empty', 'Token 用量不可用：Runtime 未持久化该请求的用量'));
+    else {
+      body.append(
+        detailRow('输入', value.input === null ? '未知' : String(value.input)),
+        detailRow('输出', value.output === null ? '未知' : String(value.output)),
+        detailRow('缓存读', String(value.cached ?? 0)),
+        ...(value.reasoning === undefined ? [] : [detailRow('推理', String(value.reasoning))]),
+      );
+    }
   } else if (trajectoryDetailTab === 'schema') {
     body.append(el('div', 'trajectory-detail-empty', 'Schema 不可用：Runtime 未记录工具 schema'));
   } else if (trajectoryDetailTab === 'timing') {
@@ -1820,6 +1931,21 @@ function renderTrajectoryDetail(host, record, projection) {
   host.replaceChildren(head, tabs, body);
 }
 
+function trajectoryStatusLabel(status) {
+  return {
+    success: '已完成', completed: '已完成', failed: '失败', running: '进行中',
+    stopped: '已停止', interrupted: '已中断',
+  }[status] ?? status ?? '未知';
+}
+
+function trajectorySection(title, content) {
+  const section = el('section', 'trajectory-detail-section');
+  const heading = el('h3', 'trajectory-detail-heading');
+  heading.append(el('span', undefined, title), iconNode('chevronRight', { size: 12 }));
+  section.append(heading, content);
+  return section;
+}
+
 function renderTrajectory() {
   const root = ensureTrajectoryDom();
   const active = !!current && !isHome() && $('entry-page').hidden && activeView === 'trajectory';
@@ -1832,17 +1958,19 @@ function renderTrajectory() {
   }
   const projection = trajectoryProjection();
   const records = projection.records;
+  const windowed = trajectoryWindow(records, trajectoryNodeLimit);
+  const windowIds = new Set(windowed.records.map(record => record.id));
   const duration = root.querySelector('[data-trajectory-action="duration"]');
   duration.setAttribute('aria-pressed', String(trajectoryActualDuration));
   duration.title = trajectoryActualDuration ? '使用等宽时长' : '使用实际时长';
   const turns = root.querySelector('[data-trajectory-action="turns"]');
   turns.setAttribute('aria-label', trajectoryCollapseTurns ? '展开所有轮次' : '收起所有轮次');
   turns.setAttribute('aria-pressed', String(trajectoryCollapseTurns));
-  turns.replaceChildren(iconNode(trajectoryCollapseTurns ? 'plus' : 'minus', { size: 11 }), el('span', undefined, '轮次'));
+  turns.replaceChildren(iconNode(trajectoryCollapseTurns ? 'plus' : 'minus', { size: 12 }), el('span', undefined, '轮次'));
   const calls = root.querySelector('[data-trajectory-action="calls"]');
   calls.setAttribute('aria-label', trajectoryCollapseCalls ? '展开所有调用' : '收起所有调用');
   calls.setAttribute('aria-pressed', String(trajectoryCollapseCalls));
-  calls.replaceChildren(iconNode(trajectoryCollapseCalls ? 'plus' : 'minus', { size: 11 }), el('span', undefined, '调用'));
+  calls.replaceChildren(iconNode(trajectoryCollapseCalls ? 'plus' : 'minus', { size: 12 }), el('span', undefined, '调用'));
   const search = root.querySelector('#trajectory-search');
   if (search.value !== trajectoryQuery) search.value = trajectoryQuery;
   renderTrajectoryTimeline(root.querySelector('.trajectory-timeline'), records);
@@ -1859,13 +1987,29 @@ function renderTrajectory() {
   const selected = records.find(record => record.id === trajectorySelectedId) ?? null;
   if (!selected && trajectorySelectedId) trajectorySelectedId = null;
   let rendered = 0;
+  if (!filtering && windowed.hasOlder) {
+    const row = el('tr', 'trajectory-history-row');
+    const cell = el('td');
+    cell.colSpan = 2;
+    const button = el('button', 'trajectory-history-button');
+    button.type = 'button';
+    button.append(iconNode('chevronUp', { size: 12 }), el('span', undefined, `加载更早（已显示最近 ${windowed.records.length} / ${windowed.total} 条）`));
+    button.addEventListener('click', () => {
+      trajectoryPinned = false;
+      trajectoryNodeLimit += 50;
+      renderTrajectory();
+    });
+    cell.append(button);
+    row.append(cell);
+    tbody.append(row);
+  }
   const systemVisible = !filtering;
   if (systemVisible) {
     const row = el('tr', 'trajectory-row trajectory-system-row');
     row.dataset.kind = 'system';
     const typeCell = el('td', 'trajectory-type-cell');
     const chip = el('span', 'trajectory-kind', '系统');
-    chip.dataset.kind = 'context';
+    chip.dataset.kind = 'system';
     typeCell.append(chip);
     const contentCell = el('td', 'trajectory-content-cell');
     contentCell.append(el('span', 'trajectory-summary', '初始系统提示词 · 不可用：Runtime 未记录系统提示词'));
@@ -1873,29 +2017,40 @@ function renderTrajectory() {
     tbody.append(row);
   }
   for (const turn of projection.turns) {
-    const visible = turn.records.filter(record => !filtering || matches.has(record.id));
+    const visible = turn.records.filter(record => filtering ? matches.has(record.id) : windowIds.has(record.id));
     if (filtering && visible.length === 0) continue;
-    const group = el('tr', 'trajectory-group-row');
-    const groupCell = el('td');
-    groupCell.colSpan = 2;
-    const groupButton = el('button', 'trajectory-group-toggle');
-    groupButton.type = 'button';
-    groupButton.setAttribute('aria-expanded', String(!trajectoryCollapseTurns));
-    groupButton.append(el('span', 'trajectory-turn-label', `第 ${turn.index} 轮`));
-    if (trajectoryCollapseTurns) groupButton.append(el('span', 'trajectory-turn-summary', `${visible.length} 条记录`));
-    groupButton.addEventListener('click', () => { trajectoryCollapseTurns = !trajectoryCollapseTurns; renderTrajectory(); });
-    groupCell.append(groupButton);
-    group.append(groupCell);
-    tbody.append(group);
-    if (trajectoryCollapseTurns) continue;
+    if (trajectoryCollapseTurns) {
+      // Collapsed turns keep one summary row; the expanded ledger carries the
+      // turn label inside the first row's gutter like the reference.
+      const group = el('tr', 'trajectory-group-row');
+      const groupCell = el('td');
+      groupCell.colSpan = 2;
+      const groupButton = el('button', 'trajectory-group-toggle');
+      groupButton.type = 'button';
+      groupButton.setAttribute('aria-expanded', 'false');
+      groupButton.append(el('span', 'trajectory-turn-label', `第 ${turn.index} 轮`));
+      groupButton.append(el('span', 'trajectory-turn-summary', `${visible.length} 条记录`));
+      groupButton.addEventListener('click', () => { trajectoryCollapseTurns = false; renderTrajectory(); });
+      groupCell.append(groupButton);
+      group.append(groupCell);
+      tbody.append(group);
+      rendered += 1;
+      continue;
+    }
+    let firstShown = true;
+    let priorRequest = null;
     for (const record of visible) {
       if (trajectoryCollapseCalls && record.kind === 'tool') continue;
       const row = el('tr', 'trajectory-row');
       row.dataset.id = record.id;
       row.dataset.kind = record.kind;
+      row.dataset.start = String(record.startedMs ?? 0);
+      row.dataset.end = String(record.endedMs ?? record.startedMs ?? 0);
       if (record.id === trajectorySelectedId) row.setAttribute('aria-selected', 'true');
       const typeCell = el('td', 'trajectory-type-cell');
-      if (record.request) {
+      if (firstShown) {
+        typeCell.append(el('span', 'trajectory-turn-label', `第 ${turn.index} 轮`));
+      } else if (record.request && record.request !== priorRequest) {
         const requestButton = el('button', 'trajectory-request-button', `#${record.request}`);
         requestButton.type = 'button';
         requestButton.setAttribute('aria-label', `请求 #${record.request}`);
@@ -1908,6 +2063,7 @@ function renderTrajectory() {
         });
         typeCell.append(requestButton);
       }
+      priorRequest = record.request || priorRequest;
       const chip = el('span', 'trajectory-kind', record.label);
       chip.dataset.kind = record.kind;
       typeCell.append(chip);
@@ -1921,6 +2077,7 @@ function renderTrajectory() {
         renderTrajectory();
       });
       tbody.append(row);
+      firstShown = false;
       rendered += 1;
     }
   }
@@ -1943,6 +2100,7 @@ function renderTrajectory() {
   table.append(tbody);
   const scrollTop = ledger.scrollTop;
   ledger.replaceChildren(table);
+  applyTrajectoryRange();
   if (trajectoryPinned) ledger.scrollTop = ledger.scrollHeight;
   else ledger.scrollTop = scrollTop;
   const detailHost = root.querySelector('.trajectory-detail');
@@ -2164,7 +2322,7 @@ function commandCatalog() {
   const frozen = loading || !!uncertain || uploadPending();
   const session = !!current;
   const entries = [
-    ['add', 'file', '文件', session, 'paperclip', null, null],
+    ['add', 'file', '文件', true, 'paperclip', null, null],
     ['commands', 'goal', '目标', false, 'compass', '未接入', 'Runtime 没有长期目标编辑接口'],
     ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
@@ -2210,8 +2368,9 @@ function openCommandMenu(candidates = commandCatalog()) {
   node.append(el('div', 'menu-note', '↑↓ 选择 · Enter 执行 · Esc 关闭'));
   document.body.append(node);
   const card = $('composer-card').getBoundingClientRect();
+  const height = node.getBoundingClientRect().height;
   node.style.left = `${Math.round(card.left + 8)}px`;
-  node.style.top = `${Math.round(card.top - node.getBoundingClientRect().height - 4)}px`;
+  node.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - height - 8, card.top - height - 4)))}px`;
   node.style.width = `${Math.min(360, card.width - 16)}px`;
 }
 
@@ -2238,8 +2397,9 @@ function openAtMenu() {
   }
   document.body.append(node);
   const card = $('composer-card').getBoundingClientRect();
+  const height = node.getBoundingClientRect().height;
   node.style.left = `${Math.round(card.left + 8)}px`;
-  node.style.top = `${Math.round(card.top - node.getBoundingClientRect().height - 4)}px`;
+  node.style.top = `${Math.round(Math.max(8, Math.min(innerHeight - height - 8, card.top - height - 4)))}px`;
   node.style.width = `${Math.min(320, card.width - 16)}px`;
 }
 
@@ -2260,11 +2420,11 @@ function insertCommand(id) {
 async function executeCommand(id) {
   const command = commandCatalog().find(item => item.id === id);
   if (!command?.enabled) { composerError(command?.reason ?? '命令当前不可用'); return; }
-  $('message').value = '';
   closeComposerPopovers();
+  if (id === 'file') { composerError(''); controls(); uploadAttachment(); return; }
+  $('message').value = '';
   composerError('');
   controls();
-  if (id === 'file') { uploadAttachment(); return; }
   if (id === 'feedback') { openFeedbackDialog(); return; }
   if (id === 'permission') { openPermissionMenu($('permission-picker')); return; }
   if (id === 'model') { openModelMenu($('model-picker')); return; }
@@ -2299,6 +2459,8 @@ function newSession() {
   liveTurnStartAt = null;
   liveTurnClosed = false;
   trajectorySelectedId = null;
+  trajectoryNodeLimit = 50;
+  trajectoryRange = null;
   $('message').value = drafts.get('new-session') ?? '';
   $('conversation').replaceChildren();
   render();
@@ -2306,6 +2468,7 @@ function newSession() {
 }
 
 async function createTask() {
+  const draftText = $('message').value;
   const key = selection?.id ?? null;
   if (!pendingCreation || pendingCreation.key !== key) pendingCreation = { key, id: crypto.randomUUID() };
   const result = await api.createTask(key, pendingCreation.id);
@@ -2319,9 +2482,17 @@ async function createTask() {
   liveTurnStartAt = null;
   liveTurnClosed = false;
   trajectorySelectedId = null;
+  trajectoryNodeLimit = 50;
+  trajectoryRange = null;
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
+  if (draftText) {
+    $('message').value = draftText;
+    resizeComposer();
+    drafts.set(current.session.id, draftText);
+    drafts.delete('new-session');
+  }
   await refreshTasks();
   if (settings.defaultPermission && settings.defaultPermission !== 'assisted') {
     try {
@@ -2365,6 +2536,8 @@ async function openTask(task) {
   liveTurnStartAt = null;
   liveTurnClosed = false;
   trajectorySelectedId = null;
+  trajectoryNodeLimit = 50;
+  trajectoryRange = null;
   $('message').value = drafts.get(current.session.id) ?? '';
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
@@ -2724,6 +2897,11 @@ function tabIcon(tab) {
   return glyph;
 }
 
+function changesTabTitle() {
+  const turns = (current?.messages ?? []).filter(message => messageKind(message) === 'user').length;
+  return `第 ${Math.max(1, turns)} 轮改动`;
+}
+
 function newTabRecord(kind, extra = {}) {
   const id = `tab${rightbarSeq++}`;
   const title = {
@@ -2746,7 +2924,7 @@ function openRightbarTab(kind, extra = {}) {
   const active = pane.activeId ? rightbarTabs[pane.activeId] : null;
   if (active?.kind === 'start') {
     active.kind = kind;
-    active.title = extra.title ?? ({ files: '文件', terminal: '终端', browser: '浏览器', changes: '变更', preview: '预览' }[kind] ?? active.title);
+    active.title = extra.title ?? ({ files: '文件', terminal: '终端', browser: '浏览器', changes: changesTabTitle(), preview: '预览' }[kind] ?? active.title);
     Object.assign(active, extra);
     rightbarOpen = true;
     rightbarExpanded = false;
@@ -2760,6 +2938,7 @@ function openRightbarTab(kind, extra = {}) {
     : ['files', 'changes', 'plan', 'deliverables', 'subagent'].includes(kind)
       ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
   const tab = reusable ?? newTabRecord(kind, extra);
+  if (kind === 'changes' && !extra.title) tab.title = changesTabTitle();
   if (reusable) {
     const owner = rightbarPanes.find(item => item.tabs.includes(reusable.id));
     if (owner) {
@@ -3216,9 +3395,9 @@ function filesView() {
   } else pathNode.textContent = '未选择工作区';
   pathNode.title = path;
   const refresh = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
-  refresh.addEventListener('click', () => { renderRightbar(); toast('桌面桥接没有目录读取接口', { tone: 'info', holdMs: 2400 }); });
+  refresh.disabled = true;
   const open = el('div', 'open-in-app-pane');
-  toolbar.append(pathNode, unconnected(), refresh, open);
+  toolbar.append(pathNode, refresh, open);
   renderOpenInAppInto(open, path, 'directory');
   const body = el('div', 'files-body');
   if (!path) {
@@ -3231,7 +3410,7 @@ function filesView() {
     body.append(state);
   } else {
     const note = el('div', 'files-note');
-    note.append(el('span', undefined, '未接入：桌面桥接没有目录读取接口，无法列出真实文件树。'), unconnected());
+    note.append(el('span', undefined, '桌面桥接没有目录读取接口，无法列出真实文件树。'));
     body.append(note);
   }
   view.append(toolbar, body);
@@ -3246,10 +3425,9 @@ function terminalView() {
   mark.append(iconNode('terminal', { size: 36, stroke: 1.1 }));
   box.append(mark, el('h3', undefined, '交互式终端尚未接入'));
   box.append(el('p', undefined, '桌面桥接没有可安全复用的 PTY。Agent 命令仍在对话中执行并展示完整输出。'));
-  box.append(unconnected());
   screen.append(box);
   const status = el('div', 'terminal-status');
-  status.append(el('span', 'terminal-status-detail', '没有可用 Shell'), unconnected());
+  status.append(el('span', 'terminal-status-detail', '没有可用 Shell'));
   view.append(screen, status);
   return view;
 }
@@ -3478,16 +3656,16 @@ function parsePatch(patch) {
   let newLine = 0;
   for (const raw of String(patch ?? '').split('\n')) {
     if (raw.startsWith('diff ') || raw.startsWith('index ') || raw.startsWith('--- ') || raw.startsWith('+++ ')) {
-      out.push({ kind: 'meta', text: raw }); continue;
+      out.push({ kind: 'meta', text: raw, old: null, next: null }); continue;
     }
     if (raw.startsWith('@@')) {
       const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
       if (match) { oldLine = Number(match[1]); newLine = Number(match[2]); }
-      out.push({ kind: 'hunk', text: raw }); continue;
+      out.push({ kind: 'hunk', text: raw, old: null, next: null }); continue;
     }
     if (raw.startsWith('+')) { out.push({ kind: 'added', text: raw.slice(1), old: null, next: newLine++ }); continue; }
     if (raw.startsWith('-')) { out.push({ kind: 'removed', text: raw.slice(1), old: oldLine++, next: null }); continue; }
-    if (raw.startsWith('\\')) { out.push({ kind: 'meta', text: raw }); continue; }
+    if (raw.startsWith('\\')) { out.push({ kind: 'meta', text: raw, old: null, next: null }); continue; }
     if (raw === '') continue;
     out.push({ kind: 'context', text: raw.slice(1), old: oldLine++, next: newLine++ });
   }
@@ -3721,7 +3899,7 @@ function previewView(tab) {
   } else {
     const empty = el('div', 'right-empty');
     const mark = el('span', 'empty-icon'); mark.append(iconNode('file', { size: 48, stroke: 1.1 }));
-    empty.append(mark, el('h3', undefined, '文件预览尚未接入'), el('p', undefined, '桌面桥接没有文件读取接口，无法在应用内安全打开工作区文件。'), unconnected());
+    empty.append(mark, el('h3', undefined, '文件预览尚未接入'), el('p', undefined, '桌面桥接没有文件读取接口，无法在应用内安全打开工作区文件。'));
     const openHost = el('div', 'open-in-app-unpreviewable');
     empty.append(openHost);
     renderOpenInAppInto(openHost, path, 'file');
@@ -3736,7 +3914,7 @@ function deliverablesView() {
   if (!report) {
     const empty = el('div', 'right-empty');
     const mark = el('span', 'empty-icon'); mark.append(iconNode('archive', { size: 48, stroke: 1.1 }));
-    empty.append(mark, el('h3', undefined, '暂无交付内容'), el('p', undefined, '当前 Runtime 不暴露交付物/产物列表，桌面不会伪造文件卡片。'), unconnected());
+    empty.append(mark, el('h3', undefined, '暂无交付内容'), el('p', undefined, '当前 Runtime 不暴露交付物/产物列表，桌面不会伪造文件卡片。'));
     return empty;
   }
   const view = el('div', 'deliverable-list');
@@ -3758,7 +3936,7 @@ function deliverablesView() {
   );
   card.append(icon, copy);
   const note = el('div', 'deliverable-note');
-  note.append(el('span', undefined, 'Runtime 只提供聚合统计，没有交付文件清单；不会伪造文件名或预览。'), unconnected());
+  note.append(el('span', undefined, 'Runtime 只提供聚合统计，没有交付文件清单；不会伪造文件名或预览。'));
   view.append(card, note);
   return view;
 }
@@ -3845,7 +4023,7 @@ function openSettings(section = 'general') {
   settingsSection = section;
   renderSettings();
   if (!$('settings-dialog').open) $('settings-dialog').showModal();
-  $('settings-close').focus();
+  $('settings-nav-list').querySelector('[aria-current="page"]')?.focus();
   scheduleBrowserSurface();
 }
 function closeSettings() {
@@ -3867,13 +4045,23 @@ function settingRow(label, desc, control, extra = null) {
   return row;
 }
 
+// Disabled controls keep the reference layout; the tooltip states why the
+// capability is unavailable without adding a badge to every row.
+function unavailableControl(control, reason) {
+  const wrap = el('span', 'setting-unavailable');
+  wrap.title = reason;
+  control.title = reason;
+  wrap.append(control);
+  return wrap;
+}
+
 function menuControl(value, options, onChange, { disabled = false, label = '' } = {}) {
   const button = el('button', 'select-button');
   button.type = 'button';
   button.disabled = disabled;
   button.setAttribute('aria-label', label);
   const currentOption = options.find(option => option.value === value) ?? options[0];
-  button.append(el('span', undefined, currentOption?.label ?? ''), iconNode('chevronDown', { size: 12, className: 'select-chevron' }));
+  button.append(el('span', undefined, currentOption?.label ?? ''), iconNode('chevronDown', { size: 14, className: 'select-chevron' }));
   button.addEventListener('click', () => openMenu({
     anchor: button, align: 'end', width: 260,
     items: options.map(option => ({
@@ -3934,7 +4122,7 @@ function themeCards() {
     button.type = 'button';
     button.setAttribute('role', 'radio');
     button.setAttribute('aria-checked', String(settings.theme === value));
-    button.append(iconNode(icon, { size: 18 }), el('span', undefined, label));
+    button.append(iconNode(icon, { size: 16 }), el('span', undefined, label));
     button.addEventListener('click', () => {
       settings.theme = value;
       saveSettings();
@@ -3955,13 +4143,13 @@ function fontSizeControl(value, min, max, onChange, { expander = false } = {}) {
   up.type = 'button';
   up.setAttribute('aria-label', '增大字号');
   up.disabled = value >= max;
-  up.append(iconNode('chevronUp', { size: 12 }));
+  up.append(iconNode('chevronUp', { size: 9 }));
   up.addEventListener('click', () => onChange(Math.min(max, value + 1)));
   const down = el('button', 'font-stepper-arrow');
   down.type = 'button';
   down.setAttribute('aria-label', '减小字号');
   down.disabled = value <= min;
-  down.append(iconNode('chevronDown', { size: 12 }));
+  down.append(iconNode('chevronDown', { size: 9 }));
   down.addEventListener('click', () => onChange(Math.max(min, value - 1)));
   arrows.append(up, down);
   stepper.append(arrows);
@@ -4001,7 +4189,7 @@ function renderGeneralSettings(content) {
   group.append(settingRow('权限', '选择新会话的默认权限模式', menuControl(settings.defaultPermission, PERMISSION_MODES.map(([value, label]) => ({ value, label })), value => {
     settings.defaultPermission = value; saveSettings(); toast('默认权限已更新', { tone: 'success', holdMs: 1600 });
   }, { label: '权限' })));
-  group.append(settingRow('语言', '', menuControl('zh-CN', [{ value: 'zh-CN', label: '中文' }], () => {}, { disabled: true, label: '语言' }), unconnected()));
+  group.append(settingRow('语言', '', menuControl('zh-CN', [{ value: 'zh-CN', label: '中文' }], () => {}, { label: '语言' })));
   const themeRow = el('div', 'setting-row appearance-row');
   const themeCopy = el('div', 'setting-copy');
   themeCopy.append(el('div', 'setting-label', '外观'));
@@ -4028,27 +4216,33 @@ function renderGeneralSettings(content) {
     })));
   }
   group.append(settingRow('工作步骤展示', '选择希望看到多少工具调用细节', menuControl(settings.workSteps, [
-    { value: 'compact', label: '精简' }, { value: 'standard', label: '标准' },
-    { value: 'detailed', label: '详细' }, { value: 'verbose', label: '详细展开' },
+    { value: 'compact', label: '简洁' }, { value: 'standard', label: '标准' },
+    { value: 'detailed', label: '详细' }, { value: 'verbose', label: '完全展开' },
   ], value => { settings.workSteps = value; saveSettings(); renderConversation(); }, { label: '工作步骤展示' })));
   group.append(settingRow('工作步骤收起时机', '选择何时自动收起工作步骤', menuControl(settings.collapseAfter, [
-    { value: 'answer', label: '回答结束后' }, { value: 'next', label: '下一条消息' },
+    { value: 'answer', label: '回答结束后' }, { value: 'next', label: '下次有新消息时' },
   ], value => { settings.collapseAfter = value; saveSettings(); renderConversation(); }, { label: '工作步骤收起时机' })));
-  group.append(settingRow('显示代码工作视图', '开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 预设切换', switchControl(settings.codingView, () => {}, { disabled: true }), unconnected()));
+  const viewRow = settingRow('显示代码工作视图', '开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 预设切换',
+    unavailableControl(switchControl(settings.codingView, () => {}, { disabled: true }), '当前版本不可用：没有本轮代码差异视图，无法完整切换'));
+  viewRow.classList.add('setting-row-compact');
+  group.append(viewRow);
   const shortcuts = el('button', 'settings-shortcut-button', '编辑快捷键');
   shortcuts.type = 'button';
   shortcuts.addEventListener('click', () => showShortcuts());
-  group.append(settingRow('快捷键', '查看和编辑当前可用的快捷键和输入操作', shortcuts, unconnected()));
+  group.append(settingRow('快捷键', '查看和编辑当前可用的快捷键和输入操作', shortcuts));
   group.append(settingRow('网页链接默认打开方式', '对话中网页链接的打开位置', menuControl(settings.linkOpen, [
-    { value: 'side', label: '应用内侧边栏' }, { value: 'system', label: '系统默认浏览器' },
+    { value: 'side', label: '应用内侧边栏' }, { value: 'system', label: '默认浏览器' },
   ], value => { settings.linkOpen = value; saveSettings(); }, { label: '网页链接默认打开方式' })));
   group.append(settingRow('繁忙时的发送行为', '智能体运行时 Enter 键和发送按钮的行为；Cmd/Ctrl+Enter 使用另一行为', menuControl(settings.busySend, [
-    { value: 'queue', label: '排队发送' }, { value: 'steer', label: '立即插入当前回合' },
+    { value: 'queue', label: '排队发送' }, { value: 'steer', label: '插话发送' },
   ], value => { settings.busySend = value; saveSettings(); renderComposerMeta(); controls(); }, { label: '繁忙时的发送行为' })));
   group.append(settingRow('性能与用量', '选择性能与用量信息展示的详细程度', menuControl(settings.performance, [
     { value: 'detailed', label: '详细' }, { value: 'compact', label: '简洁' },
   ], value => { settings.performance = value; saveSettings(); renderConversation(); renderContextMeter(); }, { label: '性能与用量' })));
-  group.append(settingRow('在使用官方模型 API 时上传 Session Log', '帮助改进 DeepSeek 模型与产品', switchControl(false, () => {}, { disabled: true }), unconnected()));
+  const sessionLogRow = settingRow('在使用官方模型 API 时上传 Session Log', '帮助改进 DeepSeek 模型与产品',
+    unavailableControl(switchControl(false, () => {}, { disabled: true }), '当前版本不可用：未接入 Session Log 上传接口'));
+  sessionLogRow.classList.add('setting-row-compact');
+  group.append(sessionLogRow);
   content.append(group);
   content.append(el('div', 'settings-footer', `当前版本：${$('brand-version').textContent || 'CodeLeveler'}`));
 }
@@ -4186,8 +4380,8 @@ function renderEntryPage() {
   if (entryPage === 'plugins') {
     copy.append(el('h1', undefined, '插件'), el('p', undefined, '扩展 CodeLeveler 的工具与界面。'));
     const action = el('button', 'button secondary', '安装插件');
-    action.type = 'button'; action.disabled = true;
-    const wrap = el('div', 'settings-actions'); wrap.append(action, unconnected());
+    action.type = 'button'; action.disabled = true; action.title = '当前版本未接入插件安装';
+    const wrap = el('div', 'settings-actions'); wrap.append(action);
     head.append(copy, wrap);
     page.append(head);
     const search = el('div', 'entry-search');
@@ -4206,17 +4400,17 @@ function renderEntryPage() {
     }
     page.append(tabs);
     const card = el('div', 'entry-card');
-    card.append(el('h2', undefined, '当前 Runtime 未提供插件目录'), el('p', undefined, '桌面桥接层没有可读取的插件清单、启停或安装接口。这里不会伪造插件列表或开关。'), unconnected());
+    card.append(el('h2', undefined, '当前 Runtime 未提供插件目录'), el('p', undefined, '桌面桥接层没有可读取的插件清单、启停或安装接口。这里不会伪造插件列表或开关。'));
     page.append(card);
   } else {
     copy.append(el('h1', undefined, '自动化任务'), el('p', undefined, '按计划运行 Agent 任务。'));
     const action = el('button', 'button secondary', '新建任务');
-    action.type = 'button'; action.disabled = true;
-    const wrap = el('div', 'settings-actions'); wrap.append(action, unconnected());
+    action.type = 'button'; action.disabled = true; action.title = '当前版本未接入调度接口';
+    const wrap = el('div', 'settings-actions'); wrap.append(action);
     head.append(copy, wrap);
     page.append(head);
     const card = el('div', 'entry-card');
-    card.append(el('h2', undefined, '调度接口尚未接入'), el('p', undefined, 'CodeLeveler Runtime 暴露了 schedule 工具与事件，但桌面桥接层没有列表/创建/取消接口。这里不会展示伪造的计划记录。'), unconnected());
+    card.append(el('h2', undefined, '调度接口尚未接入'), el('p', undefined, 'CodeLeveler Runtime 暴露了 schedule 工具与事件，但桌面桥接层没有列表/创建/取消接口。这里不会展示伪造的计划记录。'));
     page.append(card);
     const empty = el('div', 'entry-empty');
     const mark = el('span', 'empty-mark');
@@ -4330,6 +4524,14 @@ api.onEvent(frame => {
   if (event.type === 'agents_loaded') return;
   const pendingDiff = current.diffQuery?.status === 'pending' && event.query_id === current.diffQuery.id;
   current = applyEvent(current, event);
+  if (terminalEvents.has(event.type) && current?.session?.repository) {
+    const attemptDiff = (attempt = 0) => {
+      if (attempt > 6 || !current?.session?.repository) return;
+      if (loading || uncertain) { setTimeout(() => attemptDiff(attempt + 1), 400); return; }
+      requestDiff();
+    };
+    setTimeout(() => attemptDiff(), 800);
+  }
   if ((event.type === 'tool_call_started' || event.type === 'tool_call_completed') && event.duration_ms !== undefined) {
     const tool = current.tools.find(item => item.id === event.id);
     if (tool) tool.durationMs = event.duration_ms;
@@ -4341,6 +4543,7 @@ api.onEvent(frame => {
       if (tab && !tab.selected) tab.selected = current.diff?.files?.[0]?.path ?? null;
     }
     renderRightbar();
+    renderConversation();
   } else if (event.type === 'plan_updated') {
     renderRightbar();
   }

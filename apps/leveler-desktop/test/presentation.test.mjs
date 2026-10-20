@@ -40,9 +40,9 @@ test('task navigation uses a compact relative timestamp without changing facts',
  assert.equal(relativeActivity('invalid',now),'');
 });
 test('permission chrome reports actual runtime mode and never guesses an absent mode',()=>{
- assert.equal(permissionLabel('full_access'),'完全开放');
- assert.equal(permissionLabel('assisted'),'自动权限');
- assert.equal(permissionLabel('request_approval'),'受限权限');
+ assert.equal(permissionLabel('full_access'),'完全权限');
+ assert.equal(permissionLabel('assisted'),'工作区内修改');
+ assert.equal(permissionLabel('request_approval'),'需批准');
  assert.equal(permissionLabel(undefined),'权限由 Runtime 决定');
 });
 test('recent workspaces are distinct real task locations and searchable by name',()=>{
