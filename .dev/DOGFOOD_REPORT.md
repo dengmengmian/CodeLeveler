@@ -13,11 +13,11 @@
 | 项 | 值 |
 |---|---|
 | 平台 | macOS 26.6（darwin） |
-| 二进制 | `CodeLeveler/target/debug/leveler`（dirty working tree，`1.0.20 (584bfdd6efcb-dirty)`） |
+| 二进制 | `CodeLeveler/target/debug/leveler`（committed tree `fd56d76`，`1.0.20 (fd56d7694dd9)`） |
 | 确定性 Provider | `dogfood/eval/pty/mock_provider.py`，loopback SSE，零网络 |
 | 真实 Provider | `deepseek/deepseek-v4-flash`（dogfood `secrets/codeleveler/config.toml`） |
 | 证据 | `dogfood/.dev/evidence/goal_contracts_20261021.json` |
-| 原始 lab | `dogfood/scratch/goal-contracts-canonical-final2/`（gitignored，含每个 run 的 PTY 日志与 `sessions.db`） |
+| 原始 lab | `dogfood/scratch/goal-contracts-postcommit/`（gitignored，含每个 run 的 PTY 日志与 `sessions.db`） |
 
 运行命令：
 
@@ -25,8 +25,8 @@
 cd dogfood
 python3 eval/pty/goal_execution_contracts.py \
   --binary /Users/mengmian/Develop/app/dengmengmian/CodeLeveler/target/debug/leveler \
-  --lab scratch/goal-contracts-canonical-final2 \
-  --out scratch/goal-contracts-canonical-final2/goal_contracts.json
+  --lab scratch/goal-contracts-postcommit \
+  --out scratch/goal-contracts-postcommit/goal_contracts.json
 ```
 
 退出码 0；报告 `counts = {PASS: 10, FAIL: 0, SKIPPED: 0, NOT_VERIFIED: 0}`。
@@ -51,9 +51,9 @@ python3 eval/pty/goal_execution_contracts.py \
 | DF-5 Resume | **PASS** | 中断后重启 + `继续`：goals 行数仍为 1，objective 保留，原文在 transcript 只出现 1 行（wire 中 2 次 = transcript + host-pinned objective） | 10.6s |
 | DF-6 预算/空转 | **PASS** | 只输出阶段总结：3 次主请求后停止（初始 + 2 次有界续跑），`interrupted/incomplete`，从未 completed | 4.2s |
 | DF-7 Tool Result 脱敏 | **PASS** | 第二回合 wire 保留 `github.com/dengmengmian/devorder/internal/core/errors`，不出现 `[REDACTED]` 路径；`password=[REDACTED]`、`dbname=devorder` 正常 | 8.7s |
-| DF-8 Patch 一致性 | **PASS** | `-same/+same` 空补丁：工具结果含 `changed nothing`，`modified_files=[]`，文件仍为 `same\n` | 4.2s |
+| DF-8 Patch 一致性 | **PASS** | `-same/+same` 空补丁：工具结果含 `changed nothing`，`modified_files=[]`，文件仍为 `same\n` | 4.4s |
 | DF-9 Chat 不回归 | **PASS** | 普通会话只发 1 次主请求，`completed`，0 个 goal 行 | 4.1s |
-| DF-10 真实 Provider | **PASS（DeepSeek）** | 真实 `deepseek/deepseek-v4-flash`：5 轮、5 次工具调用、41,897 input / 636 output / 28,672 cached、22.6s；五项需求完成，`python3 -m unittest` 独立复核通过；模型以 `verification.status="passed"` 引用该命令并被执行记录接受 | 22.6s |
+| DF-10 真实 Provider | **PASS（DeepSeek）** | 真实 `deepseek/deepseek-v4-flash`：5 轮、5 次工具调用、42,245 input / 816 output / 28,928 cached、25.2s；五项需求完成，`python3 -m unittest` 独立复核通过；模型以 `verification.status="passed"` 引用该命令并被执行记录接受 | 25.2s |
 
 ### DF-10 的 Grok 子项
 
