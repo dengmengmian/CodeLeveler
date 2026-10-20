@@ -10,14 +10,16 @@ name: Sync release to AtomGit
 # deliberately does NOT push the tag — it only creates the release and uploads
 # the assets, which the mirror does not carry.
 #
-# Runs after a successful Release, and hourly. AtomGit pulls on its own
+# Runs after a successful Release, and once a day. AtomGit pulls on its own
 # schedule, so the tag this job must name reaches the mirror minutes or hours
 # after GitHub has it — measured on v1.0.17: fifty minutes after the release,
 # the mirror still served the previous commit and carried no v1.0.17 tag at
 # all. A release cannot be created before the mirror carries its tag, so the
-# release trigger only finishes when the mirror happens to be quick; the hourly
-# schedule is what makes an unhurried mirror converge with no human involved.
-# Every step is idempotent, so both paths can run on the same tag.
+# post-release run waits up to 90 minutes for the mirror to catch up, which
+# covers the measured lag without any further trigger. The daily schedule is
+# only a backstop for a run that died or a mirror that took longer than that;
+# an hourly schedule was tried first and mostly produced runs with nothing to
+# do. Every step is idempotent, so both paths can run on the same tag.
 #
 # Requires an `ATOMGIT_TOKEN` repository secret (a token with release +
 # attachment write access on the AtomGit repo). Without it the job fails loudly
@@ -27,7 +29,7 @@ on:
     workflows: [Release]
     types: [completed]
   schedule:
-    - cron: '23 * * * *'
+    - cron: '23 3 * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -45,7 +47,7 @@ concurrency:
 jobs:
   sync:
     name: mirror tag, notes and assets
-    # A successful build, the hourly retry, or a human asking for a tag.
+    # A successful build, the daily retry, or a human asking for a tag.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
@@ -121,13 +123,15 @@ jobs:
           set -euo pipefail
           tags_url="$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/tags"
           mirrored=false
-          for attempt in $(seq 1 20); do
+          # 180 x 30s = 90 minutes, past the ~50 minute lag measured on the
+          # mirror, so the post-release run usually finishes the sync itself.
+          for attempt in $(seq 1 180); do
             if curl -sS "$tags_url" \
               | jq -e --arg tag "$TAG" 'any(.[]; .name == $tag)' > /dev/null 2>&1; then
               mirrored=true
               break
             fi
-            echo "the mirror does not carry $TAG yet (attempt $attempt of 20)"
+            echo "the mirror does not carry $TAG yet (attempt $attempt of 180)"
             sleep 30
           done
           echo "ready=$mirrored" >> "$GITHUB_OUTPUT"
@@ -135,14 +139,14 @@ jobs:
             echo "$TAG is in the mirror"
             exit 0
           fi
-          # Past a day of hourly retries this is not a slow mirror: something is
+          # Past a day of retries this is not a slow mirror: something is
           # wrong with the mirror itself, and staying green would hide it.
           age=$(( $(date +%s) - $(cat /tmp/published-epoch.txt) ))
           if [ "$age" -gt 86400 ]; then
             echo "::error::$TAG has not reached the AtomGit mirror in $((age / 3600))h; the mirror is stalled"
             exit 1
           fi
-          echo "::warning::$TAG is not in the AtomGit mirror yet ($((age / 60))m after the GitHub release); the hourly schedule retries until it is"
+          echo "::warning::$TAG is not in the AtomGit mirror yet ($((age / 60))m after the GitHub release); the daily schedule retries until it is"
 
       - name: Create or update the AtomGit release
         if: steps.ready.outputs.ready == 'true'
