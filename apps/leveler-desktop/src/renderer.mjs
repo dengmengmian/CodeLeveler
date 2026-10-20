@@ -1062,16 +1062,55 @@ function ensureHeaderActions() {
   const schedule = $('header-schedule');
   schedule.append(iconNode('clock', { size: 16 }));
   schedule.addEventListener('click', () => openSchedulePopover(schedule));
-  for (const tab of document.querySelectorAll('#view-tabs [data-view]')) {
-    tab.addEventListener('click', () => {
-      activeView = tab.dataset.view === 'trajectory' ? 'trajectory' : 'chat';
-      if (current) rememberView(current.session.id, activeView);
-      renderHeader();
-      renderConversation();
-      renderTrajectory();
-      controls();
-    });
-  }
+  installViewTabs();
+}
+
+/** One delegated handler owns both tabs. It survives any header re-render and
+ * gives arrow/Home/End navigation the same activation path as a click. */
+function installViewTabs() {
+  const host = $('view-tabs');
+  if (!host || host.dataset.bound === 'true') return;
+  host.dataset.bound = 'true';
+  const activate = view => {
+    const next = view === 'trajectory' ? 'trajectory' : 'chat';
+    if (!current || isHome()) return;
+    const scroller = $('conversation-scroll');
+    const previousScroll = scroller.scrollTop;
+    if (next === activeView) {
+      host.querySelector(`[data-view="${next}"]`)?.focus({ preventScroll: true });
+      return;
+    }
+    activeView = next;
+    rememberView(current.session.id, next);
+    renderHeader();
+    renderConversation();
+    renderTrajectory();
+    if (next === 'chat') scroller.scrollTop = previousScroll;
+    controls();
+    host.querySelector(`[data-view="${next}"]`)?.focus({ preventScroll: true });
+  };
+  host.addEventListener('click', event => {
+    const tab = event.target.closest('[data-view]');
+    if (!tab) return;
+    event.preventDefault();
+    activate(tab.dataset.view);
+  });
+  host.addEventListener('keydown', event => {
+    const tabs = [...host.querySelectorAll('[data-view]')];
+    const at = tabs.indexOf(document.activeElement);
+    if (at < 0) return;
+    let next = null;
+    if (event.key === 'ArrowRight') next = (at + 1) % tabs.length;
+    else if (event.key === 'ArrowLeft') next = (at - 1 + tabs.length) % tabs.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = tabs.length - 1;
+    else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(tabs[at].dataset.view); return; }
+    else return;
+    event.preventDefault();
+    const tab = tabs[next];
+    tab.focus();
+    activate(tab.dataset.view);
+  });
 }
 
 function feedbackCategories() {
@@ -1206,7 +1245,9 @@ function renderHeader() {
   if (tabs) {
     tabs.hidden = home || pageOpen || !current;
     for (const tab of tabs.querySelectorAll('[data-view]')) {
-      tab.setAttribute('aria-selected', String(tab.dataset.view === activeView));
+      const selected = tab.dataset.view === activeView;
+      tab.setAttribute('aria-selected', String(selected));
+      tab.tabIndex = selected ? 0 : -1;
     }
   }
   if (!current) {
@@ -4286,14 +4327,18 @@ function changesTabTitle() {
   return `第 ${Math.max(1, turns)} 轮改动`;
 }
 
+const TAB_TITLES = {
+  start: '开始', files: '文件', terminal: '终端', browser: '浏览器', changes: '变更',
+  preview: '预览', deliverables: '交付', plan: '计划', subagent: '子智能体', schedule: '任务详情',
+};
+
+function tabTitle(kind, extra = {}) {
+  return extra.title ?? TAB_TITLES[kind] ?? kind;
+}
+
 function newTabRecord(kind, extra = {}) {
   const id = `tab${rightbarSeq++}`;
-  const title = {
-    start: '开始', files: '文件', terminal: '终端', browser: '浏览器', changes: '变更',
-    preview: extra.title ?? '预览', deliverables: '交付', plan: '计划', subagent: '子智能体',
-    schedule: '任务详情',
-  }[kind] ?? kind;
-  return { id, kind, title, ...extra };
+  return { id, kind, title: tabTitle(kind, extra), ...extra };
 }
 
 function ensureRightbarSession() {
@@ -4309,7 +4354,7 @@ function openRightbarTab(kind, extra = {}) {
   const active = pane.activeId ? rightbarTabs[pane.activeId] : null;
   if (active?.kind === 'start') {
     active.kind = kind;
-    active.title = extra.title ?? ({ files: '文件', terminal: '终端', browser: '浏览器', changes: changesTabTitle(), preview: '预览' }[kind] ?? active.title);
+    active.title = kind === 'changes' && !extra.title ? changesTabTitle() : tabTitle(kind, extra);
     Object.assign(active, extra);
     rightbarOpen = true;
     rightbarExpanded = false;
@@ -4386,6 +4431,9 @@ function closeTab(pane, tabId) {
   }
   persistRightbar();
   renderRightbar();
+  // A dock tab can disappear while its native browser binding is already null.
+  // Recompute the surface so a stale WebContentsView never sits above the page.
+  scheduleBrowserSurface();
 }
 function splitRightbar() {
   ensureRightbarSession();
@@ -4784,9 +4832,140 @@ function startView(tab) {
   return guide;
 }
 
+const fileTreeStates = new Map();
+
+function filesStateFor(session) {
+  const key = session.id;
+  let state = fileTreeStates.get(key);
+  if (!state) {
+    state = {
+      sessionId: key,
+      root: session.repository ?? '',
+      status: 'idle',
+      entries: new Map(),
+      expanded: new Set(),
+      loading: new Set(),
+      errors: new Map(),
+    };
+    fileTreeStates.set(key, state);
+  }
+  if (state.root !== (session.repository ?? '')) {
+    state.root = session.repository ?? '';
+    state.status = 'idle';
+    state.entries.clear();
+    state.errors.clear();
+    state.loading.clear();
+  }
+  return state;
+}
+
+function filesRefresh(state) {
+  state.entries.clear();
+  state.errors.clear();
+  state.loading.clear();
+  state.status = 'idle';
+  if (rightbarOpen) renderRightbar();
+}
+
+function filesLoad(state, rel = '', { force = false } = {}) {
+  if (state.loading.has(rel)) return;
+  if (!force && state.entries.has(rel)) return;
+  state.loading.add(rel);
+  state.errors.delete(rel);
+  if (rel === '') state.status = 'loading';
+  api.filesList({ sessionId: state.sessionId, path: rel }).then(result => {
+    state.entries.set(rel, result);
+    state.loading.delete(rel);
+    if (rel === '') state.status = 'ready';
+  }).catch(error => {
+    state.loading.delete(rel);
+    state.errors.set(rel, error?.message ?? '无法读取目录');
+    if (rel === '') state.status = 'error';
+  }).finally(() => {
+    if (rightbarOpen && activePane()?.activeId && rightbarTabs[activePane().activeId]?.kind === 'files') renderRightbar();
+  });
+}
+
+function filesRow(entry, depth) {
+  const row = el('button', 'files-row');
+  row.type = 'button';
+  row.style.paddingLeft = `${12 + depth * 16}px`;
+  row.dataset.kind = entry.kind;
+  row.dataset.path = entry.path;
+  if (entry.external) {
+    row.disabled = true;
+    row.title = '链接指向工作区外部，已拒绝访问';
+    row.dataset.external = 'true';
+  }
+  row.append(el('span', 'files-chevron'), el('span', 'files-icon'));
+  row.append(el('span', 'files-name', entry.name));
+  if (entry.symlink) row.append(el('span', 'files-tag', '链接'));
+  return row;
+}
+
+function filesTree(state, rel, depth, host, selectedPath = null) {
+  const listing = state.entries.get(rel);
+  if (!listing) {
+    if (state.loading.has(rel)) {
+      const loading = el('div', 'files-loading', '正在读取…');
+      loading.style.paddingLeft = `${12 + depth * 16}px`;
+      host.append(loading);
+    }
+    else if (state.errors.has(rel)) {
+      const error = el('div', 'files-error');
+      error.append(el('span', undefined, state.errors.get(rel)));
+      const retry = el('button', 'button ghost small', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', () => filesLoad(state, rel, { force: true }));
+      error.append(retry);
+      host.append(error);
+    }
+    return;
+  }
+  if (!listing.entries.length) {
+    const empty = el('div', 'files-empty-dir', '空目录');
+    empty.style.paddingLeft = `${12 + depth * 16}px`;
+    host.append(empty);
+  }
+  for (const entry of listing.entries) {
+    const row = filesRow(entry, depth);
+    const chevron = row.querySelector('.files-chevron');
+    const icon = row.querySelector('.files-icon');
+    if (entry.kind === 'directory') {
+      const open = state.expanded.has(entry.path);
+      chevron.append(iconNode(open ? 'chevronDown' : 'chevronRight', { size: 12 }));
+      icon.append(iconNode(open ? 'folderOpen' : 'folder', { size: 16 }));
+      row.setAttribute('aria-expanded', String(open));
+      if (!entry.external) row.addEventListener('click', () => {
+        if (state.expanded.has(entry.path)) state.expanded.delete(entry.path);
+        else {
+          state.expanded.add(entry.path);
+          filesLoad(state, entry.path);
+        }
+        renderRightbar();
+      });
+      host.append(row);
+      if (open && !entry.external) {
+        const children = el('div', 'files-children');
+        host.append(children);
+        if (!state.entries.has(entry.path)) filesLoad(state, entry.path);
+        filesTree(state, entry.path, depth + 1, children, selectedPath);
+      }
+    } else {
+      chevron.hidden = true;
+      icon.append(fileIcon(entry.path));
+      row.classList.toggle('selected', entry.path === selectedPath);
+      if (!entry.external) row.addEventListener('click', () => openPreviewForPath(entry.path, entry.name));
+      host.append(row);
+    }
+  }
+  if (listing.truncated) host.append(el('div', 'files-note', `目录条目过多，仅显示前 ${listing.entries.length} 项。`));
+}
+
 function filesView() {
   const view = el('div', 'files-view');
-  const path = current?.session.repository ?? '';
+  const session = current?.session;
+  const path = session?.repository ?? '';
   const toolbar = el('div', 'view-toolbar');
   const pathNode = el('div', 'toolbar-path');
   if (path) {
@@ -4794,24 +4973,37 @@ function filesView() {
     pathNode.append(document.createTextNode(path.slice(0, path.length - last.length)), el('strong', undefined, last));
   } else pathNode.textContent = '未选择工作区';
   pathNode.title = path;
-  const refresh = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
-  refresh.disabled = true;
+  const refresh = iconButton('refresh', '刷新文件列表', { size: 15, tooltip: '刷新文件列表' });
   const open = el('div', 'open-in-app-pane');
   toolbar.append(pathNode, refresh, open);
   renderOpenInAppInto(open, path, 'directory');
-  const body = el('div', 'files-body');
-  if (!path) {
+  if (!session || !path) {
+    refresh.disabled = true;
     const state = el('div', 'files-empty');
     state.append(el('div', undefined, '当前会话没有工作区。先选择一个本地文件夹。'));
     const choose = el('button', 'button secondary small', '选择工作区');
     choose.type = 'button';
     choose.addEventListener('click', () => $('workspace-picker').click());
     state.append(choose);
-    body.append(state);
+    view.append(toolbar, state);
+    return view;
+  }
+  const tree = filesStateFor(session);
+  refresh.addEventListener('click', () => filesRefresh(tree));
+  if (tree.status === 'idle') filesLoad(tree, '');
+  const body = el('div', 'files-body');
+  if (tree.status === 'loading' || tree.status === 'idle') {
+    body.append(el('div', 'files-loading', '正在读取目录…'));
+  } else if (tree.status === 'error') {
+    const error = el('div', 'files-error');
+    error.append(el('span', undefined, tree.errors.get('') ?? '无法读取工作区'));
+    const retry = el('button', 'button secondary small', '重试');
+    retry.type = 'button';
+    retry.addEventListener('click', () => filesRefresh(tree));
+    error.append(retry);
+    body.append(error);
   } else {
-    const note = el('div', 'files-note');
-    note.append(el('span', undefined, '桌面桥接没有目录读取接口，无法列出真实文件树。'));
-    body.append(note);
+    filesTree(tree, '', 0, body);
   }
   view.append(toolbar, body);
   return view;
@@ -5272,10 +5464,37 @@ function previewCodeBody(content, path) {
   return wrap;
 }
 
+function previewIsText(renderer) {
+  return ['markdown', 'code', 'text'].includes(renderer);
+}
+
+async function loadPreview(tab, { force = false } = {}) {
+  const sessionId = current?.session?.id;
+  if (!tab || tab.kind !== 'preview' || !sessionId || !previewIsText(tab.renderer)) return;
+  if (tab.loading) return;
+  if (!force && tab.content !== undefined && tab.loadedPath === tab.path) return;
+  tab.loading = true;
+  tab.error = null;
+  if (rightbarOpen) renderRightbar();
+  try {
+    const result = await api.filesRead({ sessionId, path: tab.path });
+    tab.content = result.text;
+    tab.truncated = result.truncated === true;
+    tab.loadedPath = tab.path;
+    tab.loading = false;
+  } catch (error) {
+    tab.loading = false;
+    tab.error = error?.message ?? '无法读取文件';
+  }
+  if (rightbarOpen) renderRightbar();
+}
+
 function openPreviewForPath(path, title = null) {
   if (!path) return null;
   const renderers = previewRenderers(path);
-  return openRightbarTab('preview', { path, title: title ?? String(path).split(/[\\/]/).pop() ?? '预览', renderer: renderers[0].id, renderers });
+  const tab = openRightbarTab('preview', { path, title: title ?? String(path).split(/[\\/]/).pop() ?? '预览', renderer: renderers[0].id, renderers, content: undefined, error: null, loadedPath: undefined });
+  void loadPreview(tab);
+  return tab;
 }
 
 function previewView(tab) {
@@ -5296,23 +5515,39 @@ function previewView(tab) {
   renderer.title = selected.label;
   renderer.addEventListener('click', () => openMenu({
     anchor: renderer, width: 180, align: 'end',
-    items: renderers.map(item => ({ label: item.label, checked: item.id === selected.id, onSelect: () => { tab.renderer = item.id; persistRightbar(); renderRightbar(); } })),
+    items: renderers.map(item => ({ label: item.label, checked: item.id === selected.id, onSelect: () => { tab.renderer = item.id; persistRightbar(); renderRightbar(); void loadPreview(tab); } })),
   }));
   const wrap = iconButton('wrap', '自动换行', { size: 15, tooltip: tab.wrap ? '关闭自动换行' : '自动换行' });
   wrap.setAttribute('aria-pressed', String(!!tab.wrap));
   wrap.addEventListener('click', () => { tab.wrap = !tab.wrap; persistRightbar(); renderRightbar(); });
   const reload = iconButton('refresh', '重新读取文件', { size: 15, tooltip: '重新读取文件' });
-  reload.addEventListener('click', () => toast('桌面桥接没有文件读取接口', { tone: 'info', holdMs: 2400 }));
+  reload.disabled = !previewIsText(selected.id);
+  reload.addEventListener('click', () => void loadPreview(tab, { force: true }));
   const open = el('div', 'open-in-app-pane');
   toolbar.append(pathNode, renderer, wrap, reload, open);
   renderOpenInAppInto(open, path, 'file');
   const body = el('div', `preview-body${tab.wrap ? ' wrap' : ''}`);
-  if (tab.loading) {
-    body.append(el('div', 'review-status', '文档渲染中…'));
-  } else if (tab.error) {
-    const status = el('div', 'review-status error', tab.error);
-    body.append(status);
-  } else if (tab.content) {
+  if (!previewIsText(selected.id)) {
+    const empty = el('div', 'right-empty');
+    const mark = el('span', 'empty-icon'); mark.append(iconNode('file', { size: 48, stroke: 1.1 }));
+    empty.append(mark, el('h3', undefined, `${selected.label} 预览尚未接入`), el('p', undefined, '当前只读文件桥接仅提供 UTF-8 文本；图片、PDF、Office 等格式请用系统应用打开。'));
+    const openHost = el('div', 'open-in-app-unpreviewable');
+    empty.append(openHost);
+    renderOpenInAppInto(openHost, path, 'file');
+    body.append(empty);
+  } else if (tab.loading || tab.content === undefined) {
+    if (!tab.loading && !tab.error) void loadPreview(tab);
+    body.append(el('div', 'review-status', tab.error ? '' : '正在读取文件…'));
+    if (tab.error) {
+      const status = el('div', 'review-status error');
+      status.append(el('span', undefined, tab.error));
+      const retry = el('button', 'button secondary small', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', () => void loadPreview(tab, { force: true }));
+      status.append(retry);
+      body.replaceChildren(status);
+    }
+  } else {
     if (selected.id === 'markdown') {
       const markdown = el('div', 'markdown');
       renderMarkdown(markdown, tab.content, { onLink: openMessageLink });
@@ -5320,14 +5555,7 @@ function previewView(tab) {
       body.append(markdown);
     } else if (selected.id === 'code') body.append(previewCodeBody(tab.content, path));
     else body.append(el('pre', undefined, tab.content));
-  } else {
-    const empty = el('div', 'right-empty');
-    const mark = el('span', 'empty-icon'); mark.append(iconNode('file', { size: 48, stroke: 1.1 }));
-    empty.append(mark, el('h3', undefined, '文件预览尚未接入'), el('p', undefined, '桌面桥接没有文件读取接口，无法在应用内安全打开工作区文件。'));
-    const openHost = el('div', 'open-in-app-unpreviewable');
-    empty.append(openHost);
-    renderOpenInAppInto(openHost, path, 'file');
-    body.append(empty);
+    if (tab.truncated) body.append(el('div', 'preview-truncated', '文件超过 1 MiB，仅显示开头 1 MiB。'));
   }
   view.append(toolbar, body);
   return view;

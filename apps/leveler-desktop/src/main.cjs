@@ -13,14 +13,35 @@ const { RecentWorkspaceSelection,taskListOptions }=require('./workspace-selectio
 const { AttachmentIngress }=require('./attachment-ingress.cjs');
 const { copyText }=require('./clipboard-write.cjs');
 const { settingsMenuItem }=require('./settings-menu.cjs');
+const { WorkspaceFiles }=require('./workspace-files.cjs');
 protocol.registerSchemesAsPrivileged([{scheme:'leveler-desktop',privileges:{standard:true,secure:true,supportFetchAPI:true}}]);
 let window,bridge,browser;const folders=new Map();
 let quitApproved=false,quitPromptOpen=false,quitInspection=null;
 let selectedSource=null;
 const allowedRoots=new Set();
+const sessionRoots=new Map();
 const appIcons=new Map();
 function addRoot(value){if(typeof value!=='string'||!value||value.length>4096)return;try{allowedRoots.add(realpathSync(value));}catch{/* a missing root is not an authorized path */}}
-function trackSnapshot(snapshot){if(snapshot&&typeof snapshot.repository==='string')addRoot(snapshot.repository);}
+function trackSnapshot(snapshot){
+  if(!snapshot||typeof snapshot.repository!=='string')return;
+  addRoot(snapshot.repository);
+  if(typeof snapshot.id==='string'){
+    try{sessionRoots.set(snapshot.id,realpathSync(snapshot.repository));}catch{/* a missing root grants no files */}
+  }
+}
+let fileRequests=0;
+const MAX_FILE_REQUESTS=4;
+function withFileSlot(action){
+  if(fileRequests>=MAX_FILE_REQUESTS)return Promise.reject(new Error('文件读取繁忙，请稍后重试'));
+  fileRequests+=1;
+  return Promise.resolve().then(action).finally(()=>{fileRequests-=1;});
+}
+function workspaceFiles(sessionId){
+  if(typeof sessionId!=='string'||!sessionId)throw new Error('Invalid session');
+  const root=sessionRoots.get(sessionId);
+  if(!root)throw new Error('当前会话没有可读取的工作区');
+  return new WorkspaceFiles({root});
+}
 async function appIcon(bundle){if(appIcons.has(bundle))return appIcons.get(bundle);let icon=null;try{const image=await app.getFileIcon(bundle,{size:'small'});if(!image.isEmpty())icon=image.toDataURL();}catch{}appIcons.set(bundle,icon);return icon;}
 const attachments=new AttachmentIngress({pickFile:async()=>{const result=await dialog.showOpenDialog(window,{title:'上传附件',properties:['openFile']});return result.canceled?null:result.filePaths[0]??null;},deliver:envelope=>bridge.request('deliver',{envelope})});
 function attachmentSession(snapshot){if(selectedSource&&snapshot?.id)attachments.activate({sourceId:selectedSource,sessionId:snapshot.id,vision:snapshot.vision===true});}
@@ -88,6 +109,16 @@ app.whenReady().then(async()=>{
       reject(new Error(error?.killed?'检查更新超时':'检查更新失败'));
     });
   }));
+  handle('desktop:files-list',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid file request');
+    if(Object.keys(request).some(key=>!['sessionId','path'].includes(key)))throw new Error('Invalid file request');
+    return withFileSlot(()=>workspaceFiles(request.sessionId).list(request.path??''));
+  });
+  handle('desktop:files-read',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid file request');
+    if(Object.keys(request).some(key=>!['sessionId','path'].includes(key)))throw new Error('Invalid file request');
+    return withFileSlot(()=>workspaceFiles(request.sessionId).read(request.path));
+  });
   handle('desktop:copy-text',value=>copyText(value,clipboard));
   handle('desktop:open-external',async value=>{const url=new URL(text(value,'url'));if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('Invalid external URL');await shell.openExternal(url.href);return {ok:true};});
   handle('desktop:open-config',async()=>{const base=process.env.LEVELER_HOME??path.join(os.homedir(),'.leveler');const file=path.join(base,'config.toml');if(!existsSync(file))throw new Error('配置文件不存在');const error=await shell.openPath(file);if(error)throw new Error(error);return {ok:true};});

@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   onQuitInspect:callback=>{const listener=()=>callback();ipcRenderer.on('desktop:quit-inspect',listener);return ()=>ipcRenderer.removeListener('desktop:quit-inspect',listener);},
   quitInspectResult:running=>ipcRenderer.send('desktop:quit-inspect-result',{running:running===true}),
   copyText:text=>ipcRenderer.invoke('desktop:copy-text',text),
+  filesList:request=>ipcRenderer.invoke('desktop:files-list',request),
+  filesRead:request=>ipcRenderer.invoke('desktop:files-read',request),
   openExternal:url=>ipcRenderer.invoke('desktop:open-external',url),
   openConfig:()=>ipcRenderer.invoke('desktop:open-config'),
   openInAppApps:()=>ipcRenderer.invoke('desktop:open-in-app-apps'),
