@@ -198,3 +198,23 @@ test('desktop never carries raw reasoning (Contract v1 §I5)', () => {
   assert.equal(state.messages.length, 0);
   assert.equal('reasoningText' in state, false);
 });
+
+test('cancelling keeps an unfinished reasoning segment as an interrupted Thought', () => {
+ let state = projectSnapshot({ ...DEFAULT_SNAPSHOT, status: 'running' }, []);
+ state = applyEvent(state, { type: 'reasoning_started' });
+ state = applyEvent(state, { type: 'reasoning_delta', delta: 'half a thought' });
+ state = applyEvent(state, { type: 'turn_cancelled' });
+ assert.equal(state.thoughts.length, 1);
+ assert.equal(state.thoughts[0].text, 'half a thought');
+ assert.equal(state.thoughts[0].interrupted, true);
+ assert.equal(state.reasoning, '');
+});
+
+import { retainInterruptedThoughts } from '../src/state.mjs';
+test('a resync keeps the live interrupted Thought durable history omitted', () => {
+ const prior = { thoughts: [{ id: 'live', text: 'partial', elapsedMs: 0, interrupted: true, anchor: 'u1', seq: 7 }] };
+ const next = { thoughts: [{ id: 'done', text: 'settled', elapsedMs: 900, interrupted: false, anchor: 'u1', seq: 2 }] };
+ const merged = retainInterruptedThoughts(next, prior);
+ assert.deepEqual(merged.thoughts.map((thought) => thought.text), ['settled', 'partial']);
+ assert.equal(retainInterruptedThoughts(merged, prior).thoughts.length, 2);
+});
