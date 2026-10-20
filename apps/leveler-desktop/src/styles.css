@@ -2529,3 +2529,47 @@ body.home #permission {
   font-size: 11px;
   color: var(--muted);
 }
+
+/* Interim narration is process prose, not an answer: one step down the ink
+   ladder, inside the turn's process stream, with the live cursor the terminal
+   uses. */
+.message.assistant.assistant-progress {
+  display: flex;
+  gap: 9px;
+  max-width: none;
+  margin: 6px 0 12px 20px;
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
+.assistant-progress .progress-mark {
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 24px;
+  opacity: 0.7;
+}
+.assistant-progress .body {
+  min-width: 0;
+  flex: 1;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.7;
+}
+.message.assistant.assistant-progress .body p {
+  margin: 0 0 10px;
+}
+.message.assistant.assistant-progress .body h1,
+.message.assistant.assistant-progress .body h2,
+.message.assistant.assistant-progress .body h3,
+.message.assistant.assistant-progress .body h4,
+.message.assistant.assistant-progress .body h5,
+.message.assistant.assistant-progress .body h6 {
+  color: var(--muted);
+  font-size: 16px;
+  margin: 16px 0 8px;
+}
+.assistant-progress.streaming .body::after {
+  content: '▌';
+  color: var(--muted);
+  margin-left: 2px;
+}

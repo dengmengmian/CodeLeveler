@@ -20,7 +20,10 @@ export async function provider(){
    }
    const completed=(body.messages??[]).filter(message=>message.role==='tool').length;
    let delta,finish;
-   if(completed===0){if(!names.includes('read_file'))throw new Error('Agent request does not expose read_file');delta={role:'assistant',tool_calls:[{index:0,id:'fixture-read',type:'function',function:{name:'read_file',arguments:JSON.stringify({path:'fixture.txt'})}}]};finish='tool_calls';}
+   if(completed===0){if(!names.includes('read_file'))throw new Error('Agent request does not expose read_file');delta={role:'assistant',tool_calls:[{index:0,id:'fixture-read',type:'function',function:{name:'read_file',arguments:JSON.stringify({path:'fixture.txt'})}}]};finish='tool_calls';
+   // The interactions lane also proves interim narration is process prose;
+   // a marker keeps every other fixture scenario unchanged.
+   if(userText.includes('fixture-interactions')){response.writeHead(200,{'content-type':'text/event-stream'});const chunk=(d,f)=>({id:'fixture',object:'chat.completion.chunk',created:1,model:'fixture-model',choices:[{index:0,delta:d,finish_reason:f}]});response.write('data: '+JSON.stringify(chunk({role:'assistant',content:'fixture-interim-narration'},null))+'\n\n');response.write('data: '+JSON.stringify(chunk(delta,null))+'\n\n');response.write('data: '+JSON.stringify(chunk({},finish))+'\n\n');response.end('data: [DONE]\n\n');return;}}
    else if(completed===1){const name=names.includes('run_command')?'run_command':'shell_command';if(!names.includes(name))throw new Error('Agent request does not expose command tool');// A literal relative deletion inside the workspace auto-runs under Assisted;
 // the glob is not a literal path and therefore exercises the real approval
 // path this fixture exists to test.

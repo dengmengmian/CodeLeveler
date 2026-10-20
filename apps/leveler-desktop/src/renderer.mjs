@@ -1,5 +1,5 @@
 import {renderMarkdown} from './markdown.mjs';
-import {modelLabel,workspaceLabel,toolLabel,toolTarget,browserActivity,sourceErrorSummary,relativeActivity,permissionLabel,recentWorkspaces,filterTasks,taskSearchResults,renameCommand,conversationMatches,messageKind,messageRoleLabel,historyQuestions,planStepLabel,availableWorkbenchViews,browserTabIndex,browserChrome,browserSurfaceBounds,focusWorkbenchEntry,retainBrowserAddressOnBlur,workspaceTaskGroups,attachmentErrorPresentation,focusRestoreIndex,slashIntent,commandCandidates,activateSettingsShortcut,groupExecutionRounds,roundGlyph,roundHeadline,contractToolStatus,failureReason,displayPreview,confirmedDiffOf,diffCounts,foldedThoughts,explorationEntries,turnBlocks} from './presentation.mjs';
+import {modelLabel,workspaceLabel,toolLabel,toolTarget,browserActivity,sourceErrorSummary,relativeActivity,permissionLabel,recentWorkspaces,filterTasks,taskSearchResults,renameCommand,conversationMatches,messageKind,messageRoleLabel,historyQuestions,planStepLabel,availableWorkbenchViews,browserTabIndex,browserChrome,browserSurfaceBounds,focusWorkbenchEntry,retainBrowserAddressOnBlur,workspaceTaskGroups,attachmentErrorPresentation,focusRestoreIndex,slashIntent,commandCandidates,activateSettingsShortcut,groupExecutionRounds,roundGlyph,roundHeadline,contractToolStatus,failureReason,displayPreview,confirmedDiffOf,diffCounts,foldedThoughts,explorationEntries,turnBlocks,thoughtDuration} from './presentation.mjs';
 import {projectSnapshot,applySessionMetadata,applyEvent,commandEnvelope,terminalEvents,approvalDecisions,clarificationAnswer,uploadDraft,applyUploadEvent,reconcileUploadReply,workspaceDraftText,attachmentSubmissionError,permissionCommand,permissionConfirmed,workbenchLayout,beginDiffQuery,expireDiffQuery,beginReadQuery,applyReadResult,expireReadQuery} from './state.mjs';
 const api=window.desktop;
 document.documentElement.dataset.platform=api.platform==='darwin'?'darwin':api.platform==='win32'?'win32':'linux';
@@ -93,35 +93,74 @@ function draftKey(){return current?.session.id??'new-task';}
 function stashDraft(){drafts.set(draftKey(),$('message').value);}
 async function refreshTasks(){const index=await api.listTasks();tasks=index.tasks;sourceErrors=index.source_errors??[];renderTasks();renderFilterMenu();if($('search-dialog').open)renderSearchResults();if(index.source_errors?.length){const summary=sourceErrorSummary(index.source_errors);const banner=$('error');banner.replaceChildren(el('div',summary.summary));const details=el('details',undefined,'source-errors');details.append(el('summary','查看错误详情'));for(const item of summary.details)details.append(el('p',`${item.count} 个来源：${item.message}`));banner.append(details);banner.hidden=false;}}
 function runningLabel(){const seconds=runStartedAt?Math.floor((Date.now()-runStartedAt)/1000):0;return seconds>=1?`正在深入 \u00b7 ${seconds}s`:'正在深入\u2026';}
+function messageRow(existing,message){
+ const key='message:'+message.id;let row=existing.get(key);if(!row){row=el('article',undefined,`message ${message.role} ${message.kind??''}`);row.dataset.key=key;row.dataset.messageId=message.id;row.append(el('div',messageRoleLabel(message),'role'),el('div','','body'));}row.className=`message ${message.role} ${message.kind??''} presentation-${messageKind(message)}`;const body=row.querySelector('.body');if(renderedSources.get(body)!==message.text){renderedSources.set(body,message.text);if(messageKind(message)==='assistant'){renderMarkdown(body,message.text,{onLink:url=>openMessageLink(url)});addCodeActions(body);}else body.textContent=message.text;}decorateMessage(row,message);return row;
+}
+/** Interim narration: process prose, subordinate to the answer (TUI contract). */
+function progressNode(existing,message,streaming){
+ const key='progress:'+message.id;let node=existing.get(key);
+ if(!node){node=el('div',undefined,'message assistant assistant-progress');node.dataset.key=key;node.dataset.messageId=message.id;node.append(el('span','●','progress-mark'),el('div','','body'));}
+ node.classList.toggle('streaming',!!streaming);
+ const body=node.querySelector('.body');if(renderedSources.get(body)!==message.text){renderedSources.set(body,message.text);renderMarkdown(body,message.text,{onLink:url=>openMessageLink(url)});addCodeActions(body);}
+ return node;
+}
 function renderConversation(){
  const list=$('conversation'),nearBottom=list.scrollHeight-list.scrollTop-list.clientHeight<100;
  document.body.classList.toggle('home',!current||(!current.messages.length&&!current.tools.length&&!current.approvals.length&&!current.clarifications.length));document.body.classList.toggle('has-session',!!current);
  if(!current){list.replaceChildren();return;}
- const existing=new Map([...list.children].filter(n=>n.dataset.key).map(n=>[n.dataset.key,n]));const nodes=[];
- for(const message of current.messages){const key='message:'+message.id;let row=existing.get(key);if(!row){row=el('article',undefined,`message ${message.role} ${message.kind??''}`);row.dataset.key=key;row.dataset.messageId=message.id;row.append(el('div',messageRoleLabel(message),'role'),el('div','','body'));}row.className=`message ${message.role} ${message.kind??''} presentation-${messageKind(message)}`;const body=row.querySelector('.body');if(renderedSources.get(body)!==message.text){renderedSources.set(body,message.text);if(messageKind(message)==='assistant'){renderMarkdown(body,message.text,{onLink:url=>openMessageLink(url)});addCodeActions(body);}else body.textContent=message.text;}decorateMessage(row,message);nodes.push(row);}
- if(current.tools.length||(current.thoughts??[]).length||(current.reasoning??'').trim()!==''){const rounds=groupExecutionRounds(current.tools);const blocks=turnBlocks(foldedThoughts(current.thoughts??[]),rounds);const placed=[];
- // ONE ordered process stream per turn: Thoughts, exploration receipts and the
- // rounds that ran between them, in arrival order — the same semantic tree the
- // terminal and the Web client project. One group PER TURN, placed by the
- // anchor its rows carry, so a reopened conversation keeps every turn's
- // Thoughts and rounds where that turn ran.
- const groups=new Map();
- const groupFor=(anchor)=>{const key=anchor??'(tail)';if(!groups.has(key))groups.set(key,{anchor,nodes:[]});return groups.get(key);};
- for(const block of blocks){
-  if(block.kind==='thought'){groupFor(block.thought.anchor).nodes.push(thoughtNode(existing,block.thought));continue;}
-  if(block.kind==='receipt'){groupFor(block.receipt.anchor).nodes.push(receiptNode(existing,block.receipt,block.thoughts));continue;}
-  groupFor(block.round.tools[0].anchor).nodes.push(roundNode(existing,block.round));
- }
+ // Reuse every keyed node, including Thought/tool/receipt rows nested in a
+ // process stream, so an opened disclosure survives the next live event.
+ const existing=new Map([...list.querySelectorAll('[data-key]')].map(n=>[n.dataset.key,n]));const nodes=[];
+ // A user message starts a turn. Every process row (Thought, narration,
+ // receipt, round) belongs to its turn, so one turn has ONE ordered process
+ // stream — never one "执行过程" heading per assistant message.
+ const userTurns=[];for(const message of current.messages)if(messageKind(message)==='user')userTurns.push({id:message.id,seq:message.seq??0});
+ const seqOf=new Map(current.messages.map(message=>[message.id,message.seq??0]));
+ const turnOf=(anchor,seq)=>{let at=anchor!=null?seqOf.get(anchor):undefined;if(at===undefined)at=seq??0;let index=-1;for(let i=0;i<userTurns.length;i++){if(userTurns[i].seq<=at)index=i;else break;}return index;};
+ const buckets=new Map();
+ const bucketFor=index=>{if(!buckets.has(index))buckets.set(index,{index,anchorId:index>=0?userTurns[index].id:null,thoughts:[],rounds:[],narration:[],live:null});return buckets.get(index);};
+ for(const thought of foldedThoughts(current.thoughts??[]))bucketFor(turnOf(thought.anchor,thought.seq)).thoughts.push(thought);
+ for(const round of groupExecutionRounds(current.tools)){const first=round.tools[0];bucketFor(turnOf(first.anchor,first.seq)).rounds.push(round);}
+ const turnOfMessage=new Map();let messageTurn=-1;
+ for(const message of current.messages){if(messageKind(message)==='user')messageTurn++;turnOfMessage.set(message.id,messageTurn);}
  const liveText=(current.reasoning??'').trim();
- if(liveText!==''){let live=existing.get('thought:live');if(!live){live=el('div',undefined,'thought live');live.dataset.key='thought:live';live.append(el('div',undefined,'thought-head'),el('div',undefined,'thought-body'));}live.querySelector('.thought-head').textContent='\u25c6 思考中\u2026';live.querySelector('.thought-body').textContent=current.reasoning;groupFor(null).nodes.push(live);}
- for(const group of groups.values()){
-  let host=existing.get('process:'+(group.anchor??'(tail)'));if(!host){host=el('div','执行过程','progress-label');host.dataset.key='process:'+(group.anchor??'(tail)');}
-  const stale=[...host.children].filter(child=>!group.nodes.includes(child));for(const child of stale)child.remove();
-  for(const child of group.nodes){if(child.parentNode!==host)host.append(child);}
-  placed.push({host,anchor:group.anchor??undefined});
+ const currentTurn=userTurns.length?userTurns.length-1:-1;
+ if(liveText!=='')bucketFor(currentTurn);
+ // Assistant prose followed by work is narration, not an answer. The runtime
+ // stamps `final` on the committed answer; everything else with text is
+ // progress and belongs inside this turn's process stream.
+ const demoted=new Set();
+ for(const message of current.messages){
+  if(messageKind(message)!=='assistant'||message.final===true||String(message.text??'').trim()==='')continue;
+  const index=turnOfMessage.get(message.id)??-1,bucket=bucketFor(index);
+  if(bucket.thoughts.length>0||bucket.rounds.length>0||(liveText!==''&&index===currentTurn)){bucket.narration.push(message);demoted.add(message.id);}
  }
- const anchors=new Map();
- for(const {host,anchor} of placed){const anchorNode=anchors.get(anchor)??nodes.find(n=>n.dataset.messageId===anchor);const position=anchorNode?nodes.indexOf(anchorNode)+1:nodes.length;nodes.splice(position,0,host);anchors.set(anchor,host);}}
+ for(const message of current.messages){
+  if(demoted.has(message.id))continue;
+  // An assistant message with no public prose is not a visible answer row.
+  if(messageKind(message)==='assistant'&&String(message.text??'').trim()==='')continue;
+  nodes.push(messageRow(existing,message));
+ }
+ const placed=[];const lastIndex=buckets.size?Math.max(...buckets.keys()):-1;
+ for(const [index,bucket] of [...buckets.entries()].sort((a,b)=>a[0]-b[0])){
+  if(index===lastIndex&&liveText!==''){let live=existing.get('thought:live');if(!live){live=el('div',undefined,'thought live');live.dataset.key='thought:live';live.append(el('div',undefined,'thought-head'),el('div',undefined,'thought-body'));}live.querySelector('.thought-head').textContent='◆ 思考中…';live.querySelector('.thought-body').textContent=current.reasoning;bucket.live=live;}
+  const blocks=turnBlocks(bucket.thoughts,bucket.rounds);
+  const items=[...blocks,...bucket.narration.map(message=>({kind:'narration',message,seq:message.seq??0}))].sort((a,b)=>(a.seq??0)-(b.seq??0));
+  if(!items.length&&!bucket.live)continue;
+  const hostKey='process:turn:'+(bucket.anchorId??'(tail)');let host=existing.get(hostKey);if(!host){host=el('div','执行过程','progress-label');host.dataset.key=hostKey;}
+  const children=[];
+  for(const item of items){
+   if(item.kind==='thought')children.push(thoughtNode(existing,item.thought));
+   else if(item.kind==='receipt')children.push(receiptNode(existing,item.receipt,item.thoughts));
+   else if(item.kind==='round')children.push(roundNode(existing,item.round));
+   else if(item.kind==='narration')children.push(progressNode(existing,item.message,current.streamingMessageId===item.message.id));
+  }
+  if(bucket.live)children.push(bucket.live);
+  const stale=[...host.children].filter(child=>!children.includes(child));for(const child of stale)child.remove();
+  for(const child of children)if(child.parentNode!==host)host.append(child);
+  placed.push({host,anchorId:bucket.anchorId});
+ }
+ for(const {host,anchorId} of placed){const anchorNode=anchorId?nodes.find(node=>node.dataset.messageId===anchorId):null;const position=anchorNode?nodes.indexOf(anchorNode)+1:nodes.length;nodes.splice(position,0,host);}
  // Running truth stays visible even before the next streamed token arrives:
  // a shimmering, timed status row (never a bare spinner).
  const running=!!current&&current.status==='running';
@@ -161,7 +200,6 @@ async function openMessageLink(url){try{browserData=await api.browserCommand({ty
 function thoughtNode(existing,thought){const key='thought:'+thought.id;let node=existing.get(key);if(!node){node=el('details',undefined,'thought');node.dataset.key=key;node.dataset.thoughtId=thought.id;node.append(el('summary'),el('div',undefined,'thought-body'));}node.querySelector('summary').textContent=`\u25c6 思考 · ${thoughtDuration(thought.elapsedMs)}`;node.querySelector('.thought-body').textContent=thought.body;return node;}
 
 /** `0.1s`-style duration, the same shape the reference paints. @param {number} elapsedMs */
-export function thoughtDuration(elapsedMs){if(elapsedMs<1000)return '<0.1s';const seconds=elapsedMs/1000;return seconds<10?`${seconds.toFixed(1)}s`:`${Math.round(seconds)}s`;}
 
 /**
  * One reversible exploration receipt: collapsed it stands in for its members,
@@ -384,7 +422,10 @@ function initProductUI(){
 
  initSettingsCommands();setTheme(saved('theme','system'));$('theme').addEventListener('change',e=>setTheme(e.target.value));matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(saved('theme','system')==='system')setTheme('system');});
  let sidebarNarrow=innerWidth<1024,narrowSidebarOpen=false;
- const wideSidebarCollapsed=()=>saved('sidebar-collapsed','false')==='true';
+ // The wide preference lives in memory and is persisted best-effort: a failed
+ // localStorage write must not strand the rail collapsed with no way back.
+ let wideSidebarHidden=saved('sidebar-collapsed','false')==='true';
+ const wideSidebarCollapsed=()=>wideSidebarHidden;
  /** Publish the one sidebar truth (the body class) to the toggle and compact rail. */
  function syncSidebarChrome(){const hidden=document.body.classList.contains('sidebar-collapsed'),toggle=$('sidebar-toggle');toggle.dataset.tooltip=hidden?'打开侧边栏':'收起侧边栏';toggle.setAttribute('aria-label',toggle.dataset.tooltip);toggle.setAttribute('aria-expanded',String(!hidden));$('compact-new-task').hidden=!hidden||document.documentElement.dataset.platform!=='darwin';$('compact-new-task').disabled=$('new-task').disabled;for(const node of $('sidebar').children)if(!node.classList.contains('sidebar-top-strip'))node.inert=hidden;}
  /** macOS: narrow defaults to fully hidden; wide applies the persisted wide preference. */
@@ -399,21 +440,29 @@ function initProductUI(){
  const toggleSidebar=()=>{
   if(document.documentElement.dataset.platform!=='darwin'){document.body.classList.toggle('sidebar-collapsed');save('sidebar-collapsed',document.body.classList.contains('sidebar-collapsed'));syncSidebarChrome();layoutWorkbench();return;}
   const opening=document.body.classList.contains('sidebar-collapsed');
-  if(sidebarNarrow)narrowSidebarOpen=!narrowSidebarOpen;else save('sidebar-collapsed',String(!opening));
+  if(sidebarNarrow)narrowSidebarOpen=!narrowSidebarOpen;else{wideSidebarHidden=!opening;save('sidebar-collapsed',String(wideSidebarHidden));}
   if(opening&&sidebarNarrow)closeWorkbench();
   applySidebar();
   if(!document.body.classList.contains('sidebar-collapsed'))$('sidebar-toggle').focus();
  };
  if(document.documentElement.dataset.platform==='darwin')applySidebar();else{document.body.dataset.sidebarBand=sidebarNarrow?'narrow':'wide';document.body.classList.toggle('sidebar-collapsed',saved('sidebar-collapsed','false')==='true'||innerWidth<1024);syncSidebarChrome();}
  $('sidebar-toggle').addEventListener('click',toggleSidebar);$('compact-new-task').addEventListener('click',()=>$('new-task').click());
+ // The collapsed strip is fixed outside a zero-width sidebar. If the platform
+ // reports the press on the shell instead of the button, the button's own
+ // handler never runs; recover the same intent from the button's screen area.
+ document.addEventListener('click',event=>{
+  if(!document.body.classList.contains('sidebar-collapsed')||event.target.closest?.('#sidebar-toggle'))return;
+  const rect=$('sidebar-toggle').getBoundingClientRect();
+  if(event.clientX>=rect.left&&event.clientX<=rect.right&&event.clientY>=rect.top&&event.clientY<=rect.bottom)toggleSidebar();
+ },true);
  const savedWorkbenchWidth=Number(saved('workbench-width',''));workbenchWidth=Number.isFinite(savedWorkbenchWidth)&&savedWorkbenchWidth>0?savedWorkbenchWidth:null;
  $('workbench-toggle').addEventListener('click',()=>workbenchOpen?closeWorkbench():openWorkbench());$('workbench-close').addEventListener('click',closeWorkbench);$('workbench-backdrop').addEventListener('click',closeWorkbench);$('workbench-expand').addEventListener('click',toggleWorkbenchExpansion);$('workbench-overview').addEventListener('click',()=>openWorkbench('overview'));$('workbench-view').addEventListener('change',e=>openWorkbench(e.target.value));
  document.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)||!event.target.closest('#workbench-overview,#workbench-tabs [data-workbench-view],#browser-tabs [data-tab-id]'))return;event.preventDefault();const tabs=[$('workbench-overview'),...document.querySelectorAll('#workbench-tabs [data-workbench-view]'),...document.querySelectorAll('#browser-tabs [data-tab-id]')];const index=tabs.indexOf(document.activeElement),next=tabs[browserTabIndex(tabs.length,index,event.key)];next.focus();next.click();});
- document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&e.key.toLowerCase()==='n'){e.preventDefault();$('new-task').click();}if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='b'){e.preventDefault();toggleSidebar();}if((e.metaKey||e.ctrlKey)&&e.shiftKey&&e.key.toLowerCase()==='i'){e.preventDefault();workbenchOpen?closeWorkbench():openWorkbench();}if(e.key==='Escape'&&workbenchOpen){e.preventDefault();if(workbenchExpanded)toggleWorkbenchExpansion();else closeWorkbench();}if(e.key==='Tab'&&workbenchOpen&&(workbenchExpanded||document.body.classList.contains('workbench-overlay'))){const focusable=[...$('workbench').querySelectorAll('button,input,select,[tabindex]')].filter(n=>!n.disabled&&n.getClientRects().length);const first=focusable[0],last=focusable.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}});
+ document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&e.key.toLowerCase()==='n'){e.preventDefault();$('new-task').click();}if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&e.key.toLowerCase()==='t'){e.preventDefault();if(api.browserState)browserCommand('new').then(ok=>{if(ok){openWorkbench('browser');$('browser-url').focus();}});}if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='b'){e.preventDefault();toggleSidebar();}if((e.metaKey||e.ctrlKey)&&e.shiftKey&&e.key.toLowerCase()==='i'){e.preventDefault();workbenchOpen?closeWorkbench():openWorkbench();}if(e.key==='Escape'&&workbenchOpen){e.preventDefault();if(workbenchExpanded)toggleWorkbenchExpansion();else closeWorkbench();}if(e.key==='Tab'&&workbenchOpen&&(workbenchExpanded||document.body.classList.contains('workbench-overlay'))){const focusable=[...$('workbench').querySelectorAll('button,input,select,[tabindex]')].filter(n=>!n.disabled&&n.getClientRects().length);const first=focusable[0],last=focusable.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}});
  const handle=$('resize-handle');handle.addEventListener('pointerdown',e=>{handle.setPointerCapture(e.pointerId);const start=e.clientX,width=$('workbench').getBoundingClientRect().width;const move=event=>{workbenchWidth=Math.max(300,Math.min(Math.round(innerWidth*0.7),width+start-event.clientX));layoutWorkbench();};const finish=()=>{handle.removeEventListener('pointermove',move);handle.removeEventListener('pointerup',finish);handle.removeEventListener('pointercancel',finish);workbenchWidth=Math.round($('workbench').getBoundingClientRect().width);save('workbench-width',workbenchWidth);};handle.addEventListener('pointermove',move);handle.addEventListener('pointerup',finish,{once:true});handle.addEventListener('pointercancel',finish,{once:true});});handle.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();workbenchWidth=Math.max(300,Math.min(Math.round(innerWidth*0.7),(workbenchWidth??Math.round(innerWidth*0.45))+(e.key==='ArrowLeft'?20:-20)));layoutWorkbench();workbenchWidth=Math.round($('workbench').getBoundingClientRect().width);save('workbench-width',workbenchWidth);}});
  window.addEventListener('resize',()=>{const narrow=innerWidth<1024;if(narrow!==sidebarNarrow){sidebarNarrow=narrow;narrowSidebarOpen=false;}document.body.dataset.sidebarBand=sidebarNarrow?'narrow':'wide';if(document.documentElement.dataset.platform==='darwin')applySidebar();else if(narrow&&!workbenchExpanded)document.body.classList.add('sidebar-collapsed');layoutWorkbench();});new ResizeObserver(scheduleBrowserSurface).observe($('browser-surface'));
  $('browser-url').addEventListener('input',()=>{browserURLDirty=true;});$('browser-url').addEventListener('blur',()=>{browserURLDirty=retainBrowserAddressOnBlur({dirty:browserURLDirty,rejected:browserCommandError?.tabId===browserData.selectedId&&!!browserCommandError?.address});if(!browserURLDirty){const tab=browserData.tabs.find(item=>item.id===browserData.selectedId);$('browser-url').value=tab?.url==='about:blank'?'':tab?.url??'';}});
- $('browser-new').addEventListener('click',async()=>{if(await browserCommand('new'))openWorkbench('browser');});$('browser-navigation').addEventListener('submit',e=>{e.preventDefault();const url=$('browser-url').value.trim();browserURLDirty=false;if(url)browserCommand(browserData.selectedId?'navigate':'new',{url});});for(const type of ['back','forward','reload','external'])$('browser-'+type).addEventListener('click',()=>browserCommand(type));
+ $('browser-new').addEventListener('click',async()=>{if(await browserCommand('new')){openWorkbench('browser');$('browser-url').focus();}});$('browser-navigation').addEventListener('submit',e=>{e.preventDefault();const url=$('browser-url').value.trim();browserURLDirty=false;if(url)browserCommand(browserData.selectedId?'navigate':'new',{url});});for(const type of ['back','forward','reload','external'])$('browser-'+type).addEventListener('click',()=>browserCommand(type));
  if(api.browserState){api.browserState().then(data=>{browserData=data;renderWorkbench();}).catch(err=>error(err.message));api.onBrowserState(data=>{browserData=data;if(!data.tabs.length&&workbenchView==='browser')workbenchView='overview';renderWorkbench();scheduleBrowserSurface();});}layoutWorkbench();
 }
 function commandCatalog(){const frozen=loading||!!uncertain||uploadPending(),session=!!current;return [['new','新建任务',true],['find','搜索对话',session],['rename','重命名任务',session],['diff','读取工作区变更',!!current?.session.repository],['agents','查看智能体目录',session],['memory','查看项目记忆',session],['context','查看上下文统计',session],['observability','查看运行观测',session],['settings','打开设置',true]].map(([id,label,available])=>({id,label,enabled:available&&!frozen,reason:frozen?'请先处理当前未完成操作':id==='diff'?'需要当前任务的工作空间':'请先选择或新建任务'}));}
@@ -429,7 +478,7 @@ function settingButton(parent,label,handler,id){const button=el('button',label);
 function renderSettings(){settingsRenderedOwner=settingsOwner();const nav=$('settings-nav'),content=$('settings-content');nav.replaceChildren();content.replaceChildren();const settingsIcons={appearance:'settings',session:'chat',agents:'bot',memory:'brain',context:'layers',observability:'pulse',archives:'archive',diagnostics:'wrench'};for(const [id,label] of settingsGroups){const button=el('button');button.type='button';button.dataset.settingsSection=id;button.setAttribute('aria-current',String(id===settingsSection));button.append(svgIcon(settingsIcons[id]??'settings'),el('span',label));button.addEventListener('click',()=>{settingsSection=id;renderSettings();$('settings-nav').querySelector(`[data-settings-section="${id}"]`)?.focus();});nav.append(button);}content.append(el('h2',settingsGroups.find(([id])=>id===settingsSection)?.[1]??'设置'));
  if(settingsSection==='appearance'){const card=settingCard('外观','跟随系统使用本机的明暗外观；选择浅色或深色会保存到当前桌面。');const select=el('select');select.id='settings-theme';select.className='settings-theme-select';select.setAttribute('aria-label','设置外观');for(const [value,label] of [['system','跟随系统'],['light','浅色'],['dark','深色']]){const option=el('option',label);option.value=value;select.append(option);}select.value=saved('theme','system');select.addEventListener('change',()=>setTheme(select.value));card.append(select);const group=el('div',undefined,'theme-choice');group.setAttribute('role','radiogroup');group.setAttribute('aria-label','外观');for(const [value,label,icon] of [['light','浅色','sun'],['dark','深色','moon'],['system','跟随系统','monitor']]){const button=el('button',undefined,'theme-choice-button');button.type='button';button.dataset.themeValue=value;button.setAttribute('role','radio');button.setAttribute('aria-checked',String(saved('theme','system')===value));button.append(svgIcon(icon),el('span',label));button.addEventListener('click',()=>{select.value=value;select.dispatchEvent(new Event('change'));for(const node of group.children)node.setAttribute('aria-checked',String(node===button));});group.append(button);}card.append(group);return;}
  if(settingsSection==='session'){const card=settingCard('当前任务');const facts=el('div');facts.id='settings-session-facts';card.append(facts);updateSettingsSession();for(const [label,id] of [['在会话中切换模型','model-picker'],['在会话中调整权限','permission']]){const button=settingButton(card,label,()=>{closeSettings();if(workbenchExpanded||document.body.classList.contains('workbench-overlay'))closeWorkbench();$(id).click();});button.dataset.sessionAction='true';button.disabled=!current||loading||!!uncertain||uploadPending();}return;}
- if(settingsSection==='diagnostics'){const card=settingCard('桌面与连接','数据来源读取失败会保留错误，不会当作成功。');card.append(el('p',`CodeLeveler ${$('desktop-version').textContent}`),el('p',$('status').textContent));if(sourceErrors.length){const summary=sourceErrorSummary(sourceErrors);card.append(el('p',summary.summary));for(const item of summary.details){const details=el('details');details.append(el('summary',`${item.count} 个来源读取失败`),el('pre',item.message));card.append(details);}}else card.append(el('p','最近一次任务索引读取未报告来源错误。'));settingCard('快捷键','⌘ / Ctrl + , 打开设置；⌘ / Ctrl + B 切换侧栏；⌘ / Ctrl + F 搜索当前对话；⌘ / Ctrl + Shift + I 切换工作台；Enter 发送；Shift + Enter 换行；/ 打开命令候选。');settingCard('技能目录','当前桌面尚不能读取独立技能目录。智能体定义里的技能声明不代表已安装技能清单。');return;}
+ if(settingsSection==='diagnostics'){const card=settingCard('桌面与连接','数据来源读取失败会保留错误，不会当作成功。');card.append(el('p',`CodeLeveler ${$('desktop-version').textContent}`),el('p',$('status').textContent));if(sourceErrors.length){const summary=sourceErrorSummary(sourceErrors);card.append(el('p',summary.summary));for(const item of summary.details){const details=el('details');details.append(el('summary',`${item.count} 个来源读取失败`),el('pre',item.message));card.append(details);}}else card.append(el('p','最近一次任务索引读取未报告来源错误。'));settingCard('快捷键','⌘ / Ctrl + , 打开设置；⌘ / Ctrl + B 切换侧栏；⌘ / Ctrl + F 搜索当前对话；⌘ / Ctrl + T 打开浏览器；⌘ / Ctrl + Shift + I 切换工作台；Enter 发送；Shift + Enter 换行；/ 打开命令候选。');settingCard('技能目录','当前桌面尚不能读取独立技能目录。智能体定义里的技能声明不代表已安装技能清单。');return;}
  if(settingsSection==='archives'){const card=settingCard('归档记录','仅查看及打开保留的会话记录；打开不会取消归档。');settingButton(card,'读取归档记录',readArchives,'settings-read-archives');card.append(el('div',undefined,'settings-results'));renderArchiveResults();return;}
  const descriptions={agents:'读取 Runtime 智能体定义及读取问题。定义中的技能声明不代表已安装技能目录。',memory:'查看 Runtime 返回的活动、归档及待确认记忆。读取可能包含 Runtime 的恢复处理；此页面不修改、批准或删除记忆。',context:'上次真实模型请求的上下文统计；估计 token 保持估计含义，不是实时费用或精确用量。',observability:'查看 Runtime 持久化的有限事件窗口与相关统计。'};const card=settingCard(settingsGroups.find(([id])=>id===settingsSection)?.[1],descriptions[settingsSection]);const button=settingButton(card,'读取最新数据',()=>readSettings(settingsSection),'settings-read');button.dataset.sessionAction='true';button.disabled=!current||loading||!!uncertain||uploadPending();if(!current){card.append(el('p','请先选择任务，或明确新建一个任务后读取。'));settingButton(card,'新建任务',()=>{closeSettings();$('new-task').click();},'settings-new-task').disabled=loading||uploadPending();}card.append(el('div',undefined,'settings-results'));renderSettingsRead();
 }

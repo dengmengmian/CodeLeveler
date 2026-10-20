@@ -1,6 +1,8 @@
 // Chrome labels project protocol facts without exposing workspace paths.
 /** @param {{model?:string,provider?:string}|null|undefined} model @returns {string} */
 export function modelLabel(model){return typeof model?.model==='string'?model.model:'';}
+/** `0.1s`-style duration, the same shape the terminal paints. @param {number} elapsedMs */
+export function thoughtDuration(elapsedMs){if(elapsedMs<100)return '<0.1s';const seconds=elapsedMs/1000;return seconds<10?`${seconds.toFixed(1)}s`:`${Math.round(seconds)}s`;}
 /** @param {string|null|undefined} path @returns {string} */
 export function workspaceLabel(path){return path?path.split(/[\\/]/).filter(Boolean).at(-1)||path:'No Workspace';}
 import * as shared from '../../../packages/conversation-presentation/conversation.mjs';
@@ -68,7 +70,7 @@ export function availableWorkbenchViews(state){return ['overview',...(state.plan
 /** @param {number} count @param {number} index @param {string} key */
 export function browserTabIndex(count,index,key){if(!count)return -1;if(key==='Home')return 0;if(key==='End')return count-1;if(['ArrowRight','ArrowDown'].includes(key))return (index+1+count)%count;if(['ArrowLeft','ArrowUp'].includes(key))return (index-1+count)%count;return index;}
 /** @param {{url:string,title:string,loading:boolean,canGoBack:boolean,canGoForward:boolean}|null} tab */
-export function browserChrome(tab){return {title:tab?.title||(tab?.url&&tab.url!=='about:blank'?tab.url:'新标签'),back:!!tab?.canGoBack,forward:!!tab?.canGoForward,reload:!!tab,external:!!tab?.url&&tab.url!=='about:blank',loading:!!tab?.loading};}
+export function browserChrome(tab){const blank=!tab?.url||tab.url==='about:blank';return {title:blank?'新标签':(tab.title||tab.url),back:!!tab?.canGoBack,forward:!!tab?.canGoForward,reload:!!tab,external:!!tab?.url&&tab.url!=='about:blank',loading:!!tab?.loading};}
 
 /** @param {{x:number,y:number,width:number,height:number}} rect @param {{width:number,height:number}} viewport */
 export function browserSurfaceBounds(rect,viewport){const x=Math.ceil(Math.max(0,rect.x)),y=Math.ceil(Math.max(0,rect.y)),right=Math.floor(Math.min(viewport.width,rect.x+rect.width)),bottom=Math.floor(Math.min(viewport.height,rect.y+rect.height));if(right<=x||bottom<=y)return null;return {x,y,width:right-x,height:bottom-y};}

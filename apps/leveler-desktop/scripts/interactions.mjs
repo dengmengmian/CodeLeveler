@@ -42,7 +42,7 @@ try{
  assert.match(await page.locator('.tool[data-tool-id="fixture-consent"] summary').innerText(),/等待审批/);
  if(pending.request.requires_human_consent){assert.equal(await page.getByRole('button',{name:'本会话允许',exact:true}).count(),0);assert.equal(await page.getByRole('button',{name:'始终允许',exact:true}).count(),0);}
  assert.equal(await page.getByRole('button',{name:'允许一次',exact:true}).isEnabled(),true);
- const readTool=page.locator('.tool[data-tool-id="fixture-read"]');await readTool.waitFor();await readTool.locator('summary').click();await readTool.locator('.tool-output').waitFor();assert.match(await readTool.innerText(),/desktop-real-tool-evidence/);
+ const readTool=page.locator('.tool[data-tool-id="fixture-read"]');await readTool.waitFor();assert.equal(await page.locator('.progress-label').count(),1,'one process stream per turn');assert.ok(await page.locator('.assistant-progress').count()>=1,'interim narration is process prose');await readTool.locator('summary').click();await readTool.locator('.tool-output').waitFor();assert.match(await readTool.innerText(),/desktop-real-tool-evidence/);
  await page.screenshot({path:path.join(output,'workspace-live-approval.png')});
  await page.getByRole('button',{name:'拒绝',exact:true}).click();
  await page.waitForFunction(()=>document.querySelector('#status').textContent==='已回答'||document.querySelector('#status').textContent==='已完成');
