@@ -117,7 +117,13 @@ open -> daemon write-open -> sqlx migrations 25..40 -> same session/snapshot
 - `.dev/` is gitignored in CodeLeveler; these reports are force-added only if
   the delivery explicitly includes them.
 
-## 6. Commit
+## 6. Commit and frozen-candidate evidence
 
-Pending: the working tree also contains another session's Terminal/view WIP, so
-this round waits for that commit and then commits only these changes on top.
+- CodeLeveler: `b09c7fbd45c55ff662798dec84443d1f0e582f18` (includes the
+  Terminal/pending-input work that shared the working tree).
+- Dogfood: `e23b78a` (`test(eval): gate desktop reconnect, plan restore and
+  legacy stores`).
+- Frozen candidate binary: `28ea9c37aa822e836d63580f2a07379fefc954d201cc4a0329cd23ad2032606a`
+  (debug build, version `1.0.20 (b09c7fbd45c5)`).
+- Re-run after the commit: `desktop_resilience` 8/8 required cases PASS,
+  qualification `candidate_frozen`. The earlier dirty-tree run is superseded.
