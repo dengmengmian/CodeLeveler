@@ -164,7 +164,7 @@ function removeAnimation(node) {
 /* --------------------------------------------------------------------- menu */
 
 /**
- * @typedef {{label?:string, icon?:string, shortcut?:string, disabled?:boolean,
+ * @typedef {{label?:string, icon?:string, image?:string, shortcut?:string, disabled?:boolean,
  *   danger?:boolean, badge?:string, checked?:boolean, divider?:boolean,
  *   heading?:string, onSelect?:()=>void, title?:string}} MenuItem
  */
@@ -201,7 +201,14 @@ export function openMenu({ anchor, items, align = 'start', width = 220, side = '
     if (item.disabled) button.disabled = true;
     if (item.danger) button.dataset.danger = 'true';
     if (item.title) button.title = item.title;
-    if (item.icon) button.append(icon(item.icon, { size: 16 }));
+    if (item.image) {
+      const image = el('img', 'menu-image');
+      image.src = item.image;
+      image.alt = '';
+      image.width = 16;
+      image.height = 16;
+      button.append(image);
+    } else if (item.icon) button.append(icon(item.icon, { size: 16 }));
     else if (item.checked !== undefined) button.append(el('span', 'menu-check', item.checked ? '✓' : ''));
     else button.append(el('span', 'menu-check'));
     const label = el('span', 'menu-label', item.label ?? '');

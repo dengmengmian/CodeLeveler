@@ -82,6 +82,8 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         | ClientCommand::SetPermissionProfile { .. }
         | ClientCommand::RenameSession { .. }
         | ClientCommand::ArchiveSession { .. }
+        | ClientCommand::ForkSession { .. }
+        | ClientCommand::CompactContext { .. }
         | ClientCommand::ApprovalDecision { .. }
         | ClientCommand::AnswerClarification { .. } => {}
         _ => anyhow::bail!("command is outside supported desktop scope"),
