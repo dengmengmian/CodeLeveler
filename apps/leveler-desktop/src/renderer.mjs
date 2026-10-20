@@ -4383,8 +4383,7 @@ function tabIcon(tab) {
 }
 
 function changesTabTitle() {
-  const turns = (current?.messages ?? []).filter(message => messageKind(message) === 'user').length;
-  return `第 ${Math.max(1, turns)} 轮改动`;
+  return '工作区变更';
 }
 
 const TAB_TITLES = {
@@ -5457,6 +5456,7 @@ function changesView(tab) {
   if (selected?.path) renderOpenInAppInto(openApp, selected.path, 'file');
   head.append(tools);
   view.append(head);
+  view.append(el('div', 'review-scope', '当前工作区 Git 变更；历史轮次快照未提供，不能由当前状态冒充。'));
   const body = el('div', 'review-body');
   if (tab.wrap) body.classList.add('wrap');
   if (current?.diffQuery?.status === 'pending' && !current.diff) body.append(el('div', 'review-status', '正在读取变更…'));
