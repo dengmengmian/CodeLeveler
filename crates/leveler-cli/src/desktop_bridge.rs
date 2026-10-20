@@ -74,6 +74,8 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
                 .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
         ClientCommand::ResumeTask { content, .. }
             if !content.is_empty() && content.chars().count() <= 100_000 => {}
+        ClientCommand::CancelBackgroundTask { task_id, .. }
+            if !task_id.trim().is_empty() && task_id.len() <= 256 => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -642,6 +644,29 @@ mod tests {
                         center_seq,
                         before,
                         after
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_background_cancel_is_scoped_and_bounded() {
+        let session = SessionId::new("desktop-background");
+        let cancel = ClientCommand::CancelBackgroundTask {
+            session_id: session.clone(),
+            task_id: "host-1".into(),
+        };
+        assert!(validate_command(&session, &cancel).is_ok());
+        assert!(validate_command(&SessionId::new("other"), &cancel).is_err());
+        for task_id in ["", " ", &"a".repeat(257)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::CancelBackgroundTask {
+                        session_id: session.clone(),
+                        task_id: (*task_id).to_string(),
                     }
                 )
                 .is_err()

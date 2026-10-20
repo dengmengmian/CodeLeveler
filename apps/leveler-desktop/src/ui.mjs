@@ -181,6 +181,14 @@ export function closePopover() {
   window.dispatchEvent(new Event('ui-overlay-change'));
 }
 
+// A modal <dialog> lives in the browser's top layer; anything appended to
+// document.body is painted behind it and cannot receive pointer events.
+// Menus opened from inside Settings must join the same top-layer subtree.
+function overlayHost() {
+  const dialog = [...document.querySelectorAll('dialog[open]')].at(-1);
+  return dialog ?? document.body;
+}
+
 /**
  * Open a header-anchored panel. The caller renders arbitrary content into the
  * panel; Escape and outside pointerdown close it and restore trigger focus.
@@ -194,7 +202,7 @@ export function openPopover({ anchor, width = 336, align = 'start', className = 
   node.style.minWidth = `${width}px`;
   node.style.maxWidth = 'min(400px, calc(100vw - 32px))';
   render(node);
-  document.body.append(node);
+  overlayHost().append(node);
   window.dispatchEvent(new Event('ui-overlay-change'));
   activePopover = { node, anchor };
   anchor.setAttribute('aria-expanded', 'true');
@@ -232,6 +240,7 @@ export function closeMenu() {
   if (!activeMenu) return;
   const hadFocus = activeMenu.node.contains(document.activeElement);
   if (activeMenu.onDocKey) document.removeEventListener('keydown', activeMenu.onDocKey, true);
+  if (activeMenu.onPointer) document.removeEventListener('pointerdown', activeMenu.onPointer, true);
   activeMenu.node.remove();
   window.dispatchEvent(new Event('ui-overlay-change'));
   activeMenu.anchor?.setAttribute('aria-expanded', 'false');
@@ -287,7 +296,7 @@ export function openMenu({ anchor, items, align = 'start', width = 220, side = '
     }
     node.append(button);
   }
-  document.body.append(node);
+  overlayHost().append(node);
   window.dispatchEvent(new Event('ui-overlay-change'));
   const onDocKey = event => {
     if (event.key !== 'Escape') return;
@@ -296,7 +305,23 @@ export function openMenu({ anchor, items, align = 'start', width = 220, side = '
     anchor.focus();
   };
   document.addEventListener('keydown', onDocKey, true);
-  activeMenu = { node, anchor, restoreFocus: false, onDocKey };
+  // The pointerdown listener belongs to this menu and must die with it.
+  // A stale listener from an earlier menu would close the next menu during
+  // its pointerdown, so the click never reaches the item.
+  const entry = { node, anchor, restoreFocus: false, onDocKey, onPointer: null };
+  activeMenu = entry;
+  setTimeout(() => {
+    if (activeMenu !== entry) return;
+    const onPointer = event => {
+      if (!node.contains(event.target) && !anchor.contains(event.target)) {
+        document.removeEventListener('pointerdown', onPointer, true);
+        entry.onPointer = null;
+        closeMenu();
+      }
+    };
+    entry.onPointer = onPointer;
+    document.addEventListener('pointerdown', onPointer, true);
+  }, 0);
   anchor.setAttribute('aria-expanded', 'true');
   const rect = anchor.getBoundingClientRect();
   const box = node.getBoundingClientRect();
@@ -318,15 +343,6 @@ export function openMenu({ anchor, items, align = 'start', width = 220, side = '
       : (at + (event.key === 'ArrowDown' ? 1 : -1) + focusable.length) % focusable.length;
     focusable[next]?.focus();
   });
-  setTimeout(() => {
-    const onPointer = event => {
-      if (!node.contains(event.target) && !anchor.contains(event.target)) {
-        document.removeEventListener('pointerdown', onPointer, true);
-        closeMenu();
-      }
-    };
-    document.addEventListener('pointerdown', onPointer, true);
-  }, 0);
   return node;
 }
 
