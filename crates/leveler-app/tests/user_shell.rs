@@ -1350,6 +1350,10 @@ async fn a_cold_runtime_reports_an_orphaned_background_shell_as_unknown() {
         }
     }
     let pid = wait_pid_file(&pid_file).await;
+    // A sandbox that gave the command its own PID namespace would report `$$`
+    // as 1, and `kill -- -1` signals every process this user owns — including
+    // the test runner. Refuse to hand an unnamed group that power.
+    assert!(pid > 1, "the shell reported a namespace pid: {pid}");
     client
         .send(ClientCommand::BackgroundUserShell {
             session_id: session_id.clone(),
@@ -1377,8 +1381,10 @@ async fn a_cold_runtime_reports_an_orphaned_background_shell_as_unknown() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Simulate the runtime generation dying with the process. The local
     // registry no longer exists, so nothing could truthfully keep it Running.
+    // Kill the group the command was actually spawned into (the sandbox
+    // wrapper is its leader on Linux), never an assumed group id.
     let _ = std::process::Command::new("kill")
-        .args(["-9", &format!("-{pid}")])
+        .args(["-9", &format!("-{}", process_group_of(pid))])
         .status();
 
     let app = std::sync::Arc::new(Application::assemble(layout).unwrap());
