@@ -1,38 +1,186 @@
-// H: real native WebContentsView HTTP navigation, body, history and safety.
-// Test-only instrumentation observes original commands/events without changing navigation.
-import {_electron as electron} from 'playwright';
+// Native Browser acceptance for the current right dock: real WebContentsView
+// navigation, history, reload, network failure recovery, blocked protocols,
+// dirty address handling, narrow clipping and isolation.
+import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
-import {createServer} from 'node:http';
-import {mkdtemp,mkdir,writeFile} from 'node:fs/promises';
-import {setTimeout as delay} from 'node:timers/promises';
-import {fileURLToPath} from 'node:url';
+import { createServer } from 'node:http';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-const root=fileURLToPath(new URL('..',import.meta.url)),tmp=await mkdtemp('/tmp/leveler-desktop-browser-'),home=path.join(tmp,'home'),output=path.join(root,'acceptance-output/desktop');await mkdir(home);await mkdir(output,{recursive:true});await writeFile(path.join(home,'config.toml'),'default_model="fixture/m"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="http://127.0.0.1:1"\napi_key="test-only"\n[models.m]\nprovider="fixture"\nmodel_id="fixture"\ncontext_window=131072\n',{mode:0o600});
-let failing=true;const requests=[];const server=createServer((req,res)=>{requests.push({url:req.url,time:Date.now()});if(req.url==='/fail'&&failing){req.socket.destroy();return;}if(req.url==='/privileged-redirect'){res.writeHead(302,{location:'leveler-desktop://desktop/index.html'});res.end();return;}const name=req.url.startsWith('/b')?'B':'A';res.writeHead(200,{'content-type':'text/html','cache-control':'no-store'});res.end(`<!doctype html><html><head><title>H Native ${name}</title></head><body style="background:${name==='A'?'#cce8da':'#ffe0ab'};font:24px sans-serif;padding:22px"><h1 id="marker">REAL_NATIVE_BODY_${name}</h1><a id="next" href="/b">Actual B link</a><input id="browser-input" value="native"><script>globalThis.fixtureMarker='${name}';globalThis.safety=Promise.all([fetch('leveler-desktop://desktop/index.html').then(()=>true,()=>false),navigator.permissions.query({name:'geolocation'}).then(x=>x.state,()=> 'unavailable')]).then(x=>({privilegedFetchSucceeded:x[0],geolocation:x[1],desktop:typeof window.desktop,require:typeof require,process:typeof process}));</script></body></html>`);});await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+server.address().port;
-let app,page;const errors=[],evidence={scope:'H isolated real Runtime and actual native HTTP Browser; instrumentation only observes original methods/events, fixture body assertions use actual webContents.executeJavaScript'};
-async function probe(body=false){return app.evaluate(async(_,{body})=>{const h=globalThis.__nativeH,m=h.manager,t=m.tabs.get(m.selectedId);if(!t)return {state:m.state(),selected:null};const wc=t.view.webContents;return {state:m.state(),selected:{id:t.id,wcId:wc.id,url:wc.getURL(),title:wc.getTitle(),loading:wc.isLoading(),destroyed:wc.isDestroyed(),visible:t.view.getVisible(),bounds:t.view.getBounds(),...(body?{body:await wc.executeJavaScript('({marker:document.querySelector("#marker")?.textContent,href:location.href,fixtureMarker:globalThis.fixtureMarker})')}:{} )}};},{body});}
-async function loaded(name){let last;for(let i=0;i<80;i++){last=await probe();if(last.selected?.url===base+'/'+name.toLowerCase()&&!last.selected.loading){const native=await probe(true);assert.equal(native.selected.body.marker,'REAL_NATIVE_BODY_'+name);assert.equal(native.selected.body.href,base+'/'+name.toLowerCase());evidence.getter_observations??=[];evidence.getter_observations.push(native.selected);return native;}await delay(100);}evidence.failed_probe=last;throw Error('Native getter did not stabilize for '+name);}
-async function capture(name){await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));await page.screenshot();const bytes=await app.evaluate(async({BrowserWindow})=>(await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));await writeFile(path.join(output,name+'.png'),Buffer.from(bytes,'base64'));const native=await app.evaluate(async()=>{const m=globalThis.__nativeH.manager;return (await m.tabs.get(m.selectedId).view.webContents.capturePage()).toPNG().toString('base64');});await writeFile(path.join(output,name+'-native.png'),Buffer.from(native,'base64'));const desktop=await app.evaluate(async({BrowserWindow,desktopCapturer,systemPreferences})=>{if(process.platform==='darwin'&&systemPreferences.getMediaAccessStatus('screen')!=='granted')throw Error('Existing screen capture permission unavailable');const win=BrowserWindow.getAllWindows()[0],[w,h]=win.getSize();const source=(await desktopCapturer.getSources({types:['window'],thumbnailSize:{width:w*2,height:h*2}})).find(s=>s.id===win.getMediaSourceId());if(!source||source.thumbnail.isEmpty())throw Error('Target native window source missing');return source.thumbnail.toPNG().toString('base64');});await writeFile(path.join(output,name+'-window.png'),Buffer.from(desktop,'base64'));}
-async function navigate(url){await page.locator('#browser-url').fill(url);await page.locator('#browser-url').press('Enter');}
-try{app=await electron.launch({args:[root,'--user-data-dir='+path.join(tmp,'profile')],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_BINARY:path.resolve(root,'../../target/debug/leveler'),LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await app.firstWindow();page.setDefaultTimeout(12000);page.on('pageerror',e=>errors.push(e.message));await page.waitForFunction(()=>window.desktop&&!!document.querySelector('#new-session'));await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1600,1000));await page.locator('#message').fill('Browser lane preserved draft');await page.locator('#model-picker').click();await page.locator('#model-options button').first().click();assert.ok(await page.locator('.task.selected').getAttribute('data-session-id'));
-await app.evaluate((_,modulePath)=>{const {ManualBrowser}=process.getBuiltinModule('module').createRequire(modulePath)(modulePath),original={add:ManualBrowser.prototype.add,navigate:ManualBrowser.prototype.navigate,command:ManualBrowser.prototype.command};const h=globalThis.__nativeH={original,ManualBrowser,commands:[],navigations:[],events:[]};ManualBrowser.prototype.command=function(command){h.manager=this;h.commands.push({command,time:Date.now()});return original.command.call(this,command);};ManualBrowser.prototype.navigate=function(tab,url){h.navigations.push({id:tab.id,url,time:Date.now()});return original.navigate.call(this,tab,url);};ManualBrowser.prototype.add=function(){const tab=original.add.call(this),wc=tab.view.webContents;for(const event of ['did-start-navigation','did-navigate','did-stop-loading','did-start-loading','page-title-updated','did-fail-load','render-process-gone'])wc.on(event,(_,...args)=>h.events.push({event,id:tab.id,wcId:wc.id,args:args.filter(x=>['string','number','boolean'].includes(typeof x)),url:wc.getURL(),title:wc.getTitle(),loading:wc.isLoading(),time:Date.now()}));return tab;};},path.join(root,'src/browser.cjs'));
-if(process.env.LEVELER_BROWSER_RACE_ONLY==='1'){
-await app.evaluate((_,base)=>{const h=globalThis.__nativeH,observedAdd=h.ManualBrowser.prototype.add;h.race=[];h.raceInvocations=[];h.ManualBrowser.prototype.add=function(){const manager=this,tab=observedAdd.call(this),wc=tab.view.webContents;wc.on('did-start-navigation',(_event,url,_inPlace,mainFrame)=>{if(!mainFrame)return;const next=url==='about:blank'?base+'/a':url===base+'/a'?base+'/b':null;if(!next)return;h.race.push({url,next,loading:wc.isLoading(),actualURL:wc.getURL(),time:Date.now()});globalThis.setImmediate(()=>{h.raceInvocations.push({next,loading:wc.isLoading(),time:Date.now()});manager.command({type:'navigate',id:tab.id,url:next});});});return tab;};},base);
-await page.locator('#browser-new').click();await page.waitForFunction(()=>document.querySelectorAll('#browser-tabs [data-tab-id]').length===1);await loaded('B');const race=await app.evaluate(()=>globalThis.__nativeH.race);assert.equal(race.length,2);assert.ok(race.every(x=>x.loading));const invocations=await app.evaluate(()=>globalThis.__nativeH.raceInvocations);assert.equal(invocations.length,2);assert.ok(invocations.every(x=>x.loading));evidence.rapid_navigation_actual_invocations=invocations;await capture('browser-native-race');await loaded('B');Object.assign(evidence,{scope:'H narrow real wc did-start-navigation timing seam triggers actual blank->A->B commands while loading; no fake navigation return/state/body',rapid_navigation_loading_observations:race,late_new_result_retained_final_body:true});
-}else{
-await page.locator('#browser-new').click();await page.waitForFunction(()=>document.querySelectorAll('#browser-tabs [data-tab-id]').length===1);await navigate(base+'/a');let first=await loaded('A');assert.equal(first.selected.visible,true);await capture('browser-native-a');await loaded('A');
-// Real renderer address submission A -> B, then actual Chromium history and reload.
-await navigate(base+'/b');await loaded('B');await page.locator('#browser-back').click();await loaded('A');await page.locator('#browser-forward').click();await loaded('B');const before=requests.filter(x=>x.url==='/b').length;await page.locator('#browser-reload').click();await loaded('B');assert.ok(requests.filter(x=>x.url==='/b').length>before);evidence.history_reload=true;
-// A focused edited address is not overwritten by real native title/state updates.
-await page.locator('#browser-url').fill(base+'/unsent-dirty');await app.evaluate(async()=>{const m=globalThis.__nativeH.manager;await m.tabs.get(m.selectedId).view.webContents.executeJavaScript('document.title="H Native Dirty state update"');});await page.waitForFunction(()=>document.querySelector('#browser-tabs').textContent.includes('Dirty state update'));assert.equal(await page.locator('#browser-url').inputValue(),base+'/unsent-dirty');await page.locator('#message').click();assert.equal(await page.locator('#browser-url').inputValue(),base+'/b');evidence.dirty_address_retained=true;
-await navigate(base+'/fail');await page.waitForFunction(()=>!document.querySelector('#browser-error').hidden);assert.equal((await probe()).selected.visible,false);failing=false;await page.locator('#browser-error button').filter({hasText:'重试'}).click();await page.waitForFunction(()=>document.querySelector('#browser-error').hidden);let recovered;for(let i=0;i<50;i++){recovered=await probe();if(recovered.selected.url===base+'/fail'&&!recovered.selected.loading)break;await delay(100);}assert.equal((await probe(true)).selected.body.marker,'REAL_NATIVE_BODY_A');evidence.network_error_actual_reload=true;await navigate(base+'/a');await loaded('A');evidence.real_error_recovery=true;
-// Actual untrusted page has no privileged bridge, Node globals or granted location permission.
-const safety=await app.evaluate(async()=>{const m=globalThis.__nativeH.manager;return m.tabs.get(m.selectedId).view.webContents.executeJavaScript('globalThis.safety');});assert.deepEqual(safety,{privilegedFetchSucceeded:false,geolocation:'denied',desktop:'undefined',require:'undefined',process:'undefined'});evidence.native_safety=safety;
-for(const url of ['file:///etc/passwd','javascript:alert(1)','data:text/html,x','https://u:p@example.com']){const rejected=await page.evaluate(async url=>{try{await window.desktop.browserCommand({type:'navigate',url});return false;}catch{return true;}},url);assert.equal(rejected,true);}assert.equal((await probe()).selected.url,base+'/a');evidence.unsafe_urls_rejected=true;await navigate('file:///etc/passwd');await page.waitForFunction(()=>!document.querySelector('#browser-error').hidden);assert.match(await page.locator('#browser-error strong').textContent(),/无法打开此地址/);assert.equal(await page.locator('#browser-error details').evaluate(n=>n.open),false);await page.locator('#browser-error summary').click();assert.equal(await page.locator('#browser-url').inputValue(),'file:///etc/passwd');await page.locator('#browser-error button').filter({hasText:'修改地址'}).click();assert.equal(await page.evaluate(()=>document.activeElement.id),'browser-url');assert.equal(await page.locator('#browser-url').inputValue(),'file:///etc/passwd');await navigate(base+'/a');await loaded('A');evidence.blocked_url_product_error_dirty_blur=true;
-// Native page itself cannot drive trusted IPC through another webContents.
-const untrusted=await app.evaluate(async()=>{const m=globalThis.__nativeH.manager;const wc=m.tabs.get(m.selectedId).view.webContents;return {prefs:wc.getLastWebPreferences(),sameSession:wc.session===m.window.webContents.session};});assert.equal(untrusted.sameSession,false);for(const key of ['nodeIntegration','nodeIntegrationInSubFrames','nodeIntegrationInWorker','webviewTag'])assert.equal(untrusted.prefs[key],false);assert.equal(untrusted.prefs.sandbox,true);assert.equal(untrusted.prefs.contextIsolation,true);assert.equal(untrusted.prefs.webSecurity,true);assert.equal(untrusted.prefs.preload,undefined);evidence.native_isolated_session=true;
-await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(700,1000));await page.waitForFunction(()=>innerWidth===700);await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));let clip=await probe();assert.ok(clip.selected.bounds.x+clip.selected.bounds.width<=700);assert.ok(clip.selected.bounds.y+clip.selected.bounds.height<=1000);assert.equal(clip.selected.visible,true);await capture('browser-native-narrow');await page.locator('#workbench-expand').click();await page.waitForFunction(()=>document.body.classList.contains('workbench-expanded'));await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));clip=await probe();assert.ok(clip.selected.bounds.x+clip.selected.bounds.width<=700);assert.equal(await page.locator('main').isVisible(),false);await capture('browser-native-fullscreen');await page.locator('#workbench-expand').click();assert.equal(await page.locator('#message').inputValue(),'Browser lane preserved draft');evidence.native_clipping=true;
-await page.locator('#browser-new').click();await page.waitForFunction(()=>document.querySelectorAll('#browser-tabs [data-tab-id]').length===2);const second=await probe();assert.notEqual(second.selected.id,first.selected.id);await page.locator('#workbench-overview').click();await page.locator('#workbench-overview').press('ArrowRight');await page.waitForFunction(id=>document.activeElement.dataset.tabId===id,first.selected.id);await page.locator('[data-tab-id="'+first.selected.id+'"]').press('ArrowRight');await page.waitForFunction(id=>document.activeElement.dataset.tabId===id,second.selected.id);assert.equal((await probe()).state.selectedId,second.selected.id);await page.locator('[data-tab-id="'+second.selected.id+'"]').press('Home');assert.equal(await page.evaluate(()=>document.activeElement.id),'workbench-overview');await page.locator('#workbench-overview').press('End');await page.waitForFunction(id=>document.activeElement.dataset.tabId===id,second.selected.id);evidence.narrow_keyboard_real_tab_focus=true;await page.locator('[data-close-tab="'+second.selected.id+'"]').click();await loaded('A');assert.equal((await probe()).selected.id,first.selected.id);await page.locator('[data-close-tab="'+first.selected.id+'"]').click();await page.waitForFunction(()=>!document.querySelectorAll('#browser-tabs [data-tab-id]').length);assert.equal(await page.locator('#workbench-overview').getAttribute('aria-selected'),'true');assert.equal(await page.evaluate(()=>document.activeElement.id),'workbench-overview');evidence.close_selected_last_to_overview=true;
+
+const root = fileURLToPath(new URL('..', import.meta.url));
+const temporary = await mkdtemp('/tmp/leveler-desktop-browser-native-');
+const home = path.join(temporary, 'home');
+const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, 'acceptance-output/desktop');
+await mkdir(home, { recursive: true });
+await mkdir(output, { recursive: true });
+await writeFile(path.join(home, 'config.toml'), 'default_model="fixture/m"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="http://127.0.0.1:1"\napi_key="test-only"\n[models.m]\nprovider="fixture"\nmodel_id="fixture"\ncontext_window=131072\n', { mode: 0o600 });
+let failing = true;
+const requests = [];
+const server = createServer((request, response) => {
+  requests.push(request.url);
+  if (request.url === '/fail' && failing) { request.socket.destroy(); return; }
+  if (request.url === '/privileged-redirect') { response.writeHead(302, { location: 'leveler-desktop://desktop/index.html' }); response.end(); return; }
+  const name = request.url.startsWith('/b') ? 'B' : 'A';
+  response.writeHead(200, { 'content-type': 'text/html', 'cache-control': 'no-store' });
+  response.end(`<!doctype html><html><head><title>Native ${name}</title></head><body><h1 id="marker">NATIVE_BODY_${name}</h1><a id="next" href="/b">B</a><script>globalThis.fixtureMarker='${name}';globalThis.safety=Promise.all([fetch('leveler-desktop://desktop/index.html').then(()=>true,()=>false),navigator.permissions.query({name:'geolocation'}).then(x=>x.state,()=> 'unavailable')]).then(x=>({privilegedFetchSucceeded:x[0],geolocation:x[1],desktop:typeof window.desktop,require:typeof require,process:typeof process}));</script></body></html>`);
+});
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+const base = `http://127.0.0.1:${server.address().port}`;
+const evidence = { scope: 'real Electron native WebContentsView in the current right dock; fixture HTTP pages' };
+const errors = [];
+let app;
+let page;
+const probe = (body = false) => app.evaluate(async (_event, options) => {
+  const manager = globalThis.__native?.manager;
+  if (!manager?.selectedId) return { state: manager?.state?.() ?? null, selected: null };
+  const tab = manager.tabs.get(manager.selectedId);
+  if (!tab) return { state: manager.state(), selected: null };
+  const contents = tab.view.webContents;
+  return {
+    state: manager.state(),
+    selected: {
+      id: tab.id,
+      url: contents.getURL(),
+      title: contents.getTitle(),
+      loading: contents.isLoading(),
+      visible: tab.view.getVisible(),
+      bounds: tab.view.getBounds(),
+      preferences: contents.getLastWebPreferences(),
+      sameSession: contents.session === manager.window.webContents.session,
+      ...(options.body ? { body: await contents.executeJavaScript('({marker:document.querySelector("#marker")?.textContent,href:location.href,fixtureMarker:globalThis.fixtureMarker})') } : {}),
+    },
+  };
+}, { body });
+const loaded = async (name, body = true) => {
+  const expected = `${base}/${name.toLowerCase()}`;
+  for (let index = 0; index < 100; index += 1) {
+    const value = await probe(body);
+    if (value.selected?.url === expected && !value.selected.loading) {
+      if (body) assert.equal(value.selected.body.marker, `NATIVE_BODY_${name}`);
+      return value;
+    }
+    await delay(100);
+  }
+  throw new Error(`native page ${name} did not load`);
+};
+const navigate = async url => {
+  const input = page.locator('.browser-address-wrap input');
+  await input.fill(url);
+  await input.press('Enter');
+};
+try {
+  app = await electron.launch({
+    args: [root, `--user-data-dir=${path.join(temporary, 'profile')}`],
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, LEVELER_HOME: home, LEVELER_CONFIG_DIR: undefined, LEVELER_BINARY: process.env.LEVELER_BINARY ?? path.resolve(root, '../../target/debug/leveler'), LEVELER_DAEMON_IDLE_TIMEOUT_SECS: '10' },
+  });
+  page = await app.firstWindow();
+  page.setDefaultTimeout(15000);
+  page.on('pageerror', error => errors.push(error.message));
+  await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && document.querySelector('#brand-version')?.textContent.startsWith('v'));
+  await page.locator('#new-session').click();
+  await page.waitForFunction(() => document.querySelector('.session-row[aria-selected="true"]') && document.querySelector('#conversation-status').textContent !== '连接 Runtime…');
+  await app.evaluate((_event, modulePath) => {
+    const { ManualBrowser } = process.getBuiltinModule('module').createRequire(modulePath)(modulePath);
+    const original = ManualBrowser.prototype.add;
+    globalThis.__native = { manager: null };
+    ManualBrowser.prototype.add = function () {
+      globalThis.__native.manager = this;
+      return original.call(this);
+    };
+  }, path.join(root, 'src/browser.cjs'));
+  await page.keyboard.press('Meta+T');
+  await page.waitForFunction(() => window.desktop.browserState().then(state => state.tabs.length === 1));
+  await navigate(`${base}/a`);
+  let current = await loaded('A');
+  assert.equal(current.selected.visible, true);
+  evidence.navigation = { url: current.selected.url, title: current.selected.title, bounds: current.selected.bounds };
+  await navigate(`${base}/b`);
+  await loaded('B');
+  await page.locator('button[aria-label="后退"]').click();
+  await loaded('A');
+  await page.locator('button[aria-label="前进"]').click();
+  await loaded('B');
+  const beforeReload = requests.filter(url => url === '/b').length;
+  await page.locator('button[aria-label="刷新"]').click();
+  await loaded('B');
+  assert.ok(requests.filter(url => url === '/b').length > beforeReload);
+  evidence.history_reload = true;
+  // An edited address is the person's draft, not a native title update.
+  await page.locator('.browser-address-wrap input').fill(`${base}/unsent-dirty`);
+  await app.evaluate(async () => {
+    const manager = globalThis.__native.manager;
+    await manager.tabs.get(manager.selectedId).view.webContents.executeJavaScript('document.title="Dirty native title"');
+  });
+  await page.waitForFunction(() => document.querySelector('#rightbar')?.textContent.includes('Dirty native title'));
+  assert.equal(await page.locator('.browser-address-wrap input').inputValue(), `${base}/unsent-dirty`);
+  await page.locator('#message').click();
+  assert.equal(await page.locator('.browser-address-wrap input').inputValue(), `${base}/b`);
+  evidence.dirty_address = true;
+  // A failed main-frame load is a product error, not a blank success. Retry
+  // reloads the actual address once the endpoint recovers.
+  await navigate(`${base}/fail`);
+  await page.waitForFunction(() => { const node = document.querySelector('.browser-error'); return !!node && node.getClientRects().length > 0; });
+  assert.equal((await probe()).selected.visible, false);
+  failing = false;
+  await page.locator('.browser-error button').filter({ hasText: '重试' }).click();
+  for (let index = 0; index < 100; index += 1) {
+    const value = await probe(true);
+    if (value.selected?.url === `${base}/fail` && !value.selected.loading && value.selected.body?.marker === 'NATIVE_BODY_A') break;
+    if (index === 99) throw new Error('retry did not reload the failed address');
+    await delay(100);
+  }
+  evidence.network_recovery = true;
+  const safety = await app.evaluate(async () => {
+    const manager = globalThis.__native.manager;
+    return manager.tabs.get(manager.selectedId).view.webContents.executeJavaScript('globalThis.safety');
+  });
+  assert.deepEqual(safety, { privilegedFetchSucceeded: false, geolocation: 'denied', desktop: 'undefined', require: 'undefined', process: 'undefined' });
+  current = await probe();
+  assert.equal(current.selected.preferences.nodeIntegration, false);
+  assert.equal(current.selected.preferences.sandbox, true);
+  assert.equal(current.selected.preferences.contextIsolation, true);
+  assert.equal(current.selected.sameSession, false);
+  evidence.native_safety = safety;
+  // The address field refuses unsupported protocols before navigation while
+  // keeping the typed value editable.
+  await navigate('file:///etc/passwd');
+  await page.waitForFunction(() => { const node = document.querySelector('.browser-error'); return !!node && node.getClientRects().length > 0; });
+  assert.match(await page.locator('.browser-error').innerText(), /仅支持|无法打开|不受支持|协议/);
+  assert.equal((await probe()).selected.url, `${base}/fail`);
+  await page.locator('.browser-error button').filter({ hasText: '修改地址' }).click();
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), '输入 HTTP(S) 地址');
+  assert.equal(await page.locator('.browser-address-wrap input').inputValue(), 'file:///etc/passwd');
+  await navigate(`${base}/a`);
+  await loaded('A');
+  evidence.blocked_protocol_product_error = true;
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(700, 1000));
+  await page.waitForFunction(() => innerWidth === 700);
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  current = await probe();
+  assert.ok(current.selected.bounds.x + current.selected.bounds.width <= 700);
+  assert.ok(current.selected.bounds.y + current.selected.bounds.height <= 1000);
+  assert.equal(current.selected.visible, true);
+  evidence.narrow_clipping = current.selected.bounds;
+  await page.locator('.pane-chrome button[aria-label="全屏"]').click();
+  await page.waitForFunction(() => document.body.classList.contains('rightbar-expanded'));
+  await page.waitForTimeout(250);
+  current = await probe();
+  assert.ok(current.selected.bounds.width > 600);
+  await page.locator('.pane-chrome button[aria-label="退出全屏"]').click();
+  await page.waitForFunction(() => !document.body.classList.contains('rightbar-expanded'));
+  assert.deepEqual(errors, []);
+  Object.assign(evidence, { page_errors: errors, passed: true });
+  await page.screenshot({ path: path.join(output, 'browser-native.png') });
+  await writeFile(path.join(output, 'browser-native-evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
+  console.log(JSON.stringify(evidence, null, 2));
+} catch (error) {
+  Object.assign(evidence, { passed: false, error: error.message, page_errors: errors });
+  if (page && !page.isClosed()) await page.screenshot({ path: path.join(output, 'browser-native-failure.png') }).catch(() => {});
+  await writeFile(path.join(output, 'browser-native-evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
+  throw error;
+} finally {
+  if (app) await app.evaluate(({ app }) => app.exit(0)).catch(() => {});
+  await new Promise(resolve => server.close(resolve));
 }
-Object.assign(evidence,{native_window_capture:'desktopCapturer exact BrowserWindow mediaSourceId includes native child; BrowserWindow.capturePage shell alone does not',prior_E_empty_getter_diagnostic:'Not reproduced by this observed stable navigation/body lane; original cause remains unknown',instrumentation:await app.evaluate(()=>({commands:globalThis.__nativeH.commands,navigations:globalThis.__nativeH.navigations,events:globalThis.__nativeH.events})),requests,page_errors:errors,passed:true});assert.deepEqual(errors,[]);
-}catch(error){Object.assign(evidence,{passed:false,error:error.message,requests,page_errors:errors});if(app)evidence.instrumentation=await app.evaluate(()=>{const h=globalThis.__nativeH;return h?{commands:h.commands,navigations:h.navigations,events:h.events}:null;});throw error;}finally{if(app){await app.evaluate(()=>{const h=globalThis.__nativeH;if(h)for(const [key,value] of Object.entries(h.original))h.ManualBrowser.prototype[key]=value;});await app.close();}await new Promise(r=>server.close(r));await writeFile(path.join(output,process.env.LEVELER_BROWSER_RACE_ONLY==='1'?'browser-native-race-evidence.json':'browser-native-evidence.json'),JSON.stringify(evidence,null,2)+'\n');console.log(JSON.stringify({passed:evidence.passed,error:evidence.error,requests:requests.length,events:evidence.instrumentation?.events.length}));}

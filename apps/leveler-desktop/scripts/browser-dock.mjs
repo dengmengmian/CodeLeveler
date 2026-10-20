@@ -39,6 +39,7 @@ const probe = () => application.evaluate(() => {
     title: contents.getTitle(),
     visible: tab.view.getVisible(),
     bounds: tab.view.getBounds(),
+    preferences: contents.getLastWebPreferences(),
     state: manager.state(),
   };
 });
@@ -89,7 +90,10 @@ try {
   let current = await waitBrowser(value => value.url === `${base}/a` && !value.state.tabs.find(tab => tab.id === value.id)?.loading, 'A did not load');
   assert.equal(current.visible, true);
   assert.equal(current.title, 'Dock A');
+  assert.equal(current.preferences.nodeIntegration, false);
+  assert.equal(current.preferences.sandbox, true);
   const firstId = current.id;
+  evidence.native_preferences = { nodeIntegration: current.preferences.nodeIntegration, sandbox: current.preferences.sandbox };
   evidence.navigation = { url: current.url, title: current.title, visible: current.visible, bounds: current.bounds };
   await capture('browser-dock-a');
 
@@ -162,7 +166,14 @@ try {
   console.log(JSON.stringify(evidence, null, 2));
 } catch (error) {
   Object.assign(evidence, { passed: false, error: error.message, page_errors: errors });
-  if (page && !page.isClosed()) await capture('browser-dock-failure').catch(() => {});
+  if (page && !page.isClosed()) {
+    evidence.failure_state = await page.evaluate(async () => ({
+      state: await window.desktop.browserState(),
+      paneTabs: [...document.querySelectorAll('.pane-tab')].map(node => ({ text: node.innerText, selected: node.getAttribute('aria-selected') })),
+      address: document.querySelector('.browser-address-wrap input')?.value ?? null,
+    })).catch(captureError => ({ captureError: captureError.message }));
+    await capture('browser-dock-failure').catch(() => {});
+  }
   await writeFile(path.join(output, 'browser-dock-evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
   throw error;
 } finally {

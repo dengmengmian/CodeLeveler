@@ -15,7 +15,7 @@ for(let turn=0;turn<100;turn++){
  }
  record({type:'assistant_text_delta',message_id:assistant.id,delta:assistant.text});record({type:'assistant_message_completed',message_id:assistant.id});
 }
-const snapshots={long:{id:'long',goal:'Synthetic 100 turns / 300 tools',repository:'/synthetic/workspace',model:'synthetic/render-fixture',task_status:'running',messages,pending_interactions:[],active_tools:[],plan:{steps:[{index:0,description:'Synthetic long-session UI acceptance',status:'running'}]},diff:null},short:{id:'short',goal:'Synthetic short task',repository:null,task_status:'answered',messages:[{id:'short-a',role:'assistant',text:'Short task switch target'}],pending_interactions:[],active_tools:[]}};
+const snapshots={long:{id:'long',goal:'Synthetic 100 turns / 300 tools',repository:'/synthetic/workspace',model:'synthetic/render-fixture',task_status:'answered',messages,pending_interactions:[],active_tools:[],plan:{steps:[{index:0,description:'Synthetic long-session UI acceptance',status:'running'}]},diff:null},short:{id:'short',goal:'Synthetic short task',repository:null,task_status:'answered',messages:[{id:'short-a',role:'assistant',text:'Short task switch target'}],pending_interactions:[],active_tools:[]}};
 function send(frame){process.stdout.write(JSON.stringify(frame)+'\n');}
 function event(session_id,data){send({event:'runtime',session_id,data});}
 readline.createInterface({input:process.stdin}).on('line',line=>{
