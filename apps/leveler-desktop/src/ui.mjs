@@ -170,6 +170,63 @@ function removeAnimation(node) {
  */
 
 let activeMenu = null;
+let activePopover = null;
+
+/** Close the header popover without moving focus. */
+export function closePopover() {
+  if (!activePopover) return;
+  const { node } = activePopover;
+  activePopover = null;
+  node.remove();
+  window.dispatchEvent(new Event('ui-overlay-change'));
+}
+
+/**
+ * Open a header-anchored panel. The caller renders arbitrary content into the
+ * panel; Escape and outside pointerdown close it and restore trigger focus.
+ * @param {{anchor:HTMLElement,width?:number,align?:'start'|'end'|'center',className?:string,render:(node:HTMLElement)=>void}} options
+ */
+export function openPopover({ anchor, width = 336, align = 'start', className = '', render }) {
+  closePopover();
+  closeMenu();
+  const node = el('div', `menu header-popover ${className}`.trim());
+  node.setAttribute('role', 'dialog');
+  node.style.minWidth = `${width}px`;
+  node.style.maxWidth = 'min(400px, calc(100vw - 32px))';
+  render(node);
+  document.body.append(node);
+  window.dispatchEvent(new Event('ui-overlay-change'));
+  activePopover = { node, anchor };
+  anchor.setAttribute('aria-expanded', 'true');
+  const rect = anchor.getBoundingClientRect();
+  const box = node.getBoundingClientRect();
+  let left = align === 'end' ? rect.right - box.width : align === 'center' ? rect.left + rect.width / 2 - box.width / 2 : rect.left;
+  let top = rect.bottom + 5;
+  left = Math.max(16, Math.min(innerWidth - box.width - 16, left));
+  if (top + box.height > innerHeight - 12) top = Math.max(12, rect.top - box.height - 5);
+  node.style.left = `${Math.round(left)}px`;
+  node.style.top = `${Math.round(top)}px`;
+  const focusable = node.querySelector('button:not([disabled]), [href], [tabindex="0"]');
+  focusable?.focus({ preventScroll: true });
+  node.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    closePopover();
+    anchor.focus();
+  });
+  setTimeout(() => {
+    const onPointer = event => {
+      if (!node.contains(event.target) && !anchor.contains(event.target)) {
+        document.removeEventListener('pointerdown', onPointer, true);
+        closePopover();
+        anchor.setAttribute('aria-expanded', 'false');
+      }
+    };
+    document.addEventListener('pointerdown', onPointer, true);
+  }, 0);
+  return node;
+}
 
 export function closeMenu() {
   if (!activeMenu) return;
@@ -187,6 +244,7 @@ export function closeMenu() {
  *   width?:number, side?:'bottom'|'top', className?:string}} options
  */
 export function openMenu({ anchor, items, align = 'start', width = 220, side = 'bottom', className = '' }) {
+  closePopover();
   closeMenu();
   const node = el('div', `menu ${className}`.trim());
   node.setAttribute('role', 'menu');
