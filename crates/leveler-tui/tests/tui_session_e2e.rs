@@ -261,6 +261,7 @@ fn tui_session_commands_ui_and_logic() {
                         status: PlanStepStatus::Running,
                     },
                 ],
+                state: Default::default(),
             },
         }),
     );

@@ -218,6 +218,10 @@ impl Bridge {
     }
     async fn handle(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         match method {
+            // Transport liveness only. Desktop uses it to prove a respawned
+            // bridge answers before announcing a connection; it touches no
+            // runtime, session or durable state.
+            "ping" => Ok(json!({"ok": true})),
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
                     &self.home,
@@ -310,6 +314,41 @@ impl Bridge {
                 Ok(serde_json::to_value(
                     self.client()?.snapshot(&session).await?,
                 )?)
+            }
+            "create_terminal" | "write_terminal" | "resize_terminal" | "observe_terminal" | "close_terminal" => {
+                use leveler_client_protocol::{TerminalOperation, TerminalRequest};
+                use base64::Engine as _;
+                let session_id = SessionId::new(required_string(&params, "session_id")?);
+                anyhow::ensure!(self.selected.as_ref() == Some(&session_id), "session is not selected");
+                let dimension = |key: &str| -> anyhow::Result<u16> {
+                    params[key].as_u64().and_then(|n| u16::try_from(n).ok()).ok_or_else(|| anyhow::anyhow!("{key} must be an integer"))
+                };
+                let operation = match method {
+                    "create_terminal" => TerminalOperation::Create {cols:dimension("cols")?, rows:dimension("rows")?},
+                    "resize_terminal" => TerminalOperation::Resize {cols:dimension("cols")?, rows:dimension("rows")?},
+                    "write_terminal" => {
+                        let encoded=required_string(&params,"data_base64")?;
+                        anyhow::ensure!(encoded.len() <= 87384,"terminal input exceeds limit");
+                        TerminalOperation::Write {data:base64::engine::general_purpose::STANDARD.decode(encoded)?}
+                    },
+                    "observe_terminal" => TerminalOperation::Observe {
+                        cursor:params["cursor"].as_u64().ok_or_else(||anyhow::anyhow!("cursor must be an unsigned integer"))?,
+                        max_bytes:params["max_bytes"].as_u64().and_then(|n|usize::try_from(n).ok()).ok_or_else(||anyhow::anyhow!("max_bytes must be an unsigned integer"))?,
+                    },
+                    _ => TerminalOperation::Close,
+                };
+                let request=TerminalRequest{session_id,terminal_id:required_string(&params,"terminal_id")?.into(),operation};
+                request.validate().map_err(anyhow::Error::msg)?;
+                match self.client()?.terminal(request).await? {
+                    None=>Ok(Value::Null),
+                    Some(mut state)=> {
+                        let bytes=std::mem::take(&mut state.data);
+                        let mut response=serde_json::to_value(state)?;
+                        response.as_object_mut().unwrap().remove("data");
+                        response["data_base64"]=Value::String(base64::engine::general_purpose::STANDARD.encode(bytes));
+                        Ok(response)
+                    }
+                }
             }
             "runtime_info" => Ok(serde_json::to_value(
                 LocalRuntimeService::runtime_info(self.client()?.as_ref()).await?,

@@ -1,5 +1,10 @@
 const {existsSync,realpathSync,statSync}=require('node:fs');
 const path=require('node:path');
+const {mkdtemp,readFile,rm}=require('node:fs/promises');
+const {tmpdir}=require('node:os');
+const {execFile}=require('node:child_process');
+const {promisify}=require('node:util');
+const runFile=promisify(execFile);
 
 // Supported local applications, in menu order. Finder is the always-present
 // file manager; the rest appear only when the bundle exists on this machine.
@@ -54,4 +59,23 @@ function resolveTarget(target,roots){
   throw new Error('路径不在当前工作区内');
 }
 
-module.exports={APP_CANDIDATES,installedCatalog,resolveTarget};
+/** Decode the bundle's own icon; getFileIcon(.app) returns a MIME-type icon. */
+async function applicationIcon(bundle){
+  const {stdout}=await runFile('/usr/bin/plutil',['-convert','json','-o','-',path.join(bundle,'Contents','Info.plist')],{timeout:5000,maxBuffer:1024*1024});
+  const metadata=JSON.parse(stdout);
+  const primary=metadata.CFBundleIcons?.CFBundlePrimaryIcon;
+  const iconName=metadata.CFBundleIconFile??primary?.CFBundleIconFiles?.at(-1);
+  if(typeof iconName!=='string'||!iconName||iconName.includes('\0')||path.basename(iconName)!==iconName)throw new Error('Application icon resource is unavailable');
+  const resources=path.join(bundle,'Contents','Resources');
+  const iconPath=path.join(resources,iconName);
+  const resource=resolveTarget(existsSync(iconPath)&&statSync(iconPath).isFile()?iconPath:`${iconPath}.icns`,[resources]);
+  const temporary=await mkdtemp(path.join(tmpdir(),'leveler-app-icon-'));
+  try{
+    const png=path.join(temporary,'icon.png');
+    // Electron cannot decode ICNS; use the system image decoder at display size.
+    await runFile('/usr/bin/sips',['-s','format','png','-Z','64',resource,'--out',png],{timeout:5000,maxBuffer:64*1024});
+    return `data:image/png;base64,${(await readFile(png)).toString('base64')}`;
+  }finally{await rm(temporary,{recursive:true,force:true});}
+}
+
+module.exports={APP_CANDIDATES,installedCatalog,resolveTarget,applicationIcon};

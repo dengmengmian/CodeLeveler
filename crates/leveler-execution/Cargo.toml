@@ -34,7 +34,7 @@ tree-sitter = "=0.25.10"
 tree-sitter-bash = "=0.25.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process", "user"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "term", "fs"] }
 rustix = { workspace = true }
 
 # Job Object and Low-integrity launch via audited safe wrappers (no in-crate

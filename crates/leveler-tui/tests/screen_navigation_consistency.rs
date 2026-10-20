@@ -582,6 +582,7 @@ fn seed(state: &mut AppState, screen: Screen) {
                         status: leveler_client_protocol::PlanStepStatus::Pending,
                     })
                     .collect(),
+                state: Default::default(),
             });
         }
         Screen::Goal => {

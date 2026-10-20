@@ -187,8 +187,9 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     // Stage the turn's goal identity before it flips to Busy. A continuation
     // phrase re-enters the goal already shown (and the runtime's own resume
     // path); any other input opens a new one.
-    let continuation =
-        attachments.is_empty() && leveler_client_protocol::parse_continuation(&content).is_some();
+    let continuation = attachments.is_empty()
+        && (state.collaboration.eq_ignore_ascii_case("goal")
+            || leveler_client_protocol::parse_continuation(&content).is_some());
     state.staged_goal = Some(crate::active_goal::StagedGoal {
         title: crate::active_goal::short_title(&content),
         objective: Some(content.clone()),
@@ -259,7 +260,8 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
     } else {
         // The runtime announces an admitted turn's message itself
         // (`UserMessageAdded`); only the optimistic Busy is ours to set.
-        let continuation = leveler_client_protocol::parse_continuation(&content).is_some();
+        let continuation = state.collaboration.eq_ignore_ascii_case("goal")
+            || leveler_client_protocol::parse_continuation(&content).is_some();
         state.staged_goal = Some(crate::active_goal::StagedGoal {
             title: crate::active_goal::short_title(&content),
             objective: Some(content.clone()),
@@ -320,6 +322,33 @@ pub(super) fn drain_pending_input(state: &mut AppState) -> Option<Effect> {
     }
     // Not busy by the checks above, so this submits a new turn (never a steer).
     send_pending_input(state, 0).into_iter().next()
+}
+
+/// Return one unsent item to the composer without creating a delivery.
+pub(super) fn edit_pending_input(state: &mut AppState, index: usize) {
+    let Some(item) = state.pending_inputs.get(index) else {
+        return;
+    };
+    if !item.is_unsent()
+        || item.session_id != state.session_id
+        || state.surface != crate::btw::SurfaceFocus::Main
+    {
+        return;
+    }
+    if !state.composer.is_empty() || !state.pending_attachments.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().pending_input_edit_draft.to_string(),
+        });
+        return;
+    }
+    let text = item.text.clone();
+    delete_pending_input(state, index);
+    state.pending_hits.clear();
+    state.composer.replace(text);
+    super::shell::reset_after_submit(state);
+    state.workbench_focus = WorkbenchFocus::Input;
+    touch_slash_filter(state);
 }
 
 /// Delete one unsent 待发送 item. Local only: it never reached the runtime.

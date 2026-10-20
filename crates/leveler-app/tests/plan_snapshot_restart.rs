@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use leveler_app::{Application, InProcessRuntimeClient};
-use leveler_client_protocol::{InteractiveRuntimeClient, PlanStepStatus};
+use leveler_client_protocol::{InteractiveRuntimeClient, PlanStepStatus, UiPlanState};
 use leveler_core::SessionId;
 use leveler_engine::EngineEvent;
 use leveler_execution::PermissionProfile;
@@ -57,9 +57,13 @@ async fn persist_plan(app: &Application, session_id: &SessionId, steps: serde_js
 }
 
 async fn persist_task_terminal(app: &Application, session_id: &SessionId) {
+    persist_task_outcome(app, session_id, TaskOutcome::Completed).await;
+}
+
+async fn persist_task_outcome(app: &Application, session_id: &SessionId, outcome: TaskOutcome) {
     let db = app.open_database().await.unwrap();
     let event = EngineEvent::TaskFinished {
-        outcome: TaskOutcome::Completed,
+        outcome,
         reason: None,
         stop: Some(StopReason::Completed),
         failure: None,
@@ -151,7 +155,7 @@ async fn a_restarted_runtime_honours_a_cleared_plan() {
 }
 
 #[tokio::test]
-async fn a_restarted_runtime_does_not_resurrect_a_plan_from_a_terminal_task_epoch() {
+async fn a_restarted_runtime_reports_a_completed_plan_as_history_not_active_work() {
     isolate_global_config();
     let tmp = tempfile::tempdir().unwrap();
 
@@ -177,10 +181,49 @@ async fn a_restarted_runtime_does_not_resurrect_a_plan_from_a_terminal_task_epoc
     let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
     let snapshot = client(app).snapshot(&session_id).await.unwrap();
 
-    assert!(
-        snapshot.plan.is_none(),
-        "a terminal epoch's final plan is history, not an active reconnect plan"
+    let plan = snapshot
+        .plan
+        .expect("a completed plan stays viewable after a restart");
+    assert_eq!(
+        plan.state,
+        UiPlanState::Completed,
+        "a terminal epoch's final plan is history, never active work"
     );
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[1].description, "not done");
+    assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
+}
+
+#[tokio::test]
+async fn a_restarted_runtime_reports_an_interrupted_task_plan_as_interrupted() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let session_id = {
+        let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+        let session_id = app
+            .create_session(&ModelRef::new("mock", "m"), "interrupted plan")
+            .await
+            .unwrap();
+        persist_plan(
+            &app,
+            &session_id,
+            serde_json::json!([{"step": "half done", "status": "in_progress"}]),
+        )
+        .await;
+        persist_task_outcome(&app, &session_id, TaskOutcome::Interrupted).await;
+        session_id
+    };
+
+    let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+    let plan = client(app)
+        .snapshot(&session_id)
+        .await
+        .unwrap()
+        .plan
+        .expect("an interrupted plan stays viewable");
+    assert_eq!(plan.state, UiPlanState::Interrupted);
+    assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
 }
 
 #[tokio::test]
@@ -219,6 +262,7 @@ async fn a_plan_updated_after_the_latest_terminal_is_active_on_restart() {
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].description, "current");
     assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+    assert_eq!(plan.state, UiPlanState::Active);
 }
 
 #[tokio::test]

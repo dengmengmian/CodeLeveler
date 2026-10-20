@@ -82,7 +82,7 @@ fn opened() -> AppState {
 }
 
 #[test]
-fn a0_opening_an_idle_session_requests_an_initial_prediction() {
+fn a0_opening_an_empty_session_does_not_request_a_prediction() {
     let mut s = AppState::new(
         Theme::no_color(),
         Boot {
@@ -107,12 +107,24 @@ fn a0_opening_an_idle_session_requests_an_initial_prediction() {
         }),
     );
 
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Send(ClientCommand::RequestPromptSuggestion { session_id })
-            if session_id.as_str() == "s1"
-    )));
+    assert_eq!(prediction_requests(&effects), 0);
     assert_eq!(recap_requests(&effects), 0);
+}
+
+#[test]
+fn a0_empty_session_ignores_a_late_prediction() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PromptSuggestion {
+            text: "继续".into(),
+        }),
+    );
+
+    assert_eq!(s.prompt_suggestion, None);
+    assert!(!composer_row(&frame(&mut s, 100, 24)).contains("继续"));
+    reduce(&mut s, key(KeyCode::Tab));
+    assert!(s.composer.is_empty());
 }
 
 fn reopened_with_history() -> AppState {

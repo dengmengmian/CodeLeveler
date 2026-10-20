@@ -4,7 +4,7 @@
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readdir } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -103,8 +103,22 @@ try {
   const previewError = await page.locator('.preview-body .review-status.error').innerText();
   assert.match(previewError, /文件或目录不存在/);
   assert.doesNotMatch(previewError, /Error invoking remote method|desktop:files-read/);
+  await page.locator('.pane-tab').filter({ hasText: /^文件$/ }).first().click();
+  await page.locator('button[aria-label="刷新文件列表"]').click();
+  await page.waitForSelector('.files-empty-dir');
+  assert.deepEqual(await readdir(workspace), []);
+  assert.equal(await page.locator('.files-row').count(), 0);
+  assert.equal(await page.locator('.files-error').count(), 0);
+  evidence.empty_directory_matches_disk = true;
   await writeFile(path.join(workspace, 'keep.txt'), 'RECOVERY_RESTORED\n');
+  await page.locator('.pane-tab').filter({ hasText: /^keep\.txt$/ }).first().click();
   await page.locator('.preview-body .review-status.error button').click();
+  await page.waitForFunction(() => document.querySelector('.preview-body')?.innerText.includes('RECOVERY_RESTORED'));
+  await page.locator('.pane-tab').filter({ hasText: /^文件$/ }).first().click();
+  await page.locator('button[aria-label="刷新文件列表"]').click();
+  await page.waitForSelector('.files-row[data-path="keep.txt"]');
+  assert.equal(await page.locator('.files-empty-dir').count(), 0);
+  await page.locator('.files-row[data-path="keep.txt"]').click();
   await page.waitForFunction(() => document.querySelector('.preview-body')?.innerText.includes('RECOVERY_RESTORED'));
   evidence.deleted_preview_recovered = true;
   await send('FAIL_HARD');
@@ -131,25 +145,49 @@ try {
   }, sessionId);
   assert.match(direct, /工作区文件夹不存在或无法访问/);
   await mkdir(workspace, { recursive: true });
+  // Restore the fixture content too: a restored directory alone is genuinely
+  // empty, even when the persisted pane still has an old file preview tab.
+  await writeFile(path.join(workspace, 'keep.txt'), 'RECOVERY_RESTORED\n');
   await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();
   await page.waitForFunction(() => document.querySelector('#conversation-status')?.textContent !== '连接 Runtime…');
   await page.waitForTimeout(500);
   assert.equal((await ui()).banner, null);
   assert.ok((await ui()).assistant.some(text => text.includes('RECOVERY_OK')));
   evidence.missing_workspace_message_and_recovery = true;
+  if (!(await page.locator('.pane-tab').filter({ hasText: /^文件$/ }).isVisible())) await page.locator('#header-right-toggle').click();
+  await page.locator('.pane-tab').filter({ hasText: /^文件$/ }).first().click();
+  await page.locator('button[aria-label="刷新文件列表"]').click();
+  await page.waitForSelector('.files-row[data-path="keep.txt"]');
+  assert.equal(await page.locator('.files-empty-dir').count(), 0);
+  await page.locator('.files-row[data-path="keep.txt"]').click();
+  await page.waitForFunction(() => document.querySelector('.preview-body')?.innerText.includes('RECOVERY_RESTORED'));
+  evidence.restored_workspace_has_real_files = true;
+  // A dead daemon is revived below Electron. The Desktop must keep the same
+  // session, keep history, and accept the next message after the resync.
+  process.kill(runtime.pid, 'SIGKILL');
+  await page.waitForFunction(async old => {
+    try { const info = await window.desktop.runtimeInfo(); return info.pid && info.pid !== old; }
+    catch { return false; }
+  }, runtime.pid, { timeout: 30000 });
+  await send('AFTER_DAEMON_LOSS');
+  await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant .markdown')].filter(node => node.textContent.includes('RECOVERY_OK')).length >= 3, null, { timeout: 60000 });
+  assert.equal(await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id'), sessionId);
+  evidence.daemon_loss_recovered_same_session = true;
+
   const mainPid = app.process().pid;
   const childIds = execFileSync('pgrep', ['-P', String(mainPid)], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
   const children = childIds.length ? execFileSync('ps', ['-o', 'pid=,command=', '-p', childIds.join(',')], { encoding: 'utf8' }) : '';
   const bridgeLine = String(children).split('\n').find(line => line.includes('desktop-bridge'));
   assert.ok(bridgeLine, 'desktop bridge child');
   process.kill(Number(bridgeLine.trim().split(/\s+/)[0]), 'SIGKILL');
-  await page.waitForFunction(() => !document.querySelector('#error-banner').hidden && document.querySelector('#error-banner').innerText.includes('disconnected'));
+  await page.waitForFunction(() => !document.querySelector('#connection-banner').hidden, null, { timeout: 15000 });
+  await page.waitForFunction(() => document.querySelector('#connection-banner').hidden, null, { timeout: 30000 });
   await send('AFTER_BRIDGE_LOSS');
-  await page.waitForFunction(() => !document.querySelector('#composer-error').hidden);
+  await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant .markdown')].filter(node => node.textContent.includes('RECOVERY_OK')).length >= 4, null, { timeout: 60000 });
+  assert.equal(await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id'), sessionId);
   const loss = await ui();
-  assert.match(loss.composer, /reopen Desktop/);
-  assert.equal(loss.assistant.some(text => text.includes('RECOVERY_OK') && text.includes('AFTER_BRIDGE_LOSS')), false);
-  evidence.bridge_loss_reported_without_fake_success = true;
+  assert.equal(loss.assistant.some(text => text.includes('reopen Desktop')), false);
+  evidence.bridge_loss_recovered_automatically = true;
   evidence.runtime_pid = runtime.pid;
   await page.screenshot({ path: path.join(output, 'recovery.png') });
   assert.deepEqual(errors, []);

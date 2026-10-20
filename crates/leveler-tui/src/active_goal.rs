@@ -260,6 +260,13 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
         state.active_goal = Some(goal);
         return;
     };
+    // Follow-up text in goal mode never renames or reopens a settled objective.
+    // Only an explicit new goal (continuation=false) replaces that identity.
+    if staged.continuation && state.collaboration.eq_ignore_ascii_case("goal")
+        && matches!(goal.phase(), GoalPhase::Completed | GoalPhase::Failed)
+    {
+        return;
+    }
     let same_goal = staged.continuation
         && matches!(
             goal.phase(),
@@ -284,12 +291,21 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
 /// when there is nothing to show. `max` is the columns available to the
 /// indicator.
 pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
-    let Some(goal) = state.active_goal.as_ref() else {
+    if !state.collaboration.eq_ignore_ascii_case("goal") {
         return Vec::new();
+    }
+    let mode = || {
+        if UnicodeWidthStr::width(state.t().goal_mode) > max {
+            return Vec::new();
+        }
+        vec![Span::styled(state.t().goal_mode, Style::default().fg(state.theme.accent.primary))]
+    };
+    let Some(goal) = state.active_goal.as_ref() else {
+        return mode();
     };
     let now = Instant::now();
     if !goal.is_visible(now) {
-        return Vec::new();
+        return mode();
     }
     // A transport retry owns the `↻` mark over the goal's stored phase: the
     // runtime is reconnecting, which is exactly what the user is watching.
@@ -304,16 +320,34 @@ pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
     // kept `◐ <task> · 3m 00s ↗` for as long as the user looked at it, which is
     // exactly the "is my task still running?" question the header exists to
     // answer. Running/resuming keep the marker; paused/failed state the phase.
-    let note = match phase {
-        GoalPhase::Paused => Some(state.t().goal_phase_paused),
-        GoalPhase::Failed => Some(state.t().goal_phase_failed),
-        GoalPhase::Running | GoalPhase::Resuming | GoalPhase::Completed => None,
+    let pending = state.pending_submissions.iter().any(|pending| {
+        pending.command.session_id() == Some(&state.session_id)
+            && matches!(pending.command,
+                leveler_client_protocol::ClientCommand::RunGoal { .. }
+                | leveler_client_protocol::ClientCommand::SubmitMessage { .. })
+    });
+    let label = if pending && matches!(phase, GoalPhase::Running | GoalPhase::Resuming) {
+        state.t().pending_input_sending
+    } else {
+        match phase {
+            GoalPhase::Running if !state.is_busy() => return mode(),
+            GoalPhase::Running => state.t().goal_phase_running,
+            GoalPhase::Paused => state.t().goal_phase_paused,
+            GoalPhase::Resuming => state.t().goal_phase_resuming,
+            GoalPhase::Completed => state.t().goal_phase_completed,
+            GoalPhase::Failed => state.t().goal_phase_failed,
+        }
     };
-    spans(phase, goal.title(), &elapsed, note, &state.theme, max)
+    let note = format!("{} · {label}", state.t().goal_mode);
+    // The explicit mode and phase outrank the title and clock in narrow panes.
+    if 2 + UnicodeWidthStr::width(elapsed.as_str()) + 3 + UnicodeWidthStr::width(note.as_str()) > max {
+        return mode();
+    }
+    spans(phase, goal.title(), &elapsed, Some(&note), &state.theme, max)
 }
 
 pub fn has_visible_goal(state: &AppState) -> bool {
-    state
+    state.collaboration.eq_ignore_ascii_case("goal") && state
         .active_goal
         .as_ref()
         .is_some_and(|goal| goal.is_visible(Instant::now()))

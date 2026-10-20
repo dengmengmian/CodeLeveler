@@ -178,6 +178,7 @@ fn plan(steps: &[(&str, PlanStepStatus)]) -> UiPlan {
                 status: *status,
             })
             .collect(),
+        state: Default::default(),
     }
 }
 

@@ -484,7 +484,8 @@ fn header_line_parts(state: &AppState, width: usize) -> (Line<'static>, Option<(
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(goal);
     let start = width.saturating_sub(goal_w);
-    (Line::from(spans), Some((start, width)))
+    let goal_range = crate::active_goal::has_visible_goal(state).then_some((start, width));
+    (Line::from(spans), goal_range)
 }
 
 /// The header underline: always a static hairline. The status spinner above
@@ -3148,6 +3149,7 @@ mod tests {
                     status: PlanStepStatus::Pending,
                 },
             ],
+            state: Default::default(),
         }
     }
 
@@ -3783,6 +3785,7 @@ mod tests {
                     status: PlanStepStatus::Pending,
                 },
             ],
+            state: Default::default(),
         };
         let rows = strip_rows(&mut state, Some(plan), 100);
         let line = rows[0].trim_end();
@@ -4041,13 +4044,20 @@ mod tests {
                     status: PlanStepStatus::Done,
                 },
             ],
+            state: Default::default(),
         }
     }
 
     #[test]
     fn plan_indicator_hidden_until_steps_exist() {
         // Busy goal with no plan must not reserve chrome for "等待计划".
-        assert!(!plan_indicator_should_show(&UiPlan { steps: vec![] }, true));
+        assert!(!plan_indicator_should_show(
+            &UiPlan {
+                steps: vec![],
+                state: Default::default(),
+            },
+            true
+        ));
         assert!(plan_indicator_should_show(&sample_plan(), true));
     }
 
@@ -4061,6 +4071,7 @@ mod tests {
                 description: "清理/重置任务计划".into(),
                 status: PlanStepStatus::Done,
             }],
+            state: Default::default(),
         };
         assert!(
             !plan_panel_should_show(&one_done),
@@ -4080,6 +4091,7 @@ mod tests {
                     status: PlanStepStatus::Skipped,
                 },
             ],
+            state: Default::default(),
         };
         assert!(!plan_panel_should_show(&multi_done));
 
@@ -4089,6 +4101,7 @@ mod tests {
                 description: "only step".into(),
                 status: PlanStepStatus::Running,
             }],
+            state: Default::default(),
         };
         assert!(
             plan_panel_should_show(&still_open),
@@ -4101,6 +4114,7 @@ mod tests {
                 description: "broke".into(),
                 status: PlanStepStatus::Failed,
             }],
+            state: Default::default(),
         };
         assert!(
             plan_panel_should_show(&failed),
@@ -4267,6 +4281,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            state: Default::default(),
         }
     }
 

@@ -30,6 +30,10 @@ export function projectSnapshot(snapshot, history = []) {
     state.messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index}));
     state.nextSeq = state.messages.length;
   }
+  // Replayed history events carry no terminal classification. The runtime's
+  // snapshot is the authority on whether the newest declaration is active or
+  // history, so a completed plan is never resurrected as active work here.
+  if (snapshot.plan) state.plan = snapshot.plan;
   for (const tool of snapshot.active_tools ?? []) state = applyEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments});
   // The durable history's turn terminal is the runtime's own fact: without it a
   // reopened turn could not tell an answer from interim narration (Contract §I9).
@@ -90,7 +94,7 @@ export function applyEvent(state,event) {
   if(event.type==='assistant_message_started'||event.type==='assistant_text_delta')next.streamingMessageId=event.message_id;
   if(event.type==='assistant_message_completed'&&state.streamingMessageId===event.message_id)next.streamingMessageId=null;
   if(terminalEvents.has(event.type)||event.type==='assistant_attempt_reset')next.streamingMessageId=null;
-  if(event.type==='plan_updated') next.plan=event.plan;
+  if(event.type==='plan_updated') next.plan=event.plan?{...event.plan,state:'active'}:null;
   if(event.type==='turn_failed'){
     const text=event.failure?.message||event.error||'Runtime 执行失败';
     const anchor=event.anchor??[...next.messages].reverse().find(message=>message.role==='user')?.id??null;

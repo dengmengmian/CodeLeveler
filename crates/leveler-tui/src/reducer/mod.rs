@@ -175,13 +175,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     session_id: state.session_id.clone(),
                     query_id: Some(query_id),
                 }));
-            } else if opened && !state.is_busy() {
-                // No conversation exists yet, so the runtime derives a starter
-                // from repository context. It returns as the same transient
-                // ghost used after ordinary turns.
-                effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
-                    session_id: state.session_id.clone(),
-                }));
             }
             // Opening/resuming a session and changing a setting both make the
             // runtime's live accounting current (or, after a model switch or a
@@ -1033,6 +1026,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             |span: Option<(u16, u16)>| span.is_some_and(|(a, b)| (a..b).contains(&mouse.column));
         match hit.index {
             Some(index) if on(hit.send) => return submit::send_pending_input(state, index),
+            Some(index) if on(hit.edit) => submit::edit_pending_input(state, index),
             Some(index) if on(hit.delete) => submit::delete_pending_input(state, index),
             Some(index) => {
                 state.workbench_focus = WorkbenchFocus::Pending;
@@ -1935,7 +1929,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.btw.scroll = state.btw.scroll.saturating_sub(1);
         }
         // 待发送 focus: ↑/↓ choose an item, Enter sends it, Delete/Backspace
-        // deletes it, Esc goes back to the composer. Typing still claims Input.
+        // deletes it, e edits it, Esc goes back to the composer. Typing claims Input.
         KeyCode::Up if state.workbench_focus == WorkbenchFocus::Pending => {
             state.pending_selected = state.pending_selected.saturating_sub(1);
         }
@@ -1945,6 +1939,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Pending => {
             return submit::send_pending_input(state, state.pending_selected);
+        }
+        KeyCode::Char('e')
+            if state.workbench_focus == WorkbenchFocus::Pending && !ctrl && !alt && !btw =>
+        {
+            submit::edit_pending_input(state, state.pending_selected);
         }
         KeyCode::Delete | KeyCode::Backspace
             if state.workbench_focus == WorkbenchFocus::Pending =>

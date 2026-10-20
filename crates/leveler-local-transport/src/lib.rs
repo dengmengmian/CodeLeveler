@@ -162,6 +162,12 @@ pub struct AttachmentBytes {
 /// contract when a daemon owns session creation.
 #[async_trait]
 pub trait LocalRuntimeService: InteractiveRuntimeClient {
+    fn supports_terminal(&self) -> bool { false }
+    /// Direct terminal I/O; older runtimes explicitly reject this capability.
+    async fn terminal(&self, _request: leveler_client_protocol::TerminalRequest) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
+        Err(ClientError::Runtime("integrated terminals are unsupported by this runtime".into()))
+    }
+
     /// A no-workspace source may only serve peers that negotiated nullable snapshots.
     fn has_primary_workspace(&self) -> bool {
         true
@@ -286,6 +292,8 @@ pub enum TransportError {
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
 #[cfg(any(unix, windows))]
 enum WireRequest {
+    TerminalSupported,
+    Terminal(leveler_client_protocol::TerminalRequest),
     Ping,
     Send(ClientCommand),
     Deliver(ProtocolEnvelope<CommandEnvelope>),
@@ -372,6 +380,8 @@ impl WireRequest {
     /// the request path (it has its own reconnect loop).
     fn safe_to_retry_after_transport_failure(&self) -> bool {
         match self {
+            WireRequest::TerminalSupported => true,
+            WireRequest::Terminal(request) => matches!(request.operation, leveler_client_protocol::TerminalOperation::Create {..} | leveler_client_protocol::TerminalOperation::Observe {..} | leveler_client_protocol::TerminalOperation::Resize {..} | leveler_client_protocol::TerminalOperation::Close),
             WireRequest::Ping
             | WireRequest::Snapshot { .. }
             | WireRequest::LocalWaiters
@@ -398,6 +408,8 @@ impl WireRequest {
     /// human sentence: it is a fact about which call went unanswered.
     fn operation_name(&self) -> &'static str {
         match self {
+            WireRequest::TerminalSupported => "terminal_supported",
+            WireRequest::Terminal(_) => "terminal",
             WireRequest::Ping => "ping",
             WireRequest::Send(_) => "send",
             WireRequest::Deliver(_) => "deliver",
@@ -442,6 +454,8 @@ fn request_timeout() -> Option<std::time::Duration> {
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
 #[cfg(any(unix, windows))]
 enum WireResponse {
+    TerminalSupported(bool),
+    Terminal(Option<leveler_client_protocol::TerminalState>),
     Ack,
     Snapshot(UiSessionSnapshot),
     SessionCreated(SessionBootstrap),
@@ -857,6 +871,15 @@ mod transport {
                         .map(WireResponse::RetireDecision),
                 )
                 .await
+            }
+            WireRequest::TerminalSupported => send_response(&mut stream, WireResponse::TerminalSupported(transport_trusted && runtime.supports_terminal())).await,
+            WireRequest::Terminal(request) => {
+                let result = if transport_trusted {
+                    runtime.terminal(request).await
+                } else {
+                    Err(ClientError::Runtime("integrated terminals require trusted local access".into()))
+                };
+                send_result(&mut stream, result.map(WireResponse::Terminal)).await
             }
             WireRequest::FetchAttachment { sha256 } => {
                 send_result(
@@ -1302,6 +1325,25 @@ mod transport {
     /// delegates to the inherent method of the same name.
     #[async_trait]
     impl LocalRuntimeService for LocalSocketRuntimeClient {
+        async fn terminal(&self, request: leveler_client_protocol::TerminalRequest) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
+            request.validate().map_err(ClientError::Runtime)?;
+            if self.client_kind == ClientKind::Remote { return Err(ClientError::Runtime("integrated terminals require a local interactive client".into())); }
+            // A read-only negotiation precedes every mutation; legacy peers
+            // cannot accidentally accept a write before reporting unsupported.
+            match self.request(WireRequest::TerminalSupported).await {
+                Ok(WireResponse::TerminalSupported(true)) => {},
+                Ok(WireResponse::TerminalSupported(false)) | Err(TransportError::PeerClosed) => return Err(ClientError::Runtime("integrated terminals are unsupported by this runtime".into())),
+                Ok(WireResponse::Error(error)) => return Err(error.into_client_error()),
+                Ok(response) => return Err(unexpected_response(response)),
+                Err(error) => return Err(transport_client_error(error)),
+            }
+            match self.request(WireRequest::Terminal(request)).await.map_err(transport_client_error)? {
+                WireResponse::Terminal(state) => Ok(state),
+                WireResponse::Error(error) => Err(error.into_client_error()),
+                response => Err(unexpected_response(response)),
+            }
+        }
+
         async fn attach_session_policy(
             &self,
             session_id: &SessionId,
@@ -2311,6 +2353,32 @@ mod tests {
         let shutdown = CancellationToken::new();
         tokio::spawn(server.serve(shutdown.clone()));
         (bound, runtime, shutdown)
+    }
+
+    #[tokio::test]
+    async fn terminal_capability_negotiation_rejects_unsupported_runtime_and_remote_clients() {
+        use leveler_client_protocol::{TerminalRequest,TerminalOperation};
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("terminal.sock");
+        let runtime=Arc::new(TestRuntime::new());
+        let server=LocalSocketServer::bind(&path,runtime).await.unwrap();
+        let shutdown=CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let request=TerminalRequest{session_id:SessionId::new("s"),terminal_id:"12345678-1234-1234-1234-123456789abc".into(),operation:TerminalOperation::Create{cols:80,rows:24}};
+        let local=LocalSocketRuntimeClient::connect_as(&path,ClientKind::LocalInteractive).await.unwrap();
+        assert!(local.terminal(request.clone()).await.unwrap_err().to_string().contains("unsupported"));
+        let remote=LocalSocketRuntimeClient::connect_as(&path,ClientKind::Remote).await.unwrap();
+        assert!(remote.terminal(request).await.unwrap_err().to_string().contains("local interactive"));
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn terminal_input_is_never_automatically_replayed() {
+        use leveler_client_protocol::{TerminalRequest,TerminalOperation};
+        let make=|operation| WireRequest::Terminal(TerminalRequest{session_id: SessionId::new("s"),terminal_id:"12345678-1234-1234-1234-123456789abc".into(),operation});
+        assert!(!make(TerminalOperation::Write{data:vec![b'x']}).safe_to_retry_after_transport_failure());
+        assert!(make(TerminalOperation::Create{cols:80,rows:24}).safe_to_retry_after_transport_failure());
+        assert!(make(TerminalOperation::Observe{cursor:0,max_bytes:1024}).safe_to_retry_after_transport_failure());
     }
 
     #[test]
@@ -4149,6 +4217,7 @@ mod tests {
         let replacement_runtime = TestRuntime::new();
         replacement_runtime.snapshot.lock().unwrap().repository =
             Some("/repo-after-restart".to_string());
+        let replacement_events = replacement_runtime.events.clone();
         let second_shutdown = CancellationToken::new();
         let second_server = LocalSocketServer::bind(&path, Arc::new(replacement_runtime))
             .await
@@ -4167,6 +4236,25 @@ mod tests {
         .await
         .expect("the existing client must reconnect and receive a fresh snapshot");
         assert_eq!(event.id, SessionId::new("s1"));
+        // The resubscribed stream must keep carrying live events, not only the
+        // one resync snapshot.
+        replacement_events
+            .send(RuntimeEvent::Notification {
+                level: leveler_client_protocol::NotificationLevel::Info,
+                message: "after reconnect".into(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let RuntimeEvent::Notification { message, .. } = events.recv().await.unwrap()
+                    && message == "after reconnect"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("events after a reconnect must reach the existing subscriber");
 
         second_shutdown.cancel();
         second_task.await.unwrap().unwrap();

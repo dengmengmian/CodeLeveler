@@ -91,6 +91,27 @@ impl Database {
     }
 }
 
+/// Build a genuine pre-`before` database: apply only the migrations an older
+/// binary would have recorded. Test-only; production code never creates a
+/// legacy store.
+#[cfg(test)]
+pub(crate) async fn create_legacy_database(path: &Path, before: i64) -> sqlx::SqliteConnection {
+    use sqlx::ConnectOptions;
+    use sqlx::migrate::Migrate;
+
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    conn.ensure_migrations_table().await.unwrap();
+    for migration in MIGRATOR.migrations.iter().filter(|m| m.version < before) {
+        conn.apply(migration).await.unwrap();
+    }
+    conn
+}
+
 /// Best-effort, read-only peek at the repository path recorded in a state
 /// dir's `sessions.db` — the discovery fallback for state dirs that predate
 /// the `.repository-root` ownership marker. Never creates or migrates the

@@ -57,6 +57,8 @@ pub mod session_wire;
 mod skills;
 mod snapshot;
 mod version;
+mod terminal;
+pub use terminal::{TerminalOperation, TerminalRequest, TerminalState};
 mod wire_types;
 
 pub use agents::{
@@ -99,7 +101,8 @@ pub use observability::{
 };
 pub use origin::ClientOrigin;
 pub use progress::{
-    FinalizationStage, PlanStepStatus, UiCompletionReport, UiDiff, UiDiffFile, UiPlan, UiPlanStep,
+    FinalizationStage, PlanStepStatus, UiCompletionReport, UiDiff, UiDiffFile, UiPlan, UiPlanState,
+    UiPlanStep,
 };
 pub use retirement::{RetireDecision, RetireRequest};
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};

@@ -839,6 +839,7 @@ fn a_plan_transition_repaints_on_the_same_frame() {
                         status: c,
                     },
                 ],
+                state: Default::default(),
             },
         })
     };
@@ -882,6 +883,7 @@ fn renders_plan_chrome_and_diff_screen() {
                     description: "调整页面布局".into(),
                     status: PlanStepStatus::Running,
                 }],
+                state: Default::default(),
             },
         }),
     );
@@ -1576,6 +1578,7 @@ fn goal_recap_and_plan_dock_do_not_mix() {
                 status: leveler_client_protocol::PlanStepStatus::Running,
             },
         ],
+        state: Default::default(),
     });
     let text = render_at(100, 34, &mut state);
     let recap_line = text

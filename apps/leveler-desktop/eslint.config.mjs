@@ -14,5 +14,5 @@ export default [
     },
   },
   { files: ['**/*.cjs'], languageOptions: { sourceType: 'commonjs', globals: readonly('require module exports __dirname __filename') } },
-  { files: ['src/renderer.mjs', 'src/presentation.mjs', 'src/icons.mjs', 'src/ui.mjs', 'scripts/*.mjs'], languageOptions: { globals: readonly('window document localStorage matchMedia requestAnimationFrame cancelAnimationFrame ResizeObserver HTMLElement HTMLTextAreaElement HTMLInputElement HTMLButtonElement KeyboardEvent Event getComputedStyle navigator location performance innerWidth innerHeight NodeFilter Highlight CSS queueMicrotask') } },
+  { files: ['src/terminal.mjs', 'src/renderer.mjs', 'src/presentation.mjs', 'src/icons.mjs', 'src/ui.mjs', 'scripts/*.mjs'], languageOptions: { globals: readonly('window document localStorage matchMedia requestAnimationFrame cancelAnimationFrame ResizeObserver HTMLElement HTMLTextAreaElement HTMLInputElement HTMLButtonElement KeyboardEvent Event getComputedStyle navigator location performance innerWidth innerHeight NodeFilter Highlight CSS queueMicrotask MutationObserver TextEncoder atob btoa') } },
 ];

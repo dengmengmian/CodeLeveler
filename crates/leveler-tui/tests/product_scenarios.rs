@@ -207,6 +207,7 @@ fn plan(steps: &[(&str, PlanStepStatus)]) -> UiPlan {
                 status: *st,
             })
             .collect(),
+        state: Default::default(),
     }
 }
 

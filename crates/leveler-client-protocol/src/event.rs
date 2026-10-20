@@ -1250,6 +1250,7 @@ mod tests {
                         description: "step".to_string(),
                         status: PlanStepStatus::Running,
                     }],
+                    state: Default::default(),
                 },
             },
             "plan_updated",

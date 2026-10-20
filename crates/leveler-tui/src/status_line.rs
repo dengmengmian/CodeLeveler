@@ -784,6 +784,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            state: Default::default(),
         }
     }
 

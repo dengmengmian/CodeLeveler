@@ -4283,6 +4283,7 @@ mod tests {
                     status: leveler_client_protocol::PlanStepStatus::Running,
                 },
             ],
+            state: Default::default(),
         });
 
         let text = render_text(&mut s, 100, 32);
@@ -4313,6 +4314,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            state: Default::default(),
         });
 
         let text = render_text(&mut s, 100, 40);
@@ -4347,6 +4349,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            state: Default::default(),
         });
 
         let text = render_text(&mut s, 100, 22);

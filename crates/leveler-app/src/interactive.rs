@@ -44,8 +44,8 @@ use leveler_storage::{MessageRepository, SessionRepository};
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
     AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
-    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
-    UiSessionSummary, UiThinkingAccess, UiThinkingState,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiPlan, UiPlanState,
+    UiRole, UiSessionSnapshot, UiSessionSummary, UiThinkingAccess, UiThinkingState,
 };
 
 /// Whether a turn auto-approves risky actions. True when the session opted in
@@ -5864,46 +5864,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let mut recaps = Vec::new();
         let stores = leveler_storage::EngineStores::from_database(&db);
 
-        // The live view only knows what THIS process forwarded. After a
-        // restart it is empty, so reconstruct the active-plan projection from
-        // durable lifecycle order. A plan older than the latest task terminal
-        // is historical: `last seen plan` must never mean `still active`.
-        // Conversely, a later PlanUpdated belongs to an open/new epoch and is
-        // exactly the state a resumed turn seeds from.
-        let plan = match live.plan {
-            Some(plan) => Some(plan),
-            None => match stores
-                .events
-                .load_last_by_type(session_id, "plan_updated", None)
-                .await
-                .map_err(|e| ClientError::Runtime(e.to_string()))?
-            {
-                Some(row) => {
-                    let latest_terminal = stores
-                        .events
-                        .load_last_by_type(session_id, "task_finished", None)
-                        .await
-                        .map_err(|e| ClientError::Runtime(e.to_string()))?;
-                    if latest_terminal.is_some_and(|terminal| terminal.sequence > row.sequence) {
-                        None
-                    } else {
-                        match leveler_engine::EngineEvent::from_payload(&row.payload)
-                            .map_err(|e| ClientError::Runtime(e.to_string()))?
-                        {
-                            leveler_engine::EngineEvent::PlanUpdated { steps } => {
-                                Some(crate::event_bridge::ui_plan(steps))
-                            }
-                            _ => {
-                                return Err(ClientError::Runtime(
-                                    "plan_updated row carried a different event".into(),
-                                ));
-                            }
-                        }
-                    }
-                }
-                None => None,
-            },
-        };
+        let plan = projected_plan(&stores, session_id, live.plan).await?;
         if let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await
             && let Ok(goals) = stores.goals.for_task(&task).await
         {
@@ -6065,6 +6026,57 @@ fn spawn_force_retire_drain(runtime: &InProcessRuntimeClient) {
 
 #[async_trait]
 impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
+    fn supports_terminal(&self) -> bool { cfg!(unix) && self.app.layout.primary_workspace().is_some() }
+    async fn terminal(&self, request: leveler_client_protocol::TerminalRequest) -> Result<Option<leveler_client_protocol::TerminalState>, ClientError> {
+        use leveler_client_protocol::TerminalOperation;
+        use leveler_execution::command::PtySize;
+        request.validate().map_err(ClientError::Runtime)?;
+        if self.app.layout.primary_workspace().is_none() {
+            return Err(ClientError::Runtime("integrated terminals require a workspace".into()));
+        }
+        // Hydrates durable settings and validates this session's canonical source.
+        let config = self.runtime_config(&request.session_id).await?;
+        let id=format!("host-{}",request.terminal_id.replace('-',""));
+        let owner=request.session_id.as_str();
+        let registry=self.app.background_tasks();
+        let observation=match request.operation {
+            TerminalOperation::Create {cols,rows} => {
+                let (_,mut process,_) = self.app.user_shell_execution(config.mode,config.sandbox,"").map_err(|e|ClientError::Runtime(e.to_string()))?;
+                let shell=self.app.environment.var("SHELL").filter(|s|std::path::Path::new(s).is_absolute() && std::path::Path::new(s).is_file()).unwrap_or_else(|| "/bin/zsh".into());
+                process.program=shell;
+                process.args=vec!["-l".into()];
+                process.pty=Some(PtySize{cols,rows});
+                process.unrestricted_execution=config.mode == leveler_execution::PermissionProfile::FullAccess;
+                registry.create_terminal(&id,process,owner).await.map_err(ClientError::Runtime)?
+            },
+            TerminalOperation::Write {data} => {
+                registry.terminal_write(&id,owner,data).await.map_err(ClientError::Runtime)?;
+                return Ok(None);
+            },
+            TerminalOperation::Resize {cols,rows} => {
+                registry.terminal_resize(&id,owner,PtySize{cols,rows}).await.map_err(ClientError::Runtime)?;
+                return Ok(None);
+            },
+            TerminalOperation::Observe {cursor,max_bytes} => registry.terminal_observe(&id,owner,cursor,max_bytes).await.map_err(ClientError::Runtime)?,
+            TerminalOperation::Close => {
+                registry.kill_owned(&id,owner).await.map_err(ClientError::Runtime)?;
+                registry.terminal_observe(&id,owner,0,65536).await.map_err(ClientError::Runtime)?
+            }
+        };
+        let snapshot=observation.snapshot;
+        Ok(Some(leveler_client_protocol::TerminalState {
+            terminal_id:request.terminal_id,shell:snapshot.program,cwd:snapshot.cwd.display().to_string(),
+            status:match snapshot.status {
+                leveler_execution::BackgroundTaskStatus::Running => "running",
+                leveler_execution::BackgroundTaskStatus::Killing => "killing",
+                leveler_execution::BackgroundTaskStatus::Exited => "exited",
+                leveler_execution::BackgroundTaskStatus::Killed => "killed",
+                leveler_execution::BackgroundTaskStatus::Unknown => "unknown",
+            }.into(),exit_code:snapshot.exit_code,pid:snapshot.pid,
+            cols:observation.cols,rows:observation.rows,output_start:observation.output_start,output_end:observation.output_end,next_cursor:observation.next_cursor,data:observation.data,truncated:observation.truncated,
+        }))
+    }
+
     fn has_primary_workspace(&self) -> bool {
         self.app.layout.primary_workspace().is_some()
     }
@@ -6515,6 +6527,63 @@ fn parse_history_messages_strict(payloads: &[String]) -> Result<Vec<Message>, St
     Ok(out)
 }
 
+/// The newest plan declaration with its durable lifecycle classification.
+///
+/// The live view only knows what THIS process forwarded. After a restart it is
+/// empty, so the append-only log is the authority: a plan followed by a task
+/// terminal is history and stays viewable, but is never reported as active
+/// work. A later `PlanUpdated` row wins by sequence, so a new epoch is active
+/// and an old plan cannot overwrite it.
+async fn projected_plan(
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+    live: Option<UiPlan>,
+) -> Result<Option<UiPlan>, ClientError> {
+    if let Some(plan) = live {
+        return Ok(Some(plan));
+    }
+    let Some(row) = stores
+        .events
+        .load_last_by_type(session_id, "plan_updated", None)
+        .await
+        .map_err(|e| ClientError::Runtime(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let steps = match leveler_engine::EngineEvent::from_payload(&row.payload)
+        .map_err(|e| ClientError::Runtime(e.to_string()))?
+    {
+        leveler_engine::EngineEvent::PlanUpdated { steps } => steps,
+        _ => {
+            return Err(ClientError::Runtime(
+                "plan_updated row carried a different event".into(),
+            ));
+        }
+    };
+    let terminal = stores
+        .events
+        .load_last_by_type(session_id, "task_finished", None)
+        .await
+        .map_err(|e| ClientError::Runtime(e.to_string()))?;
+    let state = match terminal {
+        Some(terminal) if terminal.sequence > row.sequence => {
+            match leveler_engine::EngineEvent::from_payload(&terminal.payload)
+                .map_err(|e| ClientError::Runtime(e.to_string()))?
+            {
+                leveler_engine::EngineEvent::TaskFinished {
+                    outcome: leveler_lifecycle::TaskOutcome::Completed,
+                    ..
+                } => UiPlanState::Completed,
+                _ => UiPlanState::Interrupted,
+            }
+        }
+        _ => UiPlanState::Active,
+    };
+    let mut plan = crate::event_bridge::ui_plan(steps);
+    plan.state = state;
+    Ok(Some(plan))
+}
+
 /// Summarize a session's history via the model and replace it with the summary,
 /// then push a refreshed snapshot (spec §28, §53).
 ///
@@ -6773,6 +6842,23 @@ async fn compact_conversation(
             .unwrap_or(false);
         let thinking = ui_thinking_state(profile.as_ref(), thinking_level);
         let live = live_views.view(session_id);
+        // This push REPLACES the client's view, so it must carry the same
+        // durable plan projection `snapshot` would: after a restart the live
+        // view is empty even though the log still holds the plan.
+        let live_plan = live.plan.clone();
+        let plan = match projected_plan(
+            &leveler_storage::EngineStores::from_database(&db),
+            session_id,
+            live_plan.clone(),
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(%error, "durable plan projection failed; keeping the live plan");
+                live_plan
+            }
+        };
         let active_background_tasks = background_snapshots
             .into_iter()
             .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
@@ -6824,7 +6910,7 @@ async fn compact_conversation(
                 last_sequence,
                 active_tools: live.active_tools,
                 active_background_tasks,
-                plan: live.plan,
+                plan,
                 diff: live.diff,
                 checkpoints: Vec::new(),
                 recaps: Vec::new(),

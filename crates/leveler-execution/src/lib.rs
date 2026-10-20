@@ -29,6 +29,8 @@ pub mod host_settlement;
 pub mod network;
 pub mod permission_rules;
 pub mod policy;
+#[cfg(unix)]
+mod pty;
 pub mod resource_identity;
 pub mod risk;
 mod shell_ast;

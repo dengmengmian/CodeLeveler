@@ -8,16 +8,21 @@ const os=require('node:os');
 const { Bridge }=require('./bridge.cjs');
 const { validateEnvelope }=require('./security.cjs');
 const { ManualBrowser }=require('./browser.cjs');
-const { installedCatalog,resolveTarget }=require('./open-in-app.cjs');
+const { installedCatalog,resolveTarget,applicationIcon }=require('./open-in-app.cjs');
 const { RecentWorkspaceSelection,taskListOptions }=require('./workspace-selection.cjs');
 const { AttachmentIngress }=require('./attachment-ingress.cjs');
 const { copyText }=require('./clipboard-write.cjs');
 const { settingsMenuItem }=require('./settings-menu.cjs');
 const { WorkspaceFiles }=require('./workspace-files.cjs');
+const { installTerminalIpc }=require('./terminal-ipc.cjs');
+let closeTerminals=async()=>{};
 protocol.registerSchemesAsPrivileged([{scheme:'leveler-desktop',privileges:{standard:true,secure:true,supportFetchAPI:true}}]);
 let window,bridge,browser;const folders=new Map();
 let quitApproved=false,quitPromptOpen=false,quitInspection=null;
 let selectedSource=null;
+// The session this window last confirmed with a snapshot. Reconnect restores
+// this pair by id; it is never used to create anything.
+let lastTask=null,restoring=false;
 const allowedRoots=new Set();
 const sessionRoots=new Map();
 const appIcons=new Map();
@@ -42,7 +47,18 @@ function workspaceFiles(sessionId){
   if(!root)throw new Error('当前会话没有可读取的工作区');
   return new WorkspaceFiles({root});
 }
-async function appIcon(bundle){if(appIcons.has(bundle))return appIcons.get(bundle);let icon=null;try{const image=await app.getFileIcon(bundle,{size:'small'});if(!image.isEmpty())icon=image.toDataURL();}catch{}appIcons.set(bundle,icon);return icon;}
+async function appIcon(bundle){
+  if(appIcons.has(bundle))return appIcons.get(bundle);
+  let icon=null;
+  try{icon=await applicationIcon(bundle);}
+  catch(error){
+    console.warn('Application bundle icon unavailable:',path.basename(bundle),error.message);
+    try{const image=await app.getFileIcon(bundle,{size:'small'});if(!image.isEmpty())icon=image.toDataURL();}
+    catch(error){console.warn('System application icon unavailable:',path.basename(bundle),error.message);}
+  }
+  appIcons.set(bundle,icon);
+  return icon;
+}
 const attachments=new AttachmentIngress({pickFile:async()=>{const result=await dialog.showOpenDialog(window,{title:'上传附件',properties:['openFile']});return result.canceled?null:result.filePaths[0]??null;},deliver:envelope=>bridge.request('deliver',{envelope})});
 function attachmentSession(snapshot){if(selectedSource&&snapshot?.id)attachments.activate({sourceId:selectedSource,sessionId:snapshot.id,vision:snapshot.vision===true});}
 const recentWorkspaces=new RecentWorkspaceSelection(folders);
@@ -79,8 +95,29 @@ async function requestQuit(){
   quitApproved=true;
   app.quit();
 }
+function sendFrame(frame){if(window && !window.isDestroyed())window.webContents.send('desktop:event',frame);}
+function rememberTask(snapshot){if(!snapshot||typeof snapshot.id!=='string'||!selectedSource)return;lastTask={source_id:selectedSource,id:snapshot.id};}
+// A lost bridge is the only connection that Desktop itself can repair: the
+// Runtime Host already revives a dead daemon behind it. Restore the session
+// the person was looking at, by the ids a successful snapshot confirmed.
+// Never create here — an unconfirmed create must not become a duplicate.
+async function restoreSession(){
+  if(restoring||!lastTask)return;
+  restoring=true;
+  const target={...lastTask};
+  try{
+    sendFrame({event:'connection',state:'restoring',attempt:bridge.attempt});
+    const result=await bridge.request('open',{source_id:target.source_id,session_id:target.id});
+    if(!lastTask||lastTask.id!==target.id||lastTask.source_id!==target.source_id)return;
+    selectedSource=result.source_id;rememberTask(result.session);trackSnapshot(result.session);attachmentSession(result.session);
+    sendFrame({event:'restored',data:result});
+  }catch(error){
+    if(!window||window.isDestroyed())return;
+    sendFrame({event:'connection',state:'restore_failed',message:error.message,next_step:error.nextStep});
+  }finally{restoring=false;}
+}
 async function createWindow(){
-  bridge=new Bridge(process.env.LEVELER_BINARY || path.resolve(__dirname,'../../../target/debug/leveler'),{onEvent:frame=>{if(frame.session_id===attachments.selected?.sessionId){if(frame.event==='snapshot')attachmentSession(frame.data);if(frame.event==='runtime'&&frame.data?.type==='session_updated')attachmentSession(frame.data.session);}attachments.observe(frame);if(window && !window.isDestroyed())window.webContents.send('desktop:event',frame);}});
+  bridge=new Bridge(process.env.LEVELER_BINARY || path.resolve(__dirname,'../../../target/debug/leveler'),{onEvent:frame=>{if(frame.session_id===attachments.selected?.sessionId){if(frame.event==='snapshot')attachmentSession(frame.data);if(frame.event==='runtime'&&frame.data?.type==='session_updated')attachmentSession(frame.data.session);}if(frame.event==='snapshot')rememberTask(frame.data);attachments.observe(frame);sendFrame(frame);},onState:state=>{sendFrame(state);if(state.state==='connected'&&state.resumed===true&&lastTask)restoreSession();}});
   window=new BrowserWindow({width:1280,height:820,minWidth:520,minHeight:520,title:'CodeLeveler',...(process.platform==='darwin'?{titleBarStyle:'hiddenInset',trafficLightPosition:{x:16,y:18},vibrancy:'sidebar',visualEffectState:'active',backgroundColor:'#00000000'}:{backgroundColor:'#f9fafb'}),webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false,webSecurity:true}});
   browser=new ManualBrowser({window,WebContentsView,session,shell,onState:state=>{if(window&&!window.isDestroyed())window.webContents.send('desktop:browser-event',state);}});
   window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
@@ -92,11 +129,12 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs']);
-  protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
+  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs']);
+  protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(['node_modules/@xterm/xterm/lib/xterm.mjs','node_modules/@xterm/xterm/css/xterm.css','node_modules/@xterm/addon-fit/lib/addon-fit.mjs'].includes(name))return net.fetch(pathToFileURL(path.join(__dirname,'..',name)).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
   handle('desktop:list',options=>{const params=taskListOptions(options);return bridge.request('list_tasks',params).then(index=>{recentWorkspaces.update(index,params.include_archived);return index;});});
+  closeTerminals=installTerminalIpc({handle,bridge});
   handle('desktop:info',()=>bridge.request('runtime_info'));
   handle('desktop:app-info',()=>({version:app.getVersion()}));
   handle('desktop:update-check',()=>new Promise((resolve,reject)=>{
@@ -131,13 +169,15 @@ app.whenReady().then(async()=>{
   handle('desktop:attachment',sessionId=>attachments.choose(text(sessionId,'session')));
   handle('desktop:discard-upload',value=>{if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==2||!Object.hasOwn(value,'sessionId')||!Object.hasOwn(value,'importId'))throw new Error('Invalid upload discard');return attachments.discard(text(value.sessionId,'session'),text(value.importId,'import'));});
   handle('desktop:folder',async()=>{const result=await dialog.showOpenDialog(window,{title:'选择 Workspace 文件夹',properties:['openDirectory']});if(result.canceled)return null;const id=randomUUID();folders.set(id,result.filePaths[0]);return {id,path:result.filePaths[0]};});
-  handle('desktop:create',async selection=>{let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create',{goal:''});addRoot(workspace);trackSnapshot(result.session);attachmentSession(result.session);return result;});
-  handle('desktop:create-identified',async ({selection,requestId})=>{if(typeof requestId!=='string'||!requestId)throw new Error('identified creation requires request_id');let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create_identified',{goal:'',request_id:requestId});addRoot(workspace);trackSnapshot(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:create',async selection=>{let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create',{goal:''});addRoot(workspace);trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:create-identified',async ({selection,requestId})=>{if(typeof requestId!=='string'||!requestId)throw new Error('identified creation requires request_id');let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create_identified',{goal:'',request_id:requestId});addRoot(workspace);trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
   handle('desktop:open',async task=>{if(!task||typeof task!=='object')throw new Error('Invalid task');attachments.activate(null);let result;try{result=await bridge.request('open',{source_id:text(task.source_id,'source'),session_id:text(task.id,'session')});}catch(error){// A missing workspace is an external state the person can restore; the
     // raw OS error names neither the cause nor the next step.
     if(/No such file or directory|os error 2/i.test(String(error?.message??'')))throw new Error('会话的工作区文件夹不存在或无法访问。请恢复该文件夹后重新打开会话。');
-    throw error;}selectedSource=result.source_id;trackSnapshot(result.session);attachmentSession(result.session);return result;});
-  handle('desktop:snapshot',async sessionId=>{const snapshot=await bridge.request('snapshot',{session_id:text(sessionId,'session')});trackSnapshot(snapshot);attachmentSession(snapshot);return snapshot;});
+    throw error;}selectedSource=result.source_id;trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:snapshot',async sessionId=>{const snapshot=await bridge.request('snapshot',{session_id:text(sessionId,'session')});trackSnapshot(snapshot);rememberTask(snapshot);attachmentSession(snapshot);return snapshot;});
+  handle('desktop:connection-status',()=>bridge.status());
+  handle('desktop:reconnect',()=>{bridge.retry();return {ok:true};});
   handle('desktop:open-in-app-apps',async()=>{const apps=installedCatalog();return Promise.all(apps.map(async app=>({...app,icon:await appIcon(app.path)})));});
   handle('desktop:open-in-app',async value=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid open request');const keys=Object.keys(value);if(keys.some(key=>!['path','appId','action'].includes(key)))throw new Error('Invalid open request');const action=value.action;if(!['open','reveal','default'].includes(action))throw new Error('Invalid open action');const target=resolveTarget(value.path,[...allowedRoots]);if(action==='default'){const error=await shell.openPath(target);if(error)throw new Error(error);return {ok:true};}if(action==='reveal'){if(statSync(target).isDirectory()){const error=await shell.openPath(target);if(error)throw new Error(error);}else shell.showItemInFolder(target);return {ok:true};}const appId=text(value.appId,'application');const catalog=installedCatalog();const selected=catalog.find(candidate=>candidate.id===appId);if(!selected)throw new Error('应用不可用');if(selected.id==='finder'){const error=await shell.openPath(target);if(error)throw new Error(error);return {ok:true};}const child=spawn('/usr/bin/open',['-a',selected.path,target],{detached:true,stdio:'ignore'});child.unref();return {ok:true};});
   handle('desktop:deliver',envelope=>{validateEnvelope(envelope,(sessionId,ref)=>attachments.authorize(sessionId,ref));if(envelope.command.type==='submit_message'&&envelope.command.attachments?.length&&attachments.selected?.vision!==true)throw new Error('当前模型不支持图片，请切换到视觉模型或移除附件');return bridge.request('deliver',{envelope}).then(()=>({ok:true}),error=>({ok:false,error:{message:error.message,kind:error.kind ?? 'outcome_unknown'}}));});
@@ -156,5 +196,5 @@ app.on('window-all-closed',()=>app.quit());
 let quitting=false;
 app.on('before-quit',event=>{
   if(!quitApproved){event.preventDefault();requestQuit();return;}
-  if(bridge&&!quitting){event.preventDefault();quitting=true;bridge.close().finally(()=>app.quit());}
+  if(bridge&&!quitting){event.preventDefault();quitting=true;closeTerminals().finally(()=>bridge.close()).finally(()=>app.quit());}
 });

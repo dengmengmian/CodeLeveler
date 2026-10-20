@@ -46,11 +46,33 @@ pub struct UiPlanStep {
     pub status: PlanStepStatus,
 }
 
+/// Whether the plan is the current turn's work or durable history.
+///
+/// The durable log keeps every declaration; this field is the runtime's
+/// authoritative classification of the newest one. A plan from before a task
+/// terminal is still returned after a restart, but never as active work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiPlanState {
+    /// The newest declaration belongs to an epoch with no task terminal.
+    #[default]
+    Active,
+    /// The owning task finished normally.
+    Completed,
+    /// The owning task failed, was cancelled, or its process died.
+    Interrupted,
+}
+
 /// The execution plan (spec §20).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiPlan {
     pub steps: Vec<UiPlanStep>,
+    /// Lifecycle of the newest declaration. Older runtimes omit it, which
+    /// decodes as [`UiPlanState::Active`] — their only previous behavior.
+    #[serde(default)]
+    pub state: UiPlanState,
 }
 
 /// One changed file (spec §21).

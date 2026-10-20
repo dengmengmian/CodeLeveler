@@ -112,6 +112,9 @@ enum Request {
         #[serde(default)]
         unrestricted: bool,
     },
+    TerminalWrite { id: String, owner: String, data: Vec<u8> },
+    TerminalResize { id: String, owner: String, size: crate::command::PtySize },
+    TerminalObserve { id: String, owner: String, cursor: u64, max_bytes: usize },
     Observe {
         id: String,
         owner: String,
@@ -134,6 +137,7 @@ enum Reply {
     Tasks(Vec<HostedTask>),
     Task(BackgroundTaskSnapshot),
     Observation(BackgroundTaskObservation),
+    TerminalObservation(crate::background::TerminalObservation),
     SpawnRejected(String),
     SpawnUnknown(String),
     Error(String),
@@ -598,6 +602,32 @@ impl ExecutionHostClient {
             _ => Err("invalid Execution Host list reply".into()),
         }
     }
+    pub fn require_terminal(&self) -> Result<(), String> {
+        for capability in ["terminal.pty", "terminal.input", "terminal.resize", "terminal.raw-observe"] {
+            if !self.ready.capabilities.iter().any(|c| c == capability) {
+                return Err(format!("Unsupported: Execution Host missing {capability}; existing services preserved"));
+            }
+        }
+        Ok(())
+    }
+    pub async fn terminal_write(&self, id: &str, owner: &str, data: Vec<u8>) -> Result<(), String> {
+        self.require_terminal()?;
+        match self.call(Request::TerminalWrite { id: id.into(), owner: owner.into(), data }).await? {
+            Reply::Acknowledged => Ok(()), _ => Err("invalid terminal write reply".into()),
+        }
+    }
+    pub async fn terminal_resize(&self, id: &str, owner: &str, size: crate::command::PtySize) -> Result<(), String> {
+        self.require_terminal()?;
+        match self.call(Request::TerminalResize { id: id.into(), owner: owner.into(), size }).await? {
+            Reply::Acknowledged => Ok(()), _ => Err("invalid terminal resize reply".into()),
+        }
+    }
+    pub async fn terminal_observe(&self, id: &str, owner: &str, cursor: u64, max_bytes: usize) -> Result<crate::background::TerminalObservation, String> {
+        self.require_terminal()?;
+        match self.call(Request::TerminalObserve { id: id.into(), owner: owner.into(), cursor, max_bytes }).await? {
+            Reply::TerminalObservation(value) => Ok(value), _ => Err("invalid terminal observation reply".into()),
+        }
+    }
     pub async fn spawn(
         &self,
         id: &str,
@@ -612,6 +642,7 @@ impl ExecutionHostClient {
         // explicit stop — so a Runtime service must not be refused (or silently
         // fall back to a runtime-local process) just because the persistent
         // owner has not been upgraded yet.
+        if request.pty.is_some() { self.require_terminal().map_err(SpawnError::Rejected)?; }
         let lifetime = hosted_wire_lifetime(self.peer_major, lifetime);
         match self
             .call(Request::Spawn {
@@ -1101,6 +1132,22 @@ impl Host {
                 self.persist().await?;
                 Ok(Reply::Task(t))
             }
+            Request::TerminalWrite { id, owner, data } => {
+                let local = self.local(&id, &owner, false).await?;
+                self.registry.terminal_write(&local, &owner, data).await?;
+                Ok(Reply::Acknowledged)
+            }
+            Request::TerminalResize { id, owner, size } => {
+                let local = self.local(&id, &owner, false).await?;
+                self.registry.terminal_resize(&local, &owner, size).await?;
+                Ok(Reply::Acknowledged)
+            }
+            Request::TerminalObserve { id, owner, cursor, max_bytes } => {
+                let local = self.local(&id, &owner, false).await?;
+                let mut value = self.registry.terminal_observe(&local, &owner, cursor, max_bytes).await?;
+                value.snapshot.id = id;
+                Ok(Reply::TerminalObservation(value))
+            }
             Request::Observe {
                 id,
                 owner,
@@ -1188,6 +1235,8 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
         minor: PROTOCOL_MINOR,
         capabilities: REQUIRED_CAPABILITIES
             .iter()
+            .copied()
+            .chain(if cfg!(unix) { vec!["terminal.pty", "terminal.input", "terminal.resize", "terminal.raw-observe"] } else { vec![] })
             .map(|s| s.to_string())
             .collect(),
     };
