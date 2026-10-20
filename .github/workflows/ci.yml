@@ -199,6 +199,9 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3]
+    env:
+      RUST_TEST_THREADS: "1"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v5
 
@@ -228,10 +231,9 @@ jobs:
           bwrap --ro-bind / / true
 
       - name: App test shard
+        if: matrix.shard != 3
         timeout-minutes: 20
         env:
-          RUST_TEST_THREADS: "1"
-          CARGO_BUILD_JOBS: "2"
           SHARD: ${{ matrix.shard }}
         run: |
           mapfile -t targets < <(ls crates/leveler-app/tests/*.rs | xargs -n1 basename | sed 's/\.rs$//')
@@ -247,6 +249,54 @@ jobs:
           fi
           echo "shard $SHARD targets (of $total): ${args[*]}"
           cargo test -p leveler-app --all-features --locked --no-fail-fast "${args[@]}"
+
+      # Shard 3 names its targets one per step. When it was a single step the
+      # runner vanished with no log; a per-target step name is the only
+      # evidence that outlives the runner, and each target is cheap on its own.
+      - name: "App target: resume_task"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test resume_task
+
+      - name: "App target: session_axes_resume"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test session_axes_resume
+
+      - name: "App target: taotoken_model_official_search_real"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test taotoken_model_official_search_real
+
+      - name: "App target: tui_path_soak"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test tui_path_soak
+
+      - name: "App target: user_shell"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test user_shell
+
+      - name: "App target: web_search_deepseek_real"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test web_search_deepseek_real
+
+      - name: "App target: web_search_provider_independence"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test web_search_provider_independence
+
+      - name: "App target: work_profile_authority"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test work_profile_authority
+
+      - name: "App target: zombie_turns"
+        if: matrix.shard == 3
+        timeout-minutes: 6
+        run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test zombie_turns
 
   # The phone client. It is Dart, so it cannot ride the Rust job. Analyze and
   # test only: CI has no simulator, and building the app needs one platform
