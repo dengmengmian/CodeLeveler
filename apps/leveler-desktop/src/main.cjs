@@ -3,7 +3,7 @@ const path=require('node:path');
 const { pathToFileURL }=require('node:url');
 const { randomUUID }=require('node:crypto');
 const { existsSync,realpathSync,statSync }=require('node:fs');
-const { spawn }=require('node:child_process');
+const { spawn,execFile }=require('node:child_process');
 const os=require('node:os');
 const { Bridge }=require('./bridge.cjs');
 const { validateEnvelope }=require('./security.cjs');
@@ -15,6 +15,7 @@ const { copyText }=require('./clipboard-write.cjs');
 const { settingsMenuItem }=require('./settings-menu.cjs');
 protocol.registerSchemesAsPrivileged([{scheme:'leveler-desktop',privileges:{standard:true,secure:true,supportFetchAPI:true}}]);
 let window,bridge,browser;const folders=new Map();
+let quitApproved=false,quitPromptOpen=false,quitInspection=null;
 let selectedSource=null;
 const allowedRoots=new Set();
 const appIcons=new Map();
@@ -27,6 +28,36 @@ const recentWorkspaces=new RecentWorkspaceSelection(folders);
 function authorize(event){if(!window || event.sender!==window.webContents || event.senderFrame!==window.webContents.mainFrame || !event.senderFrame.url.startsWith('leveler-desktop://desktop/'))throw new Error('Unauthorized desktop frame');}
 function handle(channel,action){ipcMain.handle(channel,(event,...args)=>{authorize(event);return action(...args);});}
 function text(value,label){if(typeof value!=='string'||!value||value.length>4096)throw new Error(`Invalid ${label}`);return value;}
+// The renderer owns the live task list; the Host cannot be asked for a cheap
+// running-only inspection, so quit asks the page once and treats a missed
+// answer as "something may still be running" — the same warning, never a
+// silent interrupt.
+function inspectQuit(){
+  if(!window||window.isDestroyed()||window.webContents.isDestroyed())return Promise.resolve(false);
+  return new Promise(resolve=>{
+    const finish=running=>{const pending=quitInspection;if(!pending)return;quitInspection=null;clearTimeout(pending.timer);ipcMain.removeListener('desktop:quit-inspect-result',pending.listener);resolve(running);};
+    const listener=(event,payload)=>{if(!window||event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame)return;finish(payload?.running===true);};
+    const timer=setTimeout(()=>finish(true),1500);
+    quitInspection={finish,listener,timer};
+    ipcMain.on('desktop:quit-inspect-result',listener);
+    window.webContents.send('desktop:quit-inspect');
+  });
+}
+async function requestQuit(){
+  if(quitApproved||quitPromptOpen)return;
+  quitPromptOpen=true;
+  let proceed=false;
+  try{
+    proceed=!(await inspectQuit());
+    if(!proceed&&window&&!window.isDestroyed()){
+      const result=await dialog.showMessageBox(window,{type:'warning',title:'CodeLeveler',message:'退出 CodeLeveler？',detail:'当前正在运行的任务将会中断',buttons:['退出','取消'],defaultId:0,cancelId:1,noLink:true});
+      proceed=result.response===0;
+    }
+  }finally{quitPromptOpen=false;}
+  if(!proceed)return;
+  quitApproved=true;
+  app.quit();
+}
 async function createWindow(){
   bridge=new Bridge(process.env.LEVELER_BINARY || path.resolve(__dirname,'../../../target/debug/leveler'),{onEvent:frame=>{if(frame.session_id===attachments.selected?.sessionId){if(frame.event==='snapshot')attachmentSession(frame.data);if(frame.event==='runtime'&&frame.data?.type==='session_updated')attachmentSession(frame.data.session);}attachments.observe(frame);if(window && !window.isDestroyed())window.webContents.send('desktop:event',frame);}});
   window=new BrowserWindow({width:1280,height:820,minWidth:520,minHeight:600,title:'CodeLeveler',...(process.platform==='darwin'?{titleBarStyle:'hiddenInset',trafficLightPosition:{x:16,y:18},vibrancy:'sidebar',visualEffectState:'active',backgroundColor:'#00000000'}:{backgroundColor:'#f9fafb'}),webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false,webSecurity:true}});
@@ -35,7 +66,7 @@ async function createWindow(){
   window.webContents.on('will-navigate',event=>event.preventDefault());
   window.webContents.on('will-attach-webview',event=>event.preventDefault());
   window.on('resize',()=>browser.layout());
-  window.on('close',()=>browser.destroy());
+  window.on('close',event=>{if(!quitApproved){event.preventDefault();requestQuit();return;}browser.destroy();});
   window.on('closed',()=>{attachments.activate(null);window=null;browser=null;folders.clear();app.quit();});
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
@@ -47,6 +78,16 @@ app.whenReady().then(async()=>{
   handle('desktop:list',options=>{const params=taskListOptions(options);return bridge.request('list_tasks',params).then(index=>{recentWorkspaces.update(index,params.include_archived);return index;});});
   handle('desktop:info',()=>bridge.request('runtime_info'));
   handle('desktop:app-info',()=>({version:app.getVersion()}));
+  handle('desktop:update-check',()=>new Promise((resolve,reject)=>{
+    const binary=process.env.LEVELER_BINARY||path.resolve(__dirname,'../../../target/debug/leveler');
+    execFile(binary,['update','--check'],{timeout:20000,maxBuffer:1024*1024},(error,stdout)=>{
+      const text=String(stdout||'');
+      const current=/current:\s*v?([^\s]+)/.exec(text)?.[1];
+      const latest=/latest:\s*v?([^\s]+)/.exec(text)?.[1];
+      if(current&&latest&&(error===null||error?.code===2))return resolve({current,latest,available:error!==null});
+      reject(new Error(error?.killed?'检查更新超时':'检查更新失败'));
+    });
+  }));
   handle('desktop:copy-text',value=>copyText(value,clipboard));
   handle('desktop:open-external',async value=>{const url=new URL(text(value,'url'));if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('Invalid external URL');await shell.openExternal(url.href);return {ok:true};});
   handle('desktop:open-config',async()=>{const base=process.env.LEVELER_HOME??path.join(os.homedir(),'.leveler');const file=path.join(base,'config.toml');if(!existsSync(file))throw new Error('配置文件不存在');const error=await shell.openPath(file);if(error)throw new Error(error);return {ok:true};});
@@ -74,4 +115,7 @@ app.whenReady().then(async()=>{
 }).catch(error=>{console.error(error.message);app.quit();});
 app.on('window-all-closed',()=>app.quit());
 let quitting=false;
-app.on('before-quit',event=>{if(bridge&&!quitting){event.preventDefault();quitting=true;bridge.close().finally(()=>app.quit());}});
+app.on('before-quit',event=>{
+  if(!quitApproved){event.preventDefault();requestQuit();return;}
+  if(bridge&&!quitting){event.preventDefault();quitting=true;bridge.close().finally(()=>app.quit());}
+});
