@@ -2524,3 +2524,5 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 
 .markdown-image { color: var(--text-tertiary); font-size: 12px; }
 .preview-md-image { display: block; max-width: 100%; height: auto; margin: 8px 0; border-radius: 8px; }
+
+.review-scope { flex: none; padding: 4px 10px; border-bottom: .5px solid var(--border-l1); color: var(--text-caption); font-size: 10px; line-height: 15px; }
