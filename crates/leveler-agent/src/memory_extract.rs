@@ -49,9 +49,13 @@ pub const MAX_BATCH_INPUT_CHARS: usize = 16_000;
 pub const MAX_CANDIDATES: usize = 32;
 /// Hard output ceiling for a batch request.
 pub const MAX_OUTPUT_TOKENS: u32 = 4_096;
-/// Default deadline for the extraction call. Short enough that even a
-/// sequential caller is not hurt, long enough for a small model response.
-pub const DEFAULT_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default deadline for the extraction call. This is a BACKGROUND call: it
+/// never waits in the user's turn, so it must tolerate a reasoning model's
+/// first-token latency. The old 20 s bound turned a healthy DeepSeek response
+/// into a retryable timeout (observed in the live dogfood arm); 90 s stays
+/// below the provider's 120 s idle-stream budget and the worker's batch is
+/// still bounded.
+pub const DEFAULT_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(90);
 /// Default output ceiling. A candidate list is tiny; a model that ignores the
 /// contract is cut off rather than allowed to spend the turn's budget.
 pub const DEFAULT_EXTRACTION_MAX_TOKENS: u32 = 1_024;

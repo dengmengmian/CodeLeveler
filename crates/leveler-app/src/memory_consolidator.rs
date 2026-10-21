@@ -66,6 +66,11 @@ struct StagedTurnResult {
     rejected: usize,
     #[serde(default)]
     applied: usize,
+    /// Turns or candidates deliberately not written: secret-gated, duplicate,
+    /// suppressed, or a lifecycle skip. This is the "filtered" half the status
+    /// surface must distinguish from "no candidate at all".
+    #[serde(default)]
+    skipped: usize,
 }
 
 /// The application/runtime-owned worker for one project database.
@@ -380,6 +385,7 @@ impl MemoryConsolidator {
                 accepted: Vec::new(),
                 rejected: 0,
                 applied: 0,
+                skipped: 0,
             })
             .collect::<Vec<_>>();
         tracing::info!(
@@ -415,6 +421,7 @@ impl MemoryConsolidator {
             // the user's conversation, the main coding request, and the
             // authoritative turn payload are untouched.
             if leveler_memory::looks_like_secret(&user_text) {
+                staged[index].skipped += 1;
                 tracing::info!(
                     event = "memory_secret_gate_skipped",
                     turn_id = %item.turn_id,
@@ -635,16 +642,29 @@ impl MemoryConsolidator {
                             .insert(entry.id);
                         None
                     }
-                    AdmitOutcome::Corrected(outcome) => outcome.entry.and_then(|entry| {
-                        let operation = match outcome.operation {
-                            AppliedOperation::Created => "created",
-                            AppliedOperation::Superseded => "superseded",
-                            AppliedOperation::Merged => "merged",
-                            AppliedOperation::Skipped => return None,
-                        };
-                        Some((operation, entry.id, entry.title))
-                    }),
-                    AdmitOutcome::Proposed(_) => None,
+                    AdmitOutcome::Corrected(outcome) => match outcome.operation {
+                        AppliedOperation::Created
+                        | AppliedOperation::Superseded
+                        | AppliedOperation::Merged => {
+                            let operation = match outcome.operation {
+                                AppliedOperation::Created => "created",
+                                AppliedOperation::Superseded => "superseded",
+                                AppliedOperation::Merged => "merged",
+                                AppliedOperation::Skipped => unreachable!(),
+                            };
+                            outcome
+                                .entry
+                                .map(|entry| (operation, entry.id, entry.title))
+                        }
+                        AppliedOperation::Skipped => {
+                            result.skipped += 1;
+                            None
+                        }
+                    },
+                    AdmitOutcome::Proposed(_) => {
+                        result.skipped += 1;
+                        None
+                    }
                 };
                 if let Some((operation, id, title)) = event {
                     (self.event_sink)(MemoryConsolidationEvent {
@@ -1678,6 +1698,7 @@ mod tests {
             accepted: vec![pro, flash],
             rejected: 0,
             applied: 1,
+            skipped: 0,
         };
         MemoryInboxRepository::new(&db)
             .stage_results(

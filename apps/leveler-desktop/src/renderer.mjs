@@ -2839,8 +2839,8 @@ function systemPromptNode() {
   const details = el('details', 'system-prompt-node');
   details.dataset.key = 'system-prompt';
   const summary = el('summary', 'system-prompt-head');
-  summary.append(iconNode('settings', { size: 14 }), el('span', undefined, '系统提示词'), el('span', 'system-prompt-state', '不可用'));
-  details.append(summary, el('p', 'system-prompt-empty', 'Runtime 未记录本会话的系统提示词。'));
+  summary.append(iconNode('settings', { size: 14 }), el('span', undefined, '系统提示词'), el('span', 'system-prompt-state', '未记录'));
+  details.append(summary, el('p', 'system-prompt-empty', '轨迹视图没有记录本会话的系统提示词；模型请求不受影响。'));
   return details;
 }
 

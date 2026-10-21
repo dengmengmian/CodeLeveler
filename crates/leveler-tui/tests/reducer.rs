@@ -5534,6 +5534,89 @@ fn slash_memory_list_sends_list_memory_with_archived() {
     );
 }
 
+#[test]
+fn slash_memory_status_is_a_query_and_renders_extraction_health() {
+    use leveler_client_protocol::{UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryStatus};
+    let mut s = opened();
+    typed(&mut s, "/memory status");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Send(ClientCommand::MemoryStatus { query_id, .. }) => query_id.clone(),
+            _ => None,
+        })
+        .expect("status must send a query");
+    assert_eq!(s.memory_status_query.as_ref(), Some(&query_id));
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryRecalled {
+            count: 0,
+            ids: vec![],
+        }),
+    );
+    assert_eq!(
+        s.last_memory_recall,
+        Some(0),
+        "zero hits is a real recall result, not 'never recalled'"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryStatus {
+            query_id: Some(query_id),
+            status: UiMemoryStatus {
+                active: 2,
+                pending: 1,
+                archived: 3,
+                sensitive: 1,
+                inbox_pending: 0,
+                inbox_processing: 0,
+                inbox_failed_retryable: 1,
+                inbox_processed: 4,
+                next_retry_at: Some("2026-10-21T00:00:05Z".into()),
+                retry_attempt: Some(2),
+                extraction_totals: UiMemoryExtractionTotals {
+                    accepted: 5,
+                    rejected: 2,
+                    skipped: 1,
+                },
+                last_extraction: Some(UiMemoryExtraction {
+                    at: "2026-10-21T00:00:01Z".into(),
+                    accepted: 1,
+                    rejected: 0,
+                    skipped: 0,
+                    zero_candidates: false,
+                }),
+                last_error: Some("provider unavailable".into()),
+            },
+        }),
+    );
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::Note(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("status must leave a note");
+    for expected in [
+        "记忆状态",
+        "待确认 1",
+        "retry=1",
+        "最近提取",
+        "最近错误",
+        "provider unavailable",
+        "下次重试",
+        "最近召回: 0",
+    ] {
+        assert!(note.contains(expected), "missing {expected}: {note}");
+    }
+}
+
 /// Query responses are client-owned. Opening Web may issue `list_memory` on
 /// the same session, but that answer must not appear in this TUI transcript.
 #[test]

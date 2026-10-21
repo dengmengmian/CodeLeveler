@@ -472,6 +472,8 @@ export type RuntimeEvent =
   | { type: 'background_tasks_reconciled'; tasks: UiActiveBackgroundTask[] }
   /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
   | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[]; query_id?: CommandId | null }
+  /** Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`]. */
+  | { type: 'memory_status'; query_id?: CommandId | null; status: UiMemoryStatus }
   /** The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies. */
   | { type: 'memory_recalled'; count: number; ids: string[] }
   /** A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body. */
@@ -934,6 +936,21 @@ export interface UiMemoryEntry {
   title: string;
 }
 
+export interface UiMemoryExtraction {
+  accepted: number;
+  at: string;
+  rejected: number;
+  skipped: number;
+  /** True when the extractor produced no candidate at all, which is different from candidates that were filtered or failed. */
+  zero_candidates: boolean;
+}
+
+export interface UiMemoryExtractionTotals {
+  accepted: number;
+  rejected: number;
+  skipped: number;
+}
+
 /** What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret. */
 export type UiMemoryKind =
   /** Injected into every turn while active. */
@@ -942,6 +959,28 @@ export type UiMemoryKind =
   | 'decision'
   /** Same reach as a decision. */
   | 'note';
+
+/** Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error. */
+export interface UiMemoryStatus {
+  active: number;
+  archived: number;
+  /** Sums over the retained processed window. */
+  extraction_totals: UiMemoryExtractionTotals;
+  inbox_failed_retryable: number;
+  inbox_pending: number;
+  inbox_processed: number;
+  inbox_processing: number;
+  /** Sanitized class of the oldest retry's error. */
+  last_error?: string | null;
+  /** The most recent completed batch, if any. */
+  last_extraction?: UiMemoryExtraction | null;
+  /** Due time of the oldest retry, when one is waiting. */
+  next_retry_at?: string | null;
+  pending: number;
+  /** Most recent retry attempt number, when one is waiting. */
+  retry_attempt?: number | null;
+  sensitive: number;
+}
 
 /** A rendered message in the transcript. */
 export interface UiMessage {
@@ -1004,8 +1043,19 @@ export type UiPendingInteraction =
 
 /** The execution plan (spec §20). */
 export interface UiPlan {
+  /** Lifecycle of the newest declaration. Older runtimes omit it, which decodes as [`UiPlanState::Active`] — their only previous behavior. */
+  state?: UiPlanState;
   steps: UiPlanStep[];
 }
+
+/** Whether the plan is the current turn's work or durable history. The durable log keeps every declaration; this field is the runtime's authoritative classification of the newest one. A plan from before a task terminal is still returned after a restart, but never as active work. */
+export type UiPlanState =
+  /** The newest declaration belongs to an epoch with no task terminal. */
+  | 'active'
+  /** The owning task finished normally. */
+  | 'completed'
+  /** The owning task failed, was cancelled, or its process died. */
+  | 'interrupted';
 
 /** One step in the execution plan. */
 export interface UiPlanStep {
@@ -1300,6 +1350,8 @@ export type ClientCommand =
   | { type: 'confirm_plan_to_goal'; content: string; session_id: SessionId }
   /** List project durable memory (active; optional archived) for TUI/CLI. */
   | { type: 'list_memory'; include_archived?: boolean; query_id?: CommandId | null; session_id: SessionId }
+  /** Project memory health (store counts + durable extraction queue). */
+  | { type: 'memory_status'; query_id?: CommandId | null; session_id: SessionId }
   /** Archive (forget) one active memory id — user-authoritative (no model). */
   | { type: 'forget_memory'; id: string; session_id: SessionId }
   /** Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable. */

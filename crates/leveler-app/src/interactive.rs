@@ -4956,6 +4956,24 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 send_memory_list(&events, &memory_dir, include_archived, query_id);
                 Ok(())
             }
+            ClientCommand::MemoryStatus {
+                session_id,
+                query_id,
+            } => {
+                let events = self.events_for(&session_id);
+                match crate::memory_status::report(&self.app).await {
+                    Ok(status) => {
+                        let _ = events.send(RuntimeEvent::MemoryStatus { query_id, status });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!("memory status failed: {error}"),
+                        });
+                    }
+                }
+                Ok(())
+            }
             ClientCommand::SteerCurrentTurn {
                 session_id,
                 content,

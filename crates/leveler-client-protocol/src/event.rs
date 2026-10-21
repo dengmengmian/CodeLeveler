@@ -703,6 +703,14 @@ pub enum RuntimeEvent {
         #[serde(default)]
         pending: Vec<UiMemoryCandidate>,
     },
+    /// Project memory health: store counts, durable inbox counts, the last
+    /// extraction result and the oldest due retry. A query-shaped response to
+    /// [`crate::ClientCommand::MemoryStatus`].
+    MemoryStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        status: UiMemoryStatus,
+    },
     /// The runtime recalled durable project memory into this turn's model
     /// context. Emitted ONLY when at least one memory was selected — a search
     /// that found nothing is not a recall. Ids/count only, never bodies.
@@ -836,6 +844,55 @@ pub enum UiMemoryKind {
     Decision,
     /// Same reach as a decision.
     Note,
+}
+
+/// Durable memory health for `/memory status`. Counts only: no entry text,
+/// no candidate body, no raw provider error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryStatus {
+    pub active: u32,
+    pub pending: u32,
+    pub archived: u32,
+    pub sensitive: u32,
+    pub inbox_pending: u32,
+    pub inbox_processing: u32,
+    pub inbox_failed_retryable: u32,
+    pub inbox_processed: u32,
+    /// Due time of the oldest retry, when one is waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<String>,
+    /// Most recent retry attempt number, when one is waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_attempt: Option<u32>,
+    /// Sums over the retained processed window.
+    pub extraction_totals: UiMemoryExtractionTotals,
+    /// The most recent completed batch, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_extraction: Option<UiMemoryExtraction>,
+    /// Sanitized class of the oldest retry's error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryExtractionTotals {
+    pub accepted: u32,
+    pub rejected: u32,
+    pub skipped: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryExtraction {
+    pub at: String,
+    pub accepted: u32,
+    pub rejected: u32,
+    pub skipped: u32,
+    /// True when the extractor produced no candidate at all, which is
+    /// different from candidates that were filtered or failed.
+    pub zero_candidates: bool,
 }
 
 /// A candidate awaiting consent, with enough to decide on.

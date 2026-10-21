@@ -253,6 +253,12 @@ pub enum ClientCommand {
         #[serde(default)]
         include_archived: bool,
     },
+    /// Project memory health (store counts + durable extraction queue).
+    MemoryStatus {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Archive (forget) one active memory id — user-authoritative (no model).
     ForgetMemory { session_id: SessionId, id: String },
     /// Promote one pending candidate to durable memory. User-authoritative:
@@ -543,6 +549,7 @@ impl ClientCommand {
             | ClientCommand::SetProductAxes { session_id, .. }
             | ClientCommand::ConfirmPlanToGoal { session_id, .. }
             | ClientCommand::ListMemory { session_id, .. }
+            | ClientCommand::MemoryStatus { session_id, .. }
             | ClientCommand::AcceptMemory { session_id, .. }
             | ClientCommand::RejectMemory { session_id, .. }
             | ClientCommand::RememberMemory { session_id, .. }

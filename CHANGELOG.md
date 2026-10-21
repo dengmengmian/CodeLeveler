@@ -4,6 +4,30 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [Unreleased]
+
+Durable memory becomes a first-class, default-on product surface when the
+project enables it, and historical credential-shaped records stop crossing
+display and archive boundaries.
+
+### Added
+
+- Memory is part of the first request when `memory.enabled` is true: `memory`, `remember` and `forget` plus the guidance, catalog and recall no longer require a `capability(enable)` round trip. Approval rules for memory writes are unchanged
+- `/memory status` reports active/pending/archived/sensitive counts, the durable extraction queue, accepted/rejected/skipped totals, the last extraction result, the oldest retry and its sanitized error, and the last recall count
+- `leveler memory audit` lists historical credential-shaped records without printing their content; `leveler memory scrub [--id <id>] [--apply]` is a dry-run by default and redacts only when `--apply` is explicit
+
+### Changed
+
+- `remember` now records model-inference authority with `agent_remember_tool` provenance. Human approval authorizes the write; it does not claim the user said the fact, and the entry can never replace a fact the user wrote directly
+- `memory.enabled = false` removes the memory pack before capability disclosure, so Full Access cannot expose memory tools, guidance, catalog or recall. Automatic interactive candidate extraction also obeys the switch
+- Background extraction tolerates a reasoning model's first-token latency (90 s) instead of converting a healthy call into a retry at 20 s
+
+### Fixed
+
+- Sensitive-material validation covers title, body, tags and provenance evidence on every write path
+- Forget, supersede and expiry redact credential-shaped content before writing an archive; a non-sensitive record is unchanged
+- CLI, TUI, Web projections, notifications and logs no longer print a historical sensitive title or body; clients receive a redacted marker and the `sensitive` flag
+
 ## [1.0.20] - 2026-10-19
 
 Shell commands become a first-class inline surface, their complete output stays

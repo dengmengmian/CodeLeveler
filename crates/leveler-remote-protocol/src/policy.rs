@@ -229,6 +229,7 @@ impl RemotePolicy {
             // `AcceptMemory` especially: it IS the consent K36 requires, and a
             // phone is the wrong place to give it.
             ClientCommand::ListMemory { .. }
+            | ClientCommand::MemoryStatus { .. }
             | ClientCommand::ForgetMemory { .. }
             | ClientCommand::AcceptMemory { .. }
             // Same reasoning, more so: rejecting a candidate is consent

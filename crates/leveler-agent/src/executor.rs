@@ -220,6 +220,10 @@ fn trace_ids(ids: &[String]) -> Vec<String> {
 pub(crate) struct MemoryInjection {
     pub block: Option<String>,
     pub recalled: Vec<String>,
+    /// Recall actually ran against an open store. This distinguishes "zero
+    /// hits" from "memory was not exposed / not configured" for the status
+    /// surface; only the former is a recall result.
+    pub attempted: bool,
 }
 
 /// Skills the user named on this turn, plus the injection text.
@@ -2634,7 +2638,9 @@ impl Executor {
         }
         let injection = self.relevant_memory_injection(request);
         let recall_ids = injection.recalled.clone();
-        if !injection.recalled.is_empty() {
+        if injection.attempted {
+            // Zero is a real result. Without this event a client could not
+            // tell "recalled nothing" from "memory was never consulted".
             observer(AgentEvent::MemoryRecalled {
                 count: injection.recalled.len(),
                 ids: injection.recalled,
@@ -3037,6 +3043,7 @@ impl Executor {
         MemoryInjection {
             block,
             recalled: plan.selected,
+            attempted: true,
         }
     }
 
@@ -3921,6 +3928,31 @@ mod ownership_authority_tests {
             .refuse_unscoped_mutation(&call)
             .expect("empty authority must refuse");
         assert!(msg.contains("no write scope"), "{msg}");
+    }
+
+    /// Zero hits is a recall result, not silence. The status surface needs it
+    /// to distinguish "nothing matched" from "memory was never consulted".
+    #[test]
+    fn a_zero_hit_recall_is_reported_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor()
+            .with_memory_root(Some(dir.path().join("memory")))
+            .with_memory_expose(true);
+        let mut recalled = Vec::new();
+        let _ = exec.turn_control_context_inner(
+            "nothing in the store matches this",
+            "nothing in the store matches this",
+            false,
+            false,
+            &mut |event| recalled.push(event),
+        );
+        assert!(
+            recalled.iter().any(|event| matches!(
+                event,
+                AgentEvent::MemoryRecalled { count: 0, ids } if ids.is_empty()
+            )),
+            "expected a zero-hit MemoryRecalled, got {recalled:?}"
+        );
     }
 }
 

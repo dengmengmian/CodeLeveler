@@ -25,6 +25,7 @@ mod interactive;
 mod live_view;
 pub mod mcp_config;
 pub mod memory_consolidator;
+pub mod memory_status;
 pub mod observability;
 mod parallel;
 mod prompt_assist;
@@ -1373,8 +1374,18 @@ impl Application {
                     }
             })
             .collect();
+        // Memory is part of the first-round surface when the project enables
+        // it and the host can provide it. It stays a default EXPOSURE: no
+        // grant is persisted, and tool approval rules are unchanged.
+        let default_active = if available_packs.memory && self.memory.enabled() {
+            vec![CapabilityId::Memory]
+        } else {
+            Vec::new()
+        };
         let capabilities = Arc::new(
-            CapabilityDisclosure::new(available, permitted, vec![]).map_err(AppError::Engine)?,
+            CapabilityDisclosure::new(available, permitted, vec![])
+                .and_then(|state| state.with_default_active(default_active))
+                .map_err(AppError::Engine)?,
         );
         let memory_catalog = if available_packs.memory && self.memory.enabled() {
             load_memory_catalog(&self.layout.memory_dir())

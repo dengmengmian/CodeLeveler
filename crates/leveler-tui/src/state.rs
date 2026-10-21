@@ -344,6 +344,11 @@ pub struct AppState {
     /// The `/memory` query owned by this TUI. Foreign/legacy broadcast replies
     /// are ignored so opening Web cannot inject a listing into the transcript.
     pub memory_query: Option<leveler_client_protocol::CommandId>,
+    /// The `/memory status` query, kept separate from the listing query.
+    pub memory_status_query: Option<leveler_client_protocol::CommandId>,
+    /// The most recent recall count reported by the runtime, including zero.
+    /// `None` means no recall has been observed since this TUI connected.
+    pub last_memory_recall: Option<u32>,
     /// Agent-registry queries owned by this TUI. Responses traverse the
     /// shared session stream and must not render for another client.
     pub agents_list_query: Option<leveler_client_protocol::CommandId>,
@@ -700,6 +705,8 @@ impl AppState {
             turn_diff_files: None,
             history_query: None,
             memory_query: None,
+            memory_status_query: None,
+            last_memory_recall: None,
             agents_list_query: None,
             agent_detail_query: None,
             child_contribution_query: None,
