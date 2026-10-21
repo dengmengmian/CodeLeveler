@@ -840,7 +840,7 @@ impl MemoryStore {
                 return Ok(archived
                     .superseded_at
                     .as_deref()
-                    .map_or(true, |at| candidate.created_at.as_str() < at));
+                    .is_none_or(|at| candidate.created_at.as_str() < at));
             }
             next = archived.supersedes.clone();
         }

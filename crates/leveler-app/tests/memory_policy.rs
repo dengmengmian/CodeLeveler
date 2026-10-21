@@ -147,7 +147,7 @@ async fn disabled_memory_is_not_exposed_under_any_permission_profile() {
 #[tokio::test]
 async fn enabled_memory_reaches_the_first_request_without_a_capability_round_trip() {
     let (tmp, server, app) = harness(None).await;
-    let store = leveler_memory::MemoryStore::open(&tmp.path().join("state/memory")).unwrap();
+    let store = leveler_memory::MemoryStore::open(tmp.path().join("state/memory")).unwrap();
     store
         .activate(
             "Terse output",
