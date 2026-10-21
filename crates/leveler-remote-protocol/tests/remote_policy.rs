@@ -229,6 +229,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
+            "memory_status",
+            ClientCommand::MemoryStatus {
+                session_id: session(),
+                query_id: None,
+            },
+            false,
+        ),
+        (
             "forget_memory",
             ClientCommand::ForgetMemory {
                 session_id: session(),

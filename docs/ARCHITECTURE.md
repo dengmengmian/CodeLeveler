@@ -622,7 +622,10 @@ It must not silently change Tool semantics because:
 ### 8.1 Available, Permitted, and Exposed Are Three Different Facts
 
 CodeLeveler has one normal working strategy. Each goal begins with the base
-coding tools and a small capability control. Optional tools and their guidance
+coding tools, the product's default capability surface, and a small capability
+control. Durable memory is part of that default surface when the project
+enables it: its tools and guidance are in the FIRST request, without a
+`capability(enable)` round trip. Every other optional tool and its guidance
 join following requests only when the model requests a capability.
 
 ```text
@@ -637,14 +640,20 @@ Availability is mechanical: a configured search provider, `git` on `PATH`,
 vision support, or a browser runtime that can drive the selected browser.
 Permission is independently owned by host policy and project configuration,
 including `memory.enabled` and delegation permission. Loading changes exposure;
-it cannot create availability or grant permission.
+it cannot create availability or grant permission. Memory is the one default
+exposure: a disabled project has no memory availability at all, so no
+permission profile can expose it, while an enabled project still requires the
+profile's normal approval for memory WRITES. Default exposure is never
+persisted as a grant.
 
 The model decides which capability its task needs. The harness validates the
 request, loads the existing subsystem, and executes tools. It never selects
 capabilities from task wording, model reputation, provider identity, or step
 count. A capability remains loaded until its goal ends; an unfinished goal
-restores its durable active capabilities, and a new goal starts from the base
-surface. Tool and guidance ordering must remain deterministic.
+restores its durable active capabilities plus the default surface, and a new
+goal starts from the base surface plus defaults. A capability that is not
+enabled by default still requires the model's explicit `capability(enable)`
+request. Tool and guidance ordering must remain deterministic.
 
 Legacy session work-profile values have no role in choosing the tool surface.
 Collaboration (`chat`, `plan`, `goal`) and execution permission retain their
@@ -1014,6 +1023,8 @@ as "the command did not run": receipts keep their existing dedup semantics and
 an unknown outcome never authorizes an automatic rerun.
 
 For an attachment-free `SubmitMessage`, the App command entry recognizes continuation with the existing `parse_continuation` and invokes the existing `ResumeTask` handler. It preserves the original task, Goal and plan, treating amendments as additions to the original objective. The existing Runtime owner still decides resumability, rejects explicitly cancelled tasks, and treats continuation without resumable work as an ordinary message. Submissions with attachments retain the content and image validation path; clients do not add separate continuation parsers.
+
+Chat delegation is a turn-scoped Goal identity, not a fourth collaboration axis. A top-level authoring Chat turn may call the injected `commit_task(objective, acceptance)` tool; the runtime validates the declaration and binds that turn through the existing `GoalBinder` (goal row, `turn.payload.goal_id`, budget-scope migration). From the next round the same turn exposes `update_goal`, Goal closeout and the verification gate. The session's collaboration remains `chat`, and a later ordinary message remains Chat. The declaration is structured: the runtime never classifies user text for execution intent and adds no classifier model call. Questions, discussions, read-only and Plan surfaces never receive the tool; sub-agents cannot declare tasks. Resume treats `turn.payload.goal_id` as sufficient Goal identity, so an interrupted delegated Chat turn resumes under the Goal profile without changing the session axis. A paused task remains visible until it settles or is explicitly cancelled; an explicit logical cancel settles its goal and refuses a later continuation.
 
 Web restores a saved conversation using the newly received `SessionList`, rather than a React state list whose dispatch may not yet have committed. Existing current / pending selection guards prevent restoration from overriding a conversation the user is already opening.
 

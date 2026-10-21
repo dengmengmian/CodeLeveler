@@ -1200,6 +1200,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             replace_active_background_tasks(state, &tasks);
         }
         RuntimeEvent::MemoryRecalled { count, .. } => {
+            // Keep the last count even when it is zero: "recall ran and found
+            // nothing" is different from "no recall has happened yet".
+            state.last_memory_recall = Some(count);
             // The runtime emits this only for a real recall, so a search that
             // found nothing never reaches here. Keep one auditable transcript
             // line, but do not duplicate routine recall as a transient toast.
@@ -1208,6 +1211,15 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             let label = state.t().memory_recalled.replace("{}", &count.to_string());
             state.transcript.push_note(label);
+        }
+        RuntimeEvent::MemoryStatus { query_id, status } => {
+            let ours = query_id.is_some() && query_id == state.memory_status_query;
+            if !ours {
+                return;
+            }
+            state.memory_status_query = None;
+            let lines = memory_status_lines(state, &status);
+            state.transcript.push_note(lines);
         }
         RuntimeEvent::MemoryChanged {
             operation, title, ..
@@ -1233,6 +1245,73 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
 
 /// Drop any parked interaction the predicate matches — used when a resolution
 /// event names a request that is queued behind the active overlay rather than
+/// One `/memory status` block. Counts and states only; the runtime already
+/// redacted titles and errors.
+fn memory_status_lines(
+    state: &AppState,
+    status: &leveler_client_protocol::UiMemoryStatus,
+) -> String {
+    let t = state.t();
+    let mut lines = vec![format!(
+        "{}: {} {} · {} {} · {} {} · {} {}",
+        t.memory_status_title,
+        t.memory_active,
+        status.active,
+        t.memory_pending,
+        status.pending,
+        t.memory_archived,
+        status.archived,
+        t.memory_status_sensitive,
+        status.sensitive,
+    )];
+    lines.push(format!(
+        "{}: pending={} processing={} retry={} processed={}",
+        t.memory_status_inbox,
+        status.inbox_pending,
+        status.inbox_processing,
+        status.inbox_failed_retryable,
+        status.inbox_processed,
+    ));
+    lines.push(format!(
+        "{}: accepted={} rejected={} skipped={}",
+        t.memory_status_totals,
+        status.extraction_totals.accepted,
+        status.extraction_totals.rejected,
+        status.extraction_totals.skipped,
+    ));
+    match &status.last_extraction {
+        Some(last) => {
+            let mut line = t
+                .memory_status_extraction
+                .replace("{at}", &last.at)
+                .replace("{accepted}", &last.accepted.to_string())
+                .replace("{rejected}", &last.rejected.to_string())
+                .replace("{skipped}", &last.skipped.to_string());
+            if last.zero_candidates {
+                line.push_str(" · ");
+                line.push_str(t.memory_status_zero_candidates);
+            }
+            lines.push(line);
+        }
+        None => lines.push(t.memory_status_no_extraction.to_string()),
+    }
+    if let Some(error) = &status.last_error {
+        let retry = status
+            .retry_attempt
+            .map(|attempt| format!(" (attempt {attempt})"))
+            .unwrap_or_default();
+        lines.push(format!("{}{retry}: {error}", t.memory_status_last_error));
+    }
+    if let Some(next) = &status.next_retry_at {
+        lines.push(format!("{}: {next}", t.memory_status_next_retry));
+    }
+    lines.push(match state.last_memory_recall {
+        Some(count) => format!("{}: {count}", t.memory_status_last_recall),
+        None => t.memory_status_recall_never.to_string(),
+    });
+    lines.join("\n")
+}
+
 /// Short label for a memory kind, so a listing says how an entry reaches the
 /// model instead of making the reader remember the rules.
 fn memory_kind_label(kind: leveler_client_protocol::UiMemoryKind) -> &'static str {
@@ -1857,6 +1936,8 @@ fn apply_session_with(
     if switching {
         state.history_query = None;
         state.memory_query = None;
+        state.memory_status_query = None;
+        state.last_memory_recall = None;
         state.agents_list_query = None;
         state.agent_detail_query = None;
         state.child_contribution_query = None;

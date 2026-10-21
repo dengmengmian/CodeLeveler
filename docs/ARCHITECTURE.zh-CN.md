@@ -53,7 +53,7 @@ CodeLeveler 让 AI 模型在真实工作环境里完成任务。你可以提出�
 5. 运行时保存实际结果，例如退出码、文件变化和产物。模型结合目标和证据判断是否继续。
 6. 客户端展示过程与结果，用户决定是否接受交付。
 
-模型看到的工具会按需要加载。每个新目标从基础编程工具和很小的能力控制接口开始；加载能力后，相应工具和指导才进入后续请求。同一目标内已加载能力只增不减，恢复目标时恢复其已加载能力，新目标回到基础工具集合。
+模型看到的工具会按需要加载。每个新目标从基础编程工具、产品默认能力面和很小的能力控制接口开始；项目启用 memory 时，记忆工具与指导属于默认能力面，第一轮请求即可见，不需要先调用 `capability(enable)`。其他可选能力在加载后才把工具和指导带入后续请求。同一目标内已加载能力只增不减；恢复目标时恢复其已加载能力并保留默认能力面，新目标回到基础工具集合加默认能力面。
 
 ### 能力存在、权限允许和当前可见各有条件
 
@@ -482,6 +482,8 @@ daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 
 对每个交互客户端来说，ACK 契约是同一个。启动或继续 Turn 的命令，只有在对应的持久化接收边界提交后才返回成功。进程内 TUI、`leveler serve` 暴露的 daemon、该进程服务的 `/web` UI，以及连接的 WebUI 都遵守这一条；Embedded 与 Daemon 之间不再存在不同的 Turn ACK 契约。成功 ACK 只表示执行输入已被持久接收（`EngineEvent::TurnStarted` 在 `TurnStore::start_owned` 提交后发出），不表示 Turn 已完成，也不表示工具副作用 exactly-once。被拒绝的 Turn 必须返回明确错误，而不是成功 ACK。无响应或断线不能推导命令未执行。凭证仍按原语义去重，未知结果不授权自动重跑。
 
 无附件的 `SubmitMessage` 若被既有 `parse_continuation` 识别为“继续”，由 App 命令入口统一进入已有 `ResumeTask` handler。沿原任务、Goal 和计划继续，并把补充要求追加到原目标。是否可恢复、显式取消拒绝和无可恢复任务时的普通消息语义，仍由原 Runtime owner 判定；带附件的提交保留内容与图像校验路径。客户端不各自新增“继续”解析器。
+
+Chat 显式委托是 Turn 级的 Goal 身份，不是第四条协作轴。顶层可写的 Chat 回合可以调用注入工具 `commit_task(objective, acceptance)`；Runtime 校验声明后通过既有 `GoalBinder` 把该回合绑定到持久 Goal（goals 行、`turn.payload.goal_id`、预算 scope 迁移）。从下一轮起，同一回合暴露 `update_goal`，使用 Goal closeout 与验证门。会话 collaboration 仍是 `chat`，之后普通消息仍是 Chat。声明是结构化的：Runtime 不按用户文本分类执行意图，也不增加分类模型调用。问答、讨论、只读和 Plan 面不暴露该工具，子 Agent 不能声明任务。恢复以 `turn.payload.goal_id` 作为充分的目标身份，因此被中断的委托 Chat 回合按 Goal profile 恢复，不改变会话轴。暂停的任务保持可见，直到完成或显式取消；显式取消逻辑任务会结清其 Goal 并拒绝之后的继续。
 
 Web 重开会话时，持久保存的最后选择与本次收到的 `SessionList` 决定恢复对象；不能读取尚未由 React 提交的旧列表。恢复继续遵守 current / pending selection guard，避免覆盖用户已开始的会话选择。
 

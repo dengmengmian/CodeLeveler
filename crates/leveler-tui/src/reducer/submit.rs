@@ -1155,6 +1155,14 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     if rest.is_empty() || rest == "list" {
         return vec![memory_list_effect(state, true)];
     }
+    if rest == "status" {
+        let query_id = leveler_client_protocol::CommandId::generate();
+        state.memory_status_query = Some(query_id.clone());
+        return vec![Effect::Send(ClientCommand::MemoryStatus {
+            session_id: state.session_id.clone(),
+            query_id: Some(query_id),
+        })];
+    }
     // Accepting a pending candidate is the user's consent (K36) — the reason
     // the runtime never lets the model do it.
     if let Some(id) = rest.strip_prefix("accept").map(str::trim) {

@@ -1951,6 +1951,35 @@
       }
     },
     {
+      "description": "Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`].",
+      "type": "object",
+      "required": [
+        "status",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/UiMemoryStatus"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_status"
+          ]
+        }
+      }
+    },
+    {
       "description": "The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies.",
       "type": "object",
       "required": [
@@ -5290,6 +5319,35 @@
           }
         },
         {
+          "description": "Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`].",
+          "type": "object",
+          "required": [
+            "status",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/UiMemoryStatus"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory_status"
+              ]
+            }
+          }
+        },
+        {
           "description": "The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies.",
           "type": "object",
           "required": [
@@ -7038,6 +7096,65 @@
         }
       }
     },
+    "UiMemoryExtraction": {
+      "type": "object",
+      "required": [
+        "accepted",
+        "at",
+        "rejected",
+        "skipped",
+        "zero_candidates"
+      ],
+      "properties": {
+        "accepted": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "at": {
+          "type": "string"
+        },
+        "rejected": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "zero_candidates": {
+          "description": "True when the extractor produced no candidate at all, which is different from candidates that were filtered or failed.",
+          "type": "boolean"
+        }
+      }
+    },
+    "UiMemoryExtractionTotals": {
+      "type": "object",
+      "required": [
+        "accepted",
+        "rejected",
+        "skipped"
+      ],
+      "properties": {
+        "accepted": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "rejected": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "UiMemoryKind": {
       "description": "What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret.",
       "oneOf": [
@@ -7063,6 +7180,105 @@
           ]
         }
       ]
+    },
+    "UiMemoryStatus": {
+      "description": "Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error.",
+      "type": "object",
+      "required": [
+        "active",
+        "archived",
+        "extraction_totals",
+        "inbox_failed_retryable",
+        "inbox_pending",
+        "inbox_processed",
+        "inbox_processing",
+        "pending",
+        "sensitive"
+      ],
+      "properties": {
+        "active": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "archived": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "extraction_totals": {
+          "description": "Sums over the retained processed window.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiMemoryExtractionTotals"
+            }
+          ]
+        },
+        "inbox_failed_retryable": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "inbox_pending": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "inbox_processed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "inbox_processing": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "last_error": {
+          "description": "Sanitized class of the oldest retry's error.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_extraction": {
+          "description": "The most recent completed batch, if any.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMemoryExtraction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_retry_at": {
+          "description": "Due time of the oldest retry, when one is waiting.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "retry_attempt": {
+          "description": "Most recent retry attempt number, when one is waiting.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sensitive": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
     },
     "UiMessage": {
       "description": "A rendered message in the transcript.",
@@ -7308,6 +7524,15 @@
         "steps"
       ],
       "properties": {
+        "state": {
+          "description": "Lifecycle of the newest declaration. Older runtimes omit it, which decodes as [`UiPlanState::Active`] — their only previous behavior.",
+          "default": "active",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiPlanState"
+            }
+          ]
+        },
         "steps": {
           "type": "array",
           "items": {
@@ -7315,6 +7540,32 @@
           }
         }
       }
+    },
+    "UiPlanState": {
+      "description": "Whether the plan is the current turn's work or durable history.\n\nThe durable log keeps every declaration; this field is the runtime's authoritative classification of the newest one. A plan from before a task terminal is still returned after a restart, but never as active work.",
+      "oneOf": [
+        {
+          "description": "The newest declaration belongs to an epoch with no task terminal.",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "The owning task finished normally.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "The owning task failed, was cancelled, or its process died.",
+          "type": "string",
+          "enum": [
+            "interrupted"
+          ]
+        }
+      ]
     },
     "UiPlanStep": {
       "description": "One step in the execution plan.",

@@ -48,6 +48,30 @@ pub struct MemoryInboxCounts {
     pub processed: u64,
 }
 
+/// One retained processed batch, for the memory status surface.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MemoryInboxProcessed {
+    /// When the batch settled.
+    pub processed_at: String,
+    /// Opaque runtime-validated result. The app parses it; storage does not
+    /// know the consolidator's private type.
+    pub result_json: Option<String>,
+}
+
+/// The oldest due retry, if any. The error is already a class string from the
+/// consolidator, never raw user text.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MemoryInboxFailure {
+    /// Failure class recorded by the consolidator.
+    pub last_error: Option<String>,
+    /// Attempts made so far.
+    pub attempt: i64,
+    /// When the next retry is due.
+    pub next_attempt_at: Option<String>,
+    /// When the row last changed.
+    pub updated_at: String,
+}
+
 /// Durable inbox operations. Claims are fenced by a per-process boot id.
 pub struct MemoryInboxRepository<'a> {
     db: &'a Database,
@@ -83,6 +107,49 @@ impl<'a> MemoryInboxRepository<'a> {
             }
         }
         Ok(counts)
+    }
+
+    /// Most recent processed batch, with the runtime-validated result the app
+    /// uses to report accepted / rejected / skipped counts.
+    pub async fn last_processed(&self) -> Result<Option<MemoryInboxProcessed>, StorageError> {
+        Ok(sqlx::query_as::<_, MemoryInboxProcessed>(
+            "SELECT processed_at, result_json FROM memory_inbox \
+             WHERE status = 'processed' AND processed_at IS NOT NULL \
+             ORDER BY processed_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(self.db.pool())
+        .await?)
+    }
+
+    /// Retained processed batches, newest first. Bounded by the caller; the
+    /// worker prunes old rows, so this is a diagnostic window, not history.
+    pub async fn processed_results(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MemoryInboxProcessed>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, MemoryInboxProcessed>(
+            "SELECT processed_at, result_json FROM memory_inbox \
+             WHERE status = 'processed' AND processed_at IS NOT NULL \
+             ORDER BY processed_at DESC, id DESC LIMIT ?1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(self.db.pool())
+        .await?)
+    }
+
+    /// The retry that will run next, if any. Rows are ordered by due time so
+    /// the status surface reports the actual scheduler queue, not a guess.
+    pub async fn last_failure(&self) -> Result<Option<MemoryInboxFailure>, StorageError> {
+        Ok(sqlx::query_as::<_, MemoryInboxFailure>(
+            "SELECT last_error, attempt, next_attempt_at, updated_at \
+             FROM memory_inbox WHERE status = 'failed_retryable' \
+             ORDER BY next_attempt_at ASC, id ASC LIMIT 1",
+        )
+        .fetch_optional(self.db.pool())
+        .await?)
     }
 
     /// Inspect currently claimable work without acquiring it. Uses the same
@@ -449,6 +516,58 @@ mod tests {
             "initiating_message": { "role": "user", "content": message }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn diagnostics_read_the_latest_processed_batch_and_oldest_retry() {
+        let (db, session) = fixture().await;
+        let turns = TurnRepository::new(&db);
+        let now = leveler_core::now();
+        let one = fresh_payload("one");
+        let two = fresh_payload("two");
+        let processed = turns
+            .start(&session, "user", Some(&one), now)
+            .await
+            .unwrap();
+        let failed = turns
+            .start(&session, "user", Some(&two), now)
+            .await
+            .unwrap();
+        finish_all_turns(&db, now).await;
+
+        sqlx::query(
+            "UPDATE memory_inbox SET status = 'processed', processed_at = ?1, \
+             result_json = ?2 WHERE turn_id = ?3",
+        )
+        .bind("2026-10-21T00:00:01Z")
+        .bind(r#"[{"accepted":[],"rejected":2,"applied":0,"skipped":1}]"#)
+        .bind(&processed.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE memory_inbox SET status = 'failed_retryable', \
+             last_error = 'provider unavailable', attempt = 3, \
+             next_attempt_at = ?1 WHERE turn_id = ?2",
+        )
+        .bind("2026-10-21T00:00:05Z")
+        .bind(&failed.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let repo = MemoryInboxRepository::new(&db);
+        let last = repo.last_processed().await.unwrap().unwrap();
+        assert_eq!(last.processed_at, "2026-10-21T00:00:01Z");
+        assert!(last.result_json.as_deref().unwrap().contains("rejected"));
+        assert_eq!(repo.processed_results(10).await.unwrap().len(), 1);
+        let retry = repo.last_failure().await.unwrap().unwrap();
+        assert_eq!(retry.last_error.as_deref(), Some("provider unavailable"));
+        assert_eq!(retry.attempt, 3);
+        assert_eq!(
+            retry.next_attempt_at.as_deref(),
+            Some("2026-10-21T00:00:05Z")
+        );
     }
 
     #[tokio::test]

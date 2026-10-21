@@ -642,6 +642,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::ConfirmPlanToGoal { .. } => "confirm_plan_to_goal",
         ClientCommand::SteerCurrentTurn { .. } => "steer_current_turn",
         ClientCommand::ListMemory { .. } => "list_memory",
+        ClientCommand::MemoryStatus { .. } => "memory_status",
         ClientCommand::ForgetMemory { .. } => "forget_memory",
         ClientCommand::AcceptMemory { .. } => "accept_memory",
         ClientCommand::RejectMemory { .. } => "reject_memory",

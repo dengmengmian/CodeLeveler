@@ -102,6 +102,10 @@ struct GoalBinding {
 pub struct CapabilityDisclosure {
     available: BTreeSet<CapabilityId>,
     permitted: BTreeSet<CapabilityId>,
+    /// Capabilities that are part of the product's first-round surface. They
+    /// are exposed without an enable round trip and are never persisted as a
+    /// grant, so a goal restore cannot take them away.
+    default_active: BTreeSet<CapabilityId>,
     active: Arc<RwLock<BTreeSet<CapabilityId>>>,
     binding: RwLock<Option<GoalBinding>>,
     enable_gate: Arc<tokio::sync::Mutex<()>>,
@@ -121,11 +125,30 @@ impl CapabilityDisclosure {
         Ok(Self {
             available,
             permitted,
+            default_active: BTreeSet::new(),
             active: Arc::new(RwLock::new(active)),
             binding: RwLock::new(None),
             enable_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
+
+    /// Mark capabilities as part of the product's default surface.
+    ///
+    /// They must still be mechanically available and permitted; a default is
+    /// exposure, not authority, so it can never widen what the host supports.
+    pub fn with_default_active(mut self, defaults: Vec<CapabilityId>) -> Result<Self, String> {
+        for id in defaults {
+            if !self.available.contains(&id) || !self.permitted.contains(&id) {
+                return Err(format!(
+                    "default capability unavailable or not permitted: {}",
+                    id.as_str()
+                ));
+            }
+            self.default_active.insert(id);
+        }
+        Ok(self)
+    }
+
     pub fn available(&self, id: CapabilityId) -> bool {
         self.available.contains(&id)
     }
@@ -158,7 +181,8 @@ impl CapabilityDisclosure {
     pub fn exposed(&self, id: CapabilityId) -> bool {
         self.available.contains(&id)
             && self.permitted.contains(&id)
-            && self.active.read().expect("capability lock").contains(&id)
+            && (self.default_active.contains(&id)
+                || self.active.read().expect("capability lock").contains(&id))
     }
     pub fn permits_tool(&self, name: &str) -> bool {
         tool_capability(name).is_none_or(|id| self.exposed(id))
@@ -180,6 +204,11 @@ impl CapabilityDisclosure {
         Self {
             available: self.available.intersection(&offered).copied().collect(),
             permitted: self.permitted.intersection(&offered).copied().collect(),
+            default_active: self
+                .default_active
+                .intersection(&offered)
+                .copied()
+                .collect(),
             active: self.active.clone(),
             binding: RwLock::new(self.binding.read().expect("capability lock").clone()),
             enable_gate: self.enable_gate.clone(),
@@ -192,6 +221,8 @@ impl CapabilityDisclosure {
             vec![],
         )
         .expect("empty active set")
+        .with_default_active(self.default_active.iter().copied().collect())
+        .expect("defaults were valid on the parent")
     }
     pub fn catalog_with_authority(&self, unrestricted: bool) -> serde_json::Value {
         if !unrestricted {
@@ -329,6 +360,54 @@ mod tests {
         assert!(
             state.active().is_empty(),
             "Full permission bypass must not persist a grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_capability_needs_no_enable_round_trip_and_survives_reset() {
+        let state = CapabilityDisclosure::new(
+            vec![CapabilityId::Memory],
+            vec![CapabilityId::Memory],
+            vec![],
+        )
+        .unwrap()
+        .with_default_active(vec![CapabilityId::Memory])
+        .unwrap();
+        assert!(
+            state.exposed(CapabilityId::Memory),
+            "the product's default surface is visible on the first request"
+        );
+        assert!(state.permits_tool("remember"));
+        assert!(
+            !state.enable(CapabilityId::Memory).await.unwrap(),
+            "a default is already exposed; enabling it is a no-op, not a new grant"
+        );
+        state.reset();
+        assert!(
+            state.exposed(CapabilityId::Memory),
+            "a chat turn reset must not take the default surface away"
+        );
+        assert!(
+            state.active().is_empty(),
+            "a default must never be reported as a persisted grant"
+        );
+        assert!(state.fresh().exposed(CapabilityId::Memory));
+    }
+
+    #[tokio::test]
+    async fn a_default_capability_cannot_be_permitted_or_available_by_itself() {
+        let unavailable = CapabilityDisclosure::new(vec![], vec![], vec![]).unwrap();
+        assert!(
+            unavailable
+                .with_default_active(vec![CapabilityId::Memory])
+                .is_err()
+        );
+        let unpermitted =
+            CapabilityDisclosure::new(vec![CapabilityId::Memory], vec![], vec![]).unwrap();
+        assert!(
+            unpermitted
+                .with_default_active(vec![CapabilityId::Memory])
+                .is_err()
         );
     }
 

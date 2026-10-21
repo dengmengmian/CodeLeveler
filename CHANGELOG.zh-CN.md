@@ -4,6 +4,28 @@
 
 发布说明：[`docs/RELEASE.zh-CN.md`](docs/RELEASE.zh-CN.md)。
 
+## [Unreleased]
+
+项目启用 memory 时，长期记忆成为默认的一等产品能力；历史敏感记录不再穿过展示与归档边界。
+
+### 新增
+
+- `memory.enabled` 为 true 时，记忆属于第一轮请求：`memory`、`remember`、`forget` 以及指导、catalog、召回不再需要先调用 `capability(enable)`。记忆写入的审批规则不变
+- `/memory status` 显示生效 / 待确认 / 已归档 / 敏感数量，持久提取队列，采纳 / 拒绝 / 跳过累计，最近一次提取结果，最早重试及其脱敏错误，以及最近一次召回数量
+- `leveler memory audit` 列出历史敏感记录但不打印内容；`leveler memory scrub [--id <id>] [--apply]` 默认只做 dry-run，只有显式 `--apply` 才改写
+
+### 变更
+
+- `remember` 现在记录模型推断权威和 `agent_remember_tool` 来源。人工批准只授权写入，不代表用户陈述了该事实，也不能覆盖用户直接写下的事实
+- `memory.enabled = false` 在能力披露前就移除 memory pack，因此 Full Access 也无法暴露记忆工具、指导、catalog 或召回。交互式自动候选提取同样遵守该开关
+- 后台提取的默认超时提高到 90 秒，避免把推理模型的正常首 token 延迟误判为失败重试
+
+### 修复
+
+- 敏感校验覆盖所有写入路径的 title、body、tags 与 provenance evidence
+- forget、supersede、expiry 在写归档前脱敏敏感内容；非敏感记录保持原样
+- CLI、TUI、Web 投影、通知与日志不再打印历史敏感条目的标题或正文；客户端只收到脱敏占位和 `sensitive` 标记
+
 ## [1.0.20] - 2026-10-19
 
 本地命令成为会话内的一等界面，完整输出始终可达，用户消息成为一条铺满阅读宽度的背景带。

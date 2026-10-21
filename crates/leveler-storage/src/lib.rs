@@ -42,7 +42,8 @@ pub use goal_checkpoint_store::{
 };
 pub use goal_store::{GoalRecord, GoalState, GoalStore, MemoryGoalStore};
 pub use memory_inbox_repo::{
-    MemoryInboxCounts, MemoryInboxItem, MemoryInboxReadyState, MemoryInboxRepository,
+    MemoryInboxCounts, MemoryInboxFailure, MemoryInboxItem, MemoryInboxProcessed,
+    MemoryInboxReadyState, MemoryInboxRepository,
 };
 pub use message_repo::{MessageRepository, TimedMessage};
 pub use message_store::{
