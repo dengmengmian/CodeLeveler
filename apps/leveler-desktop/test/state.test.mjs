@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { projectSnapshot, applyEvent, commandEnvelope } from '../src/state.mjs';
+import { answerFiles } from '../src/presentation.mjs';
 const snapshot = { id:'session-1', messages:[{id:'u1',role:'user',text:'hello'}], task_status:'running', pending_interactions:[], active_tools:[] };
 test('snapshot restores transcript and only live waiter approvals', () => {
   const state = projectSnapshot({...snapshot,pending_interactions:[{type:'approval',request:{id:'a1',summary:'run'}}]});
@@ -261,4 +262,46 @@ test('settings envelope carries the displayed version and refuses an unobserved 
  assert.throws(()=>commandEnvelope('s1',rename),/snapshot version required/);
  assert.equal(commandEnvelope('s1',rename,17).expected_version,17);
  assert.equal(commandEnvelope('s1',{type:'cancel_current_turn',session_id:'s1'},17).expected_version,null);
+});
+
+test('a live turn after durable history takes its own sequence, never an earlier turn\'s', () => {
+  const history = [
+    { event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: 'first' } } },
+    { event: { type: 'tool_call_started', id: 't1', name: 'apply_patch', arguments: '{}' } },
+    { event: { type: 'tool_call_completed', id: 't1', ok: true, preview: 'applied', applied_diff: '--- a/one.md\n+++ b/one.md\n@@ -1 +1 @@\n-a\n+b\n' } },
+    { event: { type: 'assistant_message_started', message_id: 'a1' } },
+    { event: { type: 'assistant_text_delta', message_id: 'a1', delta: 'first done' } },
+    { event: { type: 'turn_answered' } },
+  ];
+  let state = projectSnapshot({ id: 's', messages: [], task_status: 'answered', pending_interactions: [], active_tools: [] }, history);
+  state = applyEvent(state, { type: 'user_message_added', message: { id: 'u2', role: 'user', text: 'second' } });
+  state = applyEvent(state, { type: 'tool_call_started', id: 't2', name: 'apply_patch', arguments: '{}' });
+  state = applyEvent(state, { type: 'tool_call_completed', id: 't2', ok: true, preview: 'applied', applied_diff: '--- a/two.md\n+++ b/two.md\n@@ -1 +1 @@\n-a\n+b\n' });
+  state = applyEvent(state, { type: 'assistant_message_started', message_id: 'a2' });
+  state = applyEvent(state, { type: 'assistant_text_delta', message_id: 'a2', delta: 'second done' });
+  const first = state.messages.find(message => message.id === 'a1');
+  const second = state.messages.find(message => message.id === 'a2');
+  assert.ok(first.seq < state.tools.find(tool => tool.id === 't2').seq, 'the live turn reused a sequence from the replayed history');
+  assert.deepEqual(answerFiles(first, state.messages, state.tools).map(file => file.path), ['one.md']);
+  assert.deepEqual(answerFiles(second, state.messages, state.tools).map(file => file.path), ['two.md']);
+});
+
+test('a terminal event clears the live activity label that would mask the settled status', () => {
+  let state = projectSnapshot({ id: 's', messages: [], task_status: 'running', pending_interactions: [], active_tools: [] });
+  state = applyEvent(state, { type: 'agent_activity', label: '正在请求模型' });
+  assert.equal(state.activity, '正在请求模型');
+  state = applyEvent(state, { type: 'turn_answered' });
+  assert.equal(state.activity, '');
+  assert.equal(state.lastTerminal, 'no_final_answer');
+});
+
+test('a re-delivered tool event updates in place instead of adding a row', () => {
+  let state = projectSnapshot({ id: 's', messages: [], task_status: 'running', pending_interactions: [], active_tools: [] });
+  const started = { type: 'tool_call_started', id: 't1', name: 'apply_patch', arguments: '{}' };
+  const finished = { type: 'tool_call_completed', id: 't1', ok: true, preview: 'applied', applied_diff: '--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n-a\n+b\n' };
+  state = applyEvent(applyEvent(state, started), started);
+  state = applyEvent(applyEvent(state, finished), finished);
+  assert.equal(state.tools.length, 1);
+  assert.equal(state.tools[0].status, 'success');
+  assert.equal(state.tools[0].appliedDiff.split('\n')[1], '+++ b/x.md');
 });

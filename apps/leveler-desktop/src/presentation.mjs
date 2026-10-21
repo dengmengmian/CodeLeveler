@@ -53,7 +53,7 @@ export function conversationMatches(messages,query){
  return matches;
 }
 /** @param {{role:string,kind?:string}} message */
-export function messageKind(message){return message.kind==='runtime_notice'?'notice':['user','assistant'].includes(message.role)?message.role:'other';}
+export function messageKind(message){if(message.kind==='runtime_notice')return 'notice';if(message.kind==='compaction_summary')return 'assistant';return ['user','assistant'].includes(message.role)?message.role:'other';}
 /** @param {{role:string,kind?:string}} message */
 export function messageRoleLabel(message){return message.kind==='runtime_notice'?'运行提示':message.role==='user'?'你':message.role==='assistant'?'CodeLeveler':message.role;}
 /** @template {{role:string,kind?:string}} T @param {T[]} messages @returns {T[]} */

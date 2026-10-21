@@ -229,3 +229,10 @@ test('thoughtDuration uses the terminal thresholds',()=>{
  assert.equal(thoughtDuration(999),'1.0s');
  assert.equal(thoughtDuration(15000),'15s');
 });
+
+test('a compaction summary is assistant prose, never a user bubble', async () => {
+  const { messageKind, historyQuestions } = await import('../src/presentation.mjs');
+  const summary = { id: 'compact-1', role: 'user', kind: 'compaction_summary', text: '上下文已压缩' };
+  assert.equal(messageKind(summary), 'assistant');
+  assert.deepEqual(historyQuestions([summary]), []);
+});

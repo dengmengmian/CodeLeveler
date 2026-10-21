@@ -30,6 +30,16 @@ export function projectSnapshot(snapshot, history = []) {
     state.messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index}));
     state.nextSeq = state.messages.length;
   }
+  // Replay stamps every entry with its log index, but only thoughts advance
+  // `nextSeq`. Without this reset the FIRST live event after a replay would be
+  // numbered 0 again: it would fall into the previous turn's bucket, and that
+  // turn's answer would claim the new turn's file changes as its own.
+  if (history.length > 0) {
+    let replayed = history.length;
+    for (const message of state.messages) replayed = Math.max(replayed, (message.seq ?? -1) + 1);
+    for (const tool of state.tools) replayed = Math.max(replayed, (tool.seq ?? -1) + 1);
+    state.nextSeq = Math.max(state.nextSeq, replayed);
+  }
   // Replayed history events carry no terminal classification. The runtime's
   // snapshot is the authority on whether the newest declaration is active or
   // history, so a completed plan is never resurrected as active work here.
@@ -146,6 +156,10 @@ export function applyEvent(state,event) {
   }
   if(event.type==='user_message_added'){next.reasoning='';next.reasoningSuperseded=false;}
   if (terminalEvents.has(event.type)) {
+    // A terminal turn owns no live activity: leaving the last label behind
+    // masks the settled status the runtime reports next (TUI finish_turn clears
+    // it for the same reason).
+    next.activity = '';
     // The turn's committed answer, recorded on its own message: a frozen turn
     // must not look like it never answered.
     const answer=committedFinalAnswer(next.messages,next.tools);
