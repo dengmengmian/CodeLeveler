@@ -482,7 +482,8 @@ fn error_signature(preview: &str) -> Option<String> {
         "failed to",
         "error:",
     ];
-    for line in preview.lines() {
+    let lines: Vec<&str> = preview.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
         let cleaned = strip_ansi(line);
         let line = cleaned.trim();
         if line.is_empty() || line.chars().count() < 8 {
@@ -491,12 +492,111 @@ fn error_signature(preview: &str) -> Option<String> {
         if !MARKERS.iter().any(|marker| line.contains(marker)) {
             continue;
         }
-        if looks_like_secret(line) || looks_like_instruction(line) {
+        let mut signature = line.to_string();
+        // A panic's marker line ends at the source location; the message is on
+        // the next line. Include it so two different panics in one file stay
+        // distinguishable, while the location/PID is normalized away below.
+        if line.contains("panicked at")
+            && let Some(next) = lines.get(index + 1)
+        {
+            let cleaned_next = strip_ansi(next);
+            let next = cleaned_next.trim();
+            if !next.is_empty() && !looks_like_secret(next) && !looks_like_instruction(next) {
+                signature.push(' ');
+                signature.push_str(next);
+            }
+        }
+        let signature = normalize_signature(&signature);
+        if looks_like_secret(&signature) || looks_like_instruction(&signature) {
             return None;
         }
-        return Some(clip(line, 160));
+        return Some(clip(&signature, 160));
     }
     None
+}
+
+/// Remove the volatile parts of an error line so the same failure keeps one
+/// identity across runs: thread/process ids, hex addresses, and `:line:column`
+/// suffixes. The message text survives.
+fn normalize_signature(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '(' {
+            let mut group = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == ')' {
+                    closed = true;
+                    break;
+                }
+                group.push(next);
+            }
+            if closed && !group.is_empty() && group.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            out.push('(');
+            out.push_str(&group);
+            if closed {
+                out.push(')');
+            }
+            continue;
+        }
+        if character == ':' {
+            let mut lookahead = chars.clone();
+            let mut line = String::new();
+            while let Some(&next) = lookahead.peek() {
+                if next.is_ascii_digit() {
+                    line.push(next);
+                    lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            if !line.is_empty() && lookahead.peek() == Some(&':') {
+                lookahead.next();
+                let mut column = String::new();
+                while let Some(&next) = lookahead.peek() {
+                    if next.is_ascii_digit() {
+                        column.push(next);
+                        lookahead.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !column.is_empty() {
+                    for _ in 0..(line.len() + 1 + column.len()) {
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
+            out.push(character);
+            continue;
+        }
+        if character == '0' && chars.peek() == Some(&'x') {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            let mut hex = String::new();
+            while let Some(&next) = lookahead.peek() {
+                if next.is_ascii_hexdigit() {
+                    hex.push(next);
+                    lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            if hex.len() >= 4 {
+                for _ in 0..(2 + hex.len()) {
+                    chars.next();
+                }
+                out.push_str("0xADDR");
+                continue;
+            }
+        }
+        out.push(character);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A tool line that addresses the model is not a failure signature. The
@@ -1677,6 +1777,55 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first.semantic_key, second.semantic_key);
+    }
+
+    #[test]
+    fn volatile_thread_ids_and_locations_do_not_split_one_identity() {
+        let events_a = vec![
+            started("a1", "run_command", run_command("cargo", &["test"]), 1),
+            finished_with_preview(
+                "a1",
+                "run_command",
+                true,
+                Some(101),
+                None,
+                "exit: 101\nthread 'preview' (407396939) panicked at src/lib.rs:2:10:\nend byte index 4 is not a char boundary",
+            ),
+            started("a2", "apply_patch", json!({"patch": "..."}), 2),
+            finished("a2", "apply_patch", false, None, Some("--- a/src/lib.rs")),
+            started("a3", "run_command", run_command("cargo", &["test"]), 3),
+            finished("a3", "run_command", false, Some(0), None),
+        ];
+        let events_b = vec![
+            started("b1", "run_command", run_command("cargo", &["test"]), 1),
+            finished_with_preview(
+                "b1",
+                "run_command",
+                true,
+                Some(101),
+                None,
+                "exit: 101\nthread 'preview' (407409407) panicked at src/lib.rs:7:3:\nend byte index 4 is not a char boundary",
+            ),
+            started("b2", "apply_patch", json!({"patch": "..."}), 2),
+            finished("b2", "apply_patch", false, None, Some("--- a/src/lib.rs")),
+            started("b3", "run_command", run_command("cargo", &["test"]), 3),
+            finished("b3", "run_command", false, Some(0), None),
+        ];
+        let pack_a = pack_from(&events_a, "修复").unwrap();
+        let pack_b = pack_from(&events_b, "修复").unwrap();
+        assert_eq!(
+            pack_a.identity_seed(),
+            pack_b.identity_seed(),
+            "PID and line/column are volatile; the message is the identity"
+        );
+        assert!(
+            pack_a.failures[0]
+                .signature
+                .as_deref()
+                .is_some_and(|signature| !signature.contains("407396939")),
+            "{:?}",
+            pack_a.failures[0].signature
+        );
     }
 
     #[test]
