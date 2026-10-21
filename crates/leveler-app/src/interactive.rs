@@ -305,7 +305,7 @@ fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::U
             // Legacy and derived entries have no product kind to claim.
             MemoryKind::LegacyUnknown | MemoryKind::Derived => None,
         },
-        sensitive: leveler_memory::is_sensitive(entry),
+        sensitive,
     }
 }
 
