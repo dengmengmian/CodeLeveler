@@ -52,7 +52,18 @@ impl ModelRuntime for MockRuntime {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        // A compaction summary request is the runtime's own call, not a
+        // scripted model step: answer it without consuming the conversation.
+        let is_summary = request.tool_choice == leveler_model::ToolChoice::None;
         self.requests.lock().unwrap().push(request);
+        if is_summary {
+            return Ok(ModelResponse {
+                request_id: RequestId::generate(),
+                message: Message::text(Role::Assistant, "briefing about earlier rounds"),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::default(),
+            });
+        }
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
         })
@@ -175,6 +186,18 @@ async fn harness_with(
     profile: PermissionProfile,
     setup: impl FnOnce(&std::path::Path),
 ) -> Harness {
+    harness_with_overrides(responses, profile, setup, None).await
+}
+
+/// [`harness_with`] plus the executor overrides a policy-shaped fixture needs
+/// (the context threshold is one: it comes from the resolved policy, not from
+/// a task field).
+async fn harness_with_overrides(
+    responses: Vec<ModelResponse>,
+    profile: PermissionProfile,
+    setup: impl FnOnce(&std::path::Path),
+    overrides: Option<leveler_agent::coding::policy::ExecutionOverrides>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
@@ -210,7 +233,7 @@ async fn harness_with(
             tool_context,
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
-            overrides: None,
+            overrides,
             memory_catalog: String::new(),
             memory_expose: true,
             memory_root: None,
@@ -4236,4 +4259,806 @@ async fn a_goal_turn_completes_when_every_named_deliverable_exists() {
 
     assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
     assert!(h.dir.path().join("stage-3.txt").exists());
+}
+
+/// DF-24: the whole recovery chain in one run. The model delivers stage 1,
+/// tries to close the goal on that third of the user's scope, is refused with
+/// the exact missing deliverables, then — with no new user input — creates the
+/// rest, runs the acceptance script, and completes once.
+#[tokio::test]
+async fn a_refused_premature_completion_recovers_within_the_same_run() {
+    let h = harness_with(
+        vec![
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            // Premature completion: claims the whole goal, accounts for one
+            // deliverable, and never ran the acceptance script.
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "stage 1 is done",
+                    "verification": {"status": "not_applicable", "detail": "fixture"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                    ]
+                }),
+            ),
+            // The refusal was accepted as feedback: finish what is missing.
+            tool_call(
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+            ),
+            tool_call(
+                "w3",
+                "write_file",
+                serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+            ),
+            tool_call(
+                "v1",
+                "run_command",
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["./verify.sh"],
+                    "reason": "run the acceptance script after the last change"
+                }),
+            ),
+            tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all three stages delivered and verified",
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+        ],
+        PermissionProfile::Assisted,
+        |dir| {
+            std::fs::write(
+                dir.join("verify.sh"),
+                "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段的文件交付：\n\
+         1. 创建 stage-1.txt，写入 stage 1。\n\
+         2. 创建 stage-2.txt，写入 stage 2。\n\
+         3. 创建 stage-3.txt，写入 stage 3。\n\
+         三个阶段全部完成后，执行 sh ./verify.sh。\n\
+         只有三个文件全部满足要求，并且验收脚本真实运行成功，才能结束任务。\n\
+         不需要每完成一个阶段就询问用户，也不需要等待用户再次输入「继续」。"
+        .to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push((kind, detail));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Completed,
+        "the model must recover from the refusal and finish: {report:?}"
+    );
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|(kind, _)| kind == "requirements_refused")
+        .map(|(_, detail)| detail)
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "exactly one premature completion is refused: {intercepted:?}"
+    );
+    assert!(refusals[0].contains("stage-2.txt"), "{refusals:?}");
+    assert!(refusals[0].contains("stage-3.txt"), "{refusals:?}");
+    for stage in ["stage-1.txt", "stage-2.txt", "stage-3.txt"] {
+        assert!(
+            h.dir.path().join(stage).exists(),
+            "{stage} must exist after recovery"
+        );
+    }
+}
+
+/// DF-24 negative: a model that answers every refusal with the SAME
+/// incomplete completion makes no durable progress. The existing no-progress
+/// bound must stop the turn — not the scripted runtime running dry and not an
+/// unbounded `UntilTerminal` loop.
+#[tokio::test]
+async fn repeated_refused_completions_are_bounded() {
+    let premature = |id: &str| {
+        tool_call(
+            id,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "stage 1 is done",
+                "verification": {"status": "not_applicable", "detail": "fixture"},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                ]
+            }),
+        )
+    };
+    let h = harness(vec![
+        premature("g1"),
+        premature("g2"),
+        premature("g3"),
+        text("should not be reached"),
+    ])
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt。".to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = 0;
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, .. } = event
+                    && kind == "requirements_refused"
+                {
+                    refusals += 1;
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        StopReason::Incomplete,
+        "a repeating refusal must hard-stop on the no-progress bound: {report:?}"
+    );
+    assert!(
+        report
+            .stop_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no-progress")),
+        "expected the no-progress stop detail, got {:?}",
+        report.stop_detail
+    );
+    assert_eq!(
+        refusals, 2,
+        "two consecutive refused completions are the mechanical bound"
+    );
+    assert_eq!(
+        h.requests.lock().unwrap().len(),
+        2,
+        "the third scripted completion is never requested"
+    );
+}
+
+/// DF-24 negative: a completion that claims a deliverable exists when it does
+/// not is refused, and so is one whose named acceptance command never ran. The
+/// model is only allowed to close after the files exist AND the script passed.
+#[tokio::test]
+async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
+    let h = harness_with(
+        vec![
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all stages are done",
+                    "verification": {"status": "not_applicable", "detail": "fixture"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+            tool_call(
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+            ),
+            tool_call(
+                "w3",
+                "write_file",
+                serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+            ),
+            // The files exist now, but the user's script has not run: still refused.
+            tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all stages are done",
+                    "verification": {"status": "not_applicable", "detail": "fixture"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+            tool_call(
+                "v1",
+                "run_command",
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["./verify.sh"],
+                    "reason": "run the acceptance script"
+                }),
+            ),
+            tool_call(
+                "g3",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all three stages delivered and verified",
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+        ],
+        PermissionProfile::Assisted,
+        |dir| {
+            std::fs::write(
+                dir.join("verify.sh"),
+                "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
+                      最后运行 sh ./verify.sh，全部做完再结束。"
+        .to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "requirements_refused"
+                {
+                    refusals.push(detail);
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert!(
+        refusals[0].contains("stage-2.txt") && refusals[0].contains("does not exist"),
+        "a claimed artifact that does not exist must be named: {refusals:?}"
+    );
+    assert!(
+        refusals[1].contains("./verify.sh"),
+        "the acceptance script must have run: {refusals:?}"
+    );
+}
+
+/// DF-24 negative: a real acceptance script that fails is hard evidence, so the
+/// goal cannot close; after the model fixes the artifact and re-runs the script
+/// past the last change, it completes.
+#[tokio::test]
+async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
+    let h = harness_with(
+        vec![
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            tool_call(
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "stage-2.txt", "content": "wrong\n"}),
+            ),
+            tool_call(
+                "w3",
+                "write_file",
+                serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+            ),
+            tool_call(
+                "v1",
+                "run_command",
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["./verify.sh"],
+                    "reason": "run the acceptance script"
+                }),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all stages are done",
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+            tool_call(
+                "w4",
+                "write_file",
+                serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+            ),
+            tool_call(
+                "v2",
+                "run_command",
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["./verify.sh"],
+                    "reason": "re-run the acceptance script after the fix"
+                }),
+            ),
+            tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all three stages delivered and verified",
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+        ],
+        PermissionProfile::Assisted,
+        |dir| {
+            std::fs::write(
+                dir.join("verify.sh"),
+                "set -e\ngrep -qx 'stage 1' stage-1.txt\n\
+                 grep -qx 'stage 2' stage-2.txt\ngrep -qx 'stage 3' stage-3.txt\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
+                      最后运行 sh ./verify.sh，全部做完再结束。"
+        .to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "verification_refused"
+                {
+                    refusals.push(detail);
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("./verify.sh") && refusals[0].contains("failed"),
+        "a failed acceptance script is named as the obstruction: {refusals:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.dir.path().join("stage-2.txt")).unwrap(),
+        "stage 2\n",
+        "the completion must rest on the corrected artifact"
+    );
+}
+
+/// DF-24B: the recoverable checkpoint is a real turn boundary. The first
+/// process ends right after the premature completion was refused; a fresh
+/// engine resumes the same session and goal, and the model gets the refusal
+/// plus the durable objective — no new goal, no narrowed acceptance.
+#[tokio::test]
+async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume() {
+    let responses_a = vec![
+        tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "stage 1 is done",
+                "verification": {"status": "not_applicable", "detail": "fixture"},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                ]
+            }),
+        ),
+    ];
+    let h = harness_with(responses_a, PermissionProfile::Assisted, |dir| {
+        std::fs::write(
+            dir.join("verify.sh"),
+            "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
+        )
+        .unwrap();
+    })
+    .await;
+    let mut s = spec(&h);
+    let objective = "完成三个阶段的文件交付：\n\
+         1. 创建 stage-1.txt，写入 stage 1。\n\
+         2. 创建 stage-2.txt，写入 stage 2。\n\
+         3. 创建 stage-3.txt，写入 stage 3。\n\
+         三个阶段全部完成后，执行 sh ./verify.sh。\n\
+         只有三个文件全部满足要求，并且验收脚本真实运行成功，才能结束任务。";
+    s.runtime.goal = objective.to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    // Kill the process the moment the premature completion is refused: the
+    // refusal is a durable tool result, the goal is still owed.
+    let cancel = CancellationToken::new();
+    let cancel_on_refusal = cancel.clone();
+    let mut refusals = Vec::new();
+    let killed = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "requirements_refused"
+                {
+                    refusals.push(detail);
+                    cancel_on_refusal.cancel();
+                }
+            },
+            cancel,
+        )
+        .await;
+    assert!(
+        matches!(killed, Err(leveler_engine::EngineError::Cancelled)),
+        "the scripted process exit must be a cancellation: {killed:?}"
+    );
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+
+    let before = GoalStore::unfinished(&h.db).await.unwrap();
+    assert_eq!(before.len(), 1, "the refused goal is still owed");
+    let goal = before[0].clone();
+    assert_eq!(goal.objective, objective, "the objective is durable");
+    let task_id = goal.task_id.clone();
+
+    // A fresh engine on the same database and workspace: the process restarts.
+    let workspace = Workspace::new(h.dir.path()).unwrap();
+    let runtime2 = Arc::new(MockRuntime::new(vec![
+        tool_call(
+            "w2",
+            "write_file",
+            serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+        ),
+        tool_call(
+            "w3",
+            "write_file",
+            serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+        ),
+        tool_call(
+            "v1",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": ["./verify.sh"],
+                "reason": "run the acceptance script after the restart"
+            }),
+        ),
+        tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "all three stages delivered and verified",
+                "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                ]
+            }),
+        ),
+    ]));
+    let engine2 = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&h.db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
+        },
+        factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
+            runtime: runtime2.clone(),
+            registry: Arc::new(default_registry()),
+            tool_context: ToolContext::with_environment(
+                workspace,
+                PermissionProfile::Assisted,
+                Arc::new(leveler_core::EnvSnapshot::new(
+                    std::env::vars_os(),
+                    std::env::current_dir().unwrap_or_default(),
+                    std::env::temp_dir(),
+                )),
+            ),
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: None,
+            memory_catalog: String::new(),
+            memory_expose: true,
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            steering: None,
+            allow_delegation: true,
+            allow_host_input: true,
+            capabilities: None,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
+            develop_model: None,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+        task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let report = engine2
+        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
+
+    for stage in ["stage-1.txt", "stage-2.txt", "stage-3.txt"] {
+        assert!(h.dir.path().join(stage).exists(), "{stage} after resume");
+    }
+    let goals = GoalStore::for_task(&h.db, &task_id).await.unwrap();
+    assert_eq!(goals.len(), 1, "resume must not open a second goal");
+    assert_eq!(goals[0].id, goal.id, "the resumed goal keeps its identity");
+    assert_eq!(goals[0].objective, objective);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert_eq!(goals[0].windows_run, 2);
+
+    // The resumed model request carries the durable objective AND the refusal
+    // it must recover from — resume did not rebuild a narrower task.
+    let requests = runtime2.requests.lock().unwrap().clone();
+    let carries_refusal = requests[0]
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|part| {
+            matches!(part, ContentPart::ToolResult { result }
+            if result.is_error && result.content.contains("update_goal(complete) was refused"))
+        });
+    assert!(
+        carries_refusal,
+        "the resumed transcript must still carry the refused completion"
+    );
+    let carries_objective = requests[0]
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|part| {
+            matches!(part, ContentPart::Text { text }
+            if text.contains("只有三个文件全部满足要求"))
+        });
+    assert!(
+        carries_objective,
+        "the resumed model must still see the user's original objective"
+    );
+}
+
+/// DF-24A: a real context fold in the middle of the recovery chain does not
+/// touch the authority. After compaction the model tries to close again and is
+/// refused again — the durable goal row, not the folded transcript, defines
+/// the scope — and only full delivery plus a fresh script run completes it.
+#[tokio::test]
+async fn a_compacted_context_still_owes_the_users_full_scope() {
+    let h = harness_with_overrides(
+        vec![
+            tool_call(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "stage 1 is done",
+                    "verification": {"status": "not_applicable", "detail": "fixture"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                    ]
+                }),
+            ),
+            tool_call(
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+            ),
+            // After the fold, the model again claims a narrowed scope.
+            tool_call(
+                "g2",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "both stages are done",
+                    "verification": {"status": "not_applicable", "detail": "fixture"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"}
+                    ]
+                }),
+            ),
+            tool_call(
+                "w3",
+                "write_file",
+                serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+            ),
+            tool_call(
+                "v1",
+                "run_command",
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["./verify.sh"],
+                    "reason": "run the acceptance script"
+                }),
+            ),
+            tool_call(
+                "g3",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "all three stages delivered and verified",
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
+                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    ]
+                }),
+            ),
+        ],
+        PermissionProfile::Assisted,
+        |dir| {
+            std::fs::write(
+                dir.join("verify.sh"),
+                "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
+            )
+            .unwrap();
+        },
+        Some(leveler_agent::coding::policy::ExecutionOverrides {
+            // A one-percent soft threshold: the fold fires early, in the
+            // middle of the recovery chain, so this is a real compaction and
+            // not a threshold that never crosses.
+            context_soft_percent: Some(1),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let mut s = spec(&h);
+    let objective = "完成三个阶段的文件交付：\n\
+         1. 创建 stage-1.txt，写入 stage 1。\n\
+         2. 创建 stage-2.txt，写入 stage 2。\n\
+         3. 创建 stage-3.txt，写入 stage 3。\n\
+         三个阶段全部完成后，执行 sh ./verify.sh。";
+    s.runtime.goal = objective.to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "requirements_refused"
+                {
+                    refusals.push(detail);
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
+    assert_eq!(
+        refusals.len(),
+        2,
+        "the folded context did not shrink the durable scope: {refusals:?}"
+    );
+    assert!(
+        refusals[1].contains("stage-3.txt"),
+        "the second refusal still names the missing deliverable: {refusals:?}"
+    );
+
+    // The fold is real, and it happened before the second narrowed attempt.
+    let requests = h.requests.lock().unwrap().clone();
+    let fold_at = requests
+        .iter()
+        .position(|request| request.tool_choice == leveler_model::ToolChoice::None)
+        .expect("the run must fold its context at least once");
+    let second_claim_at = requests
+        .iter()
+        .position(|request| {
+            request.messages.iter().flat_map(|m| &m.content).any(
+                |part| matches!(part, ContentPart::ToolCall { call } if call.id.as_str() == "g2"),
+            )
+        })
+        .expect("the second completion attempt must be requested");
+    assert!(
+        fold_at < second_claim_at,
+        "compaction must precede the second attempt: fold={fold_at} claim={second_claim_at}"
+    );
+
+    let goals = GoalStore::unfinished(&h.db).await.unwrap();
+    assert!(
+        goals.is_empty(),
+        "the goal is settled only after full delivery"
+    );
 }

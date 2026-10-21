@@ -26,6 +26,7 @@
 
 ### 修复
 
+- 被拒绝的 `update_goal(complete)` 计入空转轮次：模型重复同一个被拒的完成声明时，会由既有的有界空转上限停止，而不是一直跑到预算耗尽（在无界 continuation 策略下则是无限循环）。拒绝仍然只是反馈，下一轮真实工作会重置计数
 - Goal 不能再以比用户请求更窄的 acceptance 完成。`commit_task` 会拒绝漏掉用户明确枚举交付项的 acceptance；`update_goal(complete)` 要求逐项记账，并用执行记录核对具名产物与命令。用户自己写下的后续豁免会移除对应要求并随 Goal 持久化，因此恢复与压缩既不会复活也不会抹掉范围
 - 敏感校验覆盖所有写入路径的 title、body、tags 与 provenance evidence
 - forget、supersede、expiry 在写归档前脱敏敏感内容；非敏感记录保持原样

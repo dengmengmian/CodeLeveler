@@ -28,6 +28,7 @@ display and archive boundaries.
 
 ### Fixed
 
+- A refused `update_goal(complete)` counts as a no-progress round, so a model that repeats the same rejected resolution stops on the existing bounded streak instead of running until its budget (or indefinitely under an unbounded continuation policy). The refusal is still feedback: the next round that does real work resets the streak
 - A Goal can no longer complete on a narrower acceptance than the user's request. `commit_task` refuses an acceptance list that drops an explicitly enumerated deliverable; `update_goal(complete)` requires one accounting entry per requirement and checks named artifacts and commands against the execution record. A user-authored continuation waiver removes a requirement and is persisted with the goal, so resume and compaction cannot resurrect or erase scope
 - Sensitive-material validation covers title, body, tags and provenance evidence on every write path
 - Forget, supersede and expiry redact credential-shaped content before writing an archive; a non-sensitive record is unchanged
