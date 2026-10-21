@@ -114,6 +114,20 @@ impl ExperienceRecord {
     pub fn is_verified(&self) -> bool {
         self.verification == ExperienceVerification::Verified
     }
+
+    /// Whether every evidence reference is an observation.
+    ///
+    /// Such a record verifies only the observed fact. Its cause and its advice
+    /// remain model inference, so a later runtime-observed claim under the same
+    /// identity must not silently replace it: the later claim may be a
+    /// contradictory reading of the same output.
+    pub fn is_observation_only(&self) -> bool {
+        !self.evidence.is_empty()
+            && self
+                .evidence
+                .iter()
+                .all(|evidence| evidence.kind.trim() == "observation")
+    }
 }
 
 /// Below this share of shared content terms, two claims under one failure

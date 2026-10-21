@@ -771,9 +771,12 @@ verified by a structured observation alone. A different explanation under the
 same failure signature is not an update: it waits for a person instead of
 silently replacing the current entry. An observation-only lesson takes its
 identity from the observed script or edit tool, so repeated silent checks
-update one lesson rather than stacking duplicates. A candidate that cannot meet
-that contract stays unverified and waits for a person; it is never current
-truth. Experience has its
+update one lesson rather than stacking duplicates. Its explanation is model
+inference beyond that observed fact, so a later runtime-observed claim under
+the same identity waits for a person instead of silently replacing it; a
+failure-backed experience still updates on new evidence. A candidate that
+cannot meet that contract stays unverified and waits for a person; it is never
+current truth. Experience has its
 own durable work queue, admitted with the turn and claimed only after the turn
 is terminal. A staged result is replayed after a crash instead of asking the
 model again.

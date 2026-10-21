@@ -656,6 +656,23 @@ pub fn decide(
                     related,
                 });
             }
+            // An observation-only record verifies the observed fact, not the
+            // model's cause or advice. A later claim under the same identity
+            // can read the same output the other way; replacing the current
+            // lesson silently would make the newer reading the only remembered
+            // truth. Only a person may choose it.
+            if existing_experience.is_some_and(crate::ExperienceRecord::is_observation_only)
+                && !user_decision
+            {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::NeedsApproval {
+                        reason: "an observation-only experience's explanation is model inference; \
+                                 a person must replace it"
+                            .to_string(),
+                    },
+                    related,
+                });
+            }
             // A verified experience may correct an earlier experience under
             // the same identity when it carries new evidence, even at equal
             // authority. This is what lets a later task retire a stale
