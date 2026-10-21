@@ -778,7 +778,7 @@ impl BackgroundTaskRegistry {
             let terminal = task.terminal.as_mut().ok_or("task is not a terminal")?;
             terminal.master.resize(size).map_err(|e| e.to_string())?;
             terminal.size = size;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         Err("Unsupported: PTY terminals on this platform".into())
@@ -821,7 +821,7 @@ impl BackgroundTaskRegistry {
                 .take(max_bytes)
                 .copied()
                 .collect();
-            return Ok(TerminalObservation {
+            Ok(TerminalObservation {
                 snapshot: snapshot(task),
                 cols: terminal.size.cols,
                 rows: terminal.size.rows,
@@ -830,7 +830,7 @@ impl BackgroundTaskRegistry {
                 next_cursor: position + data.len() as u64,
                 data,
                 truncated: cursor < start,
-            });
+            })
         }
         #[cfg(not(unix))]
         Err("Unsupported: PTY terminals on this platform".into())
@@ -2351,14 +2351,14 @@ fn spawn_terminal_pump(
                 Ok(0) => break,
                 Ok(n) => {
                     let mut state = reg.lock().await;
-                    if let Some(task) = state.tasks.get_mut(&id) {
-                        if let Some(terminal) = &mut task.terminal {
-                            terminal.bytes.extend(&bytes[..n]);
-                            terminal.end += n as u64;
-                            let excess = terminal.bytes.len().saturating_sub(MAX_LOG_BYTES);
-                            terminal.bytes.drain(..excess);
-                            task.changed.notify_waiters();
-                        }
+                    if let Some(task) = state.tasks.get_mut(&id)
+                        && let Some(terminal) = &mut task.terminal
+                    {
+                        terminal.bytes.extend(&bytes[..n]);
+                        terminal.end += n as u64;
+                        let excess = terminal.bytes.len().saturating_sub(MAX_LOG_BYTES);
+                        terminal.bytes.drain(..excess);
+                        task.changed.notify_waiters();
                     }
                 }
                 // PTY masters signal EIO after their final slave closes.
