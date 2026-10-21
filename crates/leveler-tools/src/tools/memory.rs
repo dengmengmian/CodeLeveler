@@ -310,9 +310,9 @@ impl Tool for RememberTool {
             .map_err(|e| ToolError::Io(e.to_string()))?;
         let message = match outcome {
             leveler_memory::AgentAdmitOutcome::Applied(outcome) => {
-                let entry = outcome.entry.ok_or_else(|| ToolError::Io(
-                    "memory lifecycle applied no entry".to_string(),
-                ))?;
+                let entry = outcome.entry.ok_or_else(|| {
+                    ToolError::Io("memory lifecycle applied no entry".to_string())
+                })?;
                 match outcome.operation {
                     leveler_memory::AppliedOperation::Created => {
                         format!("Remembered [{}]: {}", entry.id, entry.title)
@@ -469,11 +469,7 @@ mod tests {
                     .unwrap()
             }
         };
-        let first = remember(
-            "Staging deploys from the release branch.",
-            "deploy.staging",
-        )
-        .await;
+        let first = remember("Staging deploys from the release branch.", "deploy.staging").await;
         let second = remember(
             "Production deploys are gated on the on-call approval.",
             "deploy.production",
@@ -502,11 +498,7 @@ mod tests {
             listed.content
         );
         // Idempotent re-remember of the SAME fact must not spawn a duplicate.
-        let again = remember(
-            "Staging deploys from the release branch.",
-            "deploy.staging",
-        )
-        .await;
+        let again = remember("Staging deploys from the release branch.", "deploy.staging").await;
         assert!(
             again.content.contains("identical") || again.content.contains("already states this"),
             "identical fact must be recognized as current: {}",
