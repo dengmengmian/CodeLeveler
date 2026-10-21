@@ -539,6 +539,19 @@ pub enum MemoryCommand {
         #[arg(long)]
         text: String,
     },
+    /// Report stored records that look like they contain credentials. Never
+    /// prints the content; safe to run in a shared terminal.
+    Audit,
+    /// Redact credential-shaped content in active, archived and pending
+    /// records. Dry-run unless `--apply` is passed.
+    Scrub {
+        /// Only this memory id (all stores). Omit to scan every record.
+        #[arg(long)]
+        id: Option<String>,
+        /// Write the redaction. Without it this is a read-only report.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 /// The `--kind` values `leveler memory remember` accepts.

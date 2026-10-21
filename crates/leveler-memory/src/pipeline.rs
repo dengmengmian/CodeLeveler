@@ -54,6 +54,7 @@ impl MemoryStore {
     /// identity may update immediately only when the candidate is backed by
     /// explicit user authority; weaker observations still require consent.
     pub fn admit_candidate(&self, candidate: MemoryCandidate) -> Result<AdmitOutcome, MemoryError> {
+        crate::candidates::validate_candidate(&candidate)?;
         if candidate.authority == MemoryAuthority::ExplicitUser
             && candidate.key.is_some()
             && let Some(existing) = self.find_active_for_candidate(&candidate)?
@@ -70,6 +71,7 @@ impl MemoryStore {
 
     /// Enqueue a candidate for user consent. Never writes `active/`.
     pub fn propose(&self, candidate: MemoryCandidate) -> Result<ProposeOutcome, MemoryError> {
+        crate::candidates::validate_candidate(&candidate)?;
         if self.is_suppressed(&candidate.fingerprint)? {
             return Ok(ProposeOutcome::Suppressed {
                 fingerprint: candidate.fingerprint.clone(),

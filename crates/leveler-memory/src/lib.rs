@@ -14,9 +14,9 @@ mod pipeline;
 mod semantic;
 
 pub use candidates::{
-    CandidateKind, CandidateSource, MemoryCandidate, fingerprint_of, looks_like_secret,
-    package_manager_from_root, parse_direct_memory_command, parse_inferred_preference,
-    title_from_body,
+    CandidateKind, CandidateSource, MemoryCandidate, candidate_sensitive_fields, fingerprint_of,
+    is_sensitive_candidate, looks_like_secret, package_manager_from_root,
+    parse_direct_memory_command, parse_inferred_preference, redact_candidate, title_from_body,
 };
 pub use lifecycle::{
     AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
@@ -35,6 +35,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// What a redacted historical record shows instead of the credential.
+pub const REDACTED_TITLE: &str = "[sensitive memory]";
+pub const REDACTED_BODY: &str = "[sensitive content removed]";
 
 /// How far a memory's relevance reaches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,12 +308,23 @@ impl MemoryStore {
             let mut entry: MemoryEntry = serde_json::from_str(&fs::read_to_string(&active)?)?;
             entry.archived_at = Some(now_rfc3339());
             entry.status = MemoryStatus::Archived;
-            fs::write(&archive, serde_json::to_string_pretty(&entry)?)?;
+            // Forget is a retention boundary. The record stays for audit, but
+            // a credential must not be copied into the archive in plaintext.
+            if is_sensitive(&entry) {
+                redact_entry(&mut entry);
+            }
+            write_atomically(&archive, serde_json::to_string_pretty(&entry)?.as_bytes())?;
             fs::remove_file(active)?;
             return Ok(entry);
         }
         if archive.exists() {
-            let entry: MemoryEntry = serde_json::from_str(&fs::read_to_string(archive)?)?;
+            let mut entry: MemoryEntry = serde_json::from_str(&fs::read_to_string(&archive)?)?;
+            if is_sensitive(&entry) {
+                // Idempotent forget is also the per-id cleanup path for an
+                // archive written before this boundary existed.
+                redact_entry(&mut entry);
+                write_atomically(&archive, serde_json::to_string_pretty(&entry)?.as_bytes())?;
+            }
             return Ok(entry);
         }
         Err(MemoryError::NotFound(id.to_string()))
@@ -350,7 +365,14 @@ impl MemoryStore {
 
     /// Short INDEX lines for system injection (titles only; cap lines).
     pub fn index_lines(&self, max_entries: usize) -> Result<String, MemoryError> {
-        let entries = self.list_active()?;
+        // The legacy index is still a model-facing surface even though the
+        // catalog replaced it. A historical credential must not appear here
+        // either.
+        let entries: Vec<MemoryEntry> = self
+            .list_active()?
+            .into_iter()
+            .filter(|entry| !is_sensitive(entry))
+            .collect();
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -407,6 +429,33 @@ impl MemoryStore {
         // stored, but failing to remove it is not a reason to lose the write.
         // The domain deliberately takes no logger; a failure here is healed by
         // `list_pending`, which drops covered candidates on the next read.
+        let _ = self.clear_equivalent_pending(&saved);
+        Ok(saved)
+    }
+
+    /// Create an active memory from the model's own `remember` proposal.
+    ///
+    /// Human approval authorizes the WRITE; it does not turn the model's
+    /// finding into something the user said. The entry therefore carries
+    /// model-inference authority and an `agent_remember_tool` source, and it
+    /// goes through the non-overwriting create path so it can never replace a
+    /// fact the user wrote directly.
+    pub fn activate_agent(
+        &self,
+        title: &str,
+        body: &str,
+        kind: MemoryKind,
+        tags: Vec<String>,
+    ) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        let mut entry = new_entry(title, body, tags);
+        entry.kind = Some(kind.as_str().to_string());
+        entry.provenance = Some(Provenance {
+            authority: MemoryAuthority::ModelInference,
+            source: "agent_remember_tool".to_string(),
+            evidence: None,
+        });
+        let saved = self.remember_deduplicated_unlocked(entry)?;
         let _ = self.clear_equivalent_pending(&saved);
         Ok(saved)
     }
@@ -577,7 +626,7 @@ fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
     // tool would mean four copies of the rule and four chances to forget it.
     // Entries already on disk are not touched here — they are withheld from
     // every automatic path instead (see `is_sensitive`).
-    if looks_like_secret(&entry.title) || looks_like_secret(&entry.body) {
+    if is_sensitive(entry) {
         return Err(MemoryError::Invalid(
             "refusing to store what looks like a credential".to_string(),
         ));
@@ -717,7 +766,54 @@ impl MemoryKind {
 /// Legacy stores may already contain one: it is NOT deleted, but it is held
 /// back from every automatic path and from the model's own memory tools.
 pub fn is_sensitive(entry: &MemoryEntry) -> bool {
-    looks_like_secret(&entry.title) || looks_like_secret(&entry.body)
+    !sensitive_fields(entry).is_empty()
+}
+
+/// Which durable fields of an entry carry credential-shaped material.
+fn sensitive_fields(entry: &MemoryEntry) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if looks_like_secret(&entry.title) {
+        fields.push("title");
+    }
+    if looks_like_secret(&entry.body) {
+        fields.push("body");
+    }
+    if entry.tags.iter().any(|tag| looks_like_secret(tag)) {
+        fields.push("tags");
+    }
+    if entry
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.evidence.as_deref())
+        .is_some_and(looks_like_secret)
+    {
+        fields.push("evidence");
+    }
+    fields
+}
+
+/// Redact the credential-shaped fields of an entry in place. Safe fields are
+/// preserved, so a redacted record still says what kind of memory it was.
+pub(crate) fn redact_entry_for_archive(entry: &mut MemoryEntry) {
+    redact_entry(entry);
+}
+
+fn redact_entry(entry: &mut MemoryEntry) {
+    if looks_like_secret(&entry.title) {
+        entry.title = REDACTED_TITLE.to_string();
+    }
+    if looks_like_secret(&entry.body) {
+        entry.body = REDACTED_BODY.to_string();
+    }
+    entry.tags.retain(|tag| !looks_like_secret(tag));
+    if let Some(provenance) = entry.provenance.as_mut()
+        && provenance
+            .evidence
+            .as_deref()
+            .is_some_and(looks_like_secret)
+    {
+        provenance.evidence = None;
+    }
 }
 
 /// Whether this entry declares itself a lasting preference.
@@ -1421,6 +1517,114 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl MemoryStore {
+    /// Audit historical records that carry credential-shaped material.
+    pub fn audit_sensitive(&self) -> Result<Vec<SensitiveFinding>, MemoryError> {
+        let mut findings = Vec::new();
+        for entry in self.list_active()? {
+            let fields = sensitive_fields(&entry);
+            if !fields.is_empty() {
+                findings.push(SensitiveFinding {
+                    id: entry.id,
+                    location: SensitiveLocation::Active,
+                    fields,
+                });
+            }
+        }
+        for entry in self.list_archived()? {
+            let fields = sensitive_fields(&entry);
+            if !fields.is_empty() {
+                findings.push(SensitiveFinding {
+                    id: entry.id,
+                    location: SensitiveLocation::Archived,
+                    fields,
+                });
+            }
+        }
+        for candidate in self.list_pending_raw()? {
+            let fields = candidate_sensitive_fields(&candidate);
+            if !fields.is_empty() {
+                findings.push(SensitiveFinding {
+                    id: candidate.id,
+                    location: SensitiveLocation::Pending,
+                    fields,
+                });
+            }
+        }
+        Ok(findings)
+    }
+
+    /// Redact credential-shaped fields in historical records. A dry run reads
+    /// only; `apply` rewrites whichever stores contain a finding.
+    pub fn scrub_sensitive(
+        &self,
+        id: Option<&str>,
+        apply: bool,
+    ) -> Result<ScrubReport, MemoryError> {
+        let _lifecycle_lock = if apply {
+            Some(self.acquire_lifecycle_lock()?)
+        } else {
+            None
+        };
+        let mut report = ScrubReport::default();
+        let matches = |candidate_id: &str| id.is_none_or(|wanted| wanted == candidate_id);
+
+        for mut entry in self.list_active()? {
+            if !matches(&entry.id) {
+                continue;
+            }
+            let fields = sensitive_fields(&entry);
+            if fields.is_empty() {
+                continue;
+            }
+            report.findings += 1;
+            if apply {
+                redact_entry(&mut entry);
+                write_atomically(
+                    &self.active_path(&entry.id),
+                    serde_json::to_string_pretty(&entry)?.as_bytes(),
+                )?;
+                report.redacted += 1;
+            }
+        }
+        for mut entry in self.list_archived()? {
+            if !matches(&entry.id) {
+                continue;
+            }
+            let fields = sensitive_fields(&entry);
+            if fields.is_empty() {
+                continue;
+            }
+            report.findings += 1;
+            if apply {
+                redact_entry(&mut entry);
+                write_atomically(
+                    &self.archive_path(&entry.id),
+                    serde_json::to_string_pretty(&entry)?.as_bytes(),
+                )?;
+                report.redacted += 1;
+            }
+        }
+        for mut candidate in self.list_pending_raw()? {
+            if !matches(&candidate.id) {
+                continue;
+            }
+            let fields = candidate_sensitive_fields(&candidate);
+            if fields.is_empty() {
+                continue;
+            }
+            report.findings += 1;
+            if apply {
+                redact_candidate(&mut candidate);
+                write_atomically(
+                    &self.pending_path(&candidate.id),
+                    serde_json::to_string_pretty(&candidate)?.as_bytes(),
+                )?;
+                report.redacted += 1;
+            }
+        }
+        Ok(report)
+    }
+
     /// Dense local-vector search (cosine over [`local_embed`]).
     pub fn vector_search(
         &self,
@@ -1473,5 +1677,210 @@ mod vector_tests {
             "{:?}",
             hits[0].0.title
         );
+    }
+}
+
+/// Where a historical sensitive memory lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensitiveLocation {
+    Active,
+    Archived,
+    Pending,
+}
+
+/// One historical credential-bearing record. Never carries the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveFinding {
+    pub id: String,
+    pub location: SensitiveLocation,
+    pub fields: Vec<&'static str>,
+}
+
+/// Result of a scrub pass. `findings` counts what the audit saw; `redacted`
+/// counts records actually rewritten (always 0 for a dry run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrubReport {
+    pub findings: usize,
+    pub redacted: usize,
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_legacy_active(root: &std::path::Path, entry: &MemoryEntry) {
+        std::fs::write(
+            root.join("active").join(format!("{}.json", entry.id)),
+            serde_json::to_string_pretty(entry).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn legacy_secret(title: &str, body: &str) -> MemoryEntry {
+        let mut entry = new_entry(title, body, vec![]);
+        entry.kind = Some("note".into());
+        entry
+    }
+
+    /// Every field that reaches durability is a credential boundary, not only
+    /// title and body. Tags and provenance evidence used to bypass the gate.
+    #[test]
+    fn activation_refuses_a_secret_in_a_tag() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let error = store
+            .activate(
+                "Deploy notes",
+                "Use the release branch.",
+                MemoryKind::Note,
+                vec!["token=ghp_abcdefghijklmnopqrstuvwxyz0123".into()],
+            )
+            .unwrap_err();
+        assert!(matches!(error, MemoryError::Invalid(_)), "{error}");
+        assert!(store.list_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn activation_refuses_a_secret_in_provenance_evidence() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut entry = new_entry("Deploy notes", "Use the release branch.", vec![]);
+        entry.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "user_direct".into(),
+            evidence: Some("password=hunter2hunter2".into()),
+        });
+        let error = store.remember(entry).unwrap_err();
+        assert!(matches!(error, MemoryError::Invalid(_)), "{error}");
+        assert!(store.list_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_secret_in_a_tag_or_evidence_marks_a_legacy_entry_sensitive() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let mut tagged = legacy_secret("tagged", "safe body");
+        tagged.tags = vec!["sk-live-abcdefghijklmnopqrstuvwxyz012345".into()];
+        let mut evidenced = legacy_secret("evidenced", "safe body");
+        evidenced.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "explicit_user_turn".into(),
+            evidence: Some("ghp_abcdefghijklmnopqrstuvwxyz0123".into()),
+        });
+        write_legacy_active(dir.path(), &tagged);
+        write_legacy_active(dir.path(), &evidenced);
+
+        assert!(is_sensitive(&tagged));
+        assert!(is_sensitive(&evidenced));
+        assert!(store.standing_preferences(8).unwrap().is_empty());
+        assert!(store.catalog_lines(16).unwrap().is_empty());
+        assert!(store.index_lines(16).unwrap().is_empty());
+    }
+
+    /// Forget is a retention boundary: the archive is still on disk for audit,
+    /// but a credential must not be copied into it in plaintext.
+    #[test]
+    fn forgetting_a_sensitive_entry_does_not_archive_the_plaintext() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let entry = legacy_secret("Deploy token", &format!("token={secret}"));
+        write_legacy_active(dir.path(), &entry);
+
+        let archived = store.forget(&entry.id).unwrap();
+        let raw = std::fs::read_to_string(store.archive_path(&entry.id)).unwrap();
+        assert!(!raw.contains(secret), "archive kept the credential: {raw}");
+        assert!(!archived.body.contains(secret));
+        assert_eq!(archived.status, MemoryStatus::Archived);
+        assert!(store.archive_path(&entry.id).exists());
+    }
+
+    #[test]
+    fn expiry_archives_a_legacy_secret_without_its_plaintext() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let mut entry = legacy_secret("Expiring token", &format!("token={secret}"));
+        entry.expires_at = Some("2020-01-01T00:00:00Z".into());
+        write_legacy_active(dir.path(), &entry);
+
+        let expired = store.expire_due().unwrap();
+        assert_eq!(expired.len(), 1);
+        let raw = std::fs::read_to_string(store.archive_path(&entry.id)).unwrap();
+        assert!(!raw.contains(secret), "expiry kept the credential: {raw}");
+    }
+
+    #[test]
+    fn audit_lists_locations_and_scrub_redacts_active_archive_and_pending() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+
+        let active = legacy_secret("Active token", &format!("token={secret}"));
+        write_legacy_active(dir.path(), &active);
+        let archived = legacy_secret("Archived token", &format!("token={secret}"));
+        std::fs::write(
+            dir.path()
+                .join("archive")
+                .join(format!("{}.json", archived.id)),
+            serde_json::to_string_pretty(&archived).unwrap(),
+        )
+        .unwrap();
+        let pending = MemoryCandidate::new(
+            "Pending token",
+            "safe body",
+            CandidateKind::Free,
+            None,
+            CandidateSource::AgentProposed,
+            vec![],
+        )
+        .unwrap();
+        let mut pending = pending;
+        pending.body = format!("token={secret}");
+        std::fs::write(
+            dir.path()
+                .join("pending")
+                .join(format!("{}.json", pending.id)),
+            serde_json::to_string_pretty(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let findings = store.audit_sensitive().unwrap();
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.location == SensitiveLocation::Active)
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.location == SensitiveLocation::Archived)
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.location == SensitiveLocation::Pending)
+        );
+
+        let dry = store.scrub_sensitive(None, false).unwrap();
+        assert_eq!(dry.redacted, 0);
+        assert_eq!(dry.findings, 3);
+        let raw = std::fs::read_to_string(store.active_path(&active.id)).unwrap();
+        assert!(raw.contains(secret), "dry run must not touch user data");
+
+        let applied = store.scrub_sensitive(None, true).unwrap();
+        assert_eq!(applied.redacted, 3);
+        for path in [
+            store.active_path(&active.id),
+            store.archive_path(&archived.id),
+            store.pending_path(&pending.id),
+        ] {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains(secret), "scrub left a credential in {path:?}");
+        }
+        assert!(store.audit_sensitive().unwrap().is_empty());
     }
 }

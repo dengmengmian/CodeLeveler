@@ -228,13 +228,15 @@ impl Tool for RememberTool {
 
     fn description(&self) -> &'static str {
         "Propose a durable project memory: `title`, `body`, and `kind` \
-         (`preference`, `decision`, or `note`). Every permission profile, \
-         including full access, requires a person to approve the proposal \
-         before it becomes active. With nobody to ask, the proposal may stay \
-         pending. `preference` is injected into later turns. `decision` and \
-         `note` are retrieved by relevance or title. A proposal does not \
-         replace an existing entry; a second title match is a second entry. \
-         `forget` archives an id. Secrets are not a valid body."
+         (`preference`, `decision`, or `note`). Auto and Restricted require a \
+         person to approve the proposal before it becomes active; Full permits \
+         the write without a separate permission prompt. With nobody to ask, \
+         the proposal may stay pending. The entry records model-inference \
+         authority: approval does not claim the user stated it, and it never \
+         replaces a fact the user wrote directly. `preference` is injected \
+         into later turns. `decision` and `note` are retrieved by relevance or \
+         title. A second title match is a second entry. `forget` archives an \
+         id. Secrets are not a valid body."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -257,10 +259,12 @@ impl Tool for RememberTool {
             return Ok(ToolOutput::error("title and body are required"));
         }
         let store = self.root.open()?;
-        // One activation entry point for every writer, so overwrite, dedup,
-        // secret refusal and pending cleanup cannot differ by caller.
+        // A model proposal is not a user statement. This path records
+        // model-inference provenance and uses the non-overwriting create
+        // path, so approval cannot upgrade the model's finding into a fact
+        // that replaces what the user wrote directly.
         let saved = store
-            .activate(&args.title, &args.body, args.kind.into(), args.tags)
+            .activate_agent(&args.title, &args.body, args.kind.into(), args.tags)
             .map_err(|e| ToolError::Io(e.to_string()))?;
         Ok(ToolOutput::ok(format!(
             "Remembered [{}]: {}",
@@ -472,6 +476,65 @@ mod tests {
             out.content
         );
         assert!(out.content.contains("score"), "{}", out.content);
+    }
+
+    /// The model's `remember` call is a model finding, even when a human
+    /// approved executing it. It must not claim the user said it, and it must
+    /// never replace a fact the user wrote directly.
+    #[tokio::test]
+    async fn agent_remember_is_model_authority_and_never_replaces_a_user_fact() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let store = MemoryStore::open(&mem).unwrap();
+        let user = store
+            .activate(
+                "Deploy notes",
+                "User chose the release branch.",
+                leveler_memory::MemoryKind::Note,
+                vec![],
+            )
+            .unwrap();
+
+        let out = RememberTool::new(root.clone())
+            .execute(
+                serde_json::json!({
+                    "title": "Deploy notes",
+                    "body": "The model thinks production is gated on on-call approval.",
+                    "kind": "note"
+                }),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+
+        let active = store.list_active().unwrap();
+        assert_eq!(active.len(), 2, "the model adds a second entry: {active:?}");
+        let user_entry = active.iter().find(|entry| entry.id == user.id).unwrap();
+        assert_eq!(
+            user_entry.body, "User chose the release branch.",
+            "the user's entry must be untouched"
+        );
+        assert_eq!(
+            user_entry.provenance.as_ref().unwrap().authority,
+            leveler_memory::MemoryAuthority::ExplicitUser
+        );
+        let agent_entry = active
+            .iter()
+            .find(|entry| entry.id != user.id)
+            .expect("agent entry");
+        assert_eq!(
+            agent_entry.provenance.as_ref().unwrap().authority,
+            leveler_memory::MemoryAuthority::ModelInference,
+            "approval to execute is not a claim that the user asserted the fact"
+        );
+        assert_eq!(
+            agent_entry.provenance.as_ref().unwrap().source,
+            "agent_remember_tool"
+        );
     }
 
     /// Stores created before credential validation may already contain a key.
