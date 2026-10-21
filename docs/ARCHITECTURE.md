@@ -926,7 +926,7 @@ Model interprets those facts semantically.
 User owns final acceptance.
 ```
 
-This prevents a green check, successful Tool call, or changed file from becoming an automatic “done” signal.
+This prevents a green check, successful Tool call, or changed file from becoming an automatic “done” signal. The model cannot shrink the user's scope by shrinking its own acceptance list: explicitly enumerated deliverables are accounted for one by one, and a missing, not-done, or mechanically contradicted requirement refuses completion.
 
 ### 10.4 Final Prose Is Not a Task Terminal
 
@@ -1077,6 +1077,8 @@ an unknown outcome never authorizes an automatic rerun.
 For an attachment-free `SubmitMessage`, the App command entry recognizes continuation with the existing `parse_continuation` and invokes the existing `ResumeTask` handler. It preserves the original task, Goal and plan, treating amendments as additions to the original objective. The existing Runtime owner still decides resumability, rejects explicitly cancelled tasks, and treats continuation without resumable work as an ordinary message. Submissions with attachments retain the content and image validation path; clients do not add separate continuation parsers.
 
 Chat delegation is a turn-scoped Goal identity, not a fourth collaboration axis. A top-level authoring Chat turn may call the injected `commit_task(objective, acceptance)` tool; the runtime validates the declaration and binds that turn through the existing `GoalBinder` (goal row, `turn.payload.goal_id`, budget-scope migration). The durable goal objective is the user's own request in the turn's objective anchor, not the model's restatement, so the model cannot narrow the task by declaring a smaller objective. From the next round the same turn exposes `update_goal`, Goal closeout and the verification gate. The session's collaboration remains `chat`, and a later ordinary message remains Chat. The declaration is structured: the runtime never classifies user text for execution intent and adds no classifier model call. Questions, discussions, read-only and Plan surfaces never receive the tool; sub-agents cannot declare tasks. Resume treats `turn.payload.goal_id` as sufficient Goal identity, so an interrupted delegated Chat turn resumes under the Goal profile without changing the session axis. A paused task remains visible until it settles or is explicitly cancelled; an explicit logical cancel settles its goal and refuses a later continuation.
+
+The user's explicitly enumerated deliverables are the scope authority. The persisted goal records the model's candidate acceptance checks and every later user-authored scope instruction; `update_goal(complete)` must account for each extracted requirement and refuses completion when one is missing, declared not done, or contradicted by a checked artifact or command. Extraction is deliberately narrow: file paths, inline-code tokens, short delimiter-separated lists, numbered items, named executable commands, and an explicit demand that tests pass. Open-ended semantic goals produce no mechanical requirements and are completed only with an honest unverified boundary, never a fabricated proof. A user-authored waiver is the only way a requirement leaves the effective set.
 
 Web restores a saved conversation using the newly received `SessionList`, rather than a React state list whose dispatch may not yet have committed. Existing current / pending selection guards prevent restoration from overriding a conversation the user is already opening.
 
