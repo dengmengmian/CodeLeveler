@@ -1962,8 +1962,7 @@ function thoughtNode(existing, thought) {
     summary.append(
       iconNode('chevronRight', { size: 12, className: 'thought-chevron' }),
       iconNode('sparkle', { size: 14 }),
-      el('span', 'thought-label', '思考'),
-      el('span', 'thought-preview'),
+      el('span', 'thought-label', '已完成分析'),
     );
     node.append(summary, el('div', 'thought-body'));
     node.addEventListener('toggle', () => {
@@ -1971,9 +1970,7 @@ function thoughtNode(existing, thought) {
     });
   }
   const text = thought.body ?? thought.text ?? '';
-  node.querySelector('.thought-label').textContent = thought.interrupted ? '思考中断' : '思考';
-  const preview = node.querySelector('.thought-preview');
-  preview.textContent = text.replace(/\s+/g, ' ').slice(0, 160);
+  node.querySelector('.thought-label').textContent = thought.interrupted ? '分析中断' : '已完成分析';
   node.querySelector('.thought-body').textContent = text;
   node.open = openThoughts.has(thought.id);
   return node;
@@ -1985,10 +1982,13 @@ function liveThoughtNode(existing, text) {
     node = el('div', 'thought-row thought-live');
     node.dataset.key = 'thought:live';
     const head = el('div', 'thought-summary');
-    head.append(iconNode('chevronRight', { size: 12, className: 'thought-chevron' }), iconNode('sparkle', { size: 14 }), el('span', 'thought-label', '思考中'));
-    node.append(head, el('div', 'thought-body'));
+    head.append(iconNode('sparkle', { size: 14 }), el('span', 'thought-label', '正在分析请求'), el('span', 'thought-preview'));
+    node.append(head);
   }
-  node.querySelector('.thought-body').textContent = text;
+  // The live row is one line of activity, not the analysis transcript: the
+  // latest reasoning line is the signal, and the settled Thought keeps the body.
+  const latest = text.split('\n').map(line => line.trim()).filter(Boolean).at(-1) ?? '';
+  node.querySelector('.thought-preview').textContent = latest;
   return node;
 }
 
@@ -2292,8 +2292,9 @@ function renderToolDetails(row, id) {
     card.append(head);
     const files = (Array.isArray(args?.files) ? args.files : []).map(file => typeof file === 'string' ? file : file?.path).filter(Boolean);
     if (typeof args?.path === 'string') files.unshift(args.path);
-    for (const file of files.slice(0, 4)) card.append(el('div', 'tool-deliver-file', String(file)));
-    if (files.length > 4) card.append(el('div', 'tool-deliver-more', `其余 ${files.length - 4} 个文件`));
+    const listed = [...new Set(files)];
+    for (const file of listed.slice(0, 4)) card.append(el('div', 'tool-deliver-file', String(file)));
+    if (listed.length > 4) card.append(el('div', 'tool-deliver-more', `其余 ${listed.length - 4} 个文件`));
     if (output) card.append(el('pre', 'tool-output', output));
   } else if (kind === 'todo' && (Array.isArray(args?.todos) || Array.isArray(args?.items) || Array.isArray(args?.steps))) {
     card = el('div', 'tool-todo-card');
@@ -2497,12 +2498,15 @@ function processHost(existing, bucket) {
   let toolCount = 0;
   for (const child of children) if (child.matches?.('.execution-round')) toolCount += child.querySelectorAll('.tool-row').length;
   const finished = current?.lastTerminal && !['running', 'waiting_user'].includes(current.status);
+  // The work-steps heading exists to fold tool rounds. A turn that only
+  // reasoned has nothing to fold, so its analysis rows stand on their own.
+  if (toolCount) delete host.dataset.plain; else host.dataset.plain = '1';
   host.querySelector('.process-label').textContent = finished ? '已完成' : '处理中';
   host.querySelector('.process-count').textContent = toolCount ? `${toolCount} 项` : '';
   const latestUser = [...current.messages].reverse().find(message => messageKind(message) === 'user')?.id;
   const keepLatest = settings.collapseAfter === 'next' && (bucket.anchorId ?? latestUser) === latestUser;
   const compact = settings.workSteps === 'compact';
-  host.open = openProcess.has(hostKey) || (!compact && (!finished || keepLatest));
+  host.open = !host.dataset.plain ? (openProcess.has(hostKey) || (!compact && (!finished || keepLatest))) : true;
   const body = host.querySelector('.process-body');
   for (const child of [...body.children]) if (!children.includes(child)) child.remove();
   for (const child of children) if (child.parentNode !== body) body.append(child);
@@ -2624,45 +2628,16 @@ function deliveredCard() {
   return card;
 }
 
-function changedFilesCard() {
-  const files = current?.diff?.files ?? [];
-  if (!files.length) return null;
-  const card = el('div', 'changed-files-card');
-  card.dataset.key = 'changed-files';
-  const head = el('button', 'changed-files-head');
-  head.type = 'button';
-  const icon = el('span', 'delivered-icon');
-  icon.append(iconNode('code', { size: 20 }));
-  const copy = el('span', 'delivered-copy');
-  const added = files.reduce((sum, file) => sum + (file.added ?? 0), 0);
-  const removed = files.reduce((sum, file) => sum + (file.removed ?? 0), 0);
-  copy.append(
-    el('span', 'delivered-name', files.length === 1 ? `已修改 ${files[0].path.split('/').at(-1)}` : `已修改 ${files.length} 个文件`),
-    el('span', 'delivered-meta', `${files.length} 个文件 · +${added} −${removed}`),
-  );
-  head.append(icon, copy);
-  head.addEventListener('click', () => openRightbarTab('changes'));
-  card.append(head);
-  for (const file of files.slice(0, 4)) {
-    const row = el('button', 'changed-file-row');
-    row.type = 'button';
-    row.append(el('span', 'changed-file-path', file.path), el('span', 'changed-file-add', `+${file.added ?? 0}`), el('span', 'changed-file-del', `−${file.removed ?? 0}`));
-    row.addEventListener('click', () => {
-      const tab = openRightbarTab('changes');
-      if (tab) { tab.selected = file.path; persistRightbar(); renderRightbar(); }
-    });
-    card.append(row);
-  }
-  if (files.length > 4) card.append(el('div', 'changed-files-more', `其余 ${files.length - 4} 个文件`));
-  return card;
-}
-
 function renderConversation() {
   const list = $('conversation');
   const scroller = $('conversation-scroll');
   const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
   if (!current) {
     list.replaceChildren();
+    // No session owns a live clock; leaving the old start behind makes the
+    // next turn's elapsed time inherit the previous one.
+    if (runClockTimer) { clearInterval(runClockTimer); runClockTimer = null; }
+    runStartedAt = null;
     document.body.classList.toggle('home', true);
     document.body.classList.toggle('blank-session', true);
     return;
@@ -2701,7 +2676,6 @@ function renderConversation() {
   }
   const liveText = (current.reasoning ?? '').trim();
   const currentTurn = userTurns.length ? userTurns.length - 1 : -1;
-  if (liveText !== '') bucketFor(currentTurn);
   const demoted = new Set();
   for (const message of current.messages) {
     if (messageKind(message) !== 'assistant' || message.final === true || String(message.text ?? '').trim() === '') continue;
@@ -2720,10 +2694,8 @@ function renderConversation() {
     node.classList.toggle('flow-turn', messageKind(message) === 'user');
     nodes.push(node);
   }
-  const lastIndex = buckets.size ? Math.max(...buckets.keys()) : -1;
   const placed = [];
   for (const [index, bucket] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
-    if (index === lastIndex && liveText !== '') bucket.live = liveThoughtNode(existing, current.reasoning);
     const host = processHost(existing, bucket);
     if (host) placed.push({ host, anchorId: bucket.anchorId });
   }
@@ -2734,6 +2706,7 @@ function renderConversation() {
   }
   const maxTokens = maxTokensNode(); if (maxTokens) nodes.push(maxTokens);
   const running = current.status === 'running';
+  let runningRow = null;
   if (running) {
     runStartedAt ??= Date.now();
     let row = existing.get('running');
@@ -2743,7 +2716,7 @@ function renderConversation() {
       row.append(el('span', 'running-dot'), el('span', 'running-text'));
     }
     row.querySelector('.running-text').textContent = runningLabel();
-    nodes.push(row);
+    runningRow = row;
   }
   if (running && !runClockTimer) {
     runClockTimer = setInterval(() => {
@@ -2762,8 +2735,11 @@ function renderConversation() {
   const plan = planCard(); if (plan) nodes.push(plan);
   const delivered = deliveredCard(); if (delivered) nodes.push(delivered);
   const presented = presentedFilesCard(); if (presented) nodes.push(presented);
-  const changed = changedFilesCard(); if (changed) nodes.push(changed);
   const usage = usageNode(); if (usage) nodes.push(usage);
+  // The live analysis is the turn's latest activity: it sits above the running
+  // line, never above the answer it belongs to.
+  if (liveText !== '') nodes.push(liveThoughtNode(existing, current.reasoning));
+  if (runningRow) nodes.push(runningRow);
   const keep = new Set(nodes);
   for (const child of [...list.children]) if (!keep.has(child)) child.remove();
   for (let i = 0; i < nodes.length; i += 1) if (list.children[i] !== nodes[i]) list.insertBefore(nodes[i], list.children[i] ?? null);
@@ -2904,6 +2880,16 @@ const TRAJECTORY_TERMINALS = new Set([
   'turn_completed', 'turn_completed_with_warnings', 'turn_answered', 'turn_cancelled',
   'task_cancelled', 'turn_truncated', 'turn_incomplete', 'turn_failed', 'session_completed',
 ]);
+
+/**
+ * A frame without `last_sequence` is UNKNOWN, not older: the client protocol
+ * says the anchor is absent when unknown. Discarding such a frame silently
+ * drops the runtime's settled status. Only a KNOWN, older anchor is stale.
+ * @param {unknown} sequence
+ */
+function staleSequence(sequence) {
+  return typeof sequence === 'number' && sequence < lastEventSeq;
+}
 
 function recordLiveTrajectory(event) {
   if (!current || !event) return;
@@ -4165,6 +4151,10 @@ async function refreshSnapshot() {
   const id = current.session.id;
   const snapshot = await api.snapshot(id);
   if (current?.session.id !== id) return;
+  // Same rule as a broadcast snapshot: a response that predates live state
+  // must not replace it (it is the terminal-time refresh, so a slow answer
+  // could otherwise resurrect the running row).
+  if (staleSequence(snapshot.last_sequence)) return;
   const prior = current;
   const diffQuery = current.diffQuery;
   const diffError = current.diffError;
@@ -4488,6 +4478,13 @@ function loadRightbar(sessionKey) {
     rightbarTabs = { [tab.id]: tab };
     rightbarActivePane = 'pane1';
   }
+  // Start is the pinned tab: a layout saved before it was pinned gets one back
+  // instead of leaving the pane without its guide, active tab untouched.
+  if (!rightbarPanes.some(pane => pane.tabs.some(id => rightbarTabs[id]?.kind === 'start'))) {
+    const start = newTabRecord('start');
+    rightbarTabs[start.id] = start;
+    rightbarPanes[0].tabs.unshift(start.id);
+  }
 }
 
 function persistRightbar() {
@@ -4536,18 +4533,8 @@ function openRightbarTab(kind, extra = {}) {
   ensureRightbarSession();
   if (kind === 'changes' && !hasWorkspace()) { toast('当前会话没有工作区', { tone: 'warning' }); return null; }
   const pane = activePane();
-  const active = pane.activeId ? rightbarTabs[pane.activeId] : null;
-  if (active?.kind === 'start') {
-    active.kind = kind;
-    active.title = kind === 'changes' && !extra.title ? changesTabTitle() : tabTitle(kind, extra);
-    Object.assign(active, extra);
-    rightbarOpen = true;
-    rightbarExpanded = false;
-    persistRightbar();
-    renderRightbar();
-    if (kind === 'changes') requestDiff();
-    return active;
-  }
+  // Start is a pinned tab: opening something always adds a tab beside it
+  // instead of consuming it.
   const reusable = kind === 'preview'
     ? Object.values(rightbarTabs).find(tab => tab.kind === 'preview' && tab.path === extra.path && !rightbarFloats.some(float => float.tabId === tab.id))
     : ['files', 'changes', 'plan', 'deliverables', 'subagent', 'schedule'].includes(kind)
@@ -4693,7 +4680,7 @@ function renderRightbar() {
       button.setAttribute('role', 'tab');
       button.setAttribute('aria-selected', String(pane.activeId === tabId && rightbarActivePane === pane.id));
       button.tabIndex = 0;
-      button.draggable = true;
+      button.draggable = tab.kind !== 'start';
       button.dataset.tabId = tabId;
       button.append(tabIcon(tab), el('span', 'tab-title', tab.title));
       if (tab.kind !== 'start') {
@@ -4757,8 +4744,12 @@ function renderRightbar() {
       source.tabs = source.tabs.filter(id => id !== movedId);
       if (source.activeId === movedId) source.activeId = source.tabs[0] ?? null;
       const target = event.target.closest('.pane-tab');
-      const index = target ? pane.tabs.indexOf(target.dataset.tabId) : pane.tabs.length;
-      pane.tabs.splice(index < 0 ? pane.tabs.length : index, 0, movedId);
+      let index = target ? pane.tabs.indexOf(target.dataset.tabId) : pane.tabs.length;
+      if (index < 0) index = pane.tabs.length;
+      // Start is pinned first; a drop can never land before it.
+      const startIndex = pane.tabs.findIndex(id => rightbarTabs[id]?.kind === 'start');
+      if (startIndex >= 0 && index <= startIndex) index = startIndex + 1;
+      pane.tabs.splice(index, 0, movedId);
       pane.activeId = movedId;
       rightbarActivePane = pane.id;
       rightbarPanes = rightbarPanes.filter(item => item.tabs.length);
@@ -4974,7 +4965,7 @@ function updateRightbarButtons() {
 }
 
 function renderTabView(tab, pane) {
-  if (tab.kind === 'start') return startView(tab);
+  if (tab.kind === 'start') return startView();
   if (tab.kind === 'files') return filesView(tab);
   if (tab.kind === 'terminal') return terminalView(tab);
   if (tab.kind === 'browser') return browserView(tab, pane);
@@ -4984,10 +4975,10 @@ function renderTabView(tab, pane) {
   if (tab.kind === 'plan') return planView();
   if (tab.kind === 'subagent') return subagentView();
   if (tab.kind === 'schedule') return scheduleView();
-  return startView(tab);
+  return startView();
 }
 
-function startView(tab) {
+function startView() {
   const guide = el('div', 'start-guide');
   const mark = el('span', 'start-guide-mark');
   mark.append(iconNode('compass', { size: 56, stroke: 1.1 }));
@@ -5008,12 +4999,8 @@ function startView(tab) {
     button.addEventListener('click', onClick);
     return button;
   };
-  const launch = kind => {
-    tab.kind = kind;
-    tab.title = kind === 'files' ? '文件' : kind === 'terminal' ? '终端' : '浏览器';
-    persistRightbar();
-    renderRightbar();
-  };
+  // Start is pinned: the cards open a tab beside it instead of consuming it.
+  const launch = kind => openRightbarTab(kind);
   cards.append(card('files', 'folder', 'folder', '工作区文件', '浏览会话工作区的文件', '⌘ P', () => launch('files'), '桌面桥接没有目录读取接口'));
   cards.append(card('terminal', 'terminal', 'terminal', '新建终端', '在会话工作区运行命令', '⌃ `', () => launch('terminal')));
   cards.append(card('browser', 'globe', 'globe', '浏览器', '浏览网页', '⌘ T', () => launch('browser')));
@@ -6773,7 +6760,7 @@ api.onEvent(frame => {
   }
   if (frame.session_id !== current?.session.id) return;
   if (frame.event === 'snapshot') {
-    if ((frame.data.last_sequence ?? -1) < lastEventSeq) return;
+    if (staleSequence(frame.data.last_sequence)) return;
     lastEventSeq = Math.max(lastEventSeq, frame.data.last_sequence ?? 0);
     const prior = current;
     const diffQuery = current?.diffQuery;
@@ -6806,7 +6793,7 @@ api.onEvent(frame => {
     return;
   }
   if (event.type === 'session_opened') {
-    if ((event.session.last_sequence ?? -1) < lastEventSeq) return;
+    if (staleSequence(event.session.last_sequence)) return;
     lastEventSeq = Math.max(lastEventSeq, event.session.last_sequence ?? 0);
     const priorContext = current?.contextUsage ?? null;
     // The stale replay buffer predates whatever forced the reconnect; the
@@ -6823,11 +6810,15 @@ api.onEvent(frame => {
     return;
   }
   if (event.type === 'session_updated') {
-    if ((event.session.last_sequence ?? -1) < lastEventSeq) return;
+    if (staleSequence(event.session.last_sequence)) return;
     current = attachExtras(applySessionMetadata(current, event.session), event.session);
     renderHeader();
     renderComposerMeta();
     renderSidebar();
+    // The status the runtime settles after a turn arrives here, not on the
+    // terminal event. The transcript owns the running row and the plan/diff
+    // cards, so it has to re-render or a finished turn keeps saying 运行中.
+    scheduleConversation();
     return;
   }
   if (event.type === 'token_usage') {
@@ -6855,7 +6846,12 @@ api.onEvent(frame => {
   }
   if (event.type === 'agents_loaded') return;
   const pendingDiff = current.diffQuery?.status === 'pending' && event.query_id === current.diffQuery.id;
+  const statusBefore = current.status;
+  const activityBefore = current.activity;
   current = applyEvent(current, event);
+  // The header and composer read status/activity; when an event changes either
+  // they must be refreshed here, not only on the next full render.
+  if (current.status !== statusBefore || current.activity !== activityBefore) { renderHeader(); renderComposerMeta(); }
   modelRetry = event.type === 'model_retrying' ? { attempt: event.attempt ?? 0, max: event.max_attempts ?? 0 } : null;
   if (terminalEvents.has(event.type)) { pendingSubmit = false; setTimeout(flushQueuedMessage, 0); }
   if (terminalEvents.has(event.type) && current?.session?.repository) {
@@ -6870,7 +6866,8 @@ api.onEvent(frame => {
     const tool = current.tools.find(item => item.id === event.id);
     if (tool) tool.durationMs = event.duration_ms;
   }
-  if (['diff_updated', 'diff_failed'].includes(event.type) && event.query_id === current.diffQuery?.id
+  if (['diff_updated', 'diff_failed'].includes(event.type) && current.diffQuery
+    && event.query_id === current.diffQuery.id
     && ['confirmed', 'failed'].includes(current.diffQuery.status)) {
     if (pendingDiff && rightbarOpen) {
       const tab = Object.values(rightbarTabs).find(item => item.kind === 'changes');

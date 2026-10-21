@@ -46,8 +46,8 @@
   --text-primary: #0f1115;
   --text-primary-foreground: #ffffff;
   --text-secondary: #61666b;
-  --text-tertiary: #81858c;
-  --text-caption: #adb2b8;
+  --text-tertiary: #6e737a;
+  --text-caption: #7c8188;
   --text-link: #4176e6;
   --text-on-accent: #ffffff;
   --border-l1: rgba(0, 0, 0, .04);
@@ -705,6 +705,7 @@ body.home .conversation-scroll { display: none; }
 .thought-summary::-webkit-details-marker { display: none; }
 .thought-summary:hover { background: var(--hover); color: var(--text-secondary); }
 .thought-summary .thought-chevron { transition: transform var(--duration-fast) var(--ease); }
+.thought-label { flex: none; }
 details[open] > .thought-summary .thought-chevron { transform: rotate(90deg); }
 .thought-body {
   margin: 4px 0 4px 22px;
@@ -736,6 +737,9 @@ details[open] > .thought-summary .thought-chevron { transform: rotate(90deg); }
 details[open] > .process-heading .chevron { transform: rotate(90deg); }
 .process-body { display: flex; flex-direction: column; gap: 2px; margin-left: 4px; padding-top: 2px; }
 .process-group:not([open]) .process-body { display: none; }
+/* A turn with no tool rounds has nothing to fold: the analysis rows stand alone. */
+.process-group[data-plain] > .process-heading { display: none; }
+.process-group[data-plain] > .process-body { margin-left: 0; padding-top: 0; }
 
 .execution-round { display: flex; flex-direction: column; gap: 2px; }
 .round-head {
@@ -840,7 +844,7 @@ details[open] > .tool-summary .tool-chevron { transform: rotate(90deg); }
 .diff-line.removed { background: var(--diff-deleted-bg); }
 .diff-line.meta { color: var(--text-tertiary); }
 
-.running-row { display: flex; align-items: center; gap: 6px; padding: 2px 2px; color: var(--deep-diving); font-size: 12px; line-height: 22px; }
+.running-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding: 8px 2px 2px; border-top: .5px solid var(--border-l2); color: var(--deep-diving); font-size: 12px; line-height: 22px; }
 .running-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: blink 1.2s infinite; }
 .running-text { font-variant-numeric: tabular-nums; }
 .running-text::after { content: ""; display: inline-block; width: 18px; height: 6px; margin-left: 4px; background: linear-gradient(90deg, transparent, currentColor, transparent); background-size: 200% 100%; animation: shimmer 1.6s linear infinite; opacity: .5; }
@@ -1746,18 +1750,6 @@ body.rightbar-overlay #floating-right-toggle, body.rightbar-overlay .header-acti
 .delivered-name { font-size: 13px; line-height: 20px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .delivered-meta { color: var(--text-tertiary); font-size: 10px; line-height: 16px; }
 
-.changed-files-card { margin-top: 4px; border: .5px solid var(--border-l2); border-radius: 16px; overflow: hidden; background: var(--bg-layer-1); }
-.changed-files-head { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 60px; padding: 8px 10px; background: #fafafa; text-align: left; }
-:root[data-theme="dark"] .changed-files-head { background: #212123; }
-.changed-files-head:hover { background: #f5f5f5; }
-:root[data-theme="dark"] .changed-files-head:hover { background: #292929; }
-.changed-file-row { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 24px; padding: 3px 18px 3px 14px; color: var(--text-secondary); text-align: left; font-size: 12px; line-height: 18px; }
-.changed-file-row:hover { background: var(--hover); }
-.changed-file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.changed-file-add, .changed-file-del { flex: none; font-family: var(--font-code); font-size: 11px; }
-.changed-file-add { color: var(--diff-added-marker); }
-.changed-file-del { color: var(--diff-deleted-marker); }
-.changed-files-more { padding: 8px 14px; color: var(--text-tertiary); font-size: 11px; }
 
 /* plan card in the turn tail */
 .plan-card-row {

@@ -124,7 +124,7 @@ try {
     const filesTab = page.locator('.pane-tab').filter({ hasText: /^文件$/ });
     if (await filesTab.count()) await filesTab.first().click();
     else {
-      if (!(await page.locator('.start-card').count())) await page.locator('.add-tab').click();
+      if (!(await page.locator('.start-card').count())) await page.locator('.pane-tab').filter({ hasText: /^开始$/ }).first().click();
       await page.waitForSelector('.start-card');
       await mouseClick(page.locator('.start-card').filter({ hasText: '工作区文件' }));
     }
@@ -263,7 +263,7 @@ try {
     await tab.locator('.tab-close').click();
   };
   const openStart = async () => {
-    await page.locator('.add-tab').click();
+    await page.locator('.pane-tab').filter({ hasText: /^开始$/ }).first().click();
     await page.waitForSelector('.start-card');
   };
   await openStart();
