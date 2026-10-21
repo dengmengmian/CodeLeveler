@@ -84,6 +84,17 @@
         }
       ]
     },
+    "execution_task": {
+      "description": "A durable task committed from a Chat turn that still owes work. Additive: absent when no goal is running. The session's collaboration axis says the interaction mode, not whether work is owed.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiExecutionTask"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "finalization_stage": {
       "description": "Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message.",
       "anyOf": [
@@ -989,6 +1000,27 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        }
+      }
+    },
+    "UiExecutionTask": {
+      "description": "The durable task a Chat session owes, as projected for a client that is reconnecting. `objective` is the goal's text, never the session title.",
+      "type": "object",
+      "required": [
+        "goal_id",
+        "objective"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "running": {
+          "description": "A live turn is executing it. False means the work is owed but no window is running; the user can resume it.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },

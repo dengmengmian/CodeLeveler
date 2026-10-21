@@ -6128,7 +6128,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let mut recaps = Vec::new();
         let stores = leveler_storage::EngineStores::from_database(&db);
 
+        let runtime_active = self.active.is_running(session_id);
         let plan = projected_plan(&stores, session_id, live.plan).await?;
+        // A goal that still owes work is the durable identity behind an
+        // explicit task, whether it was opened by `/goal` or committed from a
+        // Chat turn. The snapshot carries it so a reconnecting client restores
+        // the task badge and objective, not just the transcript.
+        let mut execution_task = None;
         if let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await
             && let Ok(goals) = stores.goals.for_task(&task).await
         {
@@ -6142,9 +6148,15 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .cmp(&b.transcript_ordinal)
                     .then_with(|| a.created_at.cmp(&b.created_at))
             });
+            execution_task = goals
+                .iter()
+                .find(|goal| goal.state == leveler_storage::GoalState::Running)
+                .map(|goal| leveler_client_protocol::UiExecutionTask {
+                    goal_id: goal.id.to_string(),
+                    objective: goal.objective.clone(),
+                    running: runtime_active,
+                });
         }
-
-        let runtime_active = self.active.is_running(session_id);
         let facts = db
             .session_facts_for(session_id)
             .await
@@ -6224,6 +6236,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             thinking,
             work_profile: Some("single".into()),
             collaboration: Some(config.collaboration.clone()),
+            execution_task,
             children,
         })
     }
@@ -7230,6 +7243,11 @@ async fn compact_conversation(
                 thinking,
                 work_profile: Some(crate::canonical_work_profile(&record.work_profile)),
                 collaboration: Some(record.collaboration.clone()),
+                // This push is a same-session resync while the live turn keeps
+                // running. The client keeps its execution-task state; deriving
+                // it here would need a live-turn reading this projection does
+                // not have.
+                execution_task: None,
                 children: Vec::new(),
             },
         });

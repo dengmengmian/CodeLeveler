@@ -6629,6 +6629,27 @@
         }
       }
     },
+    "UiExecutionTask": {
+      "description": "The durable task a Chat session owes, as projected for a client that is reconnecting. `objective` is the goal's text, never the session title.",
+      "type": "object",
+      "required": [
+        "goal_id",
+        "objective"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "running": {
+          "description": "A live turn is executing it. False means the work is owed but no window is running; the user can resume it.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
     "UiFailure": {
       "description": "A structured product failure attached to a terminal turn failure.\n\n`detail` is the raw diagnostic and belongs on disclosure only; every other field is machine semantics suitable for choosing an icon, a title, and an action without reading the message.",
       "type": "object",
@@ -7990,6 +8011,17 @@
           "anyOf": [
             {
               "$ref": "#/definitions/UiDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution_task": {
+          "description": "A durable task committed from a Chat turn that still owes work. Additive: absent when no goal is running. The session's collaboration axis says the interaction mode, not whether work is owed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiExecutionTask"
             },
             {
               "type": "null"

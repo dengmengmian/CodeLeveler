@@ -196,15 +196,91 @@ retry 时作为种子注入 Drive。因此：
 谱系规则：如果 Goal 是在一个**被 resume 过的 Chat 窗口**中声明的，该绑定窗口就是 Goal 谱系的根，
 而不是更早的 Chat 根；后续 Resume 都以它为准（重复 Resume 已覆盖）。
 
-## 7. 明确不做的事
+## 7. Chat 显式委托：`commit_task`（2026-10-21）
+
+### 7.1 问题与决定
+
+普通 Chat 的 Final 是合法终局。真实事故中用户明确要求「全部接入、读写都做、完成后测试」，但会话没有 `/goal`，Runtime 12/12 个回合都以 `answered` 结束。修复不是让 Runtime 去猜用户文本，也不是把每个 Chat 都变成 Goal，而是给 Chat 一个**结构化任务委托入口**：
+
+- Chat 回合的模型工具面新增 `commit_task(objective, acceptance)`。
+- 模型只在用户明确委托执行、且工作超过一次短回合时调用；讨论、问答、只读要求不调用。
+- 调用成功后走既有 `GoalBinder::bind`，不新建第二套状态机。
+- `goals.objective` 写当前 turn 的用户原话（`ObjectiveAnchor`），不是模型传入的 `objective` 字段；模型的声明不能把用户目标缩窄。测试 `a_declared_objective_cannot_narrow_the_users_request` 锁定这条。
+
+### 7.2 生命周期
+
+```text
+Chat turn
+  model: commit_task(objective, acceptance)
+    → GoalBinder::bind
+        → goals 行（Running，objective = 用户目标）
+        → turns.payload.goal_id（当前 Chat turn）
+        → model_requests.budget_scope 迁移到 goal id
+    → Executor::goal_mode() 变为 true（binder.bound() 是真实事实）
+    → 下一轮请求：
+        - 工具面出现 update_goal，commit_task 消失
+        - system prompt 出现 GOAL MODE 契约
+        - closeout 对阶段 Final 继续，对连续无进展有界停止
+        - update_goal(complete) 走既有机械验证门
+    → task 完成/blocked/预算/取消 → 既有 TaskOutcome 与 goal settle
+Session axis 始终是 chat；任务结束后下一条消息仍是普通 Chat。
+```
+
+关键实现位置：
+
+| 事实 | 位置 |
+|---|---|
+| 工具定义与规则 | `crates/leveler-agent/src/injected_tools.rs`（`commit_task`、`TASK_COMMIT_GUIDANCE`） |
+| 工具面 | `crates/leveler-agent/src/executor/drive.rs::request_tool_definitions`：仅顶层、可写、未绑定 goal 的 Chat 回合 |
+| 处理与绑定 | `drive.rs` 的 `COMMIT_TASK_TOOL` 分支：校验参数、`binder.bind`、重建工具面、返回契约 |
+| Goal 判定 | `crates/leveler-agent/src/executor.rs::goal_mode()`：静态 Goal policy ∨ steering `/goal` ∨ `binder.bound()` |
+| Resume | `crates/leveler-agent/src/coding/run.rs::resume_inner`：turn payload 的 `goal_id` 本身就是 Goal 身份，即使会话轴是 chat |
+| 取消结算 | `run.rs::latest_bound_goal`：回合在报告前中止时，从 turn WAL 恢复 goal 身份，显式取消仍能 settle |
+| TUI | `crates/leveler-tui/src/reducer/runtime_apply.rs`：成功的 `commit_task` 置 `goal_mode_active`/`execution_task_active`；暂停任务保留 badge |
+| 重连 | `UiSessionSnapshot.execution_task`：从 Running goal 投影 goal_id/objective/running，客户端恢复 badge 与暂停态 |
+
+### 7.3 为什么不在 Runtime 里做意图分类
+
+- 关键词（「完成」「全部」「继续」）会出现在代码、引用、讨论里，不能作为授权。
+- 每个 Chat 都追加一次模型分类调用，会让普通问答的成本和延迟翻倍，违反「普通 Chat 不加无谓请求」。
+- 让 Runtime 自行启动长任务，等于用低置信度推断消耗用户预算；本次保留了「模型声明 → Runtime 持久化 → 证据验证」的权责边界。
+- 模型声明是结构化工具调用，不是自然语言 Final；Runtime 只校验参数与持久化，不判断语义好坏。
+
+### 7.4 边界
+
+| 场景 | 行为 |
+|---|---|
+| 普通问答 | 不调用 `commit_task`；1 次请求；无 goal 行 |
+| 讨论 / 「先不要改」 | 不调用；不写文件；不建任务 |
+| 小任务 | 模型可直接在一个回合内完成；不强制升级 |
+| 长任务 | 调用一次；阶段 Final 不结束；自动推进到 `update_goal` |
+| 执行中调整 | 用户 steer 进入当前回合；goal objective 不变，进度/budget 不重置 |
+| 用户取消窗口（Esc） | `TaskOutcome::Interrupted`，goal 仍 Running，可 `继续` |
+| 用户取消逻辑任务（`/goal clear`） | goal settle，后续 `继续` 拒绝 |
+| 预算耗尽 | `BudgetLimited`，goal 仍 owed |
+| 连续无进展 | `Stalled` → `Interrupted`，有界停止，不冒充完成 |
+| 只读 / Plan | 不暴露 `commit_task` |
+| 子 Agent | 不暴露 `commit_task` |
+
+### 7.5 残余限制
+
+1. **是否委托仍由模型判断。** Runtime 不解析用户文本；模型可能在该委托时没有调用，或把不该委托的请求当成任务。缓解是工具描述与 Chat 契约 prompt，而不是运行时关键词。
+2. **`acceptance` 是声明，不是机械判据。** 完成仍由 `update_goal` 的证据检查决定；acceptance 只告诉模型和用户「要证明什么」。
+3. **升级当轮的 compaction checkpoint 缺口仍在**（既有分析：Chat 起步的回合没有 checkpoint port）：Chat 起步的回合没有安装 goal checkpoint port；中途绑定 goal 不会补装。回合结束后的 resume 仍能按 turn payload 的 goal_id 生成/读取 checkpoint。
+4. **TUI 重连的 badge 来自 snapshot 的 Running goal。** 如果 goal 已 settle 但会话仍有未完成的其他工作，badge 不显示；这是既有 goal 语义，不是新任务状态。
+
+## 8. 明确不做的事
 
 - 不把模型自然语言中的「完成」「本轮」「下一步」当作完成/未完成判据。
 - 不要求用户再次输入「继续」才推进 Goal（阶段结束由 closeout 继续）。
 - 不把 Runtime 内部指令伪装成用户消息；Goal 升级注入的是用户自己的文本，`update_goal` 提示来自工具契约。
 - 不改变 Full / Auto 权限契约。
 - 不把 `update_goal(complete)` 变成不可停止的无限循环：预算、无进展、取消、阻塞都优先。
+- 不按关键词、消息长度或模型名称推断执行意图；委托只能由结构化 `commit_task` 声明。
+- 不把 `commit_task` 当成完成证明；完成仍由 `update_goal` 的机械验证门决定。
+- 不让普通问答、讨论或只读请求自动创建持久 Goal；`commit_task` 只在可写的顶层 Chat 回合暴露。
 
-## 8. 残余限制
+## 9. 残余限制
 
 1. **语义验收仍属模型责任。** 运行时能检查“命令跑过且成功”，不能检查“这条命令是否真的覆盖了用户目标”。模型可以引用一条真实通过的无关命令；这是机械检查的上限，已在完成契约中明确。
 2. **子 Agent 的验证不自动计入父 Agent。** 父 Agent 必须自己运行验收命令，或声明 `not_applicable`。这是保守选择，避免父级把子级报告当成自己的执行事实。

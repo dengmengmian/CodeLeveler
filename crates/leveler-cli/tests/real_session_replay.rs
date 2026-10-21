@@ -114,6 +114,7 @@ fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionS
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     }
 }

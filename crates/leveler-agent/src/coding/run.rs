@@ -801,6 +801,33 @@ impl CodingRuntime {
         })
     }
 
+    /// The goal bound to the most recent user/chat turn, read from its WAL
+    /// payload. Used when a turn aborts before it can report the binding, so
+    /// terminal settlement still names the right goal.
+    async fn latest_bound_goal(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<leveler_core::GoalId>, EngineError> {
+        let turns = self
+            .engine
+            .stores
+            .turns
+            .list_for_session(session_id)
+            .await?;
+        for turn in turns.iter().rev() {
+            if turn.kind != "chat" && turn.kind != "user" {
+                continue;
+            }
+            let Some(payload) = turn.payload.as_deref() else {
+                continue;
+            };
+            if let Ok(lineage) = leveler_engine::decode_turn_continuation(payload) {
+                return Ok(lineage.goal_id);
+            }
+        }
+        Ok(None)
+    }
+
     async fn unique_legacy_running_goal(
         &self,
         session_id: &SessionId,
@@ -2060,7 +2087,23 @@ impl CodingRuntime {
         .await;
         let (result, bound_goal) = match concluded {
             Ok(pair) => pair,
-            Err(error) => (Err(error), None),
+            Err(error) => {
+                // The turn aborted before it could report its facts. The goal
+                // it bound is still in the turn WAL, and a user cancellation
+                // must settle that goal rather than leave it falsely owed.
+                let goal = match self.latest_bound_goal(session_id).await {
+                    Ok(goal) => goal,
+                    Err(recovery) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %recovery,
+                            "could not recover the window's bound goal after an aborted turn"
+                        );
+                        None
+                    }
+                };
+                (Err(error), goal)
+            }
         };
         let result = if terminal_cancellation.is_cancelled() {
             Err(EngineError::Cancelled)
@@ -2201,7 +2244,12 @@ impl CodingRuntime {
             .await?
             .as_deref()
             == Some(leveler_lifecycle::CollaborationMode::Goal.as_str());
-        if lineage_was_chat && goal_axis && (lineage.goal_id.is_some() || pending.is_some()) {
+        // A bound goal id is sufficient on its own: a Chat turn can commit an
+        // explicitly delegated task (`commit_task`) without changing the
+        // session's axis, and the goal it bound still owes the work. The axis
+        // only decides the fallback for a declaration that has not been bound
+        // yet.
+        if lineage_was_chat && (lineage.goal_id.is_some() || (goal_axis && pending.is_some())) {
             lineage.kind = ResumeTurnKind::Goal;
         }
         let token = self

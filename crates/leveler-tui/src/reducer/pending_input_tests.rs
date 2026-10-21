@@ -516,6 +516,7 @@ fn idle_snapshot() -> leveler_client_protocol::UiSessionSnapshot {
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     }
 }

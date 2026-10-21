@@ -354,6 +354,16 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     },
     // Virtual / injected agent tools (not always in the tool registry).
     ToolTaxonomyEntry {
+        name: "commit_task",
+        kind: ToolKind::Goal,
+        presentation_en: "Commit Task",
+        presentation_zh: "委托任务",
+        read_only_default: true,
+        // The user must see that a Chat turn acquired a task that will keep
+        // running; this is the visible start of the execution contract.
+        visibility: ActivityVisibility::Important,
+    },
+    ToolTaxonomyEntry {
         name: "update_goal",
         kind: ToolKind::Goal,
         presentation_en: "Update Goal",

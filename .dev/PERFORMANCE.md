@@ -123,3 +123,36 @@ DF-10（真实 DeepSeek，本轮最终二进制）：
 DF-12（PTY + 真实 SQLite）：升级窗口 2 条 main-round 行，估计 token 8,358 / 9,296，
 两条 `budget_scope` 都是同一个 goal id；没有额外模型请求。DF-13：1 个 goal、2 个
 turn、0 次重复执行。
+
+## Chat 显式委托（2026-10-21）
+
+新增 `commit_task` 的固定成本与真实开销：
+
+| 项 | 值 | 说明 |
+|---|---:|---|
+| `commit_task` tool schema | 356 tokens | 每个顶层可写 Chat 请求 |
+| Chat 委托规则 prompt | 190 tokens | 同一请求的会话前缀 |
+| 合计固定成本 | **546 tokens/请求** | 进入 prefix cache；不增加模型请求 |
+| 普通 Chat 主请求 | 1（DF-14） | 与 DF-9 相同；无分类调用、无续跑 |
+| 普通 Chat 估算输入 | 10,108 tokens | 含 546 新成本；其余是既有 system/tool/history |
+| 长任务主请求 | 9（DF-15 脚本）/ 8（DF-20 真实） | 一次用户提交，无需人工 `继续` |
+| DF-15 估算输入 | 98,590 tokens | 9 轮，脚本 Provider |
+| DF-15 工具调用 | 6 | 3 个 stage 写 + 验收 + commit + update_goal |
+| DF-20 工具调用 | 8 | 3 个 stage 写 + 验收 + commit + update_goal + 读取 |
+| DF-15 wall | 6.4s | 脚本 Provider |
+| DF-20 真实 Input / Output / Cached | 80,637 / 1,974 / 58,368 | DeepSeek v4-flash |
+| DF-20 Cost / Wall | 11,749 micro-USD ≈ $0.012 / 43.6s | 8 个 main round |
+| DF-20 验收 | 独立 `python3 -m unittest` rc=0 | 3 个 stage 文件 |
+| 提前 Final / 无效续跑 | 0 / 0 | DF-15、DF-16、DF-20 |
+| 取消 / 预算 / 无进展 | 均有界 | DF-19 + `task_commit_test` |
+
+设计取舍：没有为每个 Chat 增加一次意图分类模型调用。Runtime 只处理结构化工具调用，
+因此普通问答仍是一次请求；代价是每个 Chat 请求多 546 tokens 的固定前缀（可缓存），
+以及一次 `commit_task` 工具轮（仅长任务）。
+
+预算归属：`GoalBinder::bind` 把当前窗口已产生的 `model_requests` 行从 turn scope 迁到
+goal id；DF-15/DF-18/DF-20 的所有 main-round `budget_scope` 都是同一个 goal id。
+Resume 从未重置预算；DF-18 中断前后仍是一条 scope。
+
+恢复：DF-18 证明中断的 Chat turn 通过 `turn.payload.goal_id` 以 Goal profile 恢复，
+objective、已完成 stage、budget scope 均保留；没有第二条 goal。

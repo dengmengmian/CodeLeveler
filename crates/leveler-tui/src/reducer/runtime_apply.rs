@@ -288,6 +288,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // Strip ANSI and controls so vitest/npm color codes do not show as
             // `[32m` garbage when ESC was already dropped (cell TUI).
             let preview = leveler_core::sanitize_terminal_output(&preview);
+            // A successful `commit_task` turns this Chat turn into an
+            // executing task. The runtime's tool result is the authority:
+            // a rejected commit must not change what the user sees.
+            let task_committed = ok
+                && state
+                    .transcript
+                    .tool_call_facts(&id)
+                    .is_some_and(|(name, _)| name == "commit_task");
             state.transcript.complete_command(
                 &id,
                 ok,
@@ -297,6 +305,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 exit_code,
                 stop,
             );
+            if task_committed {
+                state.goal_mode_active = true;
+                state.execution_task_active = true;
+            }
             // The tool is done; leaving its label up while the model thinks
             // reads as a hung tool ("读取 x… (4m)"). Fall back to the
             // thinking indicator until the next activity arrives.
@@ -467,6 +479,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     goal.fail(now);
                 }
             }
+            // A hard failure settles the task; only a resumable failure keeps
+            // the owed-task badge.
+            if !resumable {
+                state.execution_task_active = false;
+            }
             // ONE terminal failure → ONE primary block. The turn-end marker
             // states the outcome but must not carry a second copy of the
             // failure text.
@@ -546,6 +563,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.finalization_stage = None;
             clear_activity(state);
             state.goal_mode_active = false;
+            state.execution_task_active = false;
             state.resumable_task = false;
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
@@ -1370,6 +1388,11 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         }
         other => other,
     };
+    // A clean turn end settles the delegated task. Any other terminal keeps
+    // it visible: the goal still owes work and `继续` can re-enter it.
+    if work_is_finished(status) {
+        state.execution_task_active = false;
+    }
     // Active Goal terminal. Done (green) fades on its own; a turn that stopped
     // short of done (amber) stays because it owes work; a failure the user may
     // have to act on (red) never hides on a timer.
@@ -1849,6 +1872,8 @@ fn apply_session_with(
         state.input_mode = crate::shell_mode::InputMode::Normal;
         state.history_mode = crate::shell_mode::InputMode::Normal;
         state.completion.reset_on_edit();
+        // A committed task belongs to the session that committed it.
+        state.execution_task_active = false;
     }
     // Snapshot is runtime truth. A pending Shift+Tab from the previous
     // connection must not keep driving the cycle, and a next-step ghost from
@@ -1994,6 +2019,37 @@ fn apply_session_with(
     // the header reflects the running task.
     if state.status == RuntimeStatus::Busy && state.active_goal.is_none() {
         crate::active_goal::begin(state, None, std::time::Instant::now());
+    }
+    // A committed task outlives the turn window. The snapshot carries its
+    // durable goal so a reconnecting client restores the badge and the real
+    // objective — including the paused state of work that is still owed.
+    if let Some(task) = session.execution_task.as_ref() {
+        state.execution_task_active = true;
+        // Only a live window executes the goal contract; owed work with no
+        // window is paused, not running.
+        state.goal_mode_active = task.running && state.status == RuntimeStatus::Busy;
+        let now = std::time::Instant::now();
+        let title = crate::active_goal::short_title(&task.objective)
+            .unwrap_or_else(|| task.objective.clone());
+        match state.active_goal.as_mut() {
+            Some(goal) => {
+                goal.adopt_objective(title, task.objective.clone());
+                if !task.running {
+                    goal.pause(now);
+                }
+            }
+            None => {
+                let mut goal = crate::active_goal::ActiveGoal::running_with_objective(
+                    title,
+                    task.objective.clone(),
+                    now,
+                );
+                if !task.running {
+                    goal.pause(now);
+                }
+                state.active_goal = Some(goal);
+            }
+        }
     }
     // A reconnect snapshot replaces (rather than merges) the active process
     // projection. Its entries come from the process registry, so terminal

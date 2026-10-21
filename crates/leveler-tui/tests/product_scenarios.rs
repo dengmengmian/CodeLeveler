@@ -92,6 +92,7 @@ fn opened(goal: &str) -> AppState {
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     };
     reduce(
@@ -745,6 +746,7 @@ fn s10_resume() {
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     };
     reduce(

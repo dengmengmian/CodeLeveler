@@ -483,6 +483,7 @@ daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 
 
 无附件的 `SubmitMessage` 若被既有 `parse_continuation` 识别为“继续”，由 App 命令入口统一进入已有 `ResumeTask` handler。沿原任务、Goal 和计划继续，并把补充要求追加到原目标。是否可恢复、显式取消拒绝和无可恢复任务时的普通消息语义，仍由原 Runtime owner 判定；带附件的提交保留内容与图像校验路径。客户端不各自新增“继续”解析器。
 
+Chat 显式委托是 Turn 级的 Goal 身份，不是第四条协作轴。顶层可写的 Chat 回合可以调用注入工具 `commit_task(objective, acceptance)`；Runtime 校验声明后通过既有 `GoalBinder` 把该回合绑定到持久 Goal（goals 行、`turn.payload.goal_id`、预算 scope 迁移）。持久 Goal 的 objective 是 turn 目标锚点里的用户原话，不是模型的复述，因此模型不能通过声明一个更小目标来缩窄任务。从下一轮起，同一回合暴露 `update_goal`，使用 Goal closeout 与验证门。会话 collaboration 仍是 `chat`，之后普通消息仍是 Chat。声明是结构化的：Runtime 不按用户文本分类执行意图，也不增加分类模型调用。问答、讨论、只读和 Plan 面不暴露该工具，子 Agent 不能声明任务。恢复以 `turn.payload.goal_id` 作为充分的目标身份，因此被中断的委托 Chat 回合按 Goal profile 恢复，不改变会话轴。暂停的任务保持可见，直到完成或显式取消；显式取消逻辑任务会结清其 Goal 并拒绝之后的继续。
 
 Web 重开会话时，持久保存的最后选择与本次收到的 `SessionList` 决定恢复对象；不能读取尚未由 React 提交的旧列表。恢复继续遵守 current / pending selection guard，避免覆盖用户已开始的会话选择。
 

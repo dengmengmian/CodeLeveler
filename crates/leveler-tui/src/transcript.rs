@@ -1387,6 +1387,22 @@ impl TranscriptState {
         changed
     }
 
+    /// The name and raw arguments of a tool-call row, if this transcript still
+    /// has it. A reducer that must classify a completion (for example a task
+    /// commitment) reads the row the runtime already rendered instead of
+    /// inventing a second event stream.
+    pub fn tool_call_facts(&self, id: &ToolCallId) -> Option<(&str, &str)> {
+        self.items.iter().rev().find_map(|item| match item {
+            TranscriptItem::ToolGroup(group) => group
+                .calls
+                .iter()
+                .rev()
+                .find(|call| &call.id == id)
+                .map(|call| (call.name.as_str(), call.arguments.as_str())),
+            _ => None,
+        })
+    }
+
     fn tool_call_mut(&mut self, id: &ToolCallId) -> Option<&mut ToolCallBlock> {
         self.items.iter_mut().rev().find_map(|item| match item {
             TranscriptItem::ToolGroup(group) => {
