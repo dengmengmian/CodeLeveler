@@ -37,50 +37,66 @@ try{
  await page.locator('.directory-picker-modal .button.primary').filter({hasText:/^打开$/}).click();
  await page.waitForFunction(()=>document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
  await page.locator('#message').fill('把 README.md 改成 After，并创建相加函数 src/util.ts。');await page.locator('#send').click();
- await page.waitForFunction(()=>document.querySelector('.message.assistant .markdown')?.textContent.includes('不代表已创建文件。')&&document.querySelectorAll('.answer-file').length===2&&document.querySelectorAll('.message.assistant .markdown-file-link').length===2&&['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent));
+ await page.waitForFunction(()=>document.querySelector('.message.assistant .markdown')?.textContent.includes('不代表已创建文件。')&&document.querySelector('.execution-group.execution-edit')&&['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent));
  runtime=await page.evaluate(()=>window.desktop.runtimeInfo());evidence.runtime=runtime;
  assert.equal(await readFile(path.join(workspace,'README.md'),'utf8'),'# After\n');assert.match(await readFile(path.join(workspace,'src/util.ts'),'utf8'),/export const add/);
  const assistant=page.locator('.message.assistant').last();
  assert.equal(await assistant.locator('.markdown-file-link').count(),2);
  assert.equal(await assistant.locator('.markdown code').filter({hasText:'imaginary.ts'}).count(),1);
- assert.equal(await assistant.locator('.answer-files').evaluate(n=>getComputedStyle(n).gridTemplateColumns.split(' ').length),2);
- assert.ok((await assistant.locator('.answer-file-summary').allTextContents()).every(text=>/\+\d+ −\d+/.test(text)));
+ assert.equal(await page.locator('.answer-file').count(),0,'a duplicate answer file card is painted');
+ const edit=page.locator('.execution-group.execution-edit').last();
+ assert.match(await edit.locator('.execution-label').innerText(),/修改 2 个文件 · \+2 \/ -1/);
+ assert.equal(await edit.evaluate(node=>node.open),false,'the modification group is not collapsed by default');
  assert.equal(await page.locator('.message-time').filter({hasText:'1970'}).count(),0);
  const alignment=await page.evaluate(()=>{const u=document.querySelector('.message.user'),b=u.querySelector('.bubble'),a=document.querySelector('.message.assistant');return {userRight:Math.round(u.getBoundingClientRect().right-b.getBoundingClientRect().right),assistantOpen:getComputedStyle(a).backgroundColor,bubble:getComputedStyle(b).backgroundColor};});
  assert.equal(alignment.userRight,0);assert.equal(alignment.assistantOpen,'rgba(0, 0, 0, 0)');evidence.alignment=alignment;
  await page.screenshot({path:path.join(output,'message-layout-wide.png')});
  await assistant.locator('.markdown-file-link').first().click();await page.waitForFunction(()=>document.querySelector('.preview-body')?.textContent.includes('After'));
  evidence.inline_preview=true;
- await assistant.locator('.answer-file-preview').filter({hasText:'util.ts'}).click();await page.waitForFunction(()=>document.querySelector('.preview-body')?.textContent.includes('export const add'));
+ // The modification summary opens the confirmed Workbench, and its file rows
+ // locate the selected file inside that complete Diff.
+ await edit.locator('.execution-toggle').click();
+ await page.waitForFunction(()=>document.querySelectorAll('.execution-group.execution-edit .execution-file-row').length===2);
+ const fileRows=await page.locator('.execution-group.execution-edit .execution-file-row').allInnerTexts();
+ assert.deepEqual(fileRows.map(text=>text.split('\n')[0]),['README.md','src/util.ts']);
+ await page.locator('.execution-group.execution-edit .execution-file-row').filter({hasText:'src/util.ts'}).click();
+ await page.waitForFunction(()=>document.querySelector('.review-scope')?.textContent.includes('已确认'));
+ assert.equal(await page.locator('.review-path').innerText(),'src/util.ts');
+ assert.match(await page.locator('.review-body').innerText(),/export const add/);
  evidence.card_preview=true;
- await assistant.locator('.answer-file-open .open-app-more').first().click();await page.getByRole('menuitem',{name:'显示文件位置'}).waitFor();await page.keyboard.press('Escape');evidence.open_in_app_menu=true;
- // Only the OS-launch IPC is stubbed: verify real UI preference, pending state,
- // and requested app id without launching an external editor during acceptance.
- const apps=await page.evaluate(()=>window.desktop.openInAppApps());
- const selectedApp=apps.find(app=>app.id!=='finder');assert.ok(selectedApp,'an alternate installed app is needed for this preference acceptance');
- await app.evaluate(({ipcMain})=>{globalThis.__layoutOpenHandler=ipcMain._invokeHandlers.get('desktop:open-in-app');globalThis.__layoutOpenRequests=[];ipcMain.removeHandler('desktop:open-in-app');ipcMain.handle('desktop:open-in-app',(_event,request)=>{globalThis.__layoutOpenRequests.push(request);return new Promise(resolve=>{globalThis.__layoutReleaseOpen=()=>resolve({ok:true});});});});
- try{
-  await page.locator('#open-in-app .open-app-more').click();await page.getByRole('menuitemradio',{name:selectedApp.name,exact:true}).click();
-  await page.waitForFunction(()=>[...document.querySelectorAll('.answer-file-open .open-app-primary')].every(button=>button.disabled));
-  evidence.open_in_app_busy=true;
-  await app.evaluate(()=>globalThis.__layoutReleaseOpen());
-  await page.waitForFunction(name=>[...document.querySelectorAll('.answer-file-open .open-app-primary')].every(button=>!button.disabled&&button.getAttribute('aria-label')===`用 ${name} 打开`),selectedApp.name);
-  await assistant.locator('.answer-file-open .open-app-primary').first().click();
-  const request=await app.evaluate(()=>globalThis.__layoutOpenRequests.at(-1));assert.equal(request.appId,selectedApp.id);assert.match(request.path,/README\.md$/);
-  await app.evaluate(()=>globalThis.__layoutReleaseOpen());evidence.open_in_app_preference_and_binding=true;evidence.external_launch_stub_only=true;
- }finally{await app.evaluate(({ipcMain})=>{ipcMain.removeHandler('desktop:open-in-app');ipcMain.handle('desktop:open-in-app',globalThis.__layoutOpenHandler);delete globalThis.__layoutOpenHandler;delete globalThis.__layoutOpenRequests;delete globalThis.__layoutReleaseOpen;});}
+ await page.locator('.review-tools button[aria-label="打开完整文件"]').click();
+ await page.waitForFunction(()=>document.querySelector('.preview-body')?.textContent.includes('export const add'));
+ await page.locator('.pane-tab').filter({hasText:'本次修改'}).click();
+ await page.waitForFunction(()=>document.querySelector('.review-scope')?.textContent.includes('已确认'));
+ // The Workbench keeps its own Open In App controls. The launch IPC itself is
+ // covered by `open-in-app.test.mjs`; this layout lane only checks the entry.
+ await page.locator('.open-in-app-pane .open-app-more').click();
+ await page.waitForSelector('.menu [role="menuitem"], .menu [role="menuitemradio"]');
+ await page.keyboard.press('Escape');evidence.open_in_app_menu=true;
+ await page.locator('.pane-chrome button[aria-label="收起右侧边栏"]').first().click();
+ await page.waitForFunction(()=>!document.body.classList.contains('rightbar-open'));
  const id=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
- await page.reload();await page.locator(`.session-row[data-session-id="${id}"]`).click();await page.waitForFunction(()=>document.querySelectorAll('.answer-file').length===2);
- assert.equal(await page.locator('.answer-file-name').filter({hasText:'README.md'}).count(),1);evidence.history_replay_cards=true;
+ await page.reload();await page.locator(`.session-row[data-session-id="${id}"]`).click();
+ await page.waitForFunction(()=>document.querySelector('.execution-group.execution-edit'));
+ await page.locator('.execution-group.execution-edit .execution-toggle').last().click();
+ await page.waitForFunction(()=>document.querySelectorAll('.execution-group.execution-edit .execution-file-row').length===2);
+ assert.equal(await page.locator('.execution-file-path').filter({hasText:'README.md'}).count(),1);evidence.history_replay_cards=true;
  await page.locator('#message').fill('只解释，不修改文件。');await page.locator('#send').click();
  await page.waitForFunction(()=>document.querySelectorAll('.message.assistant').length===2&&document.querySelector('.message.assistant:last-of-type .markdown')?.textContent.includes('第二轮没有修改。')&&['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent));
- assert.equal(await page.locator('.message.assistant').last().locator('.answer-file').count(),0);
  assert.equal(await page.locator('.message.assistant').last().locator('.markdown-file-link').count(),1);
- assert.equal(await page.locator('.answer-file').count(),2);evidence.next_turn_no_stale_cards=true;evidence.session_id=id;
+ assert.equal(await page.locator('.execution-group.execution-edit').count(),1,'the second turn grew a stale modification group');
+ assert.equal(await page.locator('.answer-file').count(),0);evidence.next_turn_no_stale_cards=true;evidence.session_id=id;
  if(await page.locator('#rightbar').isVisible())await page.locator('.pane-chrome button[aria-label="收起右侧边栏"]').first().click();
  await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(700,860));
- await page.waitForFunction(()=>innerWidth===700);assert.equal(await page.locator('.answer-files').evaluate(n=>getComputedStyle(n).gridTemplateColumns.split(' ').length),1);
- assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.locator('.answer-files').scrollIntoViewIfNeeded();assert.equal(await page.locator('.answer-file').first().isVisible(),true);await page.evaluate(async()=>{await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));await Promise.all(document.getAnimations().filter(animation=>animation.constructor.name==='CSSTransition').map(animation=>animation.finished));});await page.screenshot({path:path.join(output,'message-layout-narrow.png')});
+ await page.waitForFunction(()=>innerWidth===700);
+ if(await page.evaluate(()=>document.body.classList.contains('sidebar-open')))await page.locator('#sidebar-toggle').click();
+ await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=0);
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ const narrowEdit=page.locator('.execution-group.execution-edit').last();
+ if(!(await narrowEdit.evaluate(node=>node.open)))await narrowEdit.locator('.execution-toggle').click();
+ await page.waitForFunction(()=>document.querySelectorAll('.execution-group.execution-edit .execution-file-row').length===2);
+ await narrowEdit.scrollIntoViewIfNeeded();assert.equal(await narrowEdit.locator('.execution-file-row').first().isVisible(),true);
+ await page.evaluate(async()=>{await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));await Promise.all(document.getAnimations().filter(animation=>animation.constructor.name==='CSSTransition').map(animation=>animation.finished));});await page.screenshot({path:path.join(output,'message-layout-narrow.png')});
  assert.deepEqual(errors,[]);Object.assign(evidence,{passed:true,confirmed_host_files:2,inline_file_chips:2,model_only_file_is_code:true,narrow_single_column:true,calls});
 }catch(error){evidence.error=error.message;if(page&&!page.isClosed())evidence.observed=await page.locator('.message.assistant').allTextContents();if(page&&!page.isClosed())await page.screenshot({path:path.join(output,'message-layout-failure.png')});throw error;}
 finally{if(app)await app.close();await new Promise(resolve=>server.close(resolve));if(runtime){const deadline=Date.now()+30000;let gone=false;while(Date.now()<deadline){try{process.kill(runtime.pid,0);}catch(error){if(error.code==='ESRCH'){gone=true;break;}evidence.cleanup_error=error.message;break;}await new Promise(resolve=>setTimeout(resolve,100));}evidence.runtime_idle_exit=gone;}evidence.errors=errors;await writeFile(path.join(output,'message-layout-evidence.json'),JSON.stringify(evidence,null,2)+'\n');console.log(JSON.stringify(evidence,null,2));}

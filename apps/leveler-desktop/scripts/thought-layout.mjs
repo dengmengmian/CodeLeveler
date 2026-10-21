@@ -40,18 +40,15 @@ try {
     const children = [...list.children].map(node => node.className);
     const completed = list.querySelector('.thought-row:not(.thought-live)');
     const live = list.querySelector('.thought-row.thought-live');
-    const label = completed?.querySelector('.thought-label');
-    const box = label?.getBoundingClientRect();
-    const lineHeight = label ? parseFloat(getComputedStyle(label).lineHeight) : 0;
+    const narration = list.querySelector('.message.assistant.narration');
     return {
       markers,
-      completedLabel: label?.textContent ?? null,
-      completedLines: box ? Math.round(box.height / lineHeight) : null,
-      completedHasPreview: !!completed?.querySelector('.thought-preview'),
+      completedRows: list.querySelectorAll('.thought-row:not(.thought-live)').length,
       liveLabel: live?.querySelector('.thought-label')?.textContent ?? null,
       livePreview: live?.querySelector('.thought-preview')?.textContent ?? null,
       liveHasBody: !!live?.querySelector('.thought-body'),
-      headings: [...list.querySelectorAll('.process-heading')].filter(node => getComputedStyle(node).display !== 'none').length,
+      narrationText: narration?.textContent?.trim() ?? null,
+      headings: [...list.querySelectorAll('.process-heading, .process-group')].length,
       last: children.at(-1) ?? null,
       beforeLast: children.at(-2) ?? null,
       runningText: list.querySelector('.running-row .running-text')?.textContent ?? null,
@@ -73,13 +70,12 @@ try {
     };
   });
   evidence.view = view;
-  assert.equal(view.completedLabel, '已完成分析');
-  assert.equal(view.completedLines, 1, `completed analysis label wrapped onto ${view.completedLines} lines`);
-  assert.equal(view.completedHasPreview, false, 'completed analysis keeps a preview');
+  assert.equal(view.completedRows, 0, 'a settled Thought still occupies a conversation row');
+  assert.equal(view.headings, 0, 'the removed work-steps wrapper is still rendered');
+  assert.match(view.narrationText ?? '', /好，我把运营端 MCP 验证固化成回归用例/, 'interim narration is not painted as prose');
   assert.equal(view.liveLabel, '正在分析请求');
   assert.match(view.livePreview, /The user repeated the same question/, 'live analysis does not show the latest reasoning line');
   assert.equal(view.liveHasBody, false, 'live analysis renders its full body');
-  assert.equal(view.headings, 0, 'a reasoning-only turn renders the work-steps heading');
   assert.match(view.runningText ?? '', /git fetch --all --prune/, 'the running line does not name the command that is executing');
   assert.notEqual(view.runningBorder, '0px', 'the running line has no divider above it');
   assert.ok(view.stop && !view.stop.hidden, 'the running turn exposes no stop control');
@@ -87,12 +83,11 @@ try {
   assert.ok(view.stop.radius > 0, 'the stop glyph is not a rounded block');
   assert.equal(view.stop.svgChildren, 0, 'the stop control still draws an outlined icon');
   const order = view.markers.map(marker => marker.cls);
-  const completedAt = order.findIndex(cls => cls.includes('thought-row') && !cls.includes('thought-live'));
   const answerAt = order.findIndex(cls => cls.includes('message assistant'));
   const liveAt = order.findIndex(cls => cls.includes('thought-live'));
   const runningAt = order.findIndex(cls => cls.includes('running-row'));
-  assert.ok(completedAt >= 0 && answerAt > completedAt, `completed analysis is not before the answer: ${JSON.stringify(order)}`);
-  assert.ok(liveAt > answerAt, `live analysis is not after the answer: ${JSON.stringify(order)}`);
+  assert.ok(answerAt >= 0, `narration is missing: ${JSON.stringify(order)}`);
+  assert.ok(liveAt > answerAt, `live analysis is not after the narration: ${JSON.stringify(order)}`);
   assert.equal(runningAt, order.length - 1, `the running line is not last: ${JSON.stringify(order)}`);
   assert.equal(liveAt, runningAt - 1, `live analysis is not directly above the running line: ${JSON.stringify(order)}`);
   assert.equal(view.last, 'running-row');

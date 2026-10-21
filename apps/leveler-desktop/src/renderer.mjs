@@ -4,15 +4,15 @@ import {
   modelLabel, workspaceLabel, toolLabel, toolTarget, browserActivity, sourceErrorSummary,
   relativeActivity, permissionLabel, recentWorkspaces, renameCommand, messageKind,
   historyQuestions, planStepLabel, browserChrome, browserSurfaceBounds, workspaceTaskGroups,
-  attachmentErrorPresentation, slashIntent, commandCandidates, groupExecutionRounds,
-  roundGlyph, roundHeadline, contractToolStatus, failureReason, displayPreview,
-  confirmedDiffOf, diffCounts, foldedThoughts, turnBlocks, thoughtDuration, answerFiles, messageTime,
+  attachmentErrorPresentation, slashIntent, commandCandidates,
+  contractToolStatus, failureReason, displayPreview,
+  confirmedDiffOf, diffCounts, messageTime, conversationItems, executionStatusLabel, confirmedChangeFiles,
 } from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
   workspaceDraftText, attachmentSubmissionError, permissionCommand, permissionConfirmed,
-  beginDiffQuery, expireDiffQuery, retainInterruptedThoughts,
+  beginDiffQuery, expireDiffQuery, retainInterruptedThoughts, mergeRestoredConversation,
 } from './state.mjs';
 import { brandMark, fileIcon } from './icons.mjs';
 import { projectTrajectory, searchTrajectory, buildTimeline, formatDuration, trajectoryWindow } from './trajectory.mjs';
@@ -140,9 +140,9 @@ let pendingSubmit = false;
 let modelRetry = null;
 const attachmentDrafts = new Map();
 const renderedSources = new WeakMap();
-const openThoughts = new Set();
-const openProcess = new Set();
+const openExecution = new Set();
 const openTools = new Set();
+const executionState = new WeakMap();
 const foldedGroups = new Set();
 
 /* ------------------------------------------------------------ preferences */
@@ -154,18 +154,13 @@ function loadSettings() {
   const defaults = {
     theme: 'system', fontSize: 14, codeFontSize: 11, terminalFontSize: 13,
     textFontFamily: '', codeFontFamily: '', terminalFontFamily: '',
-    workSteps: 'standard', collapseAfter: 'answer', linkOpen: 'side', busySend: 'queue',
-    performance: 'detailed', codingView: true,
+    linkOpen: 'side', busySend: 'queue', performance: 'detailed', codingView: true,
     defaultPermission: 'assisted', archivedFilter: 'default', groupMode: 'workspace',
     sortMode: 'updated', manualOrder: { sessions: [], groups: [] },
   };
   try {
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
     const merged = { ...defaults, ...(stored && typeof stored === 'object' ? stored : {}) };
-    if (merged.workSteps === 'minimal') merged.workSteps = 'compact';
-    if (!['compact', 'standard', 'detailed', 'verbose'].includes(merged.workSteps)) merged.workSteps = 'standard';
-    if (merged.collapseAfter === 'never') merged.collapseAfter = 'next';
-    if (!['answer', 'next'].includes(merged.collapseAfter)) merged.collapseAfter = 'answer';
     if (merged.performance === 'off') merged.performance = 'compact';
     if (!['compact', 'detailed'].includes(merged.performance)) merged.performance = 'detailed';
     if (!['queue', 'steer'].includes(merged.busySend)) merged.busySend = 'queue';
@@ -1657,94 +1652,89 @@ function render() {
 
 /* ---------------------------------------------------------- conversation */
 
-function messageRow(existing, message) {
+function userMessageNode(existing, message) {
   const key = `message:${message.id}`;
-  const kind = messageKind(message);
   let row = existing.get(key);
   if (!row) {
-    if (kind === 'user') {
-      row = el('article', 'message user');
-      row.dataset.key = key;
-      row.dataset.messageId = message.id;
-      row.append(el('div', 'bubble'), el('div', 'message-actions'));
-    } else if (kind === 'assistant') {
-      row = el('article', 'message assistant');
-      row.dataset.key = key;
-      row.dataset.messageId = message.id;
-      row.append(el('div', 'markdown'), el('div', 'message-actions'));
-    } else {
-      row = el('section', 'turn-trigger');
-      row.dataset.key = key;
-      row.dataset.messageId = message.id;
-      const header = el('button', 'turn-trigger-header');
-      header.type = 'button';
-      header.setAttribute('aria-expanded', 'false');
-      const compressed = String(message.text ?? '').startsWith('上下文已压缩');
-      header.append(
-        iconNode(compressed ? 'layers' : 'bot', { size: 14, className: 'turn-trigger-icon' }),
-        el('span', 'turn-trigger-title', compressed ? '上下文注入' : '子任务状态更新'),
-        iconNode('chevronDown', { size: 12, className: 'turn-trigger-chevron' }),
-      );
-      const body = el('div', 'turn-trigger-body');
-      body.hidden = true;
-      body.append(el('p', 'turn-trigger-explanation', '这条通知触发了本轮回复。'), el('pre', 'turn-trigger-text'));
-      header.addEventListener('click', () => {
-        const open = body.hidden;
-        body.hidden = !open;
-        header.setAttribute('aria-expanded', String(open));
-        row.classList.toggle('open', open);
-      });
-      row.append(header, body);
-    }
+    row = el('article', 'message user');
+    row.dataset.key = key;
+    row.dataset.messageId = message.id;
+    row.append(el('div', 'bubble'), el('div', 'message-actions'));
   }
-  if (kind === 'user') {
-    const bubble = row.querySelector('.bubble');
-    if (renderedSources.get(bubble) !== message.text) {
-      renderedSources.set(bubble, message.text);
-      bubble.textContent = message.text;
-    }
-    decorateMessageActions(row, message);
-    const images = Number(message.images ?? 0);
-    let imageRow = row.querySelector('.message-images');
-    if (images > 0 && !imageRow) {
-      imageRow = el('div', 'message-images');
-      row.querySelector('.bubble').after(imageRow);
-    }
-    if (imageRow && imageRow.dataset.count !== String(images)) {
-      imageRow.dataset.count = String(images);
-      imageRow.replaceChildren();
-      imageRow.classList.toggle('single', images === 1);
-      for (let index = 0; index < Math.min(images, 4); index += 1) {
-        const tile = el('button', 'message-image-tile');
-        tile.type = 'button';
-        tile.setAttribute('aria-label', `查看大图 ${index + 1}`);
-        tile.append(iconNode('image', { size: images === 1 ? 28 : 18 }));
-        tile.addEventListener('click', () => openImagePreview(images));
-        imageRow.append(tile);
-      }
-      if (images > 4) imageRow.append(el('span', 'message-image-more', `+${images - 4}`));
-    }
-    if (images <= 0 && imageRow) imageRow.remove();
-    renderUserExtras(row, message);
-  } else if (kind === 'assistant') {
-    const body = row.querySelector('.markdown');
-    const files = answerFiles(message, current.messages, current.tools);
-    const source = JSON.stringify([message.text, files]);
-    if (renderedSources.get(body) !== source) {
-      renderedSources.set(body, source);
-      renderMarkdown(body, message.text, { onLink: openMessageLink, filePaths: new Set(files.map(file => file.path)) });
-      for (const reference of body.querySelectorAll('.markdown-file-link')) reference.prepend(fileIcon(reference.title.split('#')[0]));
-      addCodeActions(body);
-    }
-    renderAnswerFiles(row, files);
-    decorateMessageActions(row, message);
-  } else {
-    const content = row.querySelector('.turn-trigger-text');
-    if (content && renderedSources.get(content) !== message.text) {
-      renderedSources.set(content, message.text);
-      content.textContent = message.text;
-    }
+  const bubble = row.querySelector('.bubble');
+  if (renderedSources.get(bubble) !== message.text) {
+    renderedSources.set(bubble, message.text);
+    bubble.textContent = message.text;
   }
+  decorateMessageActions(row, message);
+  const images = Number(message.images ?? 0);
+  let imageRow = row.querySelector('.message-images');
+  if (images > 0 && !imageRow) {
+    imageRow = el('div', 'message-images');
+    row.querySelector('.bubble').after(imageRow);
+  }
+  if (imageRow && imageRow.dataset.count !== String(images)) {
+    imageRow.dataset.count = String(images);
+    imageRow.replaceChildren();
+    imageRow.classList.toggle('single', images === 1);
+    for (let index = 0; index < Math.min(images, 4); index += 1) {
+      const tile = el('button', 'message-image-tile');
+      tile.type = 'button';
+      tile.setAttribute('aria-label', `查看大图 ${index + 1}`);
+      tile.append(iconNode('image', { size: images === 1 ? 28 : 18 }));
+      tile.addEventListener('click', () => openImagePreview(images));
+      imageRow.append(tile);
+    }
+    if (images > 4) imageRow.append(el('span', 'message-image-more', `+${images - 4}`));
+  }
+  if (images <= 0 && imageRow) imageRow.remove();
+  renderUserExtras(row, message);
+  return row;
+}
+
+/** One assistant message: interim narration and the committed answer share the
+ * same node so a completed turn changes its weight without re-creating a row.
+ * The classification itself comes from `conversationItems`, never from prose. */
+function assistantTextNode(existing, item) {
+  const message = item.message;
+  const key = `message:${message.id}`;
+  let row = existing.get(key);
+  if (!row) {
+    row = el('article', 'message assistant');
+    row.dataset.key = key;
+    row.dataset.messageId = message.id;
+    row.append(el('div', 'markdown'), el('div', 'message-actions'));
+  }
+  row.classList.toggle('narration', item.kind === 'narration');
+  row.classList.toggle('final', item.kind === 'final');
+  row.classList.toggle('streaming', !!item.streaming);
+  const body = row.querySelector('.markdown');
+  const filePaths = new Set(item.filePaths ?? []);
+  const source = JSON.stringify([item.text, [...filePaths]]);
+  if (renderedSources.get(body) !== source) {
+    renderedSources.set(body, source);
+    renderMarkdown(body, item.text, { onLink: openMessageLink, filePaths });
+    for (const reference of body.querySelectorAll('.markdown-file-link')) reference.prepend(fileIcon(reference.title.split('#')[0]));
+    addCodeActions(body);
+  }
+  decorateMessageActions(row, message);
+  return row;
+}
+
+/** Runtime-authored rows sit on the transcript but never look like the person
+ * speaking, and a compaction summary is never the model's answer. */
+function runtimeNoticeNode(existing, item) {
+  const key = `message:${item.message.id}`;
+  let row = existing.get(key);
+  if (!row) {
+    row = el('section', 'message notice');
+    row.dataset.key = key;
+    row.dataset.messageId = item.message.id;
+    row.append(el('span', 'notice-pill'), el('span', 'notice-text'));
+  }
+  row.classList.toggle('summary-notice', item.kind === 'summary');
+  row.querySelector('.notice-pill').textContent = item.kind === 'summary' ? '上下文摘要' : '运行提示';
+  row.querySelector('.notice-text').textContent = item.text;
   return row;
 }
 
@@ -1869,36 +1859,6 @@ function decorateMessageActions(row, message) {
   }
 }
 
-function renderAnswerFiles(row, files) {
-  let host = row.querySelector('.answer-files');
-  if (!files.length) { host?.remove(); return; }
-  if (!host) {
-    host = el('div', 'answer-files');
-    row.querySelector('.markdown').after(host);
-  }
-  const signature = JSON.stringify([files, openInAppState.apps?.map(app => app.id), openInAppState.loading, openInAppState.busy, openInAppState.preferred, openInAppState.error]);
-  if (host.dataset.signature === signature) return;
-  host.dataset.signature = signature;
-  host.replaceChildren();
-  for (const file of files) {
-    const card = el('div', 'answer-file');
-    const preview = el('button', 'answer-file-preview');
-    preview.type = 'button';
-    preview.title = file.path;
-    preview.setAttribute('aria-label', `预览 ${file.path}`);
-    const glyph = el('span', 'answer-file-icon');
-    glyph.append(fileIcon(file.path));
-    const body = el('span', 'answer-file-body');
-    body.append(el('span', 'answer-file-name', file.path.split('/').at(-1)), el('span', 'answer-file-summary', `${file.path} · +${file.added} −${file.removed}`));
-    preview.append(glyph, body);
-    preview.addEventListener('click', () => openLocalReference({ path: file.path, line: null, lineEnd: null }));
-    const open = el('div', 'open-in-app answer-file-open');
-    renderOpenInAppInto(open, file.path, 'file');
-    card.append(preview, open);
-    host.append(card);
-  }
-}
-
 function addCodeActions(body) {
   for (const pre of body.querySelectorAll('pre')) {
     if (pre.querySelector('.code-banner')) continue;
@@ -1934,49 +1894,6 @@ function addCodeActions(body) {
   }
 }
 
-function progressNode(existing, message, streaming) {
-  const key = `progress:${message.id}`;
-  let node = existing.get(key);
-  if (!node) {
-    node = el('div', 'message assistant narration');
-    node.dataset.key = key;
-    node.dataset.messageId = message.id;
-    node.append(el('div', 'markdown narration-markdown'));
-  }
-  node.classList.toggle('streaming', !!streaming);
-  const body = node.querySelector('.markdown');
-  if (renderedSources.get(body) !== message.text) {
-    renderedSources.set(body, message.text);
-    renderMarkdown(body, message.text, { onLink: openMessageLink });
-    addCodeActions(body);
-  }
-  return node;
-}
-
-function thoughtNode(existing, thought) {
-  const key = `thought:${thought.id}`;
-  let node = existing.get(key);
-  if (!node) {
-    node = el('details', 'thought-row');
-    node.dataset.key = key;
-    const summary = el('summary', 'thought-summary');
-    summary.append(
-      iconNode('chevronRight', { size: 12, className: 'thought-chevron' }),
-      iconNode('sparkle', { size: 14 }),
-      el('span', 'thought-label', '已完成分析'),
-    );
-    node.append(summary, el('div', 'thought-body'));
-    node.addEventListener('toggle', () => {
-      if (node.open) openThoughts.add(thought.id); else openThoughts.delete(thought.id);
-    });
-  }
-  const text = thought.body ?? thought.text ?? '';
-  node.querySelector('.thought-label').textContent = thought.interrupted ? '分析中断' : '已完成分析';
-  node.querySelector('.thought-body').textContent = text;
-  node.open = openThoughts.has(thought.id);
-  return node;
-}
-
 function liveThoughtNode(existing, text) {
   let node = existing.get('thought:live');
   if (!node) {
@@ -1990,25 +1907,6 @@ function liveThoughtNode(existing, text) {
   // latest reasoning line is the signal, and the settled Thought keeps the body.
   const latest = text.split('\n').map(line => line.trim()).filter(Boolean).at(-1) ?? '';
   node.querySelector('.thought-preview').textContent = latest;
-  return node;
-}
-
-function receiptNode(existing, receipt, hiddenThoughts) {
-  const key = `receipt:${receipt.members[0].id}`;
-  let node = existing.get(key);
-  if (!node) {
-    node = el('details', 'thought-row');
-    node.dataset.key = key;
-    node.append(el('summary', 'thought-summary'), el('div', 'thought-body'));
-  }
-  node.querySelector('summary').textContent = `▸ ${receipt.label}`;
-  const body = node.querySelector('.thought-body');
-  body.replaceChildren();
-  for (const thought of hiddenThoughts ?? []) {
-    const text = thought.body ?? thought.text ?? '';
-    body.append(el('div', `◆ ${thought.interrupted ? '思考中断' : '思考'}`), el('pre', undefined, text));
-  }
-  for (const member of receipt.members ?? []) body.append(el('div', `${member.name} ${member.target ?? ''}`));
   return node;
 }
 
@@ -2069,7 +1967,7 @@ function toolNode(existing, tool) {
     row.dataset.toolId = tool.id;
     const summary = el('summary', 'tool-summary');
     const lead = el('span', 'tool-status');
-    summary.append(lead, el('span', 'tool-label'), el('span', 'tool-target'), el('span', 'tool-duration'));
+    summary.append(lead, el('span', 'tool-label'), el('span', 'tool-target'), el('span', 'tool-failure'), el('span', 'tool-state'), el('span', 'tool-duration'));
     row.append(summary);
     row.addEventListener('toggle', () => {
       if (row.open) openTools.add(tool.id); else openTools.delete(tool.id);
@@ -2084,8 +1982,13 @@ function toolNode(existing, tool) {
   lead.replaceChildren(iconNode(toolIconName(tool), { size: 14 }));
   row.querySelector('.tool-label').textContent = waiting ? '等待审批' : toolLabel(tool);
   const target = String(toolTarget(tool) ?? '');
+  const failureText = failureReason(tool.preview ?? '') ?? '';
   row.querySelector('.tool-target').textContent = waiting ? '等待你的批准'
-    : target || (status === 'failed' ? failureReason(tool.preview ?? '') ?? '' : '');
+    : target || (status === 'failed' ? failureText : '');
+  row.querySelector('.tool-failure').textContent = !waiting && status === 'failed' && target ? failureText : '';
+  row.querySelector('.tool-state').textContent = waiting ? ''
+    : status === 'cancelled' ? '已停止'
+      : status === 'unknown' ? '结果未知' : '';
   const summary = row.querySelector('.tool-summary');
   let extras = summary.querySelector('.tool-extras');
   if (!extras) {
@@ -2193,8 +2096,27 @@ function renderToolDetails(row, id) {
     }
     card.append(head, pre);
   } else if (kind === 'edit') {
-    card = patch ? renderConfirmedDiff(tool, patch) : el('div', 'tool-edit-card');
-    if (!patch) card.append(el('pre', 'tool-output', output || '（无输出）'));
+    card = el('div', 'tool-edit-card');
+    if (patch) {
+      const [added, removed] = diffCounts(patch);
+      const receipt = el('div', 'tool-edit-receipt');
+      receipt.append(
+        el('span', 'tool-edit-title', '已确认改动'),
+        el('span', 'tool-diffstat add', `+${added}`),
+        el('span', 'tool-diffstat del', `−${removed}`),
+      );
+      const openChanges = el('button', 'button secondary small', '查看完整变更');
+      openChanges.type = 'button';
+      openChanges.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        openConfirmedChanges([tool.id], null);
+      });
+      receipt.append(openChanges);
+      card.append(receipt);
+    } else {
+      card.append(el('pre', 'tool-output', output || '（无输出）'));
+    }
     const openFile = toolFileButton(tool);
     if (openFile) card.append(openFile);
   } else if (kind === 'search') {
@@ -2424,116 +2346,163 @@ function scheduleTurnCard(tool, args, output) {
   return card;
 }
 
-function renderConfirmedDiff(tool, patch) {
-  const node = el('div', 'confirmed-diff');
-  node.dataset.patch = patch;
-  const [added, removed] = diffCounts(patch);
-  const head = el('div', 'confirmed-diff-head');
-  head.append(el('span', 'confirmed-diff-title', '已确认改动'));
-  head.append(el('span', 'confirmed-diff-stat add', `+${added}`), el('span', 'confirmed-diff-stat del', `−${removed}`));
-  const copy = el('button', 'message-copy');
-  copy.type = 'button';
-  copy.setAttribute('aria-label', '复制完整 diff');
-  copy.dataset.tooltip = '复制完整 diff';
-  copy.append(iconNode('copy', { size: 14 }));
-  copy.addEventListener('click', () => copyText(api, patch));
-  head.append(copy);
-  const body = el('pre', 'confirmed-diff-body');
-  body.textContent = patch;
-  node.append(head, body);
+const EXECUTION_GLYPHS = { running: '●', ok: '✓', failed: '✗', cancelled: '■', unknown: '◇' };
+
+function syncChildren(host, children) {
+  for (const child of [...host.children]) if (!children.includes(child)) child.remove();
+  for (const child of children) if (child.parentNode !== host) host.append(child);
+}
+
+function executionFilesNode(view) {
+  const host = el('div', 'execution-files');
+  host.append(el('div', 'execution-files-head', '已确认改动'));
+  if (!view.files?.length) {
+    host.append(el('div', 'execution-files-empty', '运行时没有提供该操作的 Diff。'));
+    return host;
+  }
+  for (const file of view.files) {
+    const row = el('button', 'execution-file-row');
+    row.type = 'button';
+    row.title = `${file.path} · +${file.added} −${file.removed}`;
+    const glyph = el('span', 'execution-file-icon');
+    glyph.append(fileIcon(file.path));
+    row.append(
+      glyph,
+      el('span', 'execution-file-path', file.path),
+      el('span', 'execution-file-stat add', `+${file.added}`),
+      el('span', 'execution-file-stat del', `−${file.removed}`),
+    );
+    row.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openConfirmedChanges(view.toolIds, file.path);
+    });
+    host.append(row);
+  }
+  return host;
+}
+
+function fillExecutionBody(node, view, existing) {
+  const body = node.querySelector('.execution-body');
+  const children = [];
+  if (view.variant === 'edit') {
+    const signature = JSON.stringify(view.files?.map(file => [file.path, file.added, file.removed]) ?? []);
+    let files = node.querySelector('.execution-files');
+    if (!files || files.dataset.signature !== signature) {
+      const fresh = executionFilesNode(view);
+      fresh.dataset.signature = signature;
+      if (files) files.replaceWith(fresh);
+      files = fresh;
+    }
+    children.push(files);
+  }
+  for (const id of view.tools) {
+    const tool = current?.tools.find(item => item.id === id);
+    if (tool) children.push(toolNode(existing, tool));
+  }
+  syncChildren(body, children);
+}
+
+/** One execution group: a sibling of narration, collapsed by default even while
+ * it runs. Opening it reveals the real tool rows; an edit's summary opens the
+ * Workbench instead, because the full Diff is not conversation text. */
+function executionNode(existing, item) {
+  const view = item.execution;
+  const key = `exec:${view.id}:${view.variant}`;
+  let node = existing.get(key);
+  if (!node) {
+    node = el('details', `execution-group execution-${view.variant}`);
+    node.dataset.key = key;
+    node.dataset.groupId = view.id;
+    node.dataset.variant = view.variant;
+    const summary = el('summary', 'execution-summary');
+    summary.append(
+      el('span', 'execution-glyph'),
+      el('span', 'execution-label'),
+      el('span', 'execution-action'),
+      el('span', 'execution-status'),
+      el('span', 'execution-failure'),
+      el('span', 'execution-hint'),
+    );
+    node.append(summary, el('div', 'execution-body'));
+    executionState.set(node, { view, existing });
+    node.addEventListener('toggle', () => {
+      const state = /** @type {{view:any,existing:Map<string,HTMLElement>}} */ (executionState.get(node));
+      if (node.open) openExecution.add(state.view.id); else openExecution.delete(state.view.id);
+      if (node.open) fillExecutionBody(node, state.view, state.existing);
+      else node.querySelector('.execution-body').replaceChildren();
+    });
+    if (view.variant === 'edit') {
+      const toggle = el('button', 'execution-toggle');
+      toggle.type = 'button';
+      toggle.setAttribute('aria-label', '展开修改详情');
+      toggle.dataset.tooltip = '展开修改详情';
+      toggle.append(iconNode('chevronRight', { size: 12, className: 'execution-chevron' }));
+      summary.prepend(toggle);
+      summary.addEventListener('click', event => {
+        if (event.target.closest('.execution-toggle')) {
+          event.preventDefault();
+          node.open = !node.open;
+          return;
+        }
+        event.preventDefault();
+        const state = /** @type {{view:any,existing:Map<string,HTMLElement>}} */ (executionState.get(node));
+        openConfirmedChanges(state.view.toolIds, null);
+      });
+    } else {
+      summary.prepend(el('span', 'execution-caret', '▸'));
+    }
+  }
+  executionState.set(node, { view, existing });
+  node.dataset.status = view.waiting ? 'waiting' : view.status;
+  node.dataset.tone = view.failed ? 'error' : view.cancelled || view.unknown ? 'warning' : view.running ? 'active' : '';
+  const summary = node.querySelector('.execution-summary');
+  summary.querySelector('.execution-glyph').textContent = view.waiting ? '◆' : (EXECUTION_GLYPHS[view.status] ?? '◇');
+  summary.querySelector('.execution-label').textContent = view.label;
+  summary.querySelector('.execution-action').textContent = view.waiting
+    ? '等待你的批准'
+    : view.running ? view.liveAction : '';
+  const status = executionStatusLabel(view);
+  summary.querySelector('.execution-status').textContent = status ? `· ${status}` : '';
+  summary.querySelector('.execution-failure').textContent = view.running ? '' : view.failure;
+  summary.querySelector('.execution-hint').textContent = view.variant === 'edit' ? '查看变更' : '';
+  node.open = openExecution.has(view.id);
+  // Collapsed means nothing inside is painted: the real tool rows still exist
+  // in the model's ledger and are built the moment the reader opens the group.
+  if (node.open) fillExecutionBody(node, view, existing);
+  else node.querySelector('.execution-body').replaceChildren();
   return node;
 }
 
-function roundNode(existing, round) {
-  const key = `round:${round.modelStep ?? 'legacy'}:${round.tools[0].id}`;
-  let host = existing.get(key);
-  if (!host) {
-    host = el('div', 'execution-round');
-    host.dataset.key = key;
-    host.append(el('div', 'round-head'));
+function turnReceiptNode(existing, item) {
+  const terminal = item.terminal;
+  const key = `receipt:${item.seq}`;
+  let row = existing.get(key);
+  if (!row) {
+    row = el('div', 'turn-receipt');
+    row.dataset.key = key;
+    row.append(
+      el('span', 'turn-receipt-mark'),
+      el('span', 'turn-receipt-label'),
+      el('span', 'turn-receipt-stats'),
+      el('div', 'turn-receipt-detail'),
+    );
   }
-  host.dataset.status = round.status;
-  const waiting = round.tools.some(tool => current?.approvals.some(item => item.call_id === tool.id));
-  const head = host.querySelector('.round-head');
-  head.replaceChildren(
-    el('span', 'round-glyph', waiting ? '◆' : roundGlyph(round)),
-    el('span', 'round-label', waiting ? '等待审批' : roundHeadline(round)),
-  );
-  const kept = [];
-  for (const tool of round.tools) {
-    const node = toolNode(existing, tool);
-    kept.push(node);
-    if (node.parentNode !== host) host.append(node);
-  }
-  for (const child of [...host.children]) if (child !== head && !kept.includes(child)) child.remove();
-  return host;
+  row.dataset.status = terminal.status;
+  row.dataset.tone = terminal.tone;
+  row.querySelector('.turn-receipt-mark').textContent = terminal.glyph;
+  row.querySelector('.turn-receipt-label').textContent = terminal.label;
+  row.querySelector('.turn-receipt-stats').textContent = terminal.stats.join(' · ');
+  const detail = row.querySelector('.turn-receipt-detail');
+  detail.textContent = terminal.detail ?? '';
+  detail.hidden = !terminal.detail;
+  return row;
 }
 
-function processNodes(existing, bucket) {
-  const blocks = turnBlocks(bucket.thoughts, bucket.rounds);
-  const items = [
-    ...blocks,
-    ...bucket.narration.map(message => ({ kind: 'narration', message, seq: message.seq ?? 0 })),
-  ].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-  const out = [];
-  let group = null;
-  const flush = () => {
-    if (group && group.children.length) out.push(processGroupNode(existing, bucket, group));
-    group = null;
-  };
-  for (const item of items) {
-    if (item.kind === 'narration') {
-      // The model's own explanation is transcript-level prose: it stays
-      // visible when the tool runs around it fold, exactly as the TUI keeps
-      // narration outside a receipt.
-      flush();
-      out.push(progressNode(existing, item.message, current?.streamingMessageId === item.message.id));
-      continue;
-    }
-    let child = null;
-    if (item.kind === 'thought') child = thoughtNode(existing, item.thought);
-    else if (item.kind === 'receipt') child = receiptNode(existing, item.receipt, item.thoughts);
-    else if (item.kind === 'round') child = roundNode(existing, item.round);
-    if (!child) continue;
-    if (!group) group = { children: [], key: null };
-    if (!group.key) group.key = `process:turn:${bucket.anchorId ?? '(tail)'}:${child.dataset.key ?? group.children.length}`;
-    group.children.push(child);
-  }
-  flush();
-  return out;
+function openConfirmedChanges(toolIds, selected = null) {
+  openRightbarTab('changes', { source: 'confirmed', toolIds, selected, title: '本次修改' });
 }
 
-function processGroupNode(existing, bucket, group) {
-  const hostKey = group.key;
-  const children = group.children;
-  let host = existing.get(hostKey);
-  if (!host) {
-    host = el('details', 'process-group');
-    host.dataset.key = hostKey;
-    const summary = el('summary', 'process-heading');
-    summary.append(iconNode('chevronRight', { size: 14, className: 'chevron' }), el('span', 'process-label'), el('span', 'process-count'));
-    host.append(summary, el('div', 'process-body'));
-    host.addEventListener('toggle', () => {
-      if (host.open) openProcess.add(hostKey); else openProcess.delete(hostKey);
-    });
-  }
-  let toolCount = 0;
-  for (const child of children) if (child.matches?.('.execution-round')) toolCount += child.querySelectorAll('.tool-row').length;
-  const finished = current?.lastTerminal && !['running', 'waiting_user'].includes(current.status);
-  // The work-steps heading exists to fold tool rounds. A turn that only
-  // reasoned has nothing to fold, so its analysis rows stand on their own.
-  if (toolCount) delete host.dataset.plain; else host.dataset.plain = '1';
-  host.querySelector('.process-label').textContent = finished ? '已完成' : '处理中';
-  host.querySelector('.process-count').textContent = toolCount ? `${toolCount} 项` : '';
-  const latestUser = [...current.messages].reverse().find(message => messageKind(message) === 'user')?.id;
-  const keepLatest = settings.collapseAfter === 'next' && (bucket.anchorId ?? latestUser) === latestUser;
-  const compact = settings.workSteps === 'compact';
-  host.open = !host.dataset.plain ? (openProcess.has(hostKey) || (!compact && (!finished || keepLatest))) : true;
-  const body = host.querySelector('.process-body');
-  for (const child of [...body.children]) if (!children.includes(child)) child.remove();
-  for (const child of children) if (child.parentNode !== body) body.append(child);
-  return host;
-}
 
 function planCard() {
   const steps = current?.plan?.steps ?? [];
@@ -2670,61 +2639,35 @@ function renderConversation() {
   const existing = new Map([...list.querySelectorAll('[data-key]')].map(node => [node.dataset.key, node]));
   const nodes = [];
   if (!home) nodes.push(systemPromptNode());
-  const userTurns = [];
-  for (const message of current.messages) if (messageKind(message) === 'user') userTurns.push({ id: message.id, seq: message.seq ?? 0 });
-  const seqOf = new Map(current.messages.map(message => [message.id, message.seq ?? 0]));
-  const turnOf = (anchor, seq) => {
-    let at = anchor != null ? seqOf.get(anchor) : undefined;
-    if (at === undefined) at = seq ?? 0;
-    let index = -1;
-    for (let i = 0; i < userTurns.length; i += 1) { if (userTurns[i].seq <= at) index = i; else break; }
-    return index;
-  };
-  const buckets = new Map();
-  const bucketFor = index => {
-    if (!buckets.has(index)) buckets.set(index, { index, anchorId: index >= 0 ? userTurns[index].id : null, thoughts: [], rounds: [], narration: [], live: null });
-    return buckets.get(index);
-  };
-  for (const thought of foldedThoughts(current.thoughts ?? [])) bucketFor(turnOf(thought.anchor, thought.seq)).thoughts.push(thought);
-  for (const round of groupExecutionRounds(current.tools)) {
-    const first = round.tools[0];
-    bucketFor(turnOf(first.anchor, first.seq)).rounds.push(round);
-  }
-  const messageTurn = new Map();
-  let turnIndex = -1;
-  for (const message of current.messages) {
-    if (messageKind(message) === 'user') turnIndex += 1;
-    messageTurn.set(message.id, turnIndex);
-  }
-  const liveText = (current.reasoning ?? '').trim();
-  const currentTurn = userTurns.length ? userTurns.length - 1 : -1;
-  const demoted = new Set();
-  for (const message of current.messages) {
-    if (messageKind(message) !== 'assistant' || message.final === true || String(message.text ?? '').trim() === '') continue;
-    const index = messageTurn.get(message.id) ?? -1;
-    const bucket = bucketFor(index);
-    if (bucket.thoughts.length > 0 || bucket.rounds.length > 0 || (liveText !== '' && index === currentTurn)) {
-      bucket.narration.push(message);
-      demoted.add(message.id);
+  // The renderer paints the presentation projection; it does not decide what
+  // a message is, where a group begins, or whether a turn answered.
+  const items = conversationItems({ ...current, approvals: current.approvals ?? [] });
+  const trailing = [];
+  while (items.at(-1)?.kind === 'live_thought') trailing.unshift(items.pop());
+  for (const item of items) {
+    if (item.kind === 'thought') continue;
+    if (item.kind === 'user') {
+      const node = userMessageNode(existing, item.message);
+      node.classList.add('flow-turn');
+      nodes.push(node);
+    } else if (item.kind === 'narration' || item.kind === 'final') {
+      const node = assistantTextNode(existing, item);
+      node.classList.add('flow-response');
+      nodes.push(node);
+    } else if (item.kind === 'notice' || item.kind === 'summary') {
+      nodes.push(runtimeNoticeNode(existing, item));
+    } else if (item.kind === 'execution') {
+      if (item.execution.variant === 'tool') {
+        const tool = current.tools.find(candidate => candidate.id === item.execution.tools[0]);
+        if (tool) nodes.push(toolNode(existing, tool));
+      } else {
+        nodes.push(executionNode(existing, item));
+      }
+    } else if (item.kind === 'turn_receipt') {
+      nodes.push(turnReceiptNode(existing, item));
+    } else if (item.kind === 'turn_error') {
+      nodes.push(turnErrorNode(item.error));
     }
-  }
-  for (const message of current.messages) {
-    if (demoted.has(message.id)) continue;
-    if (messageKind(message) === 'assistant' && String(message.text ?? '').trim() === '') continue;
-    const node = messageRow(existing, message);
-    node.classList.toggle('flow-response', messageKind(message) === 'assistant');
-    node.classList.toggle('flow-turn', messageKind(message) === 'user');
-    nodes.push(node);
-  }
-  const placed = [];
-  for (const [index, bucket] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
-    const turnNodes = processNodes(existing, bucket);
-    if (turnNodes.length) placed.push({ turnNodes, anchorId: bucket.anchorId });
-  }
-  for (const { turnNodes, anchorId } of placed) {
-    const anchorNode = anchorId ? nodes.find(node => node.dataset.messageId === anchorId) : null;
-    const position = anchorNode ? nodes.indexOf(anchorNode) + 1 : nodes.length;
-    nodes.splice(position, 0, ...turnNodes);
   }
   const maxTokens = maxTokensNode(); if (maxTokens) nodes.push(maxTokens);
   const running = current.status === 'running';
@@ -2747,12 +2690,6 @@ function renderConversation() {
     }, 1000);
   }
   if (!running && runClockTimer) { clearInterval(runClockTimer); runClockTimer = null; runStartedAt = null; }
-  for (const error of [...(current.turnErrors ?? [])].sort((a, b) => a.seq - b.seq)) {
-    const anchorIndex = error.anchor ? nodes.findIndex(node => node.dataset.messageId === error.anchor) : -1;
-    const hostIndex = error.anchor ? nodes.findIndex(node => node.dataset.key === `process:turn:${error.anchor}`) : -1;
-    const position = hostIndex >= 0 ? hostIndex + 1 : anchorIndex >= 0 ? anchorIndex + 1 : nodes.length;
-    nodes.splice(position, 0, turnErrorNode(error));
-  }
   for (const shell of current.session.user_shells ?? []) nodes.push(userShellNode(shell));
   const plan = planCard(); if (plan) nodes.push(plan);
   const delivered = deliveredCard(); if (delivered) nodes.push(delivered);
@@ -2760,7 +2697,7 @@ function renderConversation() {
   const usage = usageNode(); if (usage) nodes.push(usage);
   // The live analysis is the turn's latest activity: it sits above the running
   // line, never above the answer it belongs to.
-  if (liveText !== '') nodes.push(liveThoughtNode(existing, current.reasoning));
+  for (const item of trailing) nodes.push(liveThoughtNode(existing, item.text));
   if (runningRow) nodes.push(runningRow);
   const keep = new Set(nodes);
   for (const child of [...list.children]) if (!keep.has(child)) child.remove();
@@ -4181,12 +4118,21 @@ async function refreshSnapshot() {
   // must not replace it (it is the terminal-time refresh, so a slow answer
   // could otherwise resurrect the running row).
   if (staleSequence(snapshot.last_sequence)) return;
+  lastEventSeq = Math.max(lastEventSeq, snapshot.last_sequence ?? 0);
   const prior = current;
   const diffQuery = current.diffQuery;
   const diffError = current.diffError;
   const settledBackgroundTasks = current.settledBackgroundTasks ?? [];
   const priorBackgroundTasks = current.backgroundTasks ?? [];
-  current = attachExtras(retainInterruptedThoughts(projectSnapshot(snapshot, history), prior), snapshot);
+  const replayed = projectSnapshot(snapshot, history);
+  current = attachExtras(retainInterruptedThoughts(mergeRestoredConversation(replayed, prior), prior), snapshot);
+  // The snapshot is the authority for session metadata, status and the plan;
+  // the merge only protects the live transcript from a stale replay.
+  current.session = replayed.session;
+  current.status = replayed.status;
+  current.plan = replayed.plan ?? current.plan;
+  current.approvals = replayed.approvals;
+  current.clarifications = replayed.clarifications;
   current.settledBackgroundTasks = settledBackgroundTasks;
   const activeJobs = snapshot.active_background_tasks ?? [];
   const activeIds = new Set(activeJobs.map(job => job.task_id));
@@ -4557,7 +4503,8 @@ function activePane() { return rightbarPanes.find(pane => pane.id === rightbarAc
 
 function openRightbarTab(kind, extra = {}) {
   ensureRightbarSession();
-  if (kind === 'changes' && !hasWorkspace()) { toast('当前会话没有工作区', { tone: 'warning' }); return null; }
+  const confirmed = kind === 'changes' && extra.source === 'confirmed';
+  if (kind === 'changes' && !confirmed && !hasWorkspace()) { toast('当前会话没有工作区', { tone: 'warning' }); return null; }
   const pane = activePane();
   // Start is a pinned tab: opening something always adds a tab beside it
   // instead of consuming it.
@@ -4566,7 +4513,20 @@ function openRightbarTab(kind, extra = {}) {
     : ['files', 'changes', 'plan', 'deliverables', 'subagent', 'schedule'].includes(kind)
       ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
   const tab = reusable ?? newTabRecord(kind, extra);
-  if (kind === 'changes' && !extra.title) tab.title = changesTabTitle();
+  if (kind === 'changes') {
+    const previous = { source: tab.source ?? 'workspace', toolIds: JSON.stringify(tab.toolIds ?? []) };
+    if (confirmed) {
+      tab.source = 'confirmed';
+      tab.toolIds = [...new Set(extra.toolIds ?? [])];
+      tab.title = extra.title ?? '本次修改';
+      if (previous.source !== 'confirmed' || previous.toolIds !== JSON.stringify(tab.toolIds)) tab.selected = null;
+    } else {
+      tab.source = 'workspace';
+      tab.toolIds = null;
+      tab.title = changesTabTitle();
+    }
+    if (extra.selected !== undefined && extra.selected !== null) tab.selected = extra.selected;
+  }
   if (reusable) {
     const owner = rightbarPanes.find(item => item.tabs.includes(reusable.id));
     if (owner) {
@@ -4587,7 +4547,7 @@ function openRightbarTab(kind, extra = {}) {
   rightbarExpanded = false;
   persistRightbar();
   renderRightbar();
-  if (kind === 'changes') requestDiff();
+  if (kind === 'changes' && tab.source !== 'confirmed') requestDiff();
   return tab;
 }
 
@@ -5572,10 +5532,11 @@ function reviewSplit(lines, language = 'text') {
 }
 
 function changesView(tab) {
-  if (hasWorkspace() && !current.diff && !current.diffError && current.diffQuery?.status !== 'pending') setTimeout(requestDiff, 0);
+  const confirmed = tab.source === 'confirmed';
+  if (!confirmed && hasWorkspace() && !current.diff && !current.diffError && current.diffQuery?.status !== 'pending') setTimeout(requestDiff, 0);
   const view = el('div');
   view.style.display = 'flex'; view.style.flexDirection = 'column'; view.style.flex = '1'; view.style.minHeight = '0';
-  const files = current?.diff?.files ?? [];
+  const files = confirmed ? confirmedChangeFiles(tab.toolIds ?? [], current?.tools ?? []) : current?.diff?.files ?? [];
   if (!tab.selected || !files.some(file => file.path === tab.selected)) tab.selected = files[0]?.path ?? null;
   const selected = files.find(file => file.path === tab.selected);
   const mode = tab.mode ?? 'split';
@@ -5606,27 +5567,30 @@ function changesView(tab) {
   const open = iconButton('external', '打开完整文件', { size: 15, tooltip: '打开完整文件' });
   open.disabled = !selected;
   open.addEventListener('click', () => { if (selected) openPreviewForPath(selected.path); });
-  const refresh = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
-  refresh.disabled = current?.diffQuery?.status === 'pending';
+  const refresh = iconButton('refresh', '重新读取工作区变更', { size: 15, tooltip: '重新读取工作区变更' });
+  refresh.disabled = confirmed || current?.diffQuery?.status === 'pending';
   refresh.addEventListener('click', requestDiff);
   const openApp = el('div', 'open-in-app-pane');
   tools.append(copyPatch, split, wrap, open, refresh, openApp);
   if (selected?.path) renderOpenInAppInto(openApp, selected.path, 'file');
   head.append(tools);
   view.append(head);
-  view.append(el('div', 'review-scope', '当前工作区 Git 变更；历史轮次快照未提供，不能由当前状态冒充。'));
+  view.append(el('div', 'review-scope', confirmed
+    ? '运行时已确认的工具改动；这是修改发生时的历史证据，不随当前工作区变化。'
+    : '当前工作区 Git 变更；历史轮次快照未提供，不能由当前状态冒充。'));
   const body = el('div', 'review-body');
   if (tab.wrap) body.classList.add('wrap');
-  if (current?.diffQuery?.status === 'pending' && !current.diff) body.append(el('div', 'review-status', '正在读取变更…'));
-  else if (current?.diffError) {
+  if (!confirmed && current?.diffQuery?.status === 'pending' && !current.diff) body.append(el('div', 'review-status', '正在读取变更…'));
+  else if (!confirmed && current?.diffError) {
     const status = el('div', 'review-status error', current.diffError);
     const retry = el('button', 'button secondary small', '重新读取');
     retry.type = 'button';
     retry.addEventListener('click', requestDiff);
     status.append(retry);
     body.append(status);
-  } else if (!selected) body.append(el('div', 'review-status', hasWorkspace() ? '工作区没有变更' : '当前会话没有工作区'));
-  else if (!selected.patch) body.append(el('div', 'review-status', '当前快照未包含补丁正文。完整内容请查看对话中的已确认改动。'));
+  } else if (!selected) body.append(el('div', 'review-status',
+    confirmed ? '运行时没有提供已确认的变更。' : hasWorkspace() ? '工作区没有变更' : '当前会话没有工作区'));
+  else if (!selected.patch) body.append(el('div', 'review-status', '该快照未包含补丁正文。'));
   else {
     const lines = parsePatch(selected.patch);
     const language = previewLanguage(selected.path);
@@ -5647,9 +5611,10 @@ function changesView(tab) {
       });
     } else {
       const diff = el('div', 'review-diff');
-      for (const line of lines.slice(0, 5000)) diff.append(reviewLineNode(line, language));
+      const fragment = document.createDocumentFragment();
+      for (const line of lines) fragment.append(reviewLineNode(line, language));
+      diff.append(fragment);
       body.append(diff);
-      if (lines.length > 5000) body.append(el('div', 'review-status', `变更较大，仅显示前 5000 行（共 ${lines.length} 行）。`));
     }
   }
   view.append(body);
@@ -6420,13 +6385,6 @@ function renderGeneralSettings(content) {
       settings.terminalFontSize = value; saveSettings(); applyContentFont(); renderSettings();
     })));
   }
-  group.append(settingRow('工作步骤展示', '选择希望看到多少工具调用细节', menuControl(settings.workSteps, [
-    { value: 'compact', label: '简洁' }, { value: 'standard', label: '标准' },
-    { value: 'detailed', label: '详细' }, { value: 'verbose', label: '完全展开' },
-  ], value => { settings.workSteps = value; saveSettings(); renderConversation(); }, { label: '工作步骤展示' })));
-  group.append(settingRow('工作步骤收起时机', '选择何时自动收起工作步骤', menuControl(settings.collapseAfter, [
-    { value: 'answer', label: '回答结束后' }, { value: 'next', label: '下次有新消息时' },
-  ], value => { settings.collapseAfter = value; saveSettings(); renderConversation(); }, { label: '工作步骤收起时机' })));
   const viewRow = settingRow('显示代码工作视图', '开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 预设切换',
     unavailableControl(switchControl(settings.codingView, () => {}, { disabled: true }), '当前版本不可用：没有本轮代码差异视图，无法完整切换'));
   viewRow.classList.add('setting-row-compact');
@@ -6794,7 +6752,13 @@ api.onEvent(frame => {
     const priorContext = current?.contextUsage ?? null;
     const settledBackgroundTasks = current?.settledBackgroundTasks ?? [];
     const priorBackgroundTasks = current?.backgroundTasks ?? [];
-    current = attachExtras(projectSnapshot(frame.data, history), frame.data);
+    const replayed = projectSnapshot(frame.data, history);
+    current = attachExtras(mergeRestoredConversation(replayed, prior), frame.data);
+    current.session = replayed.session;
+    current.status = replayed.status;
+    current.plan = replayed.plan ?? current.plan;
+    current.approvals = replayed.approvals;
+    current.clarifications = replayed.clarifications;
     current.settledBackgroundTasks = settledBackgroundTasks;
     const activeJobs = frame.data.active_background_tasks ?? [];
     const activeIds = new Set(activeJobs.map(job => job.task_id));
@@ -6812,8 +6776,9 @@ api.onEvent(frame => {
   if (event.type === 'session_history_loaded') {
     history = event.entries ?? [];
     liveTrajectory = [];
-    const restored = retainInterruptedThoughts(projectSnapshot(current.session, history), current);
-    current = { ...current, messages: restored.messages, tools: restored.tools, thoughts: restored.thoughts, lastTerminal: restored.lastTerminal ?? current.lastTerminal, turnErrors: restored.turnErrors ?? [], plan: restored.plan ?? current.plan };
+    const replayed = projectSnapshot(current.session, history);
+    current = retainInterruptedThoughts(mergeRestoredConversation(replayed, current), current);
+    current.plan = replayed.plan ?? current.plan;
     renderConversation();
     if (activeView === 'trajectory') renderTrajectory();
     return;
@@ -6837,6 +6802,7 @@ api.onEvent(frame => {
   }
   if (event.type === 'session_updated') {
     if (staleSequence(event.session.last_sequence)) return;
+    lastEventSeq = Math.max(lastEventSeq, event.session.last_sequence ?? 0);
     current = attachExtras(applySessionMetadata(current, event.session), event.session);
     renderHeader();
     renderComposerMeta();
