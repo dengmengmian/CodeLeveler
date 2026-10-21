@@ -2469,22 +2469,43 @@ function roundNode(existing, round) {
   return host;
 }
 
-function processHost(existing, bucket) {
-  const hostKey = `process:turn:${bucket.anchorId ?? '(tail)'}`;
-  const children = [];
+function processNodes(existing, bucket) {
   const blocks = turnBlocks(bucket.thoughts, bucket.rounds);
   const items = [
     ...blocks,
     ...bucket.narration.map(message => ({ kind: 'narration', message, seq: message.seq ?? 0 })),
   ].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  const out = [];
+  let group = null;
+  const flush = () => {
+    if (group && group.children.length) out.push(processGroupNode(existing, bucket, group));
+    group = null;
+  };
   for (const item of items) {
-    if (item.kind === 'thought') children.push(thoughtNode(existing, item.thought));
-    else if (item.kind === 'receipt') children.push(receiptNode(existing, item.receipt, item.thoughts));
-    else if (item.kind === 'round') children.push(roundNode(existing, item.round));
-    else if (item.kind === 'narration') children.push(progressNode(existing, item.message, current?.streamingMessageId === item.message.id));
+    if (item.kind === 'narration') {
+      // The model's own explanation is transcript-level prose: it stays
+      // visible when the tool runs around it fold, exactly as the TUI keeps
+      // narration outside a receipt.
+      flush();
+      out.push(progressNode(existing, item.message, current?.streamingMessageId === item.message.id));
+      continue;
+    }
+    let child = null;
+    if (item.kind === 'thought') child = thoughtNode(existing, item.thought);
+    else if (item.kind === 'receipt') child = receiptNode(existing, item.receipt, item.thoughts);
+    else if (item.kind === 'round') child = roundNode(existing, item.round);
+    if (!child) continue;
+    if (!group) group = { children: [], key: null };
+    if (!group.key) group.key = `process:turn:${bucket.anchorId ?? '(tail)'}:${child.dataset.key ?? group.children.length}`;
+    group.children.push(child);
   }
-  if (bucket.live) children.push(bucket.live);
-  if (!children.length) return null;
+  flush();
+  return out;
+}
+
+function processGroupNode(existing, bucket, group) {
+  const hostKey = group.key;
+  const children = group.children;
   let host = existing.get(hostKey);
   if (!host) {
     host = el('details', 'process-group');
@@ -2697,13 +2718,13 @@ function renderConversation() {
   }
   const placed = [];
   for (const [index, bucket] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
-    const host = processHost(existing, bucket);
-    if (host) placed.push({ host, anchorId: bucket.anchorId });
+    const turnNodes = processNodes(existing, bucket);
+    if (turnNodes.length) placed.push({ turnNodes, anchorId: bucket.anchorId });
   }
-  for (const { host, anchorId } of placed) {
+  for (const { turnNodes, anchorId } of placed) {
     const anchorNode = anchorId ? nodes.find(node => node.dataset.messageId === anchorId) : null;
     const position = anchorNode ? nodes.indexOf(anchorNode) + 1 : nodes.length;
-    nodes.splice(position, 0, host);
+    nodes.splice(position, 0, ...turnNodes);
   }
   const maxTokens = maxTokensNode(); if (maxTokens) nodes.push(maxTokens);
   const running = current.status === 'running';
