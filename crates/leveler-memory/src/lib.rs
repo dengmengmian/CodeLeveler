@@ -8,11 +8,15 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod candidates;
 mod lifecycle;
 mod pipeline;
 mod semantic;
 
+pub use audit::{
+    IdentityAudit, IdentityLocation, IdentityRecord, IdentityState, IdentitySummary,
+};
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, candidate_sensitive_fields, fingerprint_of,
     is_sensitive_candidate, looks_like_secret, package_manager_from_root,
@@ -20,9 +24,12 @@ pub use candidates::{
 };
 pub use lifecycle::{
     AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
-    MemoryLifecycleOp, MemoryOperation, Provenance, decide, parse_durable_fact, semantic_key_of,
+    MemoryLifecycleOp, MemoryOperation, Provenance, agent_candidate, decide, parse_durable_fact,
+    semantic_key_of,
 };
-pub use pipeline::{AdmitOutcome, ProposeOutcome, SuppressRecord, collect_turn_candidates};
+pub use pipeline::{
+    AdmitOutcome, AgentAdmitOutcome, ProposeOutcome, SuppressRecord, collect_turn_candidates,
+};
 pub use semantic::{
     CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
     SemanticError, SemanticMemoryType, ValidatedCandidates, canonical_subject, evidence_matches,
@@ -369,7 +376,7 @@ impl MemoryStore {
         // catalog replaced it. A historical credential must not appear here
         // either.
         let entries: Vec<MemoryEntry> = self
-            .list_active()?
+            .effective_active()?
             .into_iter()
             .filter(|entry| !is_sensitive(entry))
             .collect();
@@ -393,12 +400,15 @@ impl MemoryStore {
     /// dedup and pending cleanup for itself; the CLI picked the upsert and
     /// silently destroyed same-titled notes.
     ///
-    /// Guarantees: never overwrites; identical title+body returns the
-    /// entry that already exists (so a retry is idempotent); the same title
-    /// with different content gets its own id; secrets are refused here rather
-    /// than in each UI; and an equivalent pending candidate is cleaned up once
-    /// the active copy is durable — a failure to clean up leaves the active
-    /// entry in place rather than rolling it back.
+    /// Guarantees: a non-assignment body never overwrites — identical
+    /// title+body returns the entry that already exists (so a retry is
+    /// idempotent) and the same title with different content gets its own id.
+    /// A body that states a durable assignment ("以后…固定为 X") instead runs
+    /// the shared lifecycle: it updates the current value for that semantic
+    /// identity and preserves the old value as superseded history. Secrets are
+    /// refused here rather than in each UI, and an equivalent pending
+    /// candidate is cleaned up once the active copy is durable — a failure to
+    /// clean up leaves the active entry in place rather than rolling it back.
     pub fn activate(
         &self,
         title: &str,
@@ -407,6 +417,68 @@ impl MemoryStore {
         tags: Vec<String>,
     ) -> Result<MemoryEntry, MemoryError> {
         let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        // A user write that states an assignment ("以后默认模型固定为 Pro")
+        // carries the same semantic identity as every other path. It therefore
+        // runs the same lifecycle decision: a later value replaces the earlier
+        // one and the old value becomes history, instead of accumulating a
+        // second current truth. A non-assignment body stays a plain create.
+        if let Some(mut candidate) = crate::parse_durable_fact(body) {
+            candidate.title = title.trim().to_string();
+            candidate.body = body.trim().to_string();
+            candidate.kind = kind.candidate_kind();
+            candidate
+                .tags
+                .retain(|tag| !tag.trim_start().starts_with("kind:"));
+            candidate
+                .tags
+                .push(format!("kind:{}", kind.as_str()));
+            candidate.authority = MemoryAuthority::ExplicitUser;
+            candidate.source = CandidateSource::UserExplicit;
+            if candidate.evidence.is_none() {
+                candidate.evidence = Some(body.trim().to_string());
+            }
+            let outcome = self.apply_candidate_locked(&candidate, &now_rfc3339())?;
+            return match outcome.operation {
+                AppliedOperation::Created
+                | AppliedOperation::Superseded
+                | AppliedOperation::Merged => {
+                    let saved = outcome.entry.ok_or_else(|| {
+                        MemoryError::Invalid(
+                            "memory write produced no current entry".to_string(),
+                        )
+                    })?;
+                    // Best effort, after the active copy is durable, exactly
+                    // like the non-assignment path below.
+                    let _ = self.clear_equivalent_pending(&saved);
+                    Ok(saved)
+                }
+                AppliedOperation::Skipped => {
+                    let key = candidate
+                        .semantic_key
+                        .as_deref()
+                        .or(candidate.key.as_deref());
+                    self.effective_active()?
+                        .into_iter()
+                        .find(|entry| {
+                            key.is_some_and(|key| {
+                                crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)
+                            })
+                        })
+                        .ok_or_else(|| {
+                            MemoryError::Invalid(
+                                outcome
+                                    .skipped_reason
+                                    .unwrap_or_else(|| "memory was not stored".to_string()),
+                            )
+                        })
+                }
+                AppliedOperation::NeedsApproval => Err(MemoryError::Invalid(
+                    outcome
+                        .skipped_reason
+                        .unwrap_or_else(|| "memory needs a person".to_string()),
+                )),
+            };
+        }
         let mut entry = new_entry(title, body, tags);
         entry.kind = Some(kind.as_str().to_string());
         // Every caller of `activate` is a person's own command or a proposal
@@ -680,13 +752,25 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
         entry.id = slugify(key);
         entry.key = Some(key.clone());
     }
+    // A caller that means `decision`/`note` records it in the tags; the
+    // candidate category alone cannot tell those apart from a generic fact.
+    let declared_kind = candidate
+        .tags
+        .iter()
+        .find_map(|tag| tag.trim().strip_prefix("kind:"))
+        .map(str::trim)
+        .filter(|kind| matches!(*kind, "preference" | "decision" | "note"));
     entry.kind = Some(
-        match candidate.kind {
-            CandidateKind::Preference => "preference",
-            CandidateKind::PackageManager => "package_manager",
-            CandidateKind::Free => "free",
-        }
-        .to_string(),
+        declared_kind
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                match candidate.kind {
+                    CandidateKind::Preference => "preference",
+                    CandidateKind::PackageManager => "package_manager",
+                    CandidateKind::Free => "free",
+                }
+                .to_string()
+            }),
     );
     entry.provenance = Some(Provenance {
         authority: candidate.authority,
@@ -695,6 +779,8 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
             crate::CandidateSource::SystemPropose => "system_propose",
             crate::CandidateSource::SystemInferred => "system_inferred",
             crate::CandidateSource::AgentProposed => "agent_remember_tool",
+            crate::CandidateSource::UserRestore => "user_restore",
+            crate::CandidateSource::UserAccepted => "user_accepted",
         }
         .to_string(),
         evidence: None,
@@ -745,6 +831,17 @@ impl MemoryKind {
         }
     }
 
+    /// The candidate category that carries this kind through the lifecycle.
+    /// `preference` stays distinct because it is injected every turn; the
+    /// decision/note distinction is preserved by a `kind:` tag instead.
+    pub fn candidate_kind(self) -> CandidateKind {
+        match self {
+            Self::Preference => CandidateKind::Preference,
+            Self::Derived => CandidateKind::PackageManager,
+            Self::Decision | Self::Note | Self::LegacyUnknown => CandidateKind::Free,
+        }
+    }
+
     /// Parse a stored entry's labels. `key` is consulted because older derived
     /// entries carry the marker there and not in `kind`.
     pub fn of(entry: &MemoryEntry) -> Self {
@@ -781,6 +878,11 @@ fn sensitive_fields(entry: &MemoryEntry) -> Vec<&'static str> {
     if entry.tags.iter().any(|tag| looks_like_secret(tag)) {
         fields.push("tags");
     }
+    // A semantic key is durable content too. A credential there would reach
+    // the audit report, the pending filename and the entry id.
+    if entry.key.as_deref().is_some_and(looks_like_secret) {
+        fields.push("key");
+    }
     if entry
         .provenance
         .as_ref()
@@ -806,6 +908,12 @@ fn redact_entry(entry: &mut MemoryEntry) {
         entry.body = REDACTED_BODY.to_string();
     }
     entry.tags.retain(|tag| !looks_like_secret(tag));
+    if entry.key.as_deref().is_some_and(looks_like_secret) {
+        // The key is an identity, not a value. A credential-shaped key is
+        // removed rather than replaced with a placeholder that could collide
+        // with another redacted record.
+        entry.key = None;
+    }
     if let Some(provenance) = entry.provenance.as_mut()
         && provenance
             .evidence
@@ -1473,6 +1581,85 @@ mod tests {
         assert!(!store.active_path("deploy-notes-2").exists());
     }
 
+    /// Crash residue can leave two active files for one identity (the replacement
+    /// is written before the old one is archived). Every read that presents
+    /// "current" truth must collapse them; the legacy index is no exception.
+    #[test]
+    fn the_legacy_index_never_lists_a_stale_duplicate_of_a_current_identity() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let mut old = new_entry("默认模型", "默认模型：Pro", vec![]);
+        old.id = "legacy-pro".into();
+        old.key = Some("k-defaultmodel".into());
+        old.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "explicit_user_turn".into(),
+            evidence: None,
+        });
+        old.created_at = "2026-01-01T00:00:00Z".into();
+        old.updated_at = old.created_at.clone();
+        store.remember(old.clone()).unwrap();
+
+        let mut new = new_entry("默认模型", "默认模型：Flash", vec![]);
+        new.id = "legacy-flash".into();
+        new.key = Some("k-defaultmodel".into());
+        new.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "explicit_user_turn".into(),
+            evidence: None,
+        });
+        new.created_at = "2026-01-02T00:00:00Z".into();
+        new.updated_at = new.created_at.clone();
+        new.supersedes = Some(old.id.clone());
+        store.remember(new.clone()).unwrap();
+
+        let index = store.index_lines(10).unwrap();
+        assert!(index.contains(&new.id), "{index}");
+        assert!(
+            !index.contains(&old.id),
+            "a stale active copy was presented as current: {index}"
+        );
+    }
+
+    /// The supersedes link is authoritative even when both files carry the same
+    /// second-precision timestamp: after a crash, the terminal entry is the
+    /// current truth, not whichever title sorts first.
+    #[test]
+    fn crash_residue_selects_the_terminal_entry_not_the_first_title() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let mut old = new_entry("A old value", "默认模型：Pro", vec![]);
+        old.id = "old-pro".into();
+        old.key = Some("k-defaultmodel".into());
+        old.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "explicit_user_turn".into(),
+            evidence: None,
+        });
+        old.created_at = "2026-01-01T00:00:00Z".into();
+        old.updated_at = old.created_at.clone();
+        store.remember(old).unwrap();
+
+        let mut new = new_entry("B new value", "默认模型：Flash", vec![]);
+        new.id = "new-flash".into();
+        new.key = Some("k-defaultmodel".into());
+        new.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "explicit_user_turn".into(),
+            evidence: None,
+        });
+        new.created_at = "2026-01-01T00:00:00Z".into();
+        new.updated_at = new.created_at.clone();
+        new.supersedes = Some("old-pro".into());
+        store.remember(new).unwrap();
+
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "new-flash");
+    }
+
     #[test]
     fn index_stable_without_body_leak() {
         let dir = tempdir().unwrap();
@@ -1739,6 +1926,39 @@ mod safety_tests {
             .unwrap_err();
         assert!(matches!(error, MemoryError::Invalid(_)), "{error}");
         assert!(store.list_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn activation_refuses_a_secret_in_a_key() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut entry = new_entry("Deploy notes", "Use the release branch.", vec![]);
+        entry.key = Some("ghp_abcdefghijklmnopqrstuvwxyz0123".into());
+        let error = store.remember(entry).unwrap_err();
+        assert!(matches!(error, MemoryError::Invalid(_)), "{error}");
+        assert!(store.list_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_secret_key_marks_a_legacy_entry_sensitive_and_scrub_clears_it() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let mut entry = legacy_secret("legacy-key", "safe body");
+        entry.key = Some(secret.to_string());
+        write_legacy_active(dir.path(), &entry);
+
+        assert!(is_sensitive(&entry));
+        let findings = store.audit_sensitive().unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].fields.contains(&"key"));
+
+        let report = store.scrub_sensitive(None, true).unwrap();
+        assert_eq!(report.redacted, 1);
+        let raw = std::fs::read_to_string(store.active_path(&entry.id)).unwrap();
+        assert!(!raw.contains(secret), "{raw}");
+        let scrubbed = store.read_active(&entry.id).unwrap();
+        assert!(scrubbed.key.is_none());
     }
 
     #[test]

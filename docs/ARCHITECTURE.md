@@ -706,6 +706,58 @@ the results it reads are fixed by the tool, not by whichever backend is
 answering, so replacing the backend cannot widen the schema or leak a
 provider's response envelope into the transcript.
 
+### 8.3 Durable Memory Has One Identity and One Lifecycle
+
+Durable memory is advisory and user-owned. Project sources (`AGENTS.md`, the
+project's instructions, the current code) outrank it. A recalled memory records
+what was true when it was written; recall never turns it into a system fact.
+
+A fact is identified by a normalized subject, not by its title. Identity
+normalization is deterministic: ASCII case, whitespace and punctuation fold
+together; CJK subjects use a stable hash; a small explicit alias table unifies
+known spellings such as `default_model`, `model_default` and `默认模型`. Unknown
+spellings stay distinct rather than being merged by fuzzy similarity. A stored
+title is a human label and may change without changing the identity.
+
+Every write path runs the SAME decision: a direct user command, the CLI, an
+accepted candidate, background extraction, the model's `remember` tool, and a
+restore. The outcomes are Create, Merge (a strict compatible superset),
+Supersede (a new value for an existing identity), Skip (duplicate or already
+covered), and NeedsApproval (a conflict, uncertain identity, or insufficient
+authority). Pending approval is durable state: the candidate is parked and can
+only become current by a person's accept. Rejecting one value suppresses that
+value, never the identity, so a later legitimate value can still be proposed.
+
+Fact authority is independent of execution permission. Direct user statements
+outrank project sources, runtime observations, tool observations, and model
+inference. `Full` permission lets the `remember` tool run; it does not raise the
+model's fact authority. A model may replace its own earlier model-inference
+entry only with new evidence; it can never silently replace a user fact. A
+user's own later statement, or an explicitly accepted candidate, is what may
+replace a user fact. Quoted, pasted, fenced or blockquoted text is not the user
+speaking and cannot become an explicit-user fact.
+
+Writes are serialized by the project lifecycle lock. Supersede is new-first:
+the replacement is durable before the old value moves to history, so a crash
+leaves two active files rather than zero. Reads derive current truth from the
+supersedes chain, so residue is never presented as current. History is kept and
+auditable; a superseded or archived value is never recalled as current. Restore
+is an explicit user command that creates a new current version and supersedes
+whatever held the identity; it refuses redacted sensitive history. Credential-
+bearing records are redacted at every retention boundary (forget, expiry,
+supersede), so history and restore cannot resurrect a secret.
+
+`leveler memory audit-identity` reports what historical records can establish:
+ready, needs confirmation, possible duplicate under another key, stale residue,
+or sensitive. It is a read-only dry run and never rewrites user memory.
+
+Recall, the catalog, standing preferences, the model's memory tool and the
+status surface all read one effective-active view: lifecycle status, expiry,
+and the terminal entry per identity. Chat, Goal, Resume and Headless therefore
+see the same current value. Memory bodies stay out of the stable system prefix;
+catalog entries are titles for discovery. A disabled project exposes no memory
+surface and admits no extraction.
+
 ---
 
 ## 9. Host Authority: Who Is Allowed to Change the Real World?

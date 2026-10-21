@@ -258,7 +258,8 @@ fn applied_event(outcome: &leveler_memory::CommitOutcome) -> Option<AgentEvent> 
             leveler_memory::MemoryLifecycleOp::Superseded
         }
         leveler_memory::AppliedOperation::Merged => leveler_memory::MemoryLifecycleOp::Merged,
-        leveler_memory::AppliedOperation::Skipped => return None,
+        leveler_memory::AppliedOperation::Skipped
+        | leveler_memory::AppliedOperation::NeedsApproval => return None,
     };
     Some(memory_change_event(operation, entry))
 }

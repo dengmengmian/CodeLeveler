@@ -76,8 +76,10 @@ fn count_u32(value: u64) -> u32 {
 pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
     let store = MemoryStore::open(app.layout.memory_dir())
         .map_err(|error| AppError::Engine(format!("memory: {error}")))?;
+    // Status reports current truth, not raw files: crash residue or an expired
+    // entry must not inflate the active count.
     let active = store
-        .list_active()
+        .effective_active()
         .map_err(|error| AppError::Engine(format!("memory: {error}")))?;
     let pending = store
         .list_pending()

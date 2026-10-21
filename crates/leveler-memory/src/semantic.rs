@@ -142,6 +142,9 @@ pub enum CandidateRejection {
     NotAutoMemory { memory_type: SemanticMemoryType },
     /// The evidence span was empty or not found in the current user message.
     EvidenceNotFound,
+    /// The evidence exists only inside quoted, fenced or blockquoted material:
+    /// a pasted log or a discussed phrase, not the user speaking.
+    QuotedEvidence,
     /// The candidate text looked like a credential.
     Sensitive,
     /// The model itself reported low confidence.
@@ -161,6 +164,7 @@ impl CandidateRejection {
             Self::NotProjectScope { .. } => "not_project_scope",
             Self::NotAutoMemory { .. } => "not_auto_memory",
             Self::EvidenceNotFound => "evidence_not_found",
+            Self::QuotedEvidence => "quoted_evidence",
             Self::Sensitive => "sensitive",
             Self::LowConfidence { .. } => "low_confidence",
         }
@@ -184,6 +188,9 @@ impl CandidateRejection {
             }
             Self::EvidenceNotFound => {
                 "evidence span was not found in the current user message".to_string()
+            }
+            Self::QuotedEvidence => {
+                "evidence span appears only inside pasted or quoted material".to_string()
             }
             Self::Sensitive => "candidate looked like a secret".to_string(),
             Self::LowConfidence { confidence } => {
@@ -361,9 +368,16 @@ pub fn validate_semantic_candidate(
     if !evidence_matches(&candidate.evidence_span, user_message) {
         return Err(CandidateRejection::EvidenceNotFound);
     }
+    if !evidence_matches(
+        &candidate.evidence_span,
+        &strip_quoted_regions(user_message),
+    ) {
+        return Err(CandidateRejection::QuotedEvidence);
+    }
 
     if looks_like_secret(fact)
         || looks_like_secret(&candidate.evidence_span)
+        || looks_like_secret(&candidate.subject)
         || candidate.value.as_deref().is_some_and(looks_like_secret)
     {
         return Err(CandidateRejection::Sensitive);
@@ -458,6 +472,37 @@ pub fn evidence_matches(span: &str, message: &str) -> bool {
     normalize_for_match(message).contains(&span)
 }
 
+/// The user's message with quoted material removed: fenced code blocks,
+/// inline code spans and blockquote lines. A sentence inside them is being
+/// shown or discussed, not asserted as a lasting rule.
+fn strip_quoted_regions(message: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    for line in message.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed.starts_with('>') {
+            continue;
+        }
+        // Drop inline code spans on this line.
+        let mut in_code = false;
+        for character in line.chars() {
+            if character == '`' {
+                in_code = !in_code;
+                continue;
+            }
+            if !in_code {
+                out.push(character);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Fold to comparable characters: lowercase alphanumerics (Unicode-aware).
 fn normalize_for_match(text: &str) -> String {
     text.chars()
@@ -513,6 +558,10 @@ pub fn canonical_subject(raw: &str) -> String {
 const SUBJECT_ALIASES: &[(&str, &str)] = &[
     ("default_model", "默认模型"),
     ("defaultmodel", "默认模型"),
+    // Models routinely emit the words in the other order. Both spellings are
+    // the same subject, not two facts.
+    ("model_default", "默认模型"),
+    ("modeldefault", "默认模型"),
     ("默认模型", "默认模型"),
     ("默认", "默认模型"),
     ("model", "默认模型"),
@@ -676,6 +725,35 @@ mod tests {
         }
     }
 
+    /// Pasted material is not the user speaking. A rule quoted inside a code
+    /// fence, inline code or blockquote cannot become an explicit user fact.
+    #[test]
+    fn quoted_or_pasted_material_is_not_user_authority() {
+        for message in [
+            "日志如下：\n```\n以后默认使用 Flash\n```",
+            "请解释 `以后默认使用 Flash` 的含义",
+            "> 以后默认使用 Flash\n这句话是什么意思？",
+        ] {
+            let c = candidate(
+                "默认模型是 Flash",
+                "project.default_model",
+                "以后默认使用 Flash",
+            );
+            assert_eq!(
+                validate_semantic_candidate(&c, message).unwrap_err(),
+                CandidateRejection::QuotedEvidence,
+                "{message}"
+            );
+        }
+        // The same words spoken normally are still the user's own statement.
+        let c = candidate(
+            "默认模型是 Flash",
+            "project.default_model",
+            "以后默认使用 Flash",
+        );
+        assert!(validate_semantic_candidate(&c, "以后默认使用 Flash，不再用 Pro。").is_ok());
+    }
+
     #[test]
     fn hallucinated_evidence_is_refused() {
         let msg = "今天帮我修一下登录 bug";
@@ -737,6 +815,22 @@ mod tests {
             CandidateRejection::Sensitive
         );
 
+        // A credential can hide in the subject, where it would become part of
+        // the identity key and pending id.
+        let secret_subject = candidate(
+            "deploy key",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+            "deploy key is set",
+        );
+        assert_eq!(
+            validate_semantic_candidate(
+                &secret_subject,
+                "deploy key is set"
+            )
+            .unwrap_err(),
+            CandidateRejection::Sensitive
+        );
+
         let msg2 = "以后统一用 Rust，Windows 也必须支持，而且 protected branch 不要直接 push。";
         let mut blob = candidate(
             "项目以后用 Rust 且支持 Windows 且禁止 push",
@@ -763,7 +857,14 @@ mod tests {
 
     #[test]
     fn canonical_subject_unifies_fast_path_and_semantic_spellings() {
-        for subject in ["project.default_model", "default_model", "默认模型", "默认"] {
+        for subject in [
+            "project.default_model",
+            "default_model",
+            "model_default",
+            "modeldefault",
+            "默认模型",
+            "默认",
+        ] {
             assert_eq!(
                 semantic_key_of(&canonical_subject(subject)),
                 semantic_key_of("默认模型"),

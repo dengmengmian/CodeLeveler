@@ -249,6 +249,81 @@ async fn direct_save_then_later_correction_recalls_only_the_new_truth() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Path A: a natural sentence that states a new decision updates the existing
+/// identity WITHOUT a `/remember` command or a second active entry.
+#[tokio::test]
+async fn a_natural_statement_updates_the_existing_decision() {
+    let (dir, mem) = workspace("natural-update");
+    let runtime_a = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
+    let executor_a = executor(&dir, &mem, runtime_a);
+    let mut events_a = Vec::new();
+    run_turn(
+        &executor_a,
+        "记住：以后本项目默认模型固定为 Pro",
+        &mut events_a,
+    )
+    .await;
+
+    let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("已更新")]));
+    let executor_b = executor(&dir, &mem, runtime_b);
+    let mut events_b = Vec::new();
+    run_turn(
+        &executor_b,
+        "以后默认使用 Flash，不再使用 Pro。",
+        &mut events_b,
+    )
+    .await;
+
+    let store = MemoryStore::open(&mem).unwrap();
+    let active = store.effective_active().unwrap();
+    assert_eq!(active.len(), 1, "one current truth: {active:?}");
+    assert!(active[0].body.contains("Flash"));
+    assert!(store.list_pending().unwrap().is_empty());
+    assert_eq!(store.list_archived().unwrap().len(), 1);
+    assert!(events_b.iter().any(|event| matches!(
+        event,
+        AgentEvent::MemoryChanged { operation, .. } if operation == "superseded"
+    )));
+
+    let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("Flash")]));
+    let executor_c = executor(&dir, &mem, runtime_c.clone());
+    let mut events_c = Vec::new();
+    run_turn(&executor_c, "默认模型是什么？", &mut events_c).await;
+    assert!(provider_saw(&runtime_c, "Flash"));
+    assert!(
+        !provider_saw(&runtime_c, "默认模型：Pro"),
+        "the superseded value must not be recalled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An ambiguous sentence has no trustworthy identity. It may be proposed, but
+/// it must not overwrite the current value.
+#[tokio::test]
+async fn an_ambiguous_update_does_not_overwrite_current_truth() {
+    let (dir, mem) = workspace("ambiguous-update");
+    let store = MemoryStore::open(&mem).unwrap();
+    let fact = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+    store.commit_candidate(&fact).unwrap();
+
+    // The app's soft-signal path proposes a candidate with no identity. It
+    // must never become current truth by itself.
+    let proposed = store.propose_from_user_text("以后用 Flash 吧").unwrap();
+    assert!(
+        matches!(proposed, Some(leveler_memory::ProposeOutcome::Pending(_))),
+        "{proposed:?}"
+    );
+
+    assert!(store.effective_active().unwrap()[0].body.contains("Pro"));
+    assert_eq!(store.list_archived().unwrap().len(), 0);
+    assert_eq!(
+        store.list_pending().unwrap().len(),
+        1,
+        "an uncertain identity waits for a person"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// M8: an unrelated turn over an empty store recalls no ids. A zero-hit search
 /// is still reported as a result (count 0), because the status surface must be
 /// able to tell "nothing matched" from "memory was never consulted".
