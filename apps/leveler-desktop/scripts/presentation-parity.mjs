@@ -46,6 +46,7 @@ try {
     const toolRows = list.querySelectorAll('.tool-row[data-tool-id="t1"]');
     const rounds = list.querySelectorAll('.execution-round');
     const finalMessage = list.querySelector('.message.assistant:not(.narration)');
+    const narration = list.querySelector('.message.assistant.narration');
     const process = list.querySelector('.process-group');
     return {
       answerFiles: fileCard.length,
@@ -57,7 +58,8 @@ try {
       running: !!list.querySelector('.running-row'),
       finalText: finalMessage?.textContent?.trim() ?? null,
       finalInsideProcess: !!process?.contains(finalMessage),
-      narrationInsideProcess: !!process?.querySelector('.message.narration'),
+      narrationText: narration?.textContent?.trim() ?? null,
+      narrationOutsideProcess: !!narration && !process?.contains(narration),
       status: document.querySelector('#conversation-status')?.textContent ?? null,
     };
   });
@@ -71,7 +73,8 @@ try {
   assert.equal(view.running, false, 'a finished turn still shows the running row');
   assert.match(view.finalText ?? '', /已写入 leveler-chat-20261021-000850\.md/);
   assert.equal(view.finalInsideProcess, false, 'the final answer is folded into the tool process');
-  assert.equal(view.narrationInsideProcess, true, 'interim narration is not grouped with the tool process');
+  assert.match(view.narrationText ?? '', /会话记录已写入/);
+  assert.equal(view.narrationOutsideProcess, true, 'interim narration is folded into the collapsible tool process');
   await page.locator('#conversation').screenshot({ path: path.join(output, 'presentation-parity.png') });
   assert.deepEqual(errors, []);
   evidence.passed = true;
