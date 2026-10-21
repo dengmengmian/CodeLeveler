@@ -13,7 +13,7 @@ const toolNames={read_file:'查看文件',read:'查看文件',grep:'搜索文件
 /** @param {ToolProjection} tool @returns {string} */
 export function toolLabel(tool){return toolNames[tool.name??'']??(tool.name?.startsWith('browser_')?'浏览器操作':'执行工具');}
 /** @param {ToolProjection} tool @returns {string} */
-export function toolTarget(tool){try{const args=typeof tool.arguments==='string'?JSON.parse(tool.arguments):tool.arguments;if(!args||typeof args!=='object')return '';for(const key of ['path','command','pattern','query','url'])if(typeof args[key]==='string')return args[key];if(typeof args.program==='string')return [args.program,...(Array.isArray(args.args)?args.args.filter(/** @param {unknown} a */ a=>typeof a==='string'):[])].join(' ');return '';}catch{return '';}}
+export function toolTarget(tool){try{const args=typeof tool.arguments==='string'?JSON.parse(tool.arguments):tool.arguments;if(!args||typeof args!=='object')return '';for(const key of ['path','command','cmd','pattern','query','url'])if(typeof args[key]==='string')return args[key];if(typeof args.program==='string')return [args.program,...(Array.isArray(args.args)?args.args.filter(/** @param {unknown} a */ a=>typeof a==='string'):[])].join(' ');return '';}catch{return '';}}
 /** @param {ToolProjection} tool */
 export function browserActivity(tool){return tool.name?.startsWith('browser_')?{id:tool.id,label:toolLabel(tool),target:toolTarget(tool),preview:tool.preview??'',status:tool.status??'unknown'}:null;}
 /** @param {{message:string}[]} errors */

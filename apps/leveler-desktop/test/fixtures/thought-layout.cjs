@@ -43,6 +43,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       event(session, { type: 'assistant_text_delta', message_id: 'a1', delta: '好，我把运营端 MCP 验证固化成回归用例。先看下 lib.sh 的辅助函数和现有用例的完整写法：' });
       event(session, { type: 'reasoning_started' });
       event(session, { type: 'reasoning_delta', delta: '正在核对第二个理由。\nThe user repeated the same question: "你好这是什么东西？" — "Hello, what is this?" Still no attachment reached this side, so I cannot guess what "this" refers to.' });
+      event(session, { type: 'command_progress', label: 'git fetch --all --prune', elapsed_ms: 3000 });
     });
     return;
   } else if (request.method !== 'connect') {

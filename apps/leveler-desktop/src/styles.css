@@ -846,7 +846,7 @@ details[open] > .tool-summary .tool-chevron { transform: rotate(90deg); }
 
 .running-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding: 8px 2px 2px; border-top: .5px solid var(--border-l2); color: var(--deep-diving); font-size: 12px; line-height: 22px; }
 .running-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: blink 1.2s infinite; }
-.running-text { font-variant-numeric: tabular-nums; }
+.running-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .running-text::after { content: ""; display: inline-block; width: 18px; height: 6px; margin-left: 4px; background: linear-gradient(90deg, transparent, currentColor, transparent); background-size: 200% 100%; animation: shimmer 1.6s linear infinite; opacity: .5; }
 @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 

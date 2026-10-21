@@ -54,6 +54,7 @@ try {
       headings: [...list.querySelectorAll('.process-heading')].filter(node => getComputedStyle(node).display !== 'none').length,
       last: children.at(-1) ?? null,
       beforeLast: children.at(-2) ?? null,
+      runningText: list.querySelector('.running-row .running-text')?.textContent ?? null,
       runningBorder: getComputedStyle(list.querySelector('.running-row')).borderTopWidth,
       stop: (() => {
         const button = document.querySelector('#stop');
@@ -79,6 +80,7 @@ try {
   assert.match(view.livePreview, /The user repeated the same question/, 'live analysis does not show the latest reasoning line');
   assert.equal(view.liveHasBody, false, 'live analysis renders its full body');
   assert.equal(view.headings, 0, 'a reasoning-only turn renders the work-steps heading');
+  assert.match(view.runningText ?? '', /git fetch --all --prune/, 'the running line does not name the command that is executing');
   assert.notEqual(view.runningBorder, '0px', 'the running line has no divider above it');
   assert.ok(view.stop && !view.stop.hidden, 'the running turn exposes no stop control');
   assert.ok(view.stop.width >= 8 && view.stop.height >= 8, `the stop glyph is too small: ${JSON.stringify(view.stop)}`);
