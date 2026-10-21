@@ -828,9 +828,13 @@ fn collect_enumerations(
     {
         let comma_items: Vec<&str> = tail.split([',', '，']).collect();
         if (2..=6).contains(&comma_items.len())
-            && comma_items
-                .iter()
-                .all(|item| item.trim().chars().count() <= 40)
+            && comma_items.iter().all(|item| {
+                let item = item.trim();
+                item.chars().count() <= 40
+                    && item.split_whitespace().count() <= 4
+                    && !item.contains(['(', ')', '（', '）'])
+                    && !item.chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
         {
             items.extend(comma_items.iter().map(|item| (*item).to_string()));
         }
@@ -1083,13 +1087,27 @@ fn command_text(text: &str) -> bool {
 
 fn path_like(token: &str) -> bool {
     let token = clean_token(token);
-    if token.is_empty() || looks_like_url(&token) {
+    if token.is_empty() || looks_like_url(&token) || token.contains("//") {
         return false;
     }
-    if token.contains('/') || token.contains('\\') {
-        return !token.contains("//");
+    // Explicit path syntax.
+    if token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with('\\')
+        || token.contains('\\')
+        || token.ends_with('/')
+        || (token.len() >= 2 && token.as_bytes()[1] == b':')
+    {
+        return true;
     }
-    let Some((stem, extension)) = token.rsplit_once('.') else {
+    // A bare `a/b` is ambiguous: users write "put/get" and "read/write" as
+    // alternatives, not paths. Only a slash token whose last segment is a
+    // known file name is treated as an artifact. Directory paths without an
+    // extension are not extracted (under-extraction, never a false demand).
+    let name = token.rsplit('/').next().unwrap_or(&token);
+    let Some((stem, extension)) = name.rsplit_once('.') else {
         return false;
     };
     !stem.is_empty() && PATH_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
@@ -1424,12 +1442,67 @@ mod tests {
     }
 
     #[test]
+    fn the_live_multi_stage_prompt_yields_paths_and_tests_only() {
+        let text = "这是一次需要分三个阶段完成的开发任务，请一次做完，中间不要停下来让我继续：\
+                    1) 创建 stage1.py，提供 add(a, b)；\
+                    2) 创建 stage2.py，提供 mul(a, b)；\
+                    3) 创建 stage3.py，提供 slugify(s)（小写并用连字符替换空格）。\
+                    最后运行 `python3 -m unittest`，全部通过后再结束。不要修改 test_flow.py。";
+        let requirements = extract(text, &[]);
+        let found = texts(&requirements);
+        for expected in ["stage1.py", "stage2.py", "stage3.py"] {
+            assert!(found.contains(&expected), "missing {expected}: {found:?}");
+        }
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "{requirements:?}"
+        );
+        assert!(
+            !found.contains(&"test_flow.py"),
+            "a prohibited path is not a deliverable: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|text| {
+                text.contains("add(") || text.contains("mul(") || text.contains("slugify(")
+            }),
+            "function signatures are not deliverables: {found:?}"
+        );
+    }
+
+    #[test]
     fn a_numbered_list_is_enumerated() {
         let requirements = extract("1. 认证模块\n2. 订单模块\n3. 财务模块\n", &[]);
         let found = texts(&requirements);
         for expected in ["认证模块", "订单模块", "财务模块"] {
             assert!(found.contains(&expected), "missing {expected}: {found:?}");
         }
+    }
+
+    #[test]
+    fn an_alternative_slash_is_not_a_path() {
+        let requirements = extract(
+            "finish all five requirements in app.py (add, mul, slugify, mean, \
+             Store.put/get) so that `python3 -m unittest` passes.",
+            &[],
+        );
+        let found = texts(&requirements);
+        assert!(found.contains(&"app.py"), "{found:?}");
+        assert!(
+            !found.contains(&"Store.put/get"),
+            "put/get is an alternative, not an artifact: {found:?}"
+        );
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "{requirements:?}"
+        );
+        assert!(
+            !found.contains(&"test_app.py"),
+            "a prohibited path is not a deliverable: {found:?}"
+        );
     }
 
     #[test]
