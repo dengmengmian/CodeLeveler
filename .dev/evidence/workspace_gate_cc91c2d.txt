@@ -1,0 +1,37 @@
+Clean candidate: cc91c2d954f5 (product f54b883 + feedback assertion cc91c2d)
+Binary: af5905a3d1d6a5a3c4545030e9d32ae675c2cc72d8ed7f364953d7c6d54a7d09
+Version: 1.0.20 (cc91c2d954f5)
+
+Source: a local clone at /tmp/df24-clean2 checked out at cc91c2d,
+`git status --porcelain` empty before build.
+
+Commands:
+  env -u NODE_OPTIONS cargo build --workspace --bins --locked
+  cargo fmt --all -- --check
+  env -u NODE_OPTIONS cargo test --workspace --all-features --locked --no-fail-fast
+  env -u NODE_OPTIONS cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+Results:
+  BUILD_EXIT=0
+  FMT_EXIT=0
+  TEST_EXIT=0
+  269 test result lines
+  passed=6961 failed=0 ignored=59
+  CLIPPY_EXIT=101 at cc91c2d, only in a parallel memory commit's new file:
+    crates/leveler-agent/src/experience.rs:987  if_same_then_else
+    crates/leveler-agent/src/experience.rs:1207 items_after_test_module
+  CLIPPY_EXIT=0 at the then-current HEAD ca1145b (a6ffd15 fixes both lints;
+    ca1145b differs from the candidate only in memory and desktop code).
+
+DF-24 runtime tests (final HEAD):
+  env -u NODE_OPTIONS cargo test -p leveler-agent --test direct_test -- <6 DF-24 tests>
+  test result: ok. 6 passed; 0 failed
+
+Dogfood:
+  binary 1.0.20 (cc91c2d954f5), sha256 af5905a3...
+  25 PASS / 0 FAIL / 0 SKIPPED / 0 NOT_VERIFIED
+  evidence: dogfood/.dev/evidence/goal_contracts_cc91c2d.json
+
+Note: the exact tested binary was not archived; its identity is the version
+string and sha256 above. A rebuild from the same commit in the same path is
+not byte-identical (incremental link state), so no substitute binary is kept.
