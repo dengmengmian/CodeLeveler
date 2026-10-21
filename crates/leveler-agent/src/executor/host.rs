@@ -1192,11 +1192,7 @@ impl Executor {
                     .collect()
             })
             .unwrap_or_default();
-        let kind = match call
-            .arguments
-            .get("kind")
-            .and_then(|value| value.as_str())
-        {
+        let kind = match call.arguments.get("kind").and_then(|value| value.as_str()) {
             Some("preference") => leveler_memory::MemoryKind::Preference,
             Some("decision") => leveler_memory::MemoryKind::Decision,
             _ => leveler_memory::MemoryKind::Note,
@@ -1229,10 +1225,8 @@ impl Executor {
                     )
                     .map_err(|e| e.to_string())?
                 } else {
-                    leveler_memory::agent_candidate(
-                        title, body, kind, tags, subject, evidence,
-                    )
-                    .map_err(|e| e.to_string())?
+                    leveler_memory::agent_candidate(title, body, kind, tags, subject, evidence)
+                        .map_err(|e| e.to_string())?
                 };
                 store.propose(candidate).map_err(|e| e.to_string())
             });

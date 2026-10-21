@@ -161,7 +161,10 @@ fn classify(
             "the stored key is not a normalized identity".to_string(),
         )
     } else if location == IdentityLocation::Archived {
-        (IdentityState::Ready, "historical record with a stable identity".to_string())
+        (
+            IdentityState::Ready,
+            "historical record with a stable identity".to_string(),
+        )
     } else if let Some(current) = key
         .as_deref()
         .and_then(|key| current_by_key.get(key))
@@ -172,7 +175,10 @@ fn classify(
             format!("another current record holds this identity: {current}"),
         )
     } else {
-        (IdentityState::Ready, "current value with a stable identity".to_string())
+        (
+            IdentityState::Ready,
+            "current value with a stable identity".to_string(),
+        )
     };
 
     IdentityRecord {
@@ -206,8 +212,10 @@ fn is_canonical_key(key: &str) -> bool {
 /// Flag active records that share a distinctive value under DIFFERENT keys.
 /// This is deliberately a report, not a merge: similar wording is not identity.
 fn mark_shared_values(records: &mut [IdentityRecord], entries: &[MemoryEntry]) {
-    let by_id: HashMap<&str, &MemoryEntry> =
-        entries.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+    let by_id: HashMap<&str, &MemoryEntry> = entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
     let mut by_token: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         if record.sensitive || record.location != IdentityLocation::Active {
@@ -282,12 +290,50 @@ fn mark_stale_active_copies(
 /// duplicate detector can compare without resorting to fuzzy text similarity.
 fn distinctive_tokens(text: &str) -> BTreeSet<String> {
     const STOPWORDS: &[&str] = &[
-        "about", "after", "allowed", "and", "api", "base", "before", "branch", "coding",
-        "compact", "config", "configuration", "default", "deploy", "enabled", "false",
-        "file", "files", "for", "from", "leveler", "memory", "model", "models", "output",
-        "path", "plan", "production", "project", "provider", "release", "service",
-        "setting", "should", "staging", "terminal", "the", "token", "true", "url",
-        "using", "value", "with", "workspace",
+        "about",
+        "after",
+        "allowed",
+        "and",
+        "api",
+        "base",
+        "before",
+        "branch",
+        "coding",
+        "compact",
+        "config",
+        "configuration",
+        "default",
+        "deploy",
+        "enabled",
+        "false",
+        "file",
+        "files",
+        "for",
+        "from",
+        "leveler",
+        "memory",
+        "model",
+        "models",
+        "output",
+        "path",
+        "plan",
+        "production",
+        "project",
+        "provider",
+        "release",
+        "service",
+        "setting",
+        "should",
+        "staging",
+        "terminal",
+        "the",
+        "token",
+        "true",
+        "url",
+        "using",
+        "value",
+        "with",
+        "workspace",
     ];
     let mut out = BTreeSet::new();
     for raw in text.split(|c: char| !c.is_ascii_alphanumeric()) {
@@ -316,9 +362,7 @@ mod tests {
         // refuse, so the fixture places files directly.
         for entry in entries {
             std::fs::write(
-                dir.path()
-                    .join("active")
-                    .join(format!("{}.json", entry.id)),
+                dir.path().join("active").join(format!("{}.json", entry.id)),
                 serde_json::to_string_pretty(&entry).unwrap(),
             )
             .unwrap();

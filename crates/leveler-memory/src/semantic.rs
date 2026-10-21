@@ -823,11 +823,7 @@ mod tests {
             "deploy key is set",
         );
         assert_eq!(
-            validate_semantic_candidate(
-                &secret_subject,
-                "deploy key is set"
-            )
-            .unwrap_err(),
+            validate_semantic_candidate(&secret_subject, "deploy key is set").unwrap_err(),
             CandidateRejection::Sensitive
         );
 
