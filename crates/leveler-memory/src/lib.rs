@@ -956,18 +956,17 @@ fn sensitive_fields(entry: &MemoryEntry) -> Vec<&'static str> {
     {
         fields.push("evidence");
     }
-    if let Some(experience) = entry.experience.as_ref() {
-        if looks_like_secret(&experience.applies_when)
+    if let Some(experience) = entry.experience.as_ref()
+        && (looks_like_secret(&experience.applies_when)
             || experience
                 .invalid_if
                 .as_deref()
                 .is_some_and(looks_like_secret)
             || experience.evidence.iter().any(|evidence| {
                 looks_like_secret(&evidence.kind) || looks_like_secret(&evidence.reference)
-            })
-        {
-            fields.push("experience");
-        }
+            }))
+    {
+        fields.push("experience");
     }
     fields
 }
