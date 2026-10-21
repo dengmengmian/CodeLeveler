@@ -564,7 +564,7 @@ impl Executor {
             // Unified closeout nudge budget shared by every quiet-round
             // mechanism (goal resolution, empty answer).
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
-            verification_runs: Vec::new(),
+            verification_runs: self.seeded_verification_runs.clone(),
             completion_warnings: Vec::new(),
             decode_retries: 0,
             length_continuations: 0,
@@ -658,13 +658,13 @@ impl Executor {
         if let Err(AgentError::BudgetExhausted(exhaustion)) = result {
             if self.depth == 0
                 && let (Some((store, session)), Some(scope)) =
-                    (&self.model_request_store, &self.budget_scope)
+                    (&self.model_request_store, self.model_budget_scope())
             {
                 harness.progress = crate::coding::turn::reconcile_model_spend(
                     harness.progress.clone(),
                     store.as_ref(),
                     session,
-                    scope,
+                    &scope,
                 )
                 .await
                 .map_err(|error| AgentError::Persistence(error.to_string()))?;
@@ -803,7 +803,9 @@ impl<'a> Drive<'a> {
 
     /// Persist a model call the kernel already folded into the run's spend.
     async fn persist_request(&mut self, mut record: ModelRequestRecord) -> Result<(), AgentError> {
-        record.budget_scope.clone_from(&self.executor.budget_scope);
+        // Resolved at write time: a mid-turn `/goal` upgrade changes the
+        // owner of the calls that follow it.
+        record.budget_scope = self.executor.model_budget_scope();
         Ok(self.sink.record_model_request(&record).await?)
     }
 
@@ -1469,6 +1471,21 @@ impl AgentHarness for Drive<'_> {
         if let Some(source) = &self.executor.steering
             && let Some(declaration) = source.take_goal_declaration()
         {
+            // A Chat turn that becomes a Goal here has no durable goal yet.
+            // Open it and bind this running turn to it BEFORE the contract is
+            // advertised: a goal that exists only in memory would be lost on
+            // the first crash, and its completion would settle nothing.
+            //
+            // A turn that was ALREADY a Goal keeps its recorded objective: the
+            // declaration is an instruction inside that goal, so the durable
+            // pending copy is consumed instead of opening a second identity.
+            if let Some(binder) = self.executor.goal_binder() {
+                if self.executor.starts_in_goal_mode() || binder.bound().is_some() {
+                    binder.discard_declaration(&declaration).await?;
+                } else {
+                    binder.bind(&declaration).await?;
+                }
+            }
             let tools = self.executor.request_tool_definitions();
             if tools != self.tools {
                 self.tools = tools;
@@ -1476,6 +1493,22 @@ impl AgentHarness for Drive<'_> {
             let message = Message::user_input(declaration);
             self.sink.append(std::slice::from_ref(&message)).await?;
             messages.push(message);
+        }
+        // The upgraded window's ledger moves to the goal it now serves. Its
+        // request rows were reassigned by the binder; duration and model-step
+        // counts live only in this ledger, so resume must find them under the
+        // same scope the goal reconciles.
+        if let Some(goal_id) = self
+            .executor
+            .goal_binder()
+            .and_then(|binder| binder.bound())
+            && self.progress.budget_scope.as_deref() != Some(goal_id.as_str())
+        {
+            self.flush_epoch(rt);
+            self.progress.budget_scope = Some(goal_id.to_string());
+            (self.observer)(AgentEvent::ProgressUpdated {
+                ledger: self.progress.clone(),
+            });
         }
         // Mid-turn user input goes in at the top of the round, before the
         // model is asked anything: a correction that arrives after the work

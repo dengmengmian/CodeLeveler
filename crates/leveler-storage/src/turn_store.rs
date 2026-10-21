@@ -60,6 +60,39 @@ pub trait TurnStore: Send + Sync {
         payload: Option<&str>,
         now: Timestamp,
     ) -> Result<TurnRecord, crate::OwnershipError>;
+
+    /// Fenced start that consumes this session's pending goal declaration in
+    /// the SAME transaction as the turn's WAL row.
+    ///
+    /// The pair belongs together: the goal was opened from that declaration,
+    /// and a crash that left the declaration behind after the turn started
+    /// would let a later, unrelated turn adopt it. Compare-and-swap on the
+    /// exact text, so a newer declaration written in between survives for
+    /// the turn that should own it.
+    async fn start_owned_consuming_declaration(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        kind: &str,
+        payload: Option<&str>,
+        now: Timestamp,
+        declaration: &str,
+    ) -> Result<TurnRecord, crate::OwnershipError>;
+
+    /// Bind a RUNNING turn's lineage to the goal it opened mid-turn.
+    ///
+    /// A Chat turn that receives `/goal <task>` starts under the Chat profile,
+    /// so its write-ahead payload was written with no goal id. The declaration
+    /// opens a real goal; recording that identity on this turn is what lets a
+    /// later resume — or a retry after `blocked` — return to THAT goal instead
+    /// of inferring one from the text. Fenced: the turn must still be running
+    /// and the caller must still own the task.
+    async fn bind_goal(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        turn_id: &TurnId,
+        goal_id: &leveler_core::GoalId,
+    ) -> Result<(), crate::OwnershipError>;
 }
 
 /// The production SQLite adapter: delegates to [`TurnRepository`].
@@ -109,6 +142,36 @@ impl TurnStore for Database {
         TurnRepository::new(self).list(session_id).await
     }
 
+    async fn bind_goal(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        turn_id: &TurnId,
+        goal_id: &leveler_core::GoalId,
+    ) -> Result<(), crate::OwnershipError> {
+        // Only a v2 payload carries lineage; a v1 row has no field to bind.
+        // Every turn this binary starts is v2, so a miss here is a stale or
+        // foreign turn rather than a legacy row.
+        let updated = sqlx::query(
+            "UPDATE turns SET payload = json_set(payload, '$.goal_id', ?2) \
+             WHERE id = ?1 AND status = 'running' \
+               AND json_extract(payload, '$.version') = 2 \
+               AND session_id = (SELECT session_id FROM tasks WHERE id = ?3 \
+                   AND owner_runtime_id = ?4 AND owner_epoch = ?5)",
+        )
+        .bind(turn_id.as_str())
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() != 1 {
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        }
+        Ok(())
+    }
+
     async fn start_owned(
         &self,
         token: &leveler_core::OwnershipToken,
@@ -147,6 +210,67 @@ impl TurnStore for Database {
         if inserted.rows_affected() != 1 {
             return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
         }
+        Ok(sqlx::query_as::<_, TurnRecord>(
+            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
+             FROM turns WHERE id = ?1",
+        )
+        .bind(&id)
+        .fetch_one(self.pool())
+        .await
+        .map_err(StorageError::from)?)
+    }
+
+    async fn start_owned_consuming_declaration(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        kind: &str,
+        payload: Option<&str>,
+        now: Timestamp,
+        declaration: &str,
+    ) -> Result<TurnRecord, crate::OwnershipError> {
+        let id = TurnId::generate().into_inner();
+        let payload = payload
+            .map(|p| crate::redact_json_payload_for_session("turn", p, Some(session_id.as_str())))
+            .transpose()
+            .map_err(crate::OwnershipError::Storage)?;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)?;
+        let inserted = sqlx::query(
+            "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at, \
+                                owner_boot_id) \
+             SELECT ?1, ?2, \
+                    (SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turns WHERE session_id = ?2), \
+                    ?3, ?4, 'running', ?5, ?9 \
+             WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 \
+                           AND id = ?6 AND owner_runtime_id = ?7 AND owner_epoch = ?8)",
+        )
+        .bind(&id)
+        .bind(session_id.as_str())
+        .bind(kind)
+        .bind(payload.as_deref())
+        .bind(now.to_rfc3339())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .bind(token.boot_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
+        }
+        sqlx::query("UPDATE sessions SET pending_goal = NULL WHERE id = ?1 AND pending_goal = ?2")
+            .bind(session_id.as_str())
+            .bind(declaration)
+            .execute(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+        tx.commit().await.map_err(StorageError::from)?;
         Ok(sqlx::query_as::<_, TurnRecord>(
             "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
              FROM turns WHERE id = ?1",
@@ -358,6 +482,58 @@ impl TurnStore for MemoryTurnStore {
             rows.push(record.clone());
             record
         })
+    }
+
+    async fn start_owned_consuming_declaration(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        kind: &str,
+        payload: Option<&str>,
+        now: Timestamp,
+        _declaration: &str,
+    ) -> Result<TurnRecord, crate::OwnershipError> {
+        // This port stores no declaration (`MemorySessionStore::pending_goal`
+        // is always empty), so there is nothing to consume. The start itself
+        // is the same fenced insert.
+        self.start_owned(token, session_id, kind, payload, now)
+            .await
+    }
+
+    async fn bind_goal(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        turn_id: &TurnId,
+        goal_id: &leveler_core::GoalId,
+    ) -> Result<(), crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory turn store has no ownership authority configured".to_string(),
+            )));
+        };
+        let applied = ownership.with_current(token, || -> Result<(), StorageError> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == turn_id.as_str() && row.status == "running")
+                .ok_or_else(|| {
+                    StorageError::InvalidData(format!(
+                        "running turn {turn_id} not found for goal binding"
+                    ))
+                })?;
+            let Some(payload) = row.payload.as_deref() else {
+                return Err(StorageError::InvalidData(format!(
+                    "turn {turn_id} has no payload to bind a goal to"
+                )));
+            };
+            let mut value: serde_json::Value = serde_json::from_str(payload)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+            value["goal_id"] = serde_json::Value::String(goal_id.as_str().to_string());
+            row.payload = Some(value.to_string());
+            Ok(())
+        });
+        applied??;
+        Ok(())
     }
 }
 

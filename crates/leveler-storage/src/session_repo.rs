@@ -24,6 +24,17 @@ pub enum SessionEdit {
     Thinking(Option<String>),
     /// Collaboration mode wire value.
     Collaboration(String),
+    /// Enter Goal mode AND record the declaration in one write.
+    ///
+    /// The axis and the objective are one user action, so they must land as
+    /// one durable fact: a session that is Goal with no objective (or an
+    /// objective with no Goal axis) is a state no client can explain.
+    GoalDeclaration {
+        /// Collaboration mode wire value (the Goal axis).
+        collaboration: String,
+        /// The user's task text, verbatim.
+        objective: String,
+    },
 }
 
 /// Atomic metadata replacement outcome.
@@ -248,6 +259,101 @@ impl<'a> SessionRepository<'a> {
         Ok(())
     }
 
+    /// Enter Goal mode and record its declaration as one durable fact.
+    ///
+    /// This is the writer for `/goal <task>`: the axis and the objective land
+    /// in one row update (and one log entry), so a crash can never leave a
+    /// Goal session whose objective was never persisted.
+    pub async fn set_goal_declaration(
+        &self,
+        id: &SessionId,
+        collaboration: &str,
+        objective: &str,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        self.edit_metadata(
+            id,
+            None,
+            &SessionEdit::GoalDeclaration {
+                collaboration: collaboration.into(),
+                objective: objective.into(),
+            },
+            now,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Record the objective a Goal turn is about to drive, without changing
+    /// the collaboration axis.
+    ///
+    /// A Goal turn can be started from a plain message while the session is
+    /// already in Goal mode (no `/goal` command re-declares it). Writing this
+    /// BEFORE the goal row means every crash in the goal-creation window
+    /// leaves a durable objective to recover; the turn start consumes it.
+    pub async fn set_pending_goal_if_absent(
+        &self,
+        id: &SessionId,
+        objective: &str,
+        now: Timestamp,
+    ) -> Result<bool, StorageError> {
+        // `pending_goal IS NULL` is the compare half: a `/goal <other>` that
+        // arrived while this turn was staged is a newer user intent and must
+        // not be replaced by the fallback text this turn would otherwise use.
+        let updated = sqlx::query(
+            "UPDATE sessions SET pending_goal = ?2, updated_at = ?3              WHERE id = ?1 AND pending_goal IS NULL",
+        )
+        .bind(id.as_str())
+        .bind(objective)
+        .bind(now.to_rfc3339())
+        .execute(self.db.pool())
+        .await?;
+        if updated.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE id = ?1")
+            .bind(id.as_str())
+            .fetch_optional(self.db.pool())
+            .await?;
+        if exists.is_none() {
+            return Err(StorageError::InvalidData(format!(
+                "session {id} not found for goal declaration"
+            )));
+        }
+        Ok(false)
+    }
+
+    /// The goal declaration accepted for this session but not yet bound to a
+    /// `goals` row, if any.
+    pub async fn pending_goal(&self, id: &SessionId) -> Result<Option<String>, StorageError> {
+        let pending: Option<Option<String>> =
+            sqlx::query_scalar("SELECT pending_goal FROM sessions WHERE id = ?1")
+                .bind(id.as_str())
+                .fetch_optional(self.db.pool())
+                .await?;
+        Ok(pending.flatten().filter(|text| !text.trim().is_empty()))
+    }
+
+    /// Consume exactly the declaration that was bound.
+    ///
+    /// Compare-and-swap on the text: a declaration written after this one was
+    /// read (a newer `/goal`) must survive. Returns whether this call cleared
+    /// the row.
+    pub async fn clear_pending_goal(
+        &self,
+        id: &SessionId,
+        expected: &str,
+    ) -> Result<bool, StorageError> {
+        let cleared = sqlx::query(
+            "UPDATE sessions SET pending_goal = NULL WHERE id = ?1 AND pending_goal = ?2",
+        )
+        .bind(id.as_str())
+        .bind(expected)
+        .execute(self.db.pool())
+        .await?;
+        Ok(cleared.rows_affected() == 1)
+    }
+
     async fn edit_metadata(
         &self,
         id: &SessionId,
@@ -276,39 +382,62 @@ impl<'a> SessionRepository<'a> {
                 return Ok(SessionEditResult::Conflict(sequence));
             }
         }
-        let (sql, value, field) = match edit {
+        let (sql, value, pending, field) = match edit {
             SessionEdit::Title(value) => (
                 "UPDATE sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
+                None,
                 "goal",
             ),
             SessionEdit::Model(value) => (
                 "UPDATE sessions SET model = ?2, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
+                None,
                 "model",
             ),
             SessionEdit::Permission(value) => (
                 "UPDATE sessions SET mode = ?2, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
+                None,
                 "mode",
             ),
             SessionEdit::Thinking(value) => (
                 "UPDATE sessions SET thinking = ?2, updated_at = ?3 WHERE id = ?1",
                 value.as_deref(),
+                None,
                 "thinking",
             ),
+            // Leaving or changing the axis drops any declaration made for the
+            // previous mode: a pending goal must not outlive the Goal axis it
+            // was declared under.
             SessionEdit::Collaboration(value) => (
-                "UPDATE sessions SET collaboration = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE sessions SET collaboration = ?2, pending_goal = NULL, \
+                 updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
+                None,
+                "collaboration",
+            ),
+            SessionEdit::GoalDeclaration {
+                collaboration,
+                objective,
+            } => (
+                "UPDATE sessions SET collaboration = ?2, updated_at = ?3, \
+                 pending_goal = ?4 WHERE id = ?1",
+                Some(collaboration.as_str()),
+                Some(objective.as_str()),
                 "collaboration",
             ),
         };
-        let changed = sqlx::query(sql)
-            .bind(id.as_str())
-            .bind(value)
-            .bind(now.to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
+        let changed = {
+            let mut query = sqlx::query(sql)
+                .bind(id.as_str())
+                .bind(value)
+                .bind(now.to_rfc3339());
+            if let Some(pending) = pending {
+                query = query.bind(pending);
+            }
+            query.execute(&mut *tx).await?
+        };
         if changed.rows_affected() != 1 {
             return Err(StorageError::InvalidData(format!(
                 "session {id} not found for metadata edit"
@@ -973,6 +1102,110 @@ mod tests {
         assert!(sandbox);
         assert_eq!(kind, "orchestrate");
         assert_eq!(outcome, Some(TaskOutcome::Completed));
+    }
+
+    /// The axis and its declaration are one write, and any later axis change
+    /// drops it: a pending goal must not outlive the Goal mode it was made in.
+    #[tokio::test]
+    async fn a_goal_declaration_is_atomic_with_the_axis_and_cleared_by_axis_changes() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::new("/repo", "title", "m", leveler_core::now());
+        repo.create(&record).await.unwrap();
+        let id = SessionId::new(record.id.clone());
+        assert_eq!(repo.pending_goal(&id).await.unwrap(), None);
+
+        repo.set_goal_declaration(&id, "goal", "ship the migration", leveler_core::now())
+            .await
+            .unwrap();
+        let loaded = repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(loaded.collaboration, "goal");
+        assert_eq!(
+            repo.pending_goal(&id).await.unwrap().as_deref(),
+            Some("ship the migration")
+        );
+
+        // A newer declaration replaces the old one in the same single field.
+        repo.set_goal_declaration(&id, "goal", "ship the new migration", leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.pending_goal(&id).await.unwrap().as_deref(),
+            Some("ship the new migration")
+        );
+
+        // Compare-and-swap: clearing a superseded text changes nothing.
+        assert!(
+            !repo
+                .clear_pending_goal(&id, "ship the migration")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repo.pending_goal(&id).await.unwrap().as_deref(),
+            Some("ship the new migration")
+        );
+        assert!(
+            repo.clear_pending_goal(&id, "ship the new migration")
+                .await
+                .unwrap()
+        );
+        assert_eq!(repo.pending_goal(&id).await.unwrap(), None);
+
+        // Leaving Goal mode drops any pending declaration.
+        repo.set_goal_declaration(&id, "goal", "unfinished", leveler_core::now())
+            .await
+            .unwrap();
+        repo.set_turn_collaboration(&id, "chat", leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(repo.get(&id).await.unwrap().unwrap().collaboration, "chat");
+        assert_eq!(repo.pending_goal(&id).await.unwrap(), None);
+    }
+
+    /// A Goal turn that starts from a plain message records its objective
+    /// without clobbering a `/goal` declaration that arrived while the turn
+    /// was being staged. The write is absent-only; consuming it is the turn
+    /// start's compare-and-swap.
+    #[tokio::test]
+    async fn an_absent_only_declaration_never_overwrites_a_newer_one() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::new("/repo", "title", "m", leveler_core::now());
+        repo.create(&record).await.unwrap();
+        let id = SessionId::new(record.id.clone());
+
+        assert!(
+            repo.set_pending_goal_if_absent(&id, "staged objective", leveler_core::now())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .set_pending_goal_if_absent(&id, "newer declaration", leveler_core::now())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repo.pending_goal(&id).await.unwrap().as_deref(),
+            Some("staged objective"),
+            "a declaration written in between is a newer user intent"
+        );
+
+        assert!(
+            repo.clear_pending_goal(&id, "staged objective")
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.set_pending_goal_if_absent(&id, "next objective", leveler_core::now())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repo.pending_goal(&id).await.unwrap().as_deref(),
+            Some("next objective")
+        );
     }
 
     #[tokio::test]

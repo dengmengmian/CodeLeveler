@@ -305,6 +305,34 @@ impl<'a> ModelRequestRepository<'a> {
         Ok(())
     }
 
+    /// Move attempts recorded under one budget scope to another.
+    ///
+    /// A Chat window upgraded by `/goal` spent tokens before the goal existed.
+    /// The goal now owns that window, so its rows change owner. This is a
+    /// move, not a copy: both totals stay derived from the same facts, and a
+    /// repeated call moves nothing. Returns how many rows changed.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the update cannot be written.
+    pub async fn reassign_budget_scope(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, StorageError> {
+        let updated = sqlx::query(
+            "UPDATE model_requests SET budget_scope = ?3 \
+             WHERE session_id = ?1 AND budget_scope = ?2",
+        )
+        .bind(session_id.as_str())
+        .bind(from)
+        .bind(to)
+        .execute(self.db.pool())
+        .await?;
+        Ok(updated.rows_affected())
+    }
+
     /// Every record for `session_id`, oldest first (ties broken by insertion
     /// order, so calls made within the same second keep their sequence).
     ///

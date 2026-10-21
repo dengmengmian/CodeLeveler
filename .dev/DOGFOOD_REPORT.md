@@ -126,3 +126,183 @@ dbname=devorder                                          ← 非凭据值保留
 3. **子 Agent 的验证不计入父 Goal**：见 `GOAL_EXECUTION_CONTRACT.md` 第 8 节。
 4. **运行中 `/goal` 的声明窗口**：轴先持久化，声明文本下一轮落库；进程恰在窗口崩溃会丢失声明文本。
 5. **真实 Provider 的任务规模**：DF-10 是 5 个需求、5 个模型轮的短任务；长回合路径的证据来自 DF-2（11 轮）与 DF-6（有界空转），不是同一个真实模型会话。
+
+---
+
+# 第二轮：生命周期收口（2026-10-21）
+
+## 结论
+
+**PASS。** 确定性套件 DF-1～DF-10 全部通过（10/10），真实 DeepSeek 的 Blocked→`继续`
+重试用例（DF-11）通过。本轮修复的三个生命周期问题都有红→绿测试锁住，并在最终二进制上
+复跑。
+
+## 环境与身份
+
+| 项 | 值 |
+|---|---|
+| 二进制 | `target/debug/leveler`，sha256 `ff898013bd4619d275bc0117ae249926dd85f5a700249cdd3688214bc4f00f84` |
+| 版本串 | `1.0.20 (9a4da5477370-dirty) UNTRUSTED: built from a modified working tree` |
+| 树状态 | HEAD `9a4da54` + 本轮未提交改动（工作树同时含其他终端的未提交改动） |
+| 确定性 lab | `dogfood/scratch/goal-contracts-final3/run-20261021-105501` |
+| 确定性结果 | `dogfood/scratch/goal-contracts-final3/goal_contracts.json`（counts = {PASS: 10}） |
+| 真实 Provider lab | `dogfood/scratch/df11-real/run-20261021-105626` |
+| 真实 Provider 结果 | `dogfood/scratch/df11-real/df11_result_final2.json` |
+
+## 用例
+
+| 用例 | 结果 | 证据 |
+|---|---|---|
+| DF-1 显式 Goal（文本客户端） | **PASS** | 首个回合 `blocked`；重启后 `继续` **重试同一个 goal**：`goals=1`、objective 原样、`继续` 未成为目标；wire 中原目标出现 2 次（transcript + host-pinned） |
+| DF-2 阶段完成 ≠ 整体完成 | PASS | 5 次阶段总结后继续，1 次 goal resolution |
+| DF-3 失败验收不能 complete | PASS | `verification_refused`，终态 blocked |
+| DF-4 Compaction | PASS | `/compact` 后目标与 Goal 工具面仍在 |
+| DF-5 Esc 中断后 Resume | PASS | 同一 `goals` 行，objective 保留 |
+| DF-6 空转有界 | PASS | 3 次主请求后 incomplete，不是 completed |
+| DF-7 脱敏 | PASS | 首窗 wire + 持久 transcript 保留源码路径；凭据 `[REDACTED]` |
+| DF-8 空补丁 | PASS | `changed nothing`，文件未改 |
+| DF-9 Chat 不回归 | PASS | 1 次请求结束，0 个 goal |
+| DF-10 真实 Provider（DeepSeek） | PASS | `deepseek/deepseek-v4-flash`，独立 `python3 -m unittest` 通过 |
+| **DF-11 Blocked 后真实重试（DeepSeek）** | **PASS** | 第一窗模型主动 `update_goal(blocked)`；`继续` 后同一 goal id、原 objective、`completed`；5/5 测试通过 |
+
+### DF-1 / DF-7 断言为什么改了
+
+这两条在第一轮是按旧行为写的：Blocked 不是可恢复终态，所以 `继续` 会新建一个
+objective 为「继续」的 goal。本轮把 Blocked 改成可重试后：
+
+- DF-1 的正确断言变成「同一 goal、原 objective、`继续` 不是 objective」；wire 中目标
+  出现 2 次是 transcript + host-pinned objective，DF-5 早已按这个上限断言。
+- DF-7 的脱敏不变量改在 **持久 transcript + 首窗 wire** 上断言。长 goal 的 retry 可能
+  用 goal checkpoint 折叠旧上下文，旧 tool result 不再出现在 wire 里；这不是脱敏失败，
+  用 retry 的 wire 断言会把「正常折叠」误判成「路径丢失」。
+
+## 真实 DeepSeek 的生命周期证据（DF-11）
+
+```text
+turn 1: user  goal_id=G  completed(blocked)   goals: 1 行  objective=原目标
+turn 2: user  continuation_root=G  goal_id=G  completed         goals: 1 行  settled
+task_finished #1: goal {goal_id:G, settle:true} outcome=blocked
+task_finished #2: goal {goal_id:G, settle:true} outcome=completed
+independent: Ran 5 tests ... OK
+```
+
+第二个回合的 turn payload 直接携带 `goal_id=G`，证明重试走的是 resume 身份绑定，而不是
+按文本新建目标。
+
+## 新增红→绿回归
+
+| 测试 | 锁住的行为 |
+|---|---|
+| `a_goal_declaration_is_atomic_with_the_axis_and_cleared_by_axis_changes` | 轴与声明同一写；CAS 清空；轴变更清空 |
+| `a_busy_goal_declaration_is_durable_with_the_axis` | 运行中 `/goal`：执行器 drain 之前，轴+目标已在库中；回合终态结算该 goal |
+| `a_pending_declaration_is_recovered_by_continue` | 崩溃窗口后 `继续` 以声明文本为目标，模型真的收到它 |
+| `continue_after_a_blocked_goal_retries_the_same_record` | Blocked→`继续` 重试同一 goal，原 objective 不变 |
+| `an_explicit_new_goal_after_blocked_stays_independent` | 显式 `/goal` 仍是独立新目标 |
+| `a_mid_turn_upgrade_resumes_as_its_goal` | 运行中升级后中断，`继续` 以 Goal profile 恢复同一 goal |
+| `verification_facts_survive_the_next_work_window` | 上一窗口成功的验收命令可被新窗口引用 |
+| `a_failed_verification_survives_into_the_retry` | 上一窗口失败的验收命令仍阻止 premature complete |
+
+敏感性检查：临时移除 resume/retry 的验证事实种子后，后两条分别转红（预算耗尽 /
+premature complete 被接受），恢复后转绿。
+
+## 回归
+
+- `cargo test --workspace`：**exit 0**，262 个测试二进制全部通过。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets`：本轮新增代码无告警；剩余告警在
+  `leveler-execution/background.rs`、`leveler-storage/session_facts.rs`，均为既有代码。
+
+## 已知抖动（不作为 PASS 依据）
+
+全量套件在最终二进制上的一次运行里，DF-10 出现过一次 **提交未发生** 的 PTY 抖动：
+4.2s 后 session 仍为 `created`，composer 里保留着输入的 `/goal …` 文本，没有 goal 行或
+`task_finished`。单独重跑 DF-10 与紧随其后的全量重跑均 PASS。该现象发生在输入被
+Runtime 接受之前，与本轮生命周期改动无关；记录在此，避免把一次 flake 混进结论。
+
+---
+
+# 第三轮：Final Hardening（2026-10-21）
+
+## 结论
+
+**PASS（12/12 dogfood 用例；全量 workspace 测试见文末）。** 本轮收口两个已确认的
+Runtime 边界，并新增永久回归：
+
+| 问题 | 结果 | 锁住它的测试 |
+|---|---|---|
+| Chat 运行中升级 Goal 后，当前窗口的模型消耗未计入 Goal 预算 | 已修复 | `chat_goal_budget_test`（4 个）、DF-12（PTY + 真实 SQLite） |
+| Goal 已创建、TurnStart 未落库时崩溃会留下无人能认领的 Running goal | 已修复 | `goal_crash_recovery_test`（5 个）、DF-13（PTY + 真实 SQLite） |
+| 在“被 resume 过的 Chat 窗口”中声明的 Goal，谱系根指向旧 Chat 窗口 | 已修复（DF-13/测试暴露） | `a_goal_declared_in_a_resumed_chat_window_keeps_its_own_lineage` |
+| Resume 时从 pending 声明收养 Goal，checkpoint 根校验失败导致 Blocked 被写成 Interrupted | 已修复（DF-13 暴露） | `a_pending_goal_adopted_by_resume_roots_its_checkpoint_at_its_own_turn` |
+
+## 预算归属（Phase 1）
+
+| 事实 | 归属 |
+|---|---|
+| 升级前已写入的 `model_requests`（Chat turn/lineage scope） | `GoalBinder` 在绑定后执行一次 `UPDATE ... SET budget_scope = goal_id`（移动，不复制） |
+| 升级后的主回合、子 Agent、harness reviewer | 执行器按 `GoalBinder::bound()` 动态取 scope |
+| `ProgressLedger` 的 model steps / duration | 绑定当轮在 `on_round_start` 把 ledger 换到 goal scope 并持久化 |
+| 崩溃后恢复 | `resume_inner` 扫描已绑定该 goal 的 Chat turn，按其 WAL payload 推导 scope（fresh=自身 id，resumed=chat root），幂等迁移 |
+
+确定性测试使用真实 SQLite 与真实引擎；cap 设为 100,000，升级窗口已经消耗 980,000
+时，第二次 Resume **不再发出任何模型请求**并返回 `BudgetExhausted`，goal 保持 `Running`
+（不伪装 Completed）。预算耗尽、Blocked、Completed、Cancelled 的映射沿用既有终态。
+
+## Goal 创建窗口（Phase 2）
+
+顺序改为：
+
+1. 没有 pending 声明时，先以 `set_pending_goal_if_absent` 把本次目标写成声明（CAS，较新的
+   `/goal` 不会被覆盖）；
+2. 打开/复用 goal；
+3. `start_owned_consuming_declaration` 在 **TurnStart 的同一事务**里插入 turn 行并 CAS
+   清空声明。
+
+因此每个崩溃窗口都留下“声明 + 至多一个 Running goal”：
+- 声明后、goal 前崩溃：下一个 Goal 回合按声明打开 goal；
+- goal 后、turn 前崩溃：下一个 Goal 回合按声明复用同一个 goal；
+- 绑定与迁移之间崩溃：`resume` 重放预算迁移；turn payload 的 `goal_id` 是身份。
+
+新测试覆盖：Goal 创建后崩溃、绑定后无终态、恢复期间再次崩溃、多次 Resume、并发两个
+Session 恢复；每项都验证 goal 数量/id/objective、`pending_goal`、turn lineage、
+goal status 与是否重复执行。
+
+## Dogfood
+
+| 用例 | 结果 | 证据 |
+|---|---|---|
+| DF-1 … DF-10 | **PASS（10/10）** | 真实 TUI + 真实 PTY；DF-10 为真实 DeepSeek |
+| DF-12 Chat→Goal 预算归属 | **PASS** | 升级窗口 2 条 main-round 行的 scope 全部 = goal id；首请求无 `update_goal`，升级后请求有 |
+| DF-13 创建窗口崩溃恢复 | **PASS** | 收养同一 goal id 与 objective；声明被消费；turn payload goal_id 一致；goal 只有一个 |
+| DF-11 Blocked→继续（真实 DeepSeek，单独复跑） | **PASS** | 第一窗口 blocked；`继续` 恢复同一 goal id、objective 不变；完成且独立 `python3 -m unittest` 通过 |
+
+详情：`dogfood/.dev/GOAL_CONTRACT_DOGFOOD.md`，冻结证据
+`dogfood/.dev/evidence/goal_contracts_20261021_final_hardening.json`。
+
+## 性能与成本（DF-10 真实 Provider）
+
+| 指标 | 值 |
+|---|---:|
+| Model rounds | 5（另 1 次 prompt suggestion） |
+| Input / Output / Cached | 42,120 / 622 / 28,928 |
+| Reasoning tokens | 162 |
+| Cost | 6,023 micro-USD（约 $0.006） |
+| Wall time | 22.2s |
+| Compaction / Resume / 重复执行 | 0 / 0 / 0 |
+
+本轮修复没有增加模型调用：预算迁移是数据库 UPDATE；崩溃恢复是已有 turn 的复用。
+DF-13 恢复后只执行 1 个 Goal turn，独立检查 `python3 -m unittest` 通过。
+
+## 残余风险
+
+1. **Grok 真实长任务：NOT_VERIFIED**（本机无 provider/凭据），与上一轮相同。
+2. **真实配置 TUI 启动窗口的输入时序**：DF-10 两次因“启动首帧后立即写入长 prompt+Enter”
+   而未提交（会话停在 `created`，0 模型请求）。这是输入层时序，不是 Goal 执行失败；
+   dogfood 驱动改为 2.5s 启动宽限 + 文本/Enter 分开发送。TUI 输入代码属于并行终端工作区，
+   本轮未改。
+3. **旧版本无 scope 的历史行不回填**：本次迁移只作用于绑定窗口仍在 `model_requests` 中的
+   行；已发布版本留下的无 scope 行沿用既有“拒绝在 cap 下恢复”的保守策略。
+4. **checkpoint 根与 turn WAL 根可能不同**：Resume 收养 pending Goal 时，里程碑 checkpoint
+   以“命名该 goal 的 turn”为根，而 turn payload 仍记录它续接的 Chat 根。两者都指向同一
+   goal；不再导致 checkpoint 失败，但首个收养窗口内切出的 checkpoint 不会被下一次
+   resume 命中（回退到完整历史，安全）。

@@ -35,6 +35,10 @@ pub enum TurnInput {
         origin: TranscriptOrigin,
         prior: Vec<Message>,
         goal_id: leveler_core::GoalId,
+        /// Commands this goal already ran in earlier windows, rebuilt from
+        /// its durable events. The completion gate judges the task, not just
+        /// the window that happens to be open.
+        verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
     },
     /// A resumed transcript (drive continues mid-conversation).
     ///
@@ -54,6 +58,8 @@ pub enum TurnInput {
         lineage_turn_ids: Vec<leveler_core::TurnId>,
         root_turn_id: leveler_core::TurnId,
         goal_id: Option<leveler_core::GoalId>,
+        /// See [`TurnInput::Goal::verification_runs`].
+        verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
     },
     /// A conversational turn: prior transcript + new content parts.
     Content {
@@ -130,6 +136,7 @@ pub async fn drive_turn(
         lost_children,
         barrier,
         fence,
+        goals,
         approver,
         clarifier,
     } = ports;
@@ -199,7 +206,19 @@ pub async fn drive_turn(
         // Ownership fence: after the barriers, before dispatch, the host
         // re-proves this runtime still owns the task. Inherited by delegated
         // child executors.
-        .with_execution_fence(fence);
+        .with_execution_fence(fence)
+        // Durable identity for a `/goal` declared while this Chat turn runs.
+        .with_goal_binder(goals.clone())
+        // What this goal already proved in earlier windows (resume / retry).
+        .with_verification_runs(match &input {
+            TurnInput::Goal {
+                verification_runs, ..
+            }
+            | TurnInput::Resume {
+                verification_runs, ..
+            } => verification_runs.clone(),
+            TurnInput::Content { .. } => Vec::new(),
+        });
 
     if let (Some(context), Some(scope)) = (checkpoint_context, checkpoint_scope) {
         executor = executor.with_compaction_checkpoint(Arc::new(CodingCompactionCheckpoint::new(
@@ -308,6 +327,7 @@ pub async fn drive_turn(
             origin,
             prior,
             goal_id: _,
+            verification_runs: _,
         } => {
             let objective = leveler_lifecycle::ObjectiveAnchor::from_session_goal(goal.as_str());
             executor
@@ -329,6 +349,7 @@ pub async fn drive_turn(
             lineage_turn_ids: _,
             root_turn_id: _,
             goal_id: _,
+            verification_runs: _,
         } => {
             // Persist the continuation message before running: it is this
             // turn's user input, and the transcript must match what the user
@@ -383,6 +404,13 @@ pub async fn drive_turn(
     // Every sender this turn handed out goes with it: the engine's pump
     // drains to close only once the last one is gone.
     drop(emitter);
+    let mut result = result;
+    // A Chat turn upgraded by `/goal` bound a durable goal mid-flight. The
+    // terminal for this turn must name it, or a completed upgrade would leave
+    // a running goal row with no run that ever settles it.
+    if let Ok(outcome) = result.as_mut() {
+        outcome.bound_goal = goals.bound();
+    }
     match result {
         Ok(outcome) => Ok(TurnFacts {
             stop: outcome.stop_reason,
@@ -392,6 +420,95 @@ pub async fn drive_turn(
         }),
         Err(error) => Err(failure(error)),
     }
+}
+
+/// Rebuild the mechanical verification facts a goal already produced.
+///
+/// The live gate records each command execution in memory for the window it
+/// runs in. A resumed goal — or a retry after `blocked` — starts a new window,
+/// and judging it on that window alone would answer "that command never ran in
+/// this task" about a command the task actually ran. Facts are rebuilt from the
+/// goal's own durable events, scoped by turn lineage so an unrelated goal's
+/// commands cannot vouch for this one.
+///
+/// Only observed facts are reconstructed: the command text, whether it
+/// succeeded, the model step that ran it, and the ledger's mutation count at
+/// that point (which is what "after the last file change" compares).
+pub(crate) async fn load_goal_verification_runs(
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+    goal_id: &leveler_core::GoalId,
+) -> Result<Vec<crate::executor::goal_verification::VerificationRun>, EngineError> {
+    let turns = stores.turns.list_for_session(session_id).await?;
+    let turn_ids: std::collections::HashSet<&str> = turns
+        .iter()
+        .filter(|turn| {
+            turn.payload
+                .as_deref()
+                .and_then(|payload| leveler_engine::decode_turn_continuation(payload).ok())
+                .and_then(|lineage| lineage.goal_id)
+                .is_some_and(|id| &id == goal_id)
+        })
+        .map(|turn| turn.id.as_str())
+        .collect();
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = stores.events.load(session_id).await?;
+    let mut calls: std::collections::HashMap<String, (String, serde_json::Value, u32)> =
+        std::collections::HashMap::new();
+    let mut mutation_ops = 0u64;
+    let mut runs = Vec::new();
+    for row in rows {
+        if !row
+            .turn_id
+            .as_deref()
+            .is_some_and(|turn| turn_ids.contains(turn))
+        {
+            continue;
+        }
+        let Ok(event) = EngineEvent::from_payload(&row.payload) else {
+            continue;
+        };
+        match event {
+            EngineEvent::ToolCallStarted {
+                call_id,
+                name,
+                arguments,
+                model_step,
+                ..
+            } => {
+                if let Ok(arguments) = serde_json::from_str(&arguments) {
+                    calls.insert(call_id, (name, arguments, model_step.unwrap_or(0)));
+                }
+            }
+            EngineEvent::ToolCallFinished {
+                call_id, is_error, ..
+            } => {
+                if let Some((name, arguments, model_step)) = calls.remove(&call_id)
+                    && let Some(label) =
+                        crate::executor::goal_verification::command_label(&name, &arguments)
+                {
+                    runs.push(crate::executor::goal_verification::VerificationRun {
+                        label,
+                        ok: !is_error,
+                        model_step,
+                        mutation_ops,
+                    });
+                }
+            }
+            EngineEvent::EvidenceLedgerUpdated { ledger } => {
+                mutation_ops = ledger.total_mutation_ops;
+            }
+            _ => {}
+        }
+    }
+    // The live collector keeps the newest 64; a rebuilt record must answer
+    // the same questions a live one would.
+    if runs.len() > 64 {
+        runs.drain(..runs.len() - 64);
+    }
+    Ok(runs)
 }
 
 struct CodingTurnSeeds {

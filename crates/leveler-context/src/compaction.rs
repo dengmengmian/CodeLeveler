@@ -170,8 +170,11 @@ pub fn retention_tail_budget(
 /// replace its own previous injection instead of stacking a second one.
 pub const ACTIVE_OBJECTIVE_MARKER: &str = "[Active objective — host-pinned]";
 
-/// Build the user message that re-pins the host objective after a fold.
-pub(crate) fn objective_pin_message(objective: &str) -> Message {
+/// Build the user message that pins the host's active objective.
+///
+/// Used by compaction (after a fold) and by a goal turn whose recovered
+/// objective differs from the text the user just typed.
+pub fn objective_pin_message(objective: &str) -> Message {
     let obj = objective.trim();
     Message {
         origin: Some(TranscriptOrigin::RuntimeNotice {

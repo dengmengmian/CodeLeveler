@@ -37,6 +37,35 @@ pub trait ExecutionFence: Send + Sync {
     async fn ensure_current(&self) -> Result<(), String>;
 }
 
+/// Durable goal identity for a turn that was not started as a Goal turn.
+///
+/// `/goal <task>` can arrive while a Chat turn is already running. The
+/// executor then gains the goal contract from the next round, but the turn
+/// itself has no `goals` row and its write-ahead lineage has no goal id.
+/// This port closes that gap: the host opens (or reuses) the goal named by
+/// the declaration, binds it to the running turn, and consumes the session's
+/// durable pending declaration in the same step.
+///
+/// Fail-closed: a declaration whose goal cannot be made durable aborts the
+/// run. Running a Goal contract whose identity exists only in memory is the
+/// exact state this port removes.
+#[async_trait::async_trait]
+pub trait GoalBinder: Send + Sync {
+    /// Bind `objective` (or the session's durable pending declaration, when
+    /// one exists) to this turn. Idempotent: the same turn binds once.
+    async fn bind(&self, objective: &str) -> Result<leveler_core::GoalId, PortError>;
+
+    /// Consume a declaration that is only an INSTRUCTION for a goal this turn
+    /// already owns (a `/goal <text>` sent while a Goal turn runs). The
+    /// original objective stays the goal's; the text must not linger as a
+    /// pending declaration for a later, unrelated turn.
+    async fn discard_declaration(&self, declaration: &str) -> Result<(), PortError>;
+
+    /// The goal this turn bound, once it did. The harness reads it when the
+    /// turn ends so the terminal names the goal it actually served.
+    fn bound(&self) -> Option<leveler_core::GoalId>;
+}
+
 /// Awaitable durability barrier for canonical tool events (side-effect
 /// barrier, convergence plan phase 1). `flush` resolves once every canonical
 /// event emitted through the observer so far is durable. The loop awaits it

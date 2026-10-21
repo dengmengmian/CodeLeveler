@@ -4,7 +4,7 @@ mod agent_spawn;
 pub mod closeout;
 mod dispatch;
 mod drive;
-mod goal_verification;
+pub(crate) mod goal_verification;
 mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
@@ -821,6 +821,10 @@ pub struct AgentOutcome {
     /// closed without executable verification, for example. The engine copies
     /// these onto `TaskFinished.warnings`; they are never a success claim.
     pub completion_warnings: Vec<String>,
+    /// The goal this turn bound when it was NOT a Goal turn at start (a Chat
+    /// turn upgraded by `/goal`). `None` for a turn that started in Goal mode:
+    /// its identity came from the caller, not from a mid-turn declaration.
+    pub bound_goal: Option<leveler_core::GoalId>,
 }
 
 impl AgentOutcome {
@@ -848,6 +852,7 @@ impl AgentOutcome {
             progress: progress.clone(),
             objective: objective.clone(),
             completion_warnings: Vec::new(),
+            bound_goal: None,
         }
     }
 
@@ -873,6 +878,7 @@ impl AgentOutcome {
             progress: progress.clone(),
             objective: objective.clone(),
             completion_warnings: Vec::new(),
+            bound_goal: None,
         }
     }
 }
@@ -1534,6 +1540,10 @@ pub struct Executor {
     seeded_plan: PlanState,
     /// Seeded process evidence (resume from last EvidenceLedgerUpdated).
     seeded_ledger: EvidenceLedger,
+    /// Verification facts this goal already proved in earlier windows
+    /// (resume / retry). The completion gate reads one task-wide record, not
+    /// only the commands that happened to run after this window opened.
+    seeded_verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
     /// Seeded progress (engine continue / resume).
     seeded_progress: ProgressLedger,
     /// Settlements from a previous window the host proved durable but the
@@ -1602,6 +1612,10 @@ pub struct Executor {
     /// Ownership fence consulted after the admission barriers and before
     /// tool dispatch; None = unfenced (non-engine/test executors).
     execution_fence: Option<Arc<dyn ExecutionFence>>,
+    /// Durable goal identity for a Chat turn that `/goal` upgrades mid-flight.
+    /// `None` on a Goal turn (identity already exists) and on hosts without
+    /// durable goals (sub-agents, standalone library use).
+    goal_binder: Option<Arc<dyn leveler_engine::GoalBinder>>,
     /// This agent's delegation id, when it IS a delegated agent. Its tool
     /// events are attributed to it so the host can tell whose side effect a
     /// dangling call belongs to.
@@ -1688,6 +1702,7 @@ impl Executor {
             sub_agent_policies: None,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
+            seeded_verification_runs: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
@@ -1712,6 +1727,7 @@ impl Executor {
             model_request_store: None,
             compaction_checkpoint: None,
             execution_fence: None,
+            goal_binder: None,
             agent_id: None,
             agent_roots: None,
             agent_brief: None,
@@ -1772,6 +1788,17 @@ impl Executor {
     /// Seed the process evidence ledger (resume from last EvidenceLedgerUpdated).
     pub fn with_seeded_ledger(mut self, ledger: EvidenceLedger) -> Self {
         self.seeded_ledger = ledger;
+        self
+    }
+
+    /// Seed the verification facts this goal already proved in earlier
+    /// windows, so a resumed or retried goal is judged on the task's record
+    /// rather than on this window alone.
+    pub(crate) fn with_verification_runs(
+        mut self,
+        runs: Vec<crate::executor::goal_verification::VerificationRun>,
+    ) -> Self {
+        self.seeded_verification_runs = runs;
         self
     }
 
@@ -2021,6 +2048,27 @@ impl Executor {
         self
     }
 
+    /// Give this turn the host's durable goal binder.
+    ///
+    /// Only a turn that did NOT start in Goal mode needs it: a mid-turn
+    /// `/goal` declaration must open a real goal and bind the running turn to
+    /// it, or the "Goal" the executor follows exists only in memory.
+    pub(crate) fn with_goal_binder(mut self, binder: Arc<dyn leveler_engine::GoalBinder>) -> Self {
+        self.goal_binder = Some(binder);
+        self
+    }
+
+    pub(crate) fn goal_binder(&self) -> Option<&Arc<dyn leveler_engine::GoalBinder>> {
+        self.goal_binder.as_ref()
+    }
+
+    /// Whether this turn STARTED under the Goal profile. Steering can turn a
+    /// Chat turn into a Goal mid-flight; that later state is [`Self::goal_mode`],
+    /// not this one.
+    pub(crate) fn starts_in_goal_mode(&self) -> bool {
+        self.policy.goal_mode
+    }
+
     /// Whether this turn is a Goal now.
     ///
     /// The static policy covers a turn that started as a Goal. A turn that
@@ -2177,6 +2225,8 @@ impl Executor {
             sub_agent_policies: self.sub_agent_policies,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
+            // A child's commands are its own; they never prove the parent's goal.
+            seeded_verification_runs: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
@@ -2189,7 +2239,9 @@ impl Executor {
             // parking mean the same thing at any depth.
             memory_root: self.memory_root.clone(),
             background_tasks: self.background_tasks.clone(),
-            budget_scope: self.budget_scope.clone(),
+            // A child spawned after the parent's `/goal` upgrade bills the
+            // goal, not the chat window the parent started in.
+            budget_scope: self.model_budget_scope(),
             task_model_limits: self.task_model_limits,
             step_limits: StepLimits {
                 max_duration: Some(crate::sub_agent::SUB_AGENT_MAX_DURATION),
@@ -2216,6 +2268,8 @@ impl Executor {
             // context must not write the goal's continuity record.
             compaction_checkpoint: None,
             execution_fence: self.execution_fence.clone(),
+            // A child never represents the top-level goal a declaration named.
+            goal_binder: None,
             agent_id: None,
             agent_roots: None,
             agent_brief: None,
@@ -2639,6 +2693,21 @@ impl Executor {
         self
     }
 
+    /// The budget owner these calls belong to RIGHT NOW.
+    ///
+    /// A Chat turn that `/goal` upgrades mid-flight starts under its own turn
+    /// scope and becomes the bound goal's once the binder has a durable goal.
+    /// Reading the binder here (rather than capturing the start-time scope)
+    /// is what makes the post-declaration rounds, delegated children and the
+    /// shared admission check all bill the same owner the goal will reconcile.
+    pub(crate) fn model_budget_scope(&self) -> Option<String> {
+        self.goal_binder
+            .as_ref()
+            .and_then(|binder| binder.bound())
+            .map(|goal| goal.to_string())
+            .or_else(|| self.budget_scope.clone())
+    }
+
     pub(crate) fn with_background_tasks(
         mut self,
         tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
@@ -2698,7 +2767,8 @@ impl Executor {
         {
             return Ok(None);
         }
-        let (Some((store, session)), Some(scope)) = (&self.model_request_store, &self.budget_scope)
+        let (Some((store, session)), Some(scope)) =
+            (&self.model_request_store, self.model_budget_scope())
         else {
             return Ok(None);
         };
@@ -2706,7 +2776,7 @@ impl Executor {
             ProgressLedger::default(),
             store.as_ref(),
             session,
-            scope,
+            &scope,
         )
         .await
         .map(Some)

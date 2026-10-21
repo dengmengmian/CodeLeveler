@@ -97,3 +97,29 @@
 - 固定成本是 Goal 工具面的 +215 tokens，且随 prefix cache 摊销。
 
 代价换来的不是“更强制的模型行为”，而是**运行时能准确判断自己是否被要求继续、以及模型的完成声明是否有可核对依据**。
+
+## Final Hardening（2026-10-21）
+
+本轮修复不增加模型调用，只增加持久化写入：
+
+| 路径 | 额外成本 |
+|---|---|
+| Chat → Goal 升级 | 绑定事务后 1 次 `UPDATE model_requests`（移动本窗口的行）+ 1 条 `progress_updated`（换 scope 时） |
+| Resume 预算迁移 | 1 次扫描该会话的 turn payload；每个已绑定该 goal 的 Chat 窗口 1 次 `UPDATE`（幂等，通常 0–1 行） |
+| Goal 创建窗口 | 无声明时 1 次 `set_pending_goal_if_absent`；TurnStart 仍是 1 个事务（多 1 条 UPDATE） |
+| 崩溃恢复 | 复用既有 turn/goal 行；DF-13 恢复后只执行 1 个 Goal turn |
+
+DF-10（真实 DeepSeek，本轮最终二进制）：
+
+| 指标 | 值 |
+|---|---:|
+| Model rounds | 5（另 1 次 prompt suggestion） |
+| Input / Output / Cached | 42,120 / 622 / 28,928 |
+| Reasoning tokens | 162 |
+| Cost | 6,023 micro-USD ≈ $0.006 |
+| Wall time | 22.2s |
+| Compaction / Resume / 重复执行 | 0 / 0 / 0 |
+
+DF-12（PTY + 真实 SQLite）：升级窗口 2 条 main-round 行，估计 token 8,358 / 9,296，
+两条 `budget_scope` 都是同一个 goal id；没有额外模型请求。DF-13：1 个 goal、2 个
+turn、0 次重复执行。

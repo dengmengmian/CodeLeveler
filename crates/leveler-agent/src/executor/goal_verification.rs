@@ -20,7 +20,7 @@
 
 /// One command execution the runtime observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VerificationRun {
+pub struct VerificationRun {
     /// The command as executed (`go test ./...`, `sh verify.sh`).
     pub label: String,
     /// The tool did not report an error (for a command, exit 0).

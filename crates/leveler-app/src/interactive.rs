@@ -464,7 +464,13 @@ pub(crate) fn collaboration_routes_submit_to_goal(collaboration: &str) -> bool {
 /// A `failed` run is resumable only when the runtime typed the failure as a
 /// recoverable provider/network fault — a schema defect, a protocol violation
 /// or an internal invariant has no repaired path that another model round
-/// follows. `blocked` is a terminal statement the model made about the goal.
+/// follows.
+///
+/// `blocked` is a statement about one work window, not a verdict on the
+/// user's intent: the goal is still owed, so `继续` re-enters the same
+/// recorded goal as a retry (the original objective is the resume lineage's
+/// objective, never the continuation word). An explicitly cancelled task
+/// stays terminal — retrying it would reopen work the user ended.
 ///
 /// `completed` is resumable **only** when the durable stop reason was
 /// [`leveler_lifecycle::StopReason::Answered`]: a turn that ended with an
@@ -494,20 +500,26 @@ pub(crate) fn task_outcome_is_resumable(
         // terminal (a declared `completed` stop, or a legacy row with no stop)
         // is one.
         TaskOutcome::Completed => stop == Some(StopReason::Answered),
-        TaskOutcome::Blocked | TaskOutcome::Cancelled => false,
+        // A blocked goal still owes its work. `继续` retries that same goal;
+        // the alternative — treating it as an ordinary goal-mode message —
+        // opens a second goal whose objective is the word the user typed,
+        // which loses the original intent on the exact path they chose to
+        // resume it.
+        TaskOutcome::Blocked => true,
+        TaskOutcome::Cancelled => false,
     }
 }
 
 /// What a continuation intent means for a session's persisted terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContinuationState {
-    /// An interrupted or recoverable-failed task with a transcript to rebuild
-    /// from. A `继续` resumes it.
+    /// An interrupted, budget-stopped, blocked or recoverably-failed task
+    /// with a transcript to rebuild from. A `继续` resumes it.
     Resumable,
     /// The user explicitly cancelled the task. A `继续` must not reopen it.
     Cancelled,
-    /// Nothing to resume: completed, blocked, non-recoverably failed, already
-    /// running, or no terminal at all. A `继续` is an ordinary message.
+    /// Nothing to resume: completed, non-recoverably failed, already running,
+    /// or no terminal at all. A `继续` is an ordinary message.
     NotResumable,
 }
 
@@ -1814,6 +1826,34 @@ impl InProcessRuntimeClient {
             .map_err(|error| ClientError::Runtime(error.to_string()))
     }
 
+    /// Enter Goal mode and record the declaration in one durable write.
+    ///
+    /// The Goal axis without an objective is a state no client can explain
+    /// and no recovery can repair; this is the only writer for `/goal <task>`.
+    async fn persist_goal_declaration(
+        &self,
+        session_id: &SessionId,
+        objective: &str,
+    ) -> Result<(), ClientError> {
+        let _projection_guard = self.settings_edits.lock().await;
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        // Store the objective trimmed: the bind step compares this exact
+        // text, and surrounding whitespace would make the CAS miss.
+        SessionRepository::new(&db)
+            .set_goal_declaration(
+                session_id,
+                leveler_lifecycle::CollaborationMode::Goal.as_str(),
+                objective.trim(),
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))
+    }
+
     async fn persist_runtime_config(
         &self,
         session_id: &SessionId,
@@ -3007,17 +3047,17 @@ impl InProcessRuntimeClient {
             return self.steer_into_goal(session_id, content).await;
         }
         let config = self.runtime_config(&session_id).await?;
-        if config.collaboration != leveler_lifecycle::CollaborationMode::Goal.as_str() {
-            self.persist_turn_collaboration(
-                &session_id,
-                leveler_lifecycle::CollaborationMode::Goal.as_str(),
-            )
-            .await?;
-            if let Ok(session) = self.snapshot(&session_id).await {
-                let _ = self
-                    .events_for(&session_id)
-                    .send(RuntimeEvent::SessionUpdated { session });
-            }
+        let axis_changed =
+            config.collaboration != leveler_lifecycle::CollaborationMode::Goal.as_str();
+        // The axis and the declaration are one durable fact. Writing the axis
+        // first and leaving the text in this process's memory is the window
+        // this closes: a crash there used to leave a Goal session whose
+        // objective had never been persisted anywhere.
+        self.persist_goal_declaration(&session_id, &content).await?;
+        if axis_changed && let Ok(session) = self.snapshot(&session_id).await {
+            let _ = self
+                .events_for(&session_id)
+                .send(RuntimeEvent::SessionUpdated { session });
         }
         let config = self.runtime_config(&session_id).await?;
         let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
@@ -3038,11 +3078,15 @@ impl InProcessRuntimeClient {
         session_id: SessionId,
         task: String,
     ) -> Result<(), ClientError> {
-        self.persist_turn_collaboration(
-            &session_id,
-            leveler_lifecycle::CollaborationMode::Goal.as_str(),
-        )
-        .await?;
+        // The durable form and the in-memory copy must be byte-identical:
+        // the executor consumes the durable declaration by compare-and-swap
+        // on this text.
+        let task = task.trim().to_string();
+        // Durable before in-memory: if this process dies before the running
+        // executor drains the declaration, the session's Goal axis and its
+        // objective are still one consistent pair on disk, and the next Goal
+        // turn adopts it.
+        self.persist_goal_declaration(&session_id, &task).await?;
         {
             let goal = self.goal_state_for(&session_id);
             let mut goal = goal
@@ -4878,15 +4922,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 content,
             } => {
-                let mut config = self.runtime_config(&session_id).await?;
-                config.collaboration = "goal".into();
-                self.persist_turn_collaboration(&session_id, &config.collaboration)
-                    .await?;
                 let goal = if content.trim().is_empty() {
                     "Execute the confirmed plan".to_string()
                 } else {
                     content
                 };
+                self.persist_goal_declaration(&session_id, &goal).await?;
                 let config = self.runtime_config(&session_id).await?;
                 let cancel = self.stage_turn(&session_id, &goal, false, 0).await?;
                 let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
@@ -7738,11 +7779,10 @@ mod resumable_task_tests {
             task_outcome_is_resumable(&TaskOutcome::Completed, Some(StopReason::Answered), None),
             "an answered terminal is not a proven completion"
         );
-        assert!(!task_outcome_is_resumable(
-            &TaskOutcome::Blocked,
-            Some(StopReason::Blocked),
-            None
-        ));
+        assert!(
+            task_outcome_is_resumable(&TaskOutcome::Blocked, Some(StopReason::Blocked), None),
+            "a blocked goal is retryable through its own recorded objective"
+        );
     }
 
     #[test]
