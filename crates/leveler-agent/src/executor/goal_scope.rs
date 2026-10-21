@@ -826,11 +826,16 @@ fn collect_enumerations(
         && ideographic.len() < 2
         && has_any(head, DELIVERY_VERBS)
     {
+        // Chinese lists use `、`, not commas. A Chinese comma after a colon
+        // is a sequence ("先创建 A，再运行 B，完成前不要结束"), not an
+        // enumeration; reading it as one manufactures requirements out of
+        // instructions.
         let comma_items: Vec<&str> = tail.split([',', '，']).collect();
         if (2..=6).contains(&comma_items.len())
             && comma_items.iter().all(|item| {
                 let item = item.trim();
-                item.chars().count() <= 40
+                item.is_ascii()
+                    && item.chars().count() <= 40
                     && item.split_whitespace().count() <= 4
                     && !item.contains(['(', ')', '（', '）'])
                     && !item.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -1468,6 +1473,29 @@ mod tests {
                 text.contains("add(") || text.contains("mul(") || text.contains("slugify(")
             }),
             "function signatures are not deliverables: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_chinese_comma_sequence_is_not_an_enumeration() {
+        let requirements = extract(
+            "分两阶段完成这个任务：先创建 stage-1.txt，再运行 sh ./verify.sh，\
+             完成前不要结束。",
+            &[],
+        );
+        let found = texts(&requirements);
+        assert!(found.contains(&"stage-1.txt"), "{found:?}");
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.text == "./verify.sh" && requirement.kind == RequirementKind::Command
+            }),
+            "{requirements:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|text| text.contains("不要") || text.contains("结束")),
+            "a sequence instruction is not a deliverable: {found:?}"
         );
     }
 
