@@ -204,14 +204,15 @@ pub(crate) const COMMIT_TASK_TOOL: &str = "commit_task";
 pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Declare that the user's request is an execution task this turn must carry \
-            to completion, and commit the turn to the task lifecycle. Call this when the \
-            user explicitly asked you to perform work (implement, fix, migrate, test) \
-            that is larger than one short pass — several stages, phases, components or \
-            files, or an explicit instruction to finish everything before stopping — or \
-            when you are about to end the turn while explicitly requested work is still \
-            unfinished. Do NOT call it for a \
-            question, an explanation, a discussion, or when the user asked you not to \
-            modify anything; do not use it to enlarge the request. `objective` is the \
+            to completion, and commit the turn to the task lifecycle. Call this before the \
+            first edit when the user explicitly asked you to perform work (implement, fix, \
+            migrate, test) AND the request names two or more deliverables (files, modules, \
+            stages, endpoints, components), or told you to finish everything before stopping, \
+            or when you are about to end the turn while explicitly requested work is still \
+            unfinished. Call it even if you expect to finish in this turn: the commitment is \
+            what keeps the turn alive if the work outlasts it. Do NOT call it for a \
+            question, an explanation, a discussion, a single small fix, or when the user asked \
+            you not to modify anything; do not use it to enlarge the request. `objective` is the \
             user's stated end state, not a narrower version of it. `acceptance` lists \
             the concrete checks that will prove it. After the commit, the runtime keeps \
             this turn running: a stage summary or a quiet end does NOT finish the task. \
@@ -246,17 +247,17 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
 /// the model declares the commitment with `commit_task`, and every behavior
 /// change follows that durable fact. Kept as a constant so its prompt cost is
 /// measured, not guessed.
-pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK DELEGATION: when the user explicitly asks you to carry out work \
-     to completion (implement, fix, migrate, test) and the work is larger than \
-     one short pass, call `commit_task` before starting, with the objective as \
-     the user stated it and the checks that will prove it. A request that names \
-     several stages, phases, components or files, or asks you to finish \
-     everything before stopping, is larger than one short pass. If you are \
-     about to end this turn while explicitly requested work is still unfinished, \
-     call `commit_task` instead of summarizing what remains. Do not call it for a \
-     question, an explanation, a discussion, or when the user asked you not to \
-     modify anything. Once committed, the runtime keeps the turn running until \
-     update_goal resolves the task.";
+pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK DELEGATION: if the user explicitly asks you to carry out work \
+     to completion (implement, fix, migrate, test) and the request names two or more \
+     deliverables (files, modules, stages, endpoints, components) or says to finish \
+     everything before stopping, call `commit_task` before the first edit — even if you \
+     expect to finish this turn; the commitment keeps the turn alive if the work outlasts \
+     it. Use the objective as the user stated it and the checks that will prove it. If you \
+     are already mid-task and about to end while requested work is unfinished, call \
+     `commit_task` instead of summarizing what remains. Do not call it for a question, an \
+     explanation, a discussion, a single small fix, or when the user asked you not to modify \
+     anything. Once committed, the runtime keeps the turn running until update_goal resolves \
+     the task.";
 
 /// The name of the injected request-permissions tool.
 pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
