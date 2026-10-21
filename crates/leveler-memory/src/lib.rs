@@ -2273,6 +2273,86 @@ mod safety_tests {
         candidate
     }
 
+    fn observation_experience(
+        subject: &str,
+        body: &str,
+        observation: &str,
+    ) -> crate::MemoryCandidate {
+        let record = crate::ExperienceRecord {
+            category: crate::ExperienceCategory::EnvironmentConstraint,
+            verification: crate::ExperienceVerification::Verified,
+            applies_when: "running the project verification script".to_string(),
+            invalid_if: Some("the verification script or executor changes".to_string()),
+            evidence: vec![crate::ExperienceEvidence {
+                kind: "observation".to_string(),
+                reference: observation.to_string(),
+            }],
+        };
+        let key = crate::semantic_key_of(subject);
+        let mut candidate = crate::MemoryCandidate::new(
+            "verification script is silent",
+            body,
+            crate::CandidateKind::Free,
+            Some(key.clone()),
+            crate::CandidateSource::RuntimeObserved,
+            vec![
+                "experience".to_string(),
+                "category:environment_constraint".to_string(),
+                format!("subject:{subject}"),
+            ],
+        )
+        .unwrap();
+        candidate.semantic_key = Some(key);
+        candidate.authority = crate::MemoryAuthority::ToolObservation;
+        candidate.evidence = Some(format!("task turn-1; {observation}"));
+        candidate.experience = Some(record);
+        candidate
+    }
+
+    /// An observation-only record verifies a fact, not the model's advice. A
+    /// later claim under the same identity can read the same output the other
+    /// way; silently replacing the safe lesson would make the wrong reading the
+    /// only current truth. The person decides.
+    #[test]
+    fn a_later_claim_cannot_silently_replace_an_observation_only_lesson() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let safe_body = "verify.sh exits 0 with no output; do not treat the exit status as proof; inspect the receipt.";
+        let outcome = store
+            .admit_experience_candidate(observation_experience(
+                "verify.script",
+                safe_body,
+                "step 1: ./verify.sh exited 0 with no output",
+            ))
+            .unwrap();
+        assert!(matches!(outcome, crate::AgentAdmitOutcome::Applied(_)));
+
+        let wrong = verified_experience(
+            "verify.script",
+            "verify.sh exits 0 with no output; treat the exit status as the success signal and rely on it.",
+            "./verify.sh --engine current (exit 0)",
+        );
+        let outcome = store.admit_experience_candidate(wrong).unwrap();
+        let crate::AgentAdmitOutcome::Queued { candidate, .. } = outcome else {
+            panic!("an observation-only lesson must not be silently replaced: {outcome:?}");
+        };
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0]
+                .body
+                .contains("do not treat the exit status as proof"),
+            "the safe observation-only lesson must remain current: {active:?}"
+        );
+
+        // A person may choose the later reading.
+        let accepted = store.accept(&candidate.id).unwrap();
+        assert!(accepted.body.contains("success signal"));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, accepted.id);
+    }
+
     #[test]
     fn a_verified_experience_is_neither_a_preference_nor_a_catalog_entry() {
         let dir = tempfile::tempdir().unwrap();
