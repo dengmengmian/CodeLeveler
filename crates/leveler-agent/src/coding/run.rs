@@ -2348,6 +2348,19 @@ impl CodingRuntime {
                 }
                 amendment.push_str(&format!("[{image_count} image attachment(s)]"));
             }
+            // The user's own continuation text is scope authority. Persist it
+            // with the goal BEFORE the turn runs: a compaction or crash must
+            // not resurrect a requirement the user has already waived, nor
+            // lose one they added.
+            if !amendment.is_empty()
+                && let Some(goal_id) = lineage.goal_id.as_ref()
+            {
+                self.engine
+                    .stores
+                    .goals
+                    .append_amendment(&token, goal_id, &amendment)
+                    .await?;
+            }
             lineage.objective.amend(amendment);
         }
         let checkpoint_scope = match (&lineage.kind, lineage.goal_id.as_ref()) {

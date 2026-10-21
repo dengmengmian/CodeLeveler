@@ -25,6 +25,7 @@
 
 ### 修复
 
+- Goal 不能再以比用户请求更窄的 acceptance 完成。`commit_task` 会拒绝漏掉用户明确枚举交付项的 acceptance；`update_goal(complete)` 要求逐项记账，并用执行记录核对具名产物与命令。用户自己写下的后续豁免会移除对应要求并随 Goal 持久化，因此恢复与压缩既不会复活也不会抹掉范围
 - 敏感校验覆盖所有写入路径的 title、body、tags 与 provenance evidence
 - forget、supersede、expiry 在写归档前脱敏敏感内容；非敏感记录保持原样
 - CLI、TUI、Web 投影、通知与日志不再打印历史敏感条目的标题或正文；客户端只收到脱敏占位和 `sensitive` 标记

@@ -147,7 +147,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             actually ran, one per line in `detail` (checked against the \
             runtime's execution record, after your last change), or \
             `not_applicable` with the reason in `detail`. A failed test or \
-            build cannot be closed as complete.",
+            build cannot be closed as complete. When the user enumerated \
+            deliverables or required tests, `requirements` must account for \
+            every one; a missing or `not_done` requirement refuses completion. \
+            `unverifiable` marks delivered work the runtime cannot prove, not \
+            work you skipped.",
     );
     ToolDefinition {
         name: UPDATE_GOAL_TOOL.to_string(),
@@ -182,6 +186,30 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                         }
                     },
                     "required": ["status", "detail"]
+                },
+                "requirements": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "description": "For complete: one entry per explicitly enumerated user requirement.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement": {
+                                "type": "string",
+                                "description": "The user's words for it."
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["done", "not_done", "unverifiable"]
+                            },
+                            "evidence": {
+                                "type": "string",
+                                "description": "What proves it, or why it has no mechanical check."
+                            }
+                        },
+                        "required": ["requirement", "status", "evidence"],
+                        "additionalProperties": false
+                    }
                 }
             },
             "required": ["status", "summary"]
@@ -234,7 +262,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                     "items": {"type": "string"},
                     "minItems": 1,
                     "maxItems": 20,
-                    "description": "Concrete checks that will prove the objective: test/build commands, observable behavior, or required files and interfaces."
+                    "description": "Concrete checks that will prove the objective. Every deliverable the user enumerated needs its own check; a commit that drops one is refused."
                 }
             },
             "required": ["objective", "acceptance"],

@@ -314,6 +314,66 @@ pub(crate) fn is_verification_command(label: &str) -> bool {
     false
 }
 
+/// Whether a command actually runs a test suite.
+///
+/// Narrower than [`is_verification_command`]: a build, a type-check or a lint
+/// is verification, but it is not the test suite the user asked to pass.
+/// Deliberately mechanical and conservative; an unrecognised runner simply
+/// does not satisfy a test requirement.
+pub(crate) fn is_test_command(label: &str) -> bool {
+    const TEST_TARGETS: &[&str] = &[
+        "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
+    ];
+    for segment in label.split([';', '&', '|', '\n']) {
+        let words: Vec<&str> = segment
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+            .filter(|word| !word.is_empty())
+            .collect();
+        let Some(first) = words.first().copied() else {
+            continue;
+        };
+        let second = words.get(1).copied().unwrap_or("");
+        let basename = first.rsplit('/').next().unwrap_or(first);
+        let matches = match basename {
+            "go" => second == "test",
+            "cargo" => second == "test" || (second == "nextest" && words.get(2) == Some(&"run")),
+            "npm" | "pnpm" | "yarn" | "bun" | "deno" => {
+                second == "test"
+                    || (second == "run"
+                        && words
+                            .get(2)
+                            .is_some_and(|word| matches!(*word, "test" | "tests")))
+            }
+            "make" | "just" | "bazel" | "mvn" | "gradle" | "dotnet" | "swift" | "flutter"
+            | "dart" | "mix" => words.iter().skip(1).any(|word| TEST_TARGETS.contains(word)),
+            "pytest" | "phpunit" | "ctest" => true,
+            "python" | "python3" | "py" => words
+                .windows(2)
+                .any(|pair| pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")),
+            "node" => words.iter().skip(1).any(|word| *word == "--test"),
+            "sh" | "bash" | "zsh" | "pwsh" | "powershell" | "cmd" => {
+                words.iter().skip(1).any(|word| {
+                    let name = word.rsplit('/').next().unwrap_or(word);
+                    TEST_TARGETS.iter().any(|target| name.contains(target))
+                })
+            }
+            _ => {
+                TEST_TARGETS.iter().any(|target| basename.contains(target))
+                    && (basename.ends_with(".sh")
+                        || basename.ends_with(".py")
+                        || basename.ends_with(".ps1")
+                        || basename.ends_with(".bat")
+                        || basename.ends_with(".cmd"))
+            }
+        };
+        if matches {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a command's output says the test runner executed no tests.
 ///
 /// A suite that only skipped, or a runner that found no tests, cannot prove
@@ -577,6 +637,38 @@ mod tests {
             command_label("run_command", &serde_json::json!({"program": "  "})),
             None
         );
+    }
+
+    #[test]
+    fn test_classification_is_narrower_than_verification() {
+        for command in [
+            "cargo test",
+            "cargo test --workspace",
+            "cargo nextest run --workspace",
+            "go test ./...",
+            "npm test",
+            "pnpm run tests",
+            "pytest -q",
+            "python3 -m unittest",
+            "make test",
+            "sh run-tests.sh",
+            "cmd /c run-tests.cmd",
+            "./acceptance-test.sh",
+        ] {
+            assert!(is_test_command(command), "{command}");
+        }
+        for command in [
+            "cargo check",
+            "cargo build",
+            "cargo clippy --all-targets",
+            "go build ./...",
+            "npm run build",
+            "sh verify.sh",
+            "sh ./scripts/check.sh",
+            "grep -rn test src",
+        ] {
+            assert!(!is_test_command(command), "not a test suite: {command}");
+        }
     }
 
     #[test]
