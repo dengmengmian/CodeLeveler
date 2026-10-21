@@ -51,11 +51,15 @@ try {
     third.apply(e3, { ...running, truncated: true, data_base64: btoa('FRESH_OUTPUT') }); await tick(); await tick();
     const buffer = Array.from({ length: e3.term.buffer.active.length }, (_, i) => e3.term.buffer.active.getLine(i)?.translateToString()).join('\n');
     if (buffer.includes('STALE_TEXT') || !buffer.includes('FRESH_OUTPUT')) throw new Error('truncation retained stale terminal state');
+    third.apply(e3, { ...running, output_error: 'terminal output read failed: injected capture fault' });
+    if (e3.status !== 'unknown' || !e3.term.options.disableStdin || !e3.detail.textContent.includes('injected capture fault')) throw new Error('terminal output failure was hidden');
+    third.apply(e3, { status: 'killed', output_error: 'capture fault', next_cursor: 0 });
+    if (e3.status !== 'killed' || !e3.detail.textContent.includes('capture fault')) throw new Error('output diagnostic hid proven process exit');
     await third.close(tab3, session.id);
     for (const item of [controller, second, third]) item.themeObserver.disconnect();
-    return { immediateClose: true, lateObserve: true, unknownWriteNoRetry: true, truncationReset: true };
+    return { immediateClose: true, lateObserve: true, unknownWriteNoRetry: true, truncationReset: true, outputFailureVisible: true };
   });
-  assert.deepEqual(evidence, { immediateClose: true, lateObserve: true, unknownWriteNoRetry: true, truncationReset: true });
+  assert.deepEqual(evidence, { immediateClose: true, lateObserve: true, unknownWriteNoRetry: true, truncationReset: true, outputFailureVisible: true });
   console.log(JSON.stringify(evidence));
 } finally {
   await app.evaluate(({ app }) => app.exit(0)).catch(() => {}); await app.close().catch(() => {});

@@ -2542,3 +2542,21 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .preview-md-image { display: block; max-width: 100%; height: auto; margin: 8px 0; border-radius: 8px; }
 
 .review-scope { flex: none; padding: 4px 10px; border-bottom: .5px solid var(--border-l1); color: var(--text-caption); font-size: 10px; line-height: 15px; }
+
+/* Conversation file references and confirmed edit cards. */
+.markdown-file-link { display: inline-flex; align-items: baseline; gap: 5px; padding: 0 6px; border: .5px solid var(--border-l1); border-radius: 7px; background: var(--inline-code); color: var(--text-link); font-family: var(--font-code); font-size: .9em; line-height: 1.5; overflow-wrap: anywhere; text-align: left; }
+.markdown-file-link > svg { align-self: center; width: 14px; height: 14px; flex: none; }
+.markdown-file-link:hover { background: var(--hover); }
+.answer-files { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 20px 0 16px; }
+.answer-file { display: flex; align-items: center; min-width: 0; padding: 10px; border: .5px solid var(--border-l1); border-radius: 14px; background: var(--bg-layer-1); }
+.answer-file-preview { display: flex; flex: 1; align-items: center; gap: 12px; min-width: 0; padding: 0; text-align: left; }
+.answer-file-icon { display: flex; width: 44px; height: 44px; align-items: center; justify-content: center; flex: none; border-radius: 10px; background: var(--bg-layer-0); border: .5px solid var(--border-l1); }
+.answer-file-icon svg { width: 26px; height: 26px; }
+.answer-file-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.answer-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; color: var(--text-primary); font-weight: 500; }
+.answer-file-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-tertiary); }
+.answer-file-open { flex: none; margin-left: 8px; }
+.message-actions { align-items: center; margin-top: 10px; }
+.message-actions .message-time { font-size: 11px; margin: 0 6px; }
+.message.assistant .message-actions { margin-top: 12px; }
+@media (max-width: 760px) { .answer-files { grid-template-columns: minmax(0, 1fr); } }

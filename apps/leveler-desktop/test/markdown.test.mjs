@@ -34,7 +34,7 @@ test('raw HTML, event handlers, SVG, image URLs and malicious links never create
 });
 test('links are inert readable text with only HTTP(S) destinations attached as text metadata',()=>{
  const root=render('[docs](https://example.com/docs) [file](file:///secret) [custom](leveler-desktop://desktop/)');
- const links=tags(root,'span').filter(n=>n.attributes.class==='markdown-link');assert.equal(links.length,1);assert.equal(links[0].attributes.title,'https://example.com/docs');assert.match(root.textContent,/docs/);assert.match(root.textContent,/file/);
+ const links=tags(root,'span').filter(n=>n.attributes.class?.split(' ').includes('markdown-link'));assert.equal(links.length,1);assert.equal(links[0].attributes.title,'https://example.com/docs');assert.match(root.textContent,/docs/);assert.match(root.textContent,/file/);
  assert.equal(tags(root,'a').length,0);
 });
 test('entities render as text rather than activating markup and updates replace old content',()=>{
@@ -52,7 +52,7 @@ test('HTTP(S) links invoke an explicit callback only on activation; unsafe desti
 
 test('workspace-relative file links are recognized without turning escapes into links',()=>{
  const root=render('[src](src/main.ts#L24) [readme](README.md) [abs](/etc/passwd) [up](../../secret.ts) [space](my%20file.ts) [protocol](file:///secret)');
- const links=tags(root,'span').filter(n=>n.attributes.class==='markdown-link');
+ const links=tags(root,'span').filter(n=>n.attributes.class?.split(' ').includes('markdown-link'));
  assert.deepEqual(links.map(n=>n.attributes.title),['src/main.ts#L24','README.md','my%20file.ts']);
 });
 test('local markdown images become inert placeholders carrying only a workspace path',()=>{
@@ -61,4 +61,18 @@ test('local markdown images become inert placeholders carrying only a workspace 
  assert.equal(images.length,1);
  assert.equal(images[0].attributes['data-src'],'pixel.png');
  assert.equal(tags(root,'img').length,0);
+});
+
+test('local references are chips; inline code becomes a chip only with confirmed file evidence',()=>{
+ const opened=[];const root=new Node('div');
+ renderMarkdown(root,'[Readme](README.md) `src/util.ts` `imaginary.ts` `add(a, b)`',{onLink:path=>opened.push(path),filePaths:new Set(['src/util.ts'])});
+ const chips=tags(root,'button').filter(n=>n.attributes.class?.includes('markdown-file-link'));
+ assert.deepEqual(chips.map(n=>n.attributes.title),['README.md','src/util.ts']);
+ chips[1].listeners.click();assert.deepEqual(opened,['src/util.ts']);
+ assert.equal(tags(root,'code').filter(n=>n.textContent==='imaginary.ts').length,1);
+});
+
+test('encoded file traversal and absolute paths are not clickable references',()=>{
+ const root=render('[escape](%2e%2e/secret.ts) [absolute](%2fetc/secret.ts) [windows](src%5c..%5csecret.ts) [null](src/a%00.ts)');
+ assert.equal(tags(root,'span').filter(n=>n.attributes.class?.includes('markdown-link')).length,0);
 });

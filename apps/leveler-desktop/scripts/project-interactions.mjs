@@ -88,6 +88,16 @@ try {
   await page.waitForFunction(id => window.desktop.snapshot(id).then(snapshot => snapshot.goal === 'Renamed shared task'), firstId);
   await page.waitForFunction(id => document.querySelector(`.session-row[data-session-id="${id}"] .session-title`)?.textContent === 'Renamed shared task', firstId, { timeout: 5000 });
   evidence.rename = (await page.evaluate(id => window.desktop.snapshot(id), firstId)).goal;
+  // The session ··· menu must also enter the header title editor. This path
+  // opens the task first, so it must not be swallowed by the loading guard.
+  await row.hover();
+  await row.locator('.session-more').click();
+  await page.locator('.menu .menu-item').filter({ hasText: '重命名' }).click();
+  await page.locator('#conversation-header .title-input').waitFor({ timeout: 5000 });
+  await page.locator('#conversation-header .title-input').fill('Renamed from menu');
+  await page.locator('#conversation-header .title-input').press('Enter');
+  await page.waitForFunction(id => window.desktop.snapshot(id).then(snapshot => snapshot.goal === 'Renamed from menu'), firstId);
+  evidence.menu_rename = (await page.evaluate(id => window.desktop.snapshot(id), firstId)).goal;
   // Archive hides from the default index; the record stays reachable with
   // the archived filter.
   const archiveRow = page.locator(`.session-row[data-session-id="${secondId}"]`);
@@ -103,6 +113,13 @@ try {
   evidence.archive = true;
   await page.locator('#view-options').click();
   await page.locator('.menu .menu-item').filter({ hasText: '默认（不含归档）' }).first().click();
+  // Forking a sidebar session that is not currently open must open it first;
+  // the runtime rejects fork_session with 'session is not selected' otherwise.
+  await page.locator(`.session-row[data-session-id="${firstId}"]`).hover();
+  await page.locator(`.session-row[data-session-id="${firstId}"] .session-more`).click();
+  await page.locator('.menu .menu-item').filter({ hasText: '分叉会话' }).click();
+  await page.waitForFunction(() => [...document.querySelectorAll('.session-title')].some(node => node.textContent.includes('(分叉)')), null, { timeout: 10000 });
+  evidence.fork_from_sidebar = (await page.evaluate(() => window.desktop.listTasks())).tasks.filter(task => task.title?.includes('(分叉)')).length;
   // Exact code copy from a real assistant markdown response.
   await app.evaluate(async ({ clipboard, ClipboardItem }) => {
     const saved = [];
