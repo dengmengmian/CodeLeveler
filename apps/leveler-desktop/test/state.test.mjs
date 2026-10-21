@@ -305,3 +305,12 @@ test('a re-delivered tool event updates in place instead of adding a row', () =>
   assert.equal(state.tools[0].status, 'success');
   assert.equal(state.tools[0].appliedDiff.split('\n')[1], '+++ b/x.md');
 });
+
+test('a finished command releases the live activity label', () => {
+  let state = projectSnapshot({ id: 's', messages: [], task_status: 'running', pending_interactions: [], active_tools: [] });
+  state = applyEvent(state, { type: 'tool_call_started', id: 't1', name: 'shell_command', arguments: '{"cmd":"git fetch"}' });
+  state = applyEvent(state, { type: 'command_progress', label: 'git fetch --all --prune', elapsed_ms: 3000 });
+  assert.equal(state.activity, 'git fetch --all --prune');
+  state = applyEvent(state, { type: 'tool_call_completed', id: 't1', ok: true, preview: 'done' });
+  assert.equal(state.activity, '');
+});

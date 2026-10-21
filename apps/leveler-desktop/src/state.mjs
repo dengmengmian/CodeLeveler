@@ -84,6 +84,9 @@ function applyToolEvent(state, event) {
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
     if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null}; tools.push(tool);}
     if (event.type === 'tool_call_completed') Object.assign(tool,{status:toolStatusFromOutcome(event.ok,event.stop),preview:event.preview,exit_code:event.exit_code,appliedDiff:event.applied_diff??null});
+    // A finished call no longer owns the live label (TUI clears activity on
+    // the same event); the next progress event or the turn's clock takes over.
+    if (event.type === 'tool_call_completed') return {...state,tools,nextSeq,activity:''};
     else tool.preview = (tool.preview + event.chunk).slice(-16000);
   }
   return {...state,tools,nextSeq};

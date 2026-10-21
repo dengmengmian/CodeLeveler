@@ -236,3 +236,8 @@ test('a compaction summary is assistant prose, never a user bubble', async () =>
   assert.equal(messageKind(summary), 'assistant');
   assert.deepEqual(historyQuestions([summary]), []);
 });
+
+test('a command row names the command the runtime actually ran', async () => {
+  const { toolTarget } = await import('../src/presentation.mjs');
+  assert.equal(toolTarget({ name: 'shell_command', arguments: '{"cmd":"git fetch --all --prune"}' }), 'git fetch --all --prune');
+});

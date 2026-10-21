@@ -2793,7 +2793,11 @@ function turnErrorNode(error) {
 
 function runningLabel() {
   const elapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
-  const base = elapsed >= 1 ? `深度求索中，用时 ${elapsed}s ···` : '深度求索中 ···';
+  const clock = elapsed >= 1 ? `，用时 ${elapsed}s ···` : ' ···';
+  // Commands and other runtime activity own the line while they run; bare
+  // "深度求索中" is only the fallback between activities (TUI precedence).
+  const activity = String(current?.activity ?? '').trim();
+  const base = activity ? `${activity}${clock}` : `深度求索中${clock}`;
   return modelRetry ? `${base} 正在重试模型请求（${modelRetry.attempt}/${modelRetry.max}）` : base;
 }
 
