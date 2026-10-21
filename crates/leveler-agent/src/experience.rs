@@ -57,10 +57,14 @@ pub const MAX_EXPERIENCE_BODY_CHARS: usize = 1_200;
 pub const MAX_EXPERIENCE_SUBJECT_CHARS: usize = 96;
 pub const MAX_EXPERIENCE_CONDITION_CHARS: usize = 400;
 pub const MAX_EXPERIENCE_EVIDENCE_IDS: usize = 8;
-pub const MAX_EXPERIENCE_OUTPUT_TOKENS: u32 = 1_024;
+pub const MAX_EXPERIENCE_OUTPUT_TOKENS: u32 = 2_048;
 /// A background call, like the user-turn extractor: it tolerates a reasoning
 /// model's first-token latency without touching turn latency.
 pub const EXPERIENCE_EXTRACTION_TIMEOUT: Duration = DEFAULT_EXTRACTION_TIMEOUT;
+/// Reasoning tokens count against the output ceiling. A live DeepSeek run hit
+/// 1024 and truncated its JSON, forcing a retry; 2048 still bounds the call
+/// while leaving room for the answer.
+const _: () = assert!(MAX_EXPERIENCE_OUTPUT_TOKENS >= 2_048);
 
 /// One persisted event, reduced to what this module reads.
 #[derive(Debug, Clone, Copy)]
