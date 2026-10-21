@@ -46,6 +46,13 @@ not turn it into a durable rule.\n\
 - A recalled memory records what was true when it was written. It can name a \
 file, flag, or command that is now stale; propose the corrected value under \
 the same subject, or `forget` it when it no longer applies.\n\
+- An entry marked `experience` is a lesson the runtime learned from an earlier \
+task. `verified` means the runtime saw the failure and its resolution; it does \
+not prove the explanation, and it never outranks a user preference or the \
+current code. Apply it only when its `applies_when` holds, re-check before \
+relying on it, and do not skip the verification this task needs because a past \
+task succeeded. Experience entries are not in the catalog; use the `memory` \
+tool to search them when a failure looks familiar.\n\
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

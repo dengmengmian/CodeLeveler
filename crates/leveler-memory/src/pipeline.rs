@@ -106,9 +106,9 @@ impl MemoryStore {
         }
         let outcome = self.commit_candidate(&candidate)?;
         match outcome.operation {
-            AppliedOperation::Created
-            | AppliedOperation::Superseded
-            | AppliedOperation::Merged => Ok(AgentAdmitOutcome::Applied(outcome)),
+            AppliedOperation::Created | AppliedOperation::Superseded | AppliedOperation::Merged => {
+                Ok(AgentAdmitOutcome::Applied(outcome))
+            }
             AppliedOperation::Skipped => Ok(AgentAdmitOutcome::NotStored {
                 reason: outcome
                     .skipped_reason
@@ -123,6 +123,57 @@ impl MemoryStore {
                         Ok(AgentAdmitOutcome::Queued { candidate, reason })
                     }
                     ProposeOutcome::AlreadyPending(candidate) => {
+                        Ok(AgentAdmitOutcome::Queued { candidate, reason })
+                    }
+                    ProposeOutcome::Suppressed { .. } => Ok(AgentAdmitOutcome::NotStored {
+                        reason: format!("{reason}; this value was rejected before"),
+                    }),
+                    ProposeOutcome::AlreadyActive { id } => Ok(AgentAdmitOutcome::NotStored {
+                        reason: format!("{reason}; memory {id} already states it"),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Admit a candidate the runtime extracted from structured execution facts.
+    ///
+    /// This is NOT the model's `remember` tool. The candidate must carry the
+    /// structured experience record, and its authority may not exceed what a
+    /// tool observation can establish. It runs through the same lifecycle as
+    /// every other write: a verified experience may become current, while an
+    /// unverified one or a conflict with another kind is parked for consent.
+    pub fn admit_experience_candidate(
+        &self,
+        candidate: MemoryCandidate,
+    ) -> Result<AgentAdmitOutcome, MemoryError> {
+        crate::candidates::validate_candidate(&candidate)?;
+        let experience = candidate.experience.as_ref().ok_or_else(|| {
+            MemoryError::Invalid("an experience candidate needs its evidence record".to_string())
+        })?;
+        crate::validate_experience_record(experience)?;
+        if candidate.authority.rank() > MemoryAuthority::ToolObservation.rank() {
+            return Err(MemoryError::Invalid(
+                "an experience cannot claim authority above a tool observation".to_string(),
+            ));
+        }
+        let outcome = self.commit_candidate(&candidate)?;
+        match outcome.operation {
+            AppliedOperation::Created | AppliedOperation::Superseded | AppliedOperation::Merged => {
+                Ok(AgentAdmitOutcome::Applied(outcome))
+            }
+            AppliedOperation::Skipped => Ok(AgentAdmitOutcome::NotStored {
+                reason: outcome
+                    .skipped_reason
+                    .unwrap_or_else(|| "nothing to store".into()),
+            }),
+            AppliedOperation::NeedsApproval => {
+                let reason = outcome
+                    .skipped_reason
+                    .unwrap_or_else(|| "a person must settle this experience".into());
+                match self.propose(candidate)? {
+                    ProposeOutcome::Pending(candidate)
+                    | ProposeOutcome::AlreadyPending(candidate) => {
                         Ok(AgentAdmitOutcome::Queued { candidate, reason })
                     }
                     ProposeOutcome::Suppressed { .. } => Ok(AgentAdmitOutcome::NotStored {
@@ -284,12 +335,20 @@ impl MemoryStore {
         // BOTH the acceptance and the source that originally proposed it.
         let proposed_as = candidate.source.as_str().to_string();
         let prior_evidence = candidate.evidence.clone();
-        candidate.authority = crate::lifecycle::MemoryAuthority::ExplicitUser;
+        let prior_authority = candidate.authority;
+        // Consent is a person's decision to keep the entry. It is not new
+        // evidence: accepting a hypothesis cannot turn it into a verified
+        // experience, and an unverified experience must stay labelled as one.
+        candidate.authority = if candidate.experience.is_some() {
+            prior_authority
+        } else {
+            crate::lifecycle::MemoryAuthority::ExplicitUser
+        };
         candidate.source = crate::candidates::CandidateSource::UserAccepted;
         candidate.evidence = Some(match prior_evidence {
-            Some(evidence) => format!(
-                "accepted pending {id}; proposed as {proposed_as}; {evidence}"
-            ),
+            Some(evidence) => {
+                format!("accepted pending {id}; proposed as {proposed_as}; {evidence}")
+            }
             None => format!("accepted pending {id}; proposed as {proposed_as}"),
         });
         let outcome = self.apply_candidate_locked(&candidate, &now_rfc3339())?;
@@ -633,12 +692,7 @@ mod pipeline_tests {
         assert_eq!(store.list_pending_raw().unwrap().len(), 1);
 
         store
-            .activate(
-                "默认模型",
-                body,
-                crate::MemoryKind::Preference,
-                Vec::new(),
-            )
+            .activate("默认模型", body, crate::MemoryKind::Preference, Vec::new())
             .unwrap();
         assert_eq!(store.list_pending_raw().unwrap().len(), 0);
     }
@@ -683,7 +737,10 @@ mod pipeline_tests {
             let accepted = accept.join().unwrap();
             let rejected = reject.join().unwrap();
             assert_ne!(accepted, rejected, "exactly one decision wins");
-            assert_eq!(store.effective_active().unwrap().len(), usize::from(accepted));
+            assert_eq!(
+                store.effective_active().unwrap().len(),
+                usize::from(accepted)
+            );
             assert!(store.list_pending().unwrap().is_empty());
         }
     }
@@ -794,11 +851,7 @@ mod pipeline_tests {
         // A legacy direct write predates identity tracking, so it has no key.
         // `activate` itself now establishes one from a durable assignment;
         // place this historical fixture directly.
-        let mut legacy = crate::new_entry(
-            "旧默认模型",
-            "以后本项目默认模型固定为 Pro",
-            Vec::new(),
-        );
+        let mut legacy = crate::new_entry("旧默认模型", "以后本项目默认模型固定为 Pro", Vec::new());
         legacy.kind = Some("preference".into());
         legacy.provenance = Some(crate::Provenance {
             authority: crate::MemoryAuthority::ExplicitUser,

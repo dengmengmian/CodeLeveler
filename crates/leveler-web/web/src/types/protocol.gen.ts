@@ -475,7 +475,7 @@ export type RuntimeEvent =
   /** Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`]. */
   | { type: 'memory_status'; query_id?: CommandId | null; status: UiMemoryStatus }
   /** The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies. */
-  | { type: 'memory_recalled'; count: number; ids: string[] }
+  | { type: 'memory_recalled'; count: number; experience_count?: number; ids: string[] }
   /** A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body. */
   | { type: 'memory_changed'; authority?: string | null; id: string; operation: string; title: string }
   /** Side-question (`/btw`) started; not persisted to session history. */
@@ -944,6 +944,20 @@ export interface UiMemoryEntry {
   title: string;
 }
 
+/** The outcome of one experience extraction. Counts only; `reason` is a stable skip class, never entry text or provider output. */
+export interface UiMemoryExperience {
+  accepted: number;
+  at: string;
+  created: number;
+  /** `extracted` | `skipped` */
+  outcome: string;
+  pending: number;
+  reason?: string | null;
+  rejected: number;
+  skipped: number;
+  updated: number;
+}
+
 export interface UiMemoryExtraction {
   accepted: number;
   at: string;
@@ -966,12 +980,28 @@ export type UiMemoryKind =
   /** Reachable by query recall and the catalog, never auto-injected. */
   | 'decision'
   /** Same reach as a decision. */
-  | 'note';
+  | 'note'
+  /** Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog. */
+  | 'experience';
 
 /** Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error. */
 export interface UiMemoryStatus {
   active: number;
   archived: number;
+  /** Active agent experiences, split by the evidence class the runtime derived. An unverified experience is a parked hypothesis; it is never counted as verified. */
+  experience_active?: number;
+  /** Experience rows retired by supersede/expiry/forget. */
+  experience_archived?: number;
+  experience_inbox_failed_retryable?: number;
+  /** The experience lane's durable queue, kept separate from the user-turn inbox so "no lesson" and "not extracted yet" are distinguishable. */
+  experience_inbox_pending?: number;
+  experience_inbox_processed?: number;
+  experience_inbox_processing?: number;
+  experience_next_retry_at?: string | null;
+  /** Experience candidates awaiting a person. */
+  experience_pending?: number;
+  experience_unverified?: number;
+  experience_verified?: number;
   /** Sums over the retained processed window. */
   extraction_totals: UiMemoryExtractionTotals;
   inbox_failed_retryable: number;
@@ -980,6 +1010,8 @@ export interface UiMemoryStatus {
   inbox_processing: number;
   /** Sanitized class of the oldest retry's error. */
   last_error?: string | null;
+  /** The most recent settled experience extraction, if any. */
+  last_experience?: UiMemoryExperience | null;
   /** The most recent completed batch, if any. */
   last_extraction?: UiMemoryExtraction | null;
   /** Due time of the oldest retry, when one is waiting. */

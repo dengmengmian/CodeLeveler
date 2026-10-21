@@ -17,6 +17,7 @@ pub mod capability;
 mod child_profile;
 pub mod coding;
 pub mod executor;
+pub mod experience;
 mod injected_tools;
 mod memory_extract;
 mod nudges;
@@ -36,6 +37,12 @@ pub use executor::{
     CompactionCheckpoint, ContinuationPolicy, DriveAborted, Executor, NoopSink, SteeringSource,
     StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy,
     auxiliary_budget_available, closeout,
+};
+pub use experience::{
+    ExperienceCandidate, ExperienceEvent, ExperienceEvidencePack, ExperienceExtraction,
+    ExperienceExtractor, ExperienceRejection, ExperienceRun, ModelExperienceExtractor,
+    ValidatedExperiences, build_evidence_pack, experience_system_prompt,
+    parse_experience_candidates, validate_experience_candidate, validate_experience_candidates,
 };
 pub use leveler_agent_core::{
     BudgetDimension, BudgetExhaustion, DEFAULT_MODEL_STEP_CEILING, ModelStepLimits,

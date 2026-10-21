@@ -1869,6 +1869,13 @@
           "enum": [
             "note"
           ]
+        },
+        {
+          "description": "Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog.",
+          "type": "string",
+          "enum": [
+            "experience"
+          ]
         }
       ]
     },

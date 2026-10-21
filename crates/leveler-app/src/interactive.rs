@@ -222,6 +222,11 @@ fn pending_entries(
         .into_iter()
         .map(|mut c| {
             let sensitive = leveler_memory::is_sensitive_candidate(&c);
+            let kind = if c.experience.is_some() {
+                leveler_memory::EXPERIENCE_KIND.to_string()
+            } else {
+                format!("{:?}", c.kind).to_lowercase()
+            };
             if sensitive {
                 leveler_memory::redact_candidate(&mut c);
             }
@@ -229,7 +234,7 @@ fn pending_entries(
                 id: c.id,
                 title: c.title,
                 body: c.body,
-                kind: format!("{:?}", c.kind).to_lowercase(),
+                kind,
                 source: c.source.as_str().to_string(),
             }
         })
@@ -302,6 +307,7 @@ fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::U
             MemoryKind::Preference => Some(UiMemoryKind::Preference),
             MemoryKind::Decision => Some(UiMemoryKind::Decision),
             MemoryKind::Note => Some(UiMemoryKind::Note),
+            MemoryKind::Experience => Some(UiMemoryKind::Experience),
             // Legacy and derived entries have no product kind to claim.
             MemoryKind::LegacyUnknown | MemoryKind::Derived => None,
         },
@@ -5079,6 +5085,18 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     UiMemoryKind::Preference => leveler_memory::MemoryKind::Preference,
                     UiMemoryKind::Decision => leveler_memory::MemoryKind::Decision,
                     UiMemoryKind::Note => leveler_memory::MemoryKind::Note,
+                    // An experience needs the structured evidence a task
+                    // records. A hand-typed /remember has none, and storing it
+                    // as one would claim a verification that never happened.
+                    UiMemoryKind::Experience => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message:
+                                "经验条目由已完成任务的运行证据自动生成，不能用 /remember 直接写入"
+                                    .to_string(),
+                        });
+                        return Ok(());
+                    }
                 };
                 // The title is derived HERE, once, so TUI / Web / CLI cannot
                 // drift into three conventions. Never model-generated.

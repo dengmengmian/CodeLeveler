@@ -864,11 +864,17 @@ impl EventBridge {
                 let plan = ui_plan(steps);
                 let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
             }
-            EngineEvent::MemoryRecalled { count, ids } => {
+            EngineEvent::MemoryRecalled {
+                count,
+                ids,
+                experience,
+            } => {
                 // Structured, so no client parses the injected system block.
-                let _ = self
-                    .events
-                    .send(RuntimeEvent::MemoryRecalled { count, ids });
+                let _ = self.events.send(RuntimeEvent::MemoryRecalled {
+                    count,
+                    ids,
+                    experience_count: experience,
+                });
             }
             EngineEvent::MemoryChanged {
                 operation,
@@ -2740,6 +2746,7 @@ mod projection_equivalence {
             EngineEvent::MemoryRecalled {
                 count: 1,
                 ids: vec!["k-probe".into()],
+                experience: 0,
             },
             EngineEvent::MemoryChanged {
                 operation: "created".into(),

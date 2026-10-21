@@ -714,7 +714,13 @@ pub enum RuntimeEvent {
     /// The runtime recalled durable project memory into this turn's model
     /// context. Emitted ONLY when at least one memory was selected — a search
     /// that found nothing is not a recall. Ids/count only, never bodies.
-    MemoryRecalled { count: u32, ids: Vec<String> },
+    MemoryRecalled {
+        count: u32,
+        ids: Vec<String>,
+        /// How many of `ids` were evidence-bound agent experience.
+        #[serde(default)]
+        experience_count: u32,
+    },
     /// A durable memory lifecycle change (created / superseded / expired /
     /// merged). `operation` is an opaque stable key; `title` is a bounded
     /// summary, never the body.
@@ -844,6 +850,9 @@ pub enum UiMemoryKind {
     Decision,
     /// Same reach as a decision.
     Note,
+    /// Evidence-bound agent experience. Recalled only when relevant; never
+    /// injected as a standing rule and never listed in the catalog.
+    Experience,
 }
 
 /// Durable memory health for `/memory status`. Counts only: no entry text,
@@ -873,6 +882,54 @@ pub struct UiMemoryStatus {
     /// Sanitized class of the oldest retry's error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Active agent experiences, split by the evidence class the runtime
+    /// derived. An unverified experience is a parked hypothesis; it is never
+    /// counted as verified.
+    #[serde(default)]
+    pub experience_active: u32,
+    #[serde(default)]
+    pub experience_verified: u32,
+    #[serde(default)]
+    pub experience_unverified: u32,
+    /// Experience candidates awaiting a person.
+    #[serde(default)]
+    pub experience_pending: u32,
+    /// Experience rows retired by supersede/expiry/forget.
+    #[serde(default)]
+    pub experience_archived: u32,
+    /// The experience lane's durable queue, kept separate from the user-turn
+    /// inbox so "no lesson" and "not extracted yet" are distinguishable.
+    #[serde(default)]
+    pub experience_inbox_pending: u32,
+    #[serde(default)]
+    pub experience_inbox_processing: u32,
+    #[serde(default)]
+    pub experience_inbox_failed_retryable: u32,
+    #[serde(default)]
+    pub experience_inbox_processed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experience_next_retry_at: Option<String>,
+    /// The most recent settled experience extraction, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_experience: Option<UiMemoryExperience>,
+}
+
+/// The outcome of one experience extraction. Counts only; `reason` is a
+/// stable skip class, never entry text or provider output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryExperience {
+    pub at: String,
+    /// `extracted` | `skipped`
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub accepted: u32,
+    pub rejected: u32,
+    pub created: u32,
+    pub updated: u32,
+    pub pending: u32,
+    pub skipped: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

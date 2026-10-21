@@ -78,6 +78,7 @@ fn summarize_usage_by_kind(requests: &[leveler_storage::ModelRequestRecord]) -> 
             ModelCallKind::Round => "round",
             ModelCallKind::Compaction => "compaction",
             ModelCallKind::MemoryExtraction => "memory_extraction",
+            ModelCallKind::ExperienceExtraction => "experience_extraction",
             ModelCallKind::PromptSuggestion => "prompt_suggestion",
             ModelCallKind::AwaySummary => "away_summary",
             ModelCallKind::SemanticRecap => "semantic_recap",

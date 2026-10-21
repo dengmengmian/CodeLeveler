@@ -1217,7 +1217,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
             replace_active_background_tasks(state, &tasks);
         }
-        RuntimeEvent::MemoryRecalled { count, .. } => {
+        RuntimeEvent::MemoryRecalled {
+            count,
+            experience_count,
+            ..
+        } => {
             // Keep the last count even when it is zero: "recall ran and found
             // nothing" is different from "no recall has happened yet".
             state.last_memory_recall = Some(count);
@@ -1227,7 +1231,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             if count == 0 {
                 return;
             }
-            let label = state.t().memory_recalled.replace("{}", &count.to_string());
+            let t = state.t();
+            let label = if experience_count > 0 {
+                t.memory_recalled_experience
+                    .replacen("{}", &count.to_string(), 1)
+                    .replacen("{}", &experience_count.to_string(), 1)
+            } else {
+                t.memory_recalled.replace("{}", &count.to_string())
+            };
             state.transcript.push_note(label);
         }
         RuntimeEvent::MemoryStatus { query_id, status } => {
@@ -1249,6 +1260,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 "updated" => t.memory_updated,
                 "expired" => t.memory_expired,
                 "merged" => t.memory_merged,
+                "experience_created" => t.memory_experience_created,
+                "experience_updated" | "experience_merged" => t.memory_experience_updated,
+                "experience_queued" => t.memory_experience_queued,
                 _ => t.memory_created,
             };
             let line = verb.replace("{}", &title);
@@ -1290,6 +1304,56 @@ fn memory_status_lines(
         status.inbox_failed_retryable,
         status.inbox_processed,
     ));
+    // Experience is its own lane: learned lessons are counted and classified
+    // separately from user-stated facts.
+    lines.push(format!(
+        "{} · {}",
+        t.memory_experience_status
+            .replace("{active}", &status.experience_active.to_string())
+            .replace("{verified}", &status.experience_verified.to_string())
+            .replace("{unverified}", &status.experience_unverified.to_string())
+            .replace("{pending}", &status.experience_pending.to_string())
+            .replace("{archived}", &status.experience_archived.to_string()),
+        t.memory_experience_inbox
+            .replace("{pending}", &status.experience_inbox_pending.to_string())
+            .replace(
+                "{processing}",
+                &status.experience_inbox_processing.to_string()
+            )
+            .replace(
+                "{retry}",
+                &status.experience_inbox_failed_retryable.to_string()
+            )
+            .replace(
+                "{processed}",
+                &status.experience_inbox_processed.to_string()
+            ),
+    ));
+    if let Some(last) = &status.last_experience {
+        let mut line = t
+            .memory_experience_last
+            .replace("{at}", &last.at)
+            .replace("{created}", &last.created.to_string())
+            .replace("{updated}", &last.updated.to_string())
+            .replace("{pending}", &last.pending.to_string())
+            .replace("{skipped}", &last.skipped.to_string())
+            .replace("{rejected}", &last.rejected.to_string());
+        if let Some(reason) = &last.reason {
+            let reason = match reason.as_str() {
+                "no_experience_signal" => t.memory_experience_skip_no_signal,
+                value if value.starts_with("task_") || value.starts_with("turn_") => {
+                    t.memory_experience_skip_task
+                }
+                value => value,
+            };
+            line.push_str(" · ");
+            line.push_str(&t.memory_experience_skipped.replace("{reason}", reason));
+        }
+        lines.push(line);
+    }
+    if let Some(next) = &status.experience_next_retry_at {
+        lines.push(format!("{}: {next}", t.memory_status_next_retry));
+    }
     lines.push(format!(
         "{}: accepted={} rejected={} skipped={}",
         t.memory_status_totals,
@@ -1338,6 +1402,7 @@ fn memory_kind_label(kind: leveler_client_protocol::UiMemoryKind) -> &'static st
         UiMemoryKind::Preference => "长期偏好",
         UiMemoryKind::Decision => "决策",
         UiMemoryKind::Note => "笔记",
+        UiMemoryKind::Experience => "经验",
     }
 }
 

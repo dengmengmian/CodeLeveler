@@ -6,18 +6,19 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use leveler_agent::{
-    BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, ExtractionCall, MAX_BATCH_INPUT_CHARS,
-    MAX_BATCH_TURNS, MAX_EXTRACTOR_INPUT_CHARS, ModelSemanticExtractor, SemanticExtractor,
-    validate_batch_candidates,
+    BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, ExperienceEvent, ExperienceExtraction,
+    ExperienceExtractor, ExtractionCall, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS,
+    MAX_EXTRACTOR_INPUT_CHARS, ModelExperienceExtractor, ModelSemanticExtractor, SemanticExtractor,
+    build_evidence_pack, validate_batch_candidates, validate_experience_candidates,
 };
 use leveler_core::{BootId, BootLiveness};
 use leveler_memory::{
-    AdmitOutcome, AppliedOperation, MemoryCandidate, MemoryStore, ProposeOutcome,
+    AdmitOutcome, AgentAdmitOutcome, AppliedOperation, MemoryCandidate, MemoryStore, ProposeOutcome,
 };
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_storage::{
-    Database, MemoryInboxItem, MemoryInboxReadyState, MemoryInboxRepository, ModelRequestRecord,
-    ModelRequestRepository,
+    Database, EventRepository, ExperienceInboxItem, ExperienceInboxRepository, MemoryInboxItem,
+    MemoryInboxReadyState, MemoryInboxRepository, ModelRequestRecord, ModelRequestRepository,
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -36,6 +37,9 @@ const MAX_AGE_FLUSH: Duration = Duration::from_secs(60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 const PROCESSED_RETENTION_DAYS: i64 = 7;
 const PRUNE_LIMIT: u32 = 128;
+/// Experience work is one whole task per row and one provider call at a time.
+/// Processing two at once would double a burst's cost for no scheduling gain.
+const EXPERIENCE_CLAIM_LIMIT: u32 = 1;
 
 static GLOBAL_MEMORY_CALL: OnceLock<Semaphore> = OnceLock::new();
 
@@ -71,6 +75,32 @@ struct StagedTurnResult {
     /// surface must distinguish from "no candidate at all".
     #[serde(default)]
     skipped: usize,
+}
+
+/// The durable result of one experience-work row. Written before any store
+/// mutation, so a retry replays the same decision rather than re-asking the
+/// model.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct StagedExperienceResult {
+    /// `extracted` or `skipped`. Skipped is a settled outcome, not an error.
+    #[serde(default)]
+    outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default)]
+    accepted: Vec<MemoryCandidate>,
+    #[serde(default)]
+    rejected: usize,
+    #[serde(default)]
+    applied: usize,
+    #[serde(default)]
+    skipped: usize,
+    #[serde(default)]
+    created: usize,
+    #[serde(default)]
+    updated: usize,
+    #[serde(default)]
+    pending: usize,
 }
 
 /// The application/runtime-owned worker for one project database.
@@ -145,45 +175,81 @@ impl MemoryConsolidator {
         if let Err(error) = self.recover_dead_claims().await {
             tracing::warn!(%error, "memory consolidation startup recovery failed");
         }
+        if let Err(error) = self.recover_dead_experience_claims().await {
+            tracing::warn!(%error, "experience consolidation startup recovery failed");
+        }
         // Startup is itself a flush signal: pending work from an earlier clean
         // shutdown must not require another user turn to become visible.
-        let mut flush_now = true;
+        // Experience work is one durable row per completed task and is
+        // processed as soon as it is ready. The USER-TURN batch keeps its own
+        // batching policy: a single new turn must not become an immediate
+        // provider call merely because an experience row woke the worker.
+        let mut flush_memory = true;
         loop {
-            if flush_now {
+            let experience_claimed = match self.run_experience_once().await {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    tracing::warn!(%error, "experience consolidation failed");
+                    false
+                }
+            };
+            let mut memory_claimed = 0usize;
+            if flush_memory {
                 match self.run_once().await {
                     Ok(outcome) => {
+                        memory_claimed = outcome.claimed;
                         tracing::debug!(
                             claimed = outcome.claimed,
                             accepted = outcome.accepted,
                             rejected = outcome.rejected,
                             "memory consolidation batch settled"
                         );
-                        flush_now = outcome.claimed == MAX_WORKER_BATCH_TURNS as usize
+                        flush_memory = outcome.claimed == MAX_WORKER_BATCH_TURNS as usize
                             || self.ready_count().await >= IMMEDIATE_BATCH_THRESHOLD as u64;
-                        if flush_now {
-                            continue;
-                        }
                     }
                     Err(error) => tracing::warn!(%error, "memory consolidation batch failed"),
                 }
             }
+            if (experience_claimed && self.experience_ready_count().await > 0)
+                || (flush_memory && memory_claimed > 0)
+            {
+                continue;
+            }
 
             let delay = self.next_wake_delay().await;
             if delay.is_zero() {
-                flush_now = true;
+                // Zero only because experience is ready. Process it on the
+                // next loop without promoting the memory batch.
+                flush_memory = self.ready_count().await >= IMMEDIATE_BATCH_THRESHOLD as u64;
                 continue;
             }
             tokio::select! {
                 _ = self.cancel.cancelled() => return,
                 _ = self.notify.notified() => {
-                    flush_now = self.ready_count().await >= IMMEDIATE_BATCH_THRESHOLD as u64;
+                    flush_memory = self.ready_count().await >= IMMEDIATE_BATCH_THRESHOLD as u64;
                 }
-                _ = tokio::time::sleep(delay) => flush_now = true,
+                _ = tokio::time::sleep(delay) => flush_memory = true,
             }
         }
     }
 
     async fn next_wake_delay(&self) -> Duration {
+        let memory = self.memory_wake_delay().await;
+        let experience = match ExperienceInboxRepository::new(&self.db)
+            .ready_state(leveler_core::now())
+            .await
+        {
+            Ok(state) if state.count > 0 => Duration::ZERO,
+            Ok(_) => MAX_AGE_FLUSH,
+            Err(error) => {
+                tracing::warn!(%error, "could not schedule pending experience work");
+                MAX_AGE_FLUSH
+            }
+        };
+        memory.min(experience)
+    }
+
+    async fn memory_wake_delay(&self) -> Duration {
         match MemoryInboxRepository::new(&self.db)
             .ready_state(leveler_core::now())
             .await
@@ -221,6 +287,19 @@ impl MemoryConsolidator {
         }
     }
 
+    async fn experience_ready_count(&self) -> u64 {
+        match ExperienceInboxRepository::new(&self.db)
+            .ready_state(leveler_core::now())
+            .await
+        {
+            Ok(state) => state.count,
+            Err(error) => {
+                tracing::warn!(%error, "could not inspect ready experience work");
+                0
+            }
+        }
+    }
+
     async fn recover_dead_claims(&self) -> Result<(), String> {
         let repo = MemoryInboxRepository::new(&self.db);
         for boot in repo.processing_boots().await.map_err(|e| e.to_string())? {
@@ -243,6 +322,414 @@ impl MemoryConsolidator {
             }
         }
         Ok(())
+    }
+
+    async fn recover_dead_experience_claims(&self) -> Result<(), String> {
+        let repo = ExperienceInboxRepository::new(&self.db);
+        for boot in repo.processing_boots().await.map_err(|e| e.to_string())? {
+            if boot != self.boot
+                && crate::runtime_boot::boot_liveness(&self.state_dir, &boot) == BootLiveness::Dead
+            {
+                let recovered = repo
+                    .recover_claims_for_boot(
+                        &boot,
+                        "worker boot ended before claim settlement",
+                        leveler_core::now(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tracing::info!(
+                    dead_boot = boot.as_str(),
+                    recovered,
+                    "recovered experience claims"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Process one completed task's experience work item.
+    ///
+    /// Returns whether a row was claimed. A deterministic skip (task not
+    /// completed, no failure signal) is a settled result, not an error: it is
+    /// recorded in `result_json` and never retried.
+    async fn run_experience_once(&self) -> Result<bool, String> {
+        let repo = ExperienceInboxRepository::new(&self.db);
+        repo.recover_claims_for_boot(
+            &self.boot,
+            "previous worker batch ended before claim settlement",
+            leveler_core::now(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        self.recover_dead_experience_claims().await?;
+        let claimed = repo
+            .claim_batch(&self.boot, leveler_core::now(), EXPERIENCE_CLAIM_LIMIT)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(item) = claimed.into_iter().next() else {
+            return Ok(false);
+        };
+        let result = self.process_experience_item(&item).await;
+        let now = leveler_core::now();
+        match result {
+            Ok(staged) => {
+                repo.mark_processed(&self.boot, item.inbox_id, now)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tracing::info!(
+                    event = "experience_consolidation_completed",
+                    turn_id = %item.turn_id,
+                    outcome = %staged.outcome,
+                    reason = ?staged.reason,
+                    accepted = staged.accepted.len(),
+                    rejected = staged.rejected,
+                    created = staged.created,
+                    updated = staged.updated,
+                    pending = staged.pending,
+                    skipped = staged.skipped,
+                    "experience consolidation completed"
+                );
+                if let Err(error) = repo
+                    .prune_processed(
+                        now - chrono::Duration::days(PROCESSED_RETENTION_DAYS),
+                        PRUNE_LIMIT,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, event = "experience_prune_failed", "could not prune processed experience rows");
+                }
+                Ok(true)
+            }
+            Err(error) => {
+                let next = leveler_core::now() + retry_delay(item.attempt.max(1));
+                repo.mark_retryable(&self.boot, item.inbox_id, next, &error, leveler_core::now())
+                    .await
+                    .map_err(|settle| {
+                        format!("{error}; failed to persist experience retry: {settle}")
+                    })?;
+                tracing::warn!(
+                    event = "experience_consolidation_retried",
+                    turn_id = %item.turn_id,
+                    %error,
+                    "experience extraction failed; durable retry scheduled"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Persist a deterministic skip before settling the claim. A skip is a
+    /// real outcome: the status surface must be able to say "looked, found
+    /// nothing" instead of "never processed".
+    async fn settle_skipped_experience(
+        &self,
+        item: &ExperienceInboxItem,
+        reason: impl Into<String>,
+    ) -> Result<StagedExperienceResult, String> {
+        let staged = skipped_experience(reason);
+        let json = serde_json::to_string(&staged).map_err(|error| error.to_string())?;
+        ExperienceInboxRepository::new(&self.db)
+            .stage_result(&self.boot, item.inbox_id, &json, leveler_core::now())
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(staged)
+    }
+
+    async fn process_experience_item(
+        &self,
+        item: &ExperienceInboxItem,
+    ) -> Result<StagedExperienceResult, String> {
+        // A staged result is a model answer already paid for. Replay it even
+        // when the turn changed state since (it cannot: claims are only made
+        // after the turn is terminal).
+        if let Some(raw) = item.result_json.as_deref() {
+            let staged: StagedExperienceResult = serde_json::from_str(raw).map_err(|error| {
+                format!(
+                    "turn {} has invalid staged experience result: {error}",
+                    item.turn_id
+                )
+            })?;
+            return self.apply_staged_experience(item, staged).await;
+        }
+        if item.turn_status != "completed" {
+            return self
+                .settle_skipped_experience(item, format!("task_{}", item.turn_status))
+                .await;
+        }
+        // A fresh turn carries the initiating message; a resumed continuation
+        // carries only the objective anchor. Both are user-authored goals and
+        // both can be the goal of an experience.
+        let initiation = leveler_engine::decode_turn_initiating_message_opt(&item.turn_payload)
+            .map_err(|error| {
+                format!(
+                    "turn {} has invalid initiating payload: {error}",
+                    item.turn_id
+                )
+            })?;
+        let is_continuation = initiation.is_none();
+        let goal = match initiation {
+            Some(message) => message.text_content(),
+            None => {
+                leveler_engine::decode_turn_continuation(&item.turn_payload)
+                    .map_err(|error| {
+                        format!(
+                            "turn {} has invalid continuation payload: {error}",
+                            item.turn_id
+                        )
+                    })?
+                    .objective
+                    .text
+            }
+        };
+        let session = leveler_core::SessionId::new(item.session_id.clone());
+        let turn_id = leveler_core::TurnId::new(item.turn_id.clone());
+        let events = EventRepository::new(&self.db);
+        let Some(turn_finished) = events
+            .load_last_by_type(&session, "turn_finished", Some(&turn_id))
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return self
+                .settle_skipped_experience(item, "turn_terminal_missing")
+                .await;
+        };
+        // `task_finished` is a session-level terminal with no turn id. The
+        // turn's own terminal sequence is the boundary that attributes the
+        // first one after it to this turn. A crash between finish_turn and
+        // finish_task leaves no terminal for THIS turn; the next turn's
+        // terminal must not be inherited as this turn's outcome.
+        let next_turn_started = events
+            .first_after(&session, "turn_started", turn_finished.sequence)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(task_terminal) = events
+            .first_after(&session, "task_finished", turn_finished.sequence)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return self
+                .settle_skipped_experience(item, "task_outcome_missing")
+                .await;
+        };
+        if next_turn_started
+            .as_ref()
+            .is_some_and(|next| task_terminal.sequence > next.sequence)
+        {
+            return self
+                .settle_skipped_experience(item, "task_outcome_unattributed")
+                .await;
+        }
+        let outcome = serde_json::from_str::<serde_json::Value>(&task_terminal.payload)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("payload")?
+                    .get("outcome")?
+                    .as_str()
+                    .map(str::to_string)
+            });
+        if outcome.as_deref() != Some("completed") {
+            return self
+                .settle_skipped_experience(
+                    item,
+                    format!("task_outcome_{}", outcome.as_deref().unwrap_or("unknown")),
+                )
+                .await;
+        }
+        // A resumed continuation inherits the lineage's earlier facts: a
+        // failure from before a crash can pair with the final pass. A fresh
+        // turn reads only itself, so an unrelated older task cannot leak in.
+        let turn_events = if is_continuation {
+            let turns = leveler_storage::TurnStore::list_for_session(&self.db, &session)
+                .await
+                .map_err(|error| error.to_string())?;
+            let current = turns
+                .iter()
+                .find(|turn| turn.id == item.turn_id)
+                .ok_or_else(|| format!("turn {} has no durable row", item.turn_id))?;
+            let root = leveler_engine::decode_turn_continuation(&item.turn_payload)
+                .map_err(|error| error.to_string())?
+                .root_turn_id;
+            let min_ordinal = root
+                .as_ref()
+                .and_then(|root| {
+                    turns
+                        .iter()
+                        .find(|turn| turn.id == root.as_str())
+                        .map(|turn| turn.ordinal)
+                })
+                .unwrap_or(current.ordinal);
+            let lineage: BTreeSet<String> = turns
+                .into_iter()
+                .filter(|turn| turn.ordinal >= min_ordinal)
+                .map(|turn| turn.id)
+                .collect();
+            events
+                .load_by_types(
+                    &session,
+                    &["tool_call_started", "tool_call_finished", "turn_finished"],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|record| {
+                    record
+                        .turn_id
+                        .as_deref()
+                        .is_some_and(|turn| lineage.contains(turn))
+                })
+                .collect()
+        } else {
+            events
+                .load_by_types_in_turn(
+                    &session,
+                    &turn_id,
+                    &["tool_call_started", "tool_call_finished", "turn_finished"],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        };
+        let mut experience_events: Vec<ExperienceEvent<'_>> = turn_events
+            .iter()
+            .map(|record| ExperienceEvent {
+                turn_id: record.turn_id.as_deref(),
+                payload: record.payload.as_str(),
+            })
+            .collect();
+        experience_events.push(ExperienceEvent {
+            turn_id: None,
+            payload: task_terminal.payload.as_str(),
+        });
+        let Some(pack) = build_evidence_pack(&item.turn_id, &goal, &experience_events) else {
+            return self
+                .settle_skipped_experience(item, "no_experience_signal")
+                .await;
+        };
+        tracing::info!(
+            event = "experience_extraction_started",
+            turn_id = %item.turn_id,
+            failures = pack.failures.len(),
+            resolutions = pack.resolutions.len(),
+            mutations = pack.mutations.len(),
+            "experience extraction started"
+        );
+        let model = ModelRef::parse(&item.model)
+            .ok_or_else(|| format!("invalid persisted model reference `{}`", item.model))?;
+        let extractor = ModelExperienceExtractor::new(self.runtime.clone(), model)
+            .with_timeout(self.extraction_timeout);
+        let ExperienceExtraction { candidates, call } =
+            extractor.extract(&pack, &self.cancel).await;
+        if let Some(call) = call.as_ref() {
+            self.record_experience_call(&item.session_id, call).await;
+        }
+        let candidates = candidates.map_err(|error| error.to_string())?;
+        let validated = validate_experience_candidates(&candidates, &pack);
+        for (index, rejection) in &validated.rejected {
+            tracing::debug!(
+                event = "experience_candidate_rejected",
+                turn_id = %item.turn_id,
+                index = *index,
+                code = rejection.code(),
+                reason = %rejection.reason(),
+                "experience candidate rejected"
+            );
+        }
+        let staged = StagedExperienceResult {
+            outcome: "extracted".to_string(),
+            reason: None,
+            rejected: validated.rejected.len(),
+            accepted: validated.accepted,
+            applied: 0,
+            skipped: 0,
+            created: 0,
+            updated: 0,
+            pending: 0,
+        };
+        let staged_json = serde_json::to_string(&staged).map_err(|error| error.to_string())?;
+        ExperienceInboxRepository::new(&self.db)
+            .stage_result(&self.boot, item.inbox_id, &staged_json, leveler_core::now())
+            .await
+            .map_err(|error| error.to_string())?;
+        self.apply_staged_experience(item, staged).await
+    }
+
+    async fn apply_staged_experience(
+        &self,
+        item: &ExperienceInboxItem,
+        mut staged: StagedExperienceResult,
+    ) -> Result<StagedExperienceResult, String> {
+        if staged.outcome != "extracted" {
+            return Ok(staged);
+        }
+        if staged.applied > staged.accepted.len() {
+            return Err(format!(
+                "turn {} staged experience apply cursor is out of bounds",
+                item.turn_id
+            ));
+        }
+        let store = MemoryStore::open(&self.memory_dir).map_err(|error| error.to_string())?;
+        let repo = ExperienceInboxRepository::new(&self.db);
+        while staged.applied < staged.accepted.len() {
+            let candidate = staged.accepted[staged.applied].clone();
+            let outcome = store
+                .admit_experience_candidate(candidate)
+                .map_err(|error| error.to_string())?;
+            staged.applied += 1;
+            let event = match outcome {
+                AgentAdmitOutcome::Applied(outcome) => match outcome.operation {
+                    AppliedOperation::Created => {
+                        staged.created += 1;
+                        outcome
+                            .entry
+                            .map(|entry| ("experience_created", entry.id, entry.title))
+                    }
+                    AppliedOperation::Superseded => {
+                        staged.updated += 1;
+                        outcome
+                            .entry
+                            .map(|entry| ("experience_updated", entry.id, entry.title))
+                    }
+                    AppliedOperation::Merged => {
+                        staged.updated += 1;
+                        outcome
+                            .entry
+                            .map(|entry| ("experience_merged", entry.id, entry.title))
+                    }
+                    AppliedOperation::Skipped => {
+                        staged.skipped += 1;
+                        None
+                    }
+                    AppliedOperation::NeedsApproval => {
+                        staged.pending += 1;
+                        None
+                    }
+                },
+                AgentAdmitOutcome::Queued { candidate, .. } => {
+                    staged.pending += 1;
+                    Some(("experience_queued", candidate.id, candidate.title))
+                }
+                AgentAdmitOutcome::NotStored { .. } => {
+                    staged.skipped += 1;
+                    None
+                }
+            };
+            let persisted = serde_json::to_string(&staged).map_err(|error| error.to_string())?;
+            repo.update_staged_result(&self.boot, item.inbox_id, &persisted, leveler_core::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some((operation, id, title)) = event {
+                (self.event_sink)(MemoryConsolidationEvent {
+                    session_id: item.session_id.clone(),
+                    operation: operation.to_string(),
+                    id,
+                    title,
+                    authority: "tool_observation".to_string(),
+                    count: 1,
+                });
+            }
+        }
+        Ok(staged)
     }
 
     async fn run_once(&self) -> Result<ConsolidationOutcome, String> {
@@ -521,6 +1008,29 @@ impl MemoryConsolidator {
     /// Never records user text or candidate bodies — only the shape of the
     /// exchange, exactly like every other row in this table.
     async fn record_extraction_call(&self, session_id: &str, call: &ExtractionCall) {
+        self.record_auxiliary_call(
+            session_id,
+            call,
+            leveler_storage::ModelCallKind::MemoryExtraction,
+        )
+        .await
+    }
+
+    async fn record_experience_call(&self, session_id: &str, call: &ExtractionCall) {
+        self.record_auxiliary_call(
+            session_id,
+            call,
+            leveler_storage::ModelCallKind::ExperienceExtraction,
+        )
+        .await
+    }
+
+    async fn record_auxiliary_call(
+        &self,
+        session_id: &str,
+        call: &ExtractionCall,
+        kind: leveler_storage::ModelCallKind,
+    ) {
         let session = leveler_core::SessionId::new(session_id);
         // Pricing is optional: an unpriced model records `None` rather than a
         // fabricated zero cost.
@@ -563,7 +1073,7 @@ impl MemoryConsolidator {
             error_kind: call
                 .error
                 .as_deref()
-                .map(|_| "memory_extraction_failed".to_string()),
+                .map(|_| format!("{}_failed", kind.as_str())),
             // The consolidator keeps the failure class only; it holds no
             // transport error to observe.
             error_detail: None,
@@ -573,7 +1083,7 @@ impl MemoryConsolidator {
             ttft_ms: None,
             max_event_gap_ms: None,
             retry_count: 0,
-            kind: leveler_storage::ModelCallKind::MemoryExtraction,
+            kind,
             created_at: leveler_core::now(),
             reasoning_effort: call
                 .reasoning_effort
@@ -583,12 +1093,14 @@ impl MemoryConsolidator {
             // A diagnostics row must never fail the consolidation it describes.
             tracing::warn!(
                 %error,
-                event = "memory_extraction_record_failed",
-                "could not record the memory extraction model call"
+                event = "auxiliary_extraction_record_failed",
+                lane = kind.as_str(),
+                "could not record the auxiliary extraction model call"
             );
         }
         tracing::info!(
-            event = "memory_extraction_call",
+            event = "auxiliary_extraction_call",
+            lane = kind.as_str(),
             model = %call.model,
             source_turn_count = call.source_turn_count,
             input_tokens = usage.input_tokens,
@@ -597,7 +1109,7 @@ impl MemoryConsolidator {
             latency_ms = call.latency_ms,
             cost_usd_micros = ?cost_usd_micros,
             error = ?call.error,
-            "memory extraction model call completed"
+            "auxiliary extraction model call completed"
         );
     }
 
@@ -650,15 +1162,15 @@ impl MemoryConsolidator {
                                 AppliedOperation::Created => "created",
                                 AppliedOperation::Superseded => "superseded",
                                 AppliedOperation::Merged => "merged",
-                                AppliedOperation::Skipped
-                                | AppliedOperation::NeedsApproval => unreachable!(),
+                                AppliedOperation::Skipped | AppliedOperation::NeedsApproval => {
+                                    unreachable!()
+                                }
                             };
                             outcome
                                 .entry
                                 .map(|entry| (operation, entry.id, entry.title))
                         }
-                        AppliedOperation::Skipped
-                        | AppliedOperation::NeedsApproval => {
+                        AppliedOperation::Skipped | AppliedOperation::NeedsApproval => {
                             result.skipped += 1;
                             None
                         }
@@ -695,6 +1207,14 @@ impl MemoryConsolidator {
             accepted,
             rejected,
         })
+    }
+}
+
+fn skipped_experience(reason: impl Into<String>) -> StagedExperienceResult {
+    StagedExperienceResult {
+        outcome: "skipped".to_string(),
+        reason: Some(reason.into()),
+        ..Default::default()
     }
 }
 
@@ -1736,5 +2256,112 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(pending[0].body.contains("Flash"));
         assert!(store.list_archived().unwrap().is_empty());
+    }
+
+    /// A staged experience result is a model answer already paid for. A crash
+    /// that returns the claim to the queue must replay that answer, not ask
+    /// the model again. `UnusedRuntime` panics on any provider call.
+    #[tokio::test]
+    async fn a_staged_experience_result_is_replayed_without_a_second_model_call() {
+        use leveler_core::{SessionId, TurnId};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/repo", "goal", "mock/model", leveler_core::now());
+        let session = SessionId::new(record.id.clone());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let payload = serde_json::json!({
+            "version": 1,
+            "initiating_message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "fix the check"}]
+            }
+        });
+        let turn = TurnRepository::new(&db)
+            .start(
+                &session,
+                "user",
+                Some(&payload.to_string()),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(turn.id.clone());
+        TurnRepository::new(&db)
+            .finish(&turn_id, "completed", leveler_core::now())
+            .await
+            .unwrap();
+        let events = EventRepository::new(&db);
+        events
+            .append(
+                &session,
+                Some(&turn_id),
+                "turn_finished",
+                &serde_json::json!({
+                    "type": "turn_finished",
+                    "payload": {
+                        "turn_id": turn.id,
+                        "outcome": "completed",
+                        "stop_reason": "Completed",
+                        "rounds": 1,
+                        "modified_files": []
+                    }
+                })
+                .to_string(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        events
+            .append(
+                &session,
+                None,
+                "task_finished",
+                &serde_json::json!({
+                    "type": "task_finished",
+                    "payload": {"outcome": "completed", "reason": null, "warnings": []}
+                })
+                .to_string(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let old_boot = BootId::generate();
+        let repo = ExperienceInboxRepository::new(&db);
+        let claimed = repo
+            .claim_batch(&old_boot, leveler_core::now(), 1)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let staged = r#"{"outcome":"skipped","reason":"crash_replay","accepted":[],"rejected":0,"applied":0,"skipped":0,"created":0,"updated":0,"pending":0}"#;
+        repo.stage_result(&old_boot, claimed[0].inbox_id, staged, leveler_core::now())
+            .await
+            .unwrap();
+        repo.recover_claims_for_boot(&old_boot, "dead boot", leveler_core::now())
+            .await
+            .unwrap();
+
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        );
+        assert!(worker.run_experience_once().await.unwrap());
+        let processed = repo
+            .last_processed()
+            .await
+            .unwrap()
+            .expect("the recovered claim settled");
+        assert!(
+            processed
+                .result_json
+                .as_deref()
+                .is_some_and(|json| json.contains("crash_replay")),
+            "the staged decision must be replayed: {processed:?}"
+        );
     }
 }
