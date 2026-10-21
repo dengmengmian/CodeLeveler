@@ -980,6 +980,7 @@ body.home .composer-input, body.home .composer-input-wrap { min-height: 52px; }
 .send-button svg { transform: translateY(0); }
 .stop-button { background: var(--send-active-bg); }
 .stop-button:hover:not(:disabled) { background: var(--error); }
+.stop-glyph { width: 10px; height: 10px; border-radius: 3px; background: currentColor; }
 
 .attachment-chips { display: flex; flex-wrap: nowrap; gap: 10px; overflow-x: auto; padding: 0 12px; scrollbar-width: thin; }
 .attachment-chip {

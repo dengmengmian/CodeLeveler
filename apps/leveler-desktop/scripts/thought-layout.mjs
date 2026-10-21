@@ -55,6 +55,20 @@ try {
       last: children.at(-1) ?? null,
       beforeLast: children.at(-2) ?? null,
       runningBorder: getComputedStyle(list.querySelector('.running-row')).borderTopWidth,
+      stop: (() => {
+        const button = document.querySelector('#stop');
+        const glyph = button?.querySelector('.stop-glyph');
+        if (!button || !glyph) return null;
+        const style = getComputedStyle(glyph);
+        return {
+          hidden: button.hidden,
+          width: parseFloat(style.width),
+          height: parseFloat(style.height),
+          radius: parseFloat(style.borderRadius),
+          background: style.backgroundColor,
+          svgChildren: button.querySelectorAll('svg').length,
+        };
+      })(),
     };
   });
   evidence.view = view;
@@ -66,6 +80,10 @@ try {
   assert.equal(view.liveHasBody, false, 'live analysis renders its full body');
   assert.equal(view.headings, 0, 'a reasoning-only turn renders the work-steps heading');
   assert.notEqual(view.runningBorder, '0px', 'the running line has no divider above it');
+  assert.ok(view.stop && !view.stop.hidden, 'the running turn exposes no stop control');
+  assert.ok(view.stop.width >= 8 && view.stop.height >= 8, `the stop glyph is too small: ${JSON.stringify(view.stop)}`);
+  assert.ok(view.stop.radius > 0, 'the stop glyph is not a rounded block');
+  assert.equal(view.stop.svgChildren, 0, 'the stop control still draws an outlined icon');
   const order = view.markers.map(marker => marker.cls);
   const completedAt = order.findIndex(cls => cls.includes('thought-row') && !cls.includes('thought-live'));
   const answerAt = order.findIndex(cls => cls.includes('message assistant'));
