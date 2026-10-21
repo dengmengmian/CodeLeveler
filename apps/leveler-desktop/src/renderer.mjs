@@ -1585,7 +1585,8 @@ function renderComposerMeta() {
   );
   $('model-picker').dataset.tooltip = model ? `模型提供商：${model.provider}` : '选择模型';
   $('send').replaceChildren(iconNode('arrowUp', { size: 16, stroke: 1.8 }));
-  $('stop').replaceChildren(iconNode('stop', { size: 12 }));
+  // The running button shows a solid stop block, not an outlined icon glyph.
+  $('stop').replaceChildren(el('span', 'stop-glyph'));
   const running = ['running', 'waiting_user'].includes(current?.status);
   const action = running ? (settings.busySend === 'steer' ? '插入当前回合' : '排队发送') : '发送消息';
   $('send').dataset.tooltip = action;
