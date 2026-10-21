@@ -19,12 +19,14 @@ function fileDestination(href){
  if(!decoded||decoded.startsWith('#')||decoded.startsWith('/')||decoded.startsWith('//'))return null;
  if(/^[a-z][a-z0-9+.-]*:/i.test(decoded))return null;
  if(/\s/.test(decoded))return null;
- if(/(^|\/)\.\.(\/|$)/.test(decoded))return null;
+ let path;
+ try{path=decodeURIComponent(decoded);}catch{return null;}
+ if(path.startsWith('/')||/^[a-z][a-z0-9+.-]*:/i.test(path)||/[\\\x00-\x1f]/.test(path)||/(^|\/)\.\.(\/|$)/.test(path))return null;
  if(!/\.[A-Za-z0-9]{1,8}(?:#L\d+(?:-L?\d+)?)?$/.test(decoded))return null;
  return decoded;
 }
 /** Render safe Markdown through a DOM allowlist. Navigation is an explicit caller callback.
- * @param {HTMLElement} container @param {string} text @param {{onLink?:(url:string)=>void}} [options] */
+ * @param {HTMLElement} container @param {string} text @param {{onLink?:(url:string)=>void,filePaths?:Set<string>}} [options] */
 export function renderMarkdown(container,text,options={}){
  const document=container.ownerDocument;
  function node(tag){return document.createElement(tag);}
@@ -40,7 +42,13 @@ export function renderMarkdown(container,text,options={}){
    case 'text':if(token.tokens){children(parent,token.tokens);}else literal(parent,decode(token.text));return;
    case 'escape':literal(parent,decode(token.text));return;
    case 'strong':case 'em':case 'del':element=node(token.type);inline(element,token);break;
-   case 'codespan':element=node('code');literal(element,token.text);break;
+   case 'codespan':{
+    const path=fileDestination(token.text);
+    if(path&&options.filePaths?.has(path)){
+     element=node(options.onLink?'button':'span');element.setAttribute('class','markdown-link markdown-file-link');element.setAttribute('title',path);literal(element,token.text);
+     if(options.onLink){element.setAttribute('type','button');element.addEventListener('click',()=>options.onLink(path));}
+    }else{element=node('code');literal(element,token.text);}break;
+   }
    case 'code':{
     element=node('pre');const code=node('code');literal(code,token.text);element.append(code);break;
    }
@@ -60,7 +68,7 @@ export function renderMarkdown(container,text,options={}){
    }
    case 'link':{
     const href=httpDestination(token.href)??fileDestination(token.href);if(!href){inline(parent,token);return;}
-    element=node(options.onLink?'button':'span');element.setAttribute('class','markdown-link');element.setAttribute('title',href);if(options.onLink){element.setAttribute('type','button');element.addEventListener('click',()=>options.onLink(href));}inline(element,token);break;
+    element=node(options.onLink?'button':'span');element.setAttribute('class',httpDestination(token.href)?'markdown-link':'markdown-link markdown-file-link');element.setAttribute('title',href);if(options.onLink){element.setAttribute('type','button');element.addEventListener('click',()=>options.onLink(href));}inline(element,token);break;
    }
    case 'image':{
     const src=fileDestination(token.href);

@@ -296,3 +296,39 @@ export function turnTerminalFromEvent(type,messages,tools){
 }
 
 export { explorationEntries } from '../../../packages/conversation-presentation/conversation.mjs';
+
+
+/** Cards describe confirmed host edits, never file names claimed in model prose.
+ * @param {ProjectionMessage} message @param {ProjectionMessage[]} messages @param {import('../../../packages/conversation-presentation/conversation.mjs').ToolView[]} tools
+ */
+export function answerFiles(message, messages, tools) {
+  const end = message.seq;
+  if (!Number.isFinite(end)) return [];
+  const start = [...messages].reverse().find(item => messageKind(item) === 'user' && (item.seq ?? -1) <= (end ?? -1))?.seq ?? -1;
+  const files = new Map();
+  for (const tool of tools) {
+    if (!((tool.seq ?? -1) > start && (tool.seq ?? -1) < (end ?? -1))) continue;
+    const patch = confirmedDiffOf(tool);
+    if (!patch) continue;
+    const sections = patch.split(/(?=^--- )/m);
+    for (const section of sections) {
+      const match = /^\+\+\+ (?:b\/)?([^\t\n]+)(?:\t[^\n]*)?$/m.exec(section);
+      const path = match?.[1];
+      if (!path || path.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(path) || /[\\\x00-\x1f]/.test(path) || path.split('/').includes('..')) continue;
+      const [added, removed] = diffCounts(section);
+      const previous = files.get(path) ?? {path, added: 0, removed: 0};
+      previous.added += added;
+      previous.removed += removed;
+      files.set(path, previous);
+    }
+  }
+  return [...files.values()];
+}
+
+/** @param {{time?:unknown,created_at?:unknown}} message */
+export function messageTime(message) {
+  const value = message.time ?? message.created_at;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.getTime() > 0 ? date.toISOString() : null;
+}

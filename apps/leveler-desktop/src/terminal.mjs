@@ -73,7 +73,7 @@ export class DesktopTerminals {
       entry.shell = result.shell.split(/[\\/]/).at(-1);
       if (entry.tab.title !== entry.shell) { entry.tab.title = entry.shell; this.onTitle(); }
     }
-    this.setStatus(entry, result.status, result.exit_code != null ? `退出码 ${result.exit_code}` : '');
+    this.setStatus(entry, result.output_error && ['running', 'killing'].includes(result.status) ? 'unknown' : result.status, result.output_error ?? (result.exit_code != null ? `退出码 ${result.exit_code}` : ''));
   }
   async observe(entry) {
     if (entry.closed || entry.closing) return;

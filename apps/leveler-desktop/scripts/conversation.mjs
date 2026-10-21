@@ -49,6 +49,11 @@ async function settled(marker){await page.waitForFunction(marker=>document.query
 try{
  application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_BINARY:binary,LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await application.firstWindow();page.setDefaultTimeout(15000);page.on('pageerror',error=>pageErrors.push(error.message));await page.waitForFunction(()=>window.desktop&&document.querySelector('#new-session')&&document.querySelector('#brand-version')?.textContent.startsWith('v'));
  await page.locator('#message').fill('conversation-rich: render the structured answer');await page.locator('#send').click();await settled('RICH_STREAM_COMPLETE');runtime=await page.evaluate(()=>window.desktop.runtimeInfo());assert.ok(Number.isInteger(runtime.pid)&&runtime.pid>0,'own Runtime PID must be observed');evidence.runtime=runtime;
+ const sessionId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
+ const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);
+ assert.ok(snapshot.goal,'the real Runtime session must have a title');
+ assert.equal(await page.locator('#composer-docks .goal-dock').count(),0,'a session title must not become an editable goal above the composer');
+ evidence.session_title_not_composer_goal=true;
  const body=page.locator('.message.assistant .markdown').last();
  for(const tag of ['h1','strong','em','ul','ol','blockquote','pre code','table th','table td'])assert.ok(await body.locator(tag).count(),`${tag} missing from real assistant response`);
  assert.equal(await body.locator('strong').first().textContent(),'rendered bold');assert.equal(await body.locator('pre code').textContent(),literalCode);
@@ -69,6 +74,12 @@ try{
  await page.keyboard.press('Meta+F');await page.locator('#find-input').fill('rendered bold');await page.waitForFunction(()=>document.querySelector('#find-count').textContent==='1 / 1');
  assert.equal(await body.locator('strong').first().textContent(),'rendered bold');await capture('conversation-rich-search');await page.locator('#find-close').click();
  await body.locator('button.markdown-link').click();for(let i=0;i<100;i++){const state=await page.evaluate(()=>window.desktop.browserState());if(state.tabs.length===1&&state.tabs[0].url===baseURL+'/docs'&&state.tabs[0].title==='Conversation linked page'&&!state.tabs[0].loading)break;await page.waitForTimeout(100);}const nativeState=await page.evaluate(()=>window.desktop.browserState());assert.equal(nativeState.tabs.length,1);assert.equal(nativeState.tabs[0].url,baseURL+'/docs');assert.equal(documentRequests,1);evidence.safe_link_native_manual_browser=true;await page.locator('.pane-chrome button[aria-label="收起右侧边栏"]').first().click();
+ await page.locator('#new-session').click();
+ await page.waitForFunction(id=>document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId!==id,sessionId);
+ await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();
+ await page.waitForFunction(()=>document.querySelector('.message.assistant .markdown')?.textContent.includes('RICH_STREAM_COMPLETE'));
+ assert.equal(await page.locator('#composer-docks .goal-dock').count(),0,'history replay must not restore a title as a composer goal');
+ evidence.history_title_not_composer_goal=true;
  await page.locator('#message').fill('conversation-long: stream long Markdown');await page.locator('#send').click();await page.waitForFunction(()=>document.querySelectorAll('.message.assistant').length===2&&document.querySelector('.message.assistant:last-of-type .markdown')?.textContent.includes('第 5 段'));
  const start=Date.now();await page.locator('#message').fill('Draft remains editable while streaming');assert.equal(await page.locator('#message').inputValue(),'Draft remains editable while streaming');evidence.streaming_input_ms=Date.now()-start;assert.ok(evidence.streaming_input_ms<1500);
  const charsBefore=await page.locator('.message.assistant .markdown').last().evaluate(n=>n.textContent.length);await page.evaluate(()=>{document.querySelector('#conversation-scroll').scrollTop=0;});await page.waitForFunction(chars=>document.querySelector('.message.assistant:last-of-type .markdown').textContent.length>chars+200,charsBefore);assert.ok(await page.locator('#conversation-scroll').evaluate(n=>n.scrollTop<100),'incoming chunks must preserve the reader position at the top');await capture('conversation-streaming-top');

@@ -268,8 +268,11 @@ try {
   };
   await openStart();
   await mouseClick(page.locator('.start-card').filter({ hasText: '新建终端' }));
-  await page.waitForSelector('.terminal-view');
-  assert.ok((await page.locator('.terminal-view').innerText()).includes('交互式终端尚未接入'));
+  await page.waitForSelector('.terminal-view .terminal-screen');
+  // The built-in terminal is connected to the execution host now; a live PTY
+  // reports a real status instead of the former not-connected placeholder.
+  await page.waitForFunction(() => /运行中|正在启动|已退出|状态未知/.test(document.querySelector('.terminal-status-detail')?.textContent ?? ''), null, { timeout: 30000 });
+  assert.equal(await page.locator('.terminal-view .terminal-screen').count(), 1);
   evidence.terminalTab = true;
   await closeTab('终端');
   await page.waitForSelector('.terminal-view', { state: 'detached' });

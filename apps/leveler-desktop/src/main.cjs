@@ -134,7 +134,7 @@ app.whenReady().then(async()=>{
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
   handle('desktop:list',options=>{const params=taskListOptions(options);return bridge.request('list_tasks',params).then(index=>{recentWorkspaces.update(index,params.include_archived);return index;});});
-  closeTerminals=installTerminalIpc({handle,bridge});
+  closeTerminals=installTerminalIpc({handle,bridge:{request:(...args)=>bridge.request(...args)}});
   handle('desktop:info',()=>bridge.request('runtime_info'));
   handle('desktop:app-info',()=>({version:app.getVersion()}));
   handle('desktop:update-check',()=>new Promise((resolve,reject)=>{

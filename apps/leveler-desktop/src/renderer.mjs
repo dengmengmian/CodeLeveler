@@ -6,7 +6,7 @@ import {
   historyQuestions, planStepLabel, browserChrome, browserSurfaceBounds, workspaceTaskGroups,
   attachmentErrorPresentation, slashIntent, commandCandidates, groupExecutionRounds,
   roundGlyph, roundHeadline, contractToolStatus, failureReason, displayPreview,
-  confirmedDiffOf, diffCounts, foldedThoughts, turnBlocks, thoughtDuration,
+  confirmedDiffOf, diffCounts, foldedThoughts, turnBlocks, thoughtDuration, answerFiles, messageTime,
 } from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
@@ -113,6 +113,24 @@ let trajectoryViewport = null;
 let openInAppState = { apps: null, loading: false, error: null, preferred: null };
 
 const drafts = new Map();
+const DRAFTS_KEY = 'codeleveler.drafts.v1';
+// Drafts are user input, not Runtime facts: keep the text per session across a
+// Desktop restart. Attachments are intentionally not persisted.
+function loadDrafts() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(DRAFTS_KEY) || '{}');
+    for (const [key, value] of Object.entries(stored)) if (typeof value === 'string' && value) drafts.set(key, value.slice(0, 200000));
+  } catch { /* unreadable storage gives an empty draft set */ }
+}
+function saveDrafts() {
+  try {
+    const stored = {};
+    for (const [key, value] of drafts) if (value) stored[key] = value.slice(0, 200000);
+    localStorage.setItem(DRAFTS_KEY, JSON.stringify(stored));
+  } catch { /* a full store must not break typing */ }
+}
+function clearDraft() { drafts.delete(draftKey()); saveDrafts(); }
+loadDrafts();
 let queuedMessages = [];
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
@@ -202,7 +220,7 @@ function draftKey() { return current?.session.id ?? 'new-session'; }
 function uploadPending() {
   return attachments().some(item => ['uploading', 'queued', 'unknown'].includes(item.status));
 }
-function stashDraft() { drafts.set(draftKey(), $('message').value); }
+function stashDraft() { drafts.set(draftKey(), $('message').value); saveDrafts(); }
 
 function controls() {
   const uploads = uploadPending();
@@ -814,7 +832,9 @@ function openSessionMenu(task, anchor) {
     width: 220,
     items: [
       { label: '置顶', icon: 'pin', disabled: true, badge: '未接入' },
-      { label: '重命名', icon: 'edit', onSelect: () => action(async () => { await openTask(task); beginTitleEdit(); }) },
+      // The title editor refuses to start while an action owns the loading
+      // guard, so open the task first and enter editing only after it clears.
+      { label: '重命名', icon: 'edit', onSelect: () => action(async () => { await openTask(task); }).then(() => { if (current?.session.id === task.id) beginTitleEdit(); }) },
       { label: '分叉会话', icon: 'fork', onSelect: () => action(() => forkTask(task)) },
       archived
         ? { label: '取消归档', icon: 'archive', disabled: true, badge: '未接入' }
@@ -826,6 +846,9 @@ function openSessionMenu(task, anchor) {
 
 async function forkTask(task) {
   const known = new Set(tasks.map(item => item.id));
+  // The runtime addresses commands through the selected session; a sidebar
+  // fork of a non-current task must open it rather than fail silently.
+  if (task.id !== current?.session.id) await openTask(task);
   await deliver({
     type: 'fork_session',
     session_id: task.id,
@@ -1348,6 +1371,7 @@ function ensureOpenInApps() {
     openInAppState = { ...openInAppState, apps: [], loading: false, error: error?.message ?? '无法获取应用列表' };
   }).finally(() => {
     renderOpenInAppControls();
+    renderConversation();
     if (rightbarOpen) renderRightbar();
   });
 }
@@ -1368,6 +1392,7 @@ async function openInApp(path, appId, { action = 'open', remember = false } = {}
   if (!path || (!appId && action !== 'default') || openInAppState.busy) return;
   openInAppState.busy = true;
   renderOpenInAppControls();
+  renderConversation();
   if (rightbarOpen) renderRightbar();
   try {
     await api.openInApp({ path, appId, action });
@@ -1382,6 +1407,7 @@ async function openInApp(path, appId, { action = 'open', remember = false } = {}
   } finally {
     openInAppState.busy = false;
     renderOpenInAppControls();
+    renderConversation();
     if (rightbarOpen) renderRightbar();
   }
 }
@@ -1466,7 +1492,10 @@ function renderComposerDocks() {
   const host = $('composer-docks');
   if (!host) return;
   host.replaceChildren();
-  if (!current || isHome()) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
+  // A plan is real progress even before its first work message commits; the
+  // composer dock must not disappear just because the session still looks home.
+  const hasPlan = (current?.plan?.steps ?? []).length > 0;
+  if (!current || (isHome() && !hasPlan)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
   queuedMessages = queuedMessages.filter(item => item.sessionId === current.session.id);
   host.hidden = false;
   if (queuedMessages.length) {
@@ -1487,18 +1516,6 @@ function renderComposerDocks() {
       row.append(remove);
       dock.append(row);
     }
-    host.append(dock);
-  }
-  const goal = current.session.goal;
-  if (goal) {
-    const dock = el('div', 'composer-dock goal-dock');
-    const head = el('div', 'composer-dock-head');
-    head.append(el('span', undefined, '目标'), el('span', 'composer-dock-meta', goal));
-    const edit = el('button', 'composer-dock-action', '编辑');
-    edit.type = 'button';
-    edit.addEventListener('click', () => beginTitleEdit());
-    head.append(edit);
-    dock.append(head);
     host.append(dock);
   }
   // The dock is current work. A completed or interrupted plan stays readable
@@ -1710,11 +1727,15 @@ function messageRow(existing, message) {
     renderUserExtras(row, message);
   } else if (kind === 'assistant') {
     const body = row.querySelector('.markdown');
-    if (renderedSources.get(body) !== message.text) {
-      renderedSources.set(body, message.text);
-      renderMarkdown(body, message.text, { onLink: openMessageLink });
+    const files = answerFiles(message, current.messages, current.tools);
+    const source = JSON.stringify([message.text, files]);
+    if (renderedSources.get(body) !== source) {
+      renderedSources.set(body, source);
+      renderMarkdown(body, message.text, { onLink: openMessageLink, filePaths: new Set(files.map(file => file.path)) });
+      for (const reference of body.querySelectorAll('.markdown-file-link')) reference.prepend(fileIcon(reference.title.split('#')[0]));
       addCodeActions(body);
     }
+    renderAnswerFiles(row, files);
     decorateMessageActions(row, message);
   } else {
     const content = row.querySelector('.turn-trigger-text');
@@ -1730,8 +1751,7 @@ function renderUserExtras(row, message) {
   const replyQuestion = clarificationReplies.get(String(message.text ?? '')) ?? null;
   const files = Array.isArray(message.files) ? message.files : [];
   const references = Array.isArray(message.references) ? message.references : [];
-  const time = typeof message.time === 'string' ? message.time : typeof message.created_at === 'string' ? message.created_at : null;
-  const signature = JSON.stringify([time, files, references, replyQuestion]);
+  const signature = JSON.stringify([files, references, replyQuestion]);
   let extras = row.querySelector('.user-extras');
   if (!extras) {
     extras = el('div', 'user-extras');
@@ -1775,10 +1795,6 @@ function renderUserExtras(row, message) {
     }
     extras.append(chips);
   }
-  if (time) {
-    const at = new Date(time);
-    if (Number.isFinite(at.getTime())) extras.append(el('time', 'message-time', at.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })));
-  }
 }
 
 function openImagePreview(count) {
@@ -1804,8 +1820,10 @@ function openImagePreview(count) {
 function decorateMessageActions(row, message) {
   let actions = row.querySelector('.message-actions');
   if (!actions) { actions = el('div', 'message-actions'); row.append(actions); }
-  if (actions.dataset.for === message.id) return;
-  actions.dataset.for = message.id;
+  const time = messageTime(message);
+  const signature = JSON.stringify([message.id, message.text, time]);
+  if (actions.dataset.for === signature) return;
+  actions.dataset.for = signature;
   const copy = el('button', 'message-copy');
   copy.type = 'button';
   copy.setAttribute('aria-label', '复制消息');
@@ -1840,7 +1858,43 @@ function decorateMessageActions(row, message) {
     bad.dataset.tooltip = '有问题的回答';
     bad.append(iconNode('thumbDown', { size: 15 }));
     bad.addEventListener('click', () => openFeedbackDialog({ category: '任务结果', detail: '有问题的回答：' }));
-    actions.append(good, bad);
+    actions.replaceChildren(copy, good, bad, branch);
+  }
+  if (time) {
+    const stamp = el('time', 'message-time', new Date(time).toLocaleString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+    stamp.dateTime = time;
+    if (messageKind(message) === 'user') actions.prepend(stamp);
+    else actions.append(stamp);
+  }
+}
+
+function renderAnswerFiles(row, files) {
+  let host = row.querySelector('.answer-files');
+  if (!files.length) { host?.remove(); return; }
+  if (!host) {
+    host = el('div', 'answer-files');
+    row.querySelector('.markdown').after(host);
+  }
+  const signature = JSON.stringify([files, openInAppState.apps?.map(app => app.id), openInAppState.loading, openInAppState.busy, openInAppState.preferred, openInAppState.error]);
+  if (host.dataset.signature === signature) return;
+  host.dataset.signature = signature;
+  host.replaceChildren();
+  for (const file of files) {
+    const card = el('div', 'answer-file');
+    const preview = el('button', 'answer-file-preview');
+    preview.type = 'button';
+    preview.title = file.path;
+    preview.setAttribute('aria-label', `预览 ${file.path}`);
+    const glyph = el('span', 'answer-file-icon');
+    glyph.append(fileIcon(file.path));
+    const body = el('span', 'answer-file-body');
+    body.append(el('span', 'answer-file-name', file.path.split('/').at(-1)), el('span', 'answer-file-summary', `${file.path} · +${file.added} −${file.removed}`));
+    preview.append(glyph, body);
+    preview.addEventListener('click', () => openLocalReference({ path: file.path, line: null, lineEnd: null }));
+    const open = el('div', 'open-in-app answer-file-open');
+    renderOpenInAppInto(open, file.path, 'file');
+    card.append(preview, open);
+    host.append(card);
   }
 }
 
@@ -3566,8 +3620,12 @@ function renderInteractions() {
   for (const request of current?.clarifications ?? []) {
     const card = el('div', 'interaction-card');
     card.append(el('h3', undefined, '需要你的回答'));
-    if (request.question) card.append(el('p', undefined, request.question));
     const questions = request.questions?.length ? request.questions : [{ question: request.question, options: request.options, kind: 'single', allow_other: true }];
+    // A single question is already the fieldset legend; repeating the same
+    // headline above it reads as two questions.
+    if (request.question && (questions.length > 1 || questions[0]?.question !== request.question)) {
+      card.append(el('p', undefined, request.question));
+    }
     const fields = [];
     for (const [index, question] of questions.entries()) {
       const group = el('fieldset', 'interaction-question');
@@ -4002,6 +4060,7 @@ async function createTask() {
     $('message').value = draftText;
     resizeComposer();
     drafts.delete('new-session');
+    saveDrafts();
   }
   await refreshTasks();
   if (settings.defaultPermission && settings.defaultPermission !== 'assisted') {
@@ -4688,6 +4747,10 @@ function renderRightbar() {
     items.addEventListener('dragover', event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; });
     items.addEventListener('drop', event => {
       event.preventDefault();
+      // The tab-strip drop is consumed here. Re-rendering detaches the event
+      // target, so the document-level drop handler would otherwise see a
+      // detached node and float the tab instead of moving it.
+      event.stopPropagation();
       const movedId = event.dataTransfer.getData('text/plain');
       const source = rightbarPanes.find(item => item.tabs.includes(movedId));
       if (!source || !rightbarTabs[movedId]) return;
@@ -6817,6 +6880,9 @@ api.onEvent(frame => {
     renderConversation();
   } else if (event.type === 'plan_updated') {
     renderRightbar();
+    // The composer dock is a plan progress surface; refresh it on the event
+    // that changes the plan instead of waiting for an unrelated full render.
+    renderComposerDocks();
   }
   controls();
   scheduleConversation();
@@ -6993,6 +7059,8 @@ function boot() {
     resizeComposer();
     controls();
     const value = $('message').value;
+    drafts.set(draftKey(), value);
+    saveDrafts();
     if (/^\/[a-z-]*$/.test(value.trim())) openSlashMenu(); else $('command-popover')?.remove();
     if (/^\s*@/.test(value)) openAtMenu(); else $('at-popover')?.remove();
   });
@@ -7159,7 +7227,7 @@ async function submitComposer(complement = false) {
       const sent = new Set(refs.map(ref => ref.id));
       attachmentDrafts.set(draftKey(), attachments().filter(item => !sent.has(item.attachment?.id)));
       renderAttachments();
-      if ($('message').value.trim() === content) { $('message').value = ''; resizeComposer(); }
+      if ($('message').value.trim() === content) { $('message').value = ''; clearDraft(); resizeComposer(); }
       renderComposerDocks();
       return;
     }
@@ -7173,7 +7241,7 @@ async function submitComposer(complement = false) {
       await deliver({ type: 'submit_message', session_id: current.session.id, content, attachments: refs });
       pendingSubmit = true;
     }
-    if ($('message').value.trim() === content) { $('message').value = ''; resizeComposer(); }
+    if ($('message').value.trim() === content) { $('message').value = ''; clearDraft(); resizeComposer(); }
     const sent = new Set(refs.map(ref => ref.id));
     attachmentDrafts.set(draftKey(), attachments().filter(item => !sent.has(item.attachment?.id)));
     renderAttachments();
