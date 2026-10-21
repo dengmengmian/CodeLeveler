@@ -2358,6 +2358,57 @@ mod safety_tests {
         assert_eq!(archived[0].status, crate::MemoryStatus::Superseded);
     }
 
+    /// A generic error line ("assertion left == right failed") can describe
+    /// unrelated causes. A later verified lesson that shares the identity but
+    /// says something else is not an update; overwriting the current account
+    /// would make one wrong explanation the only remembered truth.
+    #[test]
+    fn a_different_explanation_under_one_failure_signature_waits_for_a_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.assertion",
+                "The linker is missing because the Xcode command line tools are not installed; install them before building.",
+                "cargo test -p demo (exit 0)",
+            ))
+            .unwrap();
+        let mut conflicting = verified_experience(
+            "cargo.test.assertion",
+            "The assertion compares bytes and chars after the API changed; update the expected value in the test helper.",
+            "cargo test -p demo (exit 0)",
+        );
+        conflicting.experience.as_mut().unwrap().applies_when =
+            "a Rust test asserts on a value produced by the changed API".to_string();
+        let outcome = store.admit_experience_candidate(conflicting).unwrap();
+        let crate::AgentAdmitOutcome::Queued { candidate, .. } = outcome else {
+            panic!("a different claim must wait for a person: {outcome:?}");
+        };
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0].body.contains("linker"),
+            "the current lesson must not be overwritten: {active:?}"
+        );
+
+        // The person chooses the parked explanation: consent resolves the
+        // dispute without parking it a second time.
+        let accepted = store.accept(&candidate.id).unwrap();
+        assert!(accepted.body.contains("assertion"), "{accepted:?}");
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, accepted.id);
+        assert!(
+            store
+                .list_archived()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.body.contains("linker")
+                    && entry.status == crate::MemoryStatus::Superseded),
+            "the rejected account stays as history"
+        );
+    }
+
     #[test]
     fn an_experience_cannot_replace_a_fact_of_another_kind() {
         let dir = tempfile::tempdir().unwrap();

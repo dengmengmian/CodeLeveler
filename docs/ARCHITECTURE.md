@@ -760,12 +760,18 @@ surface and admits no extraction.
 
 Agent experience is the same durable memory with an evidence contract, not a
 second store. After a completed task, the runtime reads only its own structured
-facts (commands, exit codes, model steps, mutations, the terminal outcome) and
-builds a bounded evidence pack. Raw tool output never enters the pack. A model
-may propose a lesson, but the runtime derives verification: a `verified`
-experience requires an observed failure and, for a fix or root cause, a later
-success of the same command after the last change. An environment constraint
-may be verified by the failing observation alone. A candidate that cannot meet
+facts (commands, exit codes, model steps, mutations, structured observations —
+a project verification script that exited 0 without output, an edit that
+reported success but changed nothing — and the terminal outcome) and builds a
+bounded evidence pack. Raw tool output never enters the pack. A model may
+propose a lesson, but the runtime derives verification: a `verified` experience
+requires an observed failure and, for a fix or root cause, a later success of
+the same command after the last change. An environment constraint may be
+verified by a structured observation alone. A different explanation under the
+same failure signature is not an update: it waits for a person instead of
+silently replacing the current entry. An observation-only lesson takes its
+identity from the observed script or edit tool, so repeated silent checks
+update one lesson rather than stacking duplicates. A candidate that cannot meet
 that contract stays unverified and waits for a person; it is never current
 truth. Experience has its
 own durable work queue, admitted with the turn and claimed only after the turn
@@ -777,8 +783,10 @@ catalog, and cannot replace a fact of another kind without a person. Recall is
 relevance-based; expiry, supersession, sensitivity and the terminal entry per
 identity filter it. User preferences and the current code still win. A passing
 check proves the behavior changed, not the explanation, so a recalled line
-marks its explanation as a model reading and carries the conditions under
-which the lesson applies.
+marks its explanation as a model reading, carries the conditions under which
+the lesson applies, and carries the date it was observed. `invalid_if` is
+advisory: no service re-runs the environment, so the reader judges whether a
+change invalidated the lesson.
 
 ---
 

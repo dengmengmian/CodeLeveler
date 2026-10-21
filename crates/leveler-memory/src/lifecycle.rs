@@ -659,7 +659,11 @@ pub fn decide(
             // A verified experience may correct an earlier experience under
             // the same identity when it carries new evidence, even at equal
             // authority. This is what lets a later task retire a stale
-            // explanation instead of accumulating beside it.
+            // explanation instead of accumulating beside it. It may only do so
+            // when the two claims are about the same thing: a generic error
+            // line can match two unrelated root causes, and silently replacing
+            // one with the other would make the newest explanation the only
+            // remembered account.
             if candidate_experience.is_some_and(crate::ExperienceRecord::is_verified)
                 && existing_experience.is_some_and(crate::ExperienceRecord::is_verified)
                 && candidate
@@ -667,9 +671,23 @@ pub fn decide(
                     .as_deref()
                     .is_some_and(|evidence| !evidence.trim().is_empty())
             {
+                // An explicit accept is the person choosing between the two
+                // accounts; it resolves the dispute without a second review.
+                if user_decision
+                    || crate::experience::claims_are_related(&existing.body, &candidate.body)
+                {
+                    return Ok(MemoryDecision {
+                        operation: MemoryOperation::Supersede {
+                            existing_id: existing.id.clone(),
+                        },
+                        related,
+                    });
+                }
                 return Ok(MemoryDecision {
-                    operation: MemoryOperation::Supersede {
-                        existing_id: existing.id.clone(),
+                    operation: MemoryOperation::NeedsApproval {
+                        reason: "the same failure signature carries a different explanation; \
+                                 a person must choose which one is current"
+                            .to_string(),
                     },
                     related,
                 });

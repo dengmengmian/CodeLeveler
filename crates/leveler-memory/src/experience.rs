@@ -116,6 +116,75 @@ impl ExperienceRecord {
     }
 }
 
+/// Below this share of shared content terms, two claims under one failure
+/// identity are treated as different explanations rather than an update.
+///
+/// Measured on the Phase 4 live store: the same root cause described in three
+/// runs shared 0.25-0.37 of its terms; unrelated explanations share almost
+/// none. The floor is deliberately far below the observed same-claim range.
+const CLAIM_SIMILARITY_FLOOR: f64 = 0.10;
+/// Too few terms cannot establish similarity. When either claim is this short,
+/// the store keeps the existing update path instead of inventing a conflict.
+const MIN_CLAIM_TERMS: usize = 8;
+
+/// Whether a new verified lesson is an update of the current one.
+///
+/// The failure signature is a good identity for the *situation*, but a generic
+/// error line (`assertion \`left == right\` failed`) can describe unrelated
+/// causes. Superseding on identity alone would make the newest explanation the
+/// only remembered truth. This guard only asks whether the two bodies talk
+/// about the same thing; a low score parks the new claim for a person instead
+/// of overwriting the current one.
+pub(crate) fn claims_are_related(existing_body: &str, candidate_body: &str) -> bool {
+    let existing_terms = claim_terms(existing_body);
+    let candidate_terms = claim_terms(candidate_body);
+    if existing_terms.len() < MIN_CLAIM_TERMS || candidate_terms.len() < MIN_CLAIM_TERMS {
+        return true;
+    }
+    let shared = existing_terms.intersection(&candidate_terms).count() as f64;
+    let union = existing_terms.union(&candidate_terms).count() as f64;
+    shared / union >= CLAIM_SIMILARITY_FLOOR
+}
+
+/// Content terms of one explanation: ASCII words of three or more characters
+/// and CJK character bigrams. Short function words are not evidence either way.
+fn claim_terms(body: &str) -> std::collections::BTreeSet<String> {
+    let mut terms = std::collections::BTreeSet::new();
+    let mut word = String::new();
+    let mut previous_cjk: Option<char> = None;
+    for character in body.chars() {
+        if character.is_ascii_alphanumeric() {
+            word.push(character.to_ascii_lowercase());
+            previous_cjk = None;
+            continue;
+        }
+        flush_ascii_word(&mut word, &mut terms);
+        if is_cjk(character) {
+            if let Some(previous) = previous_cjk {
+                terms.insert(format!("{previous}{character}"));
+            }
+            previous_cjk = Some(character);
+        } else {
+            previous_cjk = None;
+        }
+    }
+    flush_ascii_word(&mut word, &mut terms);
+    terms
+}
+
+fn flush_ascii_word(word: &mut String, terms: &mut std::collections::BTreeSet<String>) {
+    if word.chars().count() >= 3 {
+        terms.insert(std::mem::take(word));
+    } else {
+        word.clear();
+    }
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(character,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
 /// Validate the structural evidence contract. This is deterministic and runs
 /// on every write path, including a candidate restored from disk.
 pub fn validate_experience_record(record: &ExperienceRecord) -> Result<(), MemoryError> {

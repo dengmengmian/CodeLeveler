@@ -612,6 +612,7 @@ impl MemoryConsolidator {
             failures = pack.failures.len(),
             resolutions = pack.resolutions.len(),
             mutations = pack.mutations.len(),
+            observations = pack.observations.len(),
             "experience extraction started"
         );
         let model = ModelRef::parse(&item.model)

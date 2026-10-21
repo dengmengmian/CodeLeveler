@@ -375,6 +375,46 @@ async fn an_ordinary_task_does_not_pay_for_an_experience_extraction_call() {
     );
 }
 
+/// A verification command that exits 0 with no output is a structured
+/// observation, not an ordinary success. The extraction lane may learn a
+/// constraint from it without any command failure.
+#[tokio::test]
+async fn a_silent_verification_command_can_produce_a_verified_constraint() {
+    let (tmp, _server, app) = harness(vec![
+        tool_call(
+            "c-write",
+            "write_file",
+            serde_json::json!({"path": "verify.sh", "content": "#!/bin/sh\nexit 0\n"}),
+        ),
+        tool_call(
+            "c-verify",
+            "run_command",
+            serde_json::json!({"program": "sh", "args": ["verify.sh"]}),
+        ),
+        text("done"),
+        json_text(
+            r#"{"experiences":[{"category":"environment_constraint","subject":"experience.workspace.silent_verifier","title":"检查脚本无输出退出 0","body":"verify.sh 在这次运行中没有任何输出就退出 0；这只能证明脚本退出成功，不能证明检查真的执行了。","applies_when":"运行 verify.sh 且输出为空","invalid_if":"verify.sh 恢复输出检查结果","evidence_ids":["observation-2-c-verify"],"confidence":0.8}]}"#,
+        ),
+    ])
+    .await;
+    run_chat(&app, "确认 verify.sh 真的检查了工作区").await;
+    let entries = wait_for_experience(&tmp, |entries| entries.len() == 1).await;
+    let record = entries[0].experience.as_ref().expect("record");
+    assert_eq!(record.verification, ExperienceVerification::Verified);
+    assert!(
+        record
+            .evidence
+            .iter()
+            .any(|item| item.kind == "observation"),
+        "{record:?}"
+    );
+    assert!(
+        !record.evidence.iter().any(|item| item.kind == "mutation"),
+        "a constraint has no passing check to attribute a mutation to: {record:?}"
+    );
+    wait_for_experience_inbox_settled(&app).await;
+}
+
 #[tokio::test]
 async fn an_unverified_candidate_is_parked_and_never_becomes_current() {
     let (tmp, _server, app) = harness(vec![
