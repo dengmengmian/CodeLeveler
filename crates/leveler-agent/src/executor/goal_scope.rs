@@ -283,12 +283,41 @@ const WAIVER_MARKERS: &[&str] = &[
     "别做",
     "跳过",
     "暂缓",
+    "不要跑",
+    "不要运行",
+    "不要执行",
+    "别跑",
+    "别运行",
+    "别执行",
     "skip",
     "defer",
     "not needed",
-    "do not",
-    "don't",
     "no need",
+    "don't do",
+    "do not do",
+    "don't run",
+    "do not run",
+    "don't execute",
+    "do not execute",
+];
+
+/// Phrases that turn a surface negative into a demand or a prohibition of a
+/// waiver. Checked before [`WAIVER_MARKERS`].
+const WAIVER_GUARDS: &[&str] = &[
+    "不要忘记",
+    "别忘了",
+    "别忘记",
+    "不能忘记",
+    "记得",
+    "不要跳过",
+    "不能跳过",
+    "别跳过",
+    "don't forget",
+    "do not forget",
+    "remember to",
+    "don't skip",
+    "do not skip",
+    "never skip",
 ];
 
 /// Effective requirements from the durable objective and user amendments.
@@ -842,6 +871,9 @@ fn has_any(text: &str, needles: &[&str]) -> bool {
 }
 
 fn is_waiver(segment: &str) -> bool {
+    if has_any(segment, WAIVER_GUARDS) {
+        return false;
+    }
     has_any(segment, WAIVER_MARKERS)
 }
 
@@ -873,6 +905,21 @@ fn test_demanded(text: &str) -> bool {
             || lower.contains("jest")
             || lower.contains("vitest")
         {
+            return true;
+        }
+        if has_any(
+            &segment,
+            &[
+                "不要跳过",
+                "不能跳过",
+                "别跳过",
+                "don't skip",
+                "do not skip",
+                "never skip",
+                "必须测试",
+                "must test",
+            ],
+        ) {
             return true;
         }
         if !mentions_tests(&prose) {
@@ -917,6 +964,26 @@ fn test_demanded(text: &str) -> bool {
 }
 
 fn segment_is_negated(segment: &str) -> bool {
+    if has_any(
+        segment,
+        &[
+            "不要忘记",
+            "别忘了",
+            "别忘记",
+            "记得",
+            "don't forget",
+            "do not forget",
+            "remember to",
+            "不要跳过",
+            "不能跳过",
+            "别跳过",
+            "don't skip",
+            "do not skip",
+            "never skip",
+        ],
+    ) {
+        return false;
+    }
     has_any(
         segment,
         &[
@@ -1253,6 +1320,44 @@ mod tests {
                 .any(|requirement| requirement.kind == RequirementKind::Tests),
             "an explicitly named test command is a test demand: {command:?}"
         );
+    }
+
+    #[test]
+    fn a_demand_to_not_forget_tests_is_not_a_waiver() {
+        for text in [
+            "不要忘记跑测试，并创建 stage-1.txt。",
+            "别忘了测试通过后再结束。",
+            "Don't forget to run the tests and create stage-1.txt.",
+        ] {
+            let requirements = extract(text, &[]);
+            assert!(
+                requirements
+                    .iter()
+                    .any(|requirement| requirement.kind == RequirementKind::Tests),
+                "a reminder is a demand, not a waiver: {text} -> {requirements:?}"
+            );
+        }
+        for text in ["不要跳过测试。", "Don't skip the tests."] {
+            let requirements = extract(text, &[]);
+            assert!(
+                requirements
+                    .iter()
+                    .any(|requirement| requirement.kind == RequirementKind::Tests),
+                "a prohibition of skipping is a demand: {text} -> {requirements:?}"
+            );
+        }
+        for text in [
+            "不要跑测试，只实现接口。",
+            "Don't run the tests; implement only.",
+        ] {
+            let requirements = extract(text, &[]);
+            assert!(
+                !requirements
+                    .iter()
+                    .any(|requirement| requirement.kind == RequirementKind::Tests),
+                "an explicit do-not-run is a waiver: {text} -> {requirements:?}"
+            );
+        }
     }
 
     #[test]

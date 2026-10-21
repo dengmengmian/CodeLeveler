@@ -1495,6 +1495,10 @@ impl AgentHarness for Drive<'_> {
             // pending copy is consumed instead of opening a second identity.
             if let Some(binder) = self.executor.goal_binder() {
                 if self.executor.starts_in_goal_mode() || binder.bound().is_some() {
+                    // The declaration is an instruction inside a goal this
+                    // turn already owns. Keep it as user scope authority
+                    // before consuming the pending copy.
+                    binder.append_amendment(&declaration).await?;
                     binder.discard_declaration(&declaration).await?;
                 } else {
                     binder.bind(&declaration, &[]).await?;
