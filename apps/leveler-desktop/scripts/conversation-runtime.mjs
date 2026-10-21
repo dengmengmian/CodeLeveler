@@ -103,18 +103,40 @@ async function thoughts() {
   if (client === 'web') {
     while (await page.locator('.exploration-head[aria-expanded="false"]').count()) await page.locator('.exploration-head[aria-expanded="false"]').first().click();
     while (await page.locator('.thought-head[aria-expanded="false"]').count()) await page.locator('.thought-head[aria-expanded="false"]').first().click();
-  } else {
-    for (const receipt of await page.locator('details.exploration').all()) if (await receipt.getAttribute('open') === null) await receipt.locator(':scope > summary').click();
-    for (const thought of await page.locator('details.thought').all()) if (await thought.getAttribute('open') === null) await thought.locator(':scope > summary').click();
+    return page.locator('.thought-body').allTextContents();
   }
-  return page.locator('.thought-body').allTextContents();
+  // Desktop keeps reasoning in the runtime's record but paints no settled
+  // Thought row (the TUI conversation rule). The semantic assertions below
+  // read the wire events instead of a DOM body that no longer exists.
+  assert.equal(await page.locator('.thought-row:not(.thought-live)').count(), 0, 'a settled Thought was painted in the conversation');
+  return [];
 }
 async function assertPresentation(id, name) {
-  await poll(name + ' four completed Thought bodies', thoughts, bodies => markers.every(marker => bodies.filter(body => body === marker).length === 1));
-  const bodies = await thoughts(); assert.deepEqual(bodies.filter(body => markers.includes(body)), markers);
-  const diffs = page.locator('.confirmed-diff'); assert.ok(await diffs.first().isVisible(), name + ' canonical diff hidden');
-  const patch = await diffs.allTextContents(); for (const marker of ['--- a/src/models.rs', '+++ b/src/models.rs', 'gpt-5.6', 'gpt-6']) assert.ok(patch.join('').includes(marker), marker);
-  const labels = await page.locator(client === 'web' ? '.exploration-label' : '.exploration > summary').allTextContents(); assert.equal(labels.length, 1); assert.ok(labels[0].includes('读取 2 次 · 搜索 2 次'));
+  const bodies = await thoughts();
+  if (client === 'web') {
+    await poll(name + ' four completed Thought bodies', thoughts, found => markers.every(marker => found.filter(body => body === marker).length === 1));
+    assert.deepEqual((await thoughts()).filter(body => markers.includes(body)), markers);
+  }
+  let patch;
+  let confirmedFile = '';
+  if (client === 'web') {
+    const diffs = page.locator('.confirmed-diff'); assert.ok(await diffs.first().isVisible(), name + ' canonical diff hidden');
+    patch = await diffs.allTextContents();
+  } else {
+    await page.locator('.execution-group.execution-edit > .execution-summary').last().click();
+    await page.waitForFunction(() => document.querySelector('.review-scope')?.textContent.includes('已确认'));
+    confirmedFile = await page.locator('.review-path').innerText();
+    patch = await page.locator('.review-body').allTextContents();
+    await page.locator('.pane-chrome button[aria-label="收起右侧边栏"]').first().click();
+    await page.waitForFunction(() => !document.body.classList.contains('rightbar-open'));
+  }
+  if (client === 'web') {
+    for (const marker of ['--- a/src/models.rs', '+++ b/src/models.rs', 'gpt-5.6', 'gpt-6']) assert.ok(patch.join('').includes(marker), marker);
+  } else {
+    assert.ok(confirmedFile.includes('src/models.rs'), 'the confirmed viewer is not on the edited file');
+    for (const marker of ['gpt-5.6', 'gpt-6']) assert.ok(patch.join('').includes(marker), marker);
+  }
+  const labels = await page.locator(client === 'web' ? '.exploration-label' : '.execution-group.execution-exploration .execution-label').allTextContents(); assert.equal(labels.length, 1); assert.ok(labels[0].includes('读取 2 次 · 搜索 2 次'));
   assert.equal((await snapshot(id)).collaboration, 'chat');
   await page.screenshot({ path: path.join(out, name + '.png'), fullPage: true });
   return { thought_bodies: bodies, receipt_labels: labels, confirmed_diff_text: patch, full_diff_visible: true };

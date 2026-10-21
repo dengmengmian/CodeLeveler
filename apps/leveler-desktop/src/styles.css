@@ -618,10 +618,12 @@ body.home .conversation-scroll { display: none; }
 .message.user:hover .message-actions, .message.user:focus-within .message-actions { opacity: 1; }
 .message.assistant { color: var(--text-primary); font-size: var(--content-font-size); line-height: calc(24px + var(--content-font-delta)); }
 .message.notice {
-  display: flex; justify-content: center;
+  display: flex; justify-content: center; align-items: baseline; gap: 6px;
   color: var(--text-tertiary); font-size: 12px; line-height: 18px;
 }
-.message.notice .notice-pill { padding: 2px 8px; border-radius: 999px; background: var(--hover); }
+.message.notice .notice-pill { flex: none; padding: 2px 8px; border-radius: 999px; background: var(--hover); }
+.message.notice .notice-text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message.notice.summary-notice .notice-text { color: var(--text-secondary); }
 .message-actions { display: flex; justify-content: flex-end; gap: 8px; height: 28px; transition: opacity 80ms var(--ease); }
 .message.assistant .message-actions { justify-content: flex-start; margin-top: 0; margin-left: -6px; }
 .message-copy {
@@ -707,13 +709,6 @@ body.home .conversation-scroll { display: none; }
 .thought-summary .thought-chevron { transition: transform var(--duration-fast) var(--ease); }
 .thought-label { flex: none; }
 details[open] > .thought-summary .thought-chevron { transform: rotate(90deg); }
-.thought-body {
-  margin: 4px 0 4px 22px;
-  color: var(--text-tertiary);
-  font-size: 13px;
-  line-height: 22px;
-  white-space: pre-wrap;
-}
 .thought-live .thought-summary { color: var(--accent); }
 .thought-live .thought-label::after {
   content: "";
@@ -723,35 +718,71 @@ details[open] > .thought-summary .thought-chevron { transform: rotate(90deg); }
 }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
 
-/* process + tools */
-.process-group { display: flex; flex-direction: column; gap: 2px; }
-.process-heading {
+/* execution groups: siblings of narration, collapsed by default */
+.execution-group { display: block; }
+.execution-summary {
   display: flex; align-items: center; gap: 6px;
-  min-height: 33px; padding: 0 2px 8px; border-bottom: .5px solid var(--border-l2);
-  color: var(--text-tertiary); font-size: 14px; line-height: 24px;
-  user-select: none; cursor: pointer; list-style: none;
+  min-height: calc(26px + var(--content-font-delta)); padding: 0 4px 0 2px;
+  border-radius: 8px; color: var(--text-secondary);
+  font-size: 13px; line-height: 22px;
+  cursor: pointer; list-style: none; user-select: none;
 }
-.process-heading::-webkit-details-marker { display: none; }
-.process-heading:hover { background: var(--hover); color: var(--text-secondary); }
-.process-heading .chevron { transition: transform var(--duration-fast) var(--ease); }
-details[open] > .process-heading .chevron { transform: rotate(90deg); }
-.process-body { display: flex; flex-direction: column; gap: 2px; margin-left: 4px; padding-top: 2px; }
-.process-group:not([open]) .process-body { display: none; }
-/* A turn with no tool rounds has nothing to fold: the analysis rows stand alone. */
-.process-group[data-plain] > .process-heading { display: none; }
-.process-group[data-plain] > .process-body { margin-left: 0; padding-top: 0; }
+.execution-summary::-webkit-details-marker { display: none; }
+.execution-summary:hover { background: var(--hover); color: var(--text-secondary); }
+.execution-caret { flex: none; width: 14px; color: var(--text-secondary); font-size: 12px; transition: transform var(--duration-fast) var(--ease); }
+details[open] > .execution-summary .execution-caret { transform: rotate(90deg); }
+.execution-glyph { flex: none; width: 14px; text-align: center; font-size: 10px; color: var(--text-tertiary); }
+.execution-group[data-status="running"] .execution-glyph { color: var(--accent); animation: blink 1.2s infinite; }
+.execution-group[data-status="failed"] .execution-glyph { color: var(--error); }
+.execution-group[data-status="ok"] .execution-glyph { color: var(--success); }
+.execution-group[data-status="waiting"] .execution-glyph { color: var(--warning); }
+.execution-label { flex: none; min-width: 0; max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-action { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); }
+.execution-status { flex: none; color: var(--text-tertiary); }
+.execution-failure { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--error); font-size: 12px; }
+.execution-group[data-tone="warning"] .execution-label { color: var(--warning); }
+.execution-group[data-tone="error"] .execution-label { color: var(--error); }
+.execution-hint { flex: none; margin-left: auto; color: var(--text-tertiary); font-size: 11px; }
+.execution-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-tertiary);
+}
+.execution-toggle:hover { background: var(--hover); color: var(--text-secondary); }
+.execution-chevron { transition: transform var(--duration-fast) var(--ease); }
+details[open] > .execution-summary .execution-chevron { transform: rotate(90deg); }
+.execution-body { display: flex; flex-direction: column; gap: 2px; margin-left: 18px; padding: 2px 0 4px; }
+.execution-group:not([open]) > .execution-body { display: none; }
+.execution-files { display: flex; flex-direction: column; gap: 1px; padding: 2px 0 4px; }
+.execution-files-head { padding: 2px 4px; color: var(--text-tertiary); font-size: 11px; line-height: 18px; }
+.execution-files-empty { padding: 4px; color: var(--text-tertiary); font-size: 12px; }
+.execution-file-row {
+  display: flex; width: 100%; align-items: center; gap: 8px;
+  padding: 4px 8px; border-radius: 8px; background: transparent;
+  color: var(--text-secondary); font-size: 12px; line-height: 20px; text-align: left;
+}
+.execution-file-row:hover { background: var(--hover); color: var(--text-primary); }
+.execution-file-icon { flex: none; display: inline-flex; }
+.execution-file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-file-stat { flex: none; font-family: var(--font-code); font-size: 11px; }
+.execution-file-stat.add { color: var(--diff-added-marker); }
+.execution-file-stat.del { color: var(--diff-deleted-marker); }
 
-.execution-round { display: flex; flex-direction: column; gap: 2px; }
-.round-head {
-  display: none;
-  align-items: center; gap: 6px;
-  height: 24px; padding: 0 4px;
-  color: var(--text-tertiary); font-size: 12px; line-height: 24px;
+/* The turn's own receipt, after its answer. The status word is the runtime's
+   terminal fact, never "answer arrived" stretched into "task completed". */
+.turn-receipt {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+  padding: 8px 2px 4px; border-top: .5px solid var(--border-l2);
+  color: var(--text-tertiary); font-size: 12px; line-height: 20px;
 }
-.round-glyph { display: inline-flex; width: 12px; justify-content: center; font-size: 10px; }
-.execution-round[data-status="running"] .round-glyph { color: var(--accent); animation: blink 1.2s infinite; }
-.execution-round[data-status="failed"] .round-glyph { color: var(--error); }
-.execution-round[data-status="ok"] .round-glyph { color: var(--success); }
+.turn-receipt-mark { flex: none; font-size: 11px; }
+.turn-receipt-label { flex: none; color: var(--text-secondary); }
+.turn-receipt-stats { min-width: 0; }
+.turn-receipt[data-tone="success"] .turn-receipt-mark { color: var(--success); }
+.turn-receipt[data-tone="warning"] .turn-receipt-mark { color: var(--warning); }
+.turn-receipt[data-tone="error"] .turn-receipt-mark { color: var(--error); }
+.turn-receipt-detail { flex-basis: 100%; color: var(--text-tertiary); font-size: 12px; overflow-wrap: anywhere; }
+.turn-receipt-detail[hidden] { display: none; }
 
 .tool-row { border-radius: 8px; }
 .tool-summary {
@@ -770,12 +801,14 @@ details[open] > .tool-summary .tool-chevron { transform: rotate(90deg); }
 .tool-row[data-status="cancelled"] .tool-status { color: var(--text-caption); }
 .tool-label { flex: none; color: inherit; font-weight: 400; }
 .tool-target {
-  flex: 1; min-width: 0; overflow: hidden; color: inherit;
+  flex: 0 1 auto; max-width: 58%; min-width: 0; overflow: hidden; color: inherit;
   font-size: 13px; text-overflow: ellipsis; white-space: nowrap;
 }
 .tool-target::before { content: ""; display: inline-block; width: 2px; height: 2px; margin: 0 8px 2px 2px; border-radius: 1px; background: var(--text-caption); vertical-align: middle; }
 .tool-target:empty::before { display: none; }
 .tool-duration { flex: none; color: var(--text-caption); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tool-failure { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--error); font-size: 12px; }
+.tool-state { flex: none; color: var(--warning); font-size: 11px; }
 .tool-waiting { color: var(--warning); font-size: 11px; }
 .tool-row[data-status="failed"] .tool-label, .tool-row[data-status="failed"] .tool-target { color: var(--error); }
 .tool-row[data-status="running"] .tool-label, .tool-row[data-status="running"] .tool-target { color: var(--deep-diving); }
@@ -819,6 +852,13 @@ details[open] > .tool-summary .tool-chevron { transform: rotate(90deg); }
 .tool-io-text { margin: 0; max-height: 150px; overflow: auto; font-family: var(--font-code); font-size: var(--code-font-size); line-height: calc(var(--code-font-size) + 5px); white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); }
 .tool-io-text.error { color: var(--error); }
 .tool-edit-card .tool-output { max-height: 224px; }
+.tool-edit-receipt {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border: .5px solid var(--border-l2); border-radius: 10px; background: var(--bg-base);
+  color: var(--text-secondary); font-size: 12px;
+}
+.tool-edit-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-edit-receipt .button { flex: none; }
 .tool-output {
   margin: 0; padding: 10px 12px; border-radius: 10px;
   background: var(--code-block); color: var(--text-secondary);
@@ -830,15 +870,7 @@ details[open] > .tool-summary .tool-chevron { transform: rotate(90deg); }
 .tool-raw pre { margin: 4px 0 0 16px; white-space: pre-wrap; font-family: var(--font-code); font-size: 11px; color: var(--text-tertiary); }
 .browser-activity-link { margin-left: 4px; color: var(--text-link); font-size: 12px; }
 
-/* confirmed diff */
-.confirmed-diff { margin: 2px 0 6px 20px; border: .5px solid var(--border-l2); border-radius: 12px; overflow: hidden; background: var(--bg-base); }
-.confirmed-diff-head { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; background: var(--code-banner); border-bottom: .5px solid var(--border-l1); }
-.confirmed-diff-title { flex: 1; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
-.confirmed-diff-stat { font-family: var(--font-code); font-size: 11px; }
-.confirmed-diff-stat.add { color: var(--diff-added-marker); }
-.confirmed-diff-stat.del { color: var(--diff-deleted-marker); }
-.confirmed-diff-head .message-copy { height: 22px; font-size: 11px; }
-.confirmed-diff-body { margin: 0; padding: 8px 0; max-height: 420px; overflow: auto; font-family: var(--font-code); font-size: var(--code-font-size); line-height: calc(var(--code-font-size) + 7px); white-space: pre; }
+/* diff */
 .diff-line { display: block; padding: 0 10px; }
 .diff-line.added { background: var(--diff-added-bg); }
 .diff-line.removed { background: var(--diff-deleted-bg); }
@@ -1840,6 +1872,12 @@ body.rightbar-overlay #floating-right-toggle, body.rightbar-overlay .header-acti
 
 .message.narration .markdown { font-size: 13px; line-height: 20px; color: var(--text-secondary); }
 .message.narration .markdown p { margin: 8px 0; line-height: 20px; }
+/* Interim prose is a step in the work, not a deliverable: its actions appear
+   on approach instead of repeating under every sentence. */
+.message.assistant.narration .message-actions { opacity: 0; }
+.message.assistant.narration:hover .message-actions,
+.message.assistant.narration:focus-within .message-actions { opacity: 1; }
+.message.assistant.final .markdown { color: var(--text-primary); }
 .tab-items { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .tab-items::-webkit-scrollbar { display: none; }
 
@@ -2284,29 +2322,6 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .schedule-task-empty h3 { margin: 0; font-size: 14px; line-height: 1.6; font-weight: 400; }
 .schedule-task-empty p { margin: 0; max-width: 280px; }
 
-.turn-trigger {
-  border: .5px solid var(--border-l1); border-radius: 20px;
-  background: var(--bg-code, #f9fafb); color: var(--text-tertiary);
-}
-:root[data-theme="dark"] .turn-trigger { background: #1b1b1c; }
-.turn-trigger-header {
-  display: flex; width: 100%; min-height: 44px; align-items: center; gap: 10px;
-  padding: 12px 16px; border: 0; background: transparent; color: inherit;
-  font: inherit; text-align: left; cursor: pointer;
-}
-.turn-trigger-header:hover { color: var(--text-secondary); }
-.turn-trigger-icon { flex: none; }
-.turn-trigger-title { flex: 1; min-width: 0; font-size: 14px; line-height: 21px; }
-.turn-trigger-chevron { transition: transform .15s ease; }
-.turn-trigger.open .turn-trigger-chevron { transform: rotate(180deg); }
-.turn-trigger-body { padding: 0 16px 12px 40px; }
-.turn-trigger-explanation { margin: 8px 0; color: var(--text-secondary); font-size: 12px; line-height: 18px; }
-.turn-trigger-text {
-  max-height: 240px; margin: 0; overflow: auto; color: var(--text-secondary);
-  font-family: var(--font-text); font-size: 12px; line-height: 18px;
-  white-space: pre-wrap; overflow-wrap: anywhere;
-}
-
 .plan-card-row { padding: 0; }
 .plan-card-main {
   display: flex; flex: 1; min-width: 0; min-height: 58px; align-items: center; gap: 10px;
@@ -2536,20 +2551,10 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 
 .review-scope { flex: none; padding: 4px 10px; border-bottom: .5px solid var(--border-l1); color: var(--text-caption); font-size: 10px; line-height: 15px; }
 
-/* Conversation file references and confirmed edit cards. */
+/* Conversation file references. */
 .markdown-file-link { display: inline-flex; align-items: baseline; gap: 5px; padding: 0 6px; border: .5px solid var(--border-l1); border-radius: 7px; background: var(--inline-code); color: var(--text-link); font-family: var(--font-code); font-size: .9em; line-height: 1.5; overflow-wrap: anywhere; text-align: left; }
 .markdown-file-link > svg { align-self: center; width: 14px; height: 14px; flex: none; }
 .markdown-file-link:hover { background: var(--hover); }
-.answer-files { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 20px 0 16px; }
-.answer-file { display: flex; align-items: center; min-width: 0; padding: 10px; border: .5px solid var(--border-l1); border-radius: 14px; background: var(--bg-layer-1); }
-.answer-file-preview { display: flex; flex: 1; align-items: center; gap: 12px; min-width: 0; padding: 0; text-align: left; }
-.answer-file-icon { display: flex; width: 44px; height: 44px; align-items: center; justify-content: center; flex: none; border-radius: 10px; background: var(--bg-layer-0); border: .5px solid var(--border-l1); }
-.answer-file-icon svg { width: 26px; height: 26px; }
-.answer-file-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.answer-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; color: var(--text-primary); font-weight: 500; }
-.answer-file-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-tertiary); }
-.answer-file-open { flex: none; margin-left: 8px; }
 .message-actions { align-items: center; margin-top: 10px; }
 .message-actions .message-time { font-size: 11px; margin: 0 6px; }
 .message.assistant .message-actions { margin-top: 12px; }
-@media (max-width: 760px) { .answer-files { grid-template-columns: minmax(0, 1fr); } }

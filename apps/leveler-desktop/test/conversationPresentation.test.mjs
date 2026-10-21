@@ -27,6 +27,7 @@ import {
   confirmedDiffs,
   contractRoundStatus,
   contractToolStatus,
+  conversationItems,
   diffCounts,
   diffLines,
   failureReason,
@@ -81,10 +82,21 @@ test('C1: the confirmed diff comes from applied_diff, never from the arguments',
   // Full display: every line of the patch is available to paint.
   assert.equal(diffLines(patch).length, patch.split('\n').length);
   assert.ok(diffLines(patch).some((line) => line.includes('@@')));
-  // The corpus expectation is what the Desktop projection agrees with.
+  // The corpus expectation is what the Desktop projection agrees with: the
+  // confirmed diff is complete and needs no rebuild. Desktop's LAYOUT places
+  // that complete patch in the Workbench Changes viewer (one click on the
+  // modification summary), while the conversation keeps the summary; the
+  // terminal and Web keep painting it inline. See
+  // `conversationArchitecture.test.mjs` for the rendered ownership.
   const expected = doc.expect.items.find((item) => item.kind === 'edit_diff');
   assert.equal(expected.rendered_in_full, true);
-  assert.equal(expected.needs_click, false);
+  const items = conversationItems(state);
+  const edit = items.find((item) => item.kind === 'execution' && item.execution.variant === 'edit');
+  assert.ok(edit, 'the Desktop conversation presents the edit as an execution group');
+  assert.deepEqual(edit.execution.files.map((file) => file.path), ['src/models.rs']);
+  assert.equal(edit.execution.added, 1);
+  assert.equal(edit.execution.removed, 1);
+  assert.equal(edit.execution.collapsed, true, 'the modification summary is collapsed by default');
 });
 
 test('C1: a call that did not confirm an edit shows no diff', async () => {

@@ -230,11 +230,15 @@ test('thoughtDuration uses the terminal thresholds',()=>{
  assert.equal(thoughtDuration(15000),'15s');
 });
 
-test('a compaction summary is assistant prose, never a user bubble', async () => {
-  const { messageKind, historyQuestions } = await import('../src/presentation.mjs');
+test('a compaction summary is its own runtime row, never user speech or an answer', async () => {
+  const { messageKind, messageRoleLabel, historyQuestions, conversationItems } = await import('../src/presentation.mjs');
   const summary = { id: 'compact-1', role: 'user', kind: 'compaction_summary', text: '上下文已压缩' };
-  assert.equal(messageKind(summary), 'assistant');
+  assert.equal(messageKind(summary), 'summary');
+  assert.equal(messageRoleLabel(summary), '上下文摘要');
   assert.deepEqual(historyQuestions([summary]), []);
+  const items = conversationItems({ messages: [summary], tools: [], turnTerminals: [] });
+  assert.deepEqual(items.map(item => item.kind), ['summary']);
+  assert.equal(items[0].text, '上下文已压缩');
 });
 
 test('a command row names the command the runtime actually ran', async () => {

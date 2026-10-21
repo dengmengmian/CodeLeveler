@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { projectSnapshot, applyEvent, commandEnvelope } from '../src/state.mjs';
-import { answerFiles } from '../src/presentation.mjs';
+import { conversationItems } from '../src/presentation.mjs';
 const snapshot = { id:'session-1', messages:[{id:'u1',role:'user',text:'hello'}], task_status:'running', pending_interactions:[], active_tools:[] };
 test('snapshot restores transcript and only live waiter approvals', () => {
   const state = projectSnapshot({...snapshot,pending_interactions:[{type:'approval',request:{id:'a1',summary:'run'}}]});
@@ -280,10 +280,11 @@ test('a live turn after durable history takes its own sequence, never an earlier
   state = applyEvent(state, { type: 'assistant_message_started', message_id: 'a2' });
   state = applyEvent(state, { type: 'assistant_text_delta', message_id: 'a2', delta: 'second done' });
   const first = state.messages.find(message => message.id === 'a1');
-  const second = state.messages.find(message => message.id === 'a2');
   assert.ok(first.seq < state.tools.find(tool => tool.id === 't2').seq, 'the live turn reused a sequence from the replayed history');
-  assert.deepEqual(answerFiles(first, state.messages, state.tools).map(file => file.path), ['one.md']);
-  assert.deepEqual(answerFiles(second, state.messages, state.tools).map(file => file.path), ['two.md']);
+  const changes = conversationItems(state)
+    .filter(item => item.kind === 'execution' && item.execution.variant === 'edit')
+    .map(item => item.execution.files.map(file => file.path));
+  assert.deepEqual(changes, [['one.md'], ['two.md']], 'each turn owns only its own confirmed changes');
 });
 
 test('a terminal event clears the live activity label that would mask the settled status', () => {

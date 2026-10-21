@@ -52,10 +52,17 @@ export function conversationMatches(messages,query){
  for(const message of messages)for(const match of message.text.matchAll(matcher))matches.push({id:message.id,start:match.index,end:match.index+match[0].length});
  return matches;
 }
+/** Stamped by the runtime on the user-role message that replaces compacted history. */
+export const COMPACTION_SUMMARY_PREFIX = '对话摘要（已压缩历史）';
+/** @param {string} text */
+export function isCompactionSummaryText(text){return typeof text==='string'&&text.startsWith(COMPACTION_SUMMARY_PREFIX);}
+/** @param {string} text */
+export function compactionBody(text){return isCompactionSummaryText(text)?text.slice(COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/,'').trimStart():text;}
+
+/** @param {{role:string,kind?:string,text?:string}} message */
+export function messageKind(message){if(message.kind==='runtime_notice')return 'notice';if(message.kind==='compaction_summary'||(message.role==='user'&&isCompactionSummaryText(message.text??'')))return 'summary';return ['user','assistant'].includes(message.role)?message.role:'other';}
 /** @param {{role:string,kind?:string}} message */
-export function messageKind(message){if(message.kind==='runtime_notice')return 'notice';if(message.kind==='compaction_summary')return 'assistant';return ['user','assistant'].includes(message.role)?message.role:'other';}
-/** @param {{role:string,kind?:string}} message */
-export function messageRoleLabel(message){return message.kind==='runtime_notice'?'运行提示':message.role==='user'?'你':message.role==='assistant'?'CodeLeveler':message.role;}
+export function messageRoleLabel(message){if(message.kind==='runtime_notice')return '运行提示';if(message.kind==='compaction_summary')return '上下文摘要';return message.role==='user'?'你':message.role==='assistant'?'CodeLeveler':message.role;}
 /** @template {{role:string,kind?:string}} T @param {T[]} messages @returns {T[]} */
 export function historyQuestions(messages){return messages.filter(message=>messageKind(message)==='user');}
 
@@ -142,6 +149,7 @@ export const isCommandTool = shared.isCommandTool;
 export const groupExploration = shared.groupExploration;
 export const explorationLabel = shared.explorationLabel;
 export const isExplorationTool = shared.isExplorationTool;
+export const isEditTool = shared.isEditTool;
 export const foldedThoughts = shared.foldedThoughts;
 export const confirmedDiffs = shared.confirmedDiffs;
 export const confirmedDiffOf = shared.confirmedDiff;
@@ -152,7 +160,7 @@ export const diffLines = shared.diffLines;
 /** Activity class for the legacy fallback only. @param {string} name */
 function activityClass(name){const n=name.toLowerCase();if(/apply_patch|edit|write|patch/.test(n))return 'edit';if(/read|cat|open|view/.test(n))return 'read';if(/search|grep|find|glob|list/.test(n))return 'search';if(/bash|shell|exec|command|run|terminal|cargo|npm|git_(?!diff)/.test(n))return 'command';return 'other';}
 
-/** @typedef {{id:string,name:string,status:string,parallel?:boolean,modelStep?:number|null,batch?:number|null,answerEffect?:string}} ExecutionToolRow */
+/** @typedef {{id:string,name:string,status:string,arguments?:string,preview?:string|null,appliedDiff?:string|null,exit_code?:number|null,seq?:number,parallel?:boolean,modelStep?:number|null,batch?:number|null,answerEffect?:string}} ExecutionToolRow */
 /** @typedef {{modelStep:number|null,tools:ExecutionToolRow[],status:string,allOk:boolean,batches:string[][]}} ExecutionRoundView */
 
 /** @param {ExecutionRoundView} round @param {ExecutionToolRow} tool */
@@ -244,12 +252,11 @@ export function projectTurn(messages,tools,turnEnded){
    const message=entry.message;
    if(message.btw!==undefined)continue;
    // Only the model's public assistant content is AssistantText. A user line,
-   // a runtime notice and a compaction summary (stored on the user role) are
-   // not assistant prose.
-   const kind=message.kind==='compaction_summary'?'assistant':messageKind(message);
+   // a runtime notice and a compaction summary are not assistant prose.
+   const kind=messageKind(message);
    if(kind!=='assistant')continue;
    if(!message.text.trim())continue;
-   nodes.push({kind:'assistant',text:message.text,demoted:false,seq:entry.seq});
+   nodes.push({kind:'assistant',text:message.text,message,demoted:false,seq:entry.seq});
    continue;
   }
   const tool=entry.tool;
@@ -261,7 +268,7 @@ export function projectTurn(messages,tools,turnEnded){
  }
  /** @type {any[]} */ const items=[];
  for(const node of nodes){
-  if(node.kind==='assistant'){items.push({seq:node.seq,kind:turnEnded&&!node.demoted?'final_answer':'assistant_text',text:node.text});continue;}
+  if(node.kind==='assistant'){items.push({seq:node.seq,kind:turnEnded&&!node.demoted?'final_answer':'assistant_text',text:node.text,message:node.message});continue;}
   node.round.status=roundStatus(node.round.tools);
   node.round.allOk=node.round.tools.length>0&&node.round.tools.every(/** @param {ExecutionToolRow} row */ row=>contractToolStatus(row.status)==='ok');
   node.round.batches=roundBatches(node.round.tools);
@@ -298,37 +305,368 @@ export function turnTerminalFromEvent(type,messages,tools){
 export { explorationEntries } from '../../../packages/conversation-presentation/conversation.mjs';
 
 
-/** Cards describe confirmed host edits, never file names claimed in model prose.
- * @param {ProjectionMessage} message @param {ProjectionMessage[]} messages @param {import('../../../packages/conversation-presentation/conversation.mjs').ToolView[]} tools
- */
-export function answerFiles(message, messages, tools) {
-  const end = message.seq;
-  if (!Number.isFinite(end)) return [];
-  const start = [...messages].reverse().find(item => messageKind(item) === 'user' && (item.seq ?? -1) <= (end ?? -1))?.seq ?? -1;
-  const files = new Map();
-  for (const tool of tools) {
-    if (!((tool.seq ?? -1) > start && (tool.seq ?? -1) < (end ?? -1))) continue;
-    const patch = confirmedDiffOf(tool);
-    if (!patch) continue;
-    const sections = patch.split(/(?=^--- )/m);
-    for (const section of sections) {
-      const match = /^\+\+\+ (?:b\/)?([^\t\n]+)(?:\t[^\n]*)?$/m.exec(section);
-      const path = match?.[1];
-      if (!path || path.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(path) || /[\\\x00-\x1f]/.test(path) || path.split('/').includes('..')) continue;
-      const [added, removed] = diffCounts(section);
-      const previous = files.get(path) ?? {path, added: 0, removed: 0};
-      previous.added += added;
-      previous.removed += removed;
-      files.set(path, previous);
-    }
-  }
-  return [...files.values()];
-}
-
 /** @param {{time?:unknown,created_at?:unknown}} message */
 export function messageTime(message) {
   const value = message.time ?? message.created_at;
   if (typeof value !== 'string' || !value.trim()) return null;
   const date = new Date(value);
   return Number.isFinite(date.getTime()) && date.getTime() > 0 ? date.toISOString() : null;
+}
+
+// ── Conversation presentation ─────────────────────────────────────────────
+// The ONE projection the Desktop renderer paints and the tests read. It keeps
+// the runtime's arrival order: a turn is the user line, everything that
+// arrived after it, and its terminal receipt. Narration stays where it was
+// written; execution groups are siblings of it, never a parent of it.
+
+/** A path that may be presented as a file the runtime actually changed.
+ * @param {string|null|undefined} path @returns {boolean} */
+export function validDiffPath(path) {
+  return typeof path === 'string' && path.length > 0
+    && !path.startsWith('/')
+    && !/^[a-z][a-z0-9+.-]*:/i.test(path)
+    && !/[\\\x00-\x1f]/.test(path)
+    && !path.split('/').includes('..');
+}
+
+/**
+ * The real files inside one confirmed patch. Header markers are not changes,
+ * and a section whose path cannot be opened is left out instead of guessed.
+ * @param {string} patch
+ * @returns {Array<{path:string,added:number,removed:number,patch:string}>}
+ */
+export function diffFiles(patch) {
+  /** @type {Array<{path:string,added:number,removed:number,patch:string}>} */
+  const files = [];
+  if (typeof patch !== 'string' || patch === '') return files;
+  for (const section of patch.split(/(?=^--- )/m)) {
+    const match = /^\+\+\+ (?:b\/)?([^\t\n]+)(?:\t[^\n]*)?$/m.exec(section);
+    const path = match?.[1];
+    if (!path || !validDiffPath(path)) continue;
+    const [added, removed] = diffCounts(section);
+    const previous = files.find(file => file.path === path);
+    if (previous) {
+      previous.added += added;
+      previous.removed += removed;
+      previous.patch += section;
+    } else {
+      files.push({ path, added, removed, patch: section });
+    }
+  }
+  return files;
+}
+
+/**
+ * The confirmed files a set of tool calls produced, merged by path. The
+ * runtime's `applied_diff` is the only source: a successful tool that
+ * confirmed no change contributes nothing.
+ * @param {string[]} toolIds
+ * @param {ExecutionToolRow[]} tools
+ */
+export function confirmedChangeFiles(toolIds, tools) {
+  const wanted = new Set(toolIds ?? []);
+  /** @type {Array<{path:string,added:number,removed:number,patch:string}>} */
+  const files = [];
+  for (const tool of tools ?? []) {
+    if (!wanted.has(tool.id)) continue;
+    const patch = confirmedDiffOf(/** @type {any} */ (tool));
+    if (!patch) continue;
+    for (const file of diffFiles(patch)) {
+      const previous = files.find(item => item.path === file.path);
+      if (previous) {
+        previous.added += file.added;
+        previous.removed += file.removed;
+        previous.patch += file.patch;
+      } else files.push(file);
+    }
+  }
+  return files;
+}
+
+/** @param {number|null|undefined} ms */
+export function elapsedLabel(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${Math.max(1, seconds)} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`;
+}
+
+/** @type {Record<string,string[]>} */
+const RECEIPT_LABELS = {
+  answered: ['✓', '回答结束'],
+  completed: ['✓', '任务已完成'],
+  completed_with_warnings: ['⚠', '已完成，但有警告'],
+  truncated: ['⚠', '已完成，但有警告'],
+  incomplete: ['⚠', '未完成'],
+  no_final_answer: ['⚠', '执行已结束，但未提交最终回答'],
+  failed: ['✗', '失败'],
+  cancelled: ['⊘', '已取消'],
+};
+/** @type {Record<string,string>} */
+const RECEIPT_TONES = {
+  answered: 'success', completed: 'success',
+  completed_with_warnings: 'warning', truncated: 'warning',
+  incomplete: 'warning', no_final_answer: 'warning',
+  failed: 'error', cancelled: 'muted',
+};
+
+/** The terminal status as the conversation's own receipt vocabulary.
+ * @param {string} status */
+export function receiptMarker(status) {
+  const [glyph, label] = RECEIPT_LABELS[status] ?? ['·', `未知状态：${status}`];
+  return { glyph, label, tone: RECEIPT_TONES[status] ?? 'muted' };
+}
+
+/** @param {{endedHm?:string|null,elapsedMs?:number|null,rounds?:number,toolCalls?:number,detail?:string|null}} terminal */
+export function receiptStats(terminal) {
+  return [
+    terminal.endedHm || '',
+    elapsedLabel(terminal.elapsedMs),
+    (terminal.rounds ?? 0) > 0 ? `${terminal.rounds} 轮` : '',
+    (terminal.toolCalls ?? 0) > 0 ? `${terminal.toolCalls} 次工具调用` : '',
+  ].filter(Boolean);
+}
+
+/** @param {ExecutionToolRow[]} tools @param {string} id */
+function toolOfId(tools, id) { return tools.find(tool => tool.id === id); }
+
+/** @param {ExecutionToolRow[]} tools */
+function statusCounts(tools) {
+  const statuses = tools.map(tool => contractToolStatus(tool.status));
+  return {
+    running: statuses.includes('running'),
+    failed: statuses.filter(status => status === 'failed').length,
+    cancelled: statuses.filter(status => status === 'cancelled').length,
+    unknown: statuses.filter(status => status === 'unknown').length,
+    ok: statuses.length > 0 && statuses.every(status => status === 'ok'),
+  };
+}
+
+/** @param {ExecutionToolRow[]} tools */
+function groupedExploration(tools) {
+  const receipt = groupExploration(/** @type {any[]} */ (tools))[0];
+  return receipt && receipt.members.length === tools.length ? receipt : null;
+}
+
+/** @param {ExecutionToolRow[]} tools */
+function isCommandGroup(tools) {
+  return tools.length > 0 && tools.every(tool => isCommandTool(tool.name));
+}
+
+/**
+ * The view one execution block presents. `kind` decides the shape the renderer
+ * uses; `label` is the collapsed summary the reader sees.
+ * @param {{kind:'round'|'receipt',round?:ExecutionRoundView,receipt?:any}} block
+ * @param {ExecutionToolRow[]} tools
+ * @param {Set<string>} approvalIds
+ */
+export function executionView(block, tools, approvalIds) {
+  /** @type {ExecutionToolRow[]} */
+  const members = block.kind === 'receipt'
+    ? /** @type {ExecutionToolRow[]} */ (block.receipt.members
+      .map(/** @param {{id:string}} member */ member => toolOfId(tools, member.id))
+      .filter(Boolean))
+    : (block.round?.tools ?? []);
+  const counts = statusCounts(members);
+  const waiting = members.some(tool => approvalIds.has(String(tool.id)));
+  const status = counts.running ? 'running'
+    : counts.failed ? 'failed'
+      : counts.cancelled ? 'cancelled'
+        : counts.unknown ? 'unknown' : 'ok';
+  const editTools = members.filter(tool => isEditTool(tool.name) && !!confirmedDiffOf(/** @type {any} */ (tool)));
+  const files = confirmedChangeFiles(editTools.map(tool => tool.id), members);
+  const editGroup = files.length > 0;
+  const allExploration = members.length > 0 && members.every(tool => isExplorationTool(tool.name));
+  const exploration = allExploration && members.length >= 2 && !counts.failed ? groupedExploration(members) : null;
+  const variant = editGroup ? 'edit'
+    : exploration ? 'exploration'
+      : members.length === 1 ? 'tool' : 'tools';
+  /** @type {any} */
+  const view = {
+    id: members[0]?.id ?? 'empty',
+    variant,
+    tools: members.map(tool => tool.id),
+    toolIds: members.map(tool => tool.id),
+    rounds: [...new Set(members.map(tool => tool.modelStep ?? null))],
+    status,
+    running: counts.running,
+    failed: counts.failed,
+    cancelled: counts.cancelled,
+    unknown: counts.unknown,
+    waiting,
+    commandGroup: isCommandGroup(members),
+    collapsed: true,
+    liveAction: '',
+    failure: '',
+    label: '',
+  };
+  if (exploration) {
+    view.exploration = exploration;
+    view.label = exploration.label;
+  }
+  if (editGroup) {
+    const otherOperations = members.length - editTools.length;
+    view.files = files;
+    view.editTools = editTools.map(tool => tool.id);
+    view.added = files.reduce((sum, file) => sum + file.added, 0);
+    view.removed = files.reduce((sum, file) => sum + file.removed, 0);
+    view.label = files.length
+      ? `修改 ${files.length} 个文件 · +${view.added} / -${view.removed}`
+      : `修改文件 · ${members.length} 项`;
+    if (otherOperations > 0) view.label += ` · 另有 ${otherOperations} 项`;
+  }
+  if (!editGroup && !exploration && members.length > 1) {
+    view.label = isCommandGroup(members) ? `执行 ${members.length} 条命令` : `执行 ${members.length} 项`;
+  }
+  if (variant === 'tool') {
+    const tool = members[0];
+    view.label = toolLabel(/** @type {any} */ (tool));
+  }
+  const runningTool = members.find(tool => contractToolStatus(tool.status) === 'running');
+  if (runningTool) {
+    view.liveAction = `${toolLabel(/** @type {any} */ (runningTool))} ${toolTarget(/** @type {any} */ (runningTool))}`.trim();
+  }
+  const failedTool = members.find(tool => contractToolStatus(tool.status) === 'failed');
+  if (failedTool) view.failure = failureReason(failedTool.preview ?? '') ?? '';
+  return view;
+}
+
+/** The status words appended to a collapsed execution summary.
+ * @param {ReturnType<typeof executionView>} view */
+export function executionStatusLabel(view) {
+  if (view.waiting) return '等待审批';
+  if (view.running) return '执行中';
+  const unit = view.commandGroup ? '条' : '项';
+  const parts = [];
+  if (view.failed > 0) parts.push(`${view.failed} ${unit}失败`);
+  if (view.cancelled > 0) parts.push(`${view.cancelled} ${unit}已停止`);
+  if (view.unknown > 0) parts.push(`${view.unknown} ${unit}结果未知`);
+  if (parts.length > 0) return parts.join(' · ');
+  if (view.variant === 'edit' || view.variant === 'exploration') return '';
+  return view.commandGroup ? '全部成功' : '全部完成';
+}
+
+/**
+ * Project one session onto the conversation's painted items, in arrival order.
+ *
+ * This is the production projection: `renderer.mjs` iterates exactly this
+ * array. Classification (final vs narration, edit vs tools, receipt status)
+ * happens here, never in the renderer.
+ *
+ * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],thoughts?:any[],reasoning?:string,turnTerminals?:any[],turnErrors?:any[],approvals?:any[],streamingMessageId?:string|null,status?:string}} state
+ */
+export function conversationItems(state) {
+  /** @param {{seq?:number}|null|undefined} entry @param {number} index @returns {number} */
+  const seqOf = (entry, index) => typeof entry?.seq === 'number' ? entry.seq : index;
+  const messages = (state.messages ?? [])
+    .map((message, index) => ({ ...message, seq: seqOf(message, index) }))
+    .filter(message => message.btw === undefined)
+    .sort((a, b) => a.seq - b.seq);
+  const tools = (state.tools ?? [])
+    .map((tool, index) => ({ ...tool, seq: seqOf(tool, index) }))
+    .sort((a, b) => a.seq - b.seq);
+  const terminals = (state.turnTerminals ?? [])
+    .map((terminal, index) => ({ ...terminal, seq: seqOf(terminal, index) }))
+    .sort((a, b) => a.seq - b.seq);
+  const approvalIds = new Set((state.approvals ?? []).map(request => String(request.call_id ?? '')));
+  const userSeqs = messages.filter(message => messageKind(message) === 'user').map(message => message.seq);
+  const segments = [];
+  let start = -Infinity;
+  for (const seq of userSeqs) {
+    segments.push({ start, end: seq });
+    start = seq;
+  }
+  segments.push({ start, end: Infinity });
+  /** @type {any[]} */
+  const items = [];
+  const liveThought = (state.reasoning ?? '').trim();
+  for (const [segmentIndex, segment] of segments.entries()) {
+    /** @param {{seq:number}} entry */
+    const inSegment = entry => entry.seq >= segment.start && entry.seq < segment.end;
+    const turnMessages = messages.filter(inSegment);
+    const turnTools = tools.filter(inSegment);
+    const turnFilePaths = [...new Set(confirmedChangeFiles(turnTools.map(tool => tool.id), turnTools).map(file => file.path))];
+    const terminalRecord = terminals.filter(inSegment).at(-1) ?? null;
+    const terminalStatus = terminalRecord?.status ?? null;
+    const endedWithAnswer = terminalStatus !== null && terminalStatus !== 'no_final_answer';
+    const projected = projectTurn(turnMessages, turnTools, endedWithAnswer);
+    /** @type {ExecutionRoundView[]} */
+    const rounds = [];
+    for (const item of projected) {
+      if (item.kind === 'execution_round') { rounds.push(item.round); continue; }
+      const message = item.message;
+      items.push({
+        kind: item.kind === 'final_answer' ? 'final' : 'narration',
+        seq: item.seq,
+        message,
+        streaming: state.streamingMessageId === message?.id,
+        text: item.text,
+        filePaths: turnFilePaths,
+      });
+    }
+    for (const message of turnMessages) {
+      const kind = messageKind(message);
+      if (kind === 'user') items.push({ kind: 'user', seq: message.seq, message });
+      else if (kind === 'notice') items.push({ kind: 'notice', seq: message.seq, message, text: message.text });
+      else if (kind === 'summary') items.push({ kind: 'summary', seq: message.seq, message, text: compactionBody(message.text) });
+    }
+    for (const thought of foldedThoughts(state.thoughts ?? [])) {
+      if (!inSegment(thought)) continue;
+      // The runtime's reasoning stays in the model's record and in Trajectory;
+      // a settled Thought paints no conversation row (the TUI's own rule).
+      items.push({ kind: 'thought', seq: thought.seq, thought, visible: false });
+    }
+    for (const block of turnBlocks([], /** @type {any[]} */ (rounds))) {
+      if (block.kind !== 'round' && block.kind !== 'receipt') continue;
+      const view = executionView(block, tools, approvalIds);
+      if (view.tools.length === 0) continue;
+      items.push({ kind: 'execution', seq: block.seq, execution: view });
+    }
+    for (const error of state.turnErrors ?? []) {
+      const seq = seqOf(error, 0);
+      if (seq >= segment.start && seq < segment.end) items.push({ kind: 'turn_error', seq, error });
+    }
+    const lastToolSeq = turnTools.length ? turnTools[turnTools.length - 1].seq : -Infinity;
+    const proseAfterTools = turnMessages.some(message =>
+      messageKind(message) === 'assistant' && message.seq > lastToolSeq && String(message.text ?? '').trim() !== '');
+    const toolCalls = turnTools.length;
+    const roundsCount = rounds.length + (proseAfterTools ? 1 : 0);
+    if (terminalRecord) {
+      let status = terminalRecord.status;
+      const hasFinal = items.some(item => item.kind === 'final'
+        && item.seq >= segment.start && item.seq < segment.end);
+      if (['answered', 'completed'].includes(status) && !hasFinal) status = 'no_final_answer';
+      if (status === 'no_final_answer') {
+        for (const item of items) {
+          if (item.kind === 'final' && item.seq >= segment.start && item.seq < segment.end) item.kind = 'narration';
+        }
+      }
+      const receiptSeq = Number.isFinite(segment.end) ? segment.end - 0.5 : Number.MAX_SAFE_INTEGER - 3;
+      items.push({
+        kind: 'turn_receipt',
+        seq: receiptSeq,
+        terminal: {
+          ...receiptMarker(status),
+          status,
+          endedHm: terminalRecord.endedHm ?? null,
+          elapsedMs: terminalRecord.elapsedMs ?? null,
+          rounds: roundsCount,
+          toolCalls,
+          detail: terminalRecord.detail ?? null,
+          stats: receiptStats({
+            endedHm: terminalRecord.endedHm ?? null,
+            elapsedMs: terminalRecord.elapsedMs ?? null,
+            rounds: roundsCount,
+            toolCalls,
+          }),
+        },
+      });
+    }
+    if (segmentIndex === segments.length - 1 && liveThought !== '') {
+      items.push({ kind: 'live_thought', seq: Number.MAX_SAFE_INTEGER - 2, text: liveThought, trailing: true });
+    }
+  }
+  return items.sort((a, b) => a.seq - b.seq);
 }

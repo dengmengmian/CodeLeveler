@@ -10,7 +10,7 @@ import {
 } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[]};
+  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
   if (history.length > 0) {
     // The durable log is the conversation; the snapshot's `messages` are the
     // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
@@ -27,7 +27,9 @@ export function projectSnapshot(snapshot, history = []) {
     }
   } else {
     // No durable turn: the snapshot is all there is (a brand-new session).
-    state.messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index}));
+    // These rows are a snapshot's ACTIVE MODEL CONTEXT, not a transcript; a
+    // later durable replay replaces them, so they are marked as placeholders.
+    state.messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index,snapshotContext:true}));
     state.nextSeq = state.messages.length;
   }
   // Replay stamps every entry with its log index, but only thoughts advance
@@ -39,12 +41,23 @@ export function projectSnapshot(snapshot, history = []) {
     for (const message of state.messages) replayed = Math.max(replayed, (message.seq ?? -1) + 1);
     for (const tool of state.tools) replayed = Math.max(replayed, (tool.seq ?? -1) + 1);
     state.nextSeq = Math.max(state.nextSeq, replayed);
+    // A replay has no wall clock. The durable log does carry each turn's own
+    // elapsed, so the receipt keeps the runtime's measurement and omits the
+    // clock instead of inventing one from the moment the client replayed it.
+    const terminals = history.filter(entry => terminalEvents.has((entry.event ?? entry).type));
+    state.turnTerminals = (state.turnTerminals ?? []).map((terminal, index) => ({
+      ...terminal,
+      at: null,
+      endedHm: null,
+      elapsedMs: Number.isFinite(terminals[index]?.turn_elapsed_ms) ? terminals[index].turn_elapsed_ms : null,
+    }));
+    state.turnStartedAt = null;
   }
   // Replayed history events carry no terminal classification. The runtime's
   // snapshot is the authority on whether the newest declaration is active or
   // history, so a completed plan is never resurrected as active work here.
   if (snapshot.plan) state.plan = snapshot.plan;
-  for (const tool of snapshot.active_tools ?? []) state = applyEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments});
+  for (const tool of snapshot.active_tools ?? []) state = applyEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments,snapshotContext:true});
   // The durable history's turn terminal is the runtime's own fact: without it a
   // reopened turn could not tell an answer from interim narration (Contract §I9).
   const terminalEntry = [...history].reverse().find(entry=>terminalEvents.has((entry.event??entry).type));
@@ -79,17 +92,114 @@ function applyToolEvent(state, event) {
         // The runtime's answer classification. `?? 'work'` is the conservative
         // read of a peer that did not state it (AnswerEffect::unstated), never
         // a local decision about the tool name.
-        answerEffect:event.answer_effect??'work',appliedDiff:null,batch,seq:event.seq??nextSeq++});
+        answerEffect:event.answer_effect??'work',appliedDiff:null,batch,seq:event.seq??nextSeq++,
+        ...(event.snapshotContext?{snapshotContext:true}:{live:true})});
     }
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
-    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null}; tools.push(tool);}
+    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null,live:true}; tools.push(tool);}
+    delete tool.snapshotContext;
+    tool.live = true;
     if (event.type === 'tool_call_completed') Object.assign(tool,{status:toolStatusFromOutcome(event.ok,event.stop),preview:event.preview,exit_code:event.exit_code,appliedDiff:event.applied_diff??null});
     // A finished call no longer owns the live label (TUI clears activity on
     // the same event); the next progress event or the turn's clock takes over.
-    if (event.type === 'tool_call_completed') return {...state,tools,nextSeq,activity:''};
+    if (event.type === 'tool_call_completed') return {...state,tools,nextSeq,activity:'',activityElapsedMs:null};
     else tool.preview = (tool.preview + event.chunk).slice(-16000);
   }
   return {...state,tools,nextSeq};
+}
+/**
+ * A durable-history replay replaces the conversation up to the query. Live
+ * events that arrived while that query was in flight are not in the replay and
+ * must survive it; events it already contains must not be applied twice.
+ *
+ * The replay owns every fact it carries. A live row is appended only when its
+ * identity is absent, or adopted when it has advanced a tool past the replay
+ * (running -> terminal). New rows are numbered after the replay, preserving
+ * their live arrival order.
+ */
+export function mergeRestoredConversation(restored, live) {
+  const seqMax = entries => entries.reduce((max, entry) => Math.max(max, (entry.seq ?? -1) + 1), 0);
+  const floor = Math.max(seqMax(restored.messages), seqMax(restored.tools));
+  let nextSeq = Math.max(restored.nextSeq ?? 0, live.nextSeq ?? 0, floor);
+  const adopt = entry => {
+    const seq = typeof entry.seq === 'number' && entry.seq >= floor ? entry.seq : nextSeq++;
+    nextSeq = Math.max(nextSeq, seq + 1);
+    return { ...entry, seq };
+  };
+  const liveMessages = live.messages ?? [];
+  const liveMessageById = new Map(liveMessages.map(message => [message.id, message]));
+  const matched = new Set();
+  for (const message of restored.messages) if (liveMessageById.has(message.id)) matched.add(message.id);
+  // Durable history re-creates user message ids on replay, so an id-only match
+  // would append every user line a second time. Match unmatched restored rows
+  // against the next unmatched live row with the same role and text, in order.
+  let cursor = 0;
+  for (const message of restored.messages) {
+    if (liveMessageById.has(message.id)) continue;
+    while (cursor < liveMessages.length && (matched.has(liveMessages[cursor].id) || liveMessages[cursor].snapshotContext)) cursor += 1;
+    const candidate = liveMessages[cursor];
+    if (!candidate) break;
+    const sameKind = candidate.role === message.role && (candidate.kind ?? null) === (message.kind ?? null);
+    const sameText = candidate.text === message.text
+      || (message.role === 'assistant' && String(candidate.text ?? '').startsWith(String(message.text ?? '')));
+    if (sameKind && sameText) { matched.add(candidate.id); cursor += 1; }
+  }
+  const messages = restored.messages.map(message => {
+    const current = liveMessageById.get(message.id);
+    if (!current) return message;
+    // A stream that continued after the replay keeps the newer text, at the
+    // position the durable log already gave it.
+    if ((current.text?.length ?? 0) > (message.text?.length ?? 0) || (current.final && !message.final)) {
+      return { ...message, ...current, seq: message.seq };
+    }
+    return message;
+  });
+  // Only a state that has no durable transcript yet keeps its snapshot rows;
+  // once history arrives, a snapshot's ACTIVE CONTEXT is not a transcript.
+  const keepSnapshotMessages = restored.messages.length === 0;
+  for (const message of liveMessages
+    .filter(item => !matched.has(item.id) && (keepSnapshotMessages || !item.snapshotContext))
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+    messages.push(adopt(message));
+  }
+  const terminalRank = status => status === 'running' ? 0 : 1;
+  const restoredTools = new Set(restored.tools.map(tool => tool.id));
+  const liveTools = new Map(live.tools.map(tool => [tool.id, tool]));
+  const tools = restored.tools.map(tool => {
+    const current = liveTools.get(tool.id);
+    if (!current) return tool;
+    return terminalRank(current.status) > terminalRank(tool.status) ? { ...tool, ...current, seq: tool.seq } : tool;
+  });
+  const keepSnapshotTools = restored.tools.length === 0;
+  for (const tool of live.tools
+    .filter(item => !restoredTools.has(item.id) && (keepSnapshotTools || !item.snapshotContext))
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+    tools.push(adopt(tool));
+  }
+  const thoughtIds = new Set(restored.thoughts.map(thought => thought.id));
+  const thoughts = [...restored.thoughts];
+  for (const thought of (live.thoughts ?? []).filter(item => !thoughtIds.has(item.id))) {
+    thoughts.push(adopt(thought));
+  }
+  const turnTerminals = [...restored.turnTerminals];
+  for (const terminal of (live.turnTerminals ?? []).slice(turnTerminals.length)) {
+    turnTerminals.push(adopt(terminal));
+  }
+  const errorIds = new Set(restored.turnErrors.map(error => error.id));
+  const turnErrors = [...restored.turnErrors];
+  for (const error of live.turnErrors ?? []) if (!errorIds.has(error.id)) turnErrors.push(adopt(error));
+  return {
+    ...live,
+    messages,
+    tools,
+    thoughts,
+    turnTerminals,
+    turnErrors,
+    nextSeq,
+    lastTerminal: turnTerminals.length > restored.turnTerminals.length
+      ? live.lastTerminal ?? restored.lastTerminal
+      : restored.lastTerminal ?? live.lastTerminal,
+  };
 }
 export function applyEvent(state,event) {
   if(['diff_updated','diff_failed'].includes(event.type)&&event.query_id&&(state.diffQuery?.id!==event.query_id||!['pending','unknown'].includes(state.diffQuery.status)))return state;
@@ -97,11 +207,14 @@ export function applyEvent(state,event) {
   next.messages=state.messages.map(m=>({...m}));
   // Arrival order is the fact the Execution Presentation Contract groups by, so
   // every message and tool carries the same monotonic stamp.
-  if (event.type==='user_message_added' && !next.messages.some(m=>m.id===event.message.id)) next.messages.push({...event.message,seq:event.seq??next.nextSeq++});
-  if (event.type==='assistant_message_started' && !next.messages.some(m=>m.id===event.message_id)) next.messages.push({id:event.message_id,role:'assistant',text:'',seq:event.seq??next.nextSeq++});
+  if (event.type==='user_message_added' && !next.messages.some(m=>m.id===event.message.id)) next.messages.push({...event.message,seq:event.seq??next.nextSeq++,live:true});
+  else if (event.type==='user_message_added') {const existing=next.messages.find(m=>m.id===event.message.id);delete existing.snapshotContext;existing.live=true;}
+  if (event.type==='assistant_message_started' && !next.messages.some(m=>m.id===event.message_id)) next.messages.push({id:event.message_id,role:'assistant',text:'',seq:event.seq??next.nextSeq++,live:true});
+  else if (event.type==='assistant_message_started') {const existing=next.messages.find(m=>m.id===event.message_id);delete existing.snapshotContext;existing.live=true;}
   if (event.type==='assistant_text_delta') {
     let message=next.messages.find(m=>m.id===event.message_id);
-    if (!message) {message={id:event.message_id,role:'assistant',text:'',seq:event.seq??next.nextSeq++};next.messages.push(message);}
+    if (!message) {message={id:event.message_id,role:'assistant',text:'',seq:event.seq??next.nextSeq++,live:true};next.messages.push(message);}
+    delete message.snapshotContext;message.live=true;
     message.text+=event.delta;
   }
   if(event.type==='assistant_message_started'||event.type==='assistant_text_delta')next.streamingMessageId=event.message_id;
@@ -127,7 +240,10 @@ export function applyEvent(state,event) {
   if (event.type==='approval_resolved') next.approvals=state.approvals.filter(a=>a.id!==event.id);
   if (event.type==='clarification_requested') next.clarifications=[...state.clarifications.filter(a=>a.id!==event.request.id),event.request];
   if (event.type==='clarification_resolved') next.clarifications=state.clarifications.filter(a=>a.id!==event.id);
-  if (event.type==='agent_activity' || event.type==='command_progress') next.activity=event.label;
+  if (event.type==='agent_activity' || event.type==='command_progress') {
+    next.activity=event.label;
+    next.activityElapsedMs=event.type==='command_progress'&&Number.isFinite(event.elapsed_ms)?event.elapsed_ms:null;
+  }
   // Reasoning is never assistant prose. A running segment is the live Thinking
   // row; `reasoning_completed` freezes it into a folded Thought with the
   // runtime's own duration. Taking a tool action ends the segment, exactly as
@@ -158,18 +274,33 @@ export function applyEvent(state,event) {
     next.reasoningSuperseded=true;
   }
   if(event.type==='user_message_added'){next.reasoning='';next.reasoningSuperseded=false;}
+  if (event.type==='user_message_added'||event.type==='assistant_message_started'||event.type==='tool_call_started') {
+    // One turn clock. A steer that arrives while a turn runs keeps the clock
+    // it already has; the next user line after a terminal starts a new one.
+    next.turnStartedAt ??= Date.now();
+  }
   if (terminalEvents.has(event.type)) {
     // A terminal turn owns no live activity: leaving the last label behind
     // masks the settled status the runtime reports next (TUI finish_turn clears
     // it for the same reason).
     next.activity = '';
+    next.activityElapsedMs = null;
     // The turn's committed answer, recorded on its own message: a frozen turn
     // must not look like it never answered.
     const answer=committedFinalAnswer(next.messages,next.tools);
     if(answer!==null)for(let i=next.messages.length-1;i>=0;i-=1){const message=next.messages[i];if(message.role==='assistant'&&message.text===answer){message.final=true;break;}}
     const status=turnTerminalFromEvent(event.type,next.messages,next.tools);
     next.lastTerminal=status;
-    next.turnTerminals=[...(next.turnTerminals??[]),{seq:(next.nextSeq??0)-0.5,status}];
+    const terminalSeq=event.seq??((next.nextSeq??0)-0.5);
+    next.turnTerminals=[...(next.turnTerminals??[]),{
+      seq:terminalSeq,
+      status,
+      at:Date.now(),
+      endedHm:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false}),
+      elapsedMs:Number.isFinite(next.turnStartedAt)?Math.max(0,Date.now()-next.turnStartedAt):null,
+      detail:event.reason??event.error??event.failure?.message??null,
+    }];
+    next.turnStartedAt=null;
     // A segment the runtime never completed is INTERRUPTED: kept and folded,
     // never presented as finished. Terminalization must not discard it.
     const unfinished=(next.reasoning||'').trim();
