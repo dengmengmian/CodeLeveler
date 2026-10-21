@@ -673,7 +673,11 @@ async fn first_submission_attempt(
     match answer {
         DeliveryAnswer::Delivered => Ok(EffectCompletion::SubmissionDelivered {
             command_id: envelope.command_id.clone(),
-            snapshot: None,
+            // A delivered command may not start a turn (a `记住：…` message is
+            // consumed as the user's own memory write). The runtime's snapshot
+            // is what tells the client whether it is busy, instead of leaving
+            // the submit-time optimism stuck forever.
+            snapshot: snapshot_within(client, &envelope.session_id).await,
         }),
         DeliveryAnswer::Rejected(message) => Ok(EffectCompletion::SubmissionRejected {
             command_id: envelope.command_id.clone(),

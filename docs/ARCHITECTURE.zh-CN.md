@@ -384,6 +384,22 @@ Anthropic thinking 由显式 `reasoning.style` 决定。`adaptive_thinking`，�
 
 provider 可见的请求随后由**唯一一个 projection owner** 产出。语义对话输入，wire 编码器与上下文统计读取同一个结果。用于替代缺失 provider usage 的估算，估算的就是这份 projection，因此“实际发了什么”和“统计了什么”不可能分叉。
 
+### 记忆的身份与生命周期
+
+持久记忆是建议性、用户所有的上下文。项目来源（`AGENTS.md`、项目指令、当前代码）高于记忆；召回的记忆只记录写入时为真的事实，不会因此变成系统事实。
+
+一个事实由规范化后的 subject 标识，而不是由标题标识。规范化是确定性的：ASCII 大小写、空白和标点折叠；中文 subject 使用稳定哈希；一小组显式别名把 `default_model`、`model_default`、`默认模型` 等已知拼写归到同一身份。未知拼写保持独立，不做模糊相似合并。标题只是人读的标签，可以变化而不改变身份。
+
+所有写入路径执行同一套决策：用户直接命令、CLI、接受候选、后台提取、模型 `remember` 工具以及恢复。结果是 Create、Merge（严格兼容的超集）、Supersede（同一身份的新值）、Skip（重复或已被覆盖）、NeedsApproval（冲突、身份不确定或权威不足）。待确认是持久状态：候选被停放，只有人接受后才能成为当前真相。拒绝某个值只压制该值，不压制整个身份，因此以后合法的值仍可被提出。
+
+事实权威与执行权限相互独立。用户直接陈述高于项目来源、运行时观察、工具观察和模型推断。`Full` 只允许 `remember` 工具执行，不提高模型的事实权威。模型只能用新证据替换自己此前记录的模型推断事实，不能静默替换用户事实；能替换用户事实的是用户后续自己的陈述，或被明确接受的候选。引用、粘贴、代码围栏或块引用中的文字不是用户在陈述，不能成为显式用户事实。
+
+写入由项目级 lifecycle lock 串行化。Supersede 采用 new-first：新真相先落盘，旧值再进入历史，因此崩溃最多留下两个 active 文件而不是零个。读取从 supersedes 链推导当前真相，残留副本不会被当成当前值。历史保留且可审计，被替换或归档的值不会再作为当前真相被召回。恢复是明确的用户命令：创建新的当前版本并替换该身份当前值；已脱敏的敏感历史拒绝恢复。凭据形状的记录在 forget、过期、supersede 每个保留边界都会脱敏，因此历史与恢复路径不会复活秘密。
+
+`leveler memory audit-identity` 只读地报告历史记录能建立什么身份：ready、needs_confirmation、possible_duplicate、possibly_stale、sensitive。它是 dry run，不重写用户记忆。
+
+召回、catalog、常驻 preference、模型记忆工具和状态面读取同一份 effective-active 视图：生命周期状态、过期时间，以及每个身份 supersedes 链的终端条目。因此 Chat、Goal、Resume 和 Headless 看到同一份当前值。记忆正文不进入稳定系统前缀，catalog 只放标题用于发现。禁用记忆的项目不暴露记忆面，也不接收提取。
+
 ---
 
 ### 9.0 Permission Mode 顶层产品契约

@@ -111,30 +111,58 @@ pub(crate) fn cmd_memory(
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        MemoryCommand::Show { id } => match store.read_active(&id) {
-            Ok(e) => {
-                let sensitive = is_sensitive(&e);
-                println!("{}", Line::heading(&format!("Memory [{}]", e.id)));
-                println!("  title: {}", safe_title(&e));
-                println!("  created: {}", e.created_at);
-                println!("  updated: {}", e.updated_at);
-                if sensitive {
-                    println!("  sensitive: content withheld; run `leveler memory audit`");
-                } else {
-                    if !e.tags.is_empty() {
-                        println!("  tags: {}", e.tags.join(", "));
-                    }
-                    println!();
-                    println!("{}", e.body);
+        MemoryCommand::Show { id, archived } => {
+            let entry = if archived {
+                store
+                    .list_archived()?
+                    .into_iter()
+                    .find(|entry| entry.id == id)
+            } else {
+                match store.read_active(&id) {
+                    Ok(entry) => Some(entry),
+                    Err(leveler_memory::MemoryError::NotFound(_)) => None,
+                    Err(e) => return Err(e.into()),
                 }
-                Ok(std::process::ExitCode::SUCCESS)
+            };
+            match entry {
+                Some(e) => {
+                    let sensitive = is_sensitive(&e);
+                    println!("{}", Line::heading(&format!("Memory [{}]", e.id)));
+                    println!("  title: {}", safe_title(&e));
+                    println!("  created: {}", e.created_at);
+                    println!("  updated: {}", e.updated_at);
+                    if archived {
+                        println!("  status: {:?}", e.effective_status());
+                        if let Some(by) = &e.superseded_by {
+                            println!("  superseded_by: {by}");
+                        }
+                        if let Some(at) = &e.superseded_at {
+                            println!("  superseded_at: {at}");
+                        }
+                    }
+                    if sensitive {
+                        println!("  sensitive: content withheld; run `leveler memory audit`");
+                    } else {
+                        if !e.tags.is_empty() {
+                            println!("  tags: {}", e.tags.join(", "));
+                        }
+                        println!();
+                        println!("{}", e.body);
+                    }
+                    Ok(std::process::ExitCode::SUCCESS)
+                }
+                None => {
+                    println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "not found{}: {id}",
+                            if archived { " in archive" } else { "" }
+                        ))
+                    );
+                    Ok(std::process::ExitCode::FAILURE)
+                }
             }
-            Err(leveler_memory::MemoryError::NotFound(_)) => {
-                println!("{}", Line::warn(&format!("not found: {id}")));
-                Ok(std::process::ExitCode::FAILURE)
-            }
-            Err(e) => Err(e.into()),
-        },
+        }
         MemoryCommand::Forget { id } => {
             let e = store.forget(&id)?;
             println!(
@@ -143,6 +171,28 @@ pub(crate) fn cmd_memory(
             );
             Ok(std::process::ExitCode::SUCCESS)
         }
+        MemoryCommand::Restore { id } => match store.restore(&id) {
+            Ok(entry) => {
+                println!(
+                    "{}",
+                    Line::ok(&format!(
+                        "restored [{}]: {}",
+                        entry.id,
+                        safe_title(&entry)
+                    ))
+                );
+                Ok(std::process::ExitCode::SUCCESS)
+            }
+            Err(leveler_memory::MemoryError::NotFound(_)) => {
+                println!("{}", Line::warn(&format!("not found: {id}")));
+                Ok(std::process::ExitCode::FAILURE)
+            }
+            Err(leveler_memory::MemoryError::Invalid(reason)) => {
+                println!("{}", Line::warn(&reason));
+                Ok(std::process::ExitCode::FAILURE)
+            }
+            Err(e) => Err(e.into()),
+        },
         MemoryCommand::Remember {
             title,
             body,
@@ -150,10 +200,14 @@ pub(crate) fn cmd_memory(
             tags,
         } => {
             let saved = remember_direct(&store, &title, &body, kind, tags)?;
-            println!(
-                "{}",
-                Line::ok(&format!("remembered [{}]: {}", saved.id, saved.title))
-            );
+            let message = match saved.supersedes.as_deref() {
+                Some(old) => format!(
+                    "updated [{}]: {} (superseded [{}])",
+                    saved.id, saved.title, old
+                ),
+                None => format!("remembered [{}]: {}", saved.id, saved.title),
+            };
+            println!("{}", Line::ok(&message));
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Pending => {
@@ -239,6 +293,44 @@ pub(crate) fn cmd_memory(
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
+        MemoryCommand::AuditIdentity => {
+            let audit = store.audit_identity()?;
+            println!(
+                "{}",
+                Line::heading("Memory identity audit (dry run; no files are modified)")
+            );
+            println!(
+                "  total={} ready={} needs_confirmation={} possible_duplicate={} \
+                 possibly_stale={} sensitive={}",
+                audit.summary.total,
+                audit.summary.ready,
+                audit.summary.needs_confirmation,
+                audit.summary.possible_duplicate,
+                audit.summary.possibly_stale,
+                audit.summary.sensitive
+            );
+            for record in &audit.records {
+                println!(
+                    "  [{:?}] {} [{}] {}",
+                    record.location,
+                    record.state.as_str(),
+                    record.id,
+                    record.title
+                );
+                if let Some(key) = &record.key {
+                    println!("         key={key}");
+                }
+                if !record.related.is_empty() {
+                    println!("         related={}", record.related.join(","));
+                }
+                println!("         {}", record.reason);
+            }
+            println!();
+            println!(
+                "  dry run only: this command does not rewrite user memory."
+            );
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         MemoryCommand::Scrub { id, apply } => {
             let report = store.scrub_sensitive(id.as_deref(), apply)?;
             if report.findings == 0 {
@@ -318,8 +410,10 @@ pub(crate) fn memory_round_trip_via_store(root: &std::path::Path) -> anyhow::Res
 /// entry IS the intent. Using it here silently replaced a memory the user had
 /// already saved whenever the new title slugged to the same id — which a
 /// repeated title always does, and which every CJK-only title does via the
-/// timestamp fallback. `base.md` promises the opposite: remember never
-/// overwrites, and a second entry competes in recall.
+/// timestamp fallback. Ordinary notes never overwrite: a second note competes
+/// in recall. A body that states a durable assignment ("以后…固定为 X") is an
+/// update of that semantic identity; the lifecycle keeps the old value as
+/// superseded history.
 fn remember_direct(
     store: &MemoryStore,
     title: &str,

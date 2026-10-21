@@ -650,13 +650,15 @@ impl MemoryConsolidator {
                                 AppliedOperation::Created => "created",
                                 AppliedOperation::Superseded => "superseded",
                                 AppliedOperation::Merged => "merged",
-                                AppliedOperation::Skipped => unreachable!(),
+                                AppliedOperation::Skipped
+                                | AppliedOperation::NeedsApproval => unreachable!(),
                             };
                             outcome
                                 .entry
                                 .map(|entry| (operation, entry.id, entry.title))
                         }
-                        AppliedOperation::Skipped => {
+                        AppliedOperation::Skipped
+                        | AppliedOperation::NeedsApproval => {
                             result.skipped += 1;
                             None
                         }

@@ -130,6 +130,9 @@ pub enum AppliedOperation {
     Superseded,
     Merged,
     Skipped,
+    /// The decision needs a person. Nothing became current; the caller that
+    /// owns consent is responsible for parking the candidate.
+    NeedsApproval,
 }
 
 /// Result of applying a decision. `entry` is the new current memory (if any);
@@ -175,17 +178,30 @@ pub fn semantic_key_of(subject: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(|c| c.to_lowercase())
         .collect();
-    // Strip a small set of trailing nouns so "默认模型" and "默认" are one fact.
-    for suffix in ["模型", "设置", "选项", "名称", "model", "value", "setting"] {
-        if normalized.len() > suffix.len() && normalized.ends_with(suffix) {
-            normalized.truncate(normalized.len() - suffix.len());
+    // Strip a small set of trailing nouns so "默认模型", "默认模型设置" and
+    // "默认" are one fact. Repeat until stable: stripping "设置" can expose
+    // "模型", and a single ordered pass would leave the two spellings with
+    // different identities.
+    loop {
+        let mut stripped = false;
+        for suffix in ["模型", "设置", "选项", "名称", "model", "value", "setting"] {
+            if normalized.len() > suffix.len() && normalized.ends_with(suffix) {
+                normalized.truncate(normalized.len() - suffix.len());
+                stripped = true;
+            }
+        }
+        if !stripped {
+            break;
         }
     }
     if normalized.is_empty() {
         "fact".to_string()
-    } else if normalized.is_ascii() {
+    } else if normalized.is_ascii() && normalized.len() <= 48 {
         format!("k-{}", slugify(&normalized))
     } else {
+        // Long subjects (and all CJK) use a hash. `slugify` truncates ids for
+        // readability, and truncating an identity would merge two facts that
+        // merely share a prefix.
         format!("k-{}", crate::short_hash(&normalized))
     }
 }
@@ -371,6 +387,78 @@ fn first_line(value: &str) -> String {
     line.chars().take(48).collect()
 }
 
+/// Build the candidate behind the model's `remember` tool.
+///
+/// The model must name a stable subject so the lifecycle can tell "this
+/// replaces an earlier value" from "this is a new fact". The subject is
+/// normalized by the SAME rules as every other path; the model never supplies
+/// a raw key. The candidate carries model-inference authority regardless of
+/// which permission profile approved the tool call.
+pub fn agent_candidate(
+    title: &str,
+    body: &str,
+    kind: MemoryKind,
+    tags: Vec<String>,
+    subject: &str,
+    evidence: Option<String>,
+) -> Result<MemoryCandidate, MemoryError> {
+    let subject = crate::canonical_subject(subject);
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return Err(MemoryError::Invalid(
+            "remember requires a non-empty subject".to_string(),
+        ));
+    }
+    if subject.chars().count() > 96 {
+        return Err(MemoryError::Invalid(
+            "remember subject is too long".to_string(),
+        ));
+    }
+    if title.trim().is_empty() || title.chars().count() > 200 {
+        return Err(MemoryError::Invalid(
+            "remember title must be 1..=200 characters".to_string(),
+        ));
+    }
+    if body.trim().is_empty() || body.chars().count() > 8_000 {
+        return Err(MemoryError::Invalid(
+            "remember body must be 1..=8000 characters".to_string(),
+        ));
+    }
+    if evidence
+        .as_deref()
+        .is_some_and(|evidence| evidence.chars().count() > 500)
+    {
+        return Err(MemoryError::Invalid(
+            "remember evidence is too long".to_string(),
+        ));
+    }
+    if tags.len() > 16 || tags.iter().any(|tag| tag.chars().count() > 100) {
+        return Err(MemoryError::Invalid(
+            "remember tags are too many or too long".to_string(),
+        ));
+    }
+    let key = semantic_key_of(subject);
+    let mut tags = tags;
+    tags.retain(|tag| {
+        let tag = tag.trim_start();
+        !tag.starts_with("kind:") && !tag.starts_with("subject:")
+    });
+    tags.push(format!("kind:{}", kind.as_str()));
+    tags.push(format!("subject:{subject}"));
+    let mut candidate = MemoryCandidate::new(
+        title,
+        body,
+        kind.candidate_kind(),
+        Some(key.clone()),
+        CandidateSource::AgentProposed,
+        tags,
+    )?;
+    candidate.semantic_key = Some(key);
+    candidate.authority = MemoryAuthority::ModelInference;
+    candidate.evidence = evidence;
+    Ok(candidate)
+}
+
 pub(crate) fn candidate_subject(candidate: &MemoryCandidate) -> Option<&str> {
     candidate
         .tags
@@ -439,6 +527,8 @@ fn source_label(source: CandidateSource) -> &'static str {
         CandidateSource::SystemPropose => "system_propose",
         CandidateSource::SystemInferred => "system_inferred",
         CandidateSource::AgentProposed => "agent_remember_tool",
+        CandidateSource::UserRestore => "user_restore",
+        CandidateSource::UserAccepted => "user_accepted",
     }
 }
 
@@ -478,6 +568,32 @@ pub fn decide(
             .collect();
         related.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         if let Some(existing) = related.first() {
+            // Same identity and same stated value: nothing new, whatever the
+            // title says.
+            if existing.body.trim() == candidate.body.trim() {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::Skip {
+                        reason: format!("existing memory {} already states this", existing.id),
+                    },
+                    related,
+                });
+            }
+            // A delayed retry of a value this identity already replaced must
+            // not rewind the chain. The retry is recognizable structurally:
+            // the candidate's value is an ancestor of the current entry.
+            // Timestamps cannot carry this (stored at second precision), and
+            // the chain is the authoritative history.
+            if store.candidate_retries_history(candidate, &existing.id)? {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::Skip {
+                        reason: format!(
+                            "candidate was already superseded by {}",
+                            existing.id
+                        ),
+                    },
+                    related,
+                });
+            }
             let incoming = candidate.authority.rank();
             let held = existing.authority().rank();
             // Deterministic merge: only when the existing entry's lines are all
@@ -512,11 +628,46 @@ pub fn decide(
                     related,
                 });
             }
-            // Same class: only the user's own correction overwrites.
-            if incoming == held && candidate.source == CandidateSource::UserExplicit {
+            // Same class: the user's own correction, or a user-commanded
+            // restore, overwrites.
+            if incoming == held
+                && matches!(
+                    candidate.source,
+                    CandidateSource::UserExplicit
+                        | CandidateSource::UserRestore
+                        | CandidateSource::UserAccepted
+                )
+            {
                 return Ok(MemoryDecision {
                     operation: MemoryOperation::Supersede {
                         existing_id: existing.id.clone(),
+                    },
+                    related,
+                });
+            }
+            // The model may correct its OWN earlier low-authority record when
+            // it supplies new evidence. The new entry keeps model authority;
+            // approval to run the tool never upgrades it to a user fact.
+            if incoming == held
+                && candidate.source == CandidateSource::AgentProposed
+                && existing.provenance.as_ref().map(|value| value.source.as_str())
+                    == Some("agent_remember_tool")
+            {
+                if candidate
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|evidence| !evidence.trim().is_empty())
+                {
+                    return Ok(MemoryDecision {
+                        operation: MemoryOperation::Supersede {
+                            existing_id: existing.id.clone(),
+                        },
+                        related,
+                    });
+                }
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::NeedsApproval {
+                        reason: "an agent update needs new evidence and a person".to_string(),
                     },
                     related,
                 });
@@ -584,14 +735,23 @@ impl MemoryStore {
         // outcome has been fully applied.
         crate::candidates::validate_candidate(candidate)?;
         let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        self.apply_candidate_locked(candidate, &now_rfc3339())
+    }
 
-        let now = now_rfc3339();
+    /// The decision and mutation half of a commit. The caller holds the
+    /// project-wide lifecycle lock, so every path that has already taken it
+    /// (a user write, a restore, a candidate commit) shares one transaction.
+    pub(crate) fn apply_candidate_locked(
+        &self,
+        candidate: &MemoryCandidate,
+        now: &str,
+    ) -> Result<CommitOutcome, MemoryError> {
         // New-first replacement guarantees no gap in current truth, so a
         // crash can leave two physical active files. Heal that durable residue
         // before deriving a fresh decision; an at-least-once retry then sees
         // the already-written replacement and becomes an idempotent skip.
-        self.reconcile_active_truths(&now)?;
-        let decision = decide(self, candidate, &now)?;
+        self.reconcile_active_truths(now)?;
+        let decision = decide(self, candidate, now)?;
         let outcome: Result<CommitOutcome, MemoryError> = match decision.operation {
             MemoryOperation::Skip { reason } => Ok(CommitOutcome {
                 operation: AppliedOperation::Skipped,
@@ -600,7 +760,7 @@ impl MemoryStore {
                 skipped_reason: Some(reason),
             }),
             MemoryOperation::NeedsApproval { reason } => Ok(CommitOutcome {
-                operation: AppliedOperation::Skipped,
+                operation: AppliedOperation::NeedsApproval,
                 entry: None,
                 superseded: Vec::new(),
                 skipped_reason: Some(reason),
@@ -617,7 +777,7 @@ impl MemoryStore {
             MemoryOperation::Supersede { existing_id } => {
                 let old = self.read_active(&existing_id)?;
                 let new = self.write_candidate(candidate, Some(&old))?;
-                let archived = self.mark_superseded_unlocked(&old, &new.id, &now)?;
+                let archived = self.mark_superseded_unlocked(&old, &new.id, now)?;
                 Ok(CommitOutcome {
                     operation: AppliedOperation::Superseded,
                     entry: Some(new),
@@ -628,7 +788,7 @@ impl MemoryStore {
             MemoryOperation::Merge { existing_id } => {
                 let old = self.read_active(&existing_id)?;
                 let new = self.write_candidate(candidate, Some(&old))?;
-                let archived = self.mark_superseded_unlocked(&old, &new.id, &now)?;
+                let archived = self.mark_superseded_unlocked(&old, &new.id, now)?;
                 Ok(CommitOutcome {
                     operation: AppliedOperation::Merged,
                     entry: Some(new),
@@ -651,6 +811,51 @@ impl MemoryStore {
         Ok(outcome)
     }
 
+    /// Whether this candidate's value is already an ancestor of the current
+    /// entry. Used to recognize a delayed retry: the same candidate applied
+    /// once, then replaced by a newer value. A retry must be an idempotent
+    /// skip, never a rewind.
+    fn candidate_retries_history(
+        &self,
+        candidate: &MemoryCandidate,
+        current_id: &str,
+    ) -> Result<bool, MemoryError> {
+        let mut next = self.read_active(current_id)?.supersedes;
+        let mut seen = HashSet::new();
+        while let Some(id) = next {
+            if !seen.insert(id.clone()) {
+                // Malformed cycle in legacy residue: stop rather than loop.
+                return Ok(false);
+            }
+            let archived = match self.read_archived(&id) {
+                Ok(entry) => entry,
+                Err(MemoryError::NotFound(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if archived.body.trim() == candidate.body.trim() {
+                // Only a candidate that existed BEFORE the ancestor was
+                // replaced can be a delayed retry. A fresh statement of the
+                // same value later is the user changing their mind back and
+                // must be allowed to win.
+                return Ok(archived
+                    .superseded_at
+                    .as_deref()
+                    .map_or(true, |at| candidate.created_at.as_str() < at));
+            }
+            next = archived.supersedes.clone();
+        }
+        Ok(false)
+    }
+
+    fn read_archived(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
+        let path = self.archive_path(id);
+        if !path.exists() {
+            return Err(MemoryError::NotFound(id.to_string()));
+        }
+        let raw = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
     /// Restore the physical invariant of at most one current entry per
     /// semantic identity.
     ///
@@ -671,26 +876,7 @@ impl MemoryStore {
         }
 
         for entries in by_key.into_values().filter(|entries| entries.len() > 1) {
-            let superseded_ids: HashSet<&str> = entries
-                .iter()
-                .filter_map(|entry| entry.supersedes.as_deref())
-                .collect();
-            // A terminal entry is not named as the predecessor of another
-            // active entry. This follows a whole A -> B -> C chain rather than
-            // relying on pairwise comparisons, which are not transitive.
-            let terminal: Vec<&MemoryEntry> = entries
-                .iter()
-                .filter(|entry| !superseded_ids.contains(entry.id.as_str()))
-                .collect();
-            let candidates: Vec<&MemoryEntry> = if terminal.is_empty() {
-                // Defensive fallback for malformed cyclic residue.
-                entries.iter().collect()
-            } else {
-                terminal
-            };
-            let winner = candidates
-                .into_iter()
-                .max_by(|left, right| compare_current_truth(left, right))
+            let winner = current_truth_of(&entries)
                 .expect("group has at least two entries")
                 .clone();
             for old in entries.into_iter().filter(|entry| entry.id != winner.id) {
@@ -743,6 +929,11 @@ impl MemoryStore {
         archived.superseded_at = Some(now.to_string());
         archived.superseded_by = Some(new_id.to_string());
         archived.archived_at = Some(now.to_string());
+        // Supersede is a retention boundary like forget/expiry: the historical
+        // copy stays for audit, but a credential must not be written into it.
+        if crate::is_sensitive(&archived) {
+            crate::redact_entry_for_archive(&mut archived);
+        }
         let json = serde_json::to_string_pretty(&archived)?;
         crate::write_atomically_pub(&self.archive_path(&archived.id), json.as_bytes())?;
         match std::fs::remove_file(self.active_path(&archived.id)) {
@@ -751,6 +942,87 @@ impl MemoryStore {
             Err(error) => return Err(MemoryError::Io(error)),
         }
         Ok(archived)
+    }
+
+    /// Restore a historical entry as the current truth.
+    ///
+    /// This is a user command, so it carries explicit-user authority and runs
+    /// through the lifecycle: a current value for the same identity is
+    /// superseded, never left active beside the restored copy. History is
+    /// preserved; the restored value becomes a NEW entry whose provenance says
+    /// where it came from. A credential-bearing history record was redacted at
+    /// the retention boundary and is refused rather than restored as redacted
+    /// text.
+    pub fn restore(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        if self.active_path(id).exists() {
+            return self.read_active(id);
+        }
+        let archived = self.read_archived(id)?;
+        // The retention boundary redacts credential-bearing records. Restoring
+        // one would either resurrect a secret or silently restore placeholder
+        // text, so both are refused.
+        if crate::is_sensitive(&archived)
+            || archived.title == crate::REDACTED_TITLE
+            || archived.body == crate::REDACTED_BODY
+        {
+            return Err(MemoryError::Invalid(
+                "sensitive history was redacted and cannot be restored".to_string(),
+            ));
+        }
+        // Ephemeral state must never become lasting truth. Restoring a
+        // time-bound record as a project fact would do exactly that.
+        if archived.scope == crate::MemoryScope::Ephemeral || archived.expires_at.is_some() {
+            return Err(MemoryError::Invalid(
+                "time-bound history cannot be restored as lasting memory".to_string(),
+            ));
+        }
+        let key = durable_entry_key(&archived);
+        let kind = match crate::MemoryKind::of(&archived) {
+            crate::MemoryKind::Preference => crate::candidates::CandidateKind::Preference,
+            _ => crate::candidates::CandidateKind::Free,
+        };
+        let mut tags = archived.tags.clone();
+        if let Some(declared) = archived.kind.as_deref() {
+            tags.push(format!("kind:{declared}"));
+        }
+        let mut candidate = MemoryCandidate::new(
+            archived.title.clone(),
+            archived.body.clone(),
+            kind,
+            key.clone(),
+            crate::candidates::CandidateSource::UserRestore,
+            tags,
+        )?;
+        candidate.authority = MemoryAuthority::ExplicitUser;
+        candidate.evidence = Some(format!("restored from memory {}", archived.id));
+        let outcome = self.apply_candidate_locked(&candidate, &now_rfc3339())?;
+        match outcome.operation {
+            AppliedOperation::Created
+            | AppliedOperation::Superseded
+            | AppliedOperation::Merged => outcome.entry.ok_or_else(|| {
+                MemoryError::Invalid("restore produced no current entry".to_string())
+            }),
+            AppliedOperation::Skipped => {
+                let current = self.effective_active()?.into_iter().find(|entry| {
+                    key.as_deref().is_some_and(|key| {
+                        durable_entry_key(entry).as_deref() == Some(key)
+                    })
+                });
+                current.ok_or_else(|| {
+                    MemoryError::Invalid(
+                        outcome
+                            .skipped_reason
+                            .unwrap_or_else(|| "nothing to restore".to_string()),
+                    )
+                })
+            }
+            AppliedOperation::NeedsApproval => Err(MemoryError::Invalid(
+                outcome
+                    .skipped_reason
+                    .unwrap_or_else(|| "restore needs a person".to_string()),
+            )),
+        }
     }
 
     /// Archive every active entry whose `expires_at` has passed.
@@ -788,21 +1060,42 @@ impl MemoryStore {
     /// different path.
     pub fn effective_active(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
         let now = now_rfc3339();
-        let mut out: Vec<MemoryEntry> = Vec::new();
-        let mut by_key: HashMap<String, usize> = HashMap::new();
-        for entry in self.list_active()? {
-            if entry.effective_status() != MemoryStatus::Active || entry.is_expired_at(&now) {
-                continue;
+        let entries: Vec<MemoryEntry> = self
+            .list_active()?
+            .into_iter()
+            .filter(|entry| {
+                entry.effective_status() == MemoryStatus::Active && !entry.is_expired_at(&now)
+            })
+            .collect();
+
+        let mut groups: HashMap<String, Vec<MemoryEntry>> = HashMap::new();
+        for entry in &entries {
+            if let Some(key) = durable_entry_key(entry) {
+                groups.entry(key).or_default().push(entry.clone());
             }
+        }
+        let winners: HashMap<String, MemoryEntry> = groups
+            .into_iter()
+            .filter_map(|(key, group)| {
+                current_truth_of(&group).map(|winner| (key, winner.clone()))
+            })
+            .collect();
+
+        // Preserve the store's stable title order, but emit only the terminal
+        // entry of each identity. A crash can leave the replacement and the
+        // old copy active together; the supersedes link decides which is real.
+        let mut out = Vec::with_capacity(entries.len());
+        let mut emitted = HashSet::new();
+        for entry in entries {
             match durable_entry_key(&entry) {
-                Some(key) => match by_key.get(&key).copied() {
-                    Some(index) if !is_better(&entry, &out[index]) => {}
-                    Some(index) => out[index] = entry,
-                    None => {
-                        by_key.insert(key, out.len());
-                        out.push(entry);
+                Some(key) => {
+                    if !emitted.insert(key.clone()) {
+                        continue;
                     }
-                },
+                    if let Some(winner) = winners.get(&key) {
+                        out.push(winner.clone());
+                    }
+                }
                 None => out.push(entry),
             }
         }
@@ -819,10 +1112,34 @@ fn body_lines(body: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-fn is_better(candidate: &MemoryEntry, current: &MemoryEntry) -> bool {
-    candidate.authority().rank() > current.authority().rank()
-        || (candidate.authority().rank() == current.authority().rank()
-            && candidate.updated_at > current.updated_at)
+/// The one entry that is current among active copies of one identity.
+///
+/// The supersedes links are authoritative: a terminal entry is not named as
+/// the predecessor of another active entry, so following them survives cycles
+/// of crash residue and A -> B -> C chains alike. Authority and timestamps are
+/// only the deterministic fallback for forked legacy residue, where timestamps
+/// have second precision and cannot order two writes.
+fn current_truth_of(entries: &[MemoryEntry]) -> Option<&MemoryEntry> {
+    if entries.is_empty() {
+        return None;
+    }
+    let superseded_ids: HashSet<&str> = entries
+        .iter()
+        .filter_map(|entry| entry.supersedes.as_deref())
+        .collect();
+    let terminal: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|entry| !superseded_ids.contains(entry.id.as_str()))
+        .collect();
+    let candidates = if terminal.is_empty() {
+        // Defensive fallback for malformed cyclic residue.
+        entries.iter().collect()
+    } else {
+        terminal
+    };
+    candidates
+        .into_iter()
+        .max_by(|left, right| compare_current_truth(left, right))
 }
 
 fn compare_current_truth(left: &MemoryEntry, right: &MemoryEntry) -> std::cmp::Ordering {
@@ -843,6 +1160,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// Suffix stripping must be confluent: "默认模型设置" hides "模型" behind
+    /// "设置", and a single ordered pass left two identities for one subject.
+    /// Ids truncate for readability; identity must not. Two long subjects that
+    /// share their first characters are different facts.
+    #[test]
+    fn long_subjects_with_the_same_prefix_do_not_collide() {
+        let prefix = "release.probe.codename.".to_string() + &"a".repeat(60);
+        assert_ne!(
+            semantic_key_of(&(prefix.clone() + "alpha")),
+            semantic_key_of(&(prefix + "bravo"))
+        );
+    }
+
+    #[test]
+    fn semantic_identity_strips_trailing_nouns_until_stable() {
+        let base = semantic_key_of("默认");
+        for subject in ["默认模型", "默认模型设置", "默认模型设置选项", "默认设置"] {
+            assert_eq!(semantic_key_of(subject), base, "{subject}");
+        }
+        assert_eq!(
+            semantic_key_of("default model setting"),
+            semantic_key_of("default")
+        );
     }
 
     #[test]
@@ -1051,7 +1393,7 @@ mod tests {
             decision.operation
         );
         let outcome = store.commit_candidate(&inference).unwrap();
-        assert_eq!(outcome.operation, AppliedOperation::Skipped);
+        assert_eq!(outcome.operation, AppliedOperation::NeedsApproval);
         assert!(
             store.effective_active().unwrap()[0]
                 .body
@@ -1081,6 +1423,346 @@ mod tests {
         let provenance = entry.provenance.clone().expect("provenance");
         assert_eq!(provenance.authority, MemoryAuthority::ExplicitUser);
         assert_eq!(provenance.source, "explicit_user_turn");
+    }
+
+    /// Updating a historical credential must not copy its plaintext into the
+    /// history copy. `forget` and expiry already redact; supersede is another
+    /// retention path and follows the same boundary.
+    #[test]
+    fn superseding_a_legacy_sensitive_entry_redacts_the_history_copy() {
+        let (_dir, store) = store();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let key = semantic_key_of("部署令牌");
+        let mut old = crate::new_entry("部署令牌", &format!("token={secret}"), vec![]);
+        old.key = Some(key.clone());
+        // A credential could only be on disk from a store written before the
+        // write boundary existed, so place the file directly.
+        std::fs::write(
+            store.active_path(&old.id),
+            serde_json::to_string_pretty(&old).unwrap(),
+        )
+        .unwrap();
+
+        let mut candidate = MemoryCandidate::new(
+            "部署令牌轮换",
+            "部署令牌：rotate",
+            CandidateKind::Free,
+            Some(key),
+            CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        candidate.authority = MemoryAuthority::ExplicitUser;
+        let outcome = store.commit_candidate(&candidate).unwrap();
+        assert_eq!(outcome.operation, AppliedOperation::Superseded);
+
+        let raw = std::fs::read_to_string(store.archive_path(&old.id)).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "supersede copied the credential into history: {raw}"
+        );
+        assert!(raw.contains(crate::REDACTED_BODY), "{raw}");
+        assert!(store.audit_sensitive().unwrap().is_empty());
+    }
+
+    /// A retry of a candidate that predates the current truth must not revert
+    /// it. The delayed copy can arrive after a crash replay or a slow queue.
+    #[test]
+    fn a_delayed_retry_of_an_old_candidate_cannot_revert_current_truth() {
+        let (_dir, store) = store();
+        let old_candidate =
+            parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        store.commit_candidate(&old_candidate).unwrap();
+        let current = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        store.commit_candidate(&current).unwrap();
+
+        let mut retried = old_candidate.clone();
+        retried.created_at = "2020-01-01T00:00:00Z".to_string();
+        let outcome = store.commit_candidate(&retried).unwrap();
+
+        assert_eq!(
+            outcome.operation,
+            AppliedOperation::Skipped,
+            "an older candidate must not supersede newer truth"
+        );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Flash"));
+    }
+
+    // ---- unified write paths ----
+
+    /// A user write that states a durable assignment uses the same identity as
+    /// every other path: the later value replaces the earlier one.
+    #[test]
+    fn activating_a_durable_assignment_updates_the_same_identity() {
+        let (_dir, store) = store();
+        let first = store
+            .activate(
+                "默认模型",
+                "以后本项目默认模型固定为 Pro",
+                crate::MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        assert!(first.key.is_some(), "identity is established on write");
+
+        let second = store
+            .activate(
+                "默认模型",
+                "以后本项目默认模型改为 Flash",
+                crate::MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(second.key, first.key, "same semantic identity");
+
+        let current = store.effective_active().unwrap();
+        assert_eq!(current.len(), 1);
+        assert!(current[0].body.contains("Flash"));
+        assert_eq!(store.list_archived().unwrap()[0].id, first.id);
+        assert_eq!(
+            current[0].kind.as_deref(),
+            Some("preference"),
+            "the caller's kind survives the lifecycle"
+        );
+    }
+
+    /// The model's `remember` runs the same decision. A conflict with a user
+    /// fact is parked for a person, never applied and never dropped.
+    #[test]
+    fn agent_conflict_with_user_truth_is_queued_not_applied() {
+        let (_dir, store) = store();
+        let user = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        store.commit_candidate(&user).unwrap();
+
+        let agent = agent_candidate(
+            "项目默认模型",
+            "项目默认模型是 Flash",
+            MemoryKind::Note,
+            vec![],
+            "project.default_model",
+            None,
+        )
+        .unwrap();
+        let outcome = store.admit_agent_candidate(agent).unwrap();
+        assert!(
+            matches!(outcome, crate::AgentAdmitOutcome::Queued { .. }),
+            "{outcome:?}"
+        );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Pro"));
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
+    /// The model may correct its own earlier low-authority record, but only
+    /// with new evidence. The entry stays model authority.
+    #[test]
+    fn agent_self_update_requires_evidence() {
+        let (_dir, store) = store();
+        let first = agent_candidate(
+            "项目默认模型",
+            "项目默认模型是 Pro",
+            MemoryKind::Note,
+            vec![],
+            "project.default_model",
+            None,
+        )
+        .unwrap();
+        store.admit_agent_candidate(first).unwrap();
+
+        let unsupported = agent_candidate(
+            "项目默认模型",
+            "项目默认模型是 Flash",
+            MemoryKind::Note,
+            vec![],
+            "project.default_model",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.admit_agent_candidate(unsupported).unwrap(),
+            crate::AgentAdmitOutcome::Queued { .. }
+        ));
+        assert!(store.effective_active().unwrap()[0].body.contains("Pro"));
+
+        let supported = agent_candidate(
+            "项目默认模型",
+            "项目默认模型是 Flash",
+            MemoryKind::Note,
+            vec![],
+            "project.default_model",
+            Some("conversation turn 12".to_string()),
+        )
+        .unwrap();
+        let outcome = store.admit_agent_candidate(supported).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::AgentAdmitOutcome::Applied(CommitOutcome {
+                operation: AppliedOperation::Superseded,
+                ..
+            })
+        ));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Flash"));
+        assert_eq!(active[0].authority(), MemoryAuthority::ModelInference);
+        assert_eq!(
+            active[0]
+                .provenance
+                .as_ref()
+                .and_then(|p| p.evidence.as_deref()),
+            Some("conversation turn 12")
+        );
+    }
+
+    /// Restoring history is a user command: it supersedes the current value
+    /// and keeps the chain, never leaving two active truths.
+    #[test]
+    fn restoring_history_supersedes_current_truth() {
+        let (_dir, store) = store();
+        let first = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old_id = store
+            .commit_candidate(&first)
+            .unwrap()
+            .entry
+            .unwrap()
+            .id;
+        let second = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        store.commit_candidate(&second).unwrap();
+
+        let restored = store.restore(&old_id).unwrap();
+        assert_eq!(
+            restored.provenance.as_ref().unwrap().source,
+            "user_restore"
+        );
+        assert!(restored.body.contains("Pro"));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Pro"));
+        assert!(
+            store
+                .list_archived()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.body.contains("Flash")),
+            "the replaced value stays in history"
+        );
+    }
+
+    /// A credential-bearing historical record was redacted on the way into
+    /// history. Restoring it would either resurrect the secret or silently
+    /// restore placeholder text, so both are refused.
+    #[test]
+    fn restoring_a_redacted_sensitive_history_is_refused() {
+        let (_dir, store) = store();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let entry = crate::new_entry("部署令牌", &format!("token={secret}"), vec![]);
+        std::fs::write(
+            store.active_path(&entry.id),
+            serde_json::to_string_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+        store.forget(&entry.id).unwrap();
+
+        let error = store.restore(&entry.id).unwrap_err();
+        assert!(matches!(error, MemoryError::Invalid(_)), "{error}");
+        assert!(store.effective_active().unwrap().is_empty());
+    }
+
+    /// The always-injected preference block is one instruction per identity,
+    /// never the old and the new value side by side.
+    #[test]
+    fn standing_preferences_never_hold_two_values_for_one_identity() {
+        let (_dir, store) = store();
+        store
+            .activate(
+                "默认模型",
+                "以后本项目默认模型固定为 Pro",
+                MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        store
+            .activate(
+                "默认模型",
+                "以后本项目默认模型改为 Flash",
+                MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        let preferences = store.standing_preferences(16).unwrap();
+        assert_eq!(preferences.len(), 1);
+        assert!(preferences[0].body.contains("Flash"));
+        assert!(!preferences[0].body.contains("Pro"));
+    }
+
+    /// A fresh statement of an older value is the user changing their mind
+    /// back, not a delayed retry. It must still win.
+    #[test]
+    fn a_fresh_restatement_of_an_older_value_is_not_treated_as_a_retry() {
+        let (_dir, store) = store();
+        let pro = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        store.commit_candidate(&pro).unwrap();
+        let flash = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        store.commit_candidate(&flash).unwrap();
+
+        let pro_again = parse_durable_fact("以后本项目默认模型改为 Pro").unwrap();
+        let outcome = store.commit_candidate(&pro_again).unwrap();
+        assert_eq!(outcome.operation, AppliedOperation::Superseded);
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Pro"));
+    }
+
+    /// Every automatic surface reads the same current truth: an update must
+    /// not leave the old value in the catalog, the standing preference block,
+    /// the legacy index or query recall.
+    #[test]
+    fn every_injection_surface_drops_the_superseded_value() {
+        let (_dir, store) = store();
+        let first = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        store.commit_candidate(&first).unwrap();
+        let second = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        store.commit_candidate(&second).unwrap();
+
+        let catalog = store.catalog_lines(16).unwrap();
+        let standing = store.standing_preferences(16).unwrap();
+        let index = store.index_lines(16).unwrap();
+        let recalled = store.recall("默认模型", 8).unwrap();
+        for surface in [
+            catalog,
+            index,
+            recalled
+                .iter()
+                .map(|(entry, _)| format!("{} {}", entry.id, entry.title))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            standing
+                .iter()
+                .map(|entry| format!("{} {}", entry.id, entry.title))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ] {
+            assert!(!surface.contains("Pro"), "stale value survived: {surface}");
+        }
+        assert!(store.effective_active().unwrap()[0].body.contains("Flash"));
+    }
+
+    /// Time-bound state must not become a lasting fact through restore.
+    #[test]
+    fn restoring_time_bound_history_is_refused() {
+        let (_dir, store) = store();
+        let mut entry = crate::new_entry("临时端口", "当前端口 51234", vec![]);
+        entry.scope = crate::MemoryScope::Ephemeral;
+        entry.expires_at = Some("2000-01-01T00:00:00Z".into());
+        store.remember(entry.clone()).unwrap();
+        store.expire_due().unwrap();
+
+        let error = store.restore(&entry.id).unwrap_err();
+        assert!(matches!(error, MemoryError::Invalid(_)), "{error}");
+        assert!(store.effective_active().unwrap().is_empty());
     }
 
     #[test]

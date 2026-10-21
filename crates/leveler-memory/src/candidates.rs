@@ -32,6 +32,14 @@ pub enum CandidateSource {
     /// guess because the user is approving the MODEL's judgement, and they
     /// deserve to know which one they are looking at.
     AgentProposed,
+    /// The user asked to restore a historical entry. It carries explicit-user
+    /// authority because the command is the person's own decision, while its
+    /// provenance keeps the restore path auditable.
+    UserRestore,
+    /// A person accepted a pending candidate. The fact now carries
+    /// explicit-user authority, and the original proposal source remains in
+    /// the entry's provenance evidence.
+    UserAccepted,
 }
 
 impl CandidateSource {
@@ -42,6 +50,8 @@ impl CandidateSource {
             Self::SystemPropose => "system_propose",
             Self::SystemInferred => "system_inferred",
             Self::AgentProposed => "agent_proposed",
+            Self::UserRestore => "user_restore",
+            Self::UserAccepted => "user_accepted",
         }
     }
 
@@ -163,6 +173,9 @@ pub fn candidate_sensitive_fields(candidate: &MemoryCandidate) -> Vec<&'static s
     if candidate.tags.iter().any(|tag| looks_like_secret(tag)) {
         fields.push("tags");
     }
+    if candidate.key.as_deref().is_some_and(looks_like_secret) {
+        fields.push("key");
+    }
     if candidate.evidence.as_deref().is_some_and(looks_like_secret) {
         fields.push("evidence");
     }
@@ -187,6 +200,10 @@ pub fn redact_candidate(candidate: &mut MemoryCandidate) {
     candidate.body = crate::REDACTED_BODY.to_string();
     candidate.tags.clear();
     candidate.evidence = None;
+    if candidate.key.as_deref().is_some_and(looks_like_secret) {
+        candidate.key = None;
+        candidate.semantic_key = None;
+    }
 }
 
 /// Validate every field that can reach durable storage, not only title/body.
@@ -430,7 +447,16 @@ pub fn parse_inferred_preference(text: &str) -> Option<MemoryCandidate> {
 
 fn extract_soft_preference(text: &str) -> Option<String> {
     // Phrasings that describe a habit rather than issue an order.
-    const ZH_HINTS: [&str; 5] = ["我通常", "我一般", "我更喜欢", "以后最好", "以后都"];
+    const ZH_HINTS: [&str; 6] = [
+        "我通常",
+        "我一般",
+        "我更喜欢",
+        "以后最好",
+        "以后都",
+        // A habit-shaped follow-up such as "以后用 Flash 吧". It has no stable
+        // subject, so it stays a candidate and can never overwrite a fact.
+        "以后用",
+    ];
     for hint in ZH_HINTS {
         if text.contains(hint) {
             return Some(text.to_string());

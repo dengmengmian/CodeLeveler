@@ -97,8 +97,11 @@ impl Tool for MemoryTool {
         let store = self.root.open()?;
         match args.action.as_str() {
             "list" => {
+                // `effective_active` is the one current-truth read: it drops
+                // expired entries and collapses crash residue by identity, so
+                // a stale copy is never presented to the model as a memory.
                 let entries = store
-                    .list_active()
+                    .effective_active()
                     .map_err(|e| ToolError::Io(e.to_string()))?
                     .into_iter()
                     .filter(|entry| !is_sensitive(entry))
@@ -125,6 +128,19 @@ impl Tool for MemoryTool {
                     .map_err(|err| ToolError::Io(err.to_string()))?;
                 if is_sensitive(&e) {
                     return Ok(ToolOutput::error("memory not found"));
+                }
+                // An id can still exist on disk as crash residue for an
+                // identity whose terminal value is another entry. Reading it
+                // as current truth would bypass recall's deduplication.
+                let current = store
+                    .effective_active()
+                    .map_err(|err| ToolError::Io(err.to_string()))?
+                    .into_iter()
+                    .any(|entry| entry.id == e.id);
+                if !current {
+                    return Ok(ToolOutput::error(
+                        "memory is historical or superseded; it is not current truth",
+                    ));
                 }
                 Ok(ToolOutput::ok(format!(
                     "# {}\n\n{}\n\n(tags: {})",
@@ -180,12 +196,21 @@ impl Tool for MemoryTool {
 struct RememberArgs {
     title: String,
     body: String,
+    /// The durable subject this fact is about, e.g. `project.default_model`.
+    /// Required: without a stable identity the lifecycle cannot tell an update
+    /// from a new fact, so the model must state what the fact is about.
+    subject: String,
     /// How this memory should reach future turns. Required of the model
     /// rather than defaulted silently: `preference` is paid for on EVERY
     /// later turn, so it must be a choice, not an accident.
     kind: ToolMemoryKind,
     #[serde(default)]
     tags: Vec<String>,
+    /// New evidence for an update of the model's own earlier memory. It is
+    /// persisted with the entry; it never turns model inference into a user
+    /// fact.
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// The kinds a proposal may claim.
@@ -227,16 +252,20 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &'static str {
-        "Propose a durable project memory: `title`, `body`, and `kind` \
-         (`preference`, `decision`, or `note`). Auto and Restricted require a \
-         person to approve the proposal before it becomes active; Full permits \
-         the write without a separate permission prompt. With nobody to ask, \
-         the proposal may stay pending. The entry records model-inference \
-         authority: approval does not claim the user stated it, and it never \
-         replaces a fact the user wrote directly. `preference` is injected \
-         into later turns. `decision` and `note` are retrieved by relevance or \
-         title. A second title match is a second entry. `forget` archives an \
-         id. Secrets are not a valid body."
+        "Propose a durable project memory: `title`, `body`, `subject`, and \
+         `kind` (`preference`, `decision`, or `note`). `subject` is the stable \
+         fact identity (e.g. `project.default_model`): a later value for the \
+         same subject updates the current memory instead of adding a second \
+         entry. Auto and Restricted require a person to approve the proposal \
+         before it becomes active; Full permits the write without a separate \
+         permission prompt. With nobody to ask, the proposal may stay pending. \
+         The entry records model-inference authority: approval does not claim \
+         the user stated it, and it never replaces a fact the user wrote \
+         directly — a conflict waits for a person. To update the model's own \
+         earlier memory, pass new `evidence`; otherwise it also waits for a \
+         person. `preference` is injected into later turns. `decision` and \
+         `note` are retrieved by relevance or title. `forget` archives an id. \
+         Secrets are not a valid body."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -259,17 +288,66 @@ impl Tool for RememberTool {
             return Ok(ToolOutput::error("title and body are required"));
         }
         let store = self.root.open()?;
-        // A model proposal is not a user statement. This path records
-        // model-inference provenance and uses the non-overwriting create
-        // path, so approval cannot upgrade the model's finding into a fact
-        // that replaces what the user wrote directly.
-        let saved = store
-            .activate_agent(&args.title, &args.body, args.kind.into(), args.tags)
+        // A model proposal is not a user statement. The candidate carries
+        // model-inference authority and runs the SAME lifecycle decision as
+        // every other write: identity match, merge/replace its own earlier
+        // value, or wait for a person. Approval to execute the tool never
+        // upgrades the fact's authority.
+        let candidate = leveler_memory::agent_candidate(
+            &args.title,
+            &args.body,
+            args.kind.into(),
+            args.tags,
+            &args.subject,
+            args.evidence,
+        )
+        .map_err(|e| ToolError::InvalidArguments {
+            tool: self.name().into(),
+            message: e.to_string(),
+        })?;
+        let outcome = store
+            .admit_agent_candidate(candidate)
             .map_err(|e| ToolError::Io(e.to_string()))?;
-        Ok(ToolOutput::ok(format!(
-            "Remembered [{}]: {}",
-            saved.id, saved.title
-        )))
+        let message = match outcome {
+            leveler_memory::AgentAdmitOutcome::Applied(outcome) => {
+                let entry = outcome.entry.ok_or_else(|| ToolError::Io(
+                    "memory lifecycle applied no entry".to_string(),
+                ))?;
+                match outcome.operation {
+                    leveler_memory::AppliedOperation::Created => {
+                        format!("Remembered [{}]: {}", entry.id, entry.title)
+                    }
+                    leveler_memory::AppliedOperation::Superseded => {
+                        let old = outcome
+                            .superseded
+                            .first()
+                            .map(|old| old.id.as_str())
+                            .unwrap_or("previous value");
+                        format!(
+                            "Updated [{}]: {} (superseded [{}])",
+                            entry.id, entry.title, old
+                        )
+                    }
+                    leveler_memory::AppliedOperation::Merged => {
+                        format!("Merged into [{}]: {}", entry.id, entry.title)
+                    }
+                    leveler_memory::AppliedOperation::Skipped
+                    | leveler_memory::AppliedOperation::NeedsApproval => {
+                        return Err(ToolError::Io(
+                            "memory lifecycle returned an inconsistent outcome".to_string(),
+                        ));
+                    }
+                }
+            }
+            leveler_memory::AgentAdmitOutcome::Queued { candidate, reason } => format!(
+                "Queued for approval [{}]: {}. A person decides; the current memory is unchanged.",
+                candidate.id, reason
+            ),
+            leveler_memory::AgentAdmitOutcome::NotStored { reason } => {
+                format!("Not stored: {reason}")
+            }
+        };
+        Ok(ToolOutput::ok(message))
     }
 }
 
@@ -347,7 +425,7 @@ mod tests {
         let ctx = ctx_in(dir.path());
         let out = RememberTool::new(root.clone())
             .execute(
-                serde_json::json!({"title": "Prefer workspace-write", "body": "Use PermissionProfile::Assisted for edits.", "kind": "note"}),
+                serde_json::json!({"title": "Prefer workspace-write", "body": "Use PermissionProfile::Assisted for edits.", "kind": "note", "subject": "editing.permission_profile"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -372,13 +450,18 @@ mod tests {
         let mem = dir.path().join("memory");
         let root = MemoryRoot::new(Some(mem.clone()));
         let ctx = ctx_in(dir.path());
-        let remember = |body: &'static str| {
+        let remember = |body: &'static str, subject: &'static str| {
             let ctx = ctx.clone();
             let root = root.clone();
             async move {
                 RememberTool::new(root)
                     .execute(
-                        serde_json::json!({"title": "Deploy notes", "body": body, "kind": "note"}),
+                        serde_json::json!({
+                            "title": "Deploy notes",
+                            "body": body,
+                            "kind": "note",
+                            "subject": subject
+                        }),
                         ctx,
                         CancellationToken::new(),
                     )
@@ -386,8 +469,16 @@ mod tests {
                     .unwrap()
             }
         };
-        let first = remember("Staging deploys from the release branch.").await;
-        let second = remember("Production deploys are gated on the on-call approval.").await;
+        let first = remember(
+            "Staging deploys from the release branch.",
+            "deploy.staging",
+        )
+        .await;
+        let second = remember(
+            "Production deploys are gated on the on-call approval.",
+            "deploy.production",
+        )
+        .await;
         assert!(!first.is_error && !second.is_error);
 
         // Both facts must be retrievable — the second must not have overwritten
@@ -411,11 +502,18 @@ mod tests {
             listed.content
         );
         // Idempotent re-remember of the SAME fact must not spawn a duplicate.
-        let again = remember("Staging deploys from the release branch.").await;
-        assert_eq!(
-            again.content, first.content,
-            "identical fact must reuse its id"
+        let again = remember(
+            "Staging deploys from the release branch.",
+            "deploy.staging",
+        )
+        .await;
+        assert!(
+            again.content.contains("identical") || again.content.contains("already states this"),
+            "identical fact must be recognized as current: {}",
+            again.content
         );
+        let store = MemoryStore::open(&mem).unwrap();
+        assert_eq!(store.effective_active().unwrap().len(), 2);
     }
 
     /// A run with memory unconfigured says so. Nothing invents a store
@@ -443,7 +541,7 @@ mod tests {
         let ctx = ctx_in(dir.path());
         RememberTool::new(root.clone())
             .execute(
-                serde_json::json!({"title": "Workspace write", "body": "Prefer PermissionProfile::Assisted for file edits.", "kind": "note"}),
+                serde_json::json!({"title": "Workspace write", "body": "Prefer PermissionProfile::Assisted for file edits.", "kind": "note", "subject": "editing.permission_profile"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -451,7 +549,7 @@ mod tests {
             .unwrap();
         RememberTool::new(root.clone())
             .execute(
-                serde_json::json!({"title": "Unrelated", "body": "The sky is blue on clear days.", "kind": "note"}),
+                serde_json::json!({"title": "Unrelated", "body": "The sky is blue on clear days.", "kind": "note", "subject": "weather.sky"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -502,7 +600,8 @@ mod tests {
                 serde_json::json!({
                     "title": "Deploy notes",
                     "body": "The model thinks production is gated on on-call approval.",
-                    "kind": "note"
+                    "kind": "note",
+                    "subject": "deploy.production"
                 }),
                 ctx.clone(),
                 CancellationToken::new(),
@@ -535,6 +634,178 @@ mod tests {
             agent_entry.provenance.as_ref().unwrap().source,
             "agent_remember_tool"
         );
+    }
+
+    /// The same semantic subject is one fact: a later value updates the
+    /// current entry instead of accumulating a second active copy.
+    #[tokio::test]
+    async fn agent_remember_with_the_same_subject_updates_instead_of_duplicating() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let remember = |body: &'static str, evidence: Option<&'static str>| {
+            let ctx = ctx.clone();
+            let root = root.clone();
+            async move {
+                let mut args = serde_json::json!({
+                    "title": "项目默认模型",
+                    "body": body,
+                    "kind": "note",
+                    "subject": "project.default_model"
+                });
+                if let Some(evidence) = evidence {
+                    args["evidence"] = serde_json::Value::String(evidence.to_string());
+                }
+                RememberTool::new(root)
+                    .execute(args, ctx, CancellationToken::new())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = remember("项目默认模型是 Pro", None).await;
+        assert!(!first.is_error, "{}", first.content);
+        let second = remember(
+            "项目默认模型是 Flash",
+            Some("the user restated the model in this turn"),
+        )
+        .await;
+        assert!(!second.is_error, "{}", second.content);
+
+        let store = MemoryStore::open(&mem).unwrap();
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1, "one current truth: {active:?}");
+        assert!(active[0].body.contains("Flash"));
+        let history = store.list_archived().unwrap();
+        assert_eq!(history.len(), 1, "the old value is history");
+        assert!(history[0].body.contains("Pro"));
+    }
+
+    /// Approval to execute a tool is not a claim that the model's fact
+    /// outranks the user's. A conflicting agent value waits for a person.
+    #[tokio::test]
+    async fn agent_remember_conflicting_with_a_user_fact_waits_for_approval() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let store = MemoryStore::open(&mem).unwrap();
+        let user = leveler_memory::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        store.commit_candidate(&user).unwrap();
+
+        let out = RememberTool::new(root)
+            .execute(
+                serde_json::json!({
+                    "title": "项目默认模型",
+                    "body": "项目默认模型是 Flash",
+                    "kind": "note",
+                    "subject": "project.default_model"
+                }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("approval") || out.content.contains("等待"),
+            "the model must be told a person decides: {}",
+            out.content
+        );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Pro"), "{active:?}");
+        assert_eq!(store.list_archived().unwrap().len(), 0);
+        assert_eq!(store.list_pending().unwrap().len(), 1, "conflict is kept");
+    }
+
+    /// Every model-facing read presents current truth. Crash residue can leave
+    /// the replacement and the old copy active together; neither `list` nor
+    /// `read` may present the loser as a memory.
+    #[tokio::test]
+    async fn reads_never_present_crash_residue_as_current_truth() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let store = MemoryStore::open(&mem).unwrap();
+
+        let mut old = leveler_memory::new_entry("Old value", "默认模型：Pro", vec![]);
+        old.id = "old-pro".into();
+        old.key = Some("k-defaultmodel".into());
+        old.updated_at = "2026-01-01T00:00:00Z".into();
+        old.created_at = old.updated_at.clone();
+        store.remember(old).unwrap();
+
+        let mut new = leveler_memory::new_entry("New value", "默认模型：Flash", vec![]);
+        new.id = "new-flash".into();
+        new.key = Some("k-defaultmodel".into());
+        new.updated_at = "2026-01-01T00:00:00Z".into();
+        new.created_at = new.updated_at.clone();
+        new.supersedes = Some("old-pro".into());
+        store.remember(new).unwrap();
+
+        let listed = MemoryTool::new(root.clone())
+            .execute(
+                serde_json::json!({"action": "list"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(listed.content.contains("New value"), "{}", listed.content);
+        assert!(!listed.content.contains("Old value"), "{}", listed.content);
+
+        let read = MemoryTool::new(root)
+            .execute(
+                serde_json::json!({"action": "read", "id": "old-pro"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(read.is_error, "stale residue is not current truth");
+    }
+
+    #[tokio::test]
+    async fn remember_requires_a_subject_and_preserves_the_declared_kind() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+
+        let missing = RememberTool::new(root.clone())
+            .execute(
+                serde_json::json!({
+                    "title": "No subject",
+                    "body": "This fact has no identity.",
+                    "kind": "note"
+                }),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(missing.is_err(), "a subject is required");
+
+        let out = RememberTool::new(root)
+            .execute(
+                serde_json::json!({
+                    "title": "Release rule",
+                    "body": "Tag only after the full test suite passes.",
+                    "kind": "decision",
+                    "subject": "release.tagging"
+                }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let store = MemoryStore::open(&mem).unwrap();
+        let active = store.effective_active().unwrap();
+        assert_eq!(active[0].kind.as_deref(), Some("decision"));
     }
 
     /// Stores created before credential validation may already contain a key.

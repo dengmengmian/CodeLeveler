@@ -1192,19 +1192,48 @@ impl Executor {
                     .collect()
             })
             .unwrap_or_default();
+        let kind = match call
+            .arguments
+            .get("kind")
+            .and_then(|value| value.as_str())
+        {
+            Some("preference") => leveler_memory::MemoryKind::Preference,
+            Some("decision") => leveler_memory::MemoryKind::Decision,
+            _ => leveler_memory::MemoryKind::Note,
+        };
+        let subject = call
+            .arguments
+            .get("subject")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let evidence = call
+            .arguments
+            .get("evidence")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
         let parked = leveler_memory::MemoryStore::open(root)
             .map_err(|e| e.to_string())
             .and_then(|store| {
-                let candidate = leveler_memory::MemoryCandidate::new(
-                    title,
-                    body,
-                    leveler_memory::CandidateKind::Preference,
-                    None,
-                    leveler_memory::CandidateSource::AgentProposed,
-                    tags,
-                )
-                .map_err(|e| e.to_string())?;
+                // The parked candidate keeps the model's identity and
+                // evidence. Parking is not a create path: it must not lose
+                // the subject that makes a later acceptance an update.
+                let candidate = if subject.trim().is_empty() {
+                    leveler_memory::MemoryCandidate::new(
+                        title,
+                        body,
+                        leveler_memory::CandidateKind::Free,
+                        None,
+                        leveler_memory::CandidateSource::AgentProposed,
+                        tags,
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    leveler_memory::agent_candidate(
+                        title, body, kind, tags, subject, evidence,
+                    )
+                    .map_err(|e| e.to_string())?
+                };
                 store.propose(candidate).map_err(|e| e.to_string())
             });
         match parked {

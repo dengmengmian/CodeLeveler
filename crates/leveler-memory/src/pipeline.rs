@@ -9,10 +9,10 @@ use std::fs;
 
 use serde::{Deserialize, Serialize};
 
-use crate::candidates::{CandidateKind, MemoryCandidate, parse_inferred_preference};
+use crate::candidates::{MemoryCandidate, parse_inferred_preference};
 use crate::{
-    CommitOutcome, MemoryAuthority, MemoryEntry, MemoryError, MemoryStore, now_rfc3339,
-    write_atomically_pub,
+    AppliedOperation, CommitOutcome, MemoryAuthority, MemoryEntry, MemoryError, MemoryStore,
+    now_rfc3339, write_atomically_pub,
 };
 
 /// Result of attempting to enqueue a candidate.
@@ -34,6 +34,24 @@ pub enum ProposeOutcome {
 pub enum AdmitOutcome {
     Proposed(ProposeOutcome),
     Corrected(CommitOutcome),
+}
+
+/// Result of the model's own `remember` proposal after the SAME lifecycle
+/// decision every other write path uses.
+#[derive(Debug, Clone)]
+pub enum AgentAdmitOutcome {
+    /// The candidate became current (created, merged, or replaced the model's
+    /// own earlier value).
+    Applied(CommitOutcome),
+    /// A person must settle this conflict or ambiguous update. The candidate
+    /// is parked in `pending/`; it is not current truth.
+    Queued {
+        candidate: MemoryCandidate,
+        reason: String,
+    },
+    /// Nothing was written and nothing was queued (duplicate, covered, or a
+    /// value the user already rejected).
+    NotStored { reason: String },
 }
 
 /// Recorded when the user rejects a candidate (suppress re-prompt).
@@ -69,20 +87,68 @@ impl MemoryStore {
         self.propose(candidate).map(AdmitOutcome::Proposed)
     }
 
+    /// Admit a candidate produced by the model's own `remember` tool.
+    ///
+    /// The tool's approval authorizes EXECUTION, not fact authority. The
+    /// candidate still runs through [`MemoryStore::commit_candidate`], so a
+    /// model inference can update its own earlier low-authority record (with
+    /// new evidence) but can never silently replace a user fact. A conflict
+    /// is parked in `pending/`, where only a person can accept it.
+    pub fn admit_agent_candidate(
+        &self,
+        candidate: MemoryCandidate,
+    ) -> Result<AgentAdmitOutcome, MemoryError> {
+        crate::candidates::validate_candidate(&candidate)?;
+        if candidate.authority.rank() > MemoryAuthority::ModelInference.rank() {
+            return Err(MemoryError::Invalid(
+                "an agent proposal cannot claim elevated fact authority".into(),
+            ));
+        }
+        let outcome = self.commit_candidate(&candidate)?;
+        match outcome.operation {
+            AppliedOperation::Created
+            | AppliedOperation::Superseded
+            | AppliedOperation::Merged => Ok(AgentAdmitOutcome::Applied(outcome)),
+            AppliedOperation::Skipped => Ok(AgentAdmitOutcome::NotStored {
+                reason: outcome
+                    .skipped_reason
+                    .unwrap_or_else(|| "nothing to store".into()),
+            }),
+            AppliedOperation::NeedsApproval => {
+                let reason = outcome
+                    .skipped_reason
+                    .unwrap_or_else(|| "a person must settle this memory".into());
+                match self.propose(candidate)? {
+                    ProposeOutcome::Pending(candidate) => {
+                        Ok(AgentAdmitOutcome::Queued { candidate, reason })
+                    }
+                    ProposeOutcome::AlreadyPending(candidate) => {
+                        Ok(AgentAdmitOutcome::Queued { candidate, reason })
+                    }
+                    ProposeOutcome::Suppressed { .. } => Ok(AgentAdmitOutcome::NotStored {
+                        reason: format!("{reason}; this value was rejected before"),
+                    }),
+                    ProposeOutcome::AlreadyActive { id } => Ok(AgentAdmitOutcome::NotStored {
+                        reason: format!("{reason}; memory {id} already states it"),
+                    }),
+                }
+            }
+        }
+    }
+
     /// Enqueue a candidate for user consent. Never writes `active/`.
     pub fn propose(&self, candidate: MemoryCandidate) -> Result<ProposeOutcome, MemoryError> {
         crate::candidates::validate_candidate(&candidate)?;
+        // Pending state is memory state too: it is read back by `accept` and
+        // can become current truth, so it uses the same project-wide lock as
+        // every active-write transaction.
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         if self.is_suppressed(&candidate.fingerprint)? {
             return Ok(ProposeOutcome::Suppressed {
                 fingerprint: candidate.fingerprint.clone(),
             });
         }
         if let Some(key) = &candidate.key {
-            if self.is_key_suppressed(candidate.kind, key)? {
-                return Ok(ProposeOutcome::Suppressed {
-                    fingerprint: candidate.fingerprint.clone(),
-                });
-            }
             if let Some(existing) = self.find_active_by_key(key)?
                 && existing.body.trim() == candidate.body.trim()
             {
@@ -205,14 +271,29 @@ impl MemoryStore {
     /// This is the explicit accept path (CLI / UI). It is **not** safe to call
     /// from auto-approved agent loops without a separate human decision.
     pub fn accept(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
+        // Read, decide, write and remove the pending copy are ONE transaction.
+        // A concurrent reject must not suppress a candidate that is becoming
+        // active, and a concurrent accept must not leave a suppressed record
+        // behind a successful promotion.
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         let mut candidate = self.read_pending(id)?;
+        crate::candidates::validate_candidate(&candidate)?;
         // Accepting is the user's authority. Route it through the same
         // lifecycle transaction as runtime corrections so a changed semantic
         // identity preserves the old value as superseded history instead of
-        // reusing its id and deleting that history.
+        // reusing its id and deleting that history. The provenance records
+        // BOTH the acceptance and the source that originally proposed it.
+        let proposed_as = candidate.source.as_str().to_string();
+        let prior_evidence = candidate.evidence.clone();
         candidate.authority = crate::lifecycle::MemoryAuthority::ExplicitUser;
-        candidate.source = crate::candidates::CandidateSource::UserExplicit;
-        let outcome = self.commit_candidate(&candidate)?;
+        candidate.source = crate::candidates::CandidateSource::UserAccepted;
+        candidate.evidence = Some(match prior_evidence {
+            Some(evidence) => format!(
+                "accepted pending {id}; proposed as {proposed_as}; {evidence}"
+            ),
+            None => format!("accepted pending {id}; proposed as {proposed_as}"),
+        });
+        let outcome = self.apply_candidate_locked(&candidate, &now_rfc3339())?;
         let saved = match outcome.entry {
             Some(entry) => entry,
             None => {
@@ -244,6 +325,9 @@ impl MemoryStore {
 
     /// Reject pending candidate and suppress the same signal from re-proposing.
     pub fn reject(&self, id: &str) -> Result<SuppressRecord, MemoryError> {
+        // Serialized with accept: a candidate is either promoted or rejected,
+        // never both.
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         let candidate = self.read_pending(id)?;
         let record = SuppressRecord {
             fingerprint: candidate.fingerprint.clone(),
@@ -253,32 +337,15 @@ impl MemoryStore {
         };
         let json = serde_json::to_string_pretty(&record)?;
         write_atomically_pub(&self.suppress_path(&record.fingerprint), json.as_bytes())?;
-        // Also suppress by key alone for package_manager so any wording of the
-        // same signal stays quiet.
-        if let Some(key) = &candidate.key {
-            let key_fp =
-                crate::candidates::fingerprint_of(candidate.kind, Some(key.as_str()), "", "");
-            let key_record = SuppressRecord {
-                fingerprint: key_fp.clone(),
-                key: Some(key.clone()),
-                rejected_at: record.rejected_at.clone(),
-                candidate_id: Some(candidate.id.clone()),
-            };
-            let kj = serde_json::to_string_pretty(&key_record)?;
-            write_atomically_pub(&self.suppress_path(&key_fp), kj.as_bytes())?;
-        }
+        // Suppression is bound to the rejected VALUE (its fingerprint), never
+        // to the identity alone. Rejecting "model = Pro" must not silence a
+        // later, legitimate "model = Flash".
         let _ = fs::remove_file(self.pending_path(id));
         Ok(record)
     }
 
     pub fn is_suppressed(&self, fingerprint: &str) -> Result<bool, MemoryError> {
         Ok(self.suppress_path(fingerprint).exists())
-    }
-
-    /// Whether a structured key (e.g. package_manager) is suppressed.
-    pub fn is_key_suppressed(&self, kind: CandidateKind, key: &str) -> Result<bool, MemoryError> {
-        let fp = crate::candidates::fingerprint_of(kind, Some(key), "", "");
-        self.is_suppressed(&fp)
     }
 
     pub fn find_active_by_key(&self, key: &str) -> Result<Option<MemoryEntry>, MemoryError> {
@@ -427,7 +494,7 @@ mod pipeline_tests {
         let refined = MemoryCandidate::new(
             "包管理器偏好",
             long_body,
-            CandidateKind::Preference,
+            crate::CandidateKind::Preference,
             None,
             CandidateSource::UserExplicit,
             vec!["preference".into()],
@@ -495,6 +562,131 @@ mod pipeline_tests {
                 .all(|o| !matches!(o, ProposeOutcome::Pending(_))),
             "no new pending after suppress: {batch:?}"
         );
+    }
+
+    /// Rejecting one value suppresses that signal, not the whole identity.
+    /// A later legitimate value for the same subject must still be proposable.
+    #[test]
+    fn rejecting_one_value_does_not_suppress_a_later_value_for_the_same_identity() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let pro = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let pending = match store.propose(pro.clone()).unwrap() {
+            ProposeOutcome::Pending(candidate) => candidate,
+            other => panic!("expected pending: {other:?}"),
+        };
+        store.reject(&pending.id).unwrap();
+
+        assert!(
+            matches!(
+                store.propose(pro).unwrap(),
+                ProposeOutcome::Suppressed { .. }
+            ),
+            "the exact rejected signal stays quiet"
+        );
+
+        let flash = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        assert!(
+            matches!(store.propose(flash).unwrap(), ProposeOutcome::Pending(_)),
+            "a new value for the same identity is a new decision"
+        );
+    }
+
+    /// Accepting a candidate records the user's approval AND the source that
+    /// proposed it; it does not rewrite history as if the user said it first.
+    #[test]
+    fn accepting_keeps_the_proposal_source_in_provenance() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let candidate = crate::agent_candidate(
+            "项目默认模型",
+            "项目默认模型是 Pro",
+            crate::MemoryKind::Note,
+            vec![],
+            "project.default_model",
+            None,
+        )
+        .unwrap();
+        let pending = match store.propose(candidate).unwrap() {
+            ProposeOutcome::Pending(candidate) => candidate,
+            other => panic!("expected pending: {other:?}"),
+        };
+        let saved = store.accept(&pending.id).unwrap();
+        let provenance = saved.provenance.as_ref().expect("provenance");
+        assert_eq!(provenance.authority, MemoryAuthority::ExplicitUser);
+        assert_eq!(provenance.source, "user_accepted");
+        let evidence = provenance.evidence.as_deref().unwrap_or("");
+        assert!(evidence.contains(&pending.id), "{evidence}");
+        assert!(evidence.contains("agent_proposed"), "{evidence}");
+    }
+
+    /// A direct durable write clears an equivalent soft proposal even when the
+    /// proposal had no identity key.
+    #[test]
+    fn a_durable_direct_write_clears_an_equivalent_keyless_candidate() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let body = "以后都默认使用 Flash";
+        assert!(matches!(
+            store.propose_from_user_text(body).unwrap().unwrap(),
+            ProposeOutcome::Pending(_)
+        ));
+        assert_eq!(store.list_pending_raw().unwrap().len(), 1);
+
+        store
+            .activate(
+                "默认模型",
+                body,
+                crate::MemoryKind::Preference,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(store.list_pending_raw().unwrap().len(), 0);
+    }
+
+    /// Accept and reject are two answers to ONE question. They are serialized
+    /// by the project lock: exactly one can win, and a promoted candidate is
+    /// never also suppressed.
+    #[test]
+    fn accept_and_reject_cannot_both_win() {
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..8 {
+            let dir = tempdir().unwrap();
+            let store = MemoryStore::open(dir.path()).unwrap();
+            let candidate = match store
+                .propose_from_user_text("我通常希望提交前先跑 lint")
+                .unwrap()
+                .unwrap()
+            {
+                ProposeOutcome::Pending(candidate) => candidate,
+                other => panic!("expected pending: {other:?}"),
+            };
+            let barrier = Arc::new(Barrier::new(2));
+            let accept = {
+                let store = store.clone();
+                let id = candidate.id.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.accept(&id).is_ok()
+                })
+            };
+            let reject = {
+                let store = store.clone();
+                let id = candidate.id.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.reject(&id).is_ok()
+                })
+            };
+            let accepted = accept.join().unwrap();
+            let rejected = reject.join().unwrap();
+            assert_ne!(accepted, rejected, "exactly one decision wins");
+            assert_eq!(store.effective_active().unwrap().len(), usize::from(accepted));
+            assert!(store.list_pending().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -600,14 +792,21 @@ mod pipeline_tests {
     fn a_legacy_keyless_direct_write_is_found_and_superseded() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let old = store
-            .activate(
-                "旧默认模型",
-                "以后本项目默认模型固定为 Pro",
-                crate::MemoryKind::Preference,
-                Vec::new(),
-            )
-            .unwrap();
+        // A legacy direct write predates identity tracking, so it has no key.
+        // `activate` itself now establishes one from a durable assignment;
+        // place this historical fixture directly.
+        let mut legacy = crate::new_entry(
+            "旧默认模型",
+            "以后本项目默认模型固定为 Pro",
+            Vec::new(),
+        );
+        legacy.kind = Some("preference".into());
+        legacy.provenance = Some(crate::Provenance {
+            authority: crate::MemoryAuthority::ExplicitUser,
+            source: "user_direct".into(),
+            evidence: None,
+        });
+        let old = store.remember(legacy).unwrap();
         assert!(
             old.key.is_none(),
             "fixture represents a legacy direct write"

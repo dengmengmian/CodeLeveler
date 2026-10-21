@@ -498,10 +498,21 @@ pub enum MemoryCommand {
     Show {
         /// Memory id.
         id: String,
+        /// Read the archived (historical) record instead of the active one.
+        /// Sensitive content stays withheld; use `restore` to make it current.
+        #[arg(long)]
+        archived: bool,
     },
     /// Archive (soft-delete) an active memory by id.
     Forget {
         /// Memory id.
+        id: String,
+    },
+    /// Restore an archived memory as the current truth.
+    ///
+    /// A current value for the same identity is superseded; history is kept.
+    Restore {
+        /// Archived memory id.
         id: String,
     },
     /// Create a new active memory (user-authoritative write; no model round).
@@ -542,6 +553,10 @@ pub enum MemoryCommand {
     /// Report stored records that look like they contain credentials. Never
     /// prints the content; safe to run in a shared terminal.
     Audit,
+    /// Report what semantic identity historical memory can establish.
+    ///
+    /// Read-only dry run: it never writes, migrates or rewrites a record.
+    AuditIdentity,
     /// Redact credential-shaped content in active, archived and pending
     /// records. Dry-run unless `--apply` is passed.
     Scrub {
@@ -1014,6 +1029,30 @@ mod tests {
                 assert_eq!(limit, 3);
             }
             other => panic!("expected Memory::Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_identity_audit_and_restore_parse() {
+        let cli = parse(&["leveler", "memory", "audit-identity"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Memory(MemoryCommand::AuditIdentity))
+        ));
+        let cli = parse(&["leveler", "memory", "restore", "old-id"]);
+        match cli.command {
+            Some(Command::Memory(MemoryCommand::Restore { id })) => {
+                assert_eq!(id, "old-id");
+            }
+            other => panic!("expected Memory::Restore, got {other:?}"),
+        }
+        let cli = parse(&["leveler", "memory", "show", "old-id", "--archived"]);
+        match cli.command {
+            Some(Command::Memory(MemoryCommand::Show { id, archived })) => {
+                assert_eq!(id, "old-id");
+                assert!(archived);
+            }
+            other => panic!("expected Memory::Show, got {other:?}"),
         }
     }
 
