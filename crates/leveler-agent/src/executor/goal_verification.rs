@@ -323,21 +323,10 @@ pub(crate) fn is_verification_command(label: &str) -> bool {
 /// one.
 pub(crate) fn reports_no_tests(output: &str) -> bool {
     let lower = output.to_ascii_lowercase();
-    const EMPTY_MARKERS: &[&str] = &[
-        "ran 0 tests",
-        "ran 0 test",
-        "running 0 tests",
-        "test result: ok. 0 passed",
-        "test result: ok. 0 tests",
-        "0 passed, 0 failed",
-        "no tests ran",
-        "no test files",
-        "no tests to run",
-        "no tests found",
-        "no test matches",
-        "0 tests completed",
-    ];
-    if EMPTY_MARKERS.iter().any(|marker| lower.contains(marker)) {
+    // Whole-invocation markers. Per-package messages such as Go's
+    // `[no test files]` are deliberately NOT used: another package in the
+    // same command may have run real tests.
+    if lower.contains("ran 0 tests") || lower.contains("no tests ran") {
         return true;
     }
     // unittest: `Ran 3 tests ... OK (skipped=3)` means every discovered test
@@ -346,6 +335,20 @@ pub(crate) fn reports_no_tests(output: &str) -> bool {
         && let Some(skipped) = number_after(&lower, "skipped=")
     {
         return ran > 0 && ran <= skipped;
+    }
+    // cargo: one `test result:` summary per test binary. Only the sum of
+    // passed tests decides emptiness, so a crate with no tests cannot turn a
+    // workspace run that passed elsewhere into a false failure.
+    if lower.contains("test result:") {
+        let mut any_passed = false;
+        for (index, _) in lower.match_indices("test result:") {
+            let rest = &lower[index + "test result:".len()..];
+            if number_after(rest, "ok. ").is_some_and(|passed| passed > 0) {
+                any_passed = true;
+                break;
+            }
+        }
+        return !any_passed;
     }
     // pytest: `3 skipped in 0.01s` with nothing passed, failed or errored.
     if lower.contains(" skipped in ")
@@ -381,11 +384,9 @@ mod tests {
     fn empty_and_all_skipped_test_runs_are_not_evidence() {
         for output in [
             "Ran 0 tests in 0.000s",
-            "running 0 tests",
             "test result: ok. 0 passed; 0 failed; 3 ignored",
             "Ran 1 test in 0.000s\n\nOK (skipped=1)",
             "3 skipped in 0.01s",
-            "go: no test files",
             "no tests ran in 0.01s",
         ] {
             assert!(
@@ -396,6 +397,10 @@ mod tests {
         for output in [
             "Ran 5 tests in 0.12s\n\nOK (skipped=1)",
             "test result: ok. 5 passed; 0 failed; 1 ignored",
+            // A workspace run may include an empty test binary. The real
+            // passes elsewhere must keep the command as evidence.
+            "test result: ok. 0 passed; 0 failed; 0 ignored\n\n\
+             test result: ok. 12 passed; 0 failed; 0 ignored",
             "3 passed, 1 skipped in 0.2s",
             "5 tests completed",
         ] {
