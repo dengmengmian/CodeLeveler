@@ -148,16 +148,15 @@ impl MemoryStore {
                 fingerprint: candidate.fingerprint.clone(),
             });
         }
-        if let Some(key) = &candidate.key {
-            if let Some(existing) = self.find_active_by_key(key)?
-                && existing.body.trim() == candidate.body.trim()
-            {
-                return Ok(ProposeOutcome::AlreadyActive { id: existing.id });
-            }
-            // Same identity, different value: this is an update proposal.
-            // It must wait for consent, but must not be discarded merely
-            // because an older value is currently active.
+        if let Some(key) = &candidate.key
+            && let Some(existing) = self.find_active_by_key(key)?
+            && existing.body.trim() == candidate.body.trim()
+        {
+            return Ok(ProposeOutcome::AlreadyActive { id: existing.id });
         }
+        // Same identity, different value: this is an update proposal. It must
+        // wait for consent, but must not be discarded merely because an older
+        // value is currently active.
         // Same fingerprint already pending?
         let mut replaces_pending = None;
         for pending in self.list_pending()? {
