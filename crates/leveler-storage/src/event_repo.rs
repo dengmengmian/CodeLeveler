@@ -313,6 +313,61 @@ impl<'a> EventRepository<'a> {
         Ok(rows)
     }
 
+    /// Events of the given types belonging to ONE turn, in sequence order.
+    ///
+    /// Experience extraction reads a completed turn's tool facts and needs no
+    /// other turn: this keeps the read proportional to that turn instead of the
+    /// whole session log.
+    pub async fn load_by_types_in_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        types: &[&str],
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let types_json = serde_json::to_string(types)
+            .map_err(|e| StorageError::InvalidData(format!("load_by_types_in_turn: {e}")))?;
+        let rows = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND turn_id = ?2 \
+               AND type IN (SELECT value FROM json_each(?3)) \
+             ORDER BY sequence",
+        )
+        .bind(session_id.as_str())
+        .bind(turn_id.as_str())
+        .bind(&types_json)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// The first event of `event_type` after `after_sequence`.
+    ///
+    /// `task_finished` is a session-level terminal with no turn id. The turn's
+    /// own `turn_finished` sequence is the boundary that attributes it to the
+    /// turn that just ended.
+    pub async fn first_after(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        after_sequence: i64,
+    ) -> Result<Option<EventRecord>, StorageError> {
+        Ok(sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND type = ?2 AND sequence > ?3 \
+             ORDER BY sequence LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .bind(event_type)
+        .bind(after_sequence)
+        .fetch_optional(self.db.pool())
+        .await?)
+    }
+
     /// The newest event of `event_type`, optionally scoped to one turn — an
     /// indexed single-row lookup so "latest plan/ledger/snapshot" seeding never
     /// scans the whole session log.

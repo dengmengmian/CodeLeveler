@@ -105,9 +105,14 @@ impl From<AgentEvent> for EngineEvent {
             A::CommandProgress { label, elapsed_ms } => {
                 EngineEvent::CommandProgress { label, elapsed_ms }
             }
-            A::MemoryRecalled { ids, count } => EngineEvent::MemoryRecalled {
+            A::MemoryRecalled {
+                ids,
+                count,
+                experience,
+            } => EngineEvent::MemoryRecalled {
                 count: count.min(u32::MAX as usize) as u32,
                 ids,
+                experience: experience.min(u32::MAX as usize) as u32,
             },
             A::MemoryChanged {
                 operation,

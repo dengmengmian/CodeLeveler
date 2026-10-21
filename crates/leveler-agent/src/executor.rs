@@ -98,6 +98,9 @@ pub(crate) struct MemoryRecallPlan {
     pub truncated: usize,
     /// Size of the rendered block, or 0 when nothing was injected.
     pub rendered_bytes: usize,
+    /// How many selected entries were agent experience. Lets a client report
+    /// "a past lesson was recalled" without exposing a body.
+    pub experience: usize,
 }
 
 impl MemoryRecallPlan {
@@ -116,7 +119,9 @@ impl MemoryRecallPlan {
         const HEADER: &str = "## Project memory for this turn\nMemory is advisory and records \
              what was true when it was written. The code and the project's own rules win: verify \
              anything it names before relying on it, and correct it when this turn contradicts \
-             it.\n";
+             it. An entry marked `experience` records a failure and resolution the runtime \
+             observed; its explanation is still a model reading, so re-check it against the \
+             current code rather than treating a past success as proof.\n";
         const STANDING_LABEL: &str =
             "\nLasting preferences (apply unless this turn says otherwise):\n";
         const QUERY_LABEL: &str = "\nRetrieved as possibly relevant to this request:\n";
@@ -144,6 +149,9 @@ impl MemoryRecallPlan {
                             label_paid = true;
                         }
                         budget = budget.saturating_sub(line.len());
+                        if entry.experience.is_some() {
+                            plan.experience += 1;
+                        }
                         plan.selected.push(entry.id.clone());
                         plan.truncated += usize::from(was_truncated);
                         out.push_str(&line);
@@ -180,8 +188,40 @@ impl MemoryRecallPlan {
 /// The id is what makes a turn auditable: without it nobody can say which
 /// memory was used.
 fn render_entry_line(entry: &leveler_memory::MemoryEntry, budget: usize) -> (Option<String>, bool) {
-    let prefix = format!("- [{}] {}: ", entry.id.trim(), entry.title.trim());
-    let body = entry.body.trim();
+    // An experience carries its evidence class and applicability. The model
+    // must be able to tell a verified resolution from an unverified
+    // hypothesis, and must know when the lesson stops applying.
+    let (label, body) = match entry.experience.as_ref() {
+        Some(experience) => {
+            let verification = match experience.verification {
+                leveler_memory::ExperienceVerification::Verified => "verified",
+                leveler_memory::ExperienceVerification::Unverified => "unverified",
+            };
+            let mut body = entry.body.trim().to_string();
+            body.push_str(&format!(
+                " [applies when: {}",
+                experience.applies_when.trim()
+            ));
+            if let Some(invalid_if) = experience.invalid_if.as_deref() {
+                body.push_str(&format!("; invalid if: {}", invalid_if.trim()));
+            }
+            body.push(']');
+            (
+                format!(
+                    "- [{}] (experience·{verification}) {}: ",
+                    entry.id.trim(),
+                    entry.title.trim()
+                ),
+                body,
+            )
+        }
+        None => (
+            format!("- [{}] {}: ", entry.id.trim(), entry.title.trim()),
+            entry.body.trim().to_string(),
+        ),
+    };
+    let prefix = label;
+    let body = body.as_str();
     let full = format!("{prefix}{body}\n");
     if full.len() <= budget {
         return (Some(full), false);
@@ -224,6 +264,8 @@ pub(crate) struct MemoryInjection {
     /// hits" from "memory was not exposed / not configured" for the status
     /// surface; only the former is a recall result.
     pub attempted: bool,
+    /// Selected entries that were agent experience.
+    pub experience: usize,
 }
 
 /// Skills the user named on this turn, plus the injection text.
@@ -491,7 +533,12 @@ pub enum AgentEvent {
     /// model context. Emitted ONLY when at least one memory was selected — a
     /// search that found nothing is not a recall. Carries ids/counts, never
     /// bodies, so it is safe on every surface.
-    MemoryRecalled { ids: Vec<String>, count: usize },
+    MemoryRecalled {
+        ids: Vec<String>,
+        count: usize,
+        /// How many of `ids` were agent experience.
+        experience: usize,
+    },
     /// A durable memory was created, superseded or expired by the runtime
     /// lifecycle. `operation` is one of `created` / `superseded` / `expired` /
     /// `merged`. Carries the short title, not the body.
@@ -2668,6 +2715,7 @@ impl Executor {
             observer(AgentEvent::MemoryRecalled {
                 count: injection.recalled.len(),
                 ids: injection.recalled,
+                experience: injection.experience,
             });
         }
         if let Some(recall) = injection.block {
@@ -3068,6 +3116,7 @@ impl Executor {
             block,
             recalled: plan.selected,
             attempted: true,
+            experience: plan.experience,
         }
     }
 
@@ -3973,7 +4022,11 @@ mod ownership_authority_tests {
         assert!(
             recalled.iter().any(|event| matches!(
                 event,
-                AgentEvent::MemoryRecalled { count: 0, ids } if ids.is_empty()
+                AgentEvent::MemoryRecalled {
+                    count: 0,
+                    ids,
+                    experience: 0,
+                } if ids.is_empty()
             )),
             "expected a zero-hit MemoryRecalled, got {recalled:?}"
         );
@@ -4006,6 +4059,7 @@ mod recall_tests {
             superseded_by: None,
             superseded_at: None,
             expires_at: None,
+            experience: None,
         }
     }
 
@@ -4048,6 +4102,42 @@ mod recall_tests {
         assert_eq!(plan.selected, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(plan.omitted, 0);
         assert_eq!(plan.truncated, 0);
+    }
+
+    #[test]
+    fn an_experience_line_carries_its_verification_and_applicability() {
+        let mut experience = entry(
+            "exp-1",
+            "dev profile 缺少 test feature",
+            "启用 feature 后测试通过",
+        );
+        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
+        experience.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::RootCause,
+            verification: leveler_memory::ExperienceVerification::Verified,
+            applies_when: "运行 cargo test 且使用 dev profile".to_string(),
+            invalid_if: Some("toolchain 或 feature 配置变化".to_string()),
+            evidence: vec![leveler_memory::ExperienceEvidence {
+                kind: "failure".to_string(),
+                reference: "step 2: cargo test (exit 101)".to_string(),
+            }],
+        });
+        let (plan, block) = render(Vec::new(), vec![experience]);
+        let block = block.expect("experience block");
+        assert!(block.contains("(experience·verified)"), "{block}");
+        assert!(
+            block.contains("applies when: 运行 cargo test 且使用 dev profile"),
+            "{block}"
+        );
+        assert!(
+            block.contains("invalid if: toolchain 或 feature 配置变化"),
+            "{block}"
+        );
+        assert_eq!(plan.experience, 1);
+        assert!(
+            block.contains("its explanation is still a model reading"),
+            "recall must say the explanation is not proven: {block}"
+        );
     }
 
     /// The ceiling binds even on the FIRST entry. The old check exempted it

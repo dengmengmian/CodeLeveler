@@ -20,6 +20,8 @@ pub enum ModelCallKind {
     Compaction,
     /// Semantic memory-candidate extraction from the user's own turns.
     MemoryExtraction,
+    /// Evidence-bound agent-experience extraction after a completed task.
+    ExperienceExtraction,
     /// An idle prompt suggestion.
     PromptSuggestion,
     /// A one-line recap of where the conversation reached.
@@ -42,6 +44,7 @@ impl ModelCallKind {
             Self::Round => "round",
             Self::Compaction => "compaction",
             Self::MemoryExtraction => "memory_extraction",
+            Self::ExperienceExtraction => "experience_extraction",
             Self::PromptSuggestion => "prompt_suggestion",
             Self::AwaySummary => "away_summary",
             Self::SemanticRecap => "semantic_recap",
@@ -58,6 +61,7 @@ impl ModelCallKind {
         match value {
             "compaction" => Self::Compaction,
             "memory_extraction" => Self::MemoryExtraction,
+            "experience_extraction" => Self::ExperienceExtraction,
             "prompt_suggestion" => Self::PromptSuggestion,
             "away_summary" => Self::AwaySummary,
             "semantic_recap" => Self::SemanticRecap,

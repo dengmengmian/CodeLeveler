@@ -40,6 +40,11 @@ pub enum CandidateSource {
     /// explicit-user authority, and the original proposal source remains in
     /// the entry's provenance evidence.
     UserAccepted,
+    /// The runtime observed a failure and its resolution in a completed task
+    /// and extracted an experience candidate from those structured facts.
+    /// Distinct from [`Self::AgentProposed`] because the claim is bound to
+    /// evidence the runtime recorded, not to a model's own judgement.
+    RuntimeObserved,
 }
 
 impl CandidateSource {
@@ -52,6 +57,7 @@ impl CandidateSource {
             Self::AgentProposed => "agent_proposed",
             Self::UserRestore => "user_restore",
             Self::UserAccepted => "user_accepted",
+            Self::RuntimeObserved => "runtime_observed",
         }
     }
 
@@ -109,6 +115,11 @@ pub struct MemoryCandidate {
     /// authorized it. Never a secret (checked at construction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// The structured evidence contract for an agent experience. Present only
+    /// for [`CandidateSource::RuntimeObserved`] (or a user-accepted/restored
+    /// experience); absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experience: Option<crate::ExperienceRecord>,
 }
 
 impl MemoryCandidate {
@@ -157,6 +168,7 @@ impl MemoryCandidate {
             operation: CandidateOperation::Create,
             expires_at: None,
             evidence: None,
+            experience: None,
         })
     }
 }
@@ -179,6 +191,19 @@ pub fn candidate_sensitive_fields(candidate: &MemoryCandidate) -> Vec<&'static s
     if candidate.evidence.as_deref().is_some_and(looks_like_secret) {
         fields.push("evidence");
     }
+    if let Some(experience) = candidate.experience.as_ref() {
+        if looks_like_secret(&experience.applies_when)
+            || experience
+                .invalid_if
+                .as_deref()
+                .is_some_and(looks_like_secret)
+            || experience.evidence.iter().any(|evidence| {
+                looks_like_secret(&evidence.kind) || looks_like_secret(&evidence.reference)
+            })
+        {
+            fields.push("experience");
+        }
+    }
     fields
 }
 
@@ -200,6 +225,7 @@ pub fn redact_candidate(candidate: &mut MemoryCandidate) {
     candidate.body = crate::REDACTED_BODY.to_string();
     candidate.tags.clear();
     candidate.evidence = None;
+    candidate.experience = None;
     if candidate.key.as_deref().is_some_and(looks_like_secret) {
         candidate.key = None;
         candidate.semantic_key = None;

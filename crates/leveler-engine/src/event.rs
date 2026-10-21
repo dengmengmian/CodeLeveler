@@ -414,6 +414,9 @@ pub enum EngineEvent {
     MemoryRecalled {
         count: u32,
         ids: Vec<String>,
+        /// How many of `ids` were evidence-bound agent experience.
+        #[serde(default)]
+        experience: u32,
     },
     /// A durable memory lifecycle change (created / superseded / expired /
     /// merged). `operation` is an opaque stable key chosen by the memory

@@ -136,9 +136,14 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             max_attempts,
             delay_ms,
         },
-        EngineEvent::MemoryRecalled { count, ids } => AgentEvent::MemoryRecalled {
+        EngineEvent::MemoryRecalled {
+            count,
+            ids,
+            experience,
+        } => AgentEvent::MemoryRecalled {
             count: count as usize,
             ids,
+            experience: experience as usize,
         },
         EngineEvent::MemoryChanged {
             operation,

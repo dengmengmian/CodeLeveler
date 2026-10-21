@@ -10,17 +10,20 @@
 
 mod audit;
 mod candidates;
+mod experience;
 mod lifecycle;
 mod pipeline;
 mod semantic;
 
-pub use audit::{
-    IdentityAudit, IdentityLocation, IdentityRecord, IdentityState, IdentitySummary,
-};
+pub use audit::{IdentityAudit, IdentityLocation, IdentityRecord, IdentityState, IdentitySummary};
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, candidate_sensitive_fields, fingerprint_of,
     is_sensitive_candidate, looks_like_secret, package_manager_from_root,
     parse_direct_memory_command, parse_inferred_preference, redact_candidate, title_from_body,
+};
+pub use experience::{
+    EXPERIENCE_KIND, ExperienceCategory, ExperienceEvidence, ExperienceRecord,
+    ExperienceVerification, validate_experience_record,
 };
 pub use lifecycle::{
     AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
@@ -113,6 +116,10 @@ pub struct MemoryEntry {
     /// When this entry stops being recallable. RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// The evidence-bound half of an agent experience. `None` on every other
+    /// kind, including all entries written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experience: Option<ExperienceRecord>,
 }
 
 impl MemoryEntry {
@@ -378,7 +385,11 @@ impl MemoryStore {
         let entries: Vec<MemoryEntry> = self
             .effective_active()?
             .into_iter()
-            .filter(|entry| !is_sensitive(entry))
+            .filter(|entry| {
+                // Experience is relevance-retrieved, never part of a standing
+                // index paid for on every request.
+                !is_sensitive(entry) && MemoryKind::of(entry) != MemoryKind::Experience
+            })
             .collect();
         if entries.is_empty() {
             return Ok(String::new());
@@ -416,6 +427,14 @@ impl MemoryStore {
         kind: MemoryKind,
         tags: Vec<String>,
     ) -> Result<MemoryEntry, MemoryError> {
+        // An experience without its structured evidence would claim a
+        // verification that never happened. Only the evidence-bound admission
+        // path may create one.
+        if kind == MemoryKind::Experience {
+            return Err(MemoryError::Invalid(
+                "experience requires runtime evidence; it cannot be written directly".to_string(),
+            ));
+        }
         let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         // A user write that states an assignment ("以后默认模型固定为 Pro")
         // carries the same semantic identity as every other path. It therefore
@@ -429,9 +448,7 @@ impl MemoryStore {
             candidate
                 .tags
                 .retain(|tag| !tag.trim_start().starts_with("kind:"));
-            candidate
-                .tags
-                .push(format!("kind:{}", kind.as_str()));
+            candidate.tags.push(format!("kind:{}", kind.as_str()));
             candidate.authority = MemoryAuthority::ExplicitUser;
             candidate.source = CandidateSource::UserExplicit;
             if candidate.evidence.is_none() {
@@ -443,9 +460,7 @@ impl MemoryStore {
                 | AppliedOperation::Superseded
                 | AppliedOperation::Merged => {
                     let saved = outcome.entry.ok_or_else(|| {
-                        MemoryError::Invalid(
-                            "memory write produced no current entry".to_string(),
-                        )
+                        MemoryError::Invalid("memory write produced no current entry".to_string())
                     })?;
                     // Best effort, after the active copy is durable, exactly
                     // like the non-assignment path below.
@@ -519,6 +534,11 @@ impl MemoryStore {
         kind: MemoryKind,
         tags: Vec<String>,
     ) -> Result<MemoryEntry, MemoryError> {
+        if kind == MemoryKind::Experience {
+            return Err(MemoryError::Invalid(
+                "experience requires runtime evidence; it cannot be written directly".to_string(),
+            ));
+        }
         let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         let mut entry = new_entry(title, body, tags);
         entry.kind = Some(kind.as_str().to_string());
@@ -550,8 +570,10 @@ impl MemoryStore {
     /// Replaces the old "all active titles" index. Its one job is discovery:
     /// when query recall misses on wording, a decision or note can still be
     /// found by title and read with the `memory` tool. Preferences are excluded
-    /// because they are already injected in full, derived and sensitive entries
-    /// because they must never reach the model this way.
+    /// because they are already injected in full; experience entries because
+    /// they are retrieved only when relevant, never carried in every request;
+    /// derived and sensitive entries because they must never reach the model
+    /// this way.
     pub fn catalog_lines(&self, max_entries: usize) -> Result<String, MemoryError> {
         let mut entries: Vec<MemoryEntry> = self
             .effective_active()?
@@ -641,7 +663,28 @@ impl MemoryStore {
         let entries = self.effective_active()?;
         let docs: Vec<Vec<String>> = entries
             .iter()
-            .map(|e| tokenize(&format!("{} {} {}", e.title, e.body, e.tags.join(" "))))
+            .map(|e| {
+                // Applicability is part of what a lesson is about: a query can
+                // name the environment without repeating the lesson body.
+                let experience = e
+                    .experience
+                    .as_ref()
+                    .map(|record| {
+                        format!(
+                            "{} {}",
+                            record.applies_when,
+                            record.invalid_if.as_deref().unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default();
+                tokenize(&format!(
+                    "{} {} {} {}",
+                    e.title,
+                    e.body,
+                    e.tags.join(" "),
+                    experience
+                ))
+            })
             .collect();
         let n = docs.len() as f64;
         if n == 0.0 {
@@ -741,6 +784,7 @@ pub fn new_entry(title: &str, body: &str, tags: Vec<String>) -> MemoryEntry {
         superseded_by: None,
         superseded_at: None,
         expires_at: None,
+        experience: None,
     }
 }
 
@@ -752,6 +796,12 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
         entry.id = slugify(key);
         entry.key = Some(key.clone());
     }
+    // The structured record is the authority for what this entry IS. A
+    // candidate that carries it is an experience even when its free-form
+    // candidate kind is `Free` (which only exists to serve the lifecycle).
+    if candidate.experience.is_some() {
+        entry.kind = Some(EXPERIENCE_KIND.to_string());
+    }
     // A caller that means `decision`/`note` records it in the tags; the
     // candidate category alone cannot tell those apart from a generic fact.
     let declared_kind = candidate
@@ -760,18 +810,16 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
         .find_map(|tag| tag.trim().strip_prefix("kind:"))
         .map(str::trim)
         .filter(|kind| matches!(*kind, "preference" | "decision" | "note"));
-    entry.kind = Some(
-        declared_kind
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                match candidate.kind {
-                    CandidateKind::Preference => "preference",
-                    CandidateKind::PackageManager => "package_manager",
-                    CandidateKind::Free => "free",
-                }
-                .to_string()
-            }),
-    );
+    if entry.kind.as_deref() != Some(EXPERIENCE_KIND) {
+        entry.kind = Some(declared_kind.map(str::to_string).unwrap_or_else(|| {
+            match candidate.kind {
+                CandidateKind::Preference => "preference",
+                CandidateKind::PackageManager => "package_manager",
+                CandidateKind::Free => "free",
+            }
+            .to_string()
+        }));
+    }
     entry.provenance = Some(Provenance {
         authority: candidate.authority,
         source: match candidate.source {
@@ -781,11 +829,13 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
             crate::CandidateSource::AgentProposed => "agent_remember_tool",
             crate::CandidateSource::UserRestore => "user_restore",
             crate::CandidateSource::UserAccepted => "user_accepted",
+            crate::CandidateSource::RuntimeObserved => "agent_experience",
         }
         .to_string(),
         evidence: None,
     });
     entry.expires_at = candidate.expires_at.clone();
+    entry.experience = candidate.experience.clone();
     entry
 }
 
@@ -817,6 +867,9 @@ pub enum MemoryKind {
     LegacyUnknown,
     /// A fact read out of the repository. Kept, never injected.
     Derived,
+    /// Evidence-bound knowledge learned from execution. Recalled by relevance,
+    /// never injected as a standing rule and never listed in the catalog.
+    Experience,
 }
 
 impl MemoryKind {
@@ -828,6 +881,7 @@ impl MemoryKind {
             Self::Note => "note",
             Self::LegacyUnknown => "unknown",
             Self::Derived => "package_manager",
+            Self::Experience => EXPERIENCE_KIND,
         }
     }
 
@@ -838,7 +892,9 @@ impl MemoryKind {
         match self {
             Self::Preference => CandidateKind::Preference,
             Self::Derived => CandidateKind::PackageManager,
-            Self::Decision | Self::Note | Self::LegacyUnknown => CandidateKind::Free,
+            Self::Decision | Self::Note | Self::LegacyUnknown | Self::Experience => {
+                CandidateKind::Free
+            }
         }
     }
 
@@ -848,10 +904,19 @@ impl MemoryKind {
         if is_derived_fact(entry) {
             return Self::Derived;
         }
+        // The structured record is authoritative even if a legacy/foreign
+        // writer labelled the kind differently. An entry that carries the
+        // evidence contract IS an experience.
+        if entry.experience.is_some() {
+            return Self::Experience;
+        }
         match entry.kind.as_deref().map(str::trim) {
             Some("preference") => Self::Preference,
             Some("decision") => Self::Decision,
             Some("note") => Self::Note,
+            // The stored label is the public contract; `EXPERIENCE_KIND` is
+            // the same value for writers.
+            Some("experience") => Self::Experience,
             _ if entry.tags.iter().any(|t| t.trim() == "preference") => Self::Preference,
             _ => Self::LegacyUnknown,
         }
@@ -891,6 +956,19 @@ fn sensitive_fields(entry: &MemoryEntry) -> Vec<&'static str> {
     {
         fields.push("evidence");
     }
+    if let Some(experience) = entry.experience.as_ref() {
+        if looks_like_secret(&experience.applies_when)
+            || experience
+                .invalid_if
+                .as_deref()
+                .is_some_and(looks_like_secret)
+            || experience.evidence.iter().any(|evidence| {
+                looks_like_secret(&evidence.kind) || looks_like_secret(&evidence.reference)
+            })
+        {
+            fields.push("experience");
+        }
+    }
     fields
 }
 
@@ -921,6 +999,23 @@ fn redact_entry(entry: &mut MemoryEntry) {
             .is_some_and(looks_like_secret)
     {
         provenance.evidence = None;
+    }
+    if let Some(experience) = entry.experience.as_mut() {
+        // An experience's conditions and evidence are durable content too.
+        // A credential-shaped one means there is nothing safe to keep.
+        if looks_like_secret(&experience.applies_when) {
+            experience.applies_when = REDACTED_BODY.to_string();
+        }
+        if experience
+            .invalid_if
+            .as_deref()
+            .is_some_and(looks_like_secret)
+        {
+            experience.invalid_if = None;
+        }
+        experience.evidence.retain(|evidence| {
+            !looks_like_secret(&evidence.kind) && !looks_like_secret(&evidence.reference)
+        });
     }
 }
 
@@ -1016,10 +1111,24 @@ fn tokenize(text: &str) -> Vec<String> {
     let mut cjk: Vec<char> = Vec::new();
 
     fn flush_word(word: &mut String, out: &mut Vec<String>) {
-        if word.chars().count() > 1 {
-            out.push(std::mem::take(word));
-        } else {
-            word.clear();
+        let original = std::mem::take(word);
+        if original.chars().count() <= 1 {
+            return;
+        }
+        let whole = original.to_lowercase();
+        out.push(whole.clone());
+        // A code identifier is often written as one word (`PermissionProfile`,
+        // `SessionId`). A query says "permission profile"; without the parts the
+        // entry can never match. Keep the whole word too, so an exact
+        // identifier query still ranks above a partial one.
+        let parts = camel_parts(&original);
+        if parts.len() > 1 {
+            for part in parts {
+                let part = part.to_lowercase();
+                if part.chars().count() > 1 && part != whole {
+                    out.push(part);
+                }
+            }
         }
     }
     fn flush_cjk(cjk: &mut Vec<char>, out: &mut Vec<String>) {
@@ -1041,7 +1150,9 @@ fn tokenize(text: &str) -> Vec<String> {
             cjk.push(c);
         } else if c.is_alphanumeric() {
             flush_cjk(&mut cjk, &mut out);
-            word.extend(c.to_lowercase());
+            // Keep the original case until flush: the camel boundary is the
+            // only place it matters.
+            word.push(c);
         } else {
             flush_word(&mut word, &mut out);
             flush_cjk(&mut cjk, &mut out);
@@ -1050,6 +1161,25 @@ fn tokenize(text: &str) -> Vec<String> {
     flush_word(&mut word, &mut out);
     flush_cjk(&mut cjk, &mut out);
     out
+}
+
+/// Split a code identifier at lower/digit → upper boundaries. `SQLite` and
+/// `HTTP2` stay one part; `PermissionProfile` becomes `Permission`, `Profile`.
+fn camel_parts(word: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for character in word.chars() {
+        if character.is_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+        previous_was_lower_or_digit = character.is_lowercase() || character.is_ascii_digit();
+        current.push(character);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 pub(crate) fn now_rfc3339() -> String {
@@ -2102,5 +2232,341 @@ mod safety_tests {
             assert!(!raw.contains(secret), "scrub left a credential in {path:?}");
         }
         assert!(store.audit_sensitive().unwrap().is_empty());
+    }
+
+    // ── Agent experience ────────────────────────────────────────────────
+
+    fn verified_experience(subject: &str, body: &str, resolution: &str) -> crate::MemoryCandidate {
+        let record = crate::ExperienceRecord {
+            category: crate::ExperienceCategory::RootCause,
+            verification: crate::ExperienceVerification::Verified,
+            applies_when: "cargo test 在 dev profile 下运行".to_string(),
+            invalid_if: Some("toolchain 或 dev profile 配置变化".to_string()),
+            evidence: vec![
+                crate::ExperienceEvidence {
+                    kind: "failure".to_string(),
+                    reference: "step 2: cargo test -p demo (exit 101)".to_string(),
+                },
+                crate::ExperienceEvidence {
+                    kind: "resolution".to_string(),
+                    reference: format!("step 5: {resolution}"),
+                },
+            ],
+        };
+        let key = crate::semantic_key_of(subject);
+        let mut candidate = crate::MemoryCandidate::new(
+            "test 失败源于 dev profile 缺少 feature",
+            body,
+            crate::CandidateKind::Free,
+            Some(key.clone()),
+            crate::CandidateSource::RuntimeObserved,
+            vec![
+                "experience".to_string(),
+                "category:root_cause".to_string(),
+                format!("subject:{subject}"),
+            ],
+        )
+        .unwrap();
+        candidate.semantic_key = Some(key);
+        candidate.authority = crate::MemoryAuthority::ToolObservation;
+        candidate.evidence = Some(format!("task turn-1; {resolution}"));
+        candidate.experience = Some(record);
+        candidate
+    }
+
+    #[test]
+    fn a_verified_experience_is_neither_a_preference_nor_a_catalog_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let candidate = verified_experience(
+            "cargo.test.dev_profile",
+            "cargo test 报 missing feature 时，先检查 dev profile 的 features；这不是代码错误。",
+            "cargo test -p demo (exit 0)",
+        );
+        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        assert!(matches!(outcome, crate::AgentAdmitOutcome::Applied(_)));
+
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            crate::MemoryKind::of(&active[0]),
+            crate::MemoryKind::Experience
+        );
+        assert!(
+            store.standing_preferences(10).unwrap().is_empty(),
+            "experience must never be injected as a standing rule"
+        );
+        assert!(
+            store.catalog_lines(10).unwrap().is_empty(),
+            "experience must not occupy the per-request catalog"
+        );
+    }
+
+    #[test]
+    fn an_unverified_experience_waits_for_a_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut candidate = verified_experience(
+            "cargo.test.dev_profile",
+            "可能是 dev profile 的 feature 缺失导致测试失败。",
+            "cargo test -p demo (exit 0)",
+        );
+        candidate.experience.as_mut().unwrap().verification =
+            crate::ExperienceVerification::Unverified;
+        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        assert!(
+            matches!(outcome, crate::AgentAdmitOutcome::Queued { .. }),
+            "an unverified experience must be parked: {outcome:?}"
+        );
+        assert!(
+            store.effective_active().unwrap().is_empty(),
+            "no unverified experience may become current automatically"
+        );
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_evidence_supersedes_the_previous_experience_and_keeps_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let first = store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "dev profile 缺少 test feature 是根因。",
+                "cargo test -p demo (exit 0)",
+            ))
+            .unwrap();
+        assert!(matches!(first, crate::AgentAdmitOutcome::Applied(_)));
+
+        let second = store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "真正的原因是 workspace 的 default-features=false；dev profile 只是表象。",
+                "cargo test -p demo --workspace (exit 0)",
+            ))
+            .unwrap();
+        match second {
+            crate::AgentAdmitOutcome::Applied(outcome) => {
+                assert_eq!(outcome.operation, crate::AppliedOperation::Superseded);
+            }
+            other => panic!("new evidence must update the old experience: {other:?}"),
+        }
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1, "one current version per identity");
+        assert!(active[0].body.contains("default-features"));
+        let archived = store.list_archived().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].status, crate::MemoryStatus::Superseded);
+    }
+
+    #[test]
+    fn an_experience_cannot_replace_a_fact_of_another_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        // A user-authored decision under the same semantic identity.
+        let key = crate::semantic_key_of("项目测试命令");
+        let mut entry = crate::new_entry(
+            "项目测试命令",
+            "cargo test -p demo 是唯一验收命令。",
+            vec![],
+        );
+        entry.id = "project-test-command".to_string();
+        entry.key = Some(key.clone());
+        entry.kind = Some("decision".to_string());
+        entry.provenance = Some(crate::Provenance {
+            authority: crate::MemoryAuthority::ExplicitUser,
+            source: "user_direct".to_string(),
+            evidence: None,
+        });
+        store.remember(entry).unwrap();
+
+        let candidate = verified_experience(
+            "项目测试命令",
+            "跑 cargo test 前必须先设置 dev profile。",
+            "cargo test -p demo (exit 0)",
+        );
+        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        assert!(
+            matches!(outcome, crate::AgentAdmitOutcome::Queued { .. }),
+            "an experience must not silently replace a user fact: {outcome:?}"
+        );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].kind.as_deref(), Some("decision"));
+        assert_eq!(
+            active[0].authority(),
+            crate::MemoryAuthority::ExplicitUser,
+            "the user fact remains the current truth"
+        );
+    }
+
+    #[test]
+    fn recall_matches_chinese_english_and_code_identifiers_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut entry = crate::new_entry(
+            "PermissionProfile 校验失败",
+            "PermissionProfile::Assisted 在 workspace 写入时仍会调用 admission；\
+             cargo nextest run --workspace 能复现。",
+            vec!["experience".to_string()],
+        );
+        entry.kind = Some("experience".to_string());
+        entry.experience = Some(crate::ExperienceRecord {
+            category: crate::ExperienceCategory::FailurePattern,
+            verification: crate::ExperienceVerification::Verified,
+            applies_when: "workspace 写入且 permission 为 Assisted".to_string(),
+            invalid_if: None,
+            evidence: vec![
+                crate::ExperienceEvidence {
+                    kind: "failure".to_string(),
+                    reference: "step 3: cargo nextest run --workspace (exit 101)".to_string(),
+                },
+                crate::ExperienceEvidence {
+                    kind: "resolution".to_string(),
+                    reference: "step 6: cargo nextest run --workspace (exit 0)".to_string(),
+                },
+            ],
+        });
+        store.remember(entry).unwrap();
+
+        for query in [
+            "permission profile 校验失败",
+            "PermissionProfile Assisted 为什么失败",
+            "cargo nextest workspace 失败",
+            "权限 workspace 写入",
+        ] {
+            assert!(
+                !store.recall(query, 5).unwrap().is_empty(),
+                "recall missed a mixed-language query: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_person_accepting_an_experience_may_replace_another_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let subject = "workspace.marker";
+        let key = crate::semantic_key_of(subject);
+        let mut decision =
+            crate::new_entry("workspace 规则", "marker.txt 必须由人工创建。", vec![]);
+        decision.id = "workspace-marker-rule".to_string();
+        decision.key = Some(key.clone());
+        decision.kind = Some("decision".to_string());
+        decision.provenance = Some(crate::Provenance {
+            authority: crate::MemoryAuthority::ExplicitUser,
+            source: "user_direct".to_string(),
+            evidence: None,
+        });
+        store.remember(decision).unwrap();
+
+        let candidate = verified_experience(
+            subject,
+            "检查依赖 marker.txt；文件缺失时失败，创建后通过。",
+            "cargo test -p demo (exit 0)",
+        );
+        let queued = store.admit_experience_candidate(candidate).unwrap();
+        let crate::AgentAdmitOutcome::Queued { candidate, .. } = queued else {
+            panic!("a conflicting kind must wait: {queued:?}");
+        };
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+
+        let accepted = store.accept(&candidate.id).unwrap();
+        assert_eq!(
+            crate::MemoryKind::of(&accepted),
+            crate::MemoryKind::Experience
+        );
+        assert_eq!(
+            accepted.authority(),
+            crate::MemoryAuthority::ToolObservation,
+            "consent does not raise the evidence class"
+        );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, accepted.id);
+        assert!(
+            store
+                .list_archived()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == "workspace-marker-rule"
+                    && entry.status == crate::MemoryStatus::Superseded),
+            "the replaced decision stays as history"
+        );
+    }
+
+    #[test]
+    fn recall_matches_an_experience_by_its_applicability_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut candidate = verified_experience(
+            "build.linker",
+            "最终链接失败时检查系统 C 工具链。",
+            "cargo test (exit 0)",
+        );
+        candidate.experience.as_mut().unwrap().applies_when =
+            "容器里没有 build-essential 或 cc 不在 PATH".to_string();
+        store.admit_experience_candidate(candidate).unwrap();
+        assert!(
+            !store.recall("build-essential 容器", 5).unwrap().is_empty(),
+            "a query naming only the applicability must find the lesson"
+        );
+    }
+
+    #[test]
+    fn an_experience_cannot_be_written_without_its_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let error = store
+            .activate(
+                "看起来像经验",
+                "没有证据的教训。",
+                crate::MemoryKind::Experience,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("runtime evidence"), "{error}");
+        assert!(store.effective_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_expired_experience_is_neither_current_nor_recalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut candidate = verified_experience(
+            "cargo.test.dev_profile",
+            "dev profile 缺少 test feature 是根因；启用后测试通过。",
+            "cargo test -p demo (exit 0)",
+        );
+        candidate.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        assert!(matches!(outcome, crate::AgentAdmitOutcome::Applied(_)));
+        assert!(
+            store.effective_active().unwrap().is_empty(),
+            "an expired experience is not current truth"
+        );
+        assert!(
+            store
+                .recall("cargo test dev profile", 5)
+                .unwrap()
+                .is_empty(),
+            "an expired experience must not reach a later task"
+        );
+    }
+
+    #[test]
+    fn a_sensitive_experience_is_refused_at_the_write_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut candidate = verified_experience(
+            "deploy.token",
+            "部署失败时检查 token。",
+            "cargo test -p demo (exit 0)",
+        );
+        candidate.experience.as_mut().unwrap().applies_when =
+            "token=ghp_abcdefghijklmnopqrstuvwxyz0123".to_string();
+        let outcome = store.admit_experience_candidate(candidate);
+        assert!(outcome.is_err(), "a credential in evidence must be refused");
+        assert!(store.effective_active().unwrap().is_empty());
     }
 }

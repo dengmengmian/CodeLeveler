@@ -5555,6 +5555,7 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
         Action::Runtime(RuntimeEvent::MemoryRecalled {
             count: 0,
             ids: vec![],
+            experience_count: 0,
         }),
     );
     assert_eq!(
@@ -5591,6 +5592,27 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
                     zero_candidates: false,
                 }),
                 last_error: Some("provider unavailable".into()),
+                experience_active: 2,
+                experience_verified: 1,
+                experience_unverified: 1,
+                experience_pending: 1,
+                experience_archived: 0,
+                experience_inbox_pending: 0,
+                experience_inbox_processing: 0,
+                experience_inbox_failed_retryable: 0,
+                experience_inbox_processed: 2,
+                experience_next_retry_at: None,
+                last_experience: Some(leveler_client_protocol::UiMemoryExperience {
+                    at: "2026-10-21T00:00:02Z".into(),
+                    outcome: "extracted".into(),
+                    reason: None,
+                    accepted: 1,
+                    rejected: 0,
+                    created: 1,
+                    updated: 0,
+                    pending: 0,
+                    skipped: 0,
+                }),
             },
         }),
     );
@@ -5613,6 +5635,12 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
         "provider unavailable",
         "下次重试",
         "最近召回: 0",
+        "经验：生效 2",
+        "已验证 1",
+        "未验证 1",
+        "经验队列",
+        "最近经验沉淀",
+        "新增 1",
     ] {
         assert!(note.contains(expected), "missing {expected}: {note}");
     }
@@ -5713,6 +5741,7 @@ fn memory_recalled_event_pushes_an_auditable_note_without_a_toast() {
         Action::Runtime(RuntimeEvent::MemoryRecalled {
             count: 2,
             ids: vec!["a".into(), "b".into()],
+            experience_count: 1,
         }),
     );
     let note = s
@@ -5724,10 +5753,37 @@ fn memory_recalled_event_pushes_an_auditable_note_without_a_toast() {
             _ => None,
         })
         .expect("MemoryRecalled must push a note");
-    assert_eq!(note, "我想起了 2 条相关记忆。");
+    assert_eq!(note, "我想起了 2 条相关记忆（其中 1 条是经验）。");
     assert!(
         s.notification.is_none(),
         "routine recall must not duplicate the transcript note as a toast"
+    );
+}
+
+#[test]
+fn an_experience_lifecycle_event_uses_the_experience_label() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryChanged {
+            operation: "experience_created".into(),
+            id: "k-demo".into(),
+            title: "检查失败源于 marker 缺失".into(),
+            authority: Some("tool_observation".into()),
+        }),
+    );
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Note(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("a saved experience must leave a note");
+    assert_eq!(
+        note,
+        "我从这次任务里记下了一条经验：检查失败源于 marker 缺失"
     );
 }
 
@@ -5739,6 +5795,7 @@ fn memory_recalled_zero_is_silent() {
         Action::Runtime(RuntimeEvent::MemoryRecalled {
             count: 0,
             ids: vec![],
+            experience_count: 0,
         }),
     );
     assert!(

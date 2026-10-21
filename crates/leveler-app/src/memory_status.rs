@@ -5,9 +5,13 @@
 //! background extractor has processed, rejected, skipped or must retry). It
 //! adds no counters of its own, so a status line cannot drift from the worker.
 
-use leveler_client_protocol::{UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryStatus};
-use leveler_memory::{MemoryStore, is_sensitive, is_sensitive_candidate};
-use leveler_storage::MemoryInboxRepository;
+use leveler_client_protocol::{
+    UiMemoryExperience, UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryStatus,
+};
+use leveler_memory::{
+    ExperienceVerification, MemoryKind, MemoryStore, is_sensitive, is_sensitive_candidate,
+};
+use leveler_storage::{ExperienceInboxRepository, MemoryInboxRepository};
 
 use crate::{AppError, Application};
 
@@ -24,6 +28,45 @@ struct StagedTurnResult {
     rejected: usize,
     #[serde(default)]
     skipped: usize,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StagedExperienceResult {
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    accepted: Vec<serde_json::Value>,
+    #[serde(default)]
+    rejected: usize,
+    #[serde(default)]
+    created: usize,
+    #[serde(default)]
+    updated: usize,
+    #[serde(default)]
+    pending: usize,
+    #[serde(default)]
+    skipped: usize,
+}
+
+fn experience_outcome(at: String, result_json: Option<&str>) -> Option<UiMemoryExperience> {
+    let staged: StagedExperienceResult = serde_json::from_str(result_json?).ok()?;
+    Some(UiMemoryExperience {
+        at,
+        outcome: if staged.outcome.is_empty() {
+            "skipped".to_string()
+        } else {
+            staged.outcome
+        },
+        reason: staged.reason,
+        accepted: count_u32(staged.accepted.len() as u64),
+        rejected: count_u32(staged.rejected as u64),
+        created: count_u32(staged.created as u64),
+        updated: count_u32(staged.updated as u64),
+        pending: count_u32(staged.pending as u64),
+        skipped: count_u32(staged.skipped as u64),
+    })
 }
 
 fn staged_totals(result_json: Option<&str>) -> (u32, u32, u32) {
@@ -124,6 +167,35 @@ pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
         .map(sanitize_error)
         .filter(|error| !error.is_empty());
 
+    let experience_active = active
+        .iter()
+        .filter(|entry| entry.experience.is_some())
+        .collect::<Vec<_>>();
+    let experience_verified = experience_active
+        .iter()
+        .filter(|entry| {
+            entry
+                .experience
+                .as_ref()
+                .is_some_and(|record| record.verification == ExperienceVerification::Verified)
+        })
+        .count();
+    let experience_pending = pending
+        .iter()
+        .filter(|candidate| candidate.experience.is_some())
+        .count();
+    let experience_archived = archived
+        .iter()
+        .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
+        .count();
+    let experience_repo = ExperienceInboxRepository::new(&db);
+    let experience_counts = experience_repo.counts().await?;
+    let last_experience = experience_repo
+        .last_processed()
+        .await?
+        .and_then(|row| experience_outcome(row.processed_at, row.result_json.as_deref()));
+    let experience_failure = experience_repo.last_failure().await?;
+
     Ok(UiMemoryStatus {
         active: u32::try_from(active.len()).unwrap_or(u32::MAX),
         pending: u32::try_from(pending.len()).unwrap_or(u32::MAX),
@@ -144,6 +216,21 @@ pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
         },
         last_extraction,
         last_error,
+        experience_active: count_u32(experience_active.len() as u64),
+        experience_verified: count_u32(experience_verified as u64),
+        experience_unverified: count_u32(
+            experience_active.len().saturating_sub(experience_verified) as u64,
+        ),
+        experience_pending: count_u32(experience_pending as u64),
+        experience_archived: count_u32(experience_archived as u64),
+        experience_inbox_pending: count_u32(experience_counts.pending),
+        experience_inbox_processing: count_u32(experience_counts.processing),
+        experience_inbox_failed_retryable: count_u32(experience_counts.failed_retryable),
+        experience_inbox_processed: count_u32(experience_counts.processed),
+        experience_next_retry_at: experience_failure
+            .as_ref()
+            .and_then(|row| row.next_attempt_at.clone()),
+        last_experience,
     })
 }
 

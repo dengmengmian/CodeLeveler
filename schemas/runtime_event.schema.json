@@ -1993,6 +1993,13 @@
           "format": "uint32",
           "minimum": 0.0
         },
+        "experience_count": {
+          "description": "How many of `ids` were evidence-bound agent experience.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "ids": {
           "type": "array",
           "items": {
@@ -5361,6 +5368,13 @@
               "format": "uint32",
               "minimum": 0.0
             },
+            "experience_count": {
+              "description": "How many of `ids` were evidence-bound agent experience.",
+              "default": 0,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "ids": {
               "type": "array",
               "items": {
@@ -7117,6 +7131,65 @@
         }
       }
     },
+    "UiMemoryExperience": {
+      "description": "The outcome of one experience extraction. Counts only; `reason` is a stable skip class, never entry text or provider output.",
+      "type": "object",
+      "required": [
+        "accepted",
+        "at",
+        "created",
+        "outcome",
+        "pending",
+        "rejected",
+        "skipped",
+        "updated"
+      ],
+      "properties": {
+        "accepted": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "at": {
+          "type": "string"
+        },
+        "created": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "outcome": {
+          "description": "`extracted` | `skipped`",
+          "type": "string"
+        },
+        "pending": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rejected": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "updated": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "UiMemoryExtraction": {
       "type": "object",
       "required": [
@@ -7199,6 +7272,13 @@
           "enum": [
             "note"
           ]
+        },
+        {
+          "description": "Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog.",
+          "type": "string",
+          "enum": [
+            "experience"
+          ]
         }
       ]
     },
@@ -7223,6 +7303,70 @@
           "minimum": 0.0
         },
         "archived": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_active": {
+          "description": "Active agent experiences, split by the evidence class the runtime derived. An unverified experience is a parked hypothesis; it is never counted as verified.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_archived": {
+          "description": "Experience rows retired by supersede/expiry/forget.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_inbox_failed_retryable": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_inbox_pending": {
+          "description": "The experience lane's durable queue, kept separate from the user-turn inbox so \"no lesson\" and \"not extracted yet\" are distinguishable.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_inbox_processed": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_inbox_processing": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_next_retry_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "experience_pending": {
+          "description": "Experience candidates awaiting a person.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_unverified": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "experience_verified": {
+          "default": 0,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -7260,6 +7404,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "last_experience": {
+          "description": "The most recent settled experience extraction, if any.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMemoryExperience"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "last_extraction": {

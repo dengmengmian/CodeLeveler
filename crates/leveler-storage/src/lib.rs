@@ -13,6 +13,7 @@ mod database;
 mod engine_stores;
 mod event_repo;
 mod event_store;
+mod experience_inbox_repo;
 mod goal_checkpoint_store;
 mod goal_store;
 mod memory_inbox_repo;
@@ -37,6 +38,10 @@ pub use database::{Database, StorageError, peek_repository};
 pub use engine_stores::EngineStores;
 pub use event_repo::{EVENT_SCHEMA_VERSION, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
+pub use experience_inbox_repo::{
+    ExperienceInboxCounts, ExperienceInboxFailure, ExperienceInboxItem, ExperienceInboxProcessed,
+    ExperienceInboxReadyState, ExperienceInboxRepository,
+};
 pub use goal_checkpoint_store::{
     GoalCheckpointRecord, GoalCheckpointStore, MemoryGoalCheckpointStore, NewGoalCheckpoint,
 };

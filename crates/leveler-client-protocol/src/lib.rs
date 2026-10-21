@@ -87,7 +87,7 @@ pub use skills::{
 pub use event::{
     ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RuntimeEvent,
     UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry,
-    UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryKind, UiMemoryStatus,
+    UiMemoryExperience, UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryKind, UiMemoryStatus,
     parse_runtime_event,
 };
 pub use global_tasks::{

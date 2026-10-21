@@ -305,6 +305,8 @@ pub enum ModelCallKind {
     Compaction,
     /// Semantic memory-candidate extraction from the user's own turns.
     MemoryExtraction,
+    /// Evidence-bound agent-experience extraction after a completed task.
+    ExperienceExtraction,
     /// The idle "what would the user type next" prompt suggestion.
     PromptSuggestion,
     /// The one-line recap shown after a successful turn.
@@ -327,6 +329,7 @@ impl ModelCallKind {
             Self::Round => "round",
             Self::Compaction => "compaction",
             Self::MemoryExtraction => "memory_extraction",
+            Self::ExperienceExtraction => "experience_extraction",
             Self::PromptSuggestion => "prompt_suggestion",
             Self::AwaySummary => "away_summary",
             Self::SemanticRecap => "semantic_recap",
@@ -353,6 +356,7 @@ impl ModelCallKind {
             Self::Round | Self::SideQuestion | Self::Advisory => None,
             Self::Compaction => Some(ReasoningEffort::Medium),
             Self::MemoryExtraction
+            | Self::ExperienceExtraction
             | Self::PromptSuggestion
             | Self::AwaySummary
             | Self::SemanticRecap
@@ -443,6 +447,7 @@ mod call_kind_policy_tests {
     fn auxiliary_kinds_never_implicitly_ask_for_max() {
         for kind in [
             ModelCallKind::MemoryExtraction,
+            ModelCallKind::ExperienceExtraction,
             ModelCallKind::PromptSuggestion,
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
@@ -460,6 +465,7 @@ mod call_kind_policy_tests {
     fn mechanical_auxiliary_tasks_ask_for_low() {
         for kind in [
             ModelCallKind::MemoryExtraction,
+            ModelCallKind::ExperienceExtraction,
             ModelCallKind::PromptSuggestion,
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
@@ -497,6 +503,7 @@ mod call_kind_policy_tests {
             ModelCallKind::Round,
             ModelCallKind::Compaction,
             ModelCallKind::MemoryExtraction,
+            ModelCallKind::ExperienceExtraction,
             ModelCallKind::PromptSuggestion,
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
@@ -511,6 +518,9 @@ mod call_kind_policy_tests {
                     ModelCallKind::Compaction => leveler_storage::ModelCallKind::Compaction,
                     ModelCallKind::MemoryExtraction => {
                         leveler_storage::ModelCallKind::MemoryExtraction
+                    }
+                    ModelCallKind::ExperienceExtraction => {
+                        leveler_storage::ModelCallKind::ExperienceExtraction
                     }
                     ModelCallKind::PromptSuggestion => {
                         leveler_storage::ModelCallKind::PromptSuggestion

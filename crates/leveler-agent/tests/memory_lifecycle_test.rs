@@ -334,16 +334,20 @@ async fn a_turn_with_no_memory_reports_a_zero_hit_recall() {
     let executor = executor(&dir, &mem, runtime.clone());
     let mut events = Vec::new();
     run_turn(&executor, "帮我看一下这个组件", &mut events).await;
-    let recalls: Vec<(usize, Vec<String>)> = events
+    let recalls: Vec<(usize, Vec<String>, usize)> = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::MemoryRecalled { count, ids } => Some((*count, ids.clone())),
+            AgentEvent::MemoryRecalled {
+                count,
+                ids,
+                experience,
+            } => Some((*count, ids.clone(), *experience)),
             _ => None,
         })
         .collect();
     assert_eq!(
         recalls,
-        vec![(0, Vec::new())],
+        vec![(0, Vec::new(), 0)],
         "a 0-hit search is a zero-count result, not a recalled memory: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);

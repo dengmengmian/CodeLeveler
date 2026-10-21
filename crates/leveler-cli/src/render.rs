@@ -467,8 +467,13 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::FinalizationPhaseFinished { phase, elapsed_ms } => serde_json::json!({
             "type": "finalization_phase_finished", "phase": phase, "elapsed_ms": elapsed_ms,
         }),
-        AgentEvent::MemoryRecalled { ids, count } => serde_json::json!({
+        AgentEvent::MemoryRecalled {
+            ids,
+            count,
+            experience,
+        } => serde_json::json!({
             "type": "memory_recalled", "count": count, "ids": ids,
+            "experience": experience,
         }),
         AgentEvent::MemoryChanged {
             operation,

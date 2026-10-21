@@ -758,6 +758,28 @@ see the same current value. Memory bodies stay out of the stable system prefix;
 catalog entries are titles for discovery. A disabled project exposes no memory
 surface and admits no extraction.
 
+Agent experience is the same durable memory with an evidence contract, not a
+second store. After a completed task, the runtime reads only its own structured
+facts (commands, exit codes, model steps, mutations, the terminal outcome) and
+builds a bounded evidence pack. Raw tool output never enters the pack. A model
+may propose a lesson, but the runtime derives verification: a `verified`
+experience requires an observed failure and, for a fix or root cause, a later
+success of the same command after the last change. An environment constraint
+may be verified by the failing observation alone. A candidate that cannot meet
+that contract stays unverified and waits for a person; it is never current
+truth. Experience has its
+own durable work queue, admitted with the turn and claimed only after the turn
+is terminal. A staged result is replayed after a crash instead of asking the
+model again.
+
+Experience is never a standing preference, never occupies the per-request
+catalog, and cannot replace a fact of another kind without a person. Recall is
+relevance-based; expiry, supersession, sensitivity and the terminal entry per
+identity filter it. User preferences and the current code still win. A passing
+check proves the behavior changed, not the explanation, so a recalled line
+marks its explanation as a model reading and carries the conditions under
+which the lesson applies.
+
 ---
 
 ## 9. Host Authority: Who Is Allowed to Change the Real World?

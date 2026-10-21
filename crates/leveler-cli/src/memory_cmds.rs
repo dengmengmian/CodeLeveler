@@ -22,6 +22,21 @@ fn safe_title(entry: &MemoryEntry) -> &str {
     }
 }
 
+/// A short marker so a person can tell an evidence-bound lesson from a
+/// user-stated fact in a one-line listing.
+fn experience_suffix(entry: &MemoryEntry) -> String {
+    match entry.experience.as_ref() {
+        None => String::new(),
+        Some(experience) => format!(
+            " [经验·{}]",
+            match experience.verification {
+                leveler_memory::ExperienceVerification::Verified => "已验证",
+                leveler_memory::ExperienceVerification::Unverified => "未验证",
+            }
+        ),
+    }
+}
+
 pub(crate) fn cmd_memory(
     layout: Layout,
     cmd: MemoryCommand,
@@ -36,7 +51,7 @@ pub(crate) fn cmd_memory(
                 println!("  (none)");
             } else {
                 for e in &active {
-                    println!("  [{}] {}", e.id, safe_title(e));
+                    println!("  [{}] {}{}", e.id, safe_title(e), experience_suffix(e));
                     if is_sensitive(e) {
                         println!("         sensitive: content withheld (leveler memory audit)");
                     }
@@ -56,7 +71,12 @@ pub(crate) fn cmd_memory(
                         println!("  [{}] {}", redacted.id, redacted.title);
                         println!("         sensitive: content withheld (leveler memory audit)");
                     } else {
-                        println!("  [{}] {}", c.id, c.title);
+                        let marker = if c.experience.is_some() {
+                            " [经验]"
+                        } else {
+                            ""
+                        };
+                        println!("  [{}] {}{}", c.id, c.title, marker);
                     }
                 }
                 println!("  adopt with: leveler memory accept <id>");
@@ -69,7 +89,7 @@ pub(crate) fn cmd_memory(
                     println!("  (none)");
                 } else {
                     for e in &arch {
-                        println!("  [{}] {}", e.id, e.title);
+                        println!("  [{}] {}{}", e.id, e.title, experience_suffix(e));
                     }
                 }
             }
@@ -99,7 +119,13 @@ pub(crate) fn cmd_memory(
             } else {
                 println!("{}", Line::heading("Search results"));
                 for (e, score) in hits {
-                    println!("  [{:.3}] [{}] {}", score, e.id, e.title);
+                    println!(
+                        "  [{:.3}] [{}] {}{}",
+                        score,
+                        e.id,
+                        e.title,
+                        experience_suffix(&e)
+                    );
                     let snippet: String = e.body.chars().take(120).collect();
                     if !snippet.is_empty() {
                         println!("         {snippet}");
@@ -146,6 +172,25 @@ pub(crate) fn cmd_memory(
                         if !e.tags.is_empty() {
                             println!("  tags: {}", e.tags.join(", "));
                         }
+                        if let Some(experience) = e.experience.as_ref() {
+                            println!(
+                                "  experience: category={} verification={}",
+                                experience.category.as_str(),
+                                match experience.verification {
+                                    leveler_memory::ExperienceVerification::Verified => "verified",
+                                    leveler_memory::ExperienceVerification::Unverified => {
+                                        "unverified"
+                                    }
+                                }
+                            );
+                            println!("  applies_when: {}", experience.applies_when);
+                            if let Some(invalid_if) = experience.invalid_if.as_deref() {
+                                println!("  invalid_if: {invalid_if}");
+                            }
+                            for evidence in &experience.evidence {
+                                println!("  evidence[{}]: {}", evidence.kind, evidence.reference);
+                            }
+                        }
                         println!();
                         println!("{}", e.body);
                     }
@@ -175,11 +220,7 @@ pub(crate) fn cmd_memory(
             Ok(entry) => {
                 println!(
                     "{}",
-                    Line::ok(&format!(
-                        "restored [{}]: {}",
-                        entry.id,
-                        safe_title(&entry)
-                    ))
+                    Line::ok(&format!("restored [{}]: {}", entry.id, safe_title(&entry)))
                 );
                 Ok(std::process::ExitCode::SUCCESS)
             }
@@ -326,9 +367,7 @@ pub(crate) fn cmd_memory(
                 println!("         {}", record.reason);
             }
             println!();
-            println!(
-                "  dry run only: this command does not rewrite user memory."
-            );
+            println!("  dry run only: this command does not rewrite user memory.");
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Scrub { id, apply } => {

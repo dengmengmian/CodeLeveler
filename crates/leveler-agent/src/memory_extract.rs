@@ -547,7 +547,7 @@ fn parse_batch_semantic_candidates(
         .collect()
 }
 
-fn strip_batch_code_fence(text: &str) -> &str {
+pub(crate) fn strip_batch_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
         return trimmed;
@@ -557,7 +557,7 @@ fn strip_batch_code_fence(text: &str) -> &str {
     rest.strip_suffix("```").map(str::trim_end).unwrap_or(rest)
 }
 
-fn extract_batch_json(text: &str) -> Option<&str> {
+pub(crate) fn extract_batch_json(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let start = bytes
         .iter()

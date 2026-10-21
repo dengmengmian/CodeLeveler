@@ -529,6 +529,7 @@ fn source_label(source: CandidateSource) -> &'static str {
         CandidateSource::AgentProposed => "agent_remember_tool",
         CandidateSource::UserRestore => "user_restore",
         CandidateSource::UserAccepted => "user_accepted",
+        CandidateSource::RuntimeObserved => "agent_experience",
     }
 }
 
@@ -554,6 +555,23 @@ pub fn decide(
                 reason: format!("identical to active memory {}", existing.id),
             },
             related: vec![existing.clone()],
+        });
+    }
+
+    // The runtime's own extraction may create a verified experience, but an
+    // unverified one is a hypothesis. It must be parked for consent even when
+    // no entry with this identity exists yet.
+    if candidate.source == CandidateSource::RuntimeObserved
+        && candidate
+            .experience
+            .as_ref()
+            .is_some_and(|experience| !experience.is_verified())
+    {
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::NeedsApproval {
+                reason: "an unverified experience needs a person".to_string(),
+            },
+            related: Vec::new(),
         });
     }
 
@@ -586,16 +604,76 @@ pub fn decide(
             if store.candidate_retries_history(candidate, &existing.id)? {
                 return Ok(MemoryDecision {
                     operation: MemoryOperation::Skip {
-                        reason: format!(
-                            "candidate was already superseded by {}",
-                            existing.id
-                        ),
+                        reason: format!("candidate was already superseded by {}", existing.id),
                     },
                     related,
                 });
             }
             let incoming = candidate.authority.rank();
             let held = existing.authority().rank();
+            let candidate_experience = candidate.experience.as_ref();
+            let existing_experience = existing.experience.as_ref();
+            // A person's explicit accept/restore may change what an entry IS.
+            // Consent is not evidence, so the entry keeps its evidence class,
+            // but the person's decision authorizes replacing the other kind.
+            let user_decision = matches!(
+                candidate.source,
+                CandidateSource::UserAccepted | CandidateSource::UserRestore
+            );
+            // An experience is evidence-bound knowledge, not a replacement for
+            // a fact of another kind. Even stronger evidence does not silently
+            // turn a user's note/decision/preference into an experience; that
+            // is a person's decision.
+            if candidate_experience.is_some() && existing_experience.is_none() && !user_decision {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::NeedsApproval {
+                        reason:
+                            "an experience may not replace another kind of memory without a person"
+                                .to_string(),
+                    },
+                    related,
+                });
+            }
+            if user_decision && candidate_experience.is_some() && existing_experience.is_none() {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::Supersede {
+                        existing_id: existing.id.clone(),
+                    },
+                    related,
+                });
+            }
+            // The runtime's own extraction may only commit a mechanically
+            // verified experience. An unverified one is a hypothesis; it can
+            // be parked for consent, never made current by this path.
+            if let Some(experience) = candidate_experience
+                && !experience.is_verified()
+                && candidate.source == CandidateSource::RuntimeObserved
+            {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::NeedsApproval {
+                        reason: "an unverified experience needs a person".to_string(),
+                    },
+                    related,
+                });
+            }
+            // A verified experience may correct an earlier experience under
+            // the same identity when it carries new evidence, even at equal
+            // authority. This is what lets a later task retire a stale
+            // explanation instead of accumulating beside it.
+            if candidate_experience.is_some_and(crate::ExperienceRecord::is_verified)
+                && existing_experience.is_some_and(crate::ExperienceRecord::is_verified)
+                && candidate
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|evidence| !evidence.trim().is_empty())
+            {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::Supersede {
+                        existing_id: existing.id.clone(),
+                    },
+                    related,
+                });
+            }
             // Deterministic merge: only when the existing entry's lines are all
             // present in the candidate (a strict superset). Two entries with
             // different values share no such relation and are never joined.
@@ -650,7 +728,10 @@ pub fn decide(
             // approval to run the tool never upgrades it to a user fact.
             if incoming == held
                 && candidate.source == CandidateSource::AgentProposed
-                && existing.provenance.as_ref().map(|value| value.source.as_str())
+                && existing
+                    .provenance
+                    .as_ref()
+                    .map(|value| value.source.as_str())
                     == Some("agent_remember_tool")
             {
                 if candidate
@@ -994,20 +1075,26 @@ impl MemoryStore {
             crate::candidates::CandidateSource::UserRestore,
             tags,
         )?;
-        candidate.authority = MemoryAuthority::ExplicitUser;
+        // Restoring an experience restores its evidence class with it. The
+        // command is the person's choice, but it does not add evidence.
+        candidate.authority = if archived.experience.is_some() {
+            archived.authority()
+        } else {
+            MemoryAuthority::ExplicitUser
+        };
+        candidate.experience = archived.experience.clone();
         candidate.evidence = Some(format!("restored from memory {}", archived.id));
         let outcome = self.apply_candidate_locked(&candidate, &now_rfc3339())?;
         match outcome.operation {
-            AppliedOperation::Created
-            | AppliedOperation::Superseded
-            | AppliedOperation::Merged => outcome.entry.ok_or_else(|| {
-                MemoryError::Invalid("restore produced no current entry".to_string())
-            }),
+            AppliedOperation::Created | AppliedOperation::Superseded | AppliedOperation::Merged => {
+                outcome.entry.ok_or_else(|| {
+                    MemoryError::Invalid("restore produced no current entry".to_string())
+                })
+            }
             AppliedOperation::Skipped => {
                 let current = self.effective_active()?.into_iter().find(|entry| {
-                    key.as_deref().is_some_and(|key| {
-                        durable_entry_key(entry).as_deref() == Some(key)
-                    })
+                    key.as_deref()
+                        .is_some_and(|key| durable_entry_key(entry).as_deref() == Some(key))
                 });
                 current.ok_or_else(|| {
                     MemoryError::Invalid(
@@ -1076,9 +1163,7 @@ impl MemoryStore {
         }
         let winners: HashMap<String, MemoryEntry> = groups
             .into_iter()
-            .filter_map(|(key, group)| {
-                current_truth_of(&group).map(|winner| (key, winner.clone()))
-            })
+            .filter_map(|(key, group)| current_truth_of(&group).map(|winner| (key, winner.clone())))
             .collect();
 
         // Preserve the store's stable title order, but emit only the terminal
@@ -1178,7 +1263,8 @@ mod tests {
     #[test]
     fn semantic_identity_strips_trailing_nouns_until_stable() {
         let base = semantic_key_of("默认");
-        for subject in ["默认模型", "默认模型设置", "默认模型设置选项", "默认设置"] {
+        for subject in ["默认模型", "默认模型设置", "默认模型设置选项", "默认设置"]
+        {
             assert_eq!(semantic_key_of(subject), base, "{subject}");
         }
         assert_eq!(
@@ -1470,8 +1556,7 @@ mod tests {
     #[test]
     fn a_delayed_retry_of_an_old_candidate_cannot_revert_current_truth() {
         let (_dir, store) = store();
-        let old_candidate =
-            parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old_candidate = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
         store.commit_candidate(&old_candidate).unwrap();
         let current = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
         store.commit_candidate(&current).unwrap();
@@ -1623,20 +1708,12 @@ mod tests {
     fn restoring_history_supersedes_current_truth() {
         let (_dir, store) = store();
         let first = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
-        let old_id = store
-            .commit_candidate(&first)
-            .unwrap()
-            .entry
-            .unwrap()
-            .id;
+        let old_id = store.commit_candidate(&first).unwrap().entry.unwrap().id;
         let second = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
         store.commit_candidate(&second).unwrap();
 
         let restored = store.restore(&old_id).unwrap();
-        assert_eq!(
-            restored.provenance.as_ref().unwrap().source,
-            "user_restore"
-        );
+        assert_eq!(restored.provenance.as_ref().unwrap().source, "user_restore");
         assert!(restored.body.contains("Pro"));
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);

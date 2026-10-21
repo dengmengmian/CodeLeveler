@@ -17,6 +17,7 @@ display and archive boundaries.
 - `leveler memory audit` lists historical credential-shaped records without printing their content; `leveler memory scrub [--id <id>] [--apply]` is a dry-run by default and redacts only when `--apply` is explicit
 - A Chat turn can declare an explicitly delegated task with the injected `commit_task` tool. The turn binds to a durable Goal (identity, turn WAL and budget scope) without changing the session's `chat` axis, then uses the existing Goal closeout, verification, cancellation and resume contract. The tool is offered only to top-level authoring Chat turns, never to Plan/read-only surfaces or sub-agents
 - The TUI shows the task badge and goal-mode status while a delegated task runs, keeps a paused task visible, and restores it from the session snapshot on reconnect
+- Agent experience memory: a completed Chat or Goal task that mechanically resolved a failure is extracted into an evidence-bound lesson without the user asking. Verification is derived from the runtime's own facts (a failure and a later success of the same command after the last change); a passing test is never treated as proof of the explanation. Experience is recalled only when relevant, never injected as a standing preference, and cannot replace a user fact without consent. `/memory status` reports verified/unverified/pending experience and the separate experience queue
 
 ### Changed
 
