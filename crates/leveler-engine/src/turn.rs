@@ -514,7 +514,7 @@ fn binder_ownership_error(error: leveler_storage::OwnershipError) -> PortError {
 
 #[async_trait::async_trait]
 impl crate::ports::GoalBinder for TurnGoalBinder {
-    async fn bind(&self, objective: &str) -> Result<GoalId, PortError> {
+    async fn bind(&self, objective: &str, acceptance: &[String]) -> Result<GoalId, PortError> {
         if let Some(bound) = self
             .bound
             .lock()
@@ -551,7 +551,7 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             None => self
                 .stores
                 .goals
-                .open(&self.token, objective, leveler_core::now())
+                .open_scoped(&self.token, objective, acceptance, leveler_core::now())
                 .await
                 .map_err(binder_ownership_error)?,
         };
@@ -594,6 +594,39 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    async fn scope(&self) -> Result<Option<crate::ports::GoalScope>, PortError> {
+        let Some(goal_id) = self.bound() else {
+            return Ok(None);
+        };
+        let Some(record) = self
+            .stores
+            .goals
+            .get(&goal_id)
+            .await
+            .map_err(binder_store_error)?
+        else {
+            return Err(PortError::Persistence(format!(
+                "bound goal {goal_id} has no durable row"
+            )));
+        };
+        Ok(Some(crate::ports::GoalScope {
+            objective: record.objective,
+            acceptance: record.acceptance,
+            amendments: record.amendments,
+        }))
+    }
+
+    async fn append_amendment(&self, amendment: &str) -> Result<(), PortError> {
+        let Some(goal_id) = self.bound() else {
+            return Ok(());
+        };
+        self.stores
+            .goals
+            .append_amendment(&self.token, &goal_id, amendment)
+            .await
+            .map_err(binder_ownership_error)
     }
 
     async fn discard_declaration(&self, declaration: &str) -> Result<(), PortError> {
@@ -644,6 +677,15 @@ impl TurnRunner<'_> {
             TurnStart::Anchored { declaration, .. } | TurnStart::Continue { declaration, .. } => {
                 declaration.clone()
             }
+            _ => None,
+        };
+        // A turn that starts inside a goal already owns that identity; the
+        // binder records it so `scope()` can read the durable contract even
+        // when no mid-turn declaration was needed.
+        let starting_goal = match &start {
+            TurnStart::Anchored { goal_id, .. }
+            | TurnStart::Continue { goal_id, .. }
+            | TurnStart::InternalLineage { goal_id, .. } => goal_id.clone(),
             _ => None,
         };
         let budget_scope = match &start {
@@ -899,7 +941,7 @@ impl TurnRunner<'_> {
                     session_id: self.session_id.clone(),
                     turn_id: turn_id.clone(),
                     turn_budget_scope: budget_scope.clone(),
-                    bound: std::sync::Mutex::new(None),
+                    bound: std::sync::Mutex::new(starting_goal),
                 }),
                 approver: Arc::new(RecordingApprover {
                     inner: self.approver.clone(),

@@ -27,6 +27,7 @@ display and archive boundaries.
 
 ### Fixed
 
+- A Goal can no longer complete on a narrower acceptance than the user's request. `commit_task` refuses an acceptance list that drops an explicitly enumerated deliverable; `update_goal(complete)` requires one accounting entry per requirement and checks named artifacts and commands against the execution record. A user-authored continuation waiver removes a requirement and is persisted with the goal, so resume and compaction cannot resurrect or erase scope
 - Sensitive-material validation covers title, body, tags and provenance evidence on every write path
 - Forget, supersede and expiry redact credential-shaped content before writing an archive; a non-sensitive record is unchanged
 - CLI, TUI, Web projections, notifications and logs no longer print a historical sensitive title or body; clients receive a redacted marker and the `sensitive` flag

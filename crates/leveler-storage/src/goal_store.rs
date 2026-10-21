@@ -75,21 +75,50 @@ pub struct GoalRecord {
     /// Work windows consumed. Durable because the count has to survive the
     /// process that ran them.
     pub windows_run: u32,
+    /// The model's candidate acceptance checks, declared once at commit. This
+    /// is a plan, not the user's scope; the runtime never lets a later turn
+    /// replace it.
+    pub acceptance: Vec<String>,
+    /// Verbatim user turns that adjust the task scope after the objective.
+    /// A waiver here is the only way a requirement leaves the effective set.
+    pub amendments: Vec<String>,
 }
 
 /// Access to durable goals.
 #[async_trait]
 pub trait GoalStore: Send + Sync {
-    /// Open a goal against the task currently owned by `token`.
+    /// Open a goal against the task currently owned by `token`, recording the
+    /// model's candidate acceptance checks in the same insert.
     ///
     /// The ownership assertion and insert are one atomic write. A stale token
     /// creates no goal and returns a typed ownership error.
+    async fn open_scoped(
+        &self,
+        token: &OwnershipToken,
+        objective: &str,
+        acceptance: &[String],
+        now: Timestamp,
+    ) -> Result<GoalId, OwnershipError>;
+
+    /// Open a goal with no model-declared acceptance (a `/goal` turn, or a
+    /// caller that has no candidate plan yet).
     async fn open(
         &self,
         token: &OwnershipToken,
         objective: &str,
         now: Timestamp,
-    ) -> Result<GoalId, OwnershipError>;
+    ) -> Result<GoalId, OwnershipError> {
+        self.open_scoped(token, objective, &[], now).await
+    }
+
+    /// Append one verbatim user amendment to the goal's scope. Idempotent for
+    /// text already recorded. Only a running goal may gain one.
+    async fn append_amendment(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        amendment: &str,
+    ) -> Result<(), OwnershipError>;
 
     /// Note that a work window ran. Idempotency is the caller's business —
     /// this counts calls, because a window that ran twice really is two
@@ -144,16 +173,20 @@ pub trait GoalStore: Send + Sync {
 /// The production SQLite adapter over the `goals` table (migration 0018).
 #[async_trait]
 impl GoalStore for Database {
-    async fn open(
+    async fn open_scoped(
         &self,
         token: &OwnershipToken,
         objective: &str,
+        acceptance: &[String],
         now: Timestamp,
     ) -> Result<GoalId, OwnershipError> {
         let id = GoalId::new(leveler_core::new_uuid_string());
+        let acceptance = serde_json::to_string(acceptance)
+            .map_err(|e| StorageError::InvalidData(format!("unencodable acceptance: {e}")))?;
         let inserted = sqlx::query(
-            "INSERT INTO goals (id, task_id, objective, state, opened_at, windows_run) \
-             SELECT ?1, id, ?5, ?6, ?7, 0 FROM tasks \
+            "INSERT INTO goals \
+             (id, task_id, objective, state, opened_at, windows_run, acceptance, amendments) \
+             SELECT ?1, id, ?5, ?6, ?7, 0, ?8, '[]' FROM tasks \
              WHERE id = ?2 AND owner_runtime_id = ?3 AND owner_epoch = ?4",
         )
         .bind(id.as_str())
@@ -163,6 +196,7 @@ impl GoalStore for Database {
         .bind(objective)
         .bind(GoalState::Running.as_str())
         .bind(now.to_rfc3339())
+        .bind(acceptance)
         .execute(self.pool())
         .await
         .map_err(StorageError::from)?;
@@ -170,6 +204,58 @@ impl GoalStore for Database {
             return Ok(id);
         }
         Err(crate::ownership_store::sqlite_stale_error(self, token).await)
+    }
+
+    async fn append_amendment(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        amendment: &str,
+    ) -> Result<(), OwnershipError> {
+        let amendment = amendment.trim();
+        if amendment.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool().begin().await.map_err(StorageError::from)?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT goals.amendments, goals.state FROM goals \
+             JOIN tasks ON tasks.id = goals.task_id \
+             WHERE goals.id = ?1 AND goals.task_id = ?2 \
+             AND tasks.owner_runtime_id = ?3 AND tasks.owner_epoch = ?4",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        let Some((amendments, state)) = row else {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return goal_write_miss(self, token, goal_id, false).await;
+        };
+        if state != GoalState::Running.as_str() {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return Err(StorageError::InvalidData(format!(
+                "goal {goal_id} is settled; a settled goal cannot gain an amendment"
+            ))
+            .into());
+        }
+        let mut values = parse_list(&amendments, "amendments")?;
+        if !values.iter().any(|value| value == amendment) {
+            values.push(amendment.to_string());
+            let encoded = serde_json::to_string(&values)
+                .map_err(|e| StorageError::InvalidData(format!("unencodable amendment: {e}")))?;
+            sqlx::query("UPDATE goals SET amendments = ?3 WHERE id = ?1 AND task_id = ?2")
+                .bind(goal_id.as_str())
+                .bind(token.task_id.as_str())
+                .bind(encoded)
+                .execute(&mut *tx)
+                .await
+                .map_err(StorageError::from)?;
+        }
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(())
     }
 
     async fn note_window(
@@ -290,37 +376,64 @@ impl GoalStore for Database {
     }
 
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
-        let row: Option<(String, String, String, String, String, Option<String>, i64)> =
-            sqlx::query_as(
-                "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run \
-                 FROM goals WHERE id = ?1",
-            )
-            .bind(goal_id.as_str())
-            .fetch_optional(self.pool())
-            .await?;
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
+             acceptance, amendments FROM goals WHERE id = ?1",
+        )
+        .bind(goal_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
         row.map(record_from_row).transpose()
     }
 
     async fn unfinished(&self) -> Result<Vec<GoalRecord>, StorageError> {
-        let rows: Vec<(String, String, String, String, String, Option<String>, i64)> =
-            sqlx::query_as(
-                "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run \
-                 FROM goals WHERE state = 'running' ORDER BY opened_at DESC",
-            )
-            .fetch_all(self.pool())
-            .await?;
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
+             acceptance, amendments FROM goals WHERE state = 'running' ORDER BY opened_at DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
         rows.into_iter().map(record_from_row).collect()
     }
 
     async fn for_task(&self, task_id: &TaskId) -> Result<Vec<GoalRecord>, StorageError> {
-        let rows: Vec<(String, String, String, String, String, Option<String>, i64)> =
-            sqlx::query_as(
-                "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run \
-                 FROM goals WHERE task_id = ?1 ORDER BY opened_at DESC",
-            )
-            .bind(task_id.as_str())
-            .fetch_all(self.pool())
-            .await?;
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
+             acceptance, amendments FROM goals WHERE task_id = ?1 ORDER BY opened_at DESC",
+        )
+        .bind(task_id.as_str())
+        .fetch_all(self.pool())
+        .await?;
         rows.into_iter().map(record_from_row).collect()
     }
 }
@@ -365,9 +478,20 @@ async fn goal_write_miss(
 }
 
 fn record_from_row(
-    row: (String, String, String, String, String, Option<String>, i64),
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        String,
+        String,
+    ),
 ) -> Result<GoalRecord, StorageError> {
-    let (id, task_id, objective, state, opened_at, settled_at, windows_run) = row;
+    let (id, task_id, objective, state, opened_at, settled_at, windows_run, acceptance, amendments) =
+        row;
     Ok(GoalRecord {
         id: GoalId::new(id),
         task_id: TaskId::new(task_id),
@@ -377,6 +501,16 @@ fn record_from_row(
         opened_at: parse_ts(&opened_at)?,
         settled_at: settled_at.as_deref().map(parse_ts).transpose()?,
         windows_run: windows_run.max(0) as u32,
+        acceptance: parse_list(&acceptance, "acceptance")?,
+        amendments: parse_list(&amendments, "amendments")?,
+    })
+}
+
+/// A malformed scope column is refused, never defaulted: a goal whose
+/// acceptance we cannot read must not silently become a goal with no plan.
+fn parse_list(raw: &str, field: &str) -> Result<Vec<String>, StorageError> {
+    serde_json::from_str(raw).map_err(|error| {
+        StorageError::InvalidData(format!("bad goal {field} JSON `{raw}`: {error}"))
     })
 }
 
@@ -420,10 +554,11 @@ impl MemoryGoalStore {
 
 #[async_trait]
 impl GoalStore for MemoryGoalStore {
-    async fn open(
+    async fn open_scoped(
         &self,
         token: &OwnershipToken,
         objective: &str,
+        acceptance: &[String],
         now: Timestamp,
     ) -> Result<GoalId, OwnershipError> {
         let Some(ownership) = self.ownership.get() else {
@@ -441,9 +576,51 @@ impl GoalStore for MemoryGoalStore {
                 opened_at: now,
                 settled_at: None,
                 windows_run: 0,
+                acceptance: acceptance.to_vec(),
+                amendments: Vec::new(),
             });
         })?;
         Ok(id)
+    }
+
+    async fn append_amendment(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        amendment: &str,
+    ) -> Result<(), OwnershipError> {
+        let amendment = amendment.trim();
+        if amendment.is_empty() {
+            return Ok(());
+        }
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let mut rows = self.rows.lock().unwrap();
+                let goal = rows
+                    .iter_mut()
+                    .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {goal_id} not found for task {}",
+                            token.task_id
+                        ))
+                    })?;
+                if goal.state != GoalState::Running {
+                    return Err(StorageError::InvalidData(format!(
+                        "goal {goal_id} is settled; a settled goal cannot gain an amendment"
+                    )));
+                }
+                if !goal.amendments.iter().any(|value| value == amendment) {
+                    goal.amendments.push(amendment.to_string());
+                }
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
     }
 
     async fn note_window(
@@ -747,6 +924,119 @@ mod tests {
             store.unfinished().await.unwrap().len(),
             1,
             "only the live goal owes work"
+        );
+    }
+
+    /// Acceptance and user amendments are part of the durable goal contract.
+    /// A resumed or compacted window must read the same scope the user
+    /// established, and a settled goal may not acquire a new one.
+    async fn assert_goal_scope_contract(store: &dyn GoalStore, token: &OwnershipToken) {
+        let acceptance = vec![
+            "stage-1.txt 存在".to_string(),
+            "stage-2.txt 存在".to_string(),
+        ];
+        let goal = store
+            .open_scoped(
+                token,
+                "complete all three stages",
+                &acceptance,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let record = store.get(&goal).await.unwrap().expect("goal exists");
+        assert_eq!(record.acceptance, acceptance);
+        assert!(record.amendments.is_empty());
+
+        let plain = store
+            .open(token, "a goal with no candidate plan", leveler_core::now())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get(&plain)
+                .await
+                .unwrap()
+                .unwrap()
+                .acceptance
+                .is_empty()
+        );
+
+        store
+            .append_amendment(token, &goal, "stage-2.txt 暂时不做")
+            .await
+            .unwrap();
+        // The same user turn replayed after a crash is one fact, not two.
+        store
+            .append_amendment(token, &goal, "stage-2.txt 暂时不做")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&goal).await.unwrap().unwrap().amendments,
+            vec!["stage-2.txt 暂时不做".to_string()]
+        );
+
+        store
+            .settle(token, &goal, leveler_core::now())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .append_amendment(token, &goal, "after settle")
+                .await
+                .is_err(),
+            "a settled goal cannot gain scope"
+        );
+        assert_eq!(
+            store.get(&goal).await.unwrap().unwrap().amendments,
+            vec!["stage-2.txt 暂时不做".to_string()],
+            "the refused amendment is not recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_store_persists_goal_scope() {
+        let state = std::sync::Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("t1");
+        state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(state.clone());
+        let token = ownership
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
+            .await
+            .unwrap();
+        let store = MemoryGoalStore::new().with_ownership(state);
+        assert_goal_scope_contract(&store, &token).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_persists_goal_scope() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (_, token) = seeded_task(&db).await;
+        assert_goal_scope_contract(&db, &token).await;
+    }
+
+    #[tokio::test]
+    async fn an_amendment_cannot_cross_goal_ownership() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (_, first) = seeded_task(&db).await;
+        let (_, second) = seeded_task(&db).await;
+        let goal = db
+            .open(&first, "first task", leveler_core::now())
+            .await
+            .unwrap();
+        assert!(
+            db.append_amendment(&second, &goal, "not this task's scope")
+                .await
+                .is_err()
+        );
+        assert!(
+            db.get(&goal).await.unwrap().unwrap().amendments.is_empty(),
+            "the stale token wrote nothing"
         );
     }
 

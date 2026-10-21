@@ -789,8 +789,12 @@ async fn progressive_initial_surface_inventory() {
     // mechanical `verification` evidence field the runtime checks. That is
     // ~100 tokens on a surface already pinned; the alternative — a completion
     // claim the harness cannot check at all — costs more than it saves.
+    // 7300 (was 7000): `update_goal` now also carries the per-requirement
+    // `requirements` accounting that stops a model from completing the user's
+    // enumerated scope with only part of it done. The field is only sent on a
+    // completion claim; the schema text is the fixed part.
     assert!(
-        schema_tokens <= 7000,
+        schema_tokens <= 7300,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());

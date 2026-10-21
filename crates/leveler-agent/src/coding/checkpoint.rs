@@ -677,6 +677,8 @@ mod tests {
             opened_at: leveler_core::now(),
             settled_at: None,
             windows_run: 0,
+            acceptance: Vec::new(),
+            amendments: Vec::new(),
         }
     }
 

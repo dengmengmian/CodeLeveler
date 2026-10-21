@@ -37,6 +37,19 @@ pub trait ExecutionFence: Send + Sync {
     async fn ensure_current(&self) -> Result<(), String>;
 }
 
+/// The durable scope of a Goal turn.
+///
+/// `objective` is the user's request verbatim; `acceptance` is the model's
+/// candidate plan and never the authority over the objective; `amendments`
+/// are later user-authored scope instructions in their own words. The harness
+/// derives requirements from the user-authored fields only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalScope {
+    pub objective: String,
+    pub acceptance: Vec<String>,
+    pub amendments: Vec<String>,
+}
+
 /// Durable goal identity for a turn that was not started as a Goal turn.
 ///
 /// `/goal <task>` can arrive while a Chat turn is already running. The
@@ -52,8 +65,24 @@ pub trait ExecutionFence: Send + Sync {
 #[async_trait::async_trait]
 pub trait GoalBinder: Send + Sync {
     /// Bind `objective` (or the session's durable pending declaration, when
-    /// one exists) to this turn. Idempotent: the same turn binds once.
-    async fn bind(&self, objective: &str) -> Result<leveler_core::GoalId, PortError>;
+    /// one exists) to this turn, recording the model's candidate acceptance
+    /// checks atomically with the goal row. Idempotent: the same turn binds
+    /// once.
+    async fn bind(
+        &self,
+        objective: &str,
+        acceptance: &[String],
+    ) -> Result<leveler_core::GoalId, PortError>;
+
+    /// The durable scope of the goal this turn serves, once it has one.
+    /// Reading it at completion is what makes resume and compaction unable to
+    /// narrow the scope: the authority is the persisted goal row, not the
+    /// live transcript.
+    async fn scope(&self) -> Result<Option<GoalScope>, PortError>;
+
+    /// Append one verbatim user-authored scope instruction to the bound goal.
+    /// No-op before a goal exists; fail-closed if the durable write fails.
+    async fn append_amendment(&self, amendment: &str) -> Result<(), PortError>;
 
     /// Consume a declaration that is only an INSTRUCTION for a goal this turn
     /// already owns (a `/goal <text>` sent while a Goal turn runs). The

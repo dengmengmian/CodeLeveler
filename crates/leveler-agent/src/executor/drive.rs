@@ -41,6 +41,9 @@ use crate::injected_tools::{
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
 use crate::nudges::goal_continuation_nudge;
+#[path = "goal_scope.rs"]
+mod goal_scope;
+
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
     multi_agent_steer_hint, new_delegated_agent_id, scopes_overlap, settlement_notice,
@@ -1494,7 +1497,7 @@ impl AgentHarness for Drive<'_> {
                 if self.executor.starts_in_goal_mode() || binder.bound().is_some() {
                     binder.discard_declaration(&declaration).await?;
                 } else {
-                    binder.bind(&declaration).await?;
+                    binder.bind(&declaration, &[]).await?;
                 }
             }
             let tools = self.executor.request_tool_definitions();
@@ -1529,6 +1532,12 @@ impl AgentHarness for Drive<'_> {
                 let text = text.trim();
                 if text.is_empty() {
                     continue;
+                }
+                // A user message during an active goal is user authority over
+                // the scope (it may narrow or add a requirement). Keep it with
+                // the goal so a later window cannot forget it.
+                if let Some(binder) = self.executor.goal_binder() {
+                    binder.append_amendment(text).await?;
                 }
                 let message = Message::user_input(text);
                 self.sink.append(std::slice::from_ref(&message)).await?;
@@ -2390,50 +2399,94 @@ impl AgentHarness for Drive<'_> {
                     // The durable objective is the user's own request, not the
                     // model's restatement. A model cannot narrow the task by
                     // declaring a smaller objective; its `acceptance` checks
-                    // are the part it owns.
+                    // are the part it owns — but they must still cover every
+                    // deliverable the user explicitly enumerated.
                     let user_objective = self.objective.text().trim();
                     let goal_objective = if user_objective.is_empty() {
                         objective.clone()
                     } else {
                         user_objective.to_string()
                     };
-                    match self.executor.goal_binder().cloned() {
-                        Some(binder) => match binder.bind(&goal_objective).await {
-                            Ok(goal) => {
-                                // The committed window carries the goal
-                                // contract from the next request on.
-                                self.tools = self.executor.request_tool_definitions();
-                                let checks = acceptance
-                                    .iter()
-                                    .map(|check| format!("- {check}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                (
-                                    true,
-                                    format!(
-                                        "Execution task committed as goal {goal}.\n\
-                                         Objective: {goal_objective}\n\
-                                         Acceptance:\n{checks}\n\
-                                         This turn stays running until the task is resolved. A \
-                                         stage summary does not end it. Continue the work, then \
-                                         call update_goal(status=\"complete\", verification=...) \
-                                         with the checks you actually ran, or \
-                                         update_goal(status=\"blocked\", ...) if the stated \
-                                         objective cannot be met. Do not narrow the objective."
+                    let requirements =
+                        goal_scope::extract(&goal_objective, &self.objective.amendments);
+                    let uncovered = goal_scope::uncovered(&requirements, &acceptance);
+                    if !uncovered.is_empty() {
+                        let detail = format!(
+                            "commit_task was refused: the user's request explicitly names {}, but \
+                             `acceptance` does not cover all of them. Every enumerated \
+                             deliverable needs its own concrete check; do not narrow the user's \
+                             scope to what you plan to do. Add the missing checks and call \
+                             commit_task again.",
+                            uncovered
+                                .iter()
+                                .map(|item| format!("`{item}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        (self.observer)(AgentEvent::GoalIntercepted {
+                            kind: "acceptance_narrowed".to_string(),
+                            detail: detail.clone(),
+                        });
+                        (false, detail)
+                    } else {
+                        match self.executor.goal_binder().cloned() {
+                            Some(binder) => {
+                                match binder.bind(&goal_objective, &acceptance).await {
+                                    Ok(goal) => {
+                                        // The committed window carries the goal
+                                        // contract from the next request on.
+                                        self.tools = self.executor.request_tool_definitions();
+                                        let checks = acceptance
+                                            .iter()
+                                            .map(|check| format!("- {check}"))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        let scope = if requirements.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(
+                                                "User requirements (explicit deliverables):\n{}\n",
+                                                requirements
+                                                    .iter()
+                                                    .map(|requirement| format!(
+                                                        "- {}",
+                                                        requirement.text
+                                                    ))
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n")
+                                            )
+                                        };
+                                        (
+                                            true,
+                                            format!(
+                                                "Execution task committed as goal {goal}.\n\
+                                                 Objective: {goal_objective}\n\
+                                                 {scope}Acceptance:\n{checks}\n\
+                                                 This turn stays running until the task is \
+                                                 resolved. A stage summary does not end it. \
+                                                 Continue the work, then call \
+                                                 update_goal(status=\"complete\", \
+                                                 verification=..., requirements=[...]) with one \
+                                                 entry per explicit user requirement, or \
+                                                 update_goal(status=\"blocked\", ...) if the \
+                                                 stated objective cannot be met. Do not narrow \
+                                                 the objective."
+                                            ),
+                                        )
+                                    }
+                                    Err(error) => (
+                                        false,
+                                        format!("commit_task could not record the task: {error}"),
                                     ),
-                                )
+                                }
                             }
-                            Err(error) => (
+                            None => (
                                 false,
-                                format!("commit_task could not record the task: {error}"),
+                                "commit_task is unavailable here: this execution has no durable \
+                                 task store."
+                                    .to_string(),
                             ),
-                        },
-                        None => (
-                            false,
-                            "commit_task is unavailable here: this execution has no durable \
-                             task store."
-                                .to_string(),
-                        ),
+                        }
                     }
                 } else {
                     (
@@ -2642,6 +2695,87 @@ impl AgentHarness for Drive<'_> {
                                 },
                             });
                             continue;
+                        }
+                    }
+                    // Acceptance scope. The user's explicitly enumerated
+                    // deliverables are the authority; the durable goal row
+                    // (objective plus user-authored amendments) is read HERE,
+                    // so neither a resumed transcript nor a compaction fold
+                    // can shrink the scope. Every requirement must be
+                    // accounted for, and the claims the runtime can check
+                    // mechanically are checked against the execution record.
+                    let scope = match self.executor.goal_binder() {
+                        Some(binder) => binder.scope().await?,
+                        None => None,
+                    };
+                    if let Some(scope) = scope {
+                        let requirements = goal_scope::extract(&scope.objective, &scope.amendments);
+                        if !requirements.is_empty() {
+                            let accounting = match goal_scope::parse_accounting(&call.arguments) {
+                                Ok(accounting) => accounting,
+                                Err(message) => {
+                                    (self.observer)(AgentEvent::GoalIntercepted {
+                                        kind: "invalid_requirements".to_string(),
+                                        detail: message.clone(),
+                                    });
+                                    (self.observer)(AgentEvent::ToolResult {
+                                        exit_code: None,
+                                        stop: None,
+                                        execution_status: None,
+                                        id: call.id.as_str().to_string(),
+                                        name: UPDATE_GOAL_TOOL.to_string(),
+                                        is_error: true,
+                                        preview: preview(&message),
+                                        applied_diff: None,
+                                    });
+                                    results[index] = Some(ContentPart::ToolResult {
+                                        result: ToolResultContent {
+                                            call_id: call.id,
+                                            content: message,
+                                            is_error: true,
+                                        },
+                                    });
+                                    continue;
+                                }
+                            };
+                            let workspace =
+                                self.executor.tool_context.execution.workspace.as_deref();
+                            let artifact = |path: &str| artifact_state(workspace, path);
+                            match goal_scope::decide(&goal_scope::ScopeFacts {
+                                requirements: &requirements,
+                                accounting: accounting.as_deref(),
+                                runs: &self.verification_runs,
+                                mutation_ops: self.ledger.total_mutation_ops,
+                                artifact: &artifact,
+                            }) {
+                                goal_scope::ScopeDecision::Accept { warnings } => {
+                                    self.completion_warnings.extend(warnings);
+                                }
+                                goal_scope::ScopeDecision::Refuse(message) => {
+                                    (self.observer)(AgentEvent::GoalIntercepted {
+                                        kind: "requirements_refused".to_string(),
+                                        detail: message.clone(),
+                                    });
+                                    (self.observer)(AgentEvent::ToolResult {
+                                        exit_code: None,
+                                        stop: None,
+                                        execution_status: None,
+                                        id: call.id.as_str().to_string(),
+                                        name: UPDATE_GOAL_TOOL.to_string(),
+                                        is_error: true,
+                                        preview: preview(&message),
+                                        applied_diff: None,
+                                    });
+                                    results[index] = Some(ContentPart::ToolResult {
+                                        result: ToolResultContent {
+                                            call_id: call.id,
+                                            content: message,
+                                            is_error: true,
+                                        },
+                                    });
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -5108,6 +5242,36 @@ fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<St
         .map(str::trim)
         .filter(|s| !s.is_empty());
     Some(cmd.map_or_else(|| call.name.clone(), str::to_string))
+}
+
+/// Whether a user-named artifact exists in this agent's workspace.
+///
+/// Only workspace-relative paths are inspected. An absolute path, a `..`
+/// escape, a missing workspace, or an unresolvable path is `Unknown`; the
+/// completion gate then records an honest unverified boundary rather than
+/// guessing.
+fn artifact_state(
+    workspace: Option<&leveler_execution::Workspace>,
+    path: &str,
+) -> goal_scope::ArtifactState {
+    use goal_scope::ArtifactState;
+    let path = path.trim().trim_start_matches("./");
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('~')
+        || path.starts_with('\\')
+        || path.split(['/', '\\']).any(|part| part == "..")
+    {
+        return ArtifactState::Unknown;
+    }
+    let Some(workspace) = workspace else {
+        return ArtifactState::Unknown;
+    };
+    match workspace.resolve_for_read(path) {
+        Ok(resolved) if resolved.exists() => ArtifactState::Present,
+        Ok(_) => ArtifactState::Absent,
+        Err(_) => ArtifactState::Unknown,
+    }
 }
 
 /// Epoch + this-drive distinct modified paths (source of truth for residual).

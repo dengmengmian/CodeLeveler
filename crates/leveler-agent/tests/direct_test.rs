@@ -4124,3 +4124,116 @@ async fn a_failed_verification_cannot_be_closed_as_complete() {
     );
     assert_eq!(report.stop_reason, StopReason::Blocked);
 }
+
+/// A `/goal` turn (not a Chat `commit_task`) is bound to the same scope
+/// contract: the durable goal's objective names three deliverables, and a
+/// completion that claims all three while only one exists is refused.
+#[tokio::test]
+async fn a_goal_turn_cannot_complete_part_of_an_enumerated_scope() {
+    let h = harness(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "all stages done",
+                "verification": {"status": "not_applicable", "detail": "fixture"},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "stage-3.txt", "status": "done", "evidence": "created"}
+                ]
+            }),
+        ),
+        tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "stages 2-3 are missing"}),
+        ),
+    ])
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt。".to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push((kind, detail));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Blocked,
+        "the goal must not complete on a third of its named scope"
+    );
+    assert!(
+        intercepted.iter().any(|(kind, detail)| {
+            kind == "requirements_refused" && detail.contains("stage-2.txt")
+        }),
+        "{intercepted:?}"
+    );
+}
+
+/// The same scope, fully delivered: the gate accepts it, so the protection is
+/// not a blanket refusal of multi-deliverable goals.
+#[tokio::test]
+async fn a_goal_turn_completes_when_every_named_deliverable_exists() {
+    let h = harness(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+        ),
+        tool_call(
+            "w2",
+            "write_file",
+            serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+        ),
+        tool_call(
+            "w3",
+            "write_file",
+            serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "all three stages are delivered",
+                "verification": {"status": "not_applicable", "detail": "fixture"},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
+                    {"requirement": "stage-3.txt", "status": "done", "evidence": "created"}
+                ]
+            }),
+        ),
+    ])
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt。".to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
+    assert!(h.dir.path().join("stage-3.txt").exists());
+}
