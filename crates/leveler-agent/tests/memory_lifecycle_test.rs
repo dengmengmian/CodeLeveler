@@ -249,19 +249,27 @@ async fn direct_save_then_later_correction_recalls_only_the_new_truth() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// M8: an unrelated turn over an empty store recalls nothing and emits nothing.
+/// M8: an unrelated turn over an empty store recalls no ids. A zero-hit search
+/// is still reported as a result (count 0), because the status surface must be
+/// able to tell "nothing matched" from "memory was never consulted".
 #[tokio::test]
-async fn a_turn_with_no_memory_emits_no_recall_event() {
+async fn a_turn_with_no_memory_reports_a_zero_hit_recall() {
     let (dir, mem) = workspace("no-recall");
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("ok")]));
     let executor = executor(&dir, &mem, runtime.clone());
     let mut events = Vec::new();
     run_turn(&executor, "帮我看一下这个组件", &mut events).await;
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::MemoryRecalled { .. })),
-        "a 0-hit search is not a recall: {events:?}"
+    let recalls: Vec<(usize, Vec<String>)> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MemoryRecalled { count, ids } => Some((*count, ids.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recalls,
+        vec![(0, Vec::new())],
+        "a 0-hit search is a zero-count result, not a recalled memory: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
