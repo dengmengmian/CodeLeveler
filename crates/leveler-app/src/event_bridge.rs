@@ -2423,6 +2423,7 @@ mod bridge_tests {
             progress: Default::default(),
             objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
             completion_warnings: Vec::new(),
+            bound_goal: None,
         }
     }
 

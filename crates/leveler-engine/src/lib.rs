@@ -32,8 +32,8 @@ pub use event::{
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{DanglingCall, EventLog, FinishedChildFact, SnapshotView};
 pub use ports::{
-    ChildToolEvent, EventBarrier, ExecutionFence, LostChild, LostChildNote, LostChildVoice,
-    ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TranscriptSink,
+    ChildToolEvent, EventBarrier, ExecutionFence, GoalBinder, LostChild, LostChildNote,
+    LostChildVoice, ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TranscriptSink,
 };
 pub use reaper::{
     ReapConflict, ReapOutcome, ReapRefusal, ReapScope, ReapedSession, reap_after_restart,

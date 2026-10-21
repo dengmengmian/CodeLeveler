@@ -44,6 +44,10 @@ pub enum TurnStart {
         message: Message,
         objective: ObjectiveAnchor,
         goal_id: Option<GoalId>,
+        /// The session's durable goal declaration this turn was opened for.
+        /// Consumed atomically with the turn's WAL row, so a crash can never
+        /// leave the declaration to be adopted by an unrelated later turn.
+        declaration: Option<String>,
     },
     /// Continue one exact turn lineage. `root_turn_id` remains stable across
     /// repeated provider failures/model switches.
@@ -52,6 +56,8 @@ pub enum TurnStart {
         objective: ObjectiveAnchor,
         root_turn_id: TurnId,
         goal_id: Option<GoalId>,
+        /// See [`TurnStart::Anchored::declaration`].
+        declaration: Option<String>,
     },
     /// Internal work performed inside an existing lineage/epoch.
     InternalLineage {
@@ -262,6 +268,8 @@ pub struct TurnPorts {
     pub lost_children: Vec<crate::LostChild>,
     pub barrier: Arc<dyn EventBarrier>,
     pub fence: Arc<dyn ExecutionFence>,
+    /// Durable goal identity for a Chat turn upgraded by `/goal`.
+    pub goals: Arc<dyn crate::ports::GoalBinder>,
     /// The turn's approver/clarifier, wrapped so every request and decision
     /// is recorded before it is answered.
     pub approver: Arc<dyn Approver>,
@@ -478,6 +486,127 @@ pub struct TurnRunner<'a> {
     pub lost_child_voice: Option<Arc<dyn crate::LostChildVoice>>,
 }
 
+/// The engine's [`crate::ports::GoalBinder`]: durable identity for a goal
+/// declared inside a running Chat turn.
+struct TurnGoalBinder {
+    stores: EngineStores,
+    token: leveler_core::OwnershipToken,
+    session_id: SessionId,
+    turn_id: TurnId,
+    /// The budget owner this turn started under (its own id for a fresh Chat,
+    /// the lineage root for a resumed one). The goal adopts it on bind.
+    turn_budget_scope: String,
+    bound: std::sync::Mutex<Option<GoalId>>,
+}
+
+fn binder_store_error(error: impl std::fmt::Display) -> PortError {
+    PortError::Persistence(error.to_string())
+}
+
+fn binder_ownership_error(error: leveler_storage::OwnershipError) -> PortError {
+    match error {
+        leveler_storage::OwnershipError::Storage(inner) => {
+            PortError::Persistence(inner.to_string())
+        }
+        other => PortError::StaleOwnership(other.to_string()),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ports::GoalBinder for TurnGoalBinder {
+    async fn bind(&self, objective: &str) -> Result<GoalId, PortError> {
+        if let Some(bound) = self
+            .bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Ok(bound);
+        }
+        // The session's durable declaration wins: it was written atomically
+        // with the Goal axis and may be the only surviving copy of the
+        // objective after a crash.
+        let pending = self
+            .stores
+            .sessions
+            .pending_goal(&self.session_id)
+            .await
+            .map_err(binder_store_error)?;
+        let objective = pending.as_deref().unwrap_or(objective);
+        // Reopen a running goal for this exact objective if one exists —
+        // a crash between `open` and the declaration clear leaves both facts
+        // and must not create a duplicate identity.
+        let existing = self
+            .stores
+            .goals
+            .for_task(&self.token.task_id)
+            .await
+            .map_err(binder_store_error)?
+            .into_iter()
+            .find(|goal| {
+                goal.state == leveler_storage::GoalState::Running && goal.objective == objective
+            });
+        let goal = match existing {
+            Some(goal) => goal.id,
+            None => self
+                .stores
+                .goals
+                .open(&self.token, objective, leveler_core::now())
+                .await
+                .map_err(binder_ownership_error)?,
+        };
+        // The running turn's lineage is what a resume or blocked-retry reads
+        // to return to THIS goal. Bind it BEFORE consuming the declaration: a
+        // crash between the two then leaves the declaration recoverable, and
+        // the next turn reuses the running goal.
+        self.stores
+            .turns
+            .bind_goal(&self.token, &self.turn_id, &goal)
+            .await
+            .map_err(binder_ownership_error)?;
+        // The window's spend moves with the work. Calls this turn made before
+        // the declaration were recorded under the turn's own budget scope;
+        // the goal now owns the turn, so its cap must own them too. This is a
+        // move (no duplicate row), and recovery repeats it idempotently.
+        if self.turn_budget_scope != goal.as_str() {
+            self.stores
+                .model_requests
+                .reassign_budget_scope(&self.session_id, &self.turn_budget_scope, goal.as_str())
+                .await
+                .map_err(binder_store_error)?;
+        }
+        if pending.is_some() {
+            self.stores
+                .sessions
+                .clear_pending_goal(&self.session_id, objective)
+                .await
+                .map_err(binder_store_error)?;
+        }
+        *self
+            .bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(goal.clone());
+        Ok(goal)
+    }
+
+    fn bound(&self) -> Option<GoalId> {
+        self.bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn discard_declaration(&self, declaration: &str) -> Result<(), PortError> {
+        // CAS on the text: a newer declaration written in between stays.
+        self.stores
+            .sessions
+            .clear_pending_goal(&self.session_id, declaration)
+            .await
+            .map_err(binder_store_error)?;
+        Ok(())
+    }
+}
+
 impl TurnRunner<'_> {
     /// The ownership fence for this runner's task, for a harness that runs an
     /// execution outside [`Self::run_turn`] — a closure-boundary child, say.
@@ -511,6 +640,12 @@ impl TurnRunner<'_> {
         F: FnOnce(TurnPorts) -> Fut,
         Fut: std::future::Future<Output = Result<TurnFacts<T>, TurnFailure>>,
     {
+        let declaration = match &start {
+            TurnStart::Anchored { declaration, .. } | TurnStart::Continue { declaration, .. } => {
+                declaration.clone()
+            }
+            _ => None,
+        };
         let budget_scope = match &start {
             TurnStart::Anchored { goal_id, .. } => goal_id.as_ref().map(ToString::to_string),
             TurnStart::Continue {
@@ -540,6 +675,7 @@ impl TurnRunner<'_> {
                     message,
                     objective,
                     goal_id,
+                    ..
                 },
             ) => Some(encode_anchored(Some(message), objective, None, goal_id)?),
             (
@@ -549,6 +685,7 @@ impl TurnRunner<'_> {
                     objective,
                     root_turn_id,
                     goal_id,
+                    ..
                 },
             ) => Some(encode_anchored(
                 message,
@@ -612,17 +749,36 @@ impl TurnRunner<'_> {
                 "reaped zombie running turns before starting a new turn"
             );
         }
-        let turn = self
-            .stores
-            .turns
-            .start_owned(
-                &self.token,
-                &self.session_id,
-                kind.as_str(),
-                payload.as_deref(),
-                leveler_core::now(),
-            )
-            .await?;
+        let turn = match declaration.as_deref() {
+            // The declaration and the turn that binds it are one durable
+            // fact. Splitting them would let a crash leave the text for a
+            // later turn to adopt as its own objective.
+            Some(declaration) => {
+                self.stores
+                    .turns
+                    .start_owned_consuming_declaration(
+                        &self.token,
+                        &self.session_id,
+                        kind.as_str(),
+                        payload.as_deref(),
+                        leveler_core::now(),
+                        declaration,
+                    )
+                    .await?
+            }
+            None => {
+                self.stores
+                    .turns
+                    .start_owned(
+                        &self.token,
+                        &self.session_id,
+                        kind.as_str(),
+                        payload.as_deref(),
+                        leveler_core::now(),
+                    )
+                    .await?
+            }
+        };
         let turn_id = TurnId::new(turn.id.clone());
         let budget_scope = budget_scope.unwrap_or_else(|| turn_id.to_string());
         self.log
@@ -726,7 +882,7 @@ impl TurnRunner<'_> {
                 emitter: events.clone(),
                 sink,
                 model_requests: self.stores.model_requests.clone(),
-                budget_scope,
+                budget_scope: budget_scope.clone(),
                 finished_children,
                 resumed_children,
                 lost_children,
@@ -736,6 +892,14 @@ impl TurnRunner<'_> {
                 fence: Arc::new(OwnershipFence {
                     ownership: self.stores.ownership.clone(),
                     token: self.token.clone(),
+                }),
+                goals: Arc::new(TurnGoalBinder {
+                    stores: self.stores.clone(),
+                    token: self.token.clone(),
+                    session_id: self.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    turn_budget_scope: budget_scope.clone(),
+                    bound: std::sync::Mutex::new(None),
                 }),
                 approver: Arc::new(RecordingApprover {
                     inner: self.approver.clone(),

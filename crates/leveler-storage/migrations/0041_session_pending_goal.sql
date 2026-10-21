@@ -1,0 +1,18 @@
+-- A goal declaration that the runtime has accepted but has not yet bound to a
+-- `goals` row.
+--
+-- `/goal <task>` is two facts for one turn: the session leaves Chat, and the
+-- task text is the objective that turn must drive. Writing them separately
+-- leaves a window where the axis says Goal and the declaration exists only in
+-- the client's memory, so a crash there loses the user's objective while the
+-- session still claims Goal mode. This column is the durable half: it is
+-- written in the SAME transaction as `collaboration`, so the pair can never
+-- disagree.
+--
+-- Consumed by the turn that opens the goal (`GoalStore::open`) and cleared by
+-- a compare-and-swap on the text, which makes recovery idempotent: a crash
+-- between the two leaves the declaration available to the next goal turn.
+-- NULL means no declaration is pending. An explicit axis change (including
+-- `/goal clear`) clears it — a declaration must not outlive the mode it was
+-- made in.
+ALTER TABLE sessions ADD COLUMN pending_goal TEXT;

@@ -256,6 +256,7 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
         progress: Default::default(),
         objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
         completion_warnings: report.completion_warnings,
+        bound_goal: None,
     })
 }
 

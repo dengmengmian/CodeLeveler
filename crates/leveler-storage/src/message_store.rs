@@ -119,6 +119,20 @@ pub trait ModelRequestStore: Send + Sync {
             .filter(|record| record.budget_scope.as_deref() == Some(scope))
             .collect())
     }
+
+    /// Move every attempt this session recorded under `from` to `to`.
+    ///
+    /// A Chat turn that `/goal` upgrades mid-flight spent part of its window
+    /// before the goal existed. That window's whole spend belongs to the goal
+    /// that now owns the turn, so the owner changes rather than the row being
+    /// copied (which would double-bill). Idempotent: a second call finds no
+    /// rows left under `from`.
+    async fn reassign_budget_scope(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, StorageError>;
 }
 
 /// The production SQLite adapters.
@@ -195,6 +209,17 @@ impl ModelRequestStore for Database {
     ) -> Result<Vec<ModelRequestRecord>, StorageError> {
         crate::ModelRequestRepository::new(self)
             .load_for_session(session_id)
+            .await
+    }
+
+    async fn reassign_budget_scope(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, StorageError> {
+        crate::ModelRequestRepository::new(self)
+            .reassign_budget_scope(session_id, from, to)
             .await
     }
 }
@@ -408,6 +433,22 @@ impl ModelRequestStore for MemoryModelRequestStore {
             .filter(|r| r.session_id == *session_id)
             .cloned()
             .collect())
+    }
+
+    async fn reassign_budget_scope(
+        &self,
+        session_id: &SessionId,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, StorageError> {
+        let mut moved = 0;
+        for row in self.rows.lock().unwrap().iter_mut() {
+            if row.session_id == *session_id && row.budget_scope.as_deref() == Some(from) {
+                row.budget_scope = Some(to.to_string());
+                moved += 1;
+            }
+        }
+        Ok(moved)
     }
 }
 

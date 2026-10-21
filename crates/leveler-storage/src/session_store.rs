@@ -55,6 +55,41 @@ pub trait SessionStore: Send + Sync {
         id: &SessionId,
     ) -> Result<Option<(String, bool, String, Option<TaskOutcome>)>, StorageError>;
 
+    /// The durable collaboration axis (`chat` | `plan` | `goal`).
+    ///
+    /// Combined with a turn's bound goal, this decides whether an interrupted
+    /// Chat turn resumes under the Goal profile: the upgrade must still be the
+    /// user's current choice, not one they cleared afterwards.
+    async fn collaboration(&self, id: &SessionId) -> Result<Option<String>, StorageError>;
+
+    /// A `/goal <task>` declaration accepted for this session but not yet
+    /// bound to a `goals` row. Written in the same transaction as the axis.
+    async fn pending_goal(&self, id: &SessionId) -> Result<Option<String>, StorageError>;
+
+    /// Record the objective a Goal turn is about to drive, without touching
+    /// the axis.
+    ///
+    /// Written BEFORE the goal is opened: a crash between goal creation and
+    /// turn start then still has the objective to recover, and the turn that
+    /// finally runs consumes it atomically with its own WAL row.
+    /// Returns whether this call wrote the declaration; `false` means a
+    /// declaration written in between won and must not be overwritten.
+    async fn set_pending_goal_if_absent(
+        &self,
+        id: &SessionId,
+        objective: &str,
+        now: Timestamp,
+    ) -> Result<bool, StorageError>;
+
+    /// Consume the exact declaration that was bound. Compare-and-swap on the
+    /// text, so a newer `/goal` written in between survives. Returns whether
+    /// this call cleared it.
+    async fn clear_pending_goal(
+        &self,
+        id: &SessionId,
+        expected: &str,
+    ) -> Result<bool, StorageError>;
+
     /// Fenced [`Self::update_status`]: guard and update in one statement, so
     /// a stale runtime cannot flip the operational lifecycle.
     async fn update_status_owned(
@@ -117,6 +152,38 @@ impl SessionStore for Database {
         id: &SessionId,
     ) -> Result<Option<(String, bool, String, Option<TaskOutcome>)>, StorageError> {
         SessionRepository::new(self).execution(id).await
+    }
+
+    async fn collaboration(&self, id: &SessionId) -> Result<Option<String>, StorageError> {
+        Ok(SessionRepository::new(self)
+            .get(id)
+            .await?
+            .map(|record| record.collaboration))
+    }
+
+    async fn pending_goal(&self, id: &SessionId) -> Result<Option<String>, StorageError> {
+        SessionRepository::new(self).pending_goal(id).await
+    }
+
+    async fn set_pending_goal_if_absent(
+        &self,
+        id: &SessionId,
+        objective: &str,
+        now: Timestamp,
+    ) -> Result<bool, StorageError> {
+        SessionRepository::new(self)
+            .set_pending_goal_if_absent(id, objective, now)
+            .await
+    }
+
+    async fn clear_pending_goal(
+        &self,
+        id: &SessionId,
+        expected: &str,
+    ) -> Result<bool, StorageError> {
+        SessionRepository::new(self)
+            .clear_pending_goal(id, expected)
+            .await
     }
 
     async fn update_status_owned(
@@ -290,6 +357,38 @@ impl SessionStore for MemorySessionStore {
             .unwrap()
             .get(id.as_str())
             .map(|s| (s.mode.clone(), s.sandbox, s.kind.clone(), s.outcome)))
+    }
+
+    async fn collaboration(&self, _id: &SessionId) -> Result<Option<String>, StorageError> {
+        // The memory port does not track axes; engine tests that need a Goal
+        // session carry the identity on the turn itself.
+        Ok(None)
+    }
+
+    async fn pending_goal(&self, _id: &SessionId) -> Result<Option<String>, StorageError> {
+        // The memory port has no declaration writer: app-level declarations
+        // are SQLite-only until a test needs to seed one.
+        Ok(None)
+    }
+
+    async fn set_pending_goal_if_absent(
+        &self,
+        _id: &SessionId,
+        _objective: &str,
+        _now: Timestamp,
+    ) -> Result<bool, StorageError> {
+        // Same reason as `pending_goal`: this port stores no declaration, and
+        // a write nobody can read back would be a lie. Engine tests use the
+        // SQLite adapter when they need the recovery contract.
+        Ok(false)
+    }
+
+    async fn clear_pending_goal(
+        &self,
+        _id: &SessionId,
+        _expected: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     async fn update_status_owned(

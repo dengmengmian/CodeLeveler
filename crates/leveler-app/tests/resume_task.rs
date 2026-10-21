@@ -528,3 +528,498 @@ async fn continuation_with_attachment_keeps_ordinary_content_validation() {
     assert_eq!(goals[0].objective, "finish the inventory work");
     assert_eq!(goals[0].state, GoalState::Running);
 }
+
+/// A model round that declares the goal blocked: the runtime terminal, not a
+/// completed answer.
+fn blocked_turn() -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            "c-block",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "missing credentials"}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
+fn completed_turn(id: &str, summary: &str) -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            id,
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": summary}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
+/// `blocked` is a statement about one work window, not the end of the user's
+/// intent. `继续` must retry the SAME goal — original objective intact — not
+/// open a second goal whose objective is literally the word `继续`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continue_after_a_blocked_goal_retries_the_same_record() {
+    let f = fixture(
+        vec![
+            blocked_turn(),
+            completed_turn("c-goal", "unblocked and finished"),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    f.app
+        .run_in_session_bounded(
+            &f.session,
+            &ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            "finish the inventory work",
+            Arc::new(AutoApprove),
+            false,
+            &mut |_| {},
+            CancellationToken::new(),
+            8,
+            None,
+        )
+        .await
+        .expect("a blocked goal is a normal return");
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(goals.len(), 1);
+    let goal_id = goals[0].id.clone();
+    assert_eq!(goals[0].state, GoalState::Settled);
+    drop(db);
+
+    let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: f.session.clone(),
+            content: "继续".to_string(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        1,
+        "`继续` retries the blocked goal; it must not open a second record: {goals:?}"
+    );
+    assert_eq!(goals[0].id, goal_id, "the goal identity is preserved");
+    assert_eq!(
+        goals[0].objective, "finish the inventory work",
+        "the original objective is never replaced by the continuation word"
+    );
+    assert_eq!(goals[0].state, GoalState::Settled);
+
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(
+        turns[1].kind, "user",
+        "the retry enters the goal resume path, not a fresh chat turn"
+    );
+}
+
+/// An explicit `/goal <new task>` after a blocked goal is a NEW intent and
+/// must stay independent: it opens its own record and leaves the old one
+/// exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_new_goal_after_blocked_stays_independent() {
+    let f = fixture(
+        vec![
+            blocked_turn(),
+            completed_turn("c-new", "the new goal is done"),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    f.app
+        .run_in_session_bounded(
+            &f.session,
+            &ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            "finish the inventory work",
+            Arc::new(AutoApprove),
+            false,
+            &mut |_| {},
+            CancellationToken::new(),
+            8,
+            None,
+        )
+        .await
+        .expect("a blocked goal is a normal return");
+
+    let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "/goal 迁移到新的构建系统".to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        2,
+        "an explicit new goal is its own record: {goals:?}"
+    );
+    let old = goals
+        .iter()
+        .find(|goal| goal.objective == "finish the inventory work")
+        .expect("the blocked goal is kept");
+    assert_eq!(old.state, GoalState::Settled);
+    let new = goals
+        .iter()
+        .find(|goal| goal.objective == "迁移到新的构建系统")
+        .expect("the new objective is recorded verbatim");
+    assert_eq!(new.state, GoalState::Settled);
+}
+
+/// A goal's verification facts belong to the GOAL, not to one work window.
+///
+/// Window 1 writes a file and runs the acceptance command, then stops at its
+/// round budget. Window 2 continues the same goal and cites that command. The
+/// gate must accept it: the command really ran in this task, after the last
+/// change. A window-local record would answer "never ran in this task" and
+/// force a pointless re-run — or, worse, let a model that re-runs nothing end
+/// `blocked` on work that already passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verification_facts_survive_the_next_work_window() {
+    let (program, args, script_name, script) = if cfg!(windows) {
+        (
+            "cmd",
+            vec!["/c", "verify.cmd"],
+            "verify.cmd",
+            "exit /b 0\r\n",
+        )
+    } else {
+        ("sh", vec!["verify.sh"], "verify.sh", "exit 0\n")
+    };
+    let cited = format!("{program} {}", args.join(" "));
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "p1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: src/feature.rs\n+pub fn feature() {}\n*** End Patch"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "v1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": program,
+                        "args": args,
+                        "reason": "run the acceptance check"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "feature added and verified",
+                        "verification": {"status": "passed", "detail": cited}
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
+
+    let model = ModelRef::new("mock", "m");
+    let run = |rounds: u32| {
+        let app = f.app.clone();
+        let session = f.session.clone();
+        let model = model.clone();
+        async move {
+            app.run_in_session_bounded(
+                &session,
+                &model,
+                PermissionProfile::Assisted,
+                "finish the inventory work",
+                Arc::new(AutoApprove),
+                false,
+                &mut |_| {},
+                CancellationToken::new(),
+                rounds,
+                None,
+            )
+            .await
+        }
+    };
+
+    let first = run(2).await.expect("the first window stops at its budget");
+    assert!(
+        matches!(
+            first.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "the first window must really be a budget stop: {first:?}"
+    );
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let owed = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].state, GoalState::Running);
+    let goal_id = owed[0].id.clone();
+    drop(db);
+
+    let second = run(8).await.expect("the second window completes the goal");
+    assert_eq!(
+        second.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the cited verification from the previous window must be accepted: {second:?}"
+    );
+    assert!(
+        !second
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("without executable verification")),
+        "a real, fresh-enough pass must not produce an unverified warning: {:?}",
+        second.completion_warnings
+    );
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let goal = stores.goals.get(&goal_id).await.unwrap().unwrap();
+    assert_eq!(goal.state, GoalState::Settled);
+    let rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+    assert!(
+        rows.iter().all(|row| {
+            row.event_type != "goal_intercepted" || !row.payload.contains("verification_refused")
+        }),
+        "the gate must not refuse a command the task actually ran"
+    );
+}
+
+/// A failed acceptance check is a fact about the GOAL, not about one window.
+/// The retry may not forget it: a premature `complete` is refused until the
+/// check actually passes, and the refusal is the same mechanical answer a live
+/// window would give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_verification_survives_into_the_retry() {
+    let (program, args, script_name) = if cfg!(windows) {
+        ("cmd", vec!["/c", "verify.cmd"], "verify.cmd")
+    } else {
+        ("sh", vec!["verify.sh"], "verify.sh")
+    };
+    let cited = format!("{program} {}", args.join(" "));
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "p1",
+                    "apply_patch",
+                    serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: src/feature.rs\n+pub fn feature() {}\n*** End Patch"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "v1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": program,
+                        "args": args,
+                        "reason": "run the acceptance check"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "g-block",
+                    "update_goal",
+                    serde_json::json!({"status": "blocked", "summary": "acceptance fails"}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            // Retry: first tries to close without evidence — the remembered
+            // failure must refuse it.
+            sse(vec![
+                tool_call_frame(
+                    "g-premature",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "treat it as done",
+                        "verification": {"status": "not_applicable", "detail": "looks fine"}
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            // Then re-runs the now-passing check and closes with it cited.
+            sse(vec![
+                tool_call_frame(
+                    "v2",
+                    "run_command",
+                    serde_json::json!({
+                        "program": program,
+                        "args": args,
+                        "reason": "re-run the acceptance check"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "g-done",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "acceptance passes",
+                        "verification": {"status": "passed", "detail": cited}
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    let fail_script = if cfg!(windows) {
+        "exit /b 1\r\n"
+    } else {
+        "exit 1\n"
+    };
+    std::fs::write(f._tmp.path().join(script_name), fail_script).unwrap();
+
+    let model = ModelRef::new("mock", "m");
+    let first = f
+        .app
+        .run_in_session_bounded(
+            &f.session,
+            &model,
+            PermissionProfile::Assisted,
+            "finish the inventory work",
+            Arc::new(AutoApprove),
+            false,
+            &mut |_| {},
+            CancellationToken::new(),
+            8,
+            None,
+        )
+        .await
+        .expect("a blocked goal is a normal return");
+    assert_eq!(first.stop_reason, leveler_agent::StopReason::Blocked);
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(goals.len(), 1);
+    let goal_id = goals[0].id.clone();
+    assert_eq!(goals[0].state, GoalState::Settled);
+    drop(db);
+
+    // The fix lands between windows; the retry must still remember the fail.
+    let pass_script = if cfg!(windows) {
+        "exit /b 0\r\n"
+    } else {
+        "exit 0\n"
+    };
+    std::fs::write(f._tmp.path().join(script_name), pass_script).unwrap();
+
+    let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
+        f.app.clone(),
+        model,
+        PermissionProfile::Assisted,
+        false,
+    ));
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: f.session.clone(),
+            content: "继续".to_string(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(goals.len(), 1, "the retry is the same goal: {goals:?}");
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].state, GoalState::Settled);
+    let terminal = stores
+        .events
+        .load_last_by_type(&f.session, "task_finished", None)
+        .await
+        .unwrap()
+        .expect("the retry wrote a terminal");
+    assert!(
+        terminal.payload.contains("\"stop\":\"completed\"")
+            || terminal.payload.contains("completed"),
+        "the retry ends completed after the check passes: {}",
+        terminal.payload
+    );
+    let rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+    assert!(
+        rows.iter().any(|row| {
+            row.event_type == "goal_intercepted" && row.payload.contains("verification_refused")
+        }),
+        "the remembered failure must refuse the evidence-free completion"
+    );
+}

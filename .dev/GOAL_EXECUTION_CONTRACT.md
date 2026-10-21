@@ -119,13 +119,82 @@ SteerCurrentTurn("/goal X")
 
 不通过“反复追加用户消息”实现持续执行；续跑轮次是既有 closeout 机制，不是新的隐藏循环。
 
-## 6. Compaction 与 Resume
+## 6. 生命周期一致性（2026-10-21 收口）
 
-- 轴：`sessions.collaboration`，进程重启后仍为 `goal`。
-- 目标：`goals.objective` 由首回合打开；恢复时按 lineage 绑定同一个 goal，不按文本猜。
-- 记录：transcript 从 `session_messages` 重放；Compaction 只折叠模型上下文，不改写会话首条用户消息。
-- 验证：`DF-4` 用真实 `/compact` + 中断/重启证明目标文本与 Goal 工具面仍在；`DF-5` 用真实 Esc 中断 + 重启证明绑定同一 `goals` 行、目标只出现一次（另有 host-pinned objective 块）。
-- 运行中 `/goal` 的声明在下一次 round 以普通用户消息持久化；若进程在声明尚未注入时退出，轴已持久化为 Goal，声明本身只在内存中（见剩余风险）。
+### 6.1 轴与声明是一个持久事实
+
+`/goal <任务>` 的两次写（协作轴、目标文本）已合并为一次数据库写入：
+`sessions.collaboration='goal'` 与 `sessions.pending_goal='<任务>'` 在同一个事务里落库
+（`SessionEdit::GoalDeclaration`）。任何显式轴变更（`/goal clear`、`SetProductAxes`）
+在同一个 `UPDATE` 里把 `pending_goal` 置空。
+
+`pending_goal` 由真正绑定目标的回合消费：
+
+| 路径 | 消费者 | 绑定位置 |
+|---|---|---|
+| 空闲 `/goal X` | `open_goal_for_turn` + TurnStart | 以声明为目标打开/复用 goal；`start_owned_consuming_declaration` 在 turn WAL 的**同一事务**里 CAS 清空声明 |
+| 运行中 `/goal X`（Chat 回合） | 引擎的 `GoalBinder::bind` | 打开/复用 goal + 把 goal_id 写进当前 turn 的 WAL payload，再 CAS 清空声明 |
+| 运行中 `/goal X`（已是 Goal 回合） | `GoalBinder::discard_declaration` | 旧目标不变，X 作为本轮指令；持久声明被消费，不会留给后续回合 |
+| 纯消息（会话已在 Goal 轴，无新 `/goal`） | `open_goal_for_turn` | 若没有声明，先把 fallback 目标写成声明（CAS-if-absent），再打开/复用 goal；由 TurnStart 原子消费 |
+
+崩溃语义：
+
+- 声明写入后、任何回合绑定前崩溃：轴 + 声明都在，下一个 Goal 回合（包括用户输入
+  `继续`）以声明文本为目标；模型收到 host-pinned objective 行，而不是把 `继续` 当目标。
+- goal 已打开、turn payload 已绑定后崩溃：`turns.payload.goal_id` 是恢复身份，
+  `resume_lineage` 直接绑定同一 goal。
+- 绑定与清空之间崩溃：声明仍在；下一次打开按 objective 复用同一个 running goal，幂等。
+- goal 已打开、TurnStart 尚未落库：声明在 goal 之前写入，且不会被提前清空，所以下一次 Goal 回合
+  （`继续` 或普通消息）以声明为目标复用同一个 running goal；**不会**出现“goal 已 running、objective 却无人能命名”的永久孤儿。
+- TurnStart 与声明清空是一个事务：要么 turn 行与消费都生效，要么都不生效。
+
+### 6.2 Continue / Resume / Retry Blocked / New Goal
+
+| 输入 | 持久终态 | 行为 |
+|---|---|---|
+| `继续` | `interrupted` / `budget_limited` / 可恢复 `failed` | 沿用既有 resume：同一 goal、原目标 + 修正文本 |
+| `继续` | `blocked` | **Retry**：reopen 同一个 `goals` 行，原 objective 不变；不新建目标 |
+| `继续` | `completed`（声明完成） | 终态；`继续` 不重开 |
+| `继续` | `cancelled` | 拒绝，并提示任务已取消 |
+| `/goal Y` | 任意 | 显式新目标：替换 pending 声明，打开独立 goal；旧 goal 行保持不变 |
+| 运行中 `/goal Y` | 当前回合已是 Goal | Y 是当前目标内的指令；原 objective 不被改写 |
+
+### 6.3 验证事实属于 Goal，不属于窗口
+
+`verification_runs` 现在按 goal 的 turn lineage 从持久事件重建
+（`ToolCallStarted` + `ToolCallFinished` + `EvidenceLedgerUpdated`），在 resume 和
+retry 时作为种子注入 Drive。因此：
+
+- 上一窗口跑过、成功、且晚于最后一次文件修改的验收命令，可以在新窗口被引用；
+- 上一窗口失败且之后没有成功的验收命令，仍然阻止 `complete`，包括 `not_applicable`；
+- 作用域是 goal 的 turns，另一个 goal 的命令不能为本 goal 作证。
+
+`DF-11`（真实 DeepSeek）与 `verification_facts_survive_the_next_work_window` /
+`a_failed_verification_survives_into_the_retry` 覆盖这三条。
+
+### 6.4 Resume 的 profile 判定
+
+- 中断回合本身就是 Goal：沿用 Goal profile（原有行为）。
+- 中断回合是 Chat，但该回合已被 `/goal` 绑定（turn payload 有 goal_id）或有待绑定声明，
+  且会话轴仍为 `goal`：以 Goal profile 恢复，并绑定该 goal。
+- 其他 Chat 中断：仍是 Chat resume；普通聊天回归不受影响。
+
+### 6.5 升级窗口的预算归属（2026-10-21 Final）
+
+一次运行中的 Chat → Goal 升级会把**同一执行窗口**的两段花费并到一个预算所有者：
+
+| 事实 | 归属 |
+|---|---|
+| 升级前的 `model_requests` 行（scope = Chat turn/lineage root） | 绑定后迁移到 goal id（`UPDATE ... SET budget_scope`，不复制行） |
+| 升级后的 model 调用、子 Agent 调用、闭环 reviewer | 执行器按 `GoalBinder::bound()` 动态取 goal id |
+| `ProgressLedger` 的 model steps / duration | 绑定当轮把 ledger 换到 goal scope 并持久化一条 `progress_updated` |
+| 恢复窗口 | `reconcile_model_spend` 从 goal scope 的行重建 token/cost；Chat 窗口的 scope 由 resume 幂等迁移 |
+
+新建独立 goal 使用新的 goal id/scope；恢复已有 goal 读取同一 scope。二者不会互相继承 spend。
+预算耗尽仍映射为 `BudgetLimited` + goal 保持 owed，不会写成 `Completed`。
+
+谱系规则：如果 Goal 是在一个**被 resume 过的 Chat 窗口**中声明的，该绑定窗口就是 Goal 谱系的根，
+而不是更早的 Chat 根；后续 Resume 都以它为准（重复 Resume 已覆盖）。
 
 ## 7. 明确不做的事
 
@@ -139,6 +208,14 @@ SteerCurrentTurn("/goal X")
 
 1. **语义验收仍属模型责任。** 运行时能检查“命令跑过且成功”，不能检查“这条命令是否真的覆盖了用户目标”。模型可以引用一条真实通过的无关命令；这是机械检查的上限，已在完成契约中明确。
 2. **子 Agent 的验证不自动计入父 Agent。** 父 Agent 必须自己运行验收命令，或声明 `not_applicable`。这是保守选择，避免父级把子级报告当成自己的执行事实。
-3. **Blocked 后的「继续」是新 Goal。** Blocked 是终态；用户说「继续」会以该续接文本作为新目标。若需要保留旧目标文本，应使用 Resume（中断/暂停），而不是 Blocked。
-4. **运行中 `/goal` 的声明窗口。** 轴先持久化；声明文本在下一轮才落库。若进程恰在此窗口崩溃，轴保留、声明文本丢失，需要用户再描述一次目标。
-5. **验证事实按回合记录。** `verification_runs` 属于当前 Drive；恢复/续接后的新回合不会自动继承上一回合的命令记录。因此恢复后的 `complete` 需要重新运行验收命令，或显式 `not_applicable`。这会产生一次额外验证回合，但不会把未验证状态伪装成通过；把验证事实提升为跨回合的持久账本需要新的耐久真相源，本轮不做。
+3. **验证事实重建是全事件扫描。** 每次 goal 回合/恢复读取该会话的事件日志并按 turn lineage 过滤；对超长会话是 O(events)。正确性优先，未做增量索引。
+4. **Goal 回合内的 `/goal Y` 不改写目标。** 运行中已经绑定 goal 的回合，后续声明只作为指令；要换目标需先 `/goal clear` 再声明（或结束本轮）。这是“阶段总结不得改写用户目标”的另一面。
+5. **声明、goal、turn 仍是三次写入，但顺序保证可恢复。** 声明先于 goal 落库，turn 与声明消费同事务；
+   每个崩溃窗口都留下“声明 + 至多一个 running goal”，下一次回合按声明复用而不是新开。没有跨事务的
+   原子 goal+turn 写入（那需要把 goal 语义塞进 storage 的 turn 事务），但不再存在永久孤立的 running goal。
+6. **折叠后的 resume 可能不重放旧工具结果。** 长 goal 的 resume 使用 goal checkpoint 时，旧 tool result 不在请求里（DF-7 因此改为在持久 transcript 与首窗 wire 上验证脱敏）；需要旧细节时由 checkpoint 的 findings/workspace 摘要承担。
+7. **升级窗口的预算归属已闭合，但历史行不可追溯。** 绑定发生时，`GoalBinder` 把本回合
+   `model_requests.budget_scope` 从 Chat scope 迁移到 goal id（移动，不复制）；执行器此后按
+   `bound()` 动态取 scope，progress ledger 同步换 scope；resume 再次幂等迁移（覆盖绑定后、
+   迁移前崩溃）。升级前的调用因此计入 Goal 的 token/cost/model-step 上限，重复升级、Resume、
+   Retry 不会重置。旧版本已写入的无 scope 历史行不在本次回填范围。

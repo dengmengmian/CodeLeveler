@@ -778,3 +778,318 @@ async fn steering_goal_command_upgrades_the_running_chat_turn() {
         "the command word must never reach the model: {bodies:?}"
     );
 }
+
+/// A slow tool call that holds the turn open long enough to inspect the
+/// declaration window without racing the executor's next round.
+fn long_tool_call(seconds: u32) -> MockResponse {
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd",
+            vec![
+                "/c".to_string(),
+                format!("ping -n {seconds} 127.0.0.1 > nul"),
+            ],
+        )
+    } else {
+        ("sh", vec!["-c".to_string(), format!("sleep {seconds}")])
+    };
+    let arguments = serde_json::json!({
+        "program": program,
+        "args": args,
+        "reason": "hold the turn open across the declaration window"
+    });
+    sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "c-hold",
+            "type": "function",
+            "function": {"name": "run_command", "arguments": arguments.to_string()}
+        }]}}]})
+        .to_string(),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+    ])
+}
+
+/// The declaration is durable BEFORE the running executor can drain it, and
+/// the axis and the text are written as one fact. A crash in this window may
+/// not leave a Goal session whose objective was never persisted.
+#[tokio::test]
+async fn a_busy_goal_declaration_is_durable_with_the_axis() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, _server, app, client) = harness(vec![
+        long_tool_call(3),
+        goal_complete_tool_call(),
+        text("done"),
+    ])
+    .await;
+    let session = client
+        .create_session(request("chat first", CollaborationMode::Chat))
+        .await
+        .unwrap()
+        .session
+        .id;
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "start chat work".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while _server.request_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first model request never reached the provider"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: session.clone(),
+            content: "/goal 持久化的目标".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // The window: the running turn has not drained the declaration yet (its
+    // tool call is still sleeping), but the durable pair must already agree.
+    {
+        let db = app.open_database().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = repo.get(&session).await.unwrap().expect("session row");
+        assert_eq!(
+            record.collaboration, "goal",
+            "the axis is Goal immediately after the declaration is accepted"
+        );
+        assert_eq!(
+            repo.pending_goal(&session).await.unwrap().as_deref(),
+            Some("持久化的目标"),
+            "the declaration text is durable in the same window, not only in memory"
+        );
+    }
+
+    wait_terminal(&mut rx).await;
+
+    // Drained: the declaration became a real goal, and the window is closed.
+    let db = app.open_database().await.unwrap();
+    let repo = SessionRepository::new(&db);
+    assert_eq!(
+        repo.pending_goal(&session).await.unwrap(),
+        None,
+        "a bound declaration is consumed"
+    );
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        1,
+        "the mid-turn upgrade opened one goal: {goals:?}"
+    );
+    assert_eq!(goals[0].objective, "持久化的目标");
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Settled,
+        "the terminal of the upgraded turn settles the goal it bound"
+    );
+}
+
+/// The crash window's recovery: axis Goal + a durable declaration, with no
+/// turn that ever ran. `继续` must continue the DECLARED objective, not adopt
+/// the word `继续` as a new goal.
+#[tokio::test]
+async fn a_pending_declaration_is_recovered_by_continue() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, server, app, client) = harness(vec![goal_complete_tool_call()]).await;
+    let session = client
+        .create_session(request("chat first", CollaborationMode::Chat))
+        .await
+        .unwrap()
+        .session
+        .id;
+
+    // Exactly what `steer_into_goal` leaves behind if the process dies before
+    // the executor's next round: one transaction, axis + objective, no goal.
+    {
+        let db = app.open_database().await.unwrap();
+        SessionRepository::new(&db)
+            .set_goal_declaration(&session, "goal", "恢复原始目标", leveler_core::now())
+            .await
+            .unwrap();
+    }
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: session.clone(),
+            content: "继续".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    let bodies = server.request_bodies().await;
+    assert!(
+        bodies.iter().any(|body| body.contains("恢复原始目标")),
+        "the recovered objective must reach the model: {bodies:?}"
+    );
+
+    let db = app.open_database().await.unwrap();
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        1,
+        "one goal, not one per continuation: {goals:?}"
+    );
+    assert_eq!(goals[0].objective, "恢复原始目标");
+    assert_eq!(
+        SessionRepository::new(&db)
+            .pending_goal(&session)
+            .await
+            .unwrap(),
+        None,
+        "the recovered declaration is consumed by the turn that bound it"
+    );
+}
+
+/// Resume after a mid-turn upgrade: the Chat turn that became a Goal was
+/// interrupted, and `继续` must re-enter THAT goal — not a fresh goal whose
+/// objective is the continuation word, and not a Chat turn that ignores the
+/// goal contract.
+#[tokio::test]
+async fn a_mid_turn_upgrade_resumes_as_its_goal() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, server, app, client) = harness(vec![
+        long_tool_call(1),
+        long_tool_call(5),
+        goal_complete_tool_call(),
+    ])
+    .await;
+    let session = client
+        .create_session(request("chat first", CollaborationMode::Chat))
+        .await
+        .unwrap()
+        .session
+        .id;
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "start chat work".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while server.request_count() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no first request");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: session.clone(),
+            content: "/goal 升级后的目标".to_string(),
+        })
+        .await
+        .unwrap();
+    // The second request is asked AFTER the declaration was bound, so the
+    // goal identity is durable before the interruption.
+    while server.request_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the upgraded round never reached the provider"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    {
+        let db = app.open_database().await.unwrap();
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let task = stores
+            .tasks
+            .task_for_session(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        let goals = stores.goals.for_task(&task).await.unwrap();
+        assert_eq!(
+            goals.len(),
+            1,
+            "the upgrade opened a durable goal: {goals:?}"
+        );
+        assert_eq!(goals[0].objective, "升级后的目标");
+        assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    }
+
+    // Interrupt the running window: the goal stays owed.
+    client
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    // Continue: same goal, goal profile, original objective.
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: session.clone(),
+            content: "继续".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    let db = app.open_database().await.unwrap();
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        1,
+        "the continuation is the same goal: {goals:?}"
+    );
+    assert_eq!(goals[0].objective, "升级后的目标");
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        turns.last().map(|turn| turn.kind.as_str()),
+        Some("user"),
+        "the resumed turn runs the Goal profile, not Chat"
+    );
+    let bodies = server.request_bodies().await;
+    assert!(
+        bodies
+            .iter()
+            .skip(2)
+            .any(|body| body.contains("\"update_goal\"")),
+        "the resumed turn advertises the goal surface: {bodies:?}"
+    );
+}

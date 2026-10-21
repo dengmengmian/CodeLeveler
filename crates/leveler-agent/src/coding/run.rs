@@ -91,18 +91,39 @@ struct ResumeLineage {
     root_turn_id: TurnId,
     turn_ids: Vec<TurnId>,
     goal_id: Option<leveler_core::GoalId>,
+    /// The pending declaration this resume will consume, when it is the exact
+    /// objective of the goal being continued.
+    declaration: Option<String>,
 }
 
 fn continuation_root_is_valid(
     turns: &[leveler_storage::TurnRecord],
     continuation: &leveler_storage::TurnRecord,
     root: &TurnId,
+    continuation_goal: Option<&leveler_core::GoalId>,
 ) -> bool {
     turns.iter().any(|candidate| {
-        candidate.id == root.as_str()
-            && candidate.session_id == continuation.session_id
-            && candidate.ordinal < continuation.ordinal
-            && candidate.kind == continuation.kind
+        if candidate.id != root.as_str()
+            || candidate.session_id != continuation.session_id
+            || candidate.ordinal >= continuation.ordinal
+        {
+            return false;
+        }
+        if candidate.kind == continuation.kind {
+            return true;
+        }
+        // A Chat turn upgraded by `/goal` is the legitimate root of the Goal
+        // windows that continue it. Its payload names the goal, which is what
+        // distinguishes it from an unrelated Chat turn.
+        candidate.kind == "chat"
+            && continuation_goal.is_some()
+            && candidate
+                .payload
+                .as_deref()
+                .and_then(|payload| leveler_engine::decode_turn_continuation(payload).ok())
+                .and_then(|lineage| lineage.goal_id)
+                .as_ref()
+                == continuation_goal
     })
 }
 
@@ -629,6 +650,7 @@ impl CodingRuntime {
                     root_turn_id: TurnId::new(turn.id.clone()),
                     turn_ids: Vec::new(),
                     goal_id: None,
+                    declaration: None,
                 });
                 break;
             };
@@ -637,8 +659,14 @@ impl CodingRuntime {
                 .and_then(|value| value.get("version")?.as_u64());
             if payload_version == Some(2) {
                 let lineage = leveler_engine::decode_turn_continuation(payload)?;
-                if let Some(root) = lineage.root_turn_id.as_ref() {
-                    let valid_root = continuation_root_is_valid(&turns, turn, root);
+                // A Chat turn that was bound by `/goal` names its OLD chat
+                // lineage root, which predates the goal. The goal's root is
+                // the binding turn itself (set below), so that older pointer
+                // is not a goal-lineage claim to validate.
+                let chat_became_goal = turn.kind == "chat" && lineage.goal_id.is_some();
+                if let Some(root) = lineage.root_turn_id.as_ref().filter(|_| !chat_became_goal) {
+                    let valid_root =
+                        continuation_root_is_valid(&turns, turn, root, lineage.goal_id.as_ref());
                     if !valid_root {
                         return Err(EngineError::Corrupt(format!(
                             "turn {} has invalid continuation root {}",
@@ -657,9 +685,10 @@ impl CodingRuntime {
                         if root_version == Some(2) {
                             let root_lineage =
                                 leveler_engine::decode_turn_continuation(root_payload)?;
-                            if root_lineage.root_turn_id.is_some()
-                                || root_lineage.goal_id != lineage.goal_id
-                            {
+                            // The goal id is the identity: a root that names
+                            // this goal is its root, even when the root is an
+                            // adopted continuation of an older chat window.
+                            if root_lineage.goal_id != lineage.goal_id {
                                 return Err(EngineError::Corrupt(format!(
                                     "turn {} names root {} from a different lineage",
                                     turn.id,
@@ -676,11 +705,20 @@ impl CodingRuntime {
                         ResumeTurnKind::Goal
                     },
                     objective: lineage.objective,
-                    root_turn_id: lineage
-                        .root_turn_id
-                        .unwrap_or_else(|| TurnId::new(turn.id.clone())),
+                    // A Chat turn bound by `/goal` is where THIS goal began:
+                    // its chat lineage may be older, but the goal did not
+                    // exist there. Using the binding window as the root keeps
+                    // every later continuation inside the goal's own lineage.
+                    root_turn_id: if turn.kind == "chat" && lineage.goal_id.is_some() {
+                        TurnId::new(turn.id.clone())
+                    } else {
+                        lineage
+                            .root_turn_id
+                            .unwrap_or_else(|| TurnId::new(turn.id.clone()))
+                    },
                     turn_ids: Vec::new(),
                     goal_id: lineage.goal_id,
+                    declaration: None,
                 });
                 break;
             }
@@ -712,6 +750,7 @@ impl CodingRuntime {
                     root_turn_id: TurnId::new(turn.id.clone()),
                     turn_ids: Vec::new(),
                     goal_id: None,
+                    declaration: None,
                 });
                 break;
             }
@@ -758,6 +797,7 @@ impl CodingRuntime {
             root_turn_id: TurnId::new(root.id.clone()),
             turn_ids: vec![TurnId::new(root.id.clone())],
             goal_id,
+            declaration: None,
         })
     }
 
@@ -810,6 +850,121 @@ impl CodingRuntime {
             return Ok(goal.id);
         }
         self.engine.open_goal(token, objective).await
+    }
+
+    /// The goal THIS turn drives.
+    ///
+    /// A session's durable pending declaration — written in the same
+    /// transaction as the Goal axis — outranks the turn's own text. After a
+    /// crash between `steer_into_goal` and the executor's next round it may be
+    /// the only surviving copy of the user's objective, and a later `继续`
+    /// must continue that objective rather than become one itself.
+    async fn open_goal_for_turn(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        fallback_objective: &str,
+    ) -> Result<leveler_core::GoalId, EngineError> {
+        let pending = self.engine.stores.sessions.pending_goal(session_id).await?;
+        let objective = match pending {
+            Some(pending) => pending,
+            None => {
+                // Durable BEFORE the goal row. A Goal turn can start from a
+                // plain message while the session already runs in Goal mode
+                // (no `/goal` command re-declares it); without this, a crash
+                // between opening the goal and starting its turn would leave
+                // a Running goal that no later message can name.
+                //
+                // The write is conditional: a declaration that arrived while
+                // this turn was staged is newer and wins.
+                if self
+                    .engine
+                    .stores
+                    .sessions
+                    .set_pending_goal_if_absent(session_id, fallback_objective, leveler_core::now())
+                    .await?
+                {
+                    fallback_objective.to_string()
+                } else {
+                    self.engine
+                        .stores
+                        .sessions
+                        .pending_goal(session_id)
+                        .await?
+                        .unwrap_or_else(|| fallback_objective.to_string())
+                }
+            }
+        };
+        // The declaration is consumed by the turn start, atomically with its
+        // WAL row — never here. A crash before that start must leave the text
+        // recoverable.
+        self.open_or_reuse_goal(token, &objective).await
+    }
+
+    /// Re-attribute every Chat window that was bound to this goal.
+    ///
+    /// The binder moves the rows at bind time. A crash between binding the
+    /// turn and moving the rows leaves the window's spend under its Chat
+    /// scope, so resume repeats the move. A Chat window's scope is derivable
+    /// from its own WAL payload: its turn id for a fresh window, its chat
+    /// lineage root for a resumed one.
+    async fn adopt_chat_window_budget(
+        &self,
+        session_id: &SessionId,
+        goal_id: &leveler_core::GoalId,
+    ) -> Result<(), EngineError> {
+        for turn in self
+            .engine
+            .stores
+            .turns
+            .list_for_session(session_id)
+            .await?
+        {
+            if turn.kind != "chat" {
+                continue;
+            }
+            let Some(payload) = turn.payload.as_deref() else {
+                continue;
+            };
+            let Ok(decoded) = leveler_engine::decode_turn_continuation(payload) else {
+                continue;
+            };
+            if decoded.goal_id.as_ref() != Some(goal_id) {
+                continue;
+            }
+            let scope = decoded
+                .root_turn_id
+                .unwrap_or_else(|| TurnId::new(turn.id.clone()));
+            self.engine
+                .stores
+                .model_requests
+                .reassign_budget_scope(session_id, scope.as_str(), goal_id.as_str())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The pending declaration this goal turn will consume.
+    ///
+    /// Only the exact objective of the goal being continued qualifies. A
+    /// newer `/goal <other>` written while the previous turn ran is not this
+    /// turn's declaration and must survive for the turn that should own it.
+    async fn turn_goal_declaration(
+        &self,
+        session_id: &SessionId,
+        goal_id: &leveler_core::GoalId,
+    ) -> Result<Option<String>, EngineError> {
+        let Some(pending) = self.engine.stores.sessions.pending_goal(session_id).await? else {
+            return Ok(None);
+        };
+        let objective = self
+            .engine
+            .stores
+            .goals
+            .get(goal_id)
+            .await?
+            .map(|goal| goal.objective);
+        Ok((objective.as_deref() == Some(pending.as_str())).then_some(pending))
     }
 
     /// Rebind a resume to the exact running goal persisted by its lineage.
@@ -1600,7 +1755,10 @@ impl CodingRuntime {
                 },
             )
             .await?;
-        let goal = match self.open_or_reuse_goal(&token, &spec.runtime.goal).await {
+        let goal = match self
+            .open_goal_for_turn(&token, session_id, &spec.runtime.goal)
+            .await
+        {
             Ok(goal) => goal,
             Err(error) => {
                 let result = Err(error);
@@ -1631,10 +1789,39 @@ impl CodingRuntime {
             clarifier: self.clarifier.clone(),
             lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
+        // The goal RECORD is the objective this turn serves. It equals the
+        // turn's text on an ordinary `/goal <task>`; after recovering a lost
+        // declaration it is the recovered text and the user's current message
+        // is only the instruction.
+        let goal_objective = self
+            .engine
+            .stores
+            .goals
+            .get(&goal)
+            .await?
+            .map(|record| record.objective)
+            .unwrap_or_else(|| spec.runtime.goal.clone());
+        let declaration = match self.turn_goal_declaration(session_id, &goal).await {
+            Ok(declaration) => declaration,
+            Err(error) => {
+                let result = Err(error);
+                self.finish_from_result(
+                    &token,
+                    session_id,
+                    &result,
+                    None,
+                    spec.coding.repository.as_deref(),
+                    observer,
+                    &cancellation,
+                )
+                .await?;
+                return result;
+            }
+        };
         log.append(
             None,
             EngineEvent::TaskStarted {
-                goal: spec.runtime.goal.clone(),
+                goal: goal_objective.clone(),
                 model: self.factory.model.to_string(),
                 mode: mode_str(spec.coding.mode).to_string(),
                 sandbox: spec.coding.sandbox,
@@ -1649,12 +1836,29 @@ impl CodingRuntime {
         let terminal_cancellation = cancellation.clone();
         let result = match (develop, spec.runtime.kind) {
             (true, _) => {
-                self.run_develop_loop(&log, &runner, spec, &goal, observer, cancellation)
-                    .await
+                self.run_develop_loop(
+                    &log,
+                    &runner,
+                    spec,
+                    &goal,
+                    declaration,
+                    observer,
+                    cancellation,
+                )
+                .await
             }
             (false, ExecutionKind::Direct) => {
-                self.run_direct(&log, &runner, spec, &goal, content, observer, cancellation)
-                    .await
+                self.run_direct(
+                    &log,
+                    &runner,
+                    spec,
+                    &goal,
+                    content,
+                    declaration,
+                    observer,
+                    cancellation,
+                )
+                .await
             }
             (false, ExecutionKind::Parallel) => Err(EngineError::Config(
                 "the parallel strategy lands in B9".to_string(),
@@ -1758,7 +1962,7 @@ impl CodingRuntime {
         let pre_turn_events: Arc<std::sync::Mutex<Vec<EngineEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&pre_turn_events);
-        let result = async {
+        let concluded = async {
             let recorded = runner
                 .run_turn(
                     TurnKind::Chat,
@@ -1768,6 +1972,9 @@ impl CodingRuntime {
                             content_objective_text(&content),
                         ),
                         goal_id: None,
+                        // A Chat turn consumes no declaration at start; one
+                        // that arrives mid-turn is bound by the executor.
+                        declaration: None,
                     },
                     observer,
                     cancellation.clone(),
@@ -1827,19 +2034,34 @@ impl CodingRuntime {
             for event in std::mem::take(&mut *pre_turn_events.lock().unwrap()) {
                 observer(event);
             }
-            self.conclude_direct(
-                &log,
-                &runner,
-                spec,
-                recorded.turn_id.as_str(),
-                recorded.outcome,
-                self.factory.independent_review,
-                observer,
-                cancellation,
-            )
-            .await
+            // A Chat turn upgraded by `/goal` names the goal it bound; the
+            // terminal must settle that record, not write a goal-less end.
+            // Work the conclusion launches on the harness's own account (the
+            // required reviewer) is billed to that same goal.
+            let bound_goal = recorded.outcome.bound_goal.clone();
+            let review_budget_scope = bound_goal
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| recorded.turn_id.to_string());
+            let concluded = self
+                .conclude_direct(
+                    &log,
+                    &runner,
+                    spec,
+                    &review_budget_scope,
+                    recorded.outcome,
+                    self.factory.independent_review,
+                    observer,
+                    cancellation,
+                )
+                .await;
+            Ok::<_, EngineError>((concluded, bound_goal))
         }
         .await;
+        let (result, bound_goal) = match concluded {
+            Ok(pair) => pair,
+            Err(error) => (Err(error), None),
+        };
         let result = if terminal_cancellation.is_cancelled() {
             Err(EngineError::Cancelled)
         } else {
@@ -1849,7 +2071,7 @@ impl CodingRuntime {
             &token,
             session_id,
             &result,
-            None,
+            bound_goal.as_ref(),
             spec.coding.repository.as_deref(),
             observer,
             &terminal_cancellation,
@@ -1964,6 +2186,103 @@ impl CodingRuntime {
             )));
         }
         let mut lineage = self.resume_lineage(session_id, &spec.runtime.goal).await?;
+        // A Chat turn can legitimately belong to a goal: `/goal <task>` while
+        // the turn runs binds the goal to that turn. That identity — not the
+        // text of `继续` — decides that this resume is a Goal resume. Without
+        // it (or a declaration still waiting to be bound) the turn keeps its
+        // recorded kind, so an ordinary chat continuation stays chat.
+        let lineage_was_chat = matches!(lineage.kind, ResumeTurnKind::Chat);
+        let pending = self.engine.stores.sessions.pending_goal(session_id).await?;
+        let goal_axis = self
+            .engine
+            .stores
+            .sessions
+            .collaboration(session_id)
+            .await?
+            .as_deref()
+            == Some(leveler_lifecycle::CollaborationMode::Goal.as_str());
+        if lineage_was_chat && goal_axis && (lineage.goal_id.is_some() || pending.is_some()) {
+            lineage.kind = ResumeTurnKind::Goal;
+        }
+        let token = self
+            .engine
+            .mark_running(session_id, AgentState::Execute)
+            .await?;
+        if matches!(lineage.kind, ResumeTurnKind::Goal) && lineage.goal_id.is_none() {
+            // Identity first: a single running goal IS the work this turn was
+            // continuing (the mid-turn bind). The durable declaration outranks
+            // that guess when one is pending, because nothing has bound it yet.
+            let bound = if lineage_was_chat && pending.is_none() {
+                match self.unique_legacy_running_goal(session_id).await? {
+                    Some(goal_id) => Ok(goal_id),
+                    None => {
+                        self.open_goal_for_turn(&token, session_id, lineage.objective.text())
+                            .await
+                    }
+                }
+            } else {
+                self.open_goal_for_turn(&token, session_id, lineage.objective.text())
+                    .await
+            };
+            lineage.goal_id = match bound {
+                Ok(goal_id) => Some(goal_id),
+                Err(error) => {
+                    let result = Err(error);
+                    self.finish_from_result(
+                        &token,
+                        session_id,
+                        &result,
+                        None,
+                        spec.coding.repository.as_deref(),
+                        observer,
+                        &cancellation,
+                    )
+                    .await?;
+                    return result;
+                }
+            };
+        }
+        // A Chat lineage's anchor is the chat message, not a goal. When that
+        // turn turns out to own a goal, the goal's own objective is the honest
+        // anchor (and after a crash it is the recovered text).
+        if lineage_was_chat
+            && let Some(goal_id) = lineage.goal_id.as_ref()
+            && let Some(record) = self.engine.stores.goals.get(goal_id).await?
+        {
+            lineage.objective =
+                leveler_lifecycle::ObjectiveAnchor::from_session_goal(record.objective);
+        }
+        // A crash between the goal bind and the request-row reassignment
+        // leaves the upgraded window's spend under the Chat lineage root.
+        // Adopt it BEFORE any budget is reconstructed for this goal: the
+        // resume must count the whole window, not only the calls that
+        // happened to be written after the bind. Idempotent.
+        if let Some(goal_id) = lineage.goal_id.as_ref() {
+            self.adopt_chat_window_budget(session_id, goal_id).await?;
+        }
+        // The declaration this resume continues, if one is still pending. It
+        // is consumed atomically with the resumed turn's WAL row below.
+        if matches!(lineage.kind, ResumeTurnKind::Goal)
+            && let Some(goal_id) = lineage.goal_id.as_ref()
+        {
+            lineage.declaration = match self.turn_goal_declaration(session_id, goal_id).await {
+                Ok(declaration) => declaration,
+                Err(error) => {
+                    let result = Err(error);
+                    self.finish_from_result(
+                        &token,
+                        session_id,
+                        &result,
+                        lineage.goal_id.as_ref(),
+                        spec.coding.repository.as_deref(),
+                        observer,
+                        &cancellation,
+                    )
+                    .await?;
+                    return result;
+                }
+            };
+        }
         if let Some(message) = instruction.as_ref() {
             let image_count = message
                 .content
@@ -1982,32 +2301,6 @@ impl CodingRuntime {
                 amendment.push_str(&format!("[{image_count} image attachment(s)]"));
             }
             lineage.objective.amend(amendment);
-        }
-        let token = self
-            .engine
-            .mark_running(session_id, AgentState::Execute)
-            .await?;
-        if matches!(lineage.kind, ResumeTurnKind::Goal) && lineage.goal_id.is_none() {
-            lineage.goal_id = match self
-                .open_or_reuse_goal(&token, lineage.objective.text())
-                .await
-            {
-                Ok(goal_id) => Some(goal_id),
-                Err(error) => {
-                    let result = Err(error);
-                    self.finish_from_result(
-                        &token,
-                        session_id,
-                        &result,
-                        None,
-                        spec.coding.repository.as_deref(),
-                        observer,
-                        &cancellation,
-                    )
-                    .await?;
-                    return result;
-                }
-            };
         }
         let checkpoint_scope = match (&lineage.kind, lineage.goal_id.as_ref()) {
             (ResumeTurnKind::Goal, Some(goal_id)) => {
@@ -2352,10 +2645,24 @@ impl CodingRuntime {
             objective: lineage.objective.clone(),
             root_turn_id: lineage.root_turn_id.clone(),
             goal_id: lineage.goal_id.clone(),
+            declaration: lineage.declaration.clone(),
         };
         let profile = match lineage.kind {
             ResumeTurnKind::Chat => chat_profile(spec),
             ResumeTurnKind::Goal => goal_profile(spec),
+        };
+        // The goal's commands from earlier windows are part of the task's
+        // verification record; a resumed window must not forget them.
+        let verification_runs = match lineage.goal_id.as_ref() {
+            Some(goal_id) => {
+                crate::coding::turn::load_goal_verification_runs(
+                    &self.engine.stores,
+                    &runner.session_id,
+                    goal_id,
+                )
+                .await?
+            }
+            None => Vec::new(),
         };
         let recorded = runner
             .run_turn(kind, start, observer, cancellation.clone(), |ports| {
@@ -2369,6 +2676,7 @@ impl CodingRuntime {
                         lineage_turn_ids: lineage.turn_ids,
                         root_turn_id: lineage.root_turn_id,
                         goal_id: lineage.goal_id,
+                        verification_runs,
                     },
                     true,
                     runner.session_id.clone(),
@@ -2412,6 +2720,7 @@ impl CodingRuntime {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         goal_id: &leveler_core::GoalId,
+        mut declaration: Option<String>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -2468,6 +2777,9 @@ impl CodingRuntime {
                     // would read the same diff a second time on the same bill.
                     IndependentReviewPolicy::Off,
                     true,
+                    // The declaration belongs to the first Coding window; a
+                    // later stage runs inside the goal it already opened.
+                    declaration.take(),
                     observer,
                     cancellation.clone(),
                 )
@@ -2643,6 +2955,7 @@ impl CodingRuntime {
         spec: &TaskSpec,
         goal_id: &leveler_core::GoalId,
         content: Vec<ContentPart>,
+        declaration: Option<String>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -2654,6 +2967,7 @@ impl CodingRuntime {
             Message::from_parts(Role::User, content, Some(TranscriptOrigin::UserInput)),
             self.factory.independent_review,
             false,
+            declaration,
             observer,
             cancellation,
         )
@@ -2676,6 +2990,7 @@ impl CodingRuntime {
         task: Message,
         review_policy: IndependentReviewPolicy,
         continues_task_budget: bool,
+        goal_declaration: Option<String>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -2690,9 +3005,14 @@ impl CodingRuntime {
                 .map_err(EngineError::Config)?;
         }
         // Multi-turn Goal: inject bounded session history so follow-ups can
-        // resolve deictic references ("刚才那个超时").
-        let objective_text = content_objective_text(&task.content);
-        let prior = self
+        // resolve deictic references ("刚才那个超时"). The objective is the
+        // goal RECORD's: a recovered declaration and the turn's instruction
+        // text can differ, and the record is what the user declared.
+        let objective_text = match self.engine.stores.goals.get(goal_id).await? {
+            Some(record) => record.objective,
+            None => content_objective_text(&task.content),
+        };
+        let mut prior = self
             .bounded_session_history(
                 log,
                 &runner.session_id,
@@ -2704,8 +3024,23 @@ impl CodingRuntime {
                 observer,
             )
             .await?;
+        // The user's message and the goal's objective can differ when a lost
+        // declaration is recovered: the turn is `继续`, the goal is the
+        // objective the crash swallowed. The model must be told that
+        // objective, so it gets the same host-pinned row a fold would use.
+        if objective_text.trim() != content_objective_text(&task.content).trim() {
+            prior.insert(0, leveler_context::objective_pin_message(&objective_text));
+        }
         let prior_epoch_open =
             continues_task_budget || self.prior_epoch_open(&runner.session_id).await?;
+        // A goal that already ran windows keeps their mechanical verification
+        // facts. A brand-new goal has none, and the loader returns empty.
+        let verification_runs = crate::coding::turn::load_goal_verification_runs(
+            &self.engine.stores,
+            &runner.session_id,
+            goal_id,
+        )
+        .await?;
         let recorded = runner
             .run_turn(
                 TurnKind::User,
@@ -2715,6 +3050,7 @@ impl CodingRuntime {
                         objective_text.clone(),
                     ),
                     goal_id: Some(goal_id.clone()),
+                    declaration: goal_declaration,
                 },
                 observer,
                 cancellation.clone(),
@@ -2731,6 +3067,7 @@ impl CodingRuntime {
                             content: task.content,
                             prior,
                             goal_id: goal_id.clone(),
+                            verification_runs,
                         },
                         prior_epoch_open,
                         runner.session_id.clone(),
@@ -3809,32 +4146,65 @@ mod continuation_lineage_tests {
         assert!(continuation_root_is_valid(
             std::slice::from_ref(&root),
             &continuation,
-            &TurnId::new("root")
+            &TurnId::new("root"),
+            None
         ));
 
         let cross_session = turn("root", "session-b", 1, "chat");
         assert!(!continuation_root_is_valid(
             &[cross_session],
             &continuation,
-            &TurnId::new("root")
+            &TurnId::new("root"),
+            None
         ));
         let wrong_kind = turn("root", "session-a", 1, "user");
         assert!(!continuation_root_is_valid(
             &[wrong_kind],
             &continuation,
-            &TurnId::new("root")
+            &TurnId::new("root"),
+            None
         ));
         let future = turn("root", "session-a", 3, "chat");
         assert!(!continuation_root_is_valid(
             &[future],
             &continuation,
-            &TurnId::new("root")
+            &TurnId::new("root"),
+            None
         ));
         let self_root = turn("next", "session-a", 2, "chat");
         assert!(!continuation_root_is_valid(
             &[self_root],
             &continuation,
-            &TurnId::new("next")
+            &TurnId::new("next"),
+            None
+        ));
+
+        // A Chat turn upgraded by `/goal` is a valid Goal root when both
+        // payloads name the same goal.
+        let goal_id = leveler_core::GoalId::new("goal-1");
+        let payload = serde_json::json!({
+            "version": 2,
+            "initiating_message": Message::text(Role::User, "start"),
+            "objective": leveler_lifecycle::ObjectiveAnchor::from_session_goal("task"),
+            "goal_id": goal_id,
+        })
+        .to_string();
+        let mut chat_root = turn("root", "session-a", 1, "chat");
+        chat_root.payload = Some(payload.clone());
+        let mut goal_continuation = turn("next", "session-a", 2, "user");
+        goal_continuation.payload = Some(payload);
+        assert!(continuation_root_is_valid(
+            std::slice::from_ref(&chat_root),
+            &goal_continuation,
+            &TurnId::new("root"),
+            Some(&goal_id)
+        ));
+        let other = leveler_core::GoalId::new("goal-2");
+        assert!(!continuation_root_is_valid(
+            &[chat_root],
+            &goal_continuation,
+            &TurnId::new("root"),
+            Some(&other)
         ));
     }
 

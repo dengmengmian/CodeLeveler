@@ -110,16 +110,19 @@ pub async fn latest_goal_checkpoint_scope(
     let Some((latest_turn, decoded)) = latest else {
         return Ok(None);
     };
-    if latest_turn.kind == "chat" {
-        return Err(EngineError::Corrupt(format!(
-            "chat turn {} cannot name goal {goal_id}",
-            latest_turn.id
-        )));
-    }
-    let root_turn_id = decoded
-        .root_turn_id
-        .unwrap_or_else(|| TurnId::new(latest_turn.id.clone()));
-    let root = turns
+    // A Chat turn bound by `/goal` is a Goal window: the binder recorded the
+    // goal on the running turn, and the pre-upgrade part of that window is
+    // the goal's spend. Its payload names the goal, so it is not the "plain
+    // chat" this resolver must refuse. The goal's lineage starts at the
+    // binding window, not at whatever older chat window it resumed from.
+    let mut root_turn_id = if latest_turn.kind == "chat" {
+        TurnId::new(latest_turn.id.clone())
+    } else {
+        decoded
+            .root_turn_id
+            .unwrap_or_else(|| TurnId::new(latest_turn.id.clone()))
+    };
+    let mut root = turns
         .iter()
         .find(|turn| turn.id == root_turn_id.as_str())
         .ok_or_else(|| {
@@ -127,33 +130,51 @@ pub async fn latest_goal_checkpoint_scope(
                 "goal {goal_id} continuation names missing root {root_turn_id}"
             ))
         })?;
+    // What makes a turn this goal's root is that its payload NAMES the goal.
+    // A root that predates the goal — a plain Chat window, or a legacy turn
+    // with no goal id — means the goal was adopted at `latest_turn` (for
+    // example the resume that consumed a pending declaration). That turn is
+    // the root; the scope must not claim a pre-goal window as its own.
+    let root_goal = root.payload.as_deref().and_then(|payload| {
+        serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| value.get("version")?.as_u64())
+            .filter(|version| *version == 2)
+            .and_then(|_| leveler_engine::decode_turn_continuation(payload).ok())
+            .and_then(|lineage| lineage.goal_id)
+    });
+    if let Some(named) = root_goal.as_ref()
+        && named != goal_id
+    {
+        return Err(EngineError::Corrupt(format!(
+            "turn {root_turn_id} names goal {named}, not {goal_id}"
+        )));
+    }
+    if root_goal.is_none() && root.id != latest_turn.id {
+        root_turn_id = TurnId::new(latest_turn.id.clone());
+        root = latest_turn;
+    }
     if root.ordinal > latest_turn.ordinal {
         return Err(EngineError::Corrupt(format!(
             "goal {goal_id} continuation root {root_turn_id} is newer than turn {}",
             latest_turn.id
         )));
     }
-    if root.kind != "user" {
+    if root.kind != "user" && root.kind != "chat" {
         return Err(EngineError::Corrupt(format!(
             "goal {goal_id} continuation root {root_turn_id} has kind {}",
             root.kind
         )));
     }
-    if let Some(root_payload) = root.payload.as_deref() {
+    if let Some(root_payload) = root.payload.as_deref()
+        && root.kind == "user"
+    {
+        // A v2 user root has already proved the goal identity above. A v1
+        // root is the legacy seam: it must at least decode as a real input.
         let root_version = serde_json::from_str::<serde_json::Value>(root_payload)
             .ok()
             .and_then(|value| value.get("version")?.as_u64());
-        if root_version == Some(2) {
-            let root_decoded = leveler_engine::decode_turn_continuation(root_payload)?;
-            if root_decoded.goal_id.as_ref() != Some(goal_id) || root_decoded.root_turn_id.is_some()
-            {
-                return Err(EngineError::Corrupt(format!(
-                    "turn {root_turn_id} is not the root of goal {goal_id}"
-                )));
-            }
-        } else {
-            // A v2 continuation is the authoritative upgrade seam for a v1
-            // root: it supplies the exact goal identity the old row lacked.
+        if root_version != Some(2) {
             leveler_engine::decode_turn_initiating_message(root_payload)?;
         }
     }
@@ -170,8 +191,10 @@ pub async fn latest_goal_checkpoint_scope(
             continue;
         }
         let turn_lineage = leveler_engine::decode_turn_continuation(payload)?;
+        // Kind is not the discriminator: a Chat turn bound by `/goal` is part
+        // of this goal's lineage exactly like a Goal turn, and its `goal_id`
+        // is what proves it.
         if turn_lineage.goal_id.as_ref() == Some(goal_id)
-            && turn.kind != "chat"
             && (turn.id == root_turn_id.as_str()
                 || turn_lineage.root_turn_id.as_ref() == Some(&root_turn_id))
         {
