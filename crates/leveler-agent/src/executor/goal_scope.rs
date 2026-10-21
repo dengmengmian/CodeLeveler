@@ -1508,6 +1508,33 @@ mod tests {
         }
     }
 
+    /// The exact DF-24 prompt: three numbered deliverables, their contents, a
+    /// named script, and an explicit "do not stop to ask" clause. The runtime
+    /// must owe exactly the three paths and the command — no invented
+    /// requirement from the prose around them.
+    #[test]
+    fn the_df24_recovery_prompt_yields_three_paths_and_one_command() {
+        let text = "完成三个阶段的文件交付：\n\
+                    1. 创建 stage-1.txt，内容为 stage 1。\n\
+                    2. 创建 stage-2.txt，内容为 stage 2。\n\
+                    3. 创建 stage-3.txt，内容为 stage 3。\n\
+                    三个阶段全部完成后，执行 sh ./verify.sh。\n\
+                    只有三个文件全部满足要求，并且验收脚本真实运行成功，才能结束任务。\n\
+                    不需要每完成一个阶段就询问用户，也不需要等待用户再次输入「继续」。";
+        let requirements = extract(text, &[]);
+        let found = texts(&requirements);
+        assert_eq!(found.len(), 4, "{requirements:?}");
+        for expected in ["stage-1.txt", "stage-2.txt", "stage-3.txt"] {
+            assert!(found.contains(&expected), "missing {expected}: {found:?}");
+        }
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.text == "./verify.sh" && requirement.kind == RequirementKind::Command
+            }),
+            "{requirements:?}"
+        );
+    }
+
     #[test]
     fn an_alternative_slash_is_not_a_path() {
         let requirements = extract(

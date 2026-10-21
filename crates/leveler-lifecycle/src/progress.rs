@@ -30,10 +30,10 @@ pub enum TurnPhase {
 /// the absolute round ceiling and budgets remain the hard boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressCaps {
-    /// Consecutive no-progress ticks (all-refused round, or a stalled goal
-    /// drive) before the turn stops. Not a calibrated threshold: both inputs
-    /// are binary, so this only answers "how many repeats of a fully blocked
-    /// round to allow".
+    /// Consecutive no-progress ticks (a round whose calls were all refused or
+    /// rejected by the goal gate, or a stalled goal drive) before the turn
+    /// stops. Not a calibrated threshold: the inputs are binary, so this only
+    /// answers "how many repeats of a fully blocked round to allow".
     pub no_progress_rounds: u32,
 }
 

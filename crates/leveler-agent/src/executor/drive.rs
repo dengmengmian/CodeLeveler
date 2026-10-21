@@ -2125,9 +2125,12 @@ impl AgentHarness for Drive<'_> {
         let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
         // spawn_agent calls deferred to run concurrently after this pass.
         let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
-        // Calls a guard refused before they ran (budgets, allowlist,
-        // permission). A round consisting solely of refusals is no progress —
-        // it feeds the all-refused streak.
+        // Calls that produced no durable effect: refused before they ran
+        // (budgets, allowlist, permission) or rejected by the goal gate
+        // (a resolution the runtime would not accept). A round consisting
+        // solely of these is no progress — it feeds the all-refused streak,
+        // so a model repeating the same refused resolution cannot spin under
+        // an unbounded continuation policy.
         let mut denied_calls_this_round: usize = 0;
         // User cancel observed inside this batch. The batch stops, but the
         // round is still committed (results + spend) before Cancelled
@@ -2605,6 +2608,7 @@ impl AgentHarness for Drive<'_> {
                         // Persisted like every other refusal: a rejected
                         // resolution is a fact resume/UI/eval must be able to
                         // count by reason, not only read from a tool result.
+                        denied_calls_this_round += 1;
                         (self.observer)(AgentEvent::GoalIntercepted {
                             kind: "invalid_status".to_string(),
                             detail: other.unwrap_or("no status").to_string(),
@@ -2639,6 +2643,7 @@ impl AgentHarness for Drive<'_> {
                     let claim = match super::goal_verification::parse_claim(&call.arguments) {
                         Ok(claim) => claim,
                         Err(message) => {
+                            denied_calls_this_round += 1;
                             (self.observer)(AgentEvent::GoalIntercepted {
                                 kind: "invalid_verification".to_string(),
                                 detail: message.clone(),
@@ -2677,6 +2682,7 @@ impl AgentHarness for Drive<'_> {
                             }
                         }
                         super::goal_verification::VerificationDecision::Refuse(message) => {
+                            denied_calls_this_round += 1;
                             (self.observer)(AgentEvent::GoalIntercepted {
                                 kind: "verification_refused".to_string(),
                                 detail: message.clone(),
@@ -2718,6 +2724,7 @@ impl AgentHarness for Drive<'_> {
                             let accounting = match goal_scope::parse_accounting(&call.arguments) {
                                 Ok(accounting) => accounting,
                                 Err(message) => {
+                                    denied_calls_this_round += 1;
                                     (self.observer)(AgentEvent::GoalIntercepted {
                                         kind: "invalid_requirements".to_string(),
                                         detail: message.clone(),
@@ -2756,6 +2763,7 @@ impl AgentHarness for Drive<'_> {
                                     self.completion_warnings.extend(warnings);
                                 }
                                 goal_scope::ScopeDecision::Refuse(message) => {
+                                    denied_calls_this_round += 1;
                                     (self.observer)(AgentEvent::GoalIntercepted {
                                         kind: "requirements_refused".to_string(),
                                         detail: message.clone(),
@@ -4444,7 +4452,7 @@ impl AgentHarness for Drive<'_> {
                         rt,
                         messages,
                         StopReason::Incomplete,
-                        "no-progress streak; all-refused model steps short-circuited",
+                        "no-progress streak; model steps that only repeated refused calls short-circuited",
                         "Stopped: no progress (every attempted action was refused).",
                     )
                     .await?,
