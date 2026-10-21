@@ -3541,6 +3541,25 @@ impl AgentHarness for Drive<'_> {
             // rule) and only advances on success.
             let mut content = content;
             let mut is_error = is_error;
+            // A test command that exits 0 while executing no tests is not
+            // evidence of a passing suite. Record it as a failed verification
+            // — the existing completion contract and a resumed turn already
+            // understand that fact, so no new state is introduced.
+            if self.executor.goal_mode()
+                && !is_error
+                && let Some(label) =
+                    super::goal_verification::command_label(&call.name, &call.arguments)
+                && super::goal_verification::is_verification_command(&label)
+                && super::goal_verification::reports_no_tests(&content)
+            {
+                content.push_str(&format!(
+                    "\n\n[verification] `{label}` exited 0 but executed no tests. \
+                     A skipped or empty suite does not verify the objective; run the \
+                     real tests, or call update_goal(status=\"blocked\") if they cannot \
+                     run."
+                ));
+                is_error = true;
+            }
             if let Some(steps) = plan
                 && !is_error
             {

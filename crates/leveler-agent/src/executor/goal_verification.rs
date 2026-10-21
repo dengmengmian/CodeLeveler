@@ -314,6 +314,56 @@ pub(crate) fn is_verification_command(label: &str) -> bool {
     false
 }
 
+/// Whether a command's output says the test runner executed no tests.
+///
+/// A suite that only skipped, or a runner that found no tests, cannot prove
+/// that the objective's tests pass. This is a mechanical fact about the
+/// output, not a judgment about the project; the markers are deliberately
+/// narrow so a mixed suite that really passed is never mistaken for an empty
+/// one.
+pub(crate) fn reports_no_tests(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    const EMPTY_MARKERS: &[&str] = &[
+        "ran 0 tests",
+        "ran 0 test",
+        "running 0 tests",
+        "test result: ok. 0 passed",
+        "test result: ok. 0 tests",
+        "0 passed, 0 failed",
+        "no tests ran",
+        "no test files",
+        "no tests to run",
+        "no tests found",
+        "no test matches",
+        "0 tests completed",
+    ];
+    if EMPTY_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    // unittest: `Ran 3 tests ... OK (skipped=3)` means every discovered test
+    // was skipped; `Ran 5 tests ... skipped=1` executed four real tests.
+    if let Some(ran) = number_after(&lower, "ran ")
+        && let Some(skipped) = number_after(&lower, "skipped=")
+    {
+        return ran > 0 && ran <= skipped;
+    }
+    // pytest: `3 skipped in 0.01s` with nothing passed, failed or errored.
+    if lower.contains(" skipped in ")
+        && !lower.contains(" passed")
+        && !lower.contains(" failed")
+        && !lower.contains(" error")
+    {
+        return true;
+    }
+    false
+}
+
+fn number_after(text: &str, needle: &str) -> Option<usize> {
+    let rest = &text[text.find(needle)? + needle.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +374,35 @@ mod tests {
             ok,
             model_step: step,
             mutation_ops,
+        }
+    }
+
+    #[test]
+    fn empty_and_all_skipped_test_runs_are_not_evidence() {
+        for output in [
+            "Ran 0 tests in 0.000s",
+            "running 0 tests",
+            "test result: ok. 0 passed; 0 failed; 3 ignored",
+            "Ran 1 test in 0.000s\n\nOK (skipped=1)",
+            "3 skipped in 0.01s",
+            "go: no test files",
+            "no tests ran in 0.01s",
+        ] {
+            assert!(
+                reports_no_tests(output),
+                "must be treated as empty: {output:?}"
+            );
+        }
+        for output in [
+            "Ran 5 tests in 0.12s\n\nOK (skipped=1)",
+            "test result: ok. 5 passed; 0 failed; 1 ignored",
+            "3 passed, 1 skipped in 0.2s",
+            "5 tests completed",
+        ] {
+            assert!(
+                !reports_no_tests(output),
+                "a real mixed run must stay evidence: {output:?}"
+            );
         }
     }
 
