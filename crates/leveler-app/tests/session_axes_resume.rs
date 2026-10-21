@@ -155,8 +155,10 @@ async fn legacy_profiles_do_not_change_resume_collaboration() {
     }
 }
 
+/// A disabled project does not register memory at all, so no profile can
+/// enable it; other capability packs still start unexposed and load on demand.
 #[tokio::test]
-async fn available_tools_start_unexposed_and_memory_config_gates_loading() {
+async fn disabled_memory_is_not_registered_and_other_packs_enable_normally() {
     use leveler_agent::AutoClarify;
     use leveler_agent::capability::CapabilityId;
     use leveler_execution::{AutoApprove, PermissionProfile};
@@ -183,8 +185,8 @@ async fn available_tools_start_unexposed_and_memory_config_gates_loading() {
         .await
         .unwrap();
     assert!(
-        engine.factory.registry.get("memory").is_some(),
-        "availability is independent of permission"
+        engine.factory.registry.get("memory").is_none(),
+        "a disabled project must not register the memory tools"
     );
     assert!(engine.factory.registry.get("find_symbol").is_some());
     let state = engine.factory.capabilities.as_ref().unwrap();
@@ -194,7 +196,8 @@ async fn available_tools_start_unexposed_and_memory_config_gates_loading() {
             .enable(CapabilityId::Memory)
             .await
             .unwrap_err()
-            .contains("not permitted")
+            .contains("unavailable"),
+        "disabled memory is unavailable, not merely unpermitted"
     );
     assert!(state.enable(CapabilityId::CodeIntelligence).await.unwrap());
     assert!(state.permits_tool("find_symbol"));

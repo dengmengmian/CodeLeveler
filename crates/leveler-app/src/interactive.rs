@@ -220,12 +220,18 @@ fn pending_entries(
     Ok(store
         .list_pending()?
         .into_iter()
-        .map(|c| leveler_client_protocol::UiMemoryCandidate {
-            id: c.id,
-            title: c.title,
-            body: c.body,
-            kind: format!("{:?}", c.kind).to_lowercase(),
-            source: format!("{:?}", c.source).to_lowercase(),
+        .map(|mut c| {
+            let sensitive = leveler_memory::is_sensitive_candidate(&c);
+            if sensitive {
+                leveler_memory::redact_candidate(&mut c);
+            }
+            leveler_client_protocol::UiMemoryCandidate {
+                id: c.id,
+                title: c.title,
+                body: c.body,
+                kind: format!("{:?}", c.kind).to_lowercase(),
+                source: c.source.as_str().to_string(),
+            }
         })
         .collect())
 }
@@ -282,9 +288,16 @@ fn proposed_memory_projects_to_truthful_pending_notification() {
 fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::UiMemoryEntry {
     use leveler_client_protocol::UiMemoryKind;
     use leveler_memory::MemoryKind;
+    let sensitive = leveler_memory::is_sensitive(entry);
     leveler_client_protocol::UiMemoryEntry {
         id: entry.id.clone(),
-        title: entry.title.clone(),
+        // A credential-shaped title is the credential. Clients still receive
+        // the `sensitive` flag and can say the entry exists without echoing it.
+        title: if sensitive {
+            leveler_memory::REDACTED_TITLE.to_string()
+        } else {
+            entry.title.clone()
+        },
         kind: match MemoryKind::of(entry) {
             MemoryKind::Preference => Some(UiMemoryKind::Preference),
             MemoryKind::Decision => Some(UiMemoryKind::Decision),
@@ -8423,6 +8436,64 @@ mod memory_listing_tests {
                 receiver.try_recv().is_err(),
                 "failed listing must not emit MemoryList"
             );
+        }
+    }
+
+    #[test]
+    fn a_sensitive_listing_row_never_carries_its_title_or_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+
+        let mut active = leveler_memory::new_entry("Deploy token", "safe body", vec![]);
+        active.body = format!("token={secret}");
+        std::fs::write(
+            directory
+                .path()
+                .join("active")
+                .join(format!("{}.json", active.id)),
+            serde_json::to_vec_pretty(&active).unwrap(),
+        )
+        .unwrap();
+
+        let mut pending = leveler_memory::MemoryCandidate::new(
+            "Pending note",
+            "safe body",
+            leveler_memory::CandidateKind::Free,
+            None,
+            leveler_memory::CandidateSource::AgentProposed,
+            vec![],
+        )
+        .unwrap();
+        pending.body = format!("password=another-{secret}");
+        std::fs::write(
+            directory
+                .path()
+                .join("pending")
+                .join(format!("{}.json", pending.id)),
+            serde_json::to_vec_pretty(&pending).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(store.list_active().unwrap().len(), 1, "fixture active");
+        assert_eq!(store.list_pending().unwrap().len(), 1, "fixture pending");
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        send_memory_list(&events, directory.path(), true, Some("query".into()));
+        match receiver.try_recv().unwrap() {
+            RuntimeEvent::MemoryList {
+                active, pending, ..
+            } => {
+                assert_eq!(active[0].title, leveler_memory::REDACTED_TITLE);
+                assert_eq!(pending[0].title, leveler_memory::REDACTED_TITLE);
+                assert_eq!(pending[0].body, leveler_memory::REDACTED_BODY);
+                let wire = format!("{active:?} {pending:?}");
+                assert!(
+                    !wire.contains(secret),
+                    "listing leaked the credential: {wire}"
+                );
+                assert!(!wire.contains("Deploy token"), "{wire}");
+            }
+            other => panic!("expected memory listing, got {other:?}"),
         }
     }
 

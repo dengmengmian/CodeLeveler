@@ -35,6 +35,16 @@ pub enum CandidateSource {
 }
 
 impl CandidateSource {
+    /// Stable label for user-facing projections.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserExplicit => "user_explicit",
+            Self::SystemPropose => "system_propose",
+            Self::SystemInferred => "system_inferred",
+            Self::AgentProposed => "agent_proposed",
+        }
+    }
+
     /// Whether this is a value only old data carries.
     pub fn is_legacy(self) -> bool {
         matches!(self, Self::UserExplicit | Self::SystemPropose)
@@ -108,7 +118,10 @@ impl MemoryCandidate {
                 "candidate title and body are required".into(),
             ));
         }
-        if looks_like_secret(&title) || looks_like_secret(&body) {
+        if looks_like_secret(&title)
+            || looks_like_secret(&body)
+            || tags.iter().any(|tag| looks_like_secret(tag))
+        {
             return Err(MemoryError::Invalid(
                 "refusing candidate that looks like a secret".into(),
             ));
@@ -136,6 +149,54 @@ impl MemoryCandidate {
             evidence: None,
         })
     }
+}
+
+/// Which durable fields of a candidate carry credential-shaped material.
+pub fn candidate_sensitive_fields(candidate: &MemoryCandidate) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if looks_like_secret(&candidate.title) {
+        fields.push("title");
+    }
+    if looks_like_secret(&candidate.body) {
+        fields.push("body");
+    }
+    if candidate.tags.iter().any(|tag| looks_like_secret(tag)) {
+        fields.push("tags");
+    }
+    if candidate.evidence.as_deref().is_some_and(looks_like_secret) {
+        fields.push("evidence");
+    }
+    fields
+}
+
+/// A pending proposal whose durable fields are safe to show a client.
+pub fn is_sensitive_candidate(candidate: &MemoryCandidate) -> bool {
+    !candidate_sensitive_fields(candidate).is_empty()
+}
+
+/// Redact a pending proposal that carries credential-shaped material.
+///
+/// Unlike an archived entry, a proposal exists ONLY to ask for consent. A
+/// credential anywhere in it means there is nothing safe to approve, so the
+/// identifying text is withheld entirely; the owner can scrub or reject it.
+pub fn redact_candidate(candidate: &mut MemoryCandidate) {
+    if !is_sensitive_candidate(candidate) {
+        return;
+    }
+    candidate.title = crate::REDACTED_TITLE.to_string();
+    candidate.body = crate::REDACTED_BODY.to_string();
+    candidate.tags.clear();
+    candidate.evidence = None;
+}
+
+/// Validate every field that can reach durable storage, not only title/body.
+pub(crate) fn validate_candidate(candidate: &MemoryCandidate) -> Result<(), MemoryError> {
+    if !candidate_sensitive_fields(candidate).is_empty() {
+        return Err(MemoryError::Invalid(
+            "refusing candidate that looks like a secret".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Stable fingerprint used for suppress-after-reject and dedup.

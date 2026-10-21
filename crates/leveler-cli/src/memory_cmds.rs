@@ -4,11 +4,23 @@
 //! require interactive approval (K36). These subcommands are **user-authoritative**
 //! writes — the human is managing memory directly (including pending accept).
 
-use leveler_memory::{MemoryStore, ProposeOutcome, collect_turn_candidates};
+use leveler_memory::{
+    MemoryEntry, MemoryStore, ProposeOutcome, collect_turn_candidates, is_sensitive,
+    is_sensitive_candidate, redact_candidate,
+};
 use leveler_project::Layout;
 
 use crate::cli::MemoryCommand;
 use crate::output::Line;
+
+/// A stored title is safe to print only when the record is not credential-shaped.
+fn safe_title(entry: &MemoryEntry) -> &str {
+    if is_sensitive(entry) {
+        leveler_memory::REDACTED_TITLE
+    } else {
+        &entry.title
+    }
+}
 
 pub(crate) fn cmd_memory(
     layout: Layout,
@@ -24,7 +36,10 @@ pub(crate) fn cmd_memory(
                 println!("  (none)");
             } else {
                 for e in &active {
-                    println!("  [{}] {}", e.id, e.title);
+                    println!("  [{}] {}", e.id, safe_title(e));
+                    if is_sensitive(e) {
+                        println!("         sensitive: content withheld (leveler memory audit)");
+                    }
                 }
             }
             // Pending candidates were listed nowhere, so `memory accept <id>`
@@ -35,7 +50,14 @@ pub(crate) fn cmd_memory(
                 println!();
                 println!("{}", Line::heading("Pending (awaiting your consent)"));
                 for c in &pending {
-                    println!("  [{}] {}", c.id, c.title);
+                    if is_sensitive_candidate(c) {
+                        let mut redacted = c.clone();
+                        redact_candidate(&mut redacted);
+                        println!("  [{}] {}", redacted.id, redacted.title);
+                        println!("         sensitive: content withheld (leveler memory audit)");
+                    } else {
+                        println!("  [{}] {}", c.id, c.title);
+                    }
                 }
                 println!("  adopt with: leveler memory accept <id>");
             }
@@ -63,7 +85,15 @@ pub(crate) fn cmd_memory(
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Search { query, limit } => {
-            let hits = store.search(&query, limit)?;
+            // Search the full active set before filtering, so sensitive hits
+            // cannot occupy the requested window and hide safe matches.
+            let active_count = store.list_active()?.len();
+            let hits = store.search(&query, active_count.max(limit))?;
+            let withheld = hits.iter().filter(|(entry, _)| is_sensitive(entry)).count();
+            let hits: Vec<_> = hits
+                .into_iter()
+                .filter(|(entry, _)| !is_sensitive(entry))
+                .collect();
             if hits.is_empty() {
                 println!("{}", Line::warn("No matches."));
             } else {
@@ -76,19 +106,27 @@ pub(crate) fn cmd_memory(
                     }
                 }
             }
+            if withheld > 0 {
+                println!("  {withheld} sensitive match(es) withheld; run `leveler memory audit`");
+            }
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Show { id } => match store.read_active(&id) {
             Ok(e) => {
+                let sensitive = is_sensitive(&e);
                 println!("{}", Line::heading(&format!("Memory [{}]", e.id)));
-                println!("  title: {}", e.title);
+                println!("  title: {}", safe_title(&e));
                 println!("  created: {}", e.created_at);
                 println!("  updated: {}", e.updated_at);
-                if !e.tags.is_empty() {
-                    println!("  tags: {}", e.tags.join(", "));
+                if sensitive {
+                    println!("  sensitive: content withheld; run `leveler memory audit`");
+                } else {
+                    if !e.tags.is_empty() {
+                        println!("  tags: {}", e.tags.join(", "));
+                    }
+                    println!();
+                    println!("{}", e.body);
                 }
-                println!();
-                println!("{}", e.body);
                 Ok(std::process::ExitCode::SUCCESS)
             }
             Err(leveler_memory::MemoryError::NotFound(_)) => {
@@ -99,7 +137,10 @@ pub(crate) fn cmd_memory(
         },
         MemoryCommand::Forget { id } => {
             let e = store.forget(&id)?;
-            println!("{}", Line::ok(&format!("archived [{}]: {}", e.id, e.title)));
+            println!(
+                "{}",
+                Line::ok(&format!("archived [{}]: {}", e.id, safe_title(&e)))
+            );
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Remember {
@@ -122,13 +163,24 @@ pub(crate) fn cmd_memory(
                 println!("  (none)");
             } else {
                 for c in &pending {
-                    println!(
-                        "  [{}] {}  (key={:?}, source={:?})",
-                        c.id, c.title, c.key, c.source
-                    );
-                    let snippet: String = c.body.chars().take(100).collect();
-                    if !snippet.is_empty() {
-                        println!("         {snippet}");
+                    let sensitive = is_sensitive_candidate(c);
+                    if sensitive {
+                        let mut redacted = c.clone();
+                        redact_candidate(&mut redacted);
+                        println!(
+                            "  [{}] {}  (key={:?}, source={:?})",
+                            redacted.id, redacted.title, redacted.key, redacted.source
+                        );
+                        println!("         sensitive: content withheld (leveler memory audit)");
+                    } else {
+                        println!(
+                            "  [{}] {}  (key={:?}, source={:?})",
+                            c.id, c.title, c.key, c.source
+                        );
+                        let snippet: String = c.body.chars().take(100).collect();
+                        if !snippet.is_empty() {
+                            println!("         {snippet}");
+                        }
                     }
                 }
             }
@@ -138,7 +190,7 @@ pub(crate) fn cmd_memory(
             Ok(saved) => {
                 println!(
                     "{}",
-                    Line::ok(&format!("accepted [{}]: {}", saved.id, saved.title))
+                    Line::ok(&format!("accepted [{}]: {}", saved.id, safe_title(&saved)))
                 );
                 Ok(std::process::ExitCode::SUCCESS)
             }
@@ -165,6 +217,48 @@ pub(crate) fn cmd_memory(
             }
             Err(e) => Err(e.into()),
         },
+        MemoryCommand::Audit => {
+            let findings = store.audit_sensitive()?;
+            println!("{}", Line::heading("Sensitive memory audit"));
+            if findings.is_empty() {
+                println!("  (none)");
+            } else {
+                for finding in &findings {
+                    println!(
+                        "  [{:?}] [{}] fields={}",
+                        finding.location,
+                        finding.id,
+                        finding.fields.join(",")
+                    );
+                }
+                println!();
+                println!(
+                    "  {} record(s) need redaction; run `leveler memory scrub --apply`",
+                    findings.len()
+                );
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        MemoryCommand::Scrub { id, apply } => {
+            let report = store.scrub_sensitive(id.as_deref(), apply)?;
+            if report.findings == 0 {
+                println!("{}", Line::ok("No sensitive memory records found."));
+            } else if apply {
+                println!(
+                    "{}",
+                    Line::ok(&format!("Redacted {} record(s).", report.redacted))
+                );
+            } else {
+                println!(
+                    "{}",
+                    Line::warn(&format!(
+                        "Dry run: {} record(s) would be redacted; pass --apply to write.",
+                        report.findings
+                    ))
+                );
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         MemoryCommand::Propose { text } => {
             // Repository signals are no longer scanned into candidates: a
             // lockfile is read from the working tree when needed, never

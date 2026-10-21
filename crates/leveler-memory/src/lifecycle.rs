@@ -582,6 +582,7 @@ impl MemoryStore {
         // writer using this project root, including writers in other
         // processes. Keeping the file handle alive holds the lock until the
         // outcome has been fully applied.
+        crate::candidates::validate_candidate(candidate)?;
         let _lifecycle_lock = self.acquire_lifecycle_lock()?;
 
         let now = now_rfc3339();
@@ -768,6 +769,9 @@ impl MemoryStore {
             let mut archived = entry.clone();
             archived.status = MemoryStatus::Expired;
             archived.archived_at = Some(now.clone());
+            if crate::is_sensitive(&archived) {
+                crate::redact_entry_for_archive(&mut archived);
+            }
             let json = serde_json::to_string_pretty(&archived)?;
             crate::write_atomically_pub(&self.archive_path(&archived.id), json.as_bytes())?;
             let _ = std::fs::remove_file(self.active_path(&archived.id));

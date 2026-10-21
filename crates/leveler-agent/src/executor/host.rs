@@ -1201,7 +1201,7 @@ impl Executor {
                     body,
                     leveler_memory::CandidateKind::Preference,
                     None,
-                    leveler_memory::CandidateSource::SystemPropose,
+                    leveler_memory::CandidateSource::AgentProposed,
                     tags,
                 )
                 .map_err(|e| e.to_string())?;
@@ -2274,6 +2274,11 @@ mod authorize_tests {
         let pending = store.list_pending().unwrap();
         assert_eq!(pending.len(), 1, "the proposal must survive as a candidate");
         assert!(pending[0].title.contains("pnpm"));
+        assert_eq!(
+            pending[0].source,
+            leveler_memory::CandidateSource::AgentProposed,
+            "the parked fact came from the model, not from the user or a system guess"
+        );
         assert!(
             store.list_active().unwrap().is_empty(),
             "parking must never activate without consent (K36)"

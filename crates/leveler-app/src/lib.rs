@@ -1111,15 +1111,20 @@ impl Application {
         // turn's engine went out of scope, and its KillOnDrop killed every
         // background process (and the next turn's registry no longer knew the
         // task id) — the "服务活不过一个回合" bug.
-        let capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
+        let mut capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
             .with_background_tasks(self.background_tasks.clone())
             .with_artifact_store(artifact_store)
-            .with_memory_root(self.layout.memory_dir())
             .with_browser(self.browser.clone())
             .with_search_provider(resolve_search_provider(
                 self.config.web_search.as_ref(),
                 self.environment.as_ref(),
             ));
+        // The handle follows the same project switch as the pack. A disabled
+        // project has no store to hand a tool even if a caller later asks for
+        // one.
+        if self.memory.enabled() {
+            capabilities = capabilities.with_memory_root(self.layout.memory_dir());
+        }
         let tool_context = match workspace {
             Some(workspace) => {
                 ToolContext::with_environment(workspace, mode, self.environment.clone())
@@ -1244,9 +1249,11 @@ impl Application {
                 .await
                 .map(|profile| profile.capabilities.vision)
                 .unwrap_or(false),
-            // The app always hands the tools a memory root and a workspace to
-            // read skills from.
-            memory: true,
+            // Memory is a project switch, not a default capability: a
+            // disabled project does not register the tools at all, so Full
+            // Access has nothing to expose and no permission mode can
+            // override the user's explicit disable.
+            memory: self.memory.enabled(),
             skills: self.layout.primary_workspace().is_some(),
             // Not "is a browser installed": is the browser this host would
             // SELECT — the call's, then `[browser].default`, then the system
@@ -1413,7 +1420,7 @@ impl Application {
                 capabilities: Some(capabilities),
                 memory_catalog,
                 memory_expose: available_packs.memory,
-                memory_root: Some(self.layout.memory_dir()),
+                memory_root: self.memory.enabled().then(|| self.layout.memory_dir()),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,
                 resource_grants: Arc::new(db.clone()),
@@ -1502,6 +1509,12 @@ impl Application {
     /// turns these into a visible notice; a headless caller ignores them,
     /// which is also why this layer does not send the notice itself.
     pub(crate) fn enqueue_memory_candidates(&self, user_text: &str) -> Vec<(String, String)> {
+        // Automatic candidate extraction is memory admission. A disabled
+        // project does not admit turns, and this interactive shortcut must
+        // not become a second policy owner that bypasses the switch.
+        if !self.memory.enabled() {
+            return Vec::new();
+        }
         let memory_dir = self.layout.memory_dir();
         let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) else {
             return Vec::new();
@@ -1608,6 +1621,31 @@ mod memory_catalog_tests {
         // path does not exist yet — open creates it empty
         let index = load_memory_catalog(&dir.path().join("nope-yet"));
         assert!(index.is_empty() || !index.contains("SECRET"));
+    }
+
+    /// The interactive shortcut proposes candidates before a turn is staged.
+    /// It must obey the same project switch as the durable inbox trigger.
+    #[tokio::test]
+    async fn a_disabled_project_admits_no_automatic_candidates() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".leveler")).unwrap();
+        std::fs::write(
+            dir.path().join(".leveler/config.yaml"),
+            "memory:\n  enabled: false\n",
+        )
+        .unwrap();
+        let app = Application::assemble(Layout::from_parts(
+            dir.path().to_path_buf(),
+            dir.path().join("configs"),
+            dir.path().join("state"),
+        ))
+        .unwrap();
+        assert!(
+            app.enqueue_memory_candidates("记住：提交前先跑 lint")
+                .is_empty(),
+            "a disabled project must not create pending candidates"
+        );
+        assert!(!dir.path().join("state/memory/pending").exists());
     }
 }
 
