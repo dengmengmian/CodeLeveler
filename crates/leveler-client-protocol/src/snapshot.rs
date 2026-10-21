@@ -152,6 +152,7 @@ mod tests {
             thinking: None,
             work_profile: None,
             collaboration: None,
+            execution_task: None,
             children: Vec::new(),
         };
         // Unset axes stay off the wire (old-client compatibility).
@@ -224,6 +225,7 @@ mod tests {
             thinking: None,
             work_profile: None,
             collaboration: None,
+            execution_task: None,
             children: Vec::new(),
         };
         let value = serde_json::to_value(&snap).unwrap();
@@ -674,9 +676,27 @@ pub struct UiSessionSnapshot {
     /// submissions and applies the read-only planning overlay from this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration: Option<String>,
+    /// A durable task committed from a Chat turn that still owes work.
+    /// Additive: absent when no goal is running. The session's collaboration
+    /// axis says the interaction mode, not whether work is owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_task: Option<UiExecutionTask>,
     /// Every delegated child of this session, oldest first, from durable storage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<crate::UiChildAgent>,
+}
+
+/// The durable task a Chat session owes, as projected for a client that is
+/// reconnecting. `objective` is the goal's text, never the session title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiExecutionTask {
+    pub goal_id: String,
+    pub objective: String,
+    /// A live turn is executing it. False means the work is owed but no
+    /// window is running; the user can resume it.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// How a model's thinking can be controlled.

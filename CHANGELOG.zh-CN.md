@@ -13,12 +13,15 @@
 - `memory.enabled` 为 true 时，记忆属于第一轮请求：`memory`、`remember`、`forget` 以及指导、catalog、召回不再需要先调用 `capability(enable)`。记忆写入的审批规则不变
 - `/memory status` 显示生效 / 待确认 / 已归档 / 敏感数量，持久提取队列，采纳 / 拒绝 / 跳过累计，最近一次提取结果，最早重试及其脱敏错误，以及最近一次召回数量
 - `leveler memory audit` 列出历史敏感记录但不打印内容；`leveler memory scrub [--id <id>] [--apply]` 默认只做 dry-run，只有显式 `--apply` 才改写
+- Chat 回合可以用注入工具 `commit_task` 声明一个明确的执行委托。该回合绑定到持久 Goal（身份、turn WAL、预算 scope），但会话 `chat` 轴不变；随后复用既有 Goal closeout、验证、取消与恢复契约。工具只提供给顶层可写 Chat 回合，不提供给 Plan/只读面和子 Agent
+- TUI 在委托任务执行时显示任务 badge 与目标模式状态；暂停的任务保持可见，重连时从会话快照恢复
 
 ### 变更
 
 - `remember` 现在记录模型推断权威和 `agent_remember_tool` 来源。人工批准只授权写入，不代表用户陈述了该事实，也不能覆盖用户直接写下的事实
 - `memory.enabled = false` 在能力披露前就移除 memory pack，因此 Full Access 也无法暴露记忆工具、指导、catalog 或召回。交互式自动候选提取同样遵守该开关
 - 后台提取的默认超时提高到 90 秒，避免把推理模型的正常首 token 延迟误判为失败重试
+- 恢复以 `turn.payload.goal_id` 作为充分的 Goal 身份，因此被中断的委托 Chat 回合按 Goal profile 恢复，不需要改变会话轴
 
 ### 修复
 

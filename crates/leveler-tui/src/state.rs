@@ -366,6 +366,10 @@ pub struct AppState {
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
+    /// This session owes an explicitly delegated task, committed from a Chat
+    /// turn. Unlike `goal_mode_active` it survives a turn end while the goal
+    /// is still owed, so a paused task remains visible until it settles.
+    pub execution_task_active: bool,
     /// Collaboration mode: chat | plan | goal.
     pub collaboration: String,
 
@@ -716,6 +720,7 @@ impl AppState {
             diff_error: None,
             diff_selected: 0,
             goal_mode_active: false,
+            execution_task_active: false,
             collaboration: "chat".into(),
             pending_attachments: Vec::new(),
             vision: false,

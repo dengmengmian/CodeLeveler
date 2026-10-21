@@ -1128,6 +1128,7 @@ fn a_reconnect_restores_the_running_clock_and_output() {
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     };
     snap.active_tools = vec![UiActiveToolCall {
@@ -1353,6 +1354,7 @@ fn background_command_identity_is_complete_live_and_restored() {
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     };
     snap.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {

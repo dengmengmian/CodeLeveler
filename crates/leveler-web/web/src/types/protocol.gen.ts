@@ -804,6 +804,14 @@ export interface UiEventRelation {
   sequence: number;
 }
 
+/** The durable task a Chat session owes, as projected for a client that is reconnecting. `objective` is the goal's text, never the session title. */
+export interface UiExecutionTask {
+  goal_id: string;
+  objective: string;
+  /** A live turn is executing it. False means the work is owed but no window is running; the user can resume it. */
+  running?: boolean;
+}
+
 /** A structured product failure attached to a terminal turn failure. `detail` is the raw diagnostic and belongs on disclosure only; every other field is machine semantics suitable for choosing an icon, a title, and an action without reading the message. */
 export interface UiFailure {
   category: FailureCategory;
@@ -1153,6 +1161,8 @@ export interface UiSessionSnapshot {
   collaboration?: string | null;
   completion_report?: UiCompletionReport | null;
   diff?: UiDiff | null;
+  /** A durable task committed from a Chat turn that still owes work. Additive: absent when no goal is running. The session's collaboration axis says the interaction mode, not whether work is owed. */
+  execution_task?: UiExecutionTask | null;
   /** Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message. */
   finalization_stage?: FinalizationStage | null;
   goal: string;

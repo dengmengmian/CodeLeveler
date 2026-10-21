@@ -111,9 +111,9 @@ pub use retirement::{RetireDecision, RetireRequest};
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
-    UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiCheckpoint, UiMessage,
-    UiMessageKind, UiRole, UiSessionSnapshot, UiSessionSummary, UiTaskDeclaration,
-    UiThinkingAccess, UiThinkingState, UiTurnBlocker, UiUserShell,
+    UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiCheckpoint,
+    UiExecutionTask, UiMessage, UiMessageKind, UiRole, UiSessionSnapshot, UiSessionSummary,
+    UiTaskDeclaration, UiThinkingAccess, UiThinkingState, UiTurnBlocker, UiUserShell,
 };
 pub use version::{
     PROTOCOL_VERSION, ProtocolCapability, ProtocolEnvelope, ProtocolError, ProtocolVersion,

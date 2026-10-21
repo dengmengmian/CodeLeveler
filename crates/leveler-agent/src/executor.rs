@@ -2077,11 +2077,17 @@ impl Executor {
     ///
     /// The static policy covers a turn that started as a Goal. A turn that
     /// started as Chat becomes one when the user declares `/goal <task>`
-    /// mid-flight: the runtime marks the steering source, and every reader of
-    /// this flag — tool surface, system prompt, closeout — follows the same
-    /// answer from the next round on.
+    /// mid-flight (the steering source), or when the model commits an
+    /// explicitly delegated task (`commit_task`) and the binder records a
+    /// durable goal. Every reader of this flag — tool surface, system prompt,
+    /// closeout — follows the same answer from the next round on.
     pub(crate) fn goal_mode(&self) -> bool {
-        self.policy.goal_mode || self.steering.as_ref().is_some_and(|s| s.goal_requested())
+        self.policy.goal_mode
+            || self.steering.as_ref().is_some_and(|s| s.goal_requested())
+            || self
+                .goal_binder
+                .as_ref()
+                .is_some_and(|binder| binder.bound().is_some())
     }
 
     /// Build a sub-agent that reuses this agent's runtime, tools, model, and
@@ -2553,6 +2559,23 @@ impl Executor {
                 SegmentLifecycle::SessionPrefix,
                 true,
                 goal_prompt,
+            ));
+        } else if self.depth == 0
+            && self.goal_binder.is_some()
+            && !self.tool_context.policy.read_only
+        {
+            // The decision rule for Chat delegation. This is a product
+            // contract, not a classification of the user's text: the model
+            // declares the commitment with commit_task, and every behavior
+            // change follows that durable fact.
+            let commit_prompt = format!("\n\n{}", crate::injected_tools::TASK_COMMIT_GUIDANCE);
+            segments.push(PromptSegment::control(
+                "task_commit_guidance",
+                PromptSource::GoalProtocol,
+                PromptAuthority::CoreContract,
+                SegmentLifecycle::SessionPrefix,
+                true,
+                commit_prompt,
             ));
         }
         segments

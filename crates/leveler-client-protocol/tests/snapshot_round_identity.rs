@@ -110,6 +110,7 @@ fn a_session_snapshot_carries_the_rounds_of_its_running_calls() {
         thinking: None,
         work_profile: None,
         collaboration: None,
+        execution_task: None,
         children: Vec::new(),
     };
 

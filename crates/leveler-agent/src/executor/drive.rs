@@ -31,11 +31,12 @@ use super::{
 };
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
-    REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
-    advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition, escalation_action,
-    escalation_missing_axis_message, is_escalatable_tool, is_user_input_tool, parse_escalation,
-    parse_permission_request, permission_already_denied_message, report_finding_tool_definition,
+    CLAIM_WRITE_SCOPE_TOOL, COMMIT_TASK_TOOL, GrantScope, PermissionRequestOutcome,
+    REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
+    UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
+    commit_task_tool_definition, escalation_action, escalation_missing_axis_message,
+    is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
+    permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
@@ -364,6 +365,16 @@ impl Executor {
         // settlement notice and decides what to do, in its own words.
         if self.depth > 0 {
             tools.push(report_finding_tool_definition());
+        }
+        // A Chat turn can be delegated as a task. The model declares it; the
+        // runtime never classifies the user's text. Read-only surfaces have
+        // no authoring, so they cannot declare execution work at all.
+        if !self.goal_mode()
+            && self.depth == 0
+            && self.goal_binder().is_some()
+            && !self.tool_context.policy.read_only
+        {
+            tools.push(commit_task_tool_definition());
         }
         // Goal mode: the model resolves the objective explicitly.
         if self.goal_mode() {
@@ -2325,6 +2336,127 @@ impl AgentHarness for Drive<'_> {
                     result: ToolResultContent {
                         call_id: call.id,
                         content: msg,
+                        is_error: !ok,
+                    },
+                });
+                continue;
+            }
+
+            // Chat delegation: the model declares that the user's request is
+            // work this turn must carry to completion. The declaration is the
+            // ONLY authority that turns a Chat window into a task window; the
+            // runtime does not infer it from the user's words. Binding is
+            // durable (goal row + turn WAL + budget scope) because the work
+            // may outlive this process.
+            if call.name == COMMIT_TASK_TOOL && self.executor.depth == 0 {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: COMMIT_TASK_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
+                let objective = call
+                    .arguments
+                    .get("objective")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty() && text.chars().count() <= 4000)
+                    .map(str::to_string);
+                let acceptance: Option<Vec<String>> = call
+                    .arguments
+                    .get("acceptance")
+                    .and_then(|value| value.as_array())
+                    .filter(|items| (1..=20).contains(&items.len()))
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .map(|item| {
+                                item.as_str()
+                                    .map(str::trim)
+                                    .filter(|text| !text.is_empty() && text.chars().count() <= 500)
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    });
+                let (ok, content) = if self.executor.goal_mode() {
+                    (
+                        false,
+                        "This turn is already executing a committed task. Continue the work \
+                         and resolve it with update_goal; do not declare it again."
+                            .to_string(),
+                    )
+                } else if let (Some(objective), Some(acceptance)) = (objective, acceptance) {
+                    // The durable objective is the user's own request, not the
+                    // model's restatement. A model cannot narrow the task by
+                    // declaring a smaller objective; its `acceptance` checks
+                    // are the part it owns.
+                    let user_objective = self.objective.text().trim();
+                    let goal_objective = if user_objective.is_empty() {
+                        objective.clone()
+                    } else {
+                        user_objective.to_string()
+                    };
+                    match self.executor.goal_binder().cloned() {
+                        Some(binder) => match binder.bind(&goal_objective).await {
+                            Ok(goal) => {
+                                // The committed window carries the goal
+                                // contract from the next request on.
+                                self.tools = self.executor.request_tool_definitions();
+                                let checks = acceptance
+                                    .iter()
+                                    .map(|check| format!("- {check}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                (
+                                    true,
+                                    format!(
+                                        "Execution task committed as goal {goal}.\n\
+                                         Objective: {goal_objective}\n\
+                                         Acceptance:\n{checks}\n\
+                                         This turn stays running until the task is resolved. A \
+                                         stage summary does not end it. Continue the work, then \
+                                         call update_goal(status=\"complete\", verification=...) \
+                                         with the checks you actually ran, or \
+                                         update_goal(status=\"blocked\", ...) if the stated \
+                                         objective cannot be met. Do not narrow the objective."
+                                    ),
+                                )
+                            }
+                            Err(error) => (
+                                false,
+                                format!("commit_task could not record the task: {error}"),
+                            ),
+                        },
+                        None => (
+                            false,
+                            "commit_task is unavailable here: this execution has no durable \
+                             task store."
+                                .to_string(),
+                        ),
+                    }
+                } else {
+                    (
+                        false,
+                        "commit_task requires a non-empty `objective` (up to 4000 characters) \
+                         and 1-20 non-empty `acceptance` checks (up to 500 characters each)."
+                            .to_string(),
+                    )
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: COMMIT_TASK_TOOL.to_string(),
+                    is_error: !ok,
+                    preview: preview(&content),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content,
                         is_error: !ok,
                     },
                 });

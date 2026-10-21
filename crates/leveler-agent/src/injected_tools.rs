@@ -189,6 +189,75 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
     }
 }
 
+/// The name of the injected task-commitment tool (Chat turns only).
+///
+/// This is the structured delegation entry: the model declares that the
+/// user's request is work to be carried to completion, and the running turn
+/// binds itself to a durable goal. It is not inferred from the user's words.
+pub(crate) const COMMIT_TASK_TOOL: &str = "commit_task";
+
+/// Commit the current Chat turn to the Goal lifecycle.
+///
+/// The description carries the decision rule because it is the only place the
+/// model is told when a request stops being a question and becomes delegated
+/// work. The runtime never classifies the user's text for it.
+pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
+    let description = String::from(
+        "Declare that the user's request is an execution task this turn must carry \
+            to completion, and commit the turn to the task lifecycle. Call this when the \
+            user explicitly asked you to perform work (implement, fix, migrate, test) \
+            that is larger than one short pass — several stages, phases, components or \
+            files, or an explicit instruction to finish everything before stopping — or \
+            when you are about to end the turn while explicitly requested work is still \
+            unfinished. Do NOT call it for a \
+            question, an explanation, a discussion, or when the user asked you not to \
+            modify anything; do not use it to enlarge the request. `objective` is the \
+            user's stated end state, not a narrower version of it. `acceptance` lists \
+            the concrete checks that will prove it. After the commit, the runtime keeps \
+            this turn running: a stage summary or a quiet end does NOT finish the task. \
+            Continue the work and resolve it with update_goal(complete|blocked). The \
+            session itself stays a Chat session.",
+    );
+    ToolDefinition {
+        name: COMMIT_TASK_TOOL.to_string(),
+        description,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "The user's requested end state, as stated. Do not add, narrow or rewrite requirements."
+                },
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "description": "Concrete checks that will prove the objective: test/build commands, observable behavior, or required files and interfaces."
+                }
+            },
+            "required": ["objective", "acceptance"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// The Chat delegation rule. It is a product contract, not a classifier:
+/// the model declares the commitment with `commit_task`, and every behavior
+/// change follows that durable fact. Kept as a constant so its prompt cost is
+/// measured, not guessed.
+pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK DELEGATION: when the user explicitly asks you to carry out work \
+     to completion (implement, fix, migrate, test) and the work is larger than \
+     one short pass, call `commit_task` before starting, with the objective as \
+     the user stated it and the checks that will prove it. A request that names \
+     several stages, phases, components or files, or asks you to finish \
+     everything before stopping, is larger than one short pass. If you are \
+     about to end this turn while explicitly requested work is still unfinished, \
+     call `commit_task` instead of summarizing what remains. Do not call it for a \
+     question, an explanation, a discussion, or when the user asked you not to \
+     modify anything. Once committed, the runtime keeps the turn running until \
+     update_goal resolves the task.";
+
 /// The name of the injected request-permissions tool.
 pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
 
@@ -1022,6 +1091,19 @@ mod scope_fidelity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Chat delegation surface is a fixed cost on every ordinary turn.
+    /// Keep it small and make the number visible to the performance record.
+    #[test]
+    fn commit_task_surface_stays_small() {
+        let tool = commit_task_tool_definition();
+        let tokens = leveler_model::estimate_text(&tool.description)
+            + leveler_model::estimate_text(&tool.input_schema.to_string());
+        let guidance = leveler_model::estimate_text(TASK_COMMIT_GUIDANCE);
+        println!("commit_task schema tokens: {tokens}; guidance tokens: {guidance}");
+        assert!(tokens < 700, "commit_task surface grew to {tokens} tokens");
+        assert!(guidance < 300, "task guidance grew to {guidance} tokens");
+    }
 
     #[test]
     fn worker_scope_advertises_directory_grants() {

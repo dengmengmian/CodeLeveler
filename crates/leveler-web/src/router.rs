@@ -517,6 +517,7 @@ mod tests {
                 thinking: None,
                 work_profile: None,
                 collaboration: None,
+                execution_task: None,
                 children: Vec::new(),
             })
         }

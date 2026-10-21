@@ -15,12 +15,15 @@ display and archive boundaries.
 - Memory is part of the first request when `memory.enabled` is true: `memory`, `remember` and `forget` plus the guidance, catalog and recall no longer require a `capability(enable)` round trip. Approval rules for memory writes are unchanged
 - `/memory status` reports active/pending/archived/sensitive counts, the durable extraction queue, accepted/rejected/skipped totals, the last extraction result, the oldest retry and its sanitized error, and the last recall count
 - `leveler memory audit` lists historical credential-shaped records without printing their content; `leveler memory scrub [--id <id>] [--apply]` is a dry-run by default and redacts only when `--apply` is explicit
+- A Chat turn can declare an explicitly delegated task with the injected `commit_task` tool. The turn binds to a durable Goal (identity, turn WAL and budget scope) without changing the session's `chat` axis, then uses the existing Goal closeout, verification, cancellation and resume contract. The tool is offered only to top-level authoring Chat turns, never to Plan/read-only surfaces or sub-agents
+- The TUI shows the task badge and goal-mode status while a delegated task runs, keeps a paused task visible, and restores it from the session snapshot on reconnect
 
 ### Changed
 
 - `remember` now records model-inference authority with `agent_remember_tool` provenance. Human approval authorizes the write; it does not claim the user said the fact, and the entry can never replace a fact the user wrote directly
 - `memory.enabled = false` removes the memory pack before capability disclosure, so Full Access cannot expose memory tools, guidance, catalog or recall. Automatic interactive candidate extraction also obeys the switch
 - Background extraction tolerates a reasoning model's first-token latency (90 s) instead of converting a healthy call into a retry at 20 s
+- Resume treats `turn.payload.goal_id` as sufficient Goal identity, so an interrupted delegated Chat turn resumes under the Goal profile without changing the session axis
 
 ### Fixed
 

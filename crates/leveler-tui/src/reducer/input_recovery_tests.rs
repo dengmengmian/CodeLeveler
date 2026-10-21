@@ -203,6 +203,7 @@ fn input_recovery_session_switch_from_btw_clears_main_undo() {
                 thinking: None,
                 work_profile: None,
                 collaboration: None,
+                execution_task: None,
                 children: Vec::new(),
             },
         }),

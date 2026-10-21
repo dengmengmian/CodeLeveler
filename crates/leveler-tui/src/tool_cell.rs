@@ -330,6 +330,9 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
         }
         "browser_inspect" => s("tab"),
         "update_plan" => s("explanation"),
+        // The task's identity is its objective; the acceptance checks live in
+        // the expanded body, not in the one-line row.
+        "commit_task" => s("objective"),
         "update_goal" => update_goal_summary_text(&v, t),
         "task" => {
             let description = s("description");

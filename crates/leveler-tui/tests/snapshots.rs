@@ -44,6 +44,7 @@ fn session_snapshot(collaboration: Option<String>) -> UiSessionSnapshot {
         thinking: None,
         work_profile: None,
         collaboration,
+        execution_task: None,
         children: Vec::new(),
     }
 }

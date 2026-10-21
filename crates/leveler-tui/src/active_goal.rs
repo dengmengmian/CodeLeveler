@@ -167,6 +167,18 @@ impl ActiveGoal {
         self.since = now;
     }
 
+    /// Adopt the durable goal's identity without restarting the display
+    /// clock. A reconnecting client already has the turn's elapsed time; it
+    /// is only missing the objective the runtime actually committed to.
+    pub fn adopt_objective(&mut self, title: String, objective: String) {
+        if !title.trim().is_empty() {
+            self.title = title;
+        }
+        if !objective.trim().is_empty() {
+            self.objective = objective;
+        }
+    }
+
     /// First real progress (a model round, a tool call): a resuming goal is
     /// running again. A goal that is already running is untouched.
     pub fn note_progress(&mut self) {
@@ -292,7 +304,7 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
 /// when there is nothing to show. `max` is the columns available to the
 /// indicator.
 pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
-    if !state.collaboration.eq_ignore_ascii_case("goal") {
+    if !state.collaboration.eq_ignore_ascii_case("goal") && !state.execution_task_active {
         return Vec::new();
     }
     let mode = || {
@@ -362,7 +374,7 @@ pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
 }
 
 pub fn has_visible_goal(state: &AppState) -> bool {
-    state.collaboration.eq_ignore_ascii_case("goal")
+    (state.collaboration.eq_ignore_ascii_case("goal") || state.execution_task_active)
         && state
             .active_goal
             .as_ref()

@@ -306,3 +306,69 @@ DF-13 恢复后只执行 1 个 Goal turn，独立检查 `python3 -m unittest` �
    以“命名该 goal 的 turn”为根，而 turn payload 仍记录它续接的 Chat 根。两者都指向同一
    goal；不再导致 checkpoint 失败，但首个收养窗口内切出的 checkpoint 不会被下一次
    resume 命中（回退到完整历史，安全）。
+
+## 2026-10-21 · Chat 显式委托（DF-14 … DF-20）
+
+### 结论
+
+**PASS（19/19 永久套件）**。新增 DF-14～DF-20 全部通过；DF-1～DF-13 全量复跑通过；
+DF-11（真实 DeepSeek，Blocked→`继续`）单独复跑通过。
+
+最终证据：`dogfood/.dev/evidence/goal_contracts_20261021_chat_delegation.json`、
+`dogfood/.dev/evidence/df11_blocked_retry_20261021_chat_delegation.json`。
+
+**二进制身份**：`1.0.20 (e2c90925c093-dirty) UNTRUSTED: built from a modified working tree`。
+工作树同时包含另一会话的内存/桌面 WIP，因此本轮证据不是干净提交构建；提交后应复跑。
+
+### 分层
+
+| 层 | 用例 | 说明 |
+|---|---|---|
+| 真实 TUI/PTY + 脚本 Provider | DF-1…DF-9、DF-12…DF-19 | 真实终端、真实 SQLite、真实工具执行 |
+| 真实 Provider | DF-10、DF-20 | `deepseek/deepseek-v4-flash`；DF-20 不使用 `/goal` |
+| 单独真实 Provider | DF-11 | Blocked→`继续` 同一 goal id |
+
+### 新增用例
+
+| 用例 | 结果 | 证据 |
+|---|---|---|
+| DF-14 普通 Chat 不委托 | **PASS** | 1 次主请求；`goals=0`；`answered`；无续跑 |
+| DF-15 Chat 明确委托长任务 | **PASS** | 1 次用户提交、9 次主请求、6 次工具调用、3 个 stage 文件、1 个 goal；`collaboration=chat`；turn kind=`chat` 且 payload `goal_id` 绑定；所有 main-round scope = goal id；首请求有 `commit_task` 无 `update_goal`，后续请求有 `update_goal`；终态 `completed`；任务完成后一条普通 Chat 消息只发 1 次请求、不新建 goal |
+| DF-16 阶段性 Final | **PASS** | 阶段总结后出现 `goal_unresolved` closeout 注入并继续；最终 `completed`，goal settle 一次 |
+| DF-17 讨论/只读保护 | **PASS** | 1 次请求；写工具调用 0；工作区无 stage 文件；`goals=0` |
+| DF-18 Chat 长任务恢复 | **PASS** | Esc 中断后重开 + `继续`：同一 goal id 与 objective；stage-1 保留；budget scope 不变；`completed` |
+| DF-19 取消与有界 | **PASS** | `/goal clear` 后 `outcome=cancelled`、goal settled；后续 `继续` 0 次模型请求、不新建 goal；纯阶段总结的任务 ≤5 次主请求后停止，goal 仍 running、无 completed 终态 |
+| DF-20 真实 Provider 长任务 | **PASS** | 1 次用户提交；真实模型调用 `commit_task` 1 次；3 个 stage 文件；独立 `python3 -m unittest` 通过；`completed`；会话轴仍为 chat；8 个 main round |
+
+### 性能（新增用例）
+
+| 指标 | DF-14 普通 Chat | DF-15 脚本长任务 | DF-20 真实长任务 |
+|---|---:|---:|---:|
+| 用户提交 | 1 | 1 | 1 |
+| 主模型请求 | 1 | 9 | 8 |
+| Tool calls | 0 | 6 | 8 |
+| Input / Output / Cached | 2 / 128 / 0（脚本 usage） | 0 / 0 / 0（脚本 usage） | 80,637 / 1,974 / 58,368 |
+| 估算输入 tokens | 10,108 | 98,590 | — |
+| Cost | 0 | 0 | 11,749 micro-USD（约 $0.012） |
+| Wall time | 4.1s | 6.4s | 43.6s |
+| 提前 Final / 无效续跑 | 0 / 0 | 0 / 0 | 0 / 0 |
+| Compaction / Resume | 0 / 0 | 0 / 0 | 0 / 0 |
+| Goal 行 | 0 | 1（settled） | 1（settled） |
+
+固定成本：`commit_task` schema 356 tokens + Chat 委托规则 190 tokens = **546 tokens/请求**，
+二者都在会话前缀中缓存；普通 Chat 的模型请求数仍为 1，没有新增分类调用。
+
+### 已知抖动
+
+DF-10 在全量套件的一次运行中因真实配置 TUI 启动窗口（会话停在 `created`、0 模型请求）
+失败；单独复跑 PASS，随后全量复跑 PASS。与上一轮记录的输入时序抖动相同，归因于驱动层，
+不是 Goal 或 Chat 委托契约失败。
+
+### 残余风险
+
+1. 是否调用 `commit_task` 仍是模型判断；脚本 Provider 证明了契约，真实 Provider 证明了
+   一次正向行为，但不能保证所有模型在所有请求上都会主动声明。
+2. `acceptance` 是模型声明，不是机械判据；完成仍由 `update_goal` 的证据检查决定。
+3. Chat 起步回合中途绑定 goal 时，本轮内折叠不会生成 goal checkpoint（既有缺口）；
+   回合结束后的 resume 仍按 `turn.payload.goal_id` 恢复。
+4. 工作树包含并行 WIP，证据二进制标记为 UNTRUSTED。
