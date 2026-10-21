@@ -733,6 +733,16 @@ fn collect_backticks(
         if added_path || is_test_phrase(span) {
             continue;
         }
+        // A backticked command the user asked to run is mechanical evidence,
+        // not a named deliverable. A test command is already the Tests
+        // requirement; a non-test command must have run.
+        if crate::executor::goal_verification::is_test_command(span) {
+            continue;
+        }
+        if command_text(span) {
+            out.push((span.to_string(), RequirementKind::Command, source.clone()));
+            continue;
+        }
         out.push((span.to_string(), RequirementKind::Named, source.clone()));
     }
 }
@@ -801,10 +811,13 @@ fn collect_enumerations(
         let Some(text) = clean_item(&item) else {
             continue;
         };
-        if path_like(&text) || contains_path(&text) {
+        if path_like(&text) || contains_path(&text) || text.contains('`') {
             continue;
         }
-        if is_test_phrase(&text) {
+        if is_test_phrase(&text)
+            || crate::executor::goal_verification::is_test_command(&text)
+            || command_text(&text)
+        {
             continue;
         }
         out.push((text, RequirementKind::Named, source.clone()));
@@ -948,6 +961,57 @@ fn mentioned(text: &str, clause: &str) -> bool {
     let text = normalize(text);
     let clause = normalize(clause);
     text.chars().count() >= 2 && clause.contains(&text)
+}
+
+/// Whether a span starts with a recognised command program. The user's own
+/// backticks are the only thing that turns a word into a command here; the
+/// runtime does not guess from prose.
+fn command_text(text: &str) -> bool {
+    const PROGRAMS: &[&str] = &[
+        "cargo",
+        "go",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+        "deno",
+        "make",
+        "just",
+        "bazel",
+        "mvn",
+        "gradle",
+        "dotnet",
+        "swift",
+        "flutter",
+        "dart",
+        "mix",
+        "pytest",
+        "phpunit",
+        "python",
+        "python3",
+        "py",
+        "node",
+        "sh",
+        "bash",
+        "zsh",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "ctest",
+        "rustfmt",
+        "gofmt",
+        "golangci-lint",
+        "eslint",
+        "prettier",
+        "tsc",
+        "ruff",
+        "mypy",
+        "black",
+        "git",
+    ];
+    let first = text.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    PROGRAMS.contains(&base)
 }
 
 fn path_like(token: &str) -> bool {
@@ -1226,6 +1290,32 @@ mod tests {
         let found = texts(&requirements);
         assert!(found.contains(&"--verbose"), "{found:?}");
         assert!(found.contains(&"README"), "{found:?}");
+    }
+
+    #[test]
+    fn a_backticked_command_is_mechanical_not_a_named_deliverable() {
+        let requirements = extract("实现接口，最后运行 `cargo fmt --check`。", &[]);
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.text == "cargo fmt --check"
+                    && requirement.kind == RequirementKind::Command
+            }),
+            "{requirements:?}"
+        );
+
+        let tests = extract("实现接口，最后运行 `python3 -m unittest`。", &[]);
+        assert!(
+            tests
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "{tests:?}"
+        );
+        assert!(
+            !tests.iter().any(|requirement| {
+                requirement.text.contains("unittest") && requirement.kind == RequirementKind::Named
+            }),
+            "the test command must not also become a named deliverable: {tests:?}"
+        );
     }
 
     #[test]
