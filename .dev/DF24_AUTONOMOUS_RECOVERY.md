@@ -96,8 +96,8 @@ summary 请求由 mock 应答），不是伪造的「已压缩」状态。
 
 | 命令 | 结果 |
 |---|---|
-| `./dev fmt <5 files>` | PASS |
-| `./dev verify <5 files>` | PASS（fmt / check / test / version） |
+| `./dev fmt`（本次修改的 Rust 文件） | PASS |
+| `./dev verify`（本次修改的 Rust 文件） | PASS（fmt / check / test / version） |
 | `env -u NODE_OPTIONS cargo test -p leveler-agent` | 全部 target 通过（含 direct_test 61、loop_test 132、task_commit 12、goal_crash_recovery 5、multi_turn 18、multi_agent 90） |
 | clean candidate `cc91c2d`：`cargo fmt --all -- --check` | PASS |
 | clean candidate `cc91c2d`：`cargo test --workspace --all-features --locked --no-fail-fast` | **6,961 passed / 0 failed / 59 ignored**（269 个 target），exit 0 |
