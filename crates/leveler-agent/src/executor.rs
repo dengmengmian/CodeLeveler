@@ -9,6 +9,7 @@ mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -101,15 +102,23 @@ pub(crate) struct MemoryRecallPlan {
     /// How many selected entries were agent experience. Lets a client report
     /// "a past lesson was recalled" without exposing a body.
     pub experience: usize,
+    /// Selected experience entries whose identity also has a different
+    /// explanation waiting for a person.
+    pub contested: usize,
 }
 
 impl MemoryRecallPlan {
     /// Select and render. Selection order IS the priority: standing
     /// preferences first because they apply to every turn, then query hits by
     /// score.
+    ///
+    /// `contested` holds the semantic keys that have a pending, different
+    /// explanation. Such an entry is still rendered — it may be the right one —
+    /// but it is marked disputed so the model cannot read it as settled truth.
     fn build(
         standing: Vec<leveler_memory::MemoryEntry>,
         queried: Vec<leveler_memory::MemoryEntry>,
+        contested: &std::collections::HashSet<String>,
     ) -> (Self, Option<String>) {
         let mut plan = Self {
             standing: standing.clone(),
@@ -121,7 +130,9 @@ impl MemoryRecallPlan {
              anything it names before relying on it, and correct it when this turn contradicts \
              it. An entry marked `experience` records a failure and resolution the runtime \
              observed; its explanation is still a model reading, so re-check it against the \
-             current code rather than treating a past success as proof.\n";
+             current code rather than treating a past success as proof. An entry marked \
+             `disputed` has a later, different explanation waiting for a person: treat neither \
+             account as settled.\n";
         const STANDING_LABEL: &str =
             "\nLasting preferences (apply unless this turn says otherwise):\n";
         const QUERY_LABEL: &str = "\nRetrieved as possibly relevant to this request:\n";
@@ -140,8 +151,12 @@ impl MemoryRecallPlan {
             let mut label_paid = false;
             for entry in entries {
                 let label_cost = if label_paid { 0 } else { label.len() };
+                let is_contested = entry
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| contested.contains(key));
                 let (line, was_truncated) =
-                    render_entry_line(&entry, budget.saturating_sub(label_cost));
+                    render_entry_line(&entry, budget.saturating_sub(label_cost), is_contested);
                 match line {
                     Some(line) => {
                         if !label_paid {
@@ -151,6 +166,9 @@ impl MemoryRecallPlan {
                         budget = budget.saturating_sub(line.len());
                         if entry.experience.is_some() {
                             plan.experience += 1;
+                            if is_contested {
+                                plan.contested += 1;
+                            }
                         }
                         plan.selected.push(entry.id.clone());
                         plan.truncated += usize::from(was_truncated);
@@ -182,15 +200,35 @@ impl MemoryRecallPlan {
     }
 }
 
+/// Whether a timestamp's date prefix is a real `YYYY-MM-DD`. Legacy or test
+/// entries may carry arbitrary text; a date marker must never invent one.
+fn looks_like_date(value: &str) -> bool {
+    value.len() == 10
+        && value
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => *byte == b'-',
+                _ => byte.is_ascii_digit(),
+            })
+}
+
 /// One rendered entry line within `budget` bytes, plus whether its body was
 /// cut. `None` when even the shortest useful form does not fit.
 ///
 /// The id is what makes a turn auditable: without it nobody can say which
 /// memory was used.
-fn render_entry_line(entry: &leveler_memory::MemoryEntry, budget: usize) -> (Option<String>, bool) {
+fn render_entry_line(
+    entry: &leveler_memory::MemoryEntry,
+    budget: usize,
+    contested: bool,
+) -> (Option<String>, bool) {
     // An experience carries its evidence class and applicability. The model
     // must be able to tell a verified resolution from an unverified
-    // hypothesis, and must know when the lesson stops applying.
+    // hypothesis, must know when the lesson stops applying, and needs the date
+    // it was observed: `invalid_if` is a condition only a reader can evaluate
+    // against today's code and toolchain.
     let (label, body) = match entry.experience.as_ref() {
         Some(experience) => {
             let verification = match experience.verification {
@@ -198,17 +236,21 @@ fn render_entry_line(entry: &leveler_memory::MemoryEntry, budget: usize) -> (Opt
                 leveler_memory::ExperienceVerification::Unverified => "unverified",
             };
             let mut body = entry.body.trim().to_string();
-            body.push_str(&format!(
-                " [applies when: {}",
-                experience.applies_when.trim()
-            ));
+            body.push_str(" [");
+            if let Some(recorded) = entry.created_at.get(..10)
+                && looks_like_date(recorded)
+            {
+                body.push_str(&format!("recorded {recorded}; "));
+            }
+            body.push_str(&format!("applies when: {}", experience.applies_when.trim()));
             if let Some(invalid_if) = experience.invalid_if.as_deref() {
                 body.push_str(&format!("; invalid if: {}", invalid_if.trim()));
             }
             body.push(']');
+            let disputed = if contested { "·disputed" } else { "" };
             (
                 format!(
-                    "- [{}] (experience·{verification}) {}: ",
+                    "- [{}] (experience·{verification}{disputed}) {}: ",
                     entry.id.trim(),
                     entry.title.trim()
                 ),
@@ -242,6 +284,21 @@ fn render_entry_line(entry: &leveler_memory::MemoryEntry, budget: usize) -> (Opt
         return (None, false);
     }
     (Some(format!("{prefix}{}…\n", &body[..cut])), true)
+}
+
+/// Semantic keys whose identity also has a different explanation waiting for
+/// a person. Recall must mark such an entry as disputed, not settled truth.
+fn contested_keys(store: &MemoryStore) -> HashSet<String> {
+    match store.list_pending() {
+        Ok(pending) => pending
+            .into_iter()
+            .filter_map(|candidate| candidate.semantic_key.or(candidate.key))
+            .collect(),
+        Err(error) => {
+            tracing::debug!(%error, "pending memory unavailable for the disputed check");
+            HashSet::new()
+        }
+    }
 }
 
 /// Ids for a trace line: bounded in count and length so one oversized legacy
@@ -3098,7 +3155,7 @@ impl Executor {
             .filter(|entry| !standing.iter().any(|s| s.id == entry.id))
             .collect();
 
-        let (plan, block) = MemoryRecallPlan::build(standing, queried);
+        let (plan, block) = MemoryRecallPlan::build(standing, queried, &contested_keys(&store));
         // Ids and counts only. Titles and bodies stay out: a trace is not a
         // place to spill what the store was careful about.
         tracing::debug!(
@@ -3108,6 +3165,8 @@ impl Executor {
             selected_count = plan.selected.len(),
             omitted_count = plan.omitted,
             truncated_count = plan.truncated,
+            experience_count = plan.experience,
+            contested_count = plan.contested,
             rendered_bytes = plan.rendered_bytes,
             selected_ids = ?trace_ids(&plan.selected),
             "memory recall"
@@ -4067,7 +4126,31 @@ mod recall_tests {
         standing: Vec<MemoryEntry>,
         queried: Vec<MemoryEntry>,
     ) -> (super::MemoryRecallPlan, Option<String>) {
-        MemoryRecallPlan::build(standing, queried)
+        MemoryRecallPlan::build(standing, queried, &std::collections::HashSet::new())
+    }
+
+    #[test]
+    fn a_contested_experience_is_rendered_as_disputed() {
+        let mut experience = entry("exp-2", "同一签名的另一个解释", "旧解释");
+        experience.key = Some("k-shared".to_string());
+        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
+        experience.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::RootCause,
+            verification: leveler_memory::ExperienceVerification::Verified,
+            applies_when: "cargo test 在 dev profile 下运行".to_string(),
+            invalid_if: None,
+            evidence: vec![leveler_memory::ExperienceEvidence {
+                kind: "failure".to_string(),
+                reference: "step 2: cargo test (exit 101)".to_string(),
+            }],
+        });
+        let contested: std::collections::HashSet<String> =
+            ["k-shared".to_string()].into_iter().collect();
+        let (plan, block) = MemoryRecallPlan::build(Vec::new(), vec![experience], &contested);
+        let block = block.expect("block");
+        assert!(block.contains("(experience·verified·disputed)"), "{block}");
+        assert!(block.contains("waiting for a person"), "{block}");
+        assert_eq!(plan.contested, 1);
     }
 
     #[test]
@@ -4112,6 +4195,7 @@ mod recall_tests {
             "启用 feature 后测试通过",
         );
         experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
+        experience.created_at = "2026-10-21T13:00:00Z".to_string();
         experience.experience = Some(leveler_memory::ExperienceRecord {
             category: leveler_memory::ExperienceCategory::RootCause,
             verification: leveler_memory::ExperienceVerification::Verified,
@@ -4132,6 +4216,11 @@ mod recall_tests {
         assert!(
             block.contains("invalid if: toolchain 或 feature 配置变化"),
             "{block}"
+        );
+        assert!(
+            block.contains("recorded 2026-10-21"),
+            "a lesson needs the date it was observed so a reader can judge \
+             whether an environment change invalidated it: {block}"
         );
         assert_eq!(plan.experience, 1);
         assert!(
