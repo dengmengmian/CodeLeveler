@@ -116,7 +116,7 @@ impl Database {
         // A source is whatever an older binary left behind. Probe what it
         // actually has instead of assuming this binary's schema: discovery is
         // read-only and must never migrate a store it merely lists.
-        let schema = FactsSchema::detect(&mut *tx).await?;
+        let schema = FactsSchema::detect(&mut tx).await?;
         // 0006 added these axes with exactly these defaults, so a pre-0006
         // store projects the same values its migration would have written.
         let collaboration = schema.sessions.project("collaboration", "'goal'");
