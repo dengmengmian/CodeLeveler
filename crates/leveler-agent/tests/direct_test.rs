@@ -4378,6 +4378,26 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
     );
     assert!(refusals[0].contains("stage-2.txt"), "{refusals:?}");
     assert!(refusals[0].contains("stage-3.txt"), "{refusals:?}");
+    // The refusal is not only recorded: the model's NEXT request carries it as
+    // an errored tool result, which is what makes recovery possible without a
+    // new user message.
+    let requests = h.requests.lock().unwrap().clone();
+    let refusal_reached_the_model = requests.iter().skip(2).any(|request| {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| {
+                matches!(part, ContentPart::ToolResult { result }
+                if result.is_error
+                    && result.content.contains("update_goal(complete) was refused")
+                    && result.content.contains("stage-2.txt"))
+            })
+    });
+    assert!(
+        refusal_reached_the_model,
+        "the missing deliverables must reach the model as feedback"
+    );
     for stage in ["stage-1.txt", "stage-2.txt", "stage-3.txt"] {
         assert!(
             h.dir.path().join(stage).exists(),
