@@ -134,6 +134,31 @@ fn updated_lesson() -> MockResponse {
     )
 }
 
+fn engine_script(required_profile: &str) -> String {
+    format!(
+        "#!/bin/sh\nset -eu\nprofile=$(sed -n 's/^profile=//p' engine.config | tail -n 1)\nif [ \"$profile\" != \"{required_profile}\" ]; then\n  echo \"error: engine profile rejected\" >&2\n  exit 1\nfi\necho \"engine: build ok (profile=$profile)\"\n"
+    )
+}
+
+fn check_script() -> serde_json::Value {
+    serde_json::json!({"program": "sh", "args": ["./check.sh"], "reason": "run the project check"})
+}
+
+/// A lesson earned while the installed engine still accepted `legacy`.
+fn legacy_profile_lesson() -> MockResponse {
+    json_text(
+        r#"{"experiences":[{"category":"fix","subject":"experience.engine.legacy_profile","title":"engine profile 拒绝时改用 legacy","body":"当 ./check.sh 以 `error: engine profile rejected` 失败时，修改 engine.config 把 profile 设为 legacy；重新运行后回执报告 profile=legacy。","applies_when":"项目检查脚本报告 engine profile 被拒绝且只能修改项目文件","invalid_if":"安装的引擎不再校验配置里的 profile","evidence_ids":["failure-1-c-fail","resolution-3-c-pass"],"confidence":0.9}]}"#,
+    )
+}
+
+/// The same failure signature after the installed engine changed: the
+/// environment now accepts `current`, not `legacy`.
+fn current_profile_lesson() -> MockResponse {
+    json_text(
+        r#"{"experiences":[{"category":"fix","subject":"experience.engine.current_profile","title":"engine profile 拒绝时改用 current","body":"当 ./check.sh 以 `error: engine profile rejected` 失败时，修改 engine.config 把 profile 设为 current；重新运行后回执报告 profile=current。旧环境里的 legacy 已不再适用。","applies_when":"项目检查脚本报告 engine profile 被拒绝且只能修改项目文件","invalid_if":"安装的引擎不再校验配置里的 profile","evidence_ids":["failure-1-c-fail","resolution-3-c-pass"],"confidence":0.9}]}"#,
+    )
+}
+
 async fn harness(
     responses: Vec<MockResponse>,
 ) -> (tempfile::TempDir, MockServer, Arc<Application>) {
@@ -482,6 +507,132 @@ async fn new_evidence_updates_the_previous_experience_instead_of_duplicating_it(
             .count(),
         1,
         "the old explanation is history, not a second current version: {archived:?}"
+    );
+}
+
+/// DF-M3: an environment change invalidates the premise the stored lesson was
+/// earned under. The same failure signature must supersede the old lesson, and
+/// a later session must recall only the replacement. The old lesson must not be
+/// deleted: it stays archived with the value that was true when it was earned.
+#[tokio::test]
+async fn a_changed_environment_supersedes_the_stale_experience_and_recalls_only_the_replacement() {
+    let (tmp, server, app) = harness(vec![
+        tool_call("c-fail", "run_command", check_script()),
+        tool_call(
+            "c-fix",
+            "write_file",
+            serde_json::json!({"path": "engine.config", "content": "profile=legacy\n"}),
+        ),
+        tool_call("c-pass", "run_command", check_script()),
+        text("done"),
+        legacy_profile_lesson(),
+        tool_call("c-fail", "run_command", check_script()),
+        tool_call(
+            "c-fix",
+            "write_file",
+            serde_json::json!({"path": "engine.config", "content": "profile=current\n"}),
+        ),
+        tool_call("c-pass", "run_command", check_script()),
+        text("done"),
+        current_profile_lesson(),
+        text("current"),
+        json_text(r#"{"experiences":[]}"#),
+    ])
+    .await;
+    std::fs::write(
+        tmp.path().join("check.sh"),
+        "#!/bin/sh\nset -eu\nexec sh ./engine build\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("engine.config"), "profile=current\n").unwrap();
+    std::fs::write(tmp.path().join("engine"), engine_script("legacy")).unwrap();
+
+    run_chat(&app, "让 ./check.sh 通过").await;
+    let first = wait_for_experience(&tmp, |entries| {
+        entries.len() == 1 && entries[0].body.contains("legacy")
+    })
+    .await;
+    let old_id = first[0].id.clone();
+    let old_key = first[0]
+        .key
+        .clone()
+        .expect("the experience has an identity");
+    assert_eq!(
+        first[0].experience.as_ref().unwrap().verification,
+        ExperienceVerification::Verified
+    );
+    wait_for_experience_inbox_settled(&app).await;
+
+    // The installed engine changes outside the task; the project keeps the
+    // fix earned under the previous engine.
+    std::fs::write(tmp.path().join("engine"), engine_script("current")).unwrap();
+
+    run_chat(&app, "再次让 ./check.sh 通过").await;
+    let second = wait_for_experience(&tmp, |entries| {
+        entries.len() == 1
+            && entries[0].body.contains("current")
+            && entries[0].body.contains("旧环境")
+    })
+    .await;
+    wait_for_experience_inbox_settled(&app).await;
+    let new_id = second[0].id.clone();
+    assert_ne!(new_id, old_id, "the replacement is a new entry");
+    assert_eq!(
+        second[0].key.as_deref(),
+        Some(old_key.as_str()),
+        "the same failure signature keeps one identity"
+    );
+    assert_eq!(
+        second[0].experience.as_ref().unwrap().verification,
+        ExperienceVerification::Verified
+    );
+    assert_eq!(second[0].supersedes.as_deref(), Some(old_id.as_str()));
+
+    let store = MemoryStore::open(tmp.path().join("state/memory")).unwrap();
+    let archived = store.list_archived().unwrap();
+    let superseded = archived
+        .iter()
+        .find(|entry| entry.id == old_id)
+        .expect("the old lesson is archived, not deleted");
+    assert_eq!(superseded.status, leveler_memory::MemoryStatus::Superseded);
+    assert_eq!(superseded.superseded_by.as_deref(), Some(new_id.as_str()));
+    assert!(
+        store
+            .effective_active()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.id != old_id)
+    );
+    assert_eq!(
+        store.effective_active().unwrap().len(),
+        1,
+        "one current version, not two"
+    );
+    drop(store);
+
+    run_chat(
+        &app,
+        "为了让 ./check.sh 通过，engine.config 应该写什么 profile？",
+    )
+    .await;
+    wait_for_experience_inbox_settled(&app).await;
+    let bodies = server.request_bodies().await;
+    let chat = bodies
+        .iter()
+        .rev()
+        .find(|body| body.contains("engine.config 应该写什么 profile"))
+        .expect("the third session reached the provider");
+    assert!(
+        chat.contains(&format!("[{new_id}]")),
+        "the replacement must be recalled: {chat}"
+    );
+    assert!(
+        !chat.contains(&format!("[{old_id}]")),
+        "the superseded lesson must not be recalled: {chat}"
+    );
+    assert!(
+        chat.contains("profile=current"),
+        "the current value must reach the model: {chat}"
     );
 }
 
