@@ -10,6 +10,18 @@ async function rememberRuntime(){runtime=await page.evaluate(()=>window.desktop.
 const agentRequests=()=>fixture.requests.filter(request=>request.names.length>0).length;
 async function deliver(id,type,content){return page.evaluate(({id,type,content})=>window.desktop.deliver({command_id:crypto.randomUUID(),session_id:id,expected_version:null,issued_at:new Date().toISOString(),command:{type,session_id:id,...(content===undefined?{}:{content})}}),{id,type,content});}
 async function waitStatus(id,status){await page.waitForFunction(async({id,status})=>(await window.desktop.snapshot(id)).task_status===status,{id,status});return page.evaluate(id=>window.desktop.snapshot(id),id);}
+/** Reveal a tool row that a settled turn may have folded into its process group. */
+async function revealTool(id){
+ const row=page.locator(`.tool-row[data-tool-id="${id}"]`);
+ if(await row.count())return row;
+ for(const group of await page.locator('.execution-group').all()){
+  if(await group.evaluate(node=>node.open))continue;
+  const toggle=group.locator('.execution-toggle');
+  if(await toggle.count())await toggle.click();else await group.locator('.execution-summary').click();
+ }
+ await row.waitFor({timeout:15000});
+ return row;
+}
 async function idleExit(pid){const deadline=Date.now()+45000;while(Date.now()<deadline){try{process.kill(pid,0);}catch(error){if(error.code==='ESRCH')return {pid,normal_idle_exit_observed:true,signaled:false};throw error;}await new Promise(resolve=>setTimeout(resolve,100));}throw new Error(`Runtime ${pid} did not exit normally; no signal sent`);}
 
 const binary=process.env.LEVELER_BINARY??path.resolve(root,'../../target/debug/leveler');
@@ -50,10 +62,10 @@ await application.evaluate(({dialog})=>{globalThis.__quitDialogs=[];dialog.showM
  await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent==='已回答'||document.querySelector('#conversation-status').textContent==='已完成');
  await page.waitForFunction(()=>document.querySelector('#takeover').children.length===0);
  const settled=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);assert.equal(settled.pending_interactions.length,0);assert.equal(await readFile(path.join(workspace,'scratch','keep.txt'),'utf8'),'must-survive-denial');assert.deepEqual(fixture.errors,[]);
- assert.equal(await page.locator('.tool-row[data-tool-id="fixture-consent"]').getAttribute('data-status'),'failed');
+ assert.equal(await (await revealTool('fixture-consent')).getAttribute('data-status'),'failed');
  // History replay must restore tool evidence, never resurrect resolved consent buttons.
  await page.locator('#new-session').click();await page.waitForFunction(()=>document.querySelector('.session-row[aria-selected="true"]')&&document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
- await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();await page.waitForFunction(()=>document.querySelector('.tool-row[data-tool-id="fixture-read"]'));
+ await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();await page.waitForFunction(()=>document.querySelector('.execution-group'));await revealTool('fixture-read');
 // Regression: reopening a workspace session renders the workbench while the
 // open action still holds `loading`; once idle the diff action must be enabled.
 await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent!=='连接 Runtime…');

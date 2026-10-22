@@ -9,9 +9,18 @@ import * as shared from '../../../packages/conversation-presentation/conversatio
 
 /** @typedef {{id?:string,name?:string,arguments?:string|Record<string,unknown>,preview?:string,status?:string}} ToolProjection */
 /** @type {Record<string,string>} */
-const toolNames={read_file:'查看文件',read:'查看文件',grep:'搜索文件内容',search:'搜索文件内容',glob:'查找文件',find_files:'查找文件',list_files:'查看目录',list_directory:'查看目录',bash:'运行命令',run_command:'运行命令',shell:'运行命令',shell_command:'运行命令',write_file:'写入文件',edit_file:'修改文件',apply_patch:'修改文件',web_search:'网页搜索',web_fetch:'网页获取',browser_navigate:'浏览网页',browser_click:'操作网页'};
+const toolNames={
+ read_file:'查看文件',read:'查看文件',grep:'搜索文件内容',search:'搜索文件内容',glob:'查找文件',find_files:'查找文件',list_files:'查看目录',list_directory:'查看目录',
+ bash:'运行命令',run_command:'运行命令',shell:'运行命令',shell_command:'运行命令',write_file:'写入文件',edit_file:'修改文件',apply_patch:'修改文件',
+ web_search:'网页搜索',web_fetch:'网页获取',browser_navigate:'浏览网页',browser_click:'操作网页',browser_act:'操作网页',browser_inspect:'检查网页',browser_tab:'管理浏览器标签',
+ load_skill:'使用技能',update_plan:'更新计划',request_user_input:'询问用户',spawn_agent:'创建子智能体',
+ get_task:'查看任务',kill_task:'停止任务',wait_task:'等待任务',read_project_rules:'读取项目规则',
+ find_references:'查找引用',find_symbol:'查找符号',read_symbol:'查看符号',view_image:'查看图片',
+ git_diff:'查看变更',git_status:'查看状态',diagnostics:'运行诊断',blast_radius:'分析影响面',
+ memory:'读取记忆',remember:'记住',forget:'忘记',
+};
 /** @param {ToolProjection} tool @returns {string} */
-export function toolLabel(tool){return toolNames[tool.name??'']??(tool.name?.startsWith('browser_')?'浏览器操作':'执行工具');}
+export function toolLabel(tool){return toolNames[tool.name??'']??(tool.name?.startsWith('browser_')?'浏览器操作':'工具调用');}
 /** @param {ToolProjection} tool @returns {string} */
 export function toolTarget(tool){try{const args=typeof tool.arguments==='string'?JSON.parse(tool.arguments):tool.arguments;if(!args||typeof args!=='object')return '';for(const key of ['path','command','cmd','pattern','query','url'])if(typeof args[key]==='string')return args[key];if(typeof args.program==='string')return [args.program,...(Array.isArray(args.args)?args.args.filter(/** @param {unknown} a */ a=>typeof a==='string'):[])].join(' ');return '';}catch{return '';}}
 /** @param {ToolProjection} tool */
@@ -456,19 +465,67 @@ function isCommandGroup(tools) {
 }
 
 /**
- * The view one execution block presents. `kind` decides the shape the renderer
- * uses; `label` is the collapsed summary the reader sees.
- * @param {{kind:'round'|'receipt',round?:ExecutionRoundView,receipt?:any}} block
- * @param {ExecutionToolRow[]} tools
+ * Reference process vocabulary: the collapsed header names the work that
+ * happened ("已读取文件并搜索代码"), never a bare item count.
+ * @param {string} name
+ */
+function toolActivity(name) {
+  const value = String(name ?? '').toLowerCase();
+  if (/read_image|image/.test(value)) return 'readImage';
+  if (/web_search|search_web/.test(value)) return 'webSearch';
+  if (/web_fetch|web_navigate|browser_|fetch/.test(value)) return 'webFetch';
+  if (/grep|search|glob|find|list/.test(value)) return 'search';
+  if (/read|cat|open|view/.test(value)) return 'read';
+  if (/write/.test(value)) return 'write';
+  if (/edit|patch|apply/.test(value)) return 'edit';
+  if (/bash|shell|command|run/.test(value)) return 'commands';
+  if (/subagent|agent/.test(value)) return 'subagents';
+  if (/plan/.test(value)) return 'plan';
+  if (/todo/.test(value)) return 'tools';
+  return 'tools';
+}
+
+/** @type {Record<string,string>} */
+const ACTIVITY_LABELS = {
+  read: '已读取文件', readImage: '已读取图片', search: '已搜索代码', write: '已写入文件',
+  edit: '修改了文件', commands: '执行了命令', webSearch: '已搜索网页', webFetch: '已访问网页',
+  subagents: '已协调子智能体', plan: '更新了计划', tools: '已调用工具', thinking: '已完成分析',
+};
+
+/**
+ * Compose a closed run's title from its top three activity categories, with
+ * the same join rule as the reference process header.
+ * @param {ExecutionToolRow[]} members
+ */
+export function processActivityLabel(members) {
+  /** @type {Map<string,{count:number,first:number}>} */
+  const ranked = new Map();
+  for (const [index, tool] of members.entries()) {
+    const kind = toolActivity(tool.name);
+    const entry = ranked.get(kind);
+    if (entry) entry.count += 1; else ranked.set(kind, { count: 1, first: index });
+  }
+  const kinds = [...ranked].sort((a, b) => b[1].count - a[1].count || a[1].first - b[1].first).map(([kind]) => kind);
+  const labels = kinds.slice(0, 3).map(kind => ACTIVITY_LABELS[kind] ?? ACTIVITY_LABELS.tools);
+  const first = labels[0] ?? ACTIVITY_LABELS.thinking;
+  const continuation = (/** @type {string} */ label) => label.charAt(0).toLowerCase() + label.slice(1);
+  const second = labels[1];
+  if (second === undefined) return first;
+  if (labels.length === 2) {
+    const shared = first.startsWith('已') && second.startsWith('已');
+    return `${first}并${continuation(shared ? second.slice(1) : second)}`;
+  }
+  const title = [first, ...labels.slice(1).map(continuation)].join('，');
+  return kinds.length > 3 ? `${title}等` : title;
+}
+
+/**
+ * One view over a set of tool rows. Kept separate from block extraction so a
+ * run split across model steps can be re-projected as one continuous group.
+ * @param {ExecutionToolRow[]} members
  * @param {Set<string>} approvalIds
  */
-export function executionView(block, tools, approvalIds) {
-  /** @type {ExecutionToolRow[]} */
-  const members = block.kind === 'receipt'
-    ? /** @type {ExecutionToolRow[]} */ (block.receipt.members
-      .map(/** @param {{id:string}} member */ member => toolOfId(tools, member.id))
-      .filter(Boolean))
-    : (block.round?.tools ?? []);
+function viewForMembers(members, approvalIds) {
   const counts = statusCounts(members);
   const waiting = members.some(tool => approvalIds.has(String(tool.id)));
   const status = counts.running ? 'running'
@@ -518,7 +575,7 @@ export function executionView(block, tools, approvalIds) {
     if (otherOperations > 0) view.label += ` · 另有 ${otherOperations} 项`;
   }
   if (!editGroup && !exploration && members.length > 1) {
-    view.label = isCommandGroup(members) ? `执行 ${members.length} 条命令` : `执行 ${members.length} 项`;
+    view.label = processActivityLabel(members);
   }
   if (variant === 'tool') {
     const tool = members[0];
@@ -533,6 +590,44 @@ export function executionView(block, tools, approvalIds) {
   return view;
 }
 
+/**
+ * The view one execution block presents. `kind` decides the shape the renderer
+ * uses; `label` is the collapsed summary the reader sees.
+ * @param {{kind:'round'|'receipt',round?:ExecutionRoundView,receipt?:any}} block
+ * @param {ExecutionToolRow[]} tools
+ * @param {Set<string>} approvalIds
+ */
+export function executionView(block, tools, approvalIds) {
+  /** @type {ExecutionToolRow[]} */
+  const members = block.kind === 'receipt'
+    ? /** @type {ExecutionToolRow[]} */ (block.receipt.members
+      .map(/** @param {{id:string}} member */ member => toolOfId(tools, member.id))
+      .filter(Boolean))
+    : (block.round?.tools ?? []);
+  return viewForMembers(members, approvalIds);
+}
+
+/**
+ * Consecutive blocks of one turn are one process, not one header per model
+ * step: the reference paints a single collapsed row for the whole run.
+ * @param {ReturnType<typeof executionView>[]} views
+ * @param {ExecutionToolRow[]} tools
+ * @param {Set<string>} approvalIds
+ */
+export function mergeExecutionViews(views, tools, approvalIds) {
+  if (views.length === 0) return null;
+  if (views.length === 1) return views[0];
+  const ids = [...new Set(views.flatMap(view => view.tools))];
+  const members = /** @type {ExecutionToolRow[]} */ (ids.map(id => toolOfId(tools, id)).filter(Boolean));
+  if (members.length === 0) return views[0];
+  const merged = viewForMembers(members, approvalIds);
+  // The first block owns the stable identity so an open group survives the
+  // next step arriving.
+  merged.id = views[0].id;
+  merged.rounds = [...new Set(views.flatMap(view => view.rounds ?? []))];
+  return merged;
+}
+
 /** The status words appended to a collapsed execution summary.
  * @param {ReturnType<typeof executionView>} view */
 export function executionStatusLabel(view) {
@@ -543,9 +638,7 @@ export function executionStatusLabel(view) {
   if (view.failed > 0) parts.push(`${view.failed} ${unit}失败`);
   if (view.cancelled > 0) parts.push(`${view.cancelled} ${unit}已停止`);
   if (view.unknown > 0) parts.push(`${view.unknown} ${unit}结果未知`);
-  if (parts.length > 0) return parts.join(' · ');
-  if (view.variant === 'edit' || view.variant === 'exploration') return '';
-  return view.commandGroup ? '全部成功' : '全部完成';
+  return parts.join(' · ');
 }
 
 /**

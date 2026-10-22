@@ -50,7 +50,58 @@ try{
  assert.equal(await page.locator('.message-time').filter({hasText:'1970'}).count(),0);
  const alignment=await page.evaluate(()=>{const u=document.querySelector('.message.user'),b=u.querySelector('.bubble'),a=document.querySelector('.message.assistant');return {userRight:Math.round(u.getBoundingClientRect().right-b.getBoundingClientRect().right),assistantOpen:getComputedStyle(a).backgroundColor,bubble:getComputedStyle(b).backgroundColor};});
  assert.equal(alignment.userRight,0);assert.equal(alignment.assistantOpen,'rgba(0, 0, 0, 0)');evidence.alignment=alignment;
+ evidence.children=await page.evaluate(()=>[...document.querySelector('#conversation').children].map(node=>{const rect=node.getBoundingClientRect();return{cls:String(node.className),key:node.dataset.key??'',top:Math.round(rect.top),bottom:Math.round(rect.bottom),height:Math.round(rect.height)};}));
+ evidence.user_children=await page.evaluate(()=>[...document.querySelector('.message.user').children].map(node=>{const rect=node.getBoundingClientRect();return{cls:String(node.className),top:Math.round(rect.top),bottom:Math.round(rect.bottom),height:Math.round(rect.height)};}));
+ const [userRow,processRow,answerRow]=evidence.children;
+ assert.equal(userRow.height,76,'user row is bubble 42 + gap 6 + actions 28');
+ assert.equal(processRow.top-userRow.bottom,6,'process follows the user turn by 6px');
+ assert.equal(answerRow.top-processRow.bottom,12,'an answer is separated from process by 12px');
  await page.screenshot({path:path.join(output,'message-layout-wide.png')});
+ // Layout parity at the reference breakpoints. Expected values come from the
+ // frozen reference CSS (ChatView/ConversationRoot), not from this render:
+ // column = clamp(680, 64% of the conversation body, 920); composer card =
+ // column + 32; process row = 24.
+ const resize = async (width,height) => {
+   await app.evaluate(({BrowserWindow},size)=>BrowserWindow.getAllWindows()[0].setContentSize(size.width,size.height),{width,height});
+   await page.waitForFunction(w=>innerWidth===w,width);
+   // The responsive sidebar collapse is a transition; sample the settled frame.
+   await page.waitForTimeout(350);
+   await page.evaluate(async()=>{await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));await Promise.all(document.getAnimations().filter(animation=>animation.constructor.name==='CSSTransition').map(animation=>animation.finished.catch(()=>{})));});
+ };
+ const measure = () => page.evaluate(()=>{
+   const box = node => { const rect=node.getBoundingClientRect(); return {left:Math.round(rect.left),right:Math.round(rect.right),width:Math.round(rect.width),height:Math.round(rect.height)}; };
+   const main=document.querySelector('.main').getBoundingClientRect();
+   return {
+     inner:[innerWidth,innerHeight],
+     main:{width:Math.round(main.width)},
+     conversation:box(document.querySelector('#conversation')),
+     bubble:box(document.querySelector('.message.user .bubble')),
+     userRow:box(document.querySelector('.message.user')),
+     composer:box(document.querySelector('#composer-card')),
+     processRow:box(document.querySelector('.execution-group .execution-summary')),
+     assistant:box(document.querySelector('.message.assistant')),
+   };
+ });
+ const columnTarget = width => Math.min(Math.max(680,0.64*width),920);
+ const layouts={};
+ for(const [label,size] of [['1440',{width:1440,height:900}],['960',{width:960,height:600}]]){
+   await resize(size.width,size.height);
+   const m=await measure();
+   const available=Math.round(m.main.width-64);
+   const expected=Math.min(Math.round(columnTarget(m.main.width)),available);
+   assert.ok(Math.abs(m.conversation.width-expected)<=2,`${label}: column ${m.conversation.width} vs ${expected}`);
+   const cardTarget=Math.min(m.conversation.width+32,m.main.width-32);
+   assert.ok(Math.abs(m.composer.width-cardTarget)<=2,`${label}: composer ${m.composer.width} vs ${cardTarget}`);
+   assert.equal(m.userRow.right,m.conversation.right,`${label}: user row is not right-aligned to the column`);
+   assert.equal(m.bubble.right,m.userRow.right,`${label}: bubble is not right-aligned`);
+   assert.ok(Math.abs(m.processRow.height-24)<=1,`${label}: process row ${m.processRow.height} vs 24`);
+   assert.equal(m.assistant.left,m.conversation.left,`${label}: assistant text is not column-aligned`);
+   layouts[label]=m;
+   await page.screenshot({path:path.join(output,`message-layout-${label}.png`)});
+ }
+ evidence.layouts=layouts;
+ evidence.column_targets={wide:columnTarget(layouts['1440'].main.width),narrow:columnTarget(layouts['960'].main.width)};
+ await resize(1280,820);
  await assistant.locator('.markdown-file-link').first().click();await page.waitForFunction(()=>document.querySelector('.preview-body')?.textContent.includes('After'));
  evidence.inline_preview=true;
  // The modification summary opens the confirmed Workbench, and its file rows

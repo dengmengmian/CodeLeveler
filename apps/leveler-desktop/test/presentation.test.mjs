@@ -245,3 +245,35 @@ test('a command row names the command the runtime actually ran', async () => {
   const { toolTarget } = await import('../src/presentation.mjs');
   assert.equal(toolTarget({ name: 'shell_command', arguments: '{"cmd":"git fetch --all --prune"}' }), 'git fetch --all --prune');
 });
+
+test('an unrecognized tool keeps the reference wording and never claims to execute', async () => {
+  const { toolLabel } = await import('../src/presentation.mjs');
+  assert.equal(toolLabel({ name: 'mystery_tool' }), '工具调用');
+  assert.equal(toolLabel({ name: 'browser_scroll' }), '浏览器操作');
+});
+
+test('skills, subagents and harness controls keep their real identity', async () => {
+  const { toolLabel } = await import('../src/presentation.mjs');
+  assert.equal(toolLabel({ name: 'load_skill' }), '使用技能');
+  assert.equal(toolLabel({ name: 'spawn_agent' }), '创建子智能体');
+  assert.equal(toolLabel({ name: 'update_plan' }), '更新计划');
+  assert.equal(toolLabel({ name: 'request_user_input' }), '询问用户');
+});
+
+test('a multi-step tool run collapses to one category sentence, not a count', async () => {
+  const { executionView, executionStatusLabel, mergeExecutionViews } = await import('../src/presentation.mjs');
+  const rows = [
+    { id: 'c1', name: 'run_command', status: 'success', modelStep: 1, preview: 'ok', seq: 1 },
+    { id: 'c2', name: 'run_command', status: 'success', modelStep: 1, preview: 'ok', seq: 2 },
+    { id: 'r1', name: 'read_file', status: 'success', modelStep: 2, preview: 'ok', seq: 3 },
+  ];
+  const first = executionView({ kind: 'round', round: { modelStep: 1, tools: rows.slice(0, 2), status: 'ok', allOk: true, batches: [] } }, rows, new Set());
+  const second = executionView({ kind: 'round', round: { modelStep: 2, tools: rows.slice(2), status: 'ok', allOk: true, batches: [] } }, rows, new Set());
+  assert.equal(first.label, '执行了命令');
+  const merged = mergeExecutionViews([first, second], rows, new Set());
+  assert.equal(merged.id, first.id);
+  assert.deepEqual(merged.toolIds, ['c1', 'c2', 'r1']);
+  assert.equal(merged.label, '执行了命令并已读取文件');
+  assert.equal(executionStatusLabel(merged), '', 'a settled run carries no trailing success sentence');
+  assert.equal(executionStatusLabel({ ...merged, failed: 1 }), '1 项失败');
+});

@@ -239,14 +239,12 @@ try {
   await page.waitForFunction(() => [...document.querySelectorAll('.execution-group')].every(group => !group.open));
   const before = await page.evaluate(() => {
     const clone = document.querySelector('#conversation').cloneNode(true);
-    clone.querySelectorAll('.turn-usage').forEach(node => node.remove());
     return {
       users: document.querySelectorAll('.message.user').length,
       finals: document.querySelectorAll('.message.assistant.final').length,
       groups: document.querySelectorAll('.execution-group').length,
       receipts: document.querySelectorAll('.turn-receipt').length,
       record: [...document.querySelector('#conversation').children]
-        .filter(node => !node.classList.contains('turn-usage'))
         .map(node => {
           if (node.classList.contains('execution-group')) return `group:${node.querySelector('.execution-summary')?.textContent.replace(/\s+/g, ' ')}`;
           if (node.classList.contains('message')) return `${node.className}:${node.textContent.trim().slice(0, 160)}`;
@@ -268,14 +266,12 @@ try {
   await page.waitForFunction(() => document.querySelector('#conversation-status')?.textContent !== '连接 Runtime…');
   const after = await page.evaluate(() => {
     const clone = document.querySelector('#conversation').cloneNode(true);
-    clone.querySelectorAll('.turn-usage').forEach(node => node.remove());
     return {
       users: document.querySelectorAll('.message.user').length,
       finals: document.querySelectorAll('.message.assistant.final').length,
       groups: document.querySelectorAll('.execution-group').length,
       receipts: document.querySelectorAll('.turn-receipt').length,
       record: [...document.querySelector('#conversation').children]
-        .filter(node => !node.classList.contains('turn-usage'))
         .map(node => {
           if (node.classList.contains('execution-group')) return `group:${node.querySelector('.execution-summary')?.textContent.replace(/\s+/g, ' ')}`;
           if (node.classList.contains('message')) return `${node.className}:${node.textContent.trim().slice(0, 160)}`;

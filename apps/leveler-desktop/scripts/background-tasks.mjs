@@ -119,18 +119,32 @@ try {
   evidence.failed_job_visible = true;
   await send('BG_RUN');
   await page.waitForFunction(() => document.querySelector('#header-session-actions')?.innerText.includes('后台任务运行中'));
+  // The header is a window drag region; the count controls must opt out or
+  // macOS consumes their real mouse events before the page sees them.
+  assert.equal(
+    await page.locator('#header-session-actions').evaluate(node => getComputedStyle(node).webkitAppRegion),
+    'no-drag',
+  );
   popover = await openJobs();
   assert.match(await popover.innerText(), /进行中/);
-  assert.match(await popover.innerText(), /tick-/);
+  assert.match(await popover.innerText(), /运行中/);
   await page.waitForTimeout(3000);
-  const outputToggle = popover.locator('.header-job-output-toggle').first();
-  await outputToggle.waitFor({ timeout: 5000 });
-  await outputToggle.click();
-  assert.match(await popover.locator('.header-job-output').innerText(), /\[stdout\] tick-/);
+  // The whole live row is the disclosure: it opens the runtime-reported output.
+  await popover.locator('.job-row').first().click();
+  await popover.locator('.job-output').waitFor({ timeout: 5000 });
+  assert.match(await popover.locator('.job-output').innerText(), /\[stdout\] tick-/);
+  await page.screenshot({ path: path.join(output, 'background-tasks-live-output.png') });
   const pids = tickPids();
   assert.ok(pids.length > 0, 'the Runtime background process is alive before stop');
-  await popover.locator('.header-job-stop').first().click();
-  await page.waitForFunction(() => !document.querySelector('.jobs-popover'));
+  // The stop control confirms on a second press; the first press only arms it.
+  await popover.locator('.job-stop').first().click();
+  assert.match(await popover.locator('.job-stop').first().innerText(), /确认停止/);
+  await page.screenshot({ path: path.join(output, 'background-tasks-stop-armed.png') });
+  await page.waitForTimeout(200);
+  assert.ok(tickPids().length > 0, 'the armed first press must not stop the process');
+  await popover.locator('.job-stop').first().click();
+  await page.waitForFunction(() => !document.querySelector('.jobs-popover .job-live-card'), null, { timeout: 15000 });
+  assert.match(await popover.innerText(), /已停止/);
   for (let index = 0; index < 40 && tickPids().length; index += 1) await page.waitForTimeout(100);
   assert.deepEqual(tickPids(), []);
   evidence.stop_killed_process = { before: pids, after: [] };
