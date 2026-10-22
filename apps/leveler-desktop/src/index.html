@@ -61,7 +61,7 @@
           <nav id="header-crumbs" class="header-crumbs" aria-label="会话层级">
             <h1 id="conversation-title"></h1>
           </nav>
-          <span id="header-preset" class="header-preset">标准模式</span>
+          <span id="header-preset" class="header-preset">默认模式</span>
           <div id="header-session-actions" class="header-session-actions"></div>
           <span id="conversation-status" class="conversation-status" role="status"></span>
         </div>
@@ -105,21 +105,21 @@
       <div id="composer-stack" class="composer-stack">
         <div id="home-hero" class="home-hero">
           <span id="hero-mark" class="hero-mark" aria-hidden="true"></span>
-          <span class="hero-title">探索未至之境</span>
-          <span class="preview-badge">预览版</span>
+          <span class="hero-title">让模型把任务做完</span>
+          <span class="preview-badge">本地运行时</span>
         </div>
         <div id="home-context" class="home-context">
           <button id="workspace-picker" class="context-trigger" type="button" aria-label="选择工作区"></button>
-          <button id="preset-picker" class="context-trigger" type="button" aria-label="选择 Agent 预设" data-tooltip="选择新任务使用的 Agent 预设"></button>
+          <button id="preset-picker" class="context-trigger" type="button" aria-label="选择 Agent 模式" data-tooltip="选择新任务使用的 Agent 模式"></button>
         </div>
         <div id="composer-docks" class="composer-docks"></div>
         <div id="composer-card" class="composer-card">
           <div class="composer-input-wrap">
-            <textarea id="message" class="composer-input" rows="1" placeholder="描述你想要构建的内容, / 调用指令, @ 文件或对话" aria-label="消息"></textarea>
+            <textarea id="message" class="composer-input" rows="1" placeholder="描述任务，/ 调用指令，@ 引用文件或会话" aria-label="消息"></textarea>
           </div>
           <div id="attachment-chips" class="attachment-chips" aria-label="待发送附件" hidden></div>
           <div class="composer-row">
-            <button id="attachment-add" class="composer-round" type="button" aria-label="添加文件或调用指令" data-tooltip="添加文件或调用指令"></button>
+            <button id="attachment-add" class="composer-round" type="button" aria-label="添加附件或调用指令" data-tooltip="添加附件或调用指令"></button>
             <button id="permission-picker" class="composer-trigger" type="button" aria-label="访问模式"></button>
             <button id="plan-mode" class="composer-trigger plan-mode" type="button" aria-label="计划模式" data-tooltip="计划模式（未接入）"></button>
             <div class="composer-spacer"></div>

@@ -1276,7 +1276,7 @@ function ensureHeaderActions() {
     });
   });
   const preset = $('header-preset');
-  if (preset && !preset.querySelector('svg')) preset.replaceChildren(iconNode('shield', { size: 14 }), el('span', undefined, '标准模式'));
+  if (preset && !preset.querySelector('svg')) preset.replaceChildren(iconNode('shield', { size: 14 }), el('span', undefined, '默认模式'));
   const sessionActions = $('header-session-actions');
   headerSubagentButton = headerCountButton();
   headerJobsButton = headerCountButton();
@@ -1731,7 +1731,7 @@ function renderComposerMeta() {
   const preset = $('preset-picker');
   preset.replaceChildren(
     iconNode('bot', { size: 14 }),
-    el('span', 'trigger-label', '标准模式'),
+    el('span', 'trigger-label', '默认模式'),
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
   const mode = current?.session.mode;
@@ -2709,9 +2709,9 @@ function openPlanReviewPanel() {
   if (!steps.length) return;
   const dialog = el('dialog', 'modal plan-review-modal');
   const card = el('div', 'plan-review-card');
-  card.setAttribute('aria-label', '计划待审');
+  card.setAttribute('aria-label', '执行计划');
   const strip = el('div', 'plan-review-strip');
-  strip.append(el('span', 'plan-review-dot'), el('span', undefined, '计划待审'));
+  strip.append(el('span', 'plan-review-dot'), el('span', undefined, '执行计划'));
   const summary = el('div', 'plan-review-summary');
   summary.append(el('h3', 'plan-review-title', steps[0]?.description ?? '执行计划'));
   if (steps.length > 1) summary.append(el('p', 'plan-review-description', steps.slice(1).map(step => step.description).join(' · ')));
@@ -2920,9 +2920,9 @@ function runningLabel() {
   const elapsed = runStartedAt ? Math.floor((Date.now() - runStartedAt) / 1000) : 0;
   const clock = elapsed >= 1 ? `，用时 ${elapsed}s ···` : ' ···';
   // Commands and other runtime activity own the line while they run; bare
-  // "深度求索中" is only the fallback between activities (TUI precedence).
+  // The bare processing label is only the fallback between activities.
   const activity = String(current?.activity ?? '').trim();
-  const base = activity ? `${activity}${clock}` : `深度求索中${clock}`;
+  const base = activity ? `${activity}${clock}` : `正在处理${clock}`;
   return modelRetry ? `${base} 正在重试模型请求（${modelRetry.attempt}/${modelRetry.max}）` : base;
 }
 
@@ -3945,12 +3945,9 @@ function openPresetMenu(anchor) {
     anchor, width: 250, side: 'top',
     items: [
       { heading: '内置' },
-      { label: '标准模式', icon: 'bot', checked: true, onSelect: () => {} },
-      { label: 'PTC 模式', icon: 'layers', disabled: true, badge: '未接入' },
-      { label: '极简模式', icon: 'minus', disabled: true, badge: '未接入' },
-      { label: '创造模式', icon: 'sparkle', disabled: true, badge: '未接入' },
+      { label: '默认模式', icon: 'bot', checked: true, onSelect: () => {} },
       { divider: true },
-      { label: 'Agent 预设切换', icon: 'bot', disabled: true, badge: '未接入' },
+      { label: 'Agent 模式切换', icon: 'bot', disabled: true, badge: '未接入' },
     ],
   });
 }
@@ -6397,7 +6394,7 @@ function settingsNav() {
   nav.replaceChildren();
   for (const [id, label, icon] of [
     ['general', '通用设置', 'settings'], ['models', '模型', 'layers'],
-    ['plugins', '内置插件', 'plugins'], ['presets', 'Agent 预设', 'bot'],
+    ['plugins', '内置插件', 'plugins'], ['presets', 'Agent 模式', 'bot'],
   ]) {
     const button = el('button');
     button.type = 'button';
@@ -6577,7 +6574,7 @@ function renderGeneralSettings(content) {
       settings.terminalFontSize = value; saveSettings(); applyContentFont(); renderSettings();
     })));
   }
-  const viewRow = settingRow('显示代码工作视图', '开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 预设切换',
+  const viewRow = settingRow('显示代码工作视图', '开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 模式切换',
     unavailableControl(switchControl(settings.codingView, () => {}, { disabled: true }), '当前版本不可用：没有本轮代码差异视图，无法完整切换'));
   viewRow.classList.add('setting-row-compact');
   group.append(viewRow);
@@ -6594,8 +6591,8 @@ function renderGeneralSettings(content) {
   group.append(settingRow('性能与用量', '选择性能与用量信息展示的详细程度', menuControl(settings.performance, [
     { value: 'detailed', label: '详细' }, { value: 'compact', label: '简洁' },
   ], value => { settings.performance = value; saveSettings(); renderConversation(); renderContextMeter(); }, { label: '性能与用量' })));
-  const sessionLogRow = settingRow('在使用官方模型 API 时上传 Session Log', '帮助改进 DeepSeek 模型与产品',
-    unavailableControl(switchControl(false, () => {}, { disabled: true }), '当前版本不可用：未接入 Session Log 上传接口'));
+  const sessionLogRow = settingRow('上传 Session 日志', '帮助改进 CodeLeveler 的工具与体验',
+    unavailableControl(switchControl(false, () => {}, { disabled: true }), '当前版本不可用：未接入 Session 日志上传接口'));
   sessionLogRow.classList.add('setting-row-compact');
   group.append(sessionLogRow);
   const updateRow = settingRow('软件更新', '检查 GitHub Releases 上是否有新版本；安装由 leveler update 完成', updateControl());
@@ -6704,12 +6701,12 @@ function renderPluginSettings(content) {
 }
 
 function renderPresetSettings(content) {
-  content.append(el('h2', 'settings-title-large', 'Agent 预设'));
-  content.append(el('p', 'settings-note', '选择 Agent 的工具和工作方式。日常任务用「标准模式」。'));
+  content.append(el('h2', 'settings-title-large', 'Agent 模式'));
+  content.append(el('p', 'settings-note', '当前会话使用 Runtime 的默认模式；模式切换接口尚未接入桌面。'));
   const standard = el('div', 'preset-card');
   const head = el('div', 'preset-head');
-  head.append(el('span', 'preset-name', '标准模式'), el('span', 'preset-tag', '当前'));
-  standard.append(head, el('div', 'preset-desc', '处理代码、文件和资料，适合大多数任务。Agent 会按需使用检索、编辑和终端等工具。'));
+  head.append(el('span', 'preset-name', '默认模式'), el('span', 'preset-tag', '当前'));
+  standard.append(head, el('div', 'preset-desc', '使用 Runtime 默认的工具与执行方式；模型会按任务需要选择检索、编辑和终端能力。'));
   content.append(standard);
   if (!current) { content.append(el('div', 'settings-note', '打开会话后可读取 Runtime 的 Agent 定义。')); return; }
   if (!agentsRead || agentsRead.owner !== current.session.id) {
@@ -6738,16 +6735,16 @@ function renderPresetSettings(content) {
     const makeDefault = el('button', 'button ghost small', '设为默认');
     makeDefault.type = 'button';
     makeDefault.disabled = true;
-    makeDefault.title = 'Runtime 未提供预设默认切换接口';
+    makeDefault.title = 'Runtime 未提供模式默认切换接口';
     tags.append(view, usage, makeDefault);
     card.append(tags);
     content.append(card);
   }
   for (const problem of agentsRead.data?.problems ?? []) content.append(el('div', 'settings-note', `${problem.source}: ${problem.error}`));
-  const create = el('button', 'button secondary', '让 Agent 帮我创建预设模式');
+  const create = el('button', 'button secondary', '让 Agent 帮我创建模式');
   create.type = 'button';
   create.disabled = true;
-  create.title = '当前桌面桥接未提供预设写入接口';
+  create.title = '当前桌面桥接未提供模式写入接口';
   content.append(create);
 }
 
@@ -6768,7 +6765,7 @@ function openPresetDialog(agent, mode) {
     body.append(el('pre', 'preset-config', JSON.stringify(safe, null, 2)));
   } else {
     body.append(el('p', undefined, agent.description || '没有描述'));
-    body.append(el('p', undefined, '该预设由 Runtime 提供；当前桌面只读展示其定义，切换能力尚未接入。'));
+    body.append(el('p', undefined, '该模式由 Runtime 提供；当前桌面只读展示其定义，切换能力尚未接入。'));
   }
   card.append(head, body);
   dialog.append(card);
