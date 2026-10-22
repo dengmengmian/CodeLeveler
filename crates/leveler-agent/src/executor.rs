@@ -292,10 +292,22 @@ fn render_entry_line(
                 body,
             )
         }
-        None => (
-            format!("- [{}] {}: ", entry.id.trim(), entry.title.trim()),
-            entry.body.trim().to_string(),
-        ),
+        None => {
+            let authority = entry.authority().as_str();
+            let source = entry
+                .provenance
+                .as_ref()
+                .map(|provenance| provenance.source.trim())
+                .filter(|source| !source.is_empty());
+            let label = match source {
+                Some(source) => format!("user·{authority}·{source}"),
+                None => format!("user·{authority}"),
+            };
+            (
+                format!("- [{}] ({label}) {}: ", entry.id.trim(), entry.title.trim()),
+                entry.body.trim().to_string(),
+            )
+        }
     };
     let prefix = label;
     let body = body.as_str();
@@ -4357,11 +4369,11 @@ mod recall_tests {
             "the model must not read recall as authorization: {block}"
         );
         assert!(
-            block.contains("[a] Build target: install to ~/.cargo/bin"),
+            block.contains("[a] (user·model_inference) Build target: install to ~/.cargo/bin"),
             "{block}"
         );
         assert!(
-            block.contains("[b] Concurrency: never git stash"),
+            block.contains("[b] (user·model_inference) Concurrency: never git stash"),
             "{block}"
         );
         assert_eq!(plan.selected, vec!["a".to_string(), "b".to_string()]);
@@ -4539,6 +4551,25 @@ mod recall_tests {
         );
         assert!(block.contains("Lasting preferences"), "{block}");
         assert!(block.contains("Retrieved as possibly relevant"), "{block}");
+    }
+
+    /// A user fact must name where it came from and how strong it is. Without
+    /// the label the model cannot tell an explicit project decision from the
+    /// model's own earlier inference.
+    #[test]
+    fn a_user_memory_names_its_source_and_authority() {
+        let mut fact = entry("mcp", "MCP 身份验证", "MCP 读写必须经过身份验证");
+        fact.provenance = Some(leveler_memory::Provenance {
+            authority: leveler_memory::MemoryAuthority::ExplicitUser,
+            source: "explicit_user_turn".to_string(),
+            evidence: None,
+        });
+        let (_, block) = render(Vec::new(), vec![fact]);
+        let block = block.expect("block");
+        assert!(
+            block.contains("(user·explicit_user·explicit_user_turn)"),
+            "user memory must name source and authority: {block}"
+        );
     }
 
     /// A lasting preference must reach the model even when the request shares
