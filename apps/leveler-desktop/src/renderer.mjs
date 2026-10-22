@@ -2601,6 +2601,13 @@ function executionNode(existing, item) {
       if (node.open) fillExecutionBody(node, state.view, state.existing);
       else node.querySelector('.execution-body').replaceChildren();
     });
+    if (view.variant !== 'edit') {
+      // Disclosure affordance: the row's leading mark names the activity, so
+      // the fold arrow trails the summary instead of competing with it.
+      const chevron = el('span', 'execution-chevron-wrap');
+      chevron.append(iconNode('chevronDown', { size: 12 }));
+      summary.append(chevron);
+    }
     if (view.variant === 'edit') {
       const toggle = el('button', 'execution-toggle');
       toggle.type = 'button';

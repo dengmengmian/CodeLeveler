@@ -753,6 +753,9 @@ details[open] > .thought-summary .thought-chevron { transform: rotate(90deg); }
 .execution-group[data-tone="warning"] .execution-label { color: var(--warning); }
 .execution-group[data-tone="error"] .execution-label { color: var(--error); }
 .execution-hint { flex: none; margin-left: auto; color: var(--text-tertiary); font-size: 11px; }
+.execution-chevron-wrap { display: inline-flex; flex: none; align-items: center; margin-left: auto; color: var(--text-caption); }
+.execution-chevron-wrap svg { transition: transform 120ms var(--ease); }
+details[open] > .execution-summary .execution-chevron-wrap svg { transform: rotate(180deg); }
 .execution-toggle {
   display: inline-flex; align-items: center; justify-content: center;
   flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 6px;
