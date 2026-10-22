@@ -35,6 +35,9 @@ pub const MAX_WORKER_BATCH_TURNS: u32 = MAX_BATCH_TURNS as u32;
 /// unless enough work exists for a real batch.
 const MAX_AGE_FLUSH: Duration = Duration::from_secs(60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+/// Settlement time an exit flush may spend beyond the extraction call it
+/// already bounds with `extraction_timeout`.
+const FLUSH_SETTLE_MARGIN: Duration = Duration::from_secs(30);
 const PROCESSED_RETENTION_DAYS: i64 = 7;
 const PRUNE_LIMIT: u32 = 128;
 /// Experience work is one whole task per row and one provider call at a time.
@@ -62,6 +65,30 @@ pub struct ConsolidationOutcome {
     pub claimed: usize,
     pub accepted: usize,
     pub rejected: usize,
+}
+
+/// What an explicit exit flush actually settled.
+///
+/// Durable queue state stays the truth: a flush that cannot finish leaves its
+/// rows `pending` or `failed_retryable`, never in a hand-off limbo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryFlushOutcome {
+    /// Rows settled by this flush (processed or deterministically skipped).
+    pub settled: usize,
+    /// Rows still durable in an open lane when the flush returned.
+    pub remaining: u64,
+    /// A lane failed; its rows are parked for a durable retry.
+    pub failed: bool,
+    /// The flush stopped at its time budget instead of draining.
+    pub timed_out: bool,
+}
+
+impl MemoryFlushOutcome {
+    /// True only when every row in an open lane was settled.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.remaining == 0 && !self.failed && !self.timed_out
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -114,6 +141,14 @@ pub struct MemoryConsolidator {
     lanes: leveler_memory::MemoryLanes,
     runtime: Arc<dyn ModelRuntime>,
     extraction_timeout: Duration,
+    /// Upper bound on an explicit exit flush: one full extraction attempt
+    /// plus settlement. Work beyond it stays durably queued for retry.
+    flush_budget: Duration,
+    /// Serialises the worker loop with an explicit exit flush. Both call
+    /// `run_once` / `run_experience_once`, which recover this boot's own
+    /// unsettled claims on entry; two concurrent callers would steal each
+    /// other's in-flight work and extract the same turn twice.
+    work: tokio::sync::Mutex<()>,
     notify: Notify,
     cancel: CancellationToken,
     event_sink: MemoryEventSink,
@@ -136,6 +171,8 @@ impl MemoryConsolidator {
             lanes: leveler_memory::MemoryLanes::ALL,
             runtime,
             extraction_timeout: DEFAULT_EXTRACTION_TIMEOUT,
+            flush_budget: DEFAULT_EXTRACTION_TIMEOUT + FLUSH_SETTLE_MARGIN,
+            work: tokio::sync::Mutex::new(()),
             notify: Notify::new(),
             cancel: CancellationToken::new(),
             event_sink,
@@ -159,6 +196,14 @@ impl MemoryConsolidator {
         self
     }
 
+    #[cfg(test)]
+    fn with_flush_budget(mut self: Arc<Self>, budget: Duration) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a fresh consolidator has no other owners")
+            .flush_budget = budget;
+        self
+    }
+
     /// Wake the worker after a turn reaches a terminal state. This never waits
     /// for extraction and therefore cannot affect turn success or latency.
     pub fn notify_turn_terminal(&self) {
@@ -174,6 +219,109 @@ impl MemoryConsolidator {
     /// return it to the retry queue after the boot lease ends.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Drain ready memory work before a headless process exits.
+    ///
+    /// The idle debounce exists to batch provider calls while a session is
+    /// live; it must not outlive the process. This runs the worker's own
+    /// passes, serially with the loop (see [`Self::work`]), under a bounded
+    /// budget. Anything that does not settle stays `pending` or
+    /// `failed_retryable` and is reported by [`MemoryFlushOutcome`].
+    pub async fn flush(&self) -> MemoryFlushOutcome {
+        let deadline = tokio::time::Instant::now() + self.flush_budget;
+        let mut settled = 0usize;
+        let mut failed = false;
+        let timed_out = loop {
+            let ready = self.ready_count().await + self.experience_ready_count().await;
+            if ready == 0 {
+                break false;
+            }
+            let permit = match tokio::time::timeout_at(deadline, self.work.lock()).await {
+                Ok(permit) => permit,
+                Err(_) => break true,
+            };
+            let mut progressed = false;
+            if self.lanes.experience {
+                match self.run_experience_once().await {
+                    Ok(claimed) => {
+                        progressed |= claimed;
+                        settled += usize::from(claimed);
+                    }
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(
+                            %error,
+                            "experience consolidation failed during the exit flush"
+                        );
+                    }
+                }
+            }
+            if self.lanes.user {
+                match self.run_once().await {
+                    Ok(outcome) => {
+                        progressed |= outcome.claimed > 0;
+                        settled += outcome.claimed;
+                    }
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(%error, "memory consolidation failed during the exit flush");
+                    }
+                }
+            }
+            drop(permit);
+            if !progressed {
+                break false;
+            }
+        };
+        let remaining = self.outstanding().await;
+        if remaining > 0 || failed || timed_out {
+            tracing::warn!(
+                event = "memory_flush_incomplete",
+                settled,
+                remaining,
+                failed,
+                timed_out,
+                "memory work remains durably queued after the exit flush"
+            );
+        } else {
+            tracing::debug!(
+                event = "memory_flush_complete",
+                settled,
+                "memory work settled before exit"
+            );
+        }
+        MemoryFlushOutcome {
+            settled,
+            remaining,
+            failed,
+            timed_out,
+        }
+    }
+
+    /// Rows still durable in lanes this worker owns. Processed rows are
+    /// retained diagnostics, not outstanding work.
+    async fn outstanding(&self) -> u64 {
+        let mut total = 0u64;
+        if self.lanes.user {
+            match MemoryInboxRepository::new(&self.db).counts().await {
+                Ok(counts) => {
+                    total += counts.pending + counts.failed_retryable + counts.processing;
+                }
+                Err(error) => tracing::warn!(%error, "could not count outstanding memory work"),
+            }
+        }
+        if self.lanes.experience {
+            match ExperienceInboxRepository::new(&self.db).counts().await {
+                Ok(counts) => {
+                    total += counts.pending + counts.failed_retryable + counts.processing;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not count outstanding experience work");
+                }
+            }
+        }
+        total
     }
 
     /// Start the single project worker. The returned task is deliberately not
@@ -199,34 +347,40 @@ impl MemoryConsolidator {
         // provider call merely because an experience row woke the worker.
         let mut flush_memory = true;
         loop {
-            let experience_claimed = if self.lanes.experience {
-                match self.run_experience_once().await {
-                    Ok(claimed) => claimed,
-                    Err(error) => {
-                        tracing::warn!(%error, "experience consolidation failed");
-                        false
+            // The pass guard is released before the idle wait: an exit flush
+            // must be able to run its own pass while the worker sleeps.
+            let (experience_claimed, memory_claimed) = {
+                let _pass = self.work.lock().await;
+                let experience_claimed = if self.lanes.experience {
+                    match self.run_experience_once().await {
+                        Ok(claimed) => claimed,
+                        Err(error) => {
+                            tracing::warn!(%error, "experience consolidation failed");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                let mut memory_claimed = 0usize;
+                if flush_memory {
+                    match self.run_once().await {
+                        Ok(outcome) => {
+                            memory_claimed = outcome.claimed;
+                            tracing::debug!(
+                                claimed = outcome.claimed,
+                                accepted = outcome.accepted,
+                                rejected = outcome.rejected,
+                                "memory consolidation batch settled"
+                            );
+                            flush_memory = outcome.claimed == MAX_WORKER_BATCH_TURNS as usize
+                                || self.ready_count().await >= IMMEDIATE_BATCH_THRESHOLD as u64;
+                        }
+                        Err(error) => tracing::warn!(%error, "memory consolidation batch failed"),
                     }
                 }
-            } else {
-                false
+                (experience_claimed, memory_claimed)
             };
-            let mut memory_claimed = 0usize;
-            if flush_memory {
-                match self.run_once().await {
-                    Ok(outcome) => {
-                        memory_claimed = outcome.claimed;
-                        tracing::debug!(
-                            claimed = outcome.claimed,
-                            accepted = outcome.accepted,
-                            rejected = outcome.rejected,
-                            "memory consolidation batch settled"
-                        );
-                        flush_memory = outcome.claimed == MAX_WORKER_BATCH_TURNS as usize
-                            || self.ready_count().await >= IMMEDIATE_BATCH_THRESHOLD as u64;
-                    }
-                    Err(error) => tracing::warn!(%error, "memory consolidation batch failed"),
-                }
-            }
             if (experience_claimed && self.experience_ready_count().await > 0)
                 || (flush_memory && memory_claimed > 0)
             {
@@ -1850,6 +2004,207 @@ mod tests {
         assert!(events.lock().unwrap().iter().any(|event| {
             event.operation == "superseded" && event.title.contains("不要后台启动")
         }));
+    }
+
+    #[tokio::test]
+    async fn flush_settles_ready_turns_before_a_headless_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型是 Flash".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+
+        let outcome = worker.flush().await;
+
+        assert_eq!(
+            outcome.settled, 1,
+            "a ready turn must be extracted before the process exits"
+        );
+        assert_eq!(outcome.remaining, 0);
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let counts = MemoryInboxRepository::new(&db)
+            .counts()
+            .await
+            .unwrap();
+        assert_eq!(counts.processed, 1);
+        assert_eq!(counts.pending, 0);
+    }
+
+    #[tokio::test]
+    async fn a_flushed_turn_is_not_consumed_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型是 Flash".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+        assert_eq!(worker.flush().await.settled, 1);
+
+        // The next process (a fresh boot) must find nothing left to extract.
+        let next = MemoryConsolidator::new(
+            db,
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+        assert_eq!(next.run_once().await.unwrap().claimed, 0);
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            1,
+            "one turn is one extraction, whoever drains it"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_flushes_settle_each_turn_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型是 Flash".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+
+        let (first, second) = tokio::join!(worker.flush(), worker.flush());
+
+        assert_eq!(first.settled + second.settled, 1);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            MemoryInboxRepository::new(&db)
+                .counts()
+                .await
+                .unwrap()
+                .processed,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_parks_its_rows_for_a_durable_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型是 Flash".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Err(ModelError::new(
+            ModelErrorKind::Timeout,
+            "timed out",
+        ))]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime,
+            Arc::new(|_| {}),
+        )
+        .with_extraction_timeout(Duration::from_millis(100))
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+
+        let outcome = worker.flush().await;
+
+        assert!(outcome.failed, "{outcome:?}");
+        assert_eq!(outcome.remaining, 1);
+        assert!(!outcome.timed_out);
+        assert!(!outcome.is_complete());
+        let counts = MemoryInboxRepository::new(&db)
+            .counts()
+            .await
+            .unwrap();
+        assert_eq!(counts.failed_retryable, 1, "the row stays durable");
+        assert_eq!(counts.processing, 0, "the claim must not be left stuck");
+    }
+
+    #[tokio::test]
+    async fn flush_never_claims_work_from_a_closed_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型是 Flash".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+
+        let outcome = worker.flush().await;
+
+        assert_eq!(outcome.settled, 1);
+        assert!(outcome.is_complete(), "{outcome:?}");
+        let experience = ExperienceInboxRepository::new(&db)
+            .counts()
+            .await
+            .unwrap();
+        assert_eq!(
+            experience.pending, 1,
+            "the closed experience lane keeps its durable row"
+        );
+        assert_eq!(experience.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_is_bounded_when_another_pass_holds_the_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型是 Flash".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        )
+        .with_flush_budget(Duration::from_millis(50))
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+
+        let _pass = worker.work.lock().await;
+        let outcome = worker.flush().await;
+
+        assert!(outcome.timed_out, "{outcome:?}");
+        assert_eq!(outcome.remaining, 1);
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            0,
+            "the flush must never run a pass beside the worker"
+        );
+        assert_eq!(
+            MemoryInboxRepository::new(&db)
+                .counts()
+                .await
+                .unwrap()
+                .pending,
+            1,
+            "the durable row is still there for the next process"
+        );
     }
 
     #[test]

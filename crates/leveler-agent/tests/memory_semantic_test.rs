@@ -154,7 +154,7 @@ async fn ordinary_main_turn_makes_zero_semantic_model_calls() {
 }
 
 #[tokio::test]
-async fn deterministic_fast_path_still_proposes_without_semantic_call() {
+async fn deterministic_fast_path_admits_without_a_semantic_call() {
     let dir = tempfile::tempdir().unwrap();
     let memory = dir.path().join("memory");
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
@@ -164,13 +164,19 @@ async fn deterministic_fast_path_still_proposes_without_semantic_call() {
 
     assert_eq!(runtime.generate_calls(), 0);
     let store = MemoryStore::open(&memory).unwrap();
-    assert!(store.effective_active().unwrap().is_empty());
-    assert_eq!(store.list_pending().unwrap().len(), 1);
+    let active = store.effective_active().unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].body.contains("flash"));
+    assert_eq!(
+        active[0].authority(),
+        leveler_memory::MemoryAuthority::ExplicitUser
+    );
+    assert!(store.list_pending().unwrap().is_empty());
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::MemoryChanged { .. })),
-        "a pending candidate is not presented as durable memory"
+        events.iter().any(
+            |event| matches!(event, AgentEvent::MemoryChanged { operation, .. } if operation == "created")
+        ),
+        "the user's own durable statement is a memory change: {events:?}"
     );
 }
 

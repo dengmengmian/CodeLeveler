@@ -389,6 +389,16 @@ impl MemoryStore {
                     .find(|entry| entry.body.trim() == candidate.body.trim())
                 {
                     active
+                } else if let Some(active) =
+                    crate::lifecycle::decide(self, &candidate, &now_rfc3339())?
+                        .related
+                        .into_iter()
+                        .next()
+                {
+                    // A duplicate stated in other words has no matching key or
+                    // body. The decision already found the entry that makes the
+                    // acceptance idempotent; return it instead of failing.
+                    active
                 } else {
                     return Err(MemoryError::Invalid(outcome.skipped_reason.unwrap_or_else(
                         || "accepted candidate produced no active memory".into(),

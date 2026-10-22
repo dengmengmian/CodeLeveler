@@ -135,6 +135,17 @@ impl ExperienceStanding {
             Self::Inferred => "inferred",
         }
     }
+
+    /// Evidence strength for replacement. A failure that later passed is
+    /// stronger than a bare observation, and both are stronger than a model
+    /// explanation with no mechanical link.
+    pub fn evidence_rank(self) -> u8 {
+        match self {
+            Self::VerifiedResolution => 2,
+            Self::Observed => 1,
+            Self::Inferred => 0,
+        }
+    }
 }
 
 impl ExperienceRecord {

@@ -109,6 +109,7 @@ pub(crate) async fn cmd_run(
         ship_changes_and_print(&app, &model_ref, &task, &outcome.modified_files, &ship).await;
     }
 
+    flush_memory_before_exit(&app, output).await;
     finish(result, &session_id.to_string(), output, execution)
 }
 pub(crate) async fn cmd_run_parallel(
@@ -1771,6 +1772,7 @@ pub(crate) async fn cmd_run_resume(
         )
         .await;
 
+    flush_memory_before_exit(&app, output).await;
     finish(result, &id, output, execution)
 }
 
@@ -1857,6 +1859,34 @@ fn outcome_exit_code(
         | StopReason::TurnLimitReached
         | StopReason::Blocked
         | StopReason::Stalled => std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
+    }
+}
+
+/// Settle memory work a one-shot process just admitted.
+///
+/// The worker's idle debounce would otherwise outlive the process, leaving the
+/// last turn for the next launch. A flush that cannot finish leaves its rows
+/// durably queued, so the warning is honest rather than a success claim.
+async fn flush_memory_before_exit(app: &Application, output: OutputFormat) {
+    let Some(outcome) = app.flush_memory_for_headless().await else {
+        return;
+    };
+    if outcome.remaining == 0 {
+        return;
+    }
+    if output == OutputFormat::Text {
+        println!(
+            "{}",
+            Line::warn(&format!(
+                "Memory consolidation left {} item(s) queued for the next session{}.",
+                outcome.remaining,
+                if outcome.timed_out {
+                    " (exit time budget reached)"
+                } else {
+                    ""
+                }
+            ))
+        );
     }
 }
 

@@ -284,6 +284,12 @@ pub fn parse_durable_fact(text: &str) -> Option<MemoryCandidate> {
         None if sep.starts_with("统一") => "统一".to_string(),
         None => return None,
     };
+    // The same canonical identity every other write path uses. Without this,
+    // "以后默认使用 Flash" stores the subject "默认" while its key aliases to
+    // "默认模型": the key updates the right entry, but the stored text loses
+    // the object the user asked about, so a later question about the default
+    // model cannot match it.
+    let subject = crate::canonical_subject(&subject);
     if subject.chars().count() > 60 {
         return None;
     }
@@ -519,6 +525,176 @@ pub(crate) fn entry_matches_candidate(entry: &MemoryEntry, candidate: &MemoryCan
     normalized_body == normalized_subject
 }
 
+// ── assertion identity ─────────────────────────────────────────────────────
+//
+// A semantic key is derived from a model-generated subject. One constraint can
+// therefore arrive under two identities when the model words its object
+// differently (`api_response_field_naming` vs `json_response_field_naming`).
+// The comparison below reads the assertion itself for autonomous user
+// statements: topic (the clause before the assignment) and value (what is
+// assigned). It uses the same lexical view as recall — CJK bigrams and ASCII
+// words — so it adds no index and no model call.
+
+/// Below this share of shared topic terms, two statements describe different
+/// subjects. The floor separates reworded objects from different predicates
+/// measured on the same phrase; it is deliberately conservative because a
+/// wrong duplicate skip loses a real fact.
+const FACT_TOPIC_SIMILARITY: f64 = 0.60;
+
+/// Structural connectives that split a fact into topic and value. This is
+/// grammar, not a synonym table for any particular fixture.
+const ASSERTION_MARKERS: &[&str] = &[
+    "always use",
+    "always be",
+    "must not use",
+    "must not",
+    "must use",
+    "must be",
+    "never use",
+    "should not use",
+    "should use",
+    "should be",
+    "set to",
+    "default to",
+    "change to",
+    "统一使用",
+    "统一采用",
+    "统一设为",
+    "统一为",
+    "统一用",
+    "固定使用",
+    "固定为",
+    "固定成",
+    "默认使用",
+    "默认为",
+    "默认用",
+    "设置为",
+    "设为",
+    "修改为",
+    "改为",
+    "改成",
+    "更换为",
+    "换成",
+    "采用",
+    "使用",
+    "=",
+    "：",
+    ":",
+];
+
+const NEGATION_MARKERS: &[&str] = &[
+    "不要", "不得", "禁止", "不能", "不可", "不再", "无需", "never", "must not", "should not",
+    "do not", "don't", "avoid",
+];
+
+struct FactAssertion<'a> {
+    topic: &'a str,
+    value: String,
+    negative: bool,
+}
+
+/// Split a remembered fact into "what it constrains" and "what it assigns".
+/// `None` when the sentence has no assignment connective: without a value
+/// there is nothing to compare, and guessing would be worse than the current
+/// subject identity.
+fn fact_assertion(body: &str) -> Option<FactAssertion<'_>> {
+    let lower = body.to_ascii_lowercase();
+    let mut split: Option<(usize, usize)> = None;
+    for marker in ASSERTION_MARKERS {
+        let found = if marker.is_ascii() {
+            lower
+                .rfind(marker)
+                .map(|start| (start, start + marker.len()))
+        } else {
+            body.rfind(marker)
+                .map(|start| (start, start + marker.len()))
+        };
+        let Some((start, end)) = found else {
+            continue;
+        };
+        let replace = match split {
+            None => true,
+            Some((best, best_end)) => {
+                start > best || (start == best && end - start > best_end - best)
+            }
+        };
+        if replace {
+            split = Some((start, end));
+        }
+    }
+    let (start, end) = split?;
+    let value = normalize_asserted_value(&body[end..]);
+    if value.is_empty() {
+        return None;
+    }
+    let topic = &body[..start];
+    if crate::tokenize(topic).is_empty() {
+        return None;
+    }
+    let lower_topic = topic.to_ascii_lowercase();
+    let negative = NEGATION_MARKERS
+        .iter()
+        .any(|marker| lower_topic.contains(marker));
+    Some(FactAssertion {
+        topic,
+        value,
+        negative,
+    })
+}
+
+fn normalize_asserted_value(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '“' | '”')
+        })
+        .trim_end_matches(['。', '.', '！', '!', '；', ';', ',', '，'])
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn topic_similarity(left: &str, right: &str) -> f64 {
+    let left: HashSet<String> = crate::tokenize(left).into_iter().collect();
+    let right: HashSet<String> = crate::tokenize(right).into_iter().collect();
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let shared = left.intersection(&right).count() as f64;
+    let union = left.union(&right).count() as f64;
+    shared / union
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactRelation {
+    /// Different topics: the lifecycle's identity rules decide.
+    Unrelated,
+    /// Same constraint, same value: one memory is enough.
+    Duplicate,
+    /// Same constraint, different value or polarity: a person must choose.
+    Conflict,
+}
+
+fn user_fact_relation(existing: &MemoryEntry, candidate: &MemoryCandidate) -> FactRelation {
+    let Some(existing_assertion) = fact_assertion(&existing.body) else {
+        return FactRelation::Unrelated;
+    };
+    let Some(candidate_assertion) = fact_assertion(&candidate.body) else {
+        return FactRelation::Unrelated;
+    };
+    if topic_similarity(existing_assertion.topic, candidate_assertion.topic) < FACT_TOPIC_SIMILARITY
+    {
+        return FactRelation::Unrelated;
+    }
+    if existing_assertion.value == candidate_assertion.value
+        && existing_assertion.negative == candidate_assertion.negative
+    {
+        FactRelation::Duplicate
+    } else {
+        FactRelation::Conflict
+    }
+}
+
 // ── decision ───────────────────────────────────────────────────────────────
 
 fn source_label(source: CandidateSource) -> &'static str {
@@ -573,6 +749,74 @@ pub fn decide(
             },
             related: Vec::new(),
         });
+    }
+
+    // A subject is a model hint, not a stable identity. Compare the assertion
+    // itself for autonomous user statements so two wordings of one constraint
+    // cannot both become current truth. Entries that already match the
+    // candidate's identity are left to the rules below, which know how to
+    // merge, supersede and preserve history for one identity. `UserRestore`
+    // is excluded: a restore has its own identity path and must not be turned
+    // into a duplicate skip or a consent prompt here.
+    let user_statement = matches!(
+        candidate.source,
+        CandidateSource::UserExplicit | CandidateSource::UserAccepted
+    );
+    if user_statement
+        && candidate.authority == MemoryAuthority::ExplicitUser
+        && candidate.experience.is_none()
+    {
+        let mut peers = Vec::new();
+        let mut conflict = None;
+        for entry in active.iter().filter(|entry| {
+            entry.scope == crate::MemoryScope::Project
+                && entry.authority() == MemoryAuthority::ExplicitUser
+                && entry.experience.is_none()
+                && MemoryKind::of(entry) != MemoryKind::Derived
+                && !entry_matches_candidate(entry, candidate)
+        }) {
+            match user_fact_relation(entry, candidate) {
+                FactRelation::Unrelated => {}
+                FactRelation::Duplicate => peers.push(entry.clone()),
+                FactRelation::Conflict => {
+                    peers.push(entry.clone());
+                    conflict = Some(entry.clone());
+                }
+            }
+        }
+        if let Some(existing) = conflict {
+            // An acceptance is the person choosing the new value. It replaces
+            // the conflicting truth while preserving it as history. An
+            // autonomous statement instead waits for that choice.
+            if candidate.source == CandidateSource::UserAccepted {
+                return Ok(MemoryDecision {
+                    operation: MemoryOperation::Supersede {
+                        existing_id: existing.id,
+                    },
+                    related: peers,
+                });
+            }
+            return Ok(MemoryDecision {
+                operation: MemoryOperation::NeedsApproval {
+                    reason: format!(
+                        "this states a different value for the same constraint as active memory {}",
+                        existing.id
+                    ),
+                },
+                related: peers,
+            });
+        }
+        if let Some(existing) = peers.first() {
+            return Ok(MemoryDecision {
+                operation: MemoryOperation::Skip {
+                    reason: format!(
+                        "active memory {} already states this constraint in other words",
+                        existing.id
+                    ),
+                },
+                related: peers,
+            });
+        }
     }
 
     let identity = candidate
@@ -688,6 +932,29 @@ pub fn decide(
                     .as_deref()
                     .is_some_and(|evidence| !evidence.trim().is_empty())
             {
+                // Replacing current truth needs evidence at least as strong as
+                // the claim it retires. An observation-only reading verifies a
+                // fact, not a failure that later passed; letting it silently
+                // replace a resolution would downgrade the remembered account
+                // to model inference. A person may still choose it.
+                let incoming_strength = candidate_experience
+                    .map(crate::ExperienceRecord::standing)
+                    .map(crate::ExperienceStanding::evidence_rank)
+                    .unwrap_or_default();
+                let held_strength = existing_experience
+                    .map(crate::ExperienceRecord::standing)
+                    .map(crate::ExperienceStanding::evidence_rank)
+                    .unwrap_or_default();
+                if !user_decision && incoming_strength < held_strength {
+                    return Ok(MemoryDecision {
+                        operation: MemoryOperation::NeedsApproval {
+                            reason: "weaker evidence cannot replace a stronger experience; \
+                                     a person must choose"
+                                .to_string(),
+                        },
+                        related,
+                    });
+                }
                 // An explicit accept is the person choosing between the two
                 // accounts; it resolves the dispute without a second review.
                 if user_decision
@@ -1282,6 +1549,50 @@ mod tests {
         (dir, store)
     }
 
+    fn semantic_fact(fact: &str, subject: &str, evidence: &str) -> crate::SemanticCandidate {
+        crate::SemanticCandidate {
+            fact: fact.to_string(),
+            subject: subject.to_string(),
+            value: None,
+            scope: crate::CandidateScope::Project,
+            durability: crate::CandidateDurability::Durable,
+            memory_type: crate::SemanticMemoryType::Project,
+            authority: MemoryAuthority::ExplicitUser,
+            operation_hint: crate::OperationHint::Create,
+            evidence_span: evidence.to_string(),
+            confidence: Some(0.9),
+        }
+    }
+
+    fn applied(outcome: crate::AdmitOutcome) -> AppliedOperation {
+        match outcome {
+            crate::AdmitOutcome::Applied(commit) => commit.operation,
+            crate::AdmitOutcome::Proposed(other) => {
+                panic!("candidate was not committed: {other:?}")
+            }
+        }
+    }
+
+    fn admit_fact(
+        store: &MemoryStore,
+        fact: &str,
+        subject: &str,
+    ) -> crate::AdmitOutcome {
+        let validated = crate::validate_semantic_candidates(
+            &[semantic_fact(fact, subject, fact)],
+            fact,
+        );
+        assert_eq!(
+            validated.accepted.len(),
+            1,
+            "fixture must validate: {:?}",
+            validated.rejected
+        );
+        store
+            .admit_candidate(validated.accepted[0].clone())
+            .unwrap()
+    }
+
     /// Suffix stripping must be confluent: "默认模型设置" hides "模型" behind
     /// "设置", and a single ordered pass left two identities for one subject.
     /// Ids truncate for readability; identity must not. Two long subjects that
@@ -1318,6 +1629,25 @@ mod tests {
             Some(semantic_key_of("发布探针代号").as_str())
         );
         assert!(c.body.contains("ORANGE-7319"));
+    }
+
+    /// The stored text carries the canonical subject, not the fragment left by
+    /// splitting the sentence. "以后默认使用 Flash" parses the subject as
+    /// "默认"; storing that fragment loses the object the user asked about, so
+    /// a later "默认模型是什么？" cannot match the updated entry.
+    #[test]
+    fn a_durable_fact_stores_the_canonical_subject() {
+        let c = parse_durable_fact("以后默认使用 Flash，不再使用 Pro。").expect("fact");
+        assert_eq!(
+            c.semantic_key.as_deref(),
+            Some(semantic_key_of("默认模型").as_str())
+        );
+        assert!(c.body.starts_with("默认模型："), "{:?}", c.body);
+        assert!(
+            c.tags.iter().any(|tag| tag == "subject:默认模型"),
+            "{:?}",
+            c.tags
+        );
     }
 
     #[test]
@@ -1379,6 +1709,343 @@ mod tests {
         let again = store.commit_candidate(&fact).unwrap();
         assert_eq!(again.operation, AppliedOperation::Skipped);
         assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    /// The acceptance fixture: one user constraint, extracted twice with a
+    /// different model-generated subject because the model described the
+    /// object as an API response once and a JSON response the next time.
+    ///
+    /// The subject is only a hint from the model. Two statements of the same
+    /// constraint must not become two Active memories; otherwise recall can
+    /// return either wording and the user sees a rule they only stated once
+    /// duplicated.
+    #[test]
+    fn one_constraint_under_two_subjects_creates_one_active_memory() {
+        let (_dir, store) = store();
+        let message =
+            "以后 API 响应字段命名统一使用 snake_case，JSON 响应字段命名统一使用 snake_case";
+        let candidates = vec![
+            semantic_fact(
+                "API 响应字段命名统一使用 snake_case",
+                "project.api_response_field_naming",
+                "API 响应字段命名统一使用 snake_case",
+            ),
+            semantic_fact(
+                "JSON 响应字段命名统一使用 snake_case",
+                "project.json_response_field_naming",
+                "JSON 响应字段命名统一使用 snake_case",
+            ),
+        ];
+        let validated = crate::validate_semantic_candidates(&candidates, message);
+        assert_eq!(
+            validated.accepted.len(),
+            2,
+            "the extraction keeps both wordings; identity is the store's job"
+        );
+
+        let first = store
+            .admit_candidate(validated.accepted[0].clone())
+            .unwrap();
+        assert_eq!(applied(first), AppliedOperation::Created);
+        let second = store
+            .admit_candidate(validated.accepted[1].clone())
+            .unwrap();
+        assert_eq!(
+            applied(second),
+            AppliedOperation::Skipped,
+            "the same constraint stated in other words is not a second memory"
+        );
+
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("snake_case"));
+        assert_eq!(active[0].authority(), MemoryAuthority::ExplicitUser);
+        assert_eq!(
+            store.list_archived().unwrap().len(),
+            0,
+            "a duplicate is skipped, not turned into history"
+        );
+        assert!(
+            store.list_pending().unwrap().is_empty(),
+            "a duplicate must not ask the user to settle it"
+        );
+    }
+
+    /// Wording drift is not limited to one pair of nouns: the same constraint
+    /// with a reworded object is still one constraint.
+    #[test]
+    fn the_same_constraint_with_a_reworded_object_is_skipped() {
+        let (_dir, store) = store();
+        let first = admit_fact(
+            &store,
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+        );
+        assert_eq!(applied(first), AppliedOperation::Created);
+
+        let second = admit_fact(
+            &store,
+            "接口响应字段命名统一使用 snake_case",
+            "project.interface_response_field_naming",
+        );
+        assert_eq!(applied(second), AppliedOperation::Skipped);
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    /// A different predicate on the same subject is a different constraint
+    /// and must remain a second, independent memory.
+    #[test]
+    fn a_different_constraint_on_the_same_topic_is_not_merged() {
+        let (_dir, store) = store();
+        admit_fact(
+            &store,
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+        );
+        let other = admit_fact(
+            &store,
+            "API 响应字段排序统一使用字母序",
+            "project.api_response_field_order",
+        );
+        assert_eq!(applied(other), AppliedOperation::Created);
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 2, "both constraints stay current");
+    }
+
+    /// A changed value for the same constraint is not a duplicate and must
+    /// not silently replace the current truth. The new wording waits for a
+    /// person while the old value stays current and historical evidence is
+    /// untouched.
+    #[test]
+    fn a_new_value_for_the_same_constraint_is_parked_not_overwritten() {
+        let (_dir, store) = store();
+        admit_fact(
+            &store,
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+        );
+        let outcome = admit_fact(
+            &store,
+            "JSON 响应字段命名统一使用 camelCase",
+            "project.json_response_field_naming",
+        );
+        match outcome {
+            crate::AdmitOutcome::Proposed(crate::ProposeOutcome::Pending(candidate)) => {
+                assert!(candidate.body.contains("camelCase"));
+            }
+            other => panic!("a conflicting value must wait for a person: {other:?}"),
+        }
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("snake_case"));
+        assert!(store.list_archived().unwrap().is_empty());
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
+    /// The same value with the opposite polarity is a contradiction, not a
+    /// duplicate.
+    #[test]
+    fn opposite_polarity_is_a_conflict_not_a_duplicate() {
+        let (_dir, store) = store();
+        admit_fact(
+            &store,
+            "响应字段命名不要使用 camelCase",
+            "project.response_field_naming",
+        );
+        let outcome = admit_fact(
+            &store,
+            "响应字段命名使用 camelCase",
+            "project.response_field_naming_positive",
+        );
+        assert!(matches!(
+            outcome,
+            crate::AdmitOutcome::Proposed(crate::ProposeOutcome::Pending(_))
+        ));
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    /// Identity is durable: a reopened store reaches the same conclusion,
+    /// which is what a resumed session or another process sees.
+    #[test]
+    fn a_duplicate_is_still_recognised_after_reopening_the_store() {
+        let (dir, store) = store();
+        admit_fact(
+            &store,
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+        );
+        drop(store);
+
+        let reopened = MemoryStore::open(dir.path()).unwrap();
+        let second = admit_fact(
+            &reopened,
+            "JSON 响应字段命名统一使用 snake_case",
+            "project.json_response_field_naming",
+        );
+        assert_eq!(applied(second), AppliedOperation::Skipped);
+        assert_eq!(reopened.effective_active().unwrap().len(), 1);
+    }
+
+    /// Two processes (or two threads) may extract the same constraint at the
+    /// same time. The lifecycle lock serializes them; exactly one becomes
+    /// current and the others are idempotent skips.
+    #[test]
+    fn concurrent_wordings_of_one_constraint_leave_one_active() {
+        use std::sync::{Arc, Barrier};
+
+        let (_dir, store) = store();
+        let writers = 8;
+        let barrier = Arc::new(Barrier::new(writers));
+        let mut threads = Vec::new();
+        for index in 0..writers {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let (fact, subject) = if index % 2 == 0 {
+                    (
+                        "API 响应字段命名统一使用 snake_case",
+                        "project.api_response_field_naming",
+                    )
+                } else {
+                    (
+                        "JSON 响应字段命名统一使用 snake_case",
+                        "project.json_response_field_naming",
+                    )
+                };
+                let validated = crate::validate_semantic_candidates(
+                    &[semantic_fact(fact, subject, fact)],
+                    fact,
+                );
+                let candidate = validated.accepted[0].clone();
+                barrier.wait();
+                store.commit_candidate(&candidate).unwrap()
+            }));
+        }
+        let mut created = 0;
+        let mut skipped = 0;
+        for thread in threads {
+            match thread.join().unwrap().operation {
+                AppliedOperation::Created => created += 1,
+                AppliedOperation::Skipped => skipped += 1,
+                other => panic!("unexpected operation: {other:?}"),
+            }
+        }
+        assert_eq!(created, 1);
+        assert_eq!(skipped, writers - 1);
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    /// Two projects have separate stores; the same wording in each is one
+    /// memory per project, not a cross-project duplicate.
+    #[test]
+    fn different_projects_keep_their_own_memory() {
+        let (_first_dir, first) = store();
+        let (_second_dir, second) = store();
+        let fact = "API 响应字段命名统一使用 snake_case";
+        assert_eq!(
+            applied(admit_fact(&first, fact, "project.api_response_field_naming")),
+            AppliedOperation::Created
+        );
+        assert_eq!(
+            applied(admit_fact(&second, fact, "project.api_response_field_naming")),
+            AppliedOperation::Created
+        );
+        assert_eq!(first.effective_active().unwrap().len(), 1);
+        assert_eq!(second.effective_active().unwrap().len(), 1);
+    }
+
+    /// A direct user write runs the same content comparison. Returning the
+    /// existing memory makes the write idempotent instead of failing on a key
+    /// that no longer matches.
+    #[test]
+    fn a_direct_write_in_other_words_returns_the_existing_memory() {
+        let (_dir, store) = store();
+        let first = store
+            .activate(
+                "API 响应字段命名",
+                "以后 API 响应字段命名统一使用 snake_case",
+                MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        let second = store
+            .activate(
+                "JSON 响应字段命名",
+                "以后 JSON 响应字段命名统一使用 snake_case",
+                MemoryKind::Preference,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    /// A person accepting the parked conflicting value is the choice the
+    /// autonomous path was not allowed to make. The old truth becomes
+    /// history; it is archived, never deleted.
+    #[test]
+    fn accepting_a_conflicting_value_replaces_the_old_truth_and_keeps_history() {
+        let (_dir, store) = store();
+        admit_fact(
+            &store,
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+        );
+        let pending = match admit_fact(
+            &store,
+            "JSON 响应字段命名统一使用 camelCase",
+            "project.json_response_field_naming",
+        ) {
+            crate::AdmitOutcome::Proposed(crate::ProposeOutcome::Pending(candidate)) => candidate,
+            other => panic!("expected a parked conflict: {other:?}"),
+        };
+
+        let accepted = store.accept(&pending.id).unwrap();
+        assert!(accepted.body.contains("camelCase"));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("camelCase"));
+        let archived = store.list_archived().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].body.contains("snake_case"));
+        assert_eq!(
+            archived[0].superseded_by.as_deref(),
+            Some(active[0].id.as_str())
+        );
+    }
+
+    /// Accepting a pending wording that has since become equivalent to an
+    /// active memory is an idempotent accept, not a second entry and not an
+    /// error.
+    #[test]
+    fn accepting_an_equivalent_pending_candidate_returns_the_current_truth() {
+        let (_dir, store) = store();
+        let fact = "JSON 响应字段命名统一使用 snake_case";
+        let validated = crate::validate_semantic_candidates(
+            &[semantic_fact(
+                fact,
+                "project.json_response_field_naming",
+                fact,
+            )],
+            fact,
+        );
+        let pending = store
+            .propose(validated.accepted[0].clone())
+            .unwrap();
+        let pending = match pending {
+            crate::ProposeOutcome::Pending(candidate) => candidate,
+            other => panic!("expected pending: {other:?}"),
+        };
+        admit_fact(
+            &store,
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+        );
+
+        let accepted = store.accept(&pending.id).unwrap();
+        assert!(accepted.body.contains("snake_case"));
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert!(store.list_archived().unwrap().is_empty());
     }
 
     #[test]

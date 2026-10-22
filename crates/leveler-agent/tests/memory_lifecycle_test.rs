@@ -158,32 +158,73 @@ fn provider_saw(runtime: &CaptureRuntime, needle: &str) -> bool {
     })
 }
 
-/// A durable-looking sentence is still only a proposal. The user did not issue
-/// a memory command, so the runtime must not turn it into active truth.
+/// A durable sentence in the user's own turn is the user's decision: the turn
+/// admits it with explicit-user authority. A second wording must not add a
+/// competing entry, and a different value must not overwrite the current one
+/// without a person.
 #[tokio::test]
-async fn durable_user_rule_waits_for_acceptance() {
+async fn a_natural_rule_is_current_and_a_conflict_waits_for_acceptance() {
     let (dir, mem) = workspace("create");
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
-    let executor = executor(&dir, &mem, runtime.clone());
+    let executor_a = executor(&dir, &mem, runtime.clone());
     let mut events = Vec::new();
     run_turn(
-        &executor,
-        "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        &executor_a,
+        "以后 API 响应字段命名统一使用 snake_case",
         &mut events,
     )
     .await;
 
     let store = MemoryStore::open(&mem).unwrap();
-    assert!(store.effective_active().unwrap().is_empty());
-    let pending = store.list_pending().unwrap();
-    assert_eq!(pending.len(), 1, "exactly one candidate waits for consent");
-    assert!(pending[0].body.contains("ORANGE-7319"));
+    let active = store.effective_active().unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].body.contains("snake_case"));
+    assert_eq!(
+        active[0].authority(),
+        leveler_memory::MemoryAuthority::ExplicitUser
+    );
+    assert!(store.list_pending().unwrap().is_empty());
     assert!(
-        !events.iter().any(
+        events.iter().any(
             |e| matches!(e, AgentEvent::MemoryChanged { operation, .. } if operation == "created")
         ),
-        "a proposal is not a durable-memory change: {events:?}"
+        "the user's own durable statement is a durable-memory change: {events:?}"
     );
+
+    // The same constraint under another model-chosen object is not a second
+    // memory and does not ask the user to settle a duplicate.
+    let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
+    let executor_b = executor(&dir, &mem, runtime_b);
+    let mut events_b = Vec::new();
+    run_turn(
+        &executor_b,
+        "以后 JSON 响应字段命名统一使用 snake_case",
+        &mut events_b,
+    )
+    .await;
+    assert_eq!(store.effective_active().unwrap().len(), 1);
+    assert!(store.list_pending().unwrap().is_empty());
+
+    // A different value for the same constraint is a conflict: it waits for a
+    // person and leaves current truth untouched.
+    let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
+    let executor_c = executor(&dir, &mem, runtime_c);
+    let mut events_c = Vec::new();
+    run_turn(
+        &executor_c,
+        "以后 JSON 响应字段命名统一使用 camelCase",
+        &mut events_c,
+    )
+    .await;
+    let active = store.effective_active().unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(
+        active[0].body.contains("snake_case"),
+        "the conflicting value must not overwrite current truth: {active:?}"
+    );
+    let pending = store.list_pending().unwrap();
+    assert_eq!(pending.len(), 1, "exactly one conflict waits for consent");
+    assert!(pending[0].body.contains("camelCase"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

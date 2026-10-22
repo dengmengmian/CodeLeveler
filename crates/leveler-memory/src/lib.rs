@@ -475,20 +475,28 @@ impl MemoryStore {
                         .semantic_key
                         .as_deref()
                         .or(candidate.key.as_deref());
-                    self.effective_active()?
-                        .into_iter()
-                        .find(|entry| {
-                            key.is_some_and(|key| {
-                                crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)
-                            })
+                    let current = self.effective_active()?.into_iter().find(|entry| {
+                        key.is_some_and(|key| {
+                            crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)
                         })
-                        .ok_or_else(|| {
-                            MemoryError::Invalid(
-                                outcome
-                                    .skipped_reason
-                                    .unwrap_or_else(|| "memory was not stored".to_string()),
-                            )
-                        })
+                    });
+                    match current {
+                        Some(entry) => Ok(entry),
+                        // The same constraint stated in other words has no
+                        // matching key. The decision already found the entry
+                        // that covers this write; return it instead of failing.
+                        None => crate::lifecycle::decide(self, &candidate, &now_rfc3339())?
+                            .related
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                MemoryError::Invalid(
+                                    outcome
+                                        .skipped_reason
+                                        .unwrap_or_else(|| "memory was not stored".to_string()),
+                                )
+                            }),
+                    }
                 }
                 AppliedOperation::NeedsApproval => Err(MemoryError::Invalid(
                     outcome
@@ -701,6 +709,7 @@ impl MemoryStore {
             })
             .collect();
         let docs: Vec<Vec<String>> = doc_texts.iter().map(|text| tokenize(text)).collect();
+        let subjects: Vec<Option<&str>> = entries.iter().map(declared_subject).collect();
         let n = docs.len() as f64;
         if n == 0.0 {
             return Ok(Vec::new());
@@ -735,12 +744,12 @@ impl MemoryStore {
                 score += idf * (tf * (K1 + 1.0)) / denom;
             }
             if score > 0.0
-                && relevant_match(
+                && (relevant_match(
                     &query_terms,
                     &matched,
                     &query_trigrams,
                     &cjk_trigrams(&doc_texts[i]),
-                )
+                ) || subjects[i].is_some_and(|subject| query_names_subject(query, subject)))
             {
                 scored.push((i, score * relevance_weight(&entries[i])));
             }
@@ -835,6 +844,51 @@ fn relevant_match(
         return true;
     }
     !query_trigrams.is_disjoint(doc_trigrams)
+}
+
+/// The identity every write path records for a fact. Entries written before
+/// subjects were tagged have none, so the rule simply does not apply to them.
+fn declared_subject(entry: &MemoryEntry) -> Option<&str> {
+    entry
+        .tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("subject:"))
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+}
+
+/// A query can refer to a declared identity by naming part of it.
+///
+/// The overlap ratio cannot see this: `模型按之前定的来` is mostly function
+/// words, so only one of its bigrams matches. Measure the longest contiguous
+/// CJK span the query shares with the subject instead. A span covering at
+/// least half of the subject names it (`模型` for `默认模型`); a single generic
+/// word does not (`字段` for `API 响应字段命名`). ASCII identifiers are already
+/// handled by [`relevant_match`].
+fn query_names_subject(query: &str, subject: &str) -> bool {
+    let subject: Vec<char> = subject.chars().filter(|c| is_cjk(*c)).collect();
+    if subject.len() < 2 {
+        return false;
+    }
+    let query: Vec<char> = query.chars().collect();
+    let mut longest = 0;
+    for start in 0..subject.len() {
+        if !query.contains(&subject[start]) {
+            continue;
+        }
+        for end in (start + 2)..=subject.len() {
+            let window = &subject[start..end];
+            if !window.iter().all(|c| is_cjk(*c)) {
+                break;
+            }
+            if query.windows(window.len()).any(|candidate| candidate == window) {
+                longest = longest.max(window.len());
+            } else {
+                break;
+            }
+        }
+    }
+    longest >= 2 && longest * 2 >= subject.len()
 }
 
 fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
@@ -2594,6 +2648,185 @@ mod safety_tests {
         );
     }
 
+    /// An observation-only reading verifies a fact, not a resolution. It is
+    /// weaker evidence than a failure that later passed under the same check,
+    /// so it must not silently become the only current account. The person may
+    /// still choose it.
+    #[test]
+    fn a_weaker_observation_cannot_replace_a_verified_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "dev profile 缺少 test feature 是根因；启用后测试通过。",
+                "cargo test -p demo (exit 0)",
+            ))
+            .unwrap();
+
+        let outcome = store
+            .admit_experience_candidate(observation_experience(
+                "cargo.test.dev_profile",
+                "dev profile 缺少 test feature 并不成立；只是脚本没有输出。",
+                "step 1: ./verify.sh exited 0 with no output",
+            ))
+            .unwrap();
+        let crate::AgentAdmitOutcome::Queued { candidate, .. } = outcome else {
+            panic!("weaker evidence must not replace a verified resolution: {outcome:?}");
+        };
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0].body.contains("启用后测试通过"),
+            "the verified resolution must remain current: {active:?}"
+        );
+
+        // Consent still lets the person choose the weaker reading.
+        let accepted = store.accept(&candidate.id).unwrap();
+        assert!(accepted.body.contains("并不成立"), "{accepted:?}");
+        assert_eq!(store.effective_active().unwrap()[0].id, accepted.id);
+    }
+
+    /// A sentence asserting that a lesson is inapplicable is a claim, not
+    /// runtime evidence. Under the same identity it must wait for a person
+    /// instead of retiring the current lesson.
+    #[test]
+    fn a_bare_claim_that_a_lesson_is_inapplicable_waits_for_a_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "dev profile 缺少 test feature 是根因，启用之后测试就通过了。",
+                "cargo test -p demo (exit 0)",
+            ))
+            .unwrap();
+
+        let outcome = store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "旧经验已经不适用：缓存目录权限才是真正原因，请先清理缓存重建索引。",
+                "cargo test -p demo (exit 0)",
+            ))
+            .unwrap();
+
+        assert!(
+            matches!(outcome, crate::AgentAdmitOutcome::Queued { .. }),
+            "a model sentence must not mechanically invalidate an experience: {outcome:?}"
+        );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("缺少 test feature 是根因"));
+    }
+
+    /// Confirming evidence under the same identity is not a second lesson.
+    #[test]
+    fn confirming_evidence_does_not_create_a_second_current_experience() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let first = verified_experience(
+            "cargo.test.dev_profile",
+            "dev profile 缺少 test feature 是根因。",
+            "cargo test -p demo (exit 0)",
+        );
+        assert!(matches!(
+            store.admit_experience_candidate(first.clone()).unwrap(),
+            crate::AgentAdmitOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            store.admit_experience_candidate(first).unwrap(),
+            crate::AgentAdmitOutcome::NotStored { .. }
+        ));
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert!(store.list_archived().unwrap().is_empty());
+    }
+
+    /// A replaced lesson is history, not current truth: a reopened store (a
+    /// new session) recalls the latest version and can audit the link from the
+    /// archived original to its replacement.
+    #[test]
+    fn the_latest_experience_is_what_a_reopened_store_recalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let old = match store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "dev profile 缺少 test feature 是根因。",
+                "cargo test -p demo (exit 0)",
+            ))
+            .unwrap()
+        {
+            crate::AgentAdmitOutcome::Applied(outcome) => outcome.entry.unwrap(),
+            other => panic!("the first lesson must be admitted: {other:?}"),
+        };
+        let new = match store
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "真正的原因是 workspace 的 default-features=false。",
+                "cargo test -p demo --workspace (exit 0)",
+            ))
+            .unwrap()
+        {
+            crate::AgentAdmitOutcome::Applied(outcome) => outcome.entry.unwrap(),
+            other => panic!("new evidence must replace the old lesson: {other:?}"),
+        };
+        assert_eq!(new.supersedes.as_deref(), Some(old.id.as_str()));
+        drop(store);
+
+        let reopened = MemoryStore::open(dir.path()).unwrap();
+        let active = reopened.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, new.id);
+        assert!(active[0].body.contains("default-features"));
+        assert!(
+            reopened
+                .search("dev profile 缺少 test feature", 10)
+                .unwrap()
+                .into_iter()
+                .all(|(entry, _)| entry.id != old.id),
+            "a superseded lesson must never be recalled as current past"
+        );
+        let archived = reopened
+            .list_archived()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == old.id)
+            .expect("the original stays as history");
+        assert_eq!(archived.status, crate::MemoryStatus::Superseded);
+        assert_eq!(archived.superseded_by.as_deref(), Some(new.id.as_str()));
+        assert!(archived.superseded_at.is_some());
+    }
+
+    /// Experience identity is project-local. Two projects may hold the same
+    /// failure signature with different current lessons.
+    #[test]
+    fn separate_projects_keep_their_own_experience() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_a = MemoryStore::open(dir_a.path()).unwrap();
+        let store_b = MemoryStore::open(dir_b.path()).unwrap();
+        store_a
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "A 项目：dev profile 缺少 test feature。",
+                "cargo test (exit 0)",
+            ))
+            .unwrap();
+        store_b
+            .admit_experience_candidate(verified_experience(
+                "cargo.test.dev_profile",
+                "B 项目：链接器缺少系统工具链。",
+                "cargo test (exit 0)",
+            ))
+            .unwrap();
+
+        let hits = store_a.search("dev profile 链接器", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.body.contains("A 项目"));
+        assert_eq!(store_b.effective_active().unwrap().len(), 1);
+        assert!(store_b.effective_active().unwrap()[0].body.contains("B 项目"));
+    }
+
     #[test]
     fn an_experience_cannot_replace_a_fact_of_another_kind() {
         let dir = tempfile::tempdir().unwrap();
@@ -3038,5 +3271,31 @@ mod safety_tests {
         store.remember(entry).unwrap();
         let hits = store.recall("部署", 4).unwrap();
         assert_eq!(hits.len(), 1, "a short topic query was over-filtered");
+    }
+
+    /// A user refers to a durable decision by a shorthand that names part of
+    /// its declared subject. The sentence's other bigrams are function words,
+    /// so the overlap ratio rejects it; the subject identity must not.
+    #[test]
+    fn recall_recognises_a_shorthand_for_the_declared_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let fact = parse_durable_fact("以后本项目默认模型固定为 flash").unwrap();
+        store.commit_candidate(&fact).unwrap();
+        let hits = store.recall("模型按之前定的来", 4).unwrap();
+        assert_eq!(hits.len(), 1, "the decision was not recalled: {hits:?}");
+        assert!(hits[0].0.body.contains("flash"), "{:?}", hits[0].0.body);
+    }
+
+    /// Naming a single generic word is not naming the identity: a field
+    /// question must not recall an unrelated naming convention.
+    #[test]
+    fn a_generic_word_below_half_the_subject_is_not_an_identity_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let fact = parse_durable_fact("以后 API 响应字段命名统一使用 snake_case").unwrap();
+        store.commit_candidate(&fact).unwrap();
+        let hits = store.recall("这个字段怎么序列化", 4).unwrap();
+        assert!(hits.is_empty(), "a generic word was treated as identity: {hits:?}");
     }
 }

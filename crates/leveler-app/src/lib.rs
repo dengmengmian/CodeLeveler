@@ -979,6 +979,19 @@ impl Application {
         }
     }
 
+    /// Drain ready memory work before a headless process exits.
+    ///
+    /// A long-lived host leaves consolidation to the worker's idle cadence.
+    /// A one-shot process must flush explicitly or its last turn is only
+    /// consumed by the next launch. Returns `None` when this runtime has no
+    /// memory worker (both lanes closed).
+    pub async fn flush_memory_for_headless(
+        &self,
+    ) -> Option<memory_consolidator::MemoryFlushOutcome> {
+        let worker = self.memory_consolidator.get()?.clone();
+        Some(worker.flush().await)
+    }
+
     /// Stamp this session's memory-admission flag from the project policy.
     ///
     /// Must run before the turn row is inserted: admission is a SQL trigger on
