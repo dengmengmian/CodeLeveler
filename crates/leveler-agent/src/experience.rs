@@ -1592,13 +1592,92 @@ fn unmodified_file_reference(body: &str, modified_files: &[String]) -> Option<St
         let Some(index) = prescriptive_clause_index(sentence) else {
             continue;
         };
-        for mention in file_mentions(prescriptive_clause(&sentence[index..])) {
-            if !modified_files.iter().any(|file| same_file(file, &mention)) {
-                return Some(mention);
+        let clause = prescriptive_clause(&sentence[index..]);
+        for mention in file_mentions(clause) {
+            if modified_files.iter().any(|file| same_file(file, &mention)) {
+                continue;
             }
+            if mention_is_prohibited(&sentence[..index], clause, &mention) {
+                continue;
+            }
+            return Some(mention);
         }
     }
     None
+}
+
+/// Whether every mention of `file` in the clause is negated. "Do not edit
+/// `verify.sh`" and "editing `verify.sh` is out of scope" name a file to keep
+/// untouched, not a place to act. `prefix` is the part of the sentence before
+/// the prescriptive clause, so a negation attached to the clause verb is
+/// still visible.
+fn mention_is_prohibited(prefix: &str, clause: &str, file: &str) -> bool {
+    let lower_clause = clause.to_ascii_lowercase();
+    let needle = file.to_ascii_lowercase();
+    let mut start = 0;
+    let mut found = false;
+    while let Some(offset) = lower_clause[start..].find(&needle) {
+        let begin = start + offset;
+        let end = begin + needle.len();
+        found = true;
+        let history: Vec<char> = format!("{prefix}{}", &clause[..begin]).chars().collect();
+        let before: String = history[history.len().saturating_sub(48)..].iter().collect();
+        let after: String = clause[end..].chars().take(48).collect();
+        if !prohibited_before(&before) && !prohibited_after(&after) {
+            return false;
+        }
+        start = end;
+    }
+    found
+}
+
+fn prohibited_before(context: &str) -> bool {
+    const NEGATORS: &[&str] = &[
+        "do not ",
+        "don't ",
+        "never ",
+        "avoid ",
+        "rather than ",
+        "instead of ",
+        "not ",
+        "without ",
+        "不要",
+        "不得",
+        "禁止",
+        "无需",
+        "而不是",
+        "而非",
+    ];
+    const ACTIONS: &[&str] = &[
+        "edit", "modify", "change", "patch", "update", "adjust", "correct", "touch", "alter",
+        "编辑", "修改", "改动", "调整",
+    ];
+    NEGATORS.iter().any(|negator| {
+        context.match_indices(negator).any(|(index, _)| {
+            let rest = &context[index + negator.len()..];
+            ACTIONS.iter().any(|action| rest.starts_with(action))
+        })
+    })
+}
+
+fn prohibited_after(context: &str) -> bool {
+    [
+        "is out of scope",
+        "are out of scope",
+        "is off-limits",
+        "are off-limits",
+        "is off limits",
+        "are off limits",
+        "must not",
+        "should not",
+        "is forbidden",
+        "are forbidden",
+        "不要",
+        "不得",
+        "禁止",
+    ]
+    .iter()
+    .any(|marker| context.contains(marker))
 }
 
 /// The first file named by a stale condition that is also a script the pack
@@ -3746,6 +3825,99 @@ mod tests {
         );
         validate_experience_candidate(&lesson, &pack)
             .expect("the verification command is not a claimed fix location");
+    }
+
+    /// A file named only to forbid changing it is not a claimed fix location.
+    /// The task's real fix is in `engine.config`; "editing verify.sh is out of
+    /// scope" protects the file instead of pointing a future agent at it.
+    #[test]
+    fn a_prohibited_file_is_not_a_fix_location() {
+        let events = vec![
+            started("a1", "run_command", run_command("./verify.sh", &[]), 2),
+            finished("a1", "run_command", true, Some(1), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished(
+                "a2",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/engine.config"),
+            ),
+            started("a3", "run_command", run_command("./verify.sh", &[]), 5),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["engine.config"]),
+        ];
+        let pack = pack_from(&events, "修复 engine profile").expect("a signal exists");
+        let lesson = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "When ./verify.sh exits non-zero with `error: engine profile rejected`, edit engine.config; editing verify.sh itself is out of scope and the engine binary is off-limits.",
+        );
+        validate_experience_candidate(&lesson, &pack)
+            .expect("a prohibited file is not a claimed fix location");
+    }
+
+    /// A file introduced by "rather than" is the alternative to avoid, not a
+    /// second target. Only the file before the contrast is where to act.
+    #[test]
+    fn a_file_after_rather_than_is_not_a_fix_location() {
+        let events = vec![
+            started("a1", "run_command", run_command("./verify.sh", &[]), 2),
+            finished("a1", "run_command", true, Some(1), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished(
+                "a2",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/engine.config"),
+            ),
+            started("a3", "run_command", run_command("./verify.sh", &[]), 5),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["engine.config"]),
+        ];
+        let pack = pack_from(&events, "修复 engine profile").expect("a signal exists");
+        let lesson = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "When ./verify.sh exits non-zero with `error: engine profile rejected`, edit engine.config rather than editing verify.sh.",
+        );
+        validate_experience_candidate(&lesson, &pack)
+            .expect("the contrast file is not a claimed fix location");
+    }
+
+    /// A negation that does not govern the file does not hide a real fix
+    /// location. "The configuration is not valid, edit verify.sh" still points
+    /// at an unmodified file.
+    #[test]
+    fn a_negation_elsewhere_does_not_hide_a_fix_location() {
+        let events = vec![
+            started("a1", "run_command", run_command("./verify.sh", &[]), 2),
+            finished("a1", "run_command", true, Some(1), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished(
+                "a2",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/engine.config"),
+            ),
+            started("a3", "run_command", run_command("./verify.sh", &[]), 5),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["engine.config"]),
+        ];
+        let pack = pack_from(&events, "修复 engine profile").expect("a signal exists");
+        let lesson = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "When ./verify.sh exits non-zero with `error: engine profile rejected` and the configuration is not valid, edit verify.sh.",
+        );
+        let rejection = validate_experience_candidate(&lesson, &pack)
+            .expect_err("an unmodified fix location must still be rejected");
+        assert!(matches!(
+            rejection,
+            ExperienceRejection::UnmodifiedFileReference { .. }
+        ));
     }
 
     /// A verification command in a later clause is still evidence about how
