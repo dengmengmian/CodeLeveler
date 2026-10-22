@@ -80,7 +80,7 @@ test('narration, execution and the final answer keep true arrival order', () => 
   assert.equal(items[5].text, '已定位问题，现在修改代码。');
   assert.equal(items[7].text, '改好了。');
   assert.equal(items[2].execution.variant, 'tools');
-  assert.equal(items[2].execution.label, '执行 2 条命令');
+  assert.equal(items[2].execution.label, '执行了命令');
   assert.equal(items[4].execution.failure, 'fatal: not a repository');
   assert.equal(items[6].execution.variant, 'edit');
   assert.deepEqual(items[6].execution.files.map(file => file.path), ['src/a.rs', 'src/b.rs']);
@@ -145,7 +145,7 @@ test('a single command is its own row, not an "executed 1 item" parent', () => {
   assert.equal(execution.variant, 'tool');
   assert.equal(execution.toolIds.length, 1);
   assert.equal(execution.label, '运行命令');
-  assert.equal(executionStatusLabel(execution), '全部成功');
+  assert.equal(executionStatusLabel(execution), '');
 });
 
 test('a group keeps its stable identity while its members update', () => {

@@ -7,6 +7,7 @@ import {
   attachmentErrorPresentation, slashIntent, commandCandidates,
   contractToolStatus, failureReason, displayPreview,
   confirmedDiffOf, diffCounts, messageTime, conversationItems, executionStatusLabel, confirmedChangeFiles,
+  mergeExecutionViews,
 } from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
@@ -1016,72 +1017,228 @@ function formatJobDuration(ms) {
 
 let jobsPopoverState = null;
 const expandedJobs = new Set();
+const clearedJobs = new Set();
+/** One armed stop at a time: a second press within the window confirms. */
+let jobsArmed = null;
+let jobsArmTimer = null;
+let jobsClockTimer = null;
+let settledOpen = true;
+const pendingJobStops = new Set();
+
+function jobCommand(job) {
+  return [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id;
+}
+
+function jobDuration(job, live) {
+  // The live clock derives from the observed start; snapshot-provided rows carry
+  // only Runtime-observed age, and event-provided rows carry started_at.
+  if (live) return formatJobDuration(job.started_at ? Date.now() - job.started_at : (job.elapsed_ms ?? 0));
+  return formatJobDuration(job.duration_ms ?? ((job.finished_at ?? 0) - (job.started_at ?? 0)));
+}
+
+function jobSettledState(job) {
+  // A stopped task is not a failure however its exit code reads (the exit
+  // event's own rule); check the stop fact before the ok flag.
+  if (job.stopped) return { label: '已停止', dot: 'warning' };
+  if (job.status === 'unknown') return { label: '结果未知', dot: 'failed' };
+  if (job.status === 'failed') return { label: '已失败', dot: 'failed' };
+  return { label: '已完成', dot: 'done' };
+}
+
+function disarmJob() {
+  if (jobsArmTimer) { clearTimeout(jobsArmTimer); jobsArmTimer = null; }
+  jobsArmed = null;
+}
+
+function stopJob(job) {
+  if (pendingJobStops.has(job.task_id)) return;
+  if (jobsArmed !== job.task_id) {
+    disarmJob();
+    jobsArmed = job.task_id;
+    jobsArmTimer = setTimeout(() => {
+      jobsArmTimer = null;
+      jobsArmed = null;
+      if (jobsPopoverState?.node.isConnected) renderJobsInto(jobsPopoverState.node);
+    }, 3000);
+    if (jobsPopoverState?.node.isConnected) renderJobsInto(jobsPopoverState.node);
+    return;
+  }
+  disarmJob();
+  pendingJobStops.add(job.task_id);
+  if (jobsPopoverState?.node.isConnected) renderJobsInto(jobsPopoverState.node);
+  deliver({ type: 'cancel_background_task', session_id: current.session.id, task_id: job.task_id }).then(result => {
+    if (result?.ok === false) throw new Error(result.error?.message ?? '停止请求未被 Runtime 接受');
+    toast('已请求停止后台任务', { tone: 'info', holdMs: 2200 });
+  }).catch(error => {
+    pendingJobStops.delete(job.task_id);
+    toast(error?.message ?? '停止后台任务失败', { tone: 'error', holdMs: 4000 });
+  }).finally(() => {
+    if (jobsPopoverState?.node.isConnected) renderJobsInto(jobsPopoverState.node);
+  });
+}
+
+function jobChevron(expanded) {
+  const box = el('span', 'job-chevron-box');
+  box.append(iconNode('chevronDown', { size: 12, className: expanded ? 'job-chevron open' : 'job-chevron' }));
+  return box;
+}
+
+function jobPanel(job) {
+  const panel = el('div', 'job-panel');
+  panel.dataset.task = job.task_id;
+  const output = el('pre', 'job-output', job.output || '尚无输出');
+  if (!job.output) output.dataset.empty = 'true';
+  panel.append(output);
+  return panel;
+}
+
+/** A live chunk updates the open panel in place, keeping its scroll position. */
+function updateJobsOutput(taskId) {
+  const node = jobsPopoverState?.node;
+  if (!node?.isConnected) return;
+  const panel = [...node.querySelectorAll('.job-panel')].find(candidate => candidate.dataset.task === taskId);
+  if (!panel) return;
+  const job = (current?.backgroundTasks ?? []).find(candidate => candidate.task_id === taskId);
+  if (!job) return;
+  const output = panel.querySelector('.job-output');
+  if (!output) return;
+  const stick = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+  output.textContent = job.output || '尚无输出';
+  output.dataset.empty = job.output ? 'false' : 'true';
+  if (stick) output.scrollTop = output.scrollHeight;
+}
+
 function renderJobsInto(node) {
+  // Rebuilding on a live output chunk must not steal keyboard focus from the
+  // control the reader is using.
+  const active = document.activeElement;
+  const focusKey = node.contains(active) ? active?.dataset?.jobFocus : null;
   node.replaceChildren();
   const jobs = current?.backgroundTasks ?? [];
-  const settled = current?.settledBackgroundTasks ?? [];
+  const settled = (current?.settledBackgroundTasks ?? []).filter(job => !clearedJobs.has(job.task_id));
   node.append(el('div', 'header-popover-title', '后台任务'));
-  if (jobs.length) node.append(el('div', 'header-popover-subtitle', '进行中'));
   if (!jobs.length && !settled.length) node.append(el('div', 'header-popover-empty', '暂无后台任务'));
+  if (jobs.length) node.append(el('div', 'job-section-label', '进行中'));
   for (const job of jobs) {
-    const row = el('div', 'header-job-row');
-    const head = el('div', 'header-job-head');
+    const expanded = expandedJobs.has(job.task_id);
+    const card = el('div', 'job-live-card');
+    const row = el('button', 'job-row');
+    row.type = 'button';
+    row.dataset.jobFocus = `row:${job.task_id}`;
+    row.setAttribute('aria-expanded', String(expanded));
+    row.setAttribute('aria-label', `${expanded ? '收起' : '展开'}任务输出：${jobCommand(job)}`);
     const dot = el('span', 'header-state-dot');
     dot.dataset.state = 'running';
-    const copy = el('span', 'header-agent-copy');
-    copy.append(el('span', 'header-agent-name', [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id));
-    const elapsed = job.elapsed_ms ?? (job.started_at ? Date.now() - job.started_at : 0);
-    copy.append(el('span', 'header-agent-meta', `运行中 · ${formatJobDuration(elapsed)}`));
-    const stop = el('button', 'header-job-stop', '停止');
+    const main = el('span', 'job-main');
+    const primary = el('span', 'job-primary');
+    primary.append(el('span', 'job-label', jobCommand(job)));
+    const secondary = el('span', 'job-secondary');
+    secondary.append(el('span', 'job-kind', '命令'));
+    secondary.append(el('span', 'job-status', pendingJobStops.has(job.task_id) ? '正在停止' : '运行中'));
+    const duration = el('span', 'job-duration', jobDuration(job, true));
+    duration.dataset.live = job.task_id;
+    secondary.append(duration);
+    main.append(primary, secondary);
+    row.append(dot, main, jobChevron(expanded));
+    row.addEventListener('click', () => {
+      if (expanded) expandedJobs.delete(job.task_id); else expandedJobs.add(job.task_id);
+      renderJobsInto(node);
+    });
+    const stop = el('button', 'job-stop');
     stop.type = 'button';
-    stop.disabled = loading;
-    stop.title = '停止后台任务';
-    stop.addEventListener('click', () => action(async () => {
-      stop.disabled = true;
-      await deliver({ type: 'cancel_background_task', session_id: current.session.id, task_id: job.task_id });
-      closePopover();
-      toast('已请求停止后台任务', { tone: 'info', holdMs: 2200 });
-    }));
-    head.append(dot, copy, stop);
-    row.append(head);
-    if (job.output) {
-      const toggle = el('button', 'header-job-output-toggle', '查看输出');
-      toggle.type = 'button';
-      const output = el('pre', 'header-job-output', job.output);
-      output.hidden = !expandedJobs.has(job.task_id);
-      toggle.textContent = output.hidden ? '查看输出' : '收起输出';
-      toggle.addEventListener('click', () => {
-        if (expandedJobs.has(job.task_id)) expandedJobs.delete(job.task_id); else expandedJobs.add(job.task_id);
-        renderJobsInto(node);
-      });
-      row.append(toggle, output);
-    }
-    node.append(row);
+    stop.dataset.jobFocus = `stop:${job.task_id}`;
+    stop.disabled = pendingJobStops.has(job.task_id);
+    const armed = jobsArmed === job.task_id;
+    stop.classList.toggle('job-stop-armed', armed);
+    stop.setAttribute('aria-label', armed ? `确认停止 ${jobCommand(job)}` : `停止 ${jobCommand(job)}`);
+    stop.title = armed ? '再次按下确认停止' : '停止后台任务';
+    stop.append(el('span', 'job-stop-glyph'));
+    if (armed) stop.append(el('span', 'job-stop-label', '确认停止'));
+    stop.addEventListener('click', () => stopJob(job));
+    card.append(row, stop);
+    node.append(card);
+    if (expanded) node.append(jobPanel(job));
   }
   if (settled.length) {
-    const header = el('div', 'header-popover-subtitle', `已结束 ${settled.length}`);
+    const header = el('div', 'job-section-label job-settled-head');
+    const toggle = el('button', 'job-section-toggle');
+    toggle.type = 'button';
+    toggle.dataset.jobFocus = 'settled-toggle';
+    toggle.setAttribute('aria-expanded', String(settledOpen));
+    toggle.append(iconNode('chevronDown', { size: 12, className: settledOpen ? 'job-chevron open' : 'job-chevron' }));
+    toggle.append(el('span', undefined, `已结束 ${settled.length}`));
+    toggle.addEventListener('click', () => { settledOpen = !settledOpen; renderJobsInto(node); });
+    const clear = el('button', 'job-section-clear', '清除');
+    clear.type = 'button';
+    clear.dataset.jobFocus = 'settled-clear';
+    clear.addEventListener('click', () => {
+      for (const job of settled) clearedJobs.add(job.task_id);
+      renderJobsInto(node);
+    });
+    header.append(toggle, clear);
     node.append(header);
-    for (const job of [...settled].reverse()) {
-      const row = el('div', 'header-job-row settled');
-      const head = el('div', 'header-job-head');
-      const dot = el('span', 'header-state-dot');
-      dot.dataset.state = job.status === 'failed' ? 'failed' : 'done';
-      const copy = el('span', 'header-agent-copy');
-      copy.append(el('span', 'header-agent-name', [job.program, ...(Array.isArray(job.args) ? job.args : [])].filter(Boolean).join(' ') || job.task_id));
-      copy.append(el('span', 'header-agent-meta', job.status === 'failed' ? '已失败' : '已完成'));
-      head.append(dot, copy);
-      row.append(head);
-      node.append(row);
+    if (settledOpen) {
+      for (const job of [...settled].reverse()) {
+        const state = jobSettledState(job);
+        const expanded = expandedJobs.has(job.task_id);
+        // A settled row with retained output is a disclosure; one without is
+        // read-only, like the reference settled tail.
+        const observable = Boolean(job.output);
+        const card = el('div', 'job-settled-card');
+        const row = el(observable ? 'button' : 'span', observable ? 'job-row job-row-settled' : 'job-row job-row-settled job-row-static');
+        if (observable) {
+          row.type = 'button';
+          row.dataset.jobFocus = `row:${job.task_id}`;
+          row.setAttribute('aria-expanded', String(expanded));
+          row.setAttribute('aria-label', `${expanded ? '收起' : '展开'}任务输出：${jobCommand(job)}`);
+        }
+        const dot = el('span', 'header-state-dot');
+        dot.dataset.state = state.dot;
+        row.append(dot, el('span', 'job-kind', '命令'), el('span', 'job-label job-label-settled', jobCommand(job)),
+          el('span', 'job-status', state.label), el('span', 'job-duration', jobDuration(job, false)));
+        if (observable) {
+          row.append(jobChevron(expanded));
+          row.addEventListener('click', () => {
+            if (expanded) expandedJobs.delete(job.task_id); else expandedJobs.add(job.task_id);
+            renderJobsInto(node);
+          });
+        }
+        card.append(row);
+        node.append(card);
+        if (expanded) node.append(jobPanel(job));
+      }
     }
   }
-  node.append(el('div', 'header-popover-note', '输出为 Runtime 报告的增量；停止只终止该后台任务，不影响当前回合。'));
+  if (focusKey) {
+    const target = [...node.querySelectorAll('[data-job-focus]')].find(candidate => candidate.dataset.jobFocus === focusKey);
+    target?.focus({ preventScroll: true });
+  }
+  startJobsClock();
+}
+
+function startJobsClock() {
+  const node = jobsPopoverState?.node;
+  if (!node || !node.isConnected) { if (jobsClockTimer) { clearInterval(jobsClockTimer); jobsClockTimer = null; } return; }
+  const live = current?.backgroundTasks ?? [];
+  if (!live.length) { if (jobsClockTimer) { clearInterval(jobsClockTimer); jobsClockTimer = null; } return; }
+  if (jobsClockTimer) return;
+  jobsClockTimer = setInterval(() => {
+    const host = jobsPopoverState?.node;
+    if (!host?.isConnected) { clearInterval(jobsClockTimer); jobsClockTimer = null; return; }
+    for (const job of current?.backgroundTasks ?? []) {
+      const cell = host.querySelector(`[data-live="${CSS.escape(job.task_id)}"]`);
+      if (cell) cell.textContent = jobDuration(job, true);
+    }
+  }, 1000);
 }
 
 function openJobsPopover(anchor) {
+  disarmJob();
   openPopover({
-    anchor, width: 400, align: 'end', className: 'jobs-popover',
+    anchor, width: 500, align: 'end', className: 'jobs-popover',
     render: node => {
       jobsPopoverState = { node, anchor };
+      node.addEventListener('keydown', event => trapTab(node, event));
       renderJobsInto(node);
     },
   });
@@ -1622,9 +1779,9 @@ function contextMeterPanel() {
 function renderContextMeter() {
   const host = $('context-stats');
   if (!host) return;
-  const panel = contextMeterPanel();
-  host.hidden = !panel;
-  host.replaceChildren(...(panel ? [panel] : []));
+  const pills = [contextMeterPanel(), usagePill()].filter(Boolean);
+  host.hidden = pills.length === 0;
+  host.replaceChildren(...pills);
 }
 
 function refreshContextUsage() {
@@ -1981,7 +2138,8 @@ function toolNode(existing, tool) {
   const lead = row.querySelector('.tool-status');
   lead.replaceChildren(iconNode(toolIconName(tool), { size: 14 }));
   row.querySelector('.tool-label').textContent = waiting ? '等待审批' : toolLabel(tool);
-  const target = String(toolTarget(tool) ?? '');
+  const target = String(toolTarget(tool) ?? '')
+    || (toolLabel(tool) === '工具调用' ? String(tool.name ?? '') : '');
   const failureText = failureReason(tool.preview ?? '') ?? '';
   row.querySelector('.tool-target').textContent = waiting ? '等待你的批准'
     : target || (status === 'failed' ? failureText : '');
@@ -2346,8 +2504,6 @@ function scheduleTurnCard(tool, args, output) {
   return card;
 }
 
-const EXECUTION_GLYPHS = { running: '●', ok: '✓', failed: '✗', cancelled: '■', unknown: '◇' };
-
 function syncChildren(host, children) {
   for (const child of [...host.children]) if (!children.includes(child)) child.remove();
   for (const child of children) if (child.parentNode !== host) host.append(child);
@@ -2449,15 +2605,16 @@ function executionNode(existing, item) {
         const state = /** @type {{view:any,existing:Map<string,HTMLElement>}} */ (executionState.get(node));
         openConfirmedChanges(state.view.toolIds, null);
       });
-    } else {
-      summary.prepend(el('span', 'execution-caret', '▸'));
     }
   }
   executionState.set(node, { view, existing });
   node.dataset.status = view.waiting ? 'waiting' : view.status;
   node.dataset.tone = view.failed ? 'error' : view.cancelled || view.unknown ? 'warning' : view.running ? 'active' : '';
   const summary = node.querySelector('.execution-summary');
-  summary.querySelector('.execution-glyph').textContent = view.waiting ? '◆' : (EXECUTION_GLYPHS[view.status] ?? '◇');
+  // The leading mark names the work (reference activity icon); the row itself
+  // is the disclosure control, so a second caret is noise.
+  const member = current?.tools.find(tool => tool.id === view.tools[0]);
+  summary.querySelector('.execution-glyph').replaceChildren(iconNode(member ? toolIconName(member) : 'wrench', { size: 14 }));
   summary.querySelector('.execution-label').textContent = view.label;
   summary.querySelector('.execution-action').textContent = view.waiting
     ? '等待你的批准'
@@ -2638,13 +2795,14 @@ function renderConversation() {
   document.body.classList.toggle('blank-session', home);
   const existing = new Map([...list.querySelectorAll('[data-key]')].map(node => [node.dataset.key, node]));
   const nodes = [];
-  if (!home) nodes.push(systemPromptNode());
   // The renderer paints the presentation projection; it does not decide what
   // a message is, where a group begins, or whether a turn answered.
   const items = conversationItems({ ...current, approvals: current.approvals ?? [] });
   const trailing = [];
   while (items.at(-1)?.kind === 'live_thought') trailing.unshift(items.pop());
-  for (const item of items) {
+  const approvalIds = new Set((current.approvals ?? []).map(item => String(item.call_id ?? '')));
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
     if (item.kind === 'thought') continue;
     if (item.kind === 'user') {
       const node = userMessageNode(existing, item.message);
@@ -2657,11 +2815,20 @@ function renderConversation() {
     } else if (item.kind === 'notice' || item.kind === 'summary') {
       nodes.push(runtimeNoticeNode(existing, item));
     } else if (item.kind === 'execution') {
-      if (item.execution.variant === 'tool') {
-        const tool = current.tools.find(candidate => candidate.id === item.execution.tools[0]);
+      // Model steps do not create reader-visible headers: consecutive blocks of
+      // one run paint as a single process row, like the reference transcript.
+      // A call waiting for approval keeps its own visible row, so it is never
+      // folded into a neighbour.
+      const run = [item.execution];
+      while (!run.at(-1).waiting && items[index + 1]?.kind === 'execution' && !items[index + 1].execution.waiting) {
+        run.push(items[++index].execution);
+      }
+      const view = run.length > 1 ? mergeExecutionViews(run, current.tools, approvalIds) : item.execution;
+      if (view.variant === 'tool') {
+        const tool = current.tools.find(candidate => candidate.id === view.tools[0]);
         if (tool) nodes.push(toolNode(existing, tool));
       } else {
-        nodes.push(executionNode(existing, item));
+        nodes.push(executionNode(existing, { ...item, execution: view }));
       }
     } else if (item.kind === 'turn_receipt') {
       nodes.push(turnReceiptNode(existing, item));
@@ -2678,7 +2845,9 @@ function renderConversation() {
     if (!row) {
       row = el('div', 'running-row');
       row.dataset.key = 'running';
-      row.append(el('span', 'running-dot'), el('span', 'running-text'));
+      const content = el('span', 'running-content');
+      content.append(el('span', 'running-dot'), el('span', 'running-text'));
+      row.append(el('span', 'running-divider'), content);
     }
     row.querySelector('.running-text').textContent = runningLabel();
     runningRow = row;
@@ -2694,7 +2863,6 @@ function renderConversation() {
   const plan = planCard(); if (plan) nodes.push(plan);
   const delivered = deliveredCard(); if (delivered) nodes.push(delivered);
   const presented = presentedFilesCard(); if (presented) nodes.push(presented);
-  const usage = usageNode(); if (usage) nodes.push(usage);
   // The live analysis is the turn's latest activity: it sits above the running
   // line, never above the answer it belongs to.
   for (const item of trailing) nodes.push(liveThoughtNode(existing, item.text));
@@ -2738,19 +2906,20 @@ function runningLabel() {
   return modelRetry ? `${base} 正在重试模型请求（${modelRetry.attempt}/${modelRetry.max}）` : base;
 }
 
-function usageNode() {
-  if (!current?.usage) return null;
-  const usage = current.usage;
+function usagePill() {
+  const usage = current?.usage;
+  if (!usage) return null;
   if (!usage.input_tokens && !usage.output_tokens) return null;
   const parts = [`输入 ${usage.input_tokens ?? 0}`, `输出 ${usage.output_tokens ?? 0}`];
   if (usage.cached_input_tokens) parts.push(`缓存 ${usage.cached_input_tokens}`);
   if (settings.performance === 'detailed' && usage.reasoning_tokens) parts.push(`推理 ${usage.reasoning_tokens}`);
-  const row = el('button', 'turn-usage', parts.join(' · '));
-  row.type = 'button';
-  row.dataset.key = 'usage';
-  row.setAttribute('aria-label', '查看 Token 用量');
-  row.addEventListener('click', () => openUsageDialog(usage));
-  return row;
+  const button = el('button', 'context-pill usage-pill');
+  button.type = 'button';
+  button.append(el('span', undefined, parts.join(' · ')));
+  button.dataset.tooltip = 'Token 用量';
+  button.setAttribute('aria-label', '查看 Token 用量');
+  button.addEventListener('click', () => openUsageDialog(usage));
+  return button;
 }
 
 function openUsageDialog(usage) {
@@ -2772,15 +2941,6 @@ function openUsageDialog(usage) {
   dialog.addEventListener('close', () => dialog.remove(), { once: true });
   close.addEventListener('click', () => dialog.close());
   dialog.showModal();
-}
-
-function systemPromptNode() {
-  const details = el('details', 'system-prompt-node');
-  details.dataset.key = 'system-prompt';
-  const summary = el('summary', 'system-prompt-head');
-  summary.append(iconNode('settings', { size: 14 }), el('span', undefined, '系统提示词'), el('span', 'system-prompt-state', '未记录'));
-  details.append(summary, el('p', 'system-prompt-empty', '轨迹视图没有记录本会话的系统提示词；模型请求不受影响。'));
-  return details;
 }
 
 function userShellNode(shell) {
@@ -4071,11 +4231,23 @@ async function openTask(task) {
   closeNarrowSidebar();
 }
 
+/** A snapshot row carries Runtime-observed age, not an anchor; publish one so
+ * the live duration keeps moving between refreshes. */
+function activeJobRecord(job, prior = []) {
+  const known = prior.find(candidate => candidate.task_id === job.task_id);
+  return {
+    ...(known ?? {}),
+    ...job,
+    started_at: known?.started_at ?? job.started_at ?? Date.now() - (job.elapsed_ms ?? 0),
+    output: known?.output ?? job.output ?? '',
+  };
+}
+
 function attachExtras(state, snapshot) {
   return {
     ...state,
     children: snapshot.children ?? state.children ?? [],
-    backgroundTasks: snapshot.active_background_tasks ?? state.backgroundTasks ?? [],
+    backgroundTasks: (snapshot.active_background_tasks ?? state.backgroundTasks ?? []).map(job => activeJobRecord(job)),
     usage: state.usage ?? null,
   };
 }
@@ -4134,7 +4306,7 @@ async function refreshSnapshot() {
   current.approvals = replayed.approvals;
   current.clarifications = replayed.clarifications;
   current.settledBackgroundTasks = settledBackgroundTasks;
-  const activeJobs = snapshot.active_background_tasks ?? [];
+  const activeJobs = (snapshot.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks));
   const activeIds = new Set(activeJobs.map(job => job.task_id));
   current.backgroundTasks = [...activeJobs, ...priorBackgroundTasks.filter(job => !activeIds.has(job.task_id))];
   current.diffQuery = diffQuery;
@@ -6760,7 +6932,7 @@ api.onEvent(frame => {
     current.approvals = replayed.approvals;
     current.clarifications = replayed.clarifications;
     current.settledBackgroundTasks = settledBackgroundTasks;
-    const activeJobs = frame.data.active_background_tasks ?? [];
+    const activeJobs = (frame.data.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks));
     const activeIds = new Set(activeJobs.map(job => job.task_id));
     current.backgroundTasks = [...activeJobs, ...priorBackgroundTasks.filter(job => !activeIds.has(job.task_id))];
     current.contextUsage = priorContext;
@@ -6815,6 +6987,7 @@ api.onEvent(frame => {
   }
   if (event.type === 'token_usage') {
     current = { ...current, usage: { ...(current.usage ?? {}), ...event } };
+    renderContextMeter();
     scheduleConversation();
     return;
   }
@@ -6826,10 +6999,13 @@ api.onEvent(frame => {
     if (rightbarOpen) renderRightbar();
     return;
   }
-  if (event.type.startsWith('background_task_')) {
+  if (event.type.startsWith('background_task_') || event.type === 'background_tasks_reconciled') {
     current = applyBackgroundEvent(current, event);
     renderHeader();
-    if (jobsPopoverState?.node.isConnected) renderJobsInto(jobsPopoverState.node);
+    if (jobsPopoverState?.node.isConnected) {
+      if (event.type === 'background_task_output') updateJobsOutput(event.task_id);
+      else renderJobsInto(jobsPopoverState.node);
+    }
     return;
   }
   if (event.type === 'notification') {
@@ -6903,6 +7079,18 @@ function applySubagentEvent(state, event) {
 
 function applyBackgroundEvent(state, event) {
   const jobs = [...(state.backgroundTasks ?? [])];
+  if (event.type === 'background_tasks_reconciled') {
+    // Authoritative replacement after a lifecycle broadcast lag. Keep the local
+    // clock anchor and streamed output for rows we already know.
+    const prior = new Map(jobs.map(job => [job.task_id, job]));
+    const active = (event.tasks ?? []).map(task => {
+      const known = prior.get(task.task_id);
+      return known
+        ? { ...known, program: task.program, args: task.args, pid: task.pid, elapsed_ms: task.elapsed_ms }
+        : { ...task, started_at: Date.now() - (task.elapsed_ms ?? 0), output: '' };
+    });
+    return { ...state, backgroundTasks: active };
+  }
   if (event.type === 'background_task_started') {
     jobs.push({ task_id: event.task_id, program: event.program, args: event.args, pid: event.pid, elapsed_ms: 0, started_at: Date.now(), output: '' });
     return { ...state, backgroundTasks: jobs };
@@ -6926,6 +7114,24 @@ function applyBackgroundEvent(state, event) {
       duration_ms: event.duration_ms,
       stopped: event.stopped === true,
     }].slice(-20);
+    pendingJobStops.delete(event.task_id);
+    if (jobsArmed === event.task_id) disarmJob();
+    return { ...state, backgroundTasks: jobs.filter(task => task.task_id !== event.task_id), settledBackgroundTasks: settled };
+  }
+  if (event.type === 'background_task_unknown') {
+    // The runtime could not establish the task's outcome. That is its own
+    // terminal fact: never paint it as running, failed, or stopped.
+    const record = jobs.find(task => task.task_id === event.task_id);
+    const settled = [...(state.settledBackgroundTasks ?? []), {
+      ...(record ?? { task_id: event.task_id, program: '', args: [], started_at: Date.now() }),
+      status: 'unknown',
+      finished_at: Date.now(),
+      output: event.output ?? record?.output ?? '',
+      duration_ms: event.duration_ms,
+      stopped: false,
+    }].slice(-20);
+    pendingJobStops.delete(event.task_id);
+    if (jobsArmed === event.task_id) disarmJob();
     return { ...state, backgroundTasks: jobs.filter(task => task.task_id !== event.task_id), settledBackgroundTasks: settled };
   }
   return { ...state, backgroundTasks: jobs };

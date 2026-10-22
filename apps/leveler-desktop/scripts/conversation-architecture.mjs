@@ -46,7 +46,6 @@ function conversationShape() {
     if (node.classList.contains('tool-row')) return 'tool';
     if (node.classList.contains('turn-receipt')) return 'receipt';
     if (node.classList.contains('turn-error-row')) return 'error';
-    if (node.classList.contains('system-prompt-node')) return 'system';
     return node.className;
   }));
 }
@@ -70,7 +69,7 @@ try {
   await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant.final')].some(node => node.textContent.includes('这是纯聊天回答')));
   let shape = await conversationShape();
   evidence.pureChatShape = shape;
-  assert.deepEqual(shape, ['system', 'user', 'final', 'receipt']);
+  assert.deepEqual(shape, ['user', 'final', 'receipt']);
   assert.equal(await page.locator('.execution-group').count(), 0, 'a pure chat grew an execution card');
   const firstReceipt = page.locator('.turn-receipt').first();
   assert.equal(await firstReceipt.getAttribute('data-status'), 'answered');
@@ -84,19 +83,20 @@ try {
   shape = await conversationShape();
   evidence.investigationShape = shape;
   assert.deepEqual(shape, [
-    'system', 'user', 'final', 'receipt',
-    'user', 'narration', 'execution:exploration', 'execution:tools', 'narration', 'execution:edit', 'final', 'receipt',
+    'user', 'final', 'receipt',
+    'user', 'narration', 'execution:tools', 'narration', 'execution:edit', 'final', 'receipt',
   ]);
-  const exploration = page.locator('.execution-group.execution-exploration').last();
+  // One process group per contiguous run: the exploration and command steps of
+  // the turn share one collapsed row instead of repeating "执行 N 项".
   const commands = page.locator('.execution-group.execution-tools').last();
   const edit = page.locator('.execution-group.execution-edit').last();
-  assert.equal(await exploration.evaluate(node => node.open), false, 'the exploration receipt is not collapsed');
-  assert.equal(await commands.evaluate(node => node.open), false, 'the command group is not collapsed');
+  assert.equal(await commands.evaluate(node => node.open), false, 'the process group is not collapsed');
   assert.equal(await edit.evaluate(node => node.open), false, 'the edit group is not collapsed');
-  assert.match(await exploration.locator('.execution-label').innerText(), /读取 2 次 · 搜索 1 次/);
   const commandSummary = await commands.locator('.execution-summary').innerText();
-  assert.match(commandSummary, /执行 2 条命令/);
-  assert.match(commandSummary, /1 条失败/);
+  assert.match(commandSummary, /已读取文件/);
+  assert.match(commandSummary, /执行了命令/);
+  assert.doesNotMatch(commandSummary, /执行 \d+ 项/);
+  assert.match(commandSummary, /1 项失败/);
   assert.match(commandSummary, /test mapping::recommended \.\.\. FAILED/, 'a folded command hides its failure');
   assert.match(await edit.locator('.execution-label').innerText(), /修改 3 个文件 · \+4 \/ -4/);
   assert.equal(await edit.locator('.execution-hint').innerText(), '查看变更');
@@ -114,7 +114,7 @@ try {
   await page.waitForFunction(() => [...document.querySelectorAll('.execution-group.execution-tools')].at(-1)?.open);
   const scrollAfterExpand = await page.evaluate(() => document.querySelector('#conversation-scroll').scrollTop);
   assert.ok(Math.abs(scrollAfterExpand - scrollBeforeExpand) <= 2, `expanding moved the reader from ${scrollBeforeExpand} to ${scrollAfterExpand}`);
-  await page.waitForFunction(() => document.querySelectorAll('.execution-group.execution-tools .tool-row').length === 2);
+  await page.waitForFunction(() => document.querySelector('.execution-group.execution-tools .tool-row[data-tool-id="c2"]'));
   const expandedCommands = await page.evaluate(() => {
     const groups = [...document.querySelectorAll('.execution-group.execution-tools')];
     const group = groups.at(-1);
@@ -124,11 +124,12 @@ try {
     };
   });
   evidence.expandedCommands = expandedCommands;
-  assert.deepEqual(expandedCommands.rows.map(row => row.id), ['c1', 'c2']);
-  assert.equal(expandedCommands.rows[0].status, 'ok');
-  assert.equal(expandedCommands.rows[1].status, 'failed');
-  assert.match(expandedCommands.rows[1].text, /cargo test -p demo/);
-  assert.match(expandedCommands.rows[1].text, /退出码 1/);
+  assert.deepEqual(expandedCommands.rows.map(row => row.id), ['r1', 'r2', 's1', 'c1', 'c2']);
+  const commandRows = expandedCommands.rows.filter(row => row.id.startsWith('c'));
+  assert.equal(commandRows[0].status, 'ok');
+  assert.equal(commandRows[1].status, 'failed');
+  assert.match(commandRows[1].text, /cargo test -p demo/);
+  assert.match(commandRows[1].text, /退出码 1/);
   assert.equal(expandedCommands.collapsedRowsBefore, 0, 'a collapsed group painted its child rows');
   // A command's copied output is the command's own text, never the runtime's
   // execution rows.
@@ -244,11 +245,8 @@ try {
   await shot('architecture-workspace-diff');
   await page.locator('.pane-chrome button[aria-label="收起右侧边栏"]').first().click();
 
-  // Copy narration and final answer without decoration.
-  const narrated = await page.locator('.message.assistant.narration').first().innerText();
-  await page.locator('.message.assistant.narration').first().locator('.message-copy').first().click();
-  await page.waitForTimeout(150);
-  assert.equal(await application.evaluate(({ clipboard }) => clipboard.readText()), narrated);
+  // Only the final answer carries message actions (reference AssistantNodeView
+  // renders none for interim narration); copying it must be undecorated.
   const finals = await page.locator('.message.assistant.final').allInnerTexts();
   await page.locator('.message.assistant.final').last().locator('.message-copy').first().click();
   await page.waitForTimeout(150);

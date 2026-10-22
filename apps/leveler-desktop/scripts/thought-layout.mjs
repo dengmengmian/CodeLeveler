@@ -52,7 +52,7 @@ try {
       last: children.at(-1) ?? null,
       beforeLast: children.at(-2) ?? null,
       runningText: list.querySelector('.running-row .running-text')?.textContent ?? null,
-      runningBorder: getComputedStyle(list.querySelector('.running-row')).borderTopWidth,
+      runningBorder: getComputedStyle(list.querySelector('.running-row .running-divider')).height,
       stop: (() => {
         const button = document.querySelector('#stop');
         const glyph = button?.querySelector('.stop-glyph');
