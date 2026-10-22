@@ -54,6 +54,17 @@ fn test_env(base_url: &str) -> TestEnv {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(configs.join("providers")).unwrap();
     std::fs::create_dir_all(configs.join("models")).unwrap();
+    // These cases count provider requests to prove the collaboration axis
+    // never continues a chat or plan turn. Memory extraction is a separate
+    // background request on its own lane, so it is switched off here: its
+    // presence says nothing about goal continuation, and counting it would
+    // make this contract depend on memory scheduling.
+    std::fs::create_dir_all(repo.join(".leveler")).unwrap();
+    std::fs::write(
+        repo.join(".leveler/config.yaml"),
+        "memory:\n  enabled: false\n",
+    )
+    .unwrap();
     git::init_repo(&repo);
     std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
     git::run(&repo, &["add", "-A"]);
