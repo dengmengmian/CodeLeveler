@@ -1676,7 +1676,7 @@ Each experience is exactly:
   "category": "root_cause" | "fix" | "failure_pattern" | "environment_constraint" | "tool_use",
   "subject": a stable lowercase dotted identity, e.g. "experience.cargo.test.dev_profile",
   "title": one short human label,
-  "body": the actionable lesson: the condition, what to do, and what the evidence shows,
+  "body": the actionable lesson: the condition, what to do, and what the evidence shows (at most __BODY_BUDGET__ characters; aim for 2-4 sentences),
   "applies_when": the concrete conditions under which it applies,
   "invalid_if": what change would make it stale,
   "evidence_ids": ids copied exactly from failures/resolutions/mutations/observations,
@@ -1684,6 +1684,8 @@ Each experience is exactly:
 }
 
 Rules:
+- Keep each body at or under __BODY_BUDGET__ characters. A longer lesson is
+  rejected, not truncated.
 - Only report a lesson a future agent could ACT on. Never summarize the patch,
   list files, restate the goal, or record a fact that git already states.
 - You do not decide whether the lesson is verified. The runtime does, from the
@@ -1712,7 +1714,10 @@ Rules:
   return an empty list.
 - Prefer one precise experience over several vague ones.
 "#
-    .to_string()
+    .replace(
+        "__BODY_BUDGET__",
+        &MAX_EXPERIENCE_BODY_CHARS.to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -1720,6 +1725,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The validator rejects a body above this limit. The prompt must state
+    /// the same number, or a model can only discover it by being rejected.
+    #[test]
+    fn the_extraction_prompt_states_the_body_budget_it_is_validated_against() {
+        let prompt = experience_system_prompt();
+        assert!(
+            prompt.contains(&MAX_EXPERIENCE_BODY_CHARS.to_string()),
+            "prompt must state the {MAX_EXPERIENCE_BODY_CHARS}-character body budget"
+        );
+    }
 
     fn started(call_id: &str, name: &str, arguments: serde_json::Value, step: u32) -> String {
         json!({
