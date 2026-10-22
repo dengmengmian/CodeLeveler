@@ -762,11 +762,19 @@ Agent experience is the same durable memory with an evidence contract, not a
 second store. After a completed task, the runtime reads only its own structured
 facts (commands, exit codes, model steps, mutations, structured observations —
 a project verification script that exited 0 without output, an edit that
-reported success but changed nothing — and the terminal outcome) and builds a
-bounded evidence pack. Raw tool output never enters the pack. A model may
-propose a lesson, but the runtime derives verification: a `verified` experience
-requires an observed failure and, for a fix or root cause, a later success of
-the same command after the last change. An environment constraint may be
+reported success but changed nothing, and at most two bounded key/value lines
+printed by a verification command, such as `engine: legacy`,
+`execution: skipped_by_engine`, or a receipt's `result=passed tests=1` — and the
+terminal outcome) and builds a bounded evidence pack. Raw tool logs never enter
+the pack. A model may propose a lesson, but the runtime derives verification: a
+`verified` experience requires an observed failure and, for a fix or root cause,
+a later success of the same command family after the last change. One project
+verification script is one family across engine flags; its `status`/`history`
+subcommands are informational and never resolve a failure. A cited failure with
+exactly one same-family later pass records that pass as evidence even when the
+model omitted its id. A changed verification entry plus printed status lines is
+also a signal, because a task can repair the official entry without any command
+failing. An environment constraint may be
 verified by a structured observation alone. A different explanation under the
 same failure signature is not an update: it waits for a person instead of
 silently replacing the current entry. An observation-only lesson takes its
