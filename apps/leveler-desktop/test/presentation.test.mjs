@@ -252,6 +252,20 @@ test('an unrecognized tool keeps the reference wording and never claims to execu
   assert.equal(toolLabel({ name: 'browser_scroll' }), '浏览器操作');
 });
 
+test('the task dock reports per-status counts in the reference order', async () => {
+  const { planProgressLabel } = await import('../src/presentation.mjs');
+  const steps = [
+    { status: 'done' }, { status: 'done' }, { status: 'done' },
+    { status: 'running' },
+    { status: 'pending' }, { status: 'pending' },
+  ];
+  assert.equal(planProgressLabel(steps), '3 已完成 · 1 进行中 · 2 待处理');
+  assert.equal(planProgressLabel([{ status: 'running' }]), '1 进行中');
+  assert.equal(planProgressLabel([{ status: 'done' }, { status: 'failed' }, { status: 'skipped' }]),
+    '1 已完成 · 1 失败 · 1 已跳过');
+  assert.equal(planProgressLabel([]), '');
+});
+
 test('skills, subagents and harness controls keep their real identity', async () => {
   const { toolLabel } = await import('../src/presentation.mjs');
   assert.equal(toolLabel({ name: 'load_skill' }), '使用技能');
