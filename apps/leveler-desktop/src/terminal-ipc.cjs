@@ -14,7 +14,16 @@ function installTerminalIpc({ handle, bridge }) {
       const key = `${request.session_id}:${request.terminal_id}`;
       // Register before writing: delivery failure can mean create happened.
       if (action === 'create') terminals.set(key, { session_id: request.session_id, terminal_id: request.terminal_id });
-      const result = await bridge.request(method, request);
+      let result;
+      try {
+        result = await bridge.request(method, request);
+      } catch (error) {
+        // A runtime reply is definitive: no terminal was admitted, so it must
+        // not be offered to shutdown cleanup as a live id. Transport and
+        // outcome-unknown errors keep the registration on purpose.
+        if (action === 'create' && error?.kind === 'rejected') terminals.delete(key);
+        throw error;
+      }
       if (action === 'close' && ['exited', 'killed'].includes(result?.status)) terminals.delete(key);
       return result;
     });

@@ -27,10 +27,15 @@ export class DesktopTerminals {
     const status = document.createElement('div'); status.className = 'terminal-status'; status.setAttribute('role', 'status');
     const detail = document.createElement('span'); detail.className = 'terminal-status-detail';
     const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = '重新查询状态'; retry.hidden = true;
-    status.append(detail, retry); view.append(screen, status);
+    const errorBox = document.createElement('details'); errorBox.className = 'terminal-error'; errorBox.hidden = true;
+    const errorSummary = document.createElement('summary'); errorSummary.textContent = '技术详情';
+    const errorPre = document.createElement('pre'); errorPre.className = 'terminal-error-text';
+    const errorCopy = document.createElement('button'); errorCopy.type = 'button'; errorCopy.className = 'terminal-error-copy'; errorCopy.textContent = '复制错误信息';
+    errorBox.append(errorSummary, errorPre, errorCopy);
+    status.append(detail, retry); view.append(screen, status, errorBox);
     const term = new Terminal({ cursorBlink: true, scrollback: 5000, allowProposedApi: false, allowTransparency: false });
     const fit = new FitAddon(); term.loadAddon(fit);
-    const entry = { tab, view, screen, detail, retry, term, fit, status: 'starting', cursor: 0, closed: false, shell: '', params: { session_id: session.id, terminal_id: tab.terminalId }, writes: Promise.resolve() };
+    const entry = { tab, view, screen, detail, retry, errorBox, errorPre, term, fit, status: 'starting', cursor: 0, closed: false, shell: '', created: false, createFailed: false, createRejected: false, params: { session_id: session.id, terminal_id: tab.terminalId }, writes: Promise.resolve() };
     this.setStatus(entry, 'starting');
     term.open(screen); this.style(entry);
     // Keep terminal keys (Ctrl+C, arrows, Escape) inside the terminal. Native
@@ -44,15 +49,38 @@ export class DesktopTerminals {
       this.api.resizeTerminal({ ...entry.params, cols, rows }).catch(error => this.unknown(entry, error));
     });
     entry.observer = new ResizeObserver(() => this.fit(entry)); entry.observer.observe(screen);
-    retry.addEventListener('click', () => { retry.hidden = true; void this.observe(entry); });
-    // Wait for attachment to obtain real terminal dimensions, never 0 x 0.
+    retry.addEventListener('click', () => {
+      retry.hidden = true;
+      if (entry.createFailed) void this.start(entry); else void this.observe(entry);
+    });
+    errorCopy.addEventListener('click', () => {
+      const text = entry.errorPre.textContent ?? '';
+      Promise.resolve(this.api.copyText?.(text)).then(() => {
+        errorCopy.textContent = '已复制';
+        setTimeout(() => { errorCopy.textContent = '复制错误信息'; }, 1200);
+      }).catch(() => { errorCopy.textContent = '复制失败'; });
+    });
+    this.start(entry);
+    return entry;
+  }
+  /** Wait for attachment to obtain real terminal dimensions, never 0 x 0.
+   * A create the runtime rejected is not retried on close: it never existed. */
+  start(entry) {
+    entry.createFailed = false;
+    entry.createRejected = false;
     entry.started = new Promise(resolve => requestAnimationFrame(resolve)).then(() => {
       this.fit(entry);
-      return this.api.createTerminal({ ...entry.params, cols: term.cols, rows: term.rows }).then(result => {
-        this.apply(entry, result); if (!entry.closed && !entry.closing) void this.observe(entry);
-      }).catch(error => this.unknown(entry, error));
+      return this.api.createTerminal({ ...entry.params, cols: entry.term.cols, rows: entry.term.rows }).then(result => {
+        entry.created = true;
+        this.apply(entry, result);
+        if (!entry.closed && !entry.closing) void this.observe(entry);
+      }).catch(error => {
+        entry.createFailed = true;
+        entry.createRejected = /^runtime error:/.test(String(error?.message ?? error));
+        this.unknown(entry, error);
+      });
     });
-    return entry;
+    return entry.started;
   }
   setStatus(entry, status, message = '') {
     entry.status = status; entry.view.dataset.status = status;
@@ -60,10 +88,16 @@ export class DesktopTerminals {
     const labels = { starting: '正在启动…', running: '运行中', killing: '正在关闭…', exited: '已退出', killed: '已关闭', unknown: '状态未知' };
     entry.detail.textContent = `${entry.shell ? `${entry.shell} · ` : ''}${labels[status] ?? status}${message ? ` · ${message}` : ''}`;
     entry.retry.hidden = status !== 'unknown';
+    if (status !== 'unknown') { entry.errorBox.hidden = true; entry.errorPre.textContent = ''; }
   }
   unknown(entry, error) {
     clearTimeout(entry.timer);
-    this.setStatus(entry, 'unknown', `${error?.message ?? error}；输入未自动重发`);
+    const raw = String(error?.message ?? error ?? '未知错误');
+    this.setStatus(entry, 'unknown', friendlyTerminalError(raw));
+    entry.errorPre.textContent = raw;
+    entry.errorBox.hidden = false;
+    entry.retry.hidden = false;
+    entry.retry.textContent = entry.createFailed ? '重试创建终端' : '重新查询状态';
   }
   apply(entry, result) {
     if (result.truncated) { entry.term.reset(); entry.term.writeln('[较早的终端输出已超出保留范围，已重置显示]\r\n'); }
@@ -112,6 +146,11 @@ export class DesktopTerminals {
     const entry = this.entries.get(`${sessionId}:${tab.terminalId}`);
     if (!entry) return;
     if (entry.closing) return entry.closing;
+    if (entry.createFailed && entry.createRejected) {
+      // The runtime refused admission, so no process exists to stop.
+      this.dispose(entry, sessionId, tab.terminalId);
+      return;
+    }
     entry.closing = (async () => {
       await entry.started;
       clearTimeout(entry.timer); this.setStatus(entry, 'killing');
@@ -121,9 +160,31 @@ export class DesktopTerminals {
         if (!['exited', 'killed'].includes(result.status)) throw new Error('尚未确认终端进程退出');
         entry.closed = true; entry.observer.disconnect(); entry.term.dispose();
         this.entries.delete(`${sessionId}:${tab.terminalId}`);
-      } catch (error) { this.unknown(entry, error); throw error; }
+      } catch (error) {
+        // The host authoritatively has no such process: there is nothing left
+        // to stop, so the tab closes instead of keeping a dead id.
+        if (/unknown hosted task/.test(String(error?.message ?? error))) {
+          this.dispose(entry, sessionId, tab.terminalId);
+          return;
+        }
+        this.unknown(entry, error); throw error;
+      }
       finally { entry.closing = null; }
     })();
     return entry.closing;
   }
+  dispose(entry, sessionId, terminalId) {
+    clearTimeout(entry.timer);
+    entry.closed = true;
+    entry.observer?.disconnect();
+    entry.term.dispose();
+    this.entries.delete(`${sessionId}:${terminalId}`);
+  }
+}
+
+/** Operator-facing summary; the raw runtime text stays under 技术详情. */
+function friendlyTerminalError(message) {
+  if (/Execution Host missing terminal\.pty/.test(message)) return '当前执行宿主不支持终端（可能仍有旧版本进程在运行），请结束后端旧进程后重试';
+  if (/unknown hosted task/.test(message)) return '终端进程已不存在';
+  return '终端操作失败，输入未自动重发';
 }
