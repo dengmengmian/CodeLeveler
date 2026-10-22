@@ -207,7 +207,20 @@ export function openPopover({ anchor, width = 336, align = 'start', className = 
   activePopover = { node, anchor };
   anchor.setAttribute('aria-expanded', 'true');
   const rect = anchor.getBoundingClientRect();
-  const box = node.getBoundingClientRect();
+  let box = node.getBoundingClientRect();
+  // An end-aligned panel wider than the space left of its anchor would be
+  // pushed right by the viewport clamp, detaching its right edge from the
+  // trigger and covering the pane beside it. Shrink to the available width and
+  // keep the edge aligned instead.
+  if (align === 'end' && box.width > 0 && rect.right - box.width < 16) {
+    const available = Math.max(240, Math.floor(rect.right - 16));
+    if (available < box.width) {
+      node.style.minWidth = '0px';
+      node.style.maxWidth = `${available}px`;
+      node.style.width = `${available}px`;
+      box = node.getBoundingClientRect();
+    }
+  }
   let left = align === 'end' ? rect.right - box.width : align === 'center' ? rect.left + rect.width / 2 - box.width / 2 : rect.left;
   let top = rect.bottom + 5;
   left = Math.max(16, Math.min(innerWidth - box.width - 16, left));
