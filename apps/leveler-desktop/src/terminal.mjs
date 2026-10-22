@@ -114,9 +114,24 @@ export class DesktopTerminals {
     try {
       const result = await this.api.observeTerminal({ ...entry.params, cursor: entry.cursor, max_bytes: 65536 });
       if (entry.closed || entry.closing) return;
+      entry.retryDelay = 0;
       this.apply(entry, result);
       if (['running', 'killing'].includes(entry.status)) entry.timer = setTimeout(() => this.observe(entry), 75);
-    } catch (error) { if (!entry.closed && !entry.closing) this.unknown(entry, error); }
+    } catch (error) {
+      if (entry.closed || entry.closing) return;
+      const message = String(error?.message ?? error);
+      // A transport outage is not a terminal fact: the PTY lives in the
+      // Execution Host, not in the bridge. Keep polling through the reconnect
+      // instead of marking the terminal dead.
+      if (entry.created && retryableTerminalError(message)) {
+        clearTimeout(entry.timer);
+        entry.retryDelay = Math.min(5000, (entry.retryDelay ?? 500) * 2);
+        this.setStatus(entry, entry.status === 'starting' ? 'starting' : 'running', '连接中断，正在重试…');
+        entry.timer = setTimeout(() => this.observe(entry), entry.retryDelay);
+        return;
+      }
+      this.unknown(entry, error);
+    }
   }
   write(entry, bytes) {
     if (entry.status !== 'running') return;
@@ -183,6 +198,10 @@ export class DesktopTerminals {
 }
 
 /** Operator-facing summary; the raw runtime text stays under 技术详情. */
+function retryableTerminalError(message) {
+  return /Runtime bridge disconnected|Runtime bridge is reconnecting|Desktop closed|Desktop is closing|not connected|ECONNREFUSED|EPIPE/i.test(message);
+}
+
 function friendlyTerminalError(message) {
   if (/Execution Host missing terminal\.pty/.test(message)) return '当前执行宿主不支持终端（可能仍有旧版本进程在运行），请结束后端旧进程后重试';
   if (/unknown hosted task/.test(message)) return '终端进程已不存在';

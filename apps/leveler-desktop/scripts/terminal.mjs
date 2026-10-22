@@ -1,7 +1,7 @@
 // Real Electron + Runtime PTY acceptance; no provider or simulated terminal.
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { realpath } from 'node:fs/promises';
@@ -105,6 +105,151 @@ try {
   });
   console.log('Real terminal: shell output, cwd, isatty, stty resize, hidden/reopen identity, Ctrl+C, shell/job process disappearance passed.');
   console.log('Stale host refusal: friendly summary, copyable raw detail, local close without a stop call passed.');
+
+  // ── Phase 2: a fresh terminal after the stale-host interlude. ───────────
+  const startTab = () => page.locator('.pane-tab').filter({ hasText: '开始' }).first();
+  const activeTerminal = () => page.locator('.terminal-view');
+  const terminalRows = () => page.locator('.terminal-view .xterm-rows').innerText();
+  const helper = () => page.locator('.terminal-view .xterm-helper-textarea');
+  const line = async text => { await helper().focus(); await page.keyboard.type(text); await page.keyboard.press('Enter'); };
+  const waitRows = (marker, timeout = 20000) => page.waitForFunction(m => document.querySelector('.terminal-view .xterm-rows')?.textContent.includes(m), marker, { timeout });
+  const newTerminal = async () => {
+    await startTab().click();
+    await page.getByRole('button', { name: '新建终端' }).click();
+    await page.waitForFunction(() => document.querySelector('.terminal-view')?.dataset.status === 'running', null, { timeout: 10000 });
+    return activeTerminal().getAttribute('data-terminal-id');
+  };
+  let captureSeq = 0;
+  const capture = async (name, send) => {
+    const seq = ++captureSeq;
+    await line(`printf 'CAPREADY_${seq}_%s\\n' OK`);
+    await waitRows(`CAPREADY_${seq}_OK`).catch(async error => {
+      console.error('CAPREADY TIMEOUT', JSON.stringify(await terminalRows()));
+      throw error;
+    });
+    await line(`cat > ${name}`);
+    await page.waitForTimeout(300);
+    await send();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Control+d');
+    await page.waitForTimeout(200);
+    await line(`printf 'CAPDONE_${seq}_%s\\n' OK`);
+    await waitRows(`CAPDONE_${seq}_OK`);
+  };
+
+  const ansiId = await newTerminal();
+  await line("printf '\\033[31mANSI_RED\\033[0m\\n'");
+  await waitRows('ANSI_RED');
+  const ansiColor = await page.evaluate(() => {
+    const rows = document.querySelector('.terminal-view .xterm-rows');
+    const normal = getComputedStyle(rows).color;
+    const hits = [...rows.querySelectorAll('span')].filter(span => span.textContent.includes('ANSI_RED'));
+    const colored = [...rows.querySelectorAll('span')].filter(span => {
+      const color = getComputedStyle(span).color;
+      return color !== normal && /\S/.test(span.textContent ?? '');
+    });
+    return { normal, hits: hits.map(span => ({ cls: span.className, color: getComputedStyle(span).color, html: span.outerHTML.slice(0, 240) })), colored: colored.slice(0, 5).map(span => ({ cls: span.className, color: getComputedStyle(span).color })) };
+  });
+  assert.ok(ansiColor.colored.length > 0, `ANSI color was not rendered: ${JSON.stringify(ansiColor)}`);
+
+  await line("seq 1 3000; printf 'LONG_END\\n'");
+  await waitRows('LONG_END', 30000);
+  assert.equal(await activeTerminal().getAttribute('data-status'), 'running');
+
+  await capture('tabs.bin', async () => { await page.keyboard.type('A'); await page.keyboard.press('Tab'); await page.keyboard.type('B'); });
+  assert.equal((await readFile(path.join(workspace, 'tabs.bin'), 'utf8')).replace(/\n$/, ''), 'A\tB');
+  await capture('arrows.bin', async () => { await page.keyboard.press('ArrowUp'); await page.keyboard.type('X'); });
+  assert.match((await readFile(path.join(workspace, 'arrows.bin'), 'utf8')).replace(/\n$/, ''), /\x1b\[[A-D]X/, 'arrow key did not reach the PTY');
+  await capture('chinese.bin', async () => { await page.keyboard.insertText('中文输入'); });
+  assert.equal((await readFile(path.join(workspace, 'chinese.bin'), 'utf8')).replace(/\n$/, ''), '中文输入');
+  await app.evaluate(({ clipboard }) => clipboard.writeText('PASTE_MARK'));
+  await capture('paste.bin', async () => { await page.keyboard.press('Meta+v'); await page.waitForTimeout(250); });
+  assert.match((await readFile(path.join(workspace, 'paste.bin'), 'utf8')).replace(/\n$/, ''), /PASTE_MARK/);
+  await line("printf 'COPY_MARK_123\\n'");
+  await waitRows('COPY_MARK_123');
+  const copyRow = page.locator('.terminal-view .xterm-rows > div').filter({ hasText: 'COPY_MARK_123' }).last();
+  const copyBox = await copyRow.boundingBox();
+  assert.ok(copyBox, 'the copy row is not measurable');
+  await page.mouse.move(copyBox.x + 2, copyBox.y + copyBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(copyBox.x + Math.min(copyBox.width, 400) - 2, copyBox.y + copyBox.height / 2, { steps: 8 });
+  await page.mouse.up();
+  await page.keyboard.press('Meta+c');
+  await page.waitForTimeout(200);
+  assert.match(await app.evaluate(({ clipboard }) => clipboard.readText()), /COPY_MARK_123/);
+
+  const sizeLine = async marker => {
+    await line(`printf '${marker}_%s\\n' \"$(stty size)\"`);
+    await page.waitForFunction(m => new RegExp(m + '_\\d+ \\d+').test(document.querySelector('.terminal-view .xterm-rows')?.textContent ?? ''), marker, { timeout: 20000 });
+    const text = await terminalRows();
+    const match = text.match(new RegExp(`${marker}_(\\d+) (\\d+)`));
+    return match ? { rows: Number(match[1]), cols: Number(match[2]) } : { rows: NaN, cols: NaN };
+  };
+  const sizeBefore = await sizeLine('SIZE');
+  await page.locator('.pane-chrome [aria-label="全屏"]').click();
+  await page.waitForTimeout(600);
+  const sizeFull = await sizeLine('FULL');
+  assert.ok(sizeFull.cols > sizeBefore.cols, `fullscreen did not resize the PTY: ${JSON.stringify({ sizeBefore, sizeFull })}`);
+  await page.locator('.pane-chrome [aria-label="退出全屏"]').click();
+  await page.waitForTimeout(400);
+
+  await line("sleep 2; printf 'HIDDEN_DONE\\n'");
+  await page.locator('#rightbar-head [aria-label="收起右侧边栏"], .pane-chrome [aria-label="收起右侧边栏"]').first().click().catch(() => {});
+  await page.waitForFunction(() => document.querySelector('#rightbar')?.hidden);
+  await page.waitForTimeout(3000);
+  await page.locator('#header-right-toggle:visible, #floating-right-toggle:visible').click();
+  await waitRows('HIDDEN_DONE', 10000);
+
+  const ansiPid = Number((await (async () => { await line("printf 'APID_%s\\n' $$"); await waitRows('APID_'); return (await terminalRows()).match(/APID_(\d+)/)?.[1]; })()));
+  assert.ok(ansiPid > 0);
+
+  const sessionIdBeforeSwitch = await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
+  await page.locator('#new-session').click();
+  await page.waitForTimeout(500);
+  await page.locator(`.session-row[data-session-id="${sessionIdBeforeSwitch}"]`).click();
+  await page.waitForFunction(() => document.querySelector('.terminal-view')?.dataset.status === 'running', null, { timeout: 10000 });
+  assert.equal(await activeTerminal().getAttribute('data-terminal-id'), ansiId, 'the terminal tab was lost on a session switch');
+
+  const bridgePid = Number(execFileSync('pgrep', ['-P', String(app.process().pid), '-f', 'desktop-bridge'], { encoding: 'utf8' }).trim().split('\n')[0]);
+  process.kill(bridgePid, 'SIGKILL');
+  await page.waitForTimeout(2500);
+  await page.waitForFunction(() => document.querySelector('.terminal-view')?.dataset.status === 'running', null, { timeout: 20000 });
+  console.error('POST-KILL STATE', JSON.stringify(await page.evaluate(() => ({ status: document.querySelector('.terminal-view')?.dataset.status, error: document.querySelector('.terminal-error-text')?.textContent }))));
+  await line("printf 'AFTER_RECONNECT\\n'");
+  await waitRows('AFTER_RECONNECT', 20000).catch(async error => {
+    console.error('RECONNECT SCREEN', JSON.stringify(await page.evaluate(() => ({ status: document.querySelector('.terminal-view')?.dataset.status, text: document.querySelector('.terminal-status')?.innerText, rows: document.querySelector('.terminal-view .xterm-rows')?.textContent?.slice(-500) }))));
+    throw error;
+  });
+
+  const exitId = await newTerminal();
+  await line('exit 7');
+  await page.waitForFunction(() => document.querySelector('.terminal-view')?.dataset.status === 'exited', null, { timeout: 10000 });
+  assert.match(await page.locator('.terminal-view .terminal-status').innerText(), /退出码 7/);
+  await page.locator('.pane-tab[aria-selected="true"] .tab-close').click();
+  await page.waitForFunction(id => !document.querySelector(`.terminal-view[data-terminal-id="${id}"]`), exitId);
+
+  const thirdId = await newTerminal();
+  await line("printf 'TERM_C\\n'");
+  await waitRows('TERM_C');
+  const tabs = page.locator('.pane-tab');
+  await tabs.nth(1).click();
+  await page.waitForTimeout(300);
+  assert.doesNotMatch(await terminalRows(), /TERM_C/, 'terminal tabs shared output');
+  await tabs.nth(2).click();
+  await page.waitForTimeout(300);
+  assert.match(await terminalRows(), /TERM_C/);
+  const thirdPid = Number((await (async () => { await line("printf 'CPID_%s\\n' $$"); await waitRows('CPID_'); return (await terminalRows()).match(/CPID_(\d+)/)?.[1]; })()));
+  await page.locator('.pane-tab[aria-selected="true"] .tab-close').click();
+  await page.waitForTimeout(300);
+  assert.throws(() => process.kill(thirdPid, 0), { code: 'ESRCH' });
+  // Close the first phase-2 terminal and prove its shell is gone too.
+  await tabs.nth(1).click();
+  await page.waitForTimeout(200);
+  await page.locator('.pane-tab[aria-selected="true"] .tab-close').click();
+  await page.waitForTimeout(400);
+  assert.throws(() => process.kill(ansiPid, 0), { code: 'ESRCH' });
+  assert.equal(thirdId.length > 0, true);
+  console.log('Terminal dogfood: ANSI, long output, Tab/arrow bytes, IME insert, copy/paste, fullscreen resize, hidden output, session switch, bridge reconnect, exit code, tab isolation and orphan cleanup passed.');
 } finally {
   if(app && terminalParams) { const page=await app.firstWindow().catch(()=>null); await page?.evaluate(params=>window.desktop.closeTerminal(params),terminalParams).catch(()=>{}); }
   if (app) { await app.evaluate(({ app }) => app.exit(0)).catch(() => {}); await app.close().catch(() => {}); }
