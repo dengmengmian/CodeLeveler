@@ -1143,6 +1143,7 @@ impl Application {
                 cancellation,
             )
             .await;
+        self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -1174,6 +1175,7 @@ impl Application {
         let result = engine
             .resume_with_instruction(session_id, &spec, instruction, observer, cancellation)
             .await;
+        self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -1190,6 +1192,11 @@ impl Application {
         task_cancel: Arc<AtomicBool>,
     ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec), AppError> {
         let db = self.open_database().await?;
+        // Resume inserts a continuation turn and therefore needs the same
+        // memory worker and admission snapshot as a fresh turn. Without this,
+        // a resumed headless run would never consolidate its work.
+        self.ensure_memory_consolidator(&db)?;
+        self.sync_session_memory_policy(&db, session_id).await;
         let repo = SessionRepository::new(&db);
         let record = repo
             .get(session_id)

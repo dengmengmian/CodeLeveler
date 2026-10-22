@@ -1374,25 +1374,26 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 fn render_memory_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     use crate::memory::MemoryView;
     let t = state.t();
-    let layout = crate::secondary::layout(area, 0);
     let hint = match state.memory.view {
-        // The full hint fits wide terminals; the narrow one keeps every key
-        // visible instead of letting the footer ellipsis hide reject and back.
-        MemoryView::Review
-            if unicode_width::UnicodeWidthStr::width(t.memory_review_hint)
-                > layout.footer.width as usize =>
-        {
-            t.memory_review_hint_narrow
-        }
         MemoryView::Home => t.memory_home_hint,
         MemoryView::Review => t.memory_review_hint,
         MemoryView::Detail => t.memory_detail_hint,
         MemoryView::Active | MemoryView::Archived => t.memory_list_hint,
     };
+    // A consent page is only usable if its keys stay readable. Wrap whole
+    // actions onto further footer rows instead of letting the shell cut the
+    // row at a narrow width; the body gives up exactly the rows the footer
+    // gained.
+    let hint_rows = crate::secondary::wrap_hint(
+        hint.split(crate::secondary::HINT_SEPARATOR),
+        crate::secondary::footer_width(area.width),
+    );
+    let layout = crate::secondary::layout_with_footer(area, 0, hint_rows.len() as u16);
+    let hint = hint_rows.join("\n");
     let page = crate::secondary::SecondaryPage {
         title: t.memory_title,
         status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint,
+        hint: &hint,
     };
     crate::secondary::draw_header(frame, state, &layout, &page);
     crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
@@ -5542,10 +5543,13 @@ mod tests {
             )],
         );
         let text = render_text(&mut state, 48, 20);
+        // At 48 columns the hint is allowed to continue on a second footer
+        // row; every action still has to be on the page, in full.
         let hint = text
             .lines()
-            .find(|line| line.contains("↑↓"))
-            .expect("the review page has a footer hint");
+            .skip_while(|line| !line.contains("↑↓"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             hint.contains("R 拒绝"),
             "reject must stay discoverable: {hint:?}"

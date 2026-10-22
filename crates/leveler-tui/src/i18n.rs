@@ -336,9 +336,6 @@ pub struct UiText {
     pub memory_home_hint: &'static str,
     pub memory_review_summary: &'static str,
     pub memory_review_hint: &'static str,
-    /// Used when the full hint does not fit the footer. Every action stays
-    /// named; only the verbs that the keys imply are dropped.
-    pub memory_review_hint_narrow: &'static str,
     pub memory_list_hint: &'static str,
     pub memory_detail_hint: &'static str,
     pub memory_loading: &'static str,
@@ -1456,7 +1453,6 @@ static ZH: UiText = UiText {
     memory_home_hint: "↑↓ 选择 · Enter 打开 · Esc 返回",
     memory_review_summary: "待确认 {count} 条 · 尚未生效",
     memory_review_hint: "↑↓ 移动 · 空格 选择 · Enter 查看 · A 接受 · R 拒绝 · Esc 返回",
-    memory_review_hint_narrow: "↑↓ · 空格 · Enter · A 接受 · R 拒绝 · Esc 返回",
     memory_list_hint: "↑↓ 移动 · Enter 查看 · Esc 返回",
     memory_detail_hint: "↑↓ 滚动 · Esc 返回",
     memory_loading: "正在读取项目记忆…",
@@ -2329,7 +2325,6 @@ static EN: UiText = UiText {
     memory_home_hint: "↑↓ select · Enter open · Esc back",
     memory_review_summary: "{count} pending · not active",
     memory_review_hint: "↑↓ move · Space select · Enter view · A accept · R reject · Esc back",
-    memory_review_hint_narrow: "↑↓ · Space · Enter · A accept · R reject · Esc",
     memory_list_hint: "↑↓ move · Enter view · Esc back",
     memory_detail_hint: "↑↓ scroll · Esc back",
     memory_loading: "Reading project memory…",

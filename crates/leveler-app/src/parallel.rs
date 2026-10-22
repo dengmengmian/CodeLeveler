@@ -184,9 +184,12 @@ impl Application {
                                 &mut |_| {},
                                 cancellation.clone(),
                             )
-                            .await
-                            .ok()?;
-                        Some((session_id, outcome))
+                            .await;
+                        // A failed or cancelled candidate still admitted its
+                        // turn; settle memory before this worktree's process
+                        // state is discarded.
+                        app.flush_memory_for_headless().await;
+                        Some((session_id, outcome.ok()?))
                     }
                     .await;
 
