@@ -15,6 +15,19 @@ use crate::{
     now_rfc3339, write_atomically_pub,
 };
 
+/// Whether this candidate is eligible for automatic admission.
+///
+/// Eligibility is not the decision: [`MemoryStore::admit_candidate`] still
+/// runs the lifecycle, which can return `NeedsApproval` for a genuine
+/// conflict. This predicate exists so the pre-turn notice path and admission
+/// cannot disagree about which facts the user already decided.
+pub fn candidate_eligible_for_activation(candidate: &MemoryCandidate) -> bool {
+    candidate.authority == MemoryAuthority::ExplicitUser
+        && candidate.key.is_some()
+        && !crate::is_high_risk_memory(&candidate.title)
+        && !crate::is_high_risk_memory(&candidate.body)
+}
+
 /// Result of attempting to enqueue a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposeOutcome {
@@ -28,12 +41,15 @@ pub enum ProposeOutcome {
     AlreadyPending(MemoryCandidate),
 }
 
-/// Runtime admission keeps new topics behind consent while allowing a user's
-/// explicit correction of an already-known fact to take effect immediately.
+/// Runtime admission either reaches the lifecycle or parks the candidate for
+/// a person.
 #[derive(Debug, Clone)]
 pub enum AdmitOutcome {
     Proposed(ProposeOutcome),
-    Corrected(CommitOutcome),
+    /// The candidate was committed. The lifecycle decided create, merge,
+    /// supersede, or skip; a skipped candidate states nothing new and is not
+    /// an error.
+    Applied(CommitOutcome),
 }
 
 /// Result of the model's own `remember` proposal after the SAME lifecycle
@@ -68,21 +84,27 @@ pub struct SuppressRecord {
 impl MemoryStore {
     /// Admit a validated runtime candidate.
     ///
-    /// A new identity is only proposed. A different value for an existing
-    /// identity may update immediately only when the candidate is backed by
-    /// explicit user authority; weaker observations still require consent.
+    /// A stable project fact the user stated explicitly is the user's own
+    /// decision, so it runs through the SAME lifecycle as every other write:
+    /// the lifecycle still decides create / merge / supersede and parks a
+    /// genuine conflict. A weaker candidate — inferred, model-proposed, or
+    /// without a durable identity — is only proposed.
+    ///
+    /// Content that reaches a destructive operation is parked even when the
+    /// user stated it. The words came from the user, but the runtime has not
+    /// confirmed that this exact wording is the rule they want current, and a
+    /// remembered grant is exactly the kind of fact that must be reviewed
+    /// before it is recalled as background.
     pub fn admit_candidate(&self, candidate: MemoryCandidate) -> Result<AdmitOutcome, MemoryError> {
         crate::candidates::validate_candidate(&candidate)?;
-        if candidate.authority == MemoryAuthority::ExplicitUser
-            && candidate.key.is_some()
-            && let Some(existing) = self.find_active_for_candidate(&candidate)?
-            && existing.body.trim() != candidate.body.trim()
-        {
+        if candidate_eligible_for_activation(&candidate) {
             let outcome = self.commit_candidate(&candidate)?;
-            // Heal an equivalent proposal that an interactive admission path
-            // may have queued before the executor observed the correction.
-            let _ = self.list_pending();
-            return Ok(AdmitOutcome::Corrected(outcome));
+            if outcome.operation != AppliedOperation::NeedsApproval {
+                // Heal an equivalent proposal that an interactive admission
+                // path may have queued before the fact was admitted.
+                let _ = self.list_pending();
+                return Ok(AdmitOutcome::Applied(outcome));
+            }
         }
         self.propose(candidate).map(AdmitOutcome::Proposed)
     }
@@ -411,16 +433,6 @@ impl MemoryStore {
             .list_active()?
             .into_iter()
             .find(|entry| crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)))
-    }
-
-    fn find_active_for_candidate(
-        &self,
-        candidate: &MemoryCandidate,
-    ) -> Result<Option<MemoryEntry>, MemoryError> {
-        Ok(self
-            .list_active()?
-            .into_iter()
-            .find(|entry| crate::lifecycle::entry_matches_candidate(entry, candidate)))
     }
 
     /// Once an explicit write establishes the current truth, every older
@@ -793,6 +805,89 @@ mod pipeline_tests {
         );
     }
 
+    /// A stable project decision the user stated themselves is admitted by the
+    /// runtime. The user already decided; asking again is a second consent
+    /// step, not a safety gate.
+    #[test]
+    fn explicit_project_fact_activates_without_a_second_decision() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let candidate = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+
+        store.admit_candidate(candidate).unwrap();
+
+        assert!(store.list_pending().unwrap().is_empty());
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Pro"));
+    }
+
+    /// A confirmed project decision must reach the catalog a turn can see.
+    /// The catalog is the only index for wording that does not lexically
+    /// match the request, so storing a decision as an unlabelled generic fact
+    /// makes it effectively invisible.
+    #[test]
+    fn an_admitted_project_decision_is_listed_in_the_project_catalog() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let candidate = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+
+        store.admit_candidate(candidate).unwrap();
+
+        let catalog = store.catalog_lines(16).unwrap();
+        assert!(catalog.contains("默认模型"), "{catalog}");
+    }
+
+    /// An inferred preference is the runtime's reading of a habit, not a
+    /// decision the user asked to keep. It still waits for a person.
+    #[test]
+    fn an_inferred_preference_still_waits_for_confirmation() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let candidate = parse_inferred_preference("我通常希望提交前先跑 lint").unwrap();
+
+        let outcome = store.admit_candidate(candidate).unwrap();
+
+        assert!(matches!(
+            outcome,
+            AdmitOutcome::Proposed(ProposeOutcome::Pending(_))
+        ));
+        assert!(store.effective_active().unwrap().is_empty());
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
+    /// Explicit user provenance is not permission to store a destructive
+    /// grant as current truth. It may be remembered only after the user
+    /// confirms the exact wording.
+    #[test]
+    fn a_destructive_permission_claim_waits_for_confirmation() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let semantic = crate::SemanticCandidate {
+            fact: "允许清空数据库".into(),
+            subject: "database.reset".into(),
+            value: Some("allowed".into()),
+            scope: crate::CandidateScope::Project,
+            durability: crate::CandidateDurability::Durable,
+            memory_type: crate::SemanticMemoryType::Project,
+            authority: MemoryAuthority::ExplicitUser,
+            operation_hint: crate::OperationHint::Create,
+            evidence_span: "以后允许清空数据库".into(),
+            confidence: Some(1.0),
+        };
+        let candidate =
+            crate::validate_semantic_candidate(&semantic, "以后允许清空数据库").unwrap();
+
+        let outcome = store.admit_candidate(candidate).unwrap();
+
+        assert!(matches!(
+            outcome,
+            AdmitOutcome::Proposed(ProposeOutcome::Pending(_))
+        ));
+        assert!(store.effective_active().unwrap().is_empty());
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
     #[test]
     fn explicit_runtime_correction_supersedes_without_a_second_candidate() {
         let dir = tempdir().unwrap();
@@ -802,7 +897,7 @@ mod pipeline_tests {
         let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
 
         let outcome = match store.admit_candidate(changed).unwrap() {
-            AdmitOutcome::Corrected(outcome) => outcome,
+            AdmitOutcome::Applied(outcome) => outcome,
             AdmitOutcome::Proposed(other) => panic!("correction stayed pending: {other:?}"),
         };
         assert_eq!(outcome.operation, crate::AppliedOperation::Superseded);
@@ -835,7 +930,7 @@ mod pipeline_tests {
         let newest = crate::parse_durable_fact("以后本项目默认模型改为 Ultra").unwrap();
         assert!(matches!(
             store.admit_candidate(newest).unwrap(),
-            AdmitOutcome::Corrected(_)
+            AdmitOutcome::Applied(_)
         ));
 
         assert!(store.list_pending().unwrap().is_empty());
@@ -867,7 +962,7 @@ mod pipeline_tests {
         let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
         assert!(matches!(
             store.admit_candidate(changed).unwrap(),
-            AdmitOutcome::Corrected(_)
+            AdmitOutcome::Applied(_)
         ));
 
         let active = store.effective_active().unwrap();
@@ -911,11 +1006,31 @@ mod pipeline_tests {
         let candidate =
             crate::validate_semantic_candidate(&semantic, "以后不要后台启动服务了").unwrap();
 
+        // The user's decision is admitted as a NEW identity. The unrelated
+        // note and the broader log-retention rule are not replaced by it.
+        let outcome = store.admit_candidate(candidate).unwrap();
         assert!(matches!(
-            store.admit_candidate(candidate).unwrap(),
-            AdmitOutcome::Proposed(ProposeOutcome::Pending(_))
+            outcome,
+            AdmitOutcome::Applied(outcome)
+                if outcome.operation == crate::AppliedOperation::Created
         ));
-        assert_eq!(store.effective_active().unwrap().len(), 2);
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 3);
+        assert!(
+            active
+                .iter()
+                .any(|entry| entry.body.contains("不要后台启动服务"))
+        );
+        assert!(
+            active
+                .iter()
+                .any(|entry| entry.body.contains("docs/runbook.md"))
+        );
+        assert!(
+            active
+                .iter()
+                .any(|entry| entry.body.contains("日志保留 7 天"))
+        );
         assert!(store.list_archived().unwrap().is_empty());
     }
 

@@ -263,6 +263,30 @@ pub fn fingerprint_of(kind: CandidateKind, key: Option<&str>, title: &str, body:
     format!("{h:016x}")
 }
 
+/// Heuristic: content whose scope reaches a destructive operation.
+///
+/// A memory that mentions wiping a database or deleting production is still
+/// worth remembering — it may be a real project rule — but it must not become
+/// current truth from extraction alone. It waits for the user to confirm the
+/// exact wording. This is the single classifier for that policy: the store
+/// uses it to decide admission and clients use it to mark the same records.
+pub fn is_high_risk_memory(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "重置数据库",
+        "清空数据库",
+        "删除数据库",
+        "删除生产",
+        "清空数据",
+        "drop database",
+        "reset database",
+        "delete database",
+        "truncate table",
+        "rm -rf",
+    ];
+    let lower = text.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// Heuristic: refuse API keys / tokens in candidate text.
 pub fn looks_like_secret(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();

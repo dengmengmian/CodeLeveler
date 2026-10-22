@@ -87,6 +87,9 @@ pub struct ExecutorFactory {
     /// settlement — nothing else; the memory TOOLS get their own handle at
     /// construction. `None` = memory unconfigured.
     pub memory_root: Option<std::path::PathBuf>,
+    /// Which memory lanes are open for this project. `memory_expose` says the
+    /// pack exists; this says which of its two lanes may read or write.
+    pub memory_lanes: leveler_memory::MemoryLanes,
     /// The process-lived background task registry, so terminal settlement can
     /// reap this session's detached processes. Held here rather than fished
     /// out of the tool context: reaping is the engine's job, not a tool's.
@@ -199,7 +202,8 @@ impl ExecutorFactory {
         executor = executor
             .with_memory_catalog(self.memory_catalog.clone())
             .with_memory_expose(self.memory_expose)
-            .with_memory_root(self.memory_root.clone());
+            .with_memory_root(self.memory_root.clone())
+            .with_memory_lanes(self.memory_lanes);
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

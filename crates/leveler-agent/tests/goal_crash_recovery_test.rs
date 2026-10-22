@@ -308,6 +308,7 @@ fn coding_runtime(
             memory_catalog: String::new(),
             memory_expose: true,
             memory_root: None,
+            memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: Default::default(),
             permission_rules_path: None,

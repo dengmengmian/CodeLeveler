@@ -8,9 +8,7 @@
 use leveler_client_protocol::{
     UiMemoryExperience, UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryStatus,
 };
-use leveler_memory::{
-    ExperienceVerification, MemoryKind, MemoryStore, is_sensitive, is_sensitive_candidate,
-};
+use leveler_memory::{MemoryKind, MemoryStore, is_sensitive, is_sensitive_candidate};
 use leveler_storage::{ExperienceInboxRepository, MemoryInboxRepository};
 
 use crate::{AppError, Application};
@@ -169,15 +167,14 @@ pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
 
     let experience_active = active
         .iter()
-        .filter(|entry| entry.experience.is_some())
+        .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
         .collect::<Vec<_>>();
     let experience_verified = experience_active
         .iter()
         .filter(|entry| {
-            entry
-                .experience
-                .as_ref()
-                .is_some_and(|record| record.verification == ExperienceVerification::Verified)
+            entry.experience.as_ref().is_some_and(|record| {
+                record.standing() == leveler_memory::ExperienceStanding::VerifiedResolution
+            })
         })
         .count();
     let experience_pending = pending
@@ -197,9 +194,16 @@ pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
     let experience_failure = experience_repo.last_failure().await?;
 
     Ok(UiMemoryStatus {
+        total_enabled: app.memory_policy().enabled(),
+        user_enabled: app.memory_policy().user_enabled(),
+        experience_enabled: app.memory_policy().experience_enabled(),
+        experience_experimental: true,
         active: u32::try_from(active.len()).unwrap_or(u32::MAX),
         pending: u32::try_from(pending.len()).unwrap_or(u32::MAX),
         archived: u32::try_from(archived.len()).unwrap_or(u32::MAX),
+        user_active: count_u32(active.len().saturating_sub(experience_active.len()) as u64),
+        user_pending: count_u32(pending.len().saturating_sub(experience_pending) as u64),
+        user_archived: count_u32(archived.len().saturating_sub(experience_archived) as u64),
         sensitive: u32::try_from(sensitive).unwrap_or(u32::MAX),
         inbox_pending: count_u32(counts.pending),
         inbox_processing: count_u32(counts.processing),

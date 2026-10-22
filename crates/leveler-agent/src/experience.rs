@@ -858,7 +858,31 @@ fn normalize_signature(text: &str) -> String {
         }
         out.push(character);
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    strip_shell_line_numbers(&out)
+}
+
+/// Shell diagnostics name the failing source line as `script: line 6:`. The
+/// line moves whenever unrelated code is added, while the failure stays the
+/// same, so the number cannot be part of the identity. Manual `line 6`
+/// references in a message are left alone.
+fn strip_shell_line_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(": line ") {
+        let after = &rest[index + ": line ".len()..];
+        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 || !after[digits..].starts_with(':') {
+            out.push_str(&rest[..index + ": line ".len()]);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..index]);
+        out.push_str(": line ");
+        rest = &after[digits..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A tool line that addresses the model is not a failure signature. The
@@ -1098,6 +1122,8 @@ pub enum ExperienceRejection {
     Sensitive,
     CodeOrLogDump,
     RestatesGoal,
+    TaskLocalWording,
+    UnmodifiedFileReference { file: String },
     InvalidContract { reason: String },
     TooManyCandidates { count: usize },
 }
@@ -1115,6 +1141,8 @@ impl ExperienceRejection {
             Self::Sensitive => "sensitive",
             Self::CodeOrLogDump => "code_or_log_dump",
             Self::RestatesGoal => "restates_goal",
+            Self::TaskLocalWording => "task_local_wording",
+            Self::UnmodifiedFileReference { .. } => "unmodified_file_reference",
             Self::InvalidContract { .. } => "invalid_contract",
             Self::TooManyCandidates { .. } => "too_many_candidates",
         }
@@ -1137,6 +1165,12 @@ impl ExperienceRejection {
             Self::Sensitive => "experience looked like a credential or raw log".to_string(),
             Self::CodeOrLogDump => "experience copied a diff, code or tool log".to_string(),
             Self::RestatesGoal => "experience only restated the task goal".to_string(),
+            Self::TaskLocalWording => {
+                "experience used task-local wording instead of a durable lesson".to_string()
+            }
+            Self::UnmodifiedFileReference { file } => format!(
+                "experience named `{file}`, which this task did not change, as a fix location or stale condition"
+            ),
             Self::InvalidContract { reason } => {
                 format!("experience did not satisfy its evidence contract: {reason}")
             }
@@ -1168,6 +1202,26 @@ pub fn validate_experience_candidate(
         return Err(ExperienceRejection::BodyTooLong {
             chars: body.chars().count(),
         });
+    }
+    // A durable lesson must read as a standing fact. "This task" / "step 2"
+    // only mean something inside the turn that produced them, and provenance
+    // already lives in the evidence ids.
+    if has_task_local_wording(body) {
+        return Err(ExperienceRejection::TaskLocalWording);
+    }
+    // The lesson names where the fix lives. Pointing a future agent at a file
+    // the task never touched sends it to the wrong place, which is worse than
+    // storing no lesson at all.
+    if let Some(file) = unmodified_file_reference(body, &pack.modified_files) {
+        return Err(ExperienceRejection::UnmodifiedFileReference { file });
+    }
+    // `invalid_if` says when the lesson stops being true. A file the task did
+    // not change cannot be the place the fix lands, so its output is a proxy:
+    // a correct fix leaves it unchanged and the lesson would never go stale.
+    if let Some(invalid_if) = candidate.invalid_if.as_deref()
+        && let Some(file) = ungrounded_stale_condition(invalid_if, pack)
+    {
+        return Err(ExperienceRejection::UnmodifiedFileReference { file });
     }
     if title.is_empty() || title.chars().count() > MAX_EXPERIENCE_TITLE_CHARS {
         return Err(ExperienceRejection::InvalidSubject);
@@ -1439,6 +1493,375 @@ fn looks_like_code_or_log(body: &str) -> bool {
     diff_lines >= 2 || log_lines >= 2
 }
 
+/// Wording that binds a lesson to the turn that produced it. A durable lesson
+/// must read as a standing fact for a future task; provenance already lives in
+/// the evidence ids.
+fn has_task_local_wording(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    for marker in [
+        "this task",
+        "this run",
+        "this turn",
+        "this conversation",
+        "in this session",
+    ] {
+        if lower.contains(marker) {
+            return true;
+        }
+    }
+    for marker in [
+        "本次任务",
+        "这次任务",
+        "本任务",
+        "本次运行",
+        "这次运行",
+        "本轮任务",
+        "本轮运行",
+    ] {
+        if body.contains(marker) {
+            return true;
+        }
+    }
+    // `step 2`, `step-2`, `第 2 步`: a numbered reference only makes sense
+    // inside the producing turn.
+    if numbered_reference(&lower, "step ") || numbered_reference(&lower, "step-") {
+        return true;
+    }
+    numbered_chinese_step(body)
+}
+
+fn numbered_reference(haystack: &str, prefix: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut start = 0;
+    while let Some(found) = haystack[start..].find(prefix) {
+        let mut cursor = start + found + prefix.len();
+        let digits = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits {
+            return true;
+        }
+        start = start + found + prefix.len();
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn numbered_chinese_step(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    for (index, character) in chars.iter().enumerate() {
+        if *character != '第' {
+            continue;
+        }
+        let mut cursor = index + 1;
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        let digits = cursor;
+        while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > digits && chars.get(cursor) == Some(&'步') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Project-file extensions that make an unquoted token a file reference.
+/// Deliberately a closed list: the check must not treat dotted prose or
+/// version numbers as paths.
+const PROJECT_FILE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "kts", "c", "cc",
+    "cpp", "h", "hpp", "sh", "bash", "zsh", "fish", "toml", "yaml", "yml", "json", "md", "txt",
+    "sql", "html", "css", "scss", "rb", "php", "swift", "lock", "cfg", "ini", "conf",
+];
+
+/// The first file-like reference in a prescriptive sentence that the task did
+/// not change.
+///
+/// "`./verify.sh` printed `engine: legacy`" is evidence the runtime observed
+/// and may name an unmodified file. "Inspect the engine in `verify.sh`" is
+/// advice about where to act, and pointing a future agent at a file the task
+/// never touched sends it to the wrong place. Only the latter is rejected.
+fn unmodified_file_reference(body: &str, modified_files: &[String]) -> Option<String> {
+    for sentence in sentences(body) {
+        if !is_prescriptive(sentence) {
+            continue;
+        }
+        for mention in file_mentions(sentence) {
+            if !modified_files.iter().any(|file| same_file(file, &mention)) {
+                return Some(mention);
+            }
+        }
+    }
+    None
+}
+
+/// The first file named by a stale condition that is also a script the pack
+/// observed running, but that the task did not change.
+///
+/// Such a script is only a reporter: it was executed, its status stayed the
+/// same, and the handling did not live there. Binding `invalid_if` to it makes
+/// the lesson permanent even though the real fix changes behavior elsewhere.
+fn ungrounded_stale_condition(invalid_if: &str, pack: &ExperienceEvidencePack) -> Option<String> {
+    let observed = observed_entry_scripts(pack);
+    file_mentions(invalid_if).into_iter().find(|mention| {
+        observed.iter().any(|script| same_file(script, mention))
+            && !pack
+                .modified_files
+                .iter()
+                .any(|file| same_file(file, mention))
+    })
+}
+
+/// The top-level scripts the pack actually ran, taken from observation labels
+/// and run commands. Only the entry script counts: an argument such as a file
+/// that a check reads is what the lesson may be about, not a status proxy.
+fn observed_entry_scripts(pack: &ExperienceEvidencePack) -> Vec<String> {
+    pack.observations
+        .iter()
+        .map(|observation| observation.label.as_str())
+        .chain(pack.failures.iter().map(|run| run.command.as_str()))
+        .chain(pack.resolutions.iter().map(|run| run.command.as_str()))
+        .filter_map(entry_script)
+        .collect()
+}
+
+/// Parse the script a command actually runs. `./verify.sh status` and
+/// `sh verify.sh status` both name `verify.sh`; `sh -c '…'` and `cargo test`
+/// name no script.
+fn entry_script(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let first = *tokens.first()?;
+    if let Some(file) = file_mention(first) {
+        return Some(file);
+    }
+    let interpreter = matches!(
+        first,
+        "sh" | "bash" | "zsh" | "dash" | "env" | "python" | "python3" | "node" | "ruby" | "perl"
+    );
+    if !interpreter {
+        return None;
+    }
+    for token in &tokens[1..] {
+        if *token == "-c" || *token == "-m" {
+            return None;
+        }
+        if token.starts_with('-') || token.contains('=') {
+            continue;
+        }
+        if let Some(file) = file_mention(token) {
+            return Some(file);
+        }
+    }
+    None
+}
+
+/// Split prose into sentences without breaking `verify.sh` in half: an ASCII
+/// full stop ends a sentence only when whitespace or the end of the body
+/// follows it.
+fn sentences(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut characters = body.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let boundary = match character {
+            '。' | '！' | '？' | '；' | '\n' | '!' | '?' | ';' => true,
+            '.' => characters
+                .peek()
+                .is_none_or(|(_, next)| next.is_whitespace()),
+            _ => false,
+        };
+        if boundary {
+            let sentence = body[start..index].trim();
+            if !sentence.is_empty() {
+                out.push(sentence);
+            }
+            start = index + character.len_utf8();
+        }
+    }
+    let rest = body[start..].trim();
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
+/// Verbs that turn the rest of a sentence into advice about where to act.
+const PRESCRIPTIVE_MARKERS: &[&str] = &[
+    "fix", "modify", "change", "edit", "patch", "inspect", "update", "adjust", "correct", "修复",
+    "修改", "改动", "修正", "调整", "改在", "落在", "应改",
+];
+
+fn is_prescriptive(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    PRESCRIPTIVE_MARKERS.iter().any(|marker| {
+        if marker.is_ascii() {
+            ascii_word_present(&lower, marker)
+        } else {
+            sentence.contains(marker)
+        }
+    })
+}
+
+/// Whether an ASCII marker appears as a word stem. `edit` must not match
+/// `editor`, but `edited` and `editing` still describe where to act.
+fn ascii_word_present(haystack: &str, needle: &str) -> bool {
+    const SUFFIXES: &[&str] = &["", "s", "es", "d", "ed", "ing"];
+    let bytes = haystack.as_bytes();
+    let mut start = 0;
+    while let Some(found) = haystack[start..].find(needle) {
+        let begin = start + found;
+        let end = begin + needle.len();
+        let before_ok = begin == 0 || !bytes[begin - 1].is_ascii_alphanumeric();
+        if before_ok {
+            let rest = &haystack[end..];
+            let after_ok = SUFFIXES.iter().any(|suffix| {
+                rest.starts_with(suffix)
+                    && !rest[suffix.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_alphanumeric())
+            });
+            if after_ok {
+                return true;
+            }
+        }
+        start = end;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn same_file(changed: &str, mention: &str) -> bool {
+    if changed == mention {
+        return true;
+    }
+    let changed_name = std::path::Path::new(changed)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let mention_name = std::path::Path::new(mention)
+        .file_name()
+        .and_then(|name| name.to_str());
+    changed_name.is_some() && changed_name == mention_name
+}
+
+fn file_mentions(body: &str) -> Vec<String> {
+    let mut plain = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(character) = chars.next() {
+        let close = match character {
+            '`' => Some('`'),
+            '\'' => Some('\''),
+            '"' => Some('"'),
+            '“' => Some('”'),
+            '‘' => Some('’'),
+            _ => None,
+        };
+        let Some(close) = close else {
+            plain.push(character);
+            continue;
+        };
+        let mut span = String::new();
+        for inner in chars.by_ref() {
+            if inner == close {
+                break;
+            }
+            span.push(inner);
+        }
+        let trimmed = span.trim();
+        let command_like = trimmed.starts_with("./")
+            || trimmed.starts_with('/')
+            || trimmed.starts_with('$')
+            || trimmed.contains(char::is_whitespace);
+        if !command_like {
+            plain.push(' ');
+            plain.push_str(trimmed);
+        }
+        plain.push(' ');
+    }
+    let mut mentions = Vec::new();
+    let mut token = String::new();
+    for character in plain.chars() {
+        if character.is_whitespace()
+            || matches!(
+                character,
+                ',' | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '&'
+                    | '*'
+                    | '='
+                    | '@'
+                    | '，'
+                    | '。'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+            )
+        {
+            push_file_mention(&mut token, &mut mentions);
+            continue;
+        }
+        token.push(character);
+    }
+    push_file_mention(&mut token, &mut mentions);
+    mentions
+}
+
+fn push_file_mention(token: &mut String, mentions: &mut Vec<String>) {
+    if let Some(mention) = file_mention(token)
+        && !mentions.iter().any(|existing| existing == &mention)
+    {
+        mentions.push(mention);
+    }
+    token.clear();
+}
+
+/// One token as a project-relative file reference, or `None` for prose,
+/// versions, dotted names and bare commands.
+fn file_mention(token: &str) -> Option<String> {
+    let mut candidate = token.trim().trim_end_matches('.').trim();
+    while let Some(rest) = candidate.strip_prefix("./") {
+        candidate = rest;
+    }
+    if candidate.is_empty() {
+        return None;
+    }
+    let lower = candidate.to_ascii_lowercase();
+    let extension = lower.rsplit_once('.').map(|(_, extension)| extension)?;
+    if !PROJECT_FILE_EXTENSIONS.contains(&extension)
+        || !lower
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
 /// A model-backed extractor. Provider-neutral: it speaks only the unified
 /// request/response types, like the user-turn extractor.
 pub struct ModelExperienceExtractor {
@@ -1661,12 +2084,21 @@ When a `verification_output` observation prints the executor's mode or a
 receipt, quote it exactly. It is stronger than silence — it names what the
 project itself reported — but it is still an observation, not proof of an
 unseen mechanism. When the evidence supports it, the body must state: the
-observed problem, the observed configuration line that explains it, the exact
-command or change that produced a fresh passing receipt, how that pass was
-verified, and the conditions that make the lesson stale. `modified_files`
-names the project-relative files the task changed; when a verification script
-or client is among them, name that file as the place the handling lives. Do
-not describe diff content that is not in evidence.
+observed problem, the actual handling that was executed, and the post-fix
+verification result. A pre-fix error line by itself is not a lesson about a
+fix: cite the fresh passing receipt (`result=passed`) when one exists, and say
+plainly when no post-fix evidence exists.
+
+`modified_files` names the project-relative files the task changed. A file you
+say the fix lives in MUST be one of them: name the file that was actually
+edited, not a wrapper, launcher or status script that only reports on it.
+Quoting a command (`./verify.sh status`, `$ cargo test`) is evidence, not a
+claim about where to change code. Do not describe diff content that is not in
+evidence.
+
+Write for a future task, not this one: never say "this task", "this run",
+"in this turn", or "step N". The evidence ids already record where the lesson
+came from.
 
 Return ONLY a JSON object: {"experiences": [ ... ]}. No prose, no code fence.
 Return {"experiences": []} when the task produced no non-obvious lesson.
@@ -1678,7 +2110,7 @@ Each experience is exactly:
   "title": one short human label,
   "body": the actionable lesson: the condition, what to do, and what the evidence shows (at most __BODY_BUDGET__ characters; aim for 2-4 sentences),
   "applies_when": the concrete conditions under which it applies,
-  "invalid_if": what change would make it stale,
+  "invalid_if": a future condition that a correct fix can actually change,
   "evidence_ids": ids copied exactly from failures/resolutions/mutations/observations,
   "confidence": a number 0..1
 }
@@ -1693,7 +2125,14 @@ Rules:
   resolution id when one exists. Never invent ids.
 - A passing command proves the behavior changed. It does NOT prove your
   explanation. State only what the commands show; mark an inferred mechanism as
-  inference ("likely", "consistent with") and keep the action precise.
+  inference ("likely", "consistent with") and keep the action precise. A
+  plausible explanation with no failure-to-pass link is inference, never a
+  verified resolution.
+- `invalid_if` must name a condition the handling itself can change. Do not
+  bind it to the executor's global default, a daemon's state, or what a status
+  command keeps reporting when it only echoes the old configuration: a correct
+  fix leaves those unchanged, so the lesson would never expire. Any file named
+  in `invalid_if` must be one of `modified_files`.
 - A constraint may be verified by an observation alone. If the only evidence
   you cite is an observation (no failure and no resolution), the category MUST
   be environment_constraint: that is the only claim the observation can carry.
@@ -1735,6 +2174,23 @@ mod tests {
             prompt.contains(&MAX_EXPERIENCE_BODY_CHARS.to_string()),
             "prompt must state the {MAX_EXPERIENCE_BODY_CHARS}-character body budget"
         );
+    }
+
+    /// The validator rejects task-local wording, wrong-file fix locations and
+    /// stale conditions a correct fix never changes. The prompt must state
+    /// those rules, or a model can only discover them by being rejected.
+    #[test]
+    fn the_extraction_prompt_states_the_durability_rules() {
+        let prompt = experience_system_prompt();
+        for needle in [
+            "never say \"this task\"",
+            "must be one of `modified_files`",
+            "The runtime does, from the",
+            "post-fix",
+            "a correct fix can actually change",
+        ] {
+            assert!(prompt.contains(needle), "prompt must state {needle:?}");
+        }
     }
 
     fn started(call_id: &str, name: &str, arguments: serde_json::Value, step: u32) -> String {
@@ -3043,6 +3499,43 @@ mod tests {
     }
 
     #[test]
+    fn shell_line_numbers_do_not_split_one_failure_identity() {
+        let pack = |line: u32| {
+            let events = vec![
+                started("a1", "run_command", run_command("sh", &["./test.sh"]), 1),
+                finished_with_preview(
+                    "a1",
+                    "run_command",
+                    true,
+                    Some(127),
+                    None,
+                    &format!(
+                        "exit: 127\n./scripts/run_checks.sh: line {line}: python3.11: command not found"
+                    ),
+                ),
+                started("a2", "apply_patch", json!({"patch": "..."}), 2),
+                finished(
+                    "a2",
+                    "apply_patch",
+                    false,
+                    None,
+                    Some("--- a/scripts/run_checks.sh"),
+                ),
+                started("a3", "run_command", run_command("sh", &["./test.sh"]), 3),
+                finished("a3", "run_command", false, Some(0), None),
+            ];
+            pack_from(&events, "修复").unwrap()
+        };
+        let first = pack(3);
+        let second = pack(6);
+        assert_eq!(
+            first.identity_seed(),
+            second.identity_seed(),
+            "a shell line number moves with unrelated edits; the message is the identity"
+        );
+    }
+
+    #[test]
     fn child_agent_failures_stay_attributed_to_the_parent_turn() {
         let events = vec![
             json!({
@@ -3064,6 +3557,317 @@ mod tests {
         let pack = pack_from(&events, "并行调查").expect("child failure is evidence");
         assert_eq!(pack.failures[0].agent_id.as_deref(), Some("explorer-1"));
         assert_eq!(pack.resolutions.len(), 1);
+    }
+
+    #[test]
+    fn a_post_change_passing_receipt_survives_next_to_the_pre_change_status() {
+        let events = vec![
+            started(
+                "s1",
+                "run_command",
+                run_command("sh", &["verify.sh", "status"]),
+                2,
+            ),
+            finished_with_preview(
+                "s1",
+                "run_command",
+                false,
+                Some(0),
+                None,
+                "engine: legacy\nexecution: skipped_by_engine",
+            ),
+            started("e1", "apply_patch", json!({"patch": "..."}), 3),
+            finished(
+                "e1",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/verify_client.py"),
+            ),
+            started("v1", "run_command", run_command("sh", &["verify.sh"]), 4),
+            finished_with_preview(
+                "v1",
+                "run_command",
+                false,
+                Some(0),
+                None,
+                "run=r-1 engine=current result=passed tests=1",
+            ),
+            turn_finished(&["verify_client.py"]),
+        ];
+        let pack = pack_from(&events, "修复验证入口").expect("the changed entry is a signal");
+        let receipt = pack
+            .observations
+            .iter()
+            .find(|observation| observation.reference.contains("result=passed"))
+            .expect("the post-change receipt must enter the pack");
+        assert!(
+            receipt.reference.contains("step 4"),
+            "the receipt must keep its later step: {}",
+            receipt.reference
+        );
+        assert!(
+            pack.observations
+                .iter()
+                .any(|observation| observation.reference.contains("skipped_by_engine")),
+            "the pre-change status stays as the observed problem"
+        );
+    }
+
+    /// A fix location named in the body must be a file the task changed. A
+    /// lesson that points at a wrapper is not actionable.
+    #[test]
+    fn a_fix_location_named_in_the_body_must_be_a_changed_file() {
+        let events = vec![
+            started(
+                "a1",
+                "run_command",
+                run_command("cargo", &["test", "-p", "demo"]),
+                2,
+            ),
+            finished("a1", "run_command", true, Some(101), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished(
+                "a2",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/verify_client.py"),
+            ),
+            started(
+                "a3",
+                "run_command",
+                run_command("cargo", &["test", "-p", "demo"]),
+                5,
+            ),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["verify_client.py"]),
+        ];
+        let pack = pack_from(&events, "修复").expect("a signal exists");
+        let wrong = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "修改 verify.sh 的引擎选择，然后重新运行。",
+        );
+        assert!(
+            matches!(
+                validate_experience_candidate(&wrong, &pack),
+                Err(ExperienceRejection::UnmodifiedFileReference { ref file })
+                    if file == "verify.sh"
+            ),
+            "a wrapper that was not changed must not be named as the fix"
+        );
+
+        let right = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "修改 verify_client.py 的引擎选择，然后重新运行。",
+        );
+        let memory = validate_experience_candidate(&right, &pack).expect("the changed file");
+        let record = memory.experience.expect("record");
+        assert_eq!(
+            record.standing(),
+            leveler_memory::ExperienceStanding::VerifiedResolution,
+            "a failure plus a later pass is a verified resolution"
+        );
+        assert!(
+            record
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == "mutation"),
+            "the fix action must be in the evidence: {:?}",
+            record.evidence
+        );
+    }
+
+    /// A quoted command is evidence, not a fix location: `./verify.sh status`
+    /// may be named even though the wrapper was not the changed file.
+    #[test]
+    fn a_command_quoted_in_the_body_is_not_treated_as_a_file_reference() {
+        let events = vec![
+            started(
+                "a1",
+                "run_command",
+                run_command("cargo", &["test", "-p", "demo"]),
+                2,
+            ),
+            finished("a1", "run_command", true, Some(101), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished(
+                "a2",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/verify_client.py"),
+            ),
+            started(
+                "a3",
+                "run_command",
+                run_command("cargo", &["test", "-p", "demo"]),
+                5,
+            ),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["verify_client.py"]),
+        ];
+        let pack = pack_from(&events, "修复").expect("a signal exists");
+        let quoted = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "`./verify.sh status` prints legacy; change `verify_client.py`, then re-run.",
+        );
+        assert!(
+            validate_experience_candidate(&quoted, &pack).is_ok(),
+            "a quoted command is not a claim about where the fix lives"
+        );
+    }
+
+    /// A lesson must stand on its own; task-local wording is not durable.
+    #[test]
+    fn task_local_wording_is_rejected_from_a_durable_lesson() {
+        let events = vec![
+            started(
+                "a1",
+                "run_command",
+                run_command("cargo", &["test", "-p", "demo"]),
+                2,
+            ),
+            finished("a1", "run_command", true, Some(101), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished("a2", "apply_patch", false, None, Some("--- a/src/lib.rs")),
+            started(
+                "a3",
+                "run_command",
+                run_command("cargo", &["test", "-p", "demo"]),
+                5,
+            ),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["src/lib.rs"]),
+        ];
+        let pack = pack_from(&events, "修复").expect("a signal exists");
+        for body in [
+            "本次任务中先失败后通过。",
+            "The failure seen in this task was fixed.",
+            "step 2 failed and step 5 passed.",
+        ] {
+            let local = candidate(
+                ExperienceCategory::RootCause,
+                &["failure-2-a1", "resolution-5-a3"],
+                body,
+            );
+            assert!(
+                matches!(
+                    validate_experience_candidate(&local, &pack),
+                    Err(ExperienceRejection::TaskLocalWording)
+                ),
+                "task-local body `{body}` must be rejected"
+            );
+        }
+    }
+
+    /// An observation-only record may be accepted, but it must present as an
+    /// observation: there is no failed-then-passed pair.
+    #[test]
+    fn pre_change_evidence_alone_cannot_present_as_a_verified_resolution() {
+        let events = vec![
+            started(
+                "s1",
+                "run_command",
+                run_command("sh", &["verify.sh", "status"]),
+                2,
+            ),
+            finished_with_preview(
+                "s1",
+                "run_command",
+                false,
+                Some(0),
+                None,
+                "engine: legacy\nexecution: skipped_by_engine",
+            ),
+            started("e1", "apply_patch", json!({"patch": "..."}), 3),
+            finished(
+                "e1",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/verify_client.py"),
+            ),
+            turn_finished(&["verify_client.py"]),
+        ];
+        let pack = pack_from(&events, "修复验证入口").expect("the changed entry is a signal");
+        let observed = candidate(
+            ExperienceCategory::EnvironmentConstraint,
+            &["observation-output-2-s1"],
+            "验证入口打印 engine: legacy 与 execution: skipped_by_engine；先检查配置再重新运行。",
+        );
+        let memory = validate_experience_candidate(&observed, &pack).expect("observed fact");
+        assert_eq!(
+            memory.experience.expect("record").standing(),
+            leveler_memory::ExperienceStanding::Observed,
+            "observation-only evidence must not read as a verified resolution"
+        );
+    }
+
+    /// An invalidation condition that hangs on a script the fix never touches
+    /// can never come true: the correct change leaves that script's output
+    /// unchanged, so the lesson would claim to be permanent.
+    #[test]
+    fn an_invalidation_condition_cannot_hang_on_an_unmodified_status_script() {
+        let events = vec![
+            started(
+                "s1",
+                "run_command",
+                run_command("sh", &["verify.sh", "status"]),
+                2,
+            ),
+            finished_with_preview(
+                "s1",
+                "run_command",
+                false,
+                Some(0),
+                None,
+                "engine: legacy\nexecution: skipped_by_engine",
+            ),
+            started("e1", "apply_patch", json!({"patch": "..."}), 3),
+            finished(
+                "e1",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/verify_client.py"),
+            ),
+            turn_finished(&["verify_client.py"]),
+        ];
+        let pack = pack_from(&events, "修复验证入口").expect("the changed entry is a signal");
+
+        let mut proxy = candidate(
+            ExperienceCategory::EnvironmentConstraint,
+            &["observation-output-2-s1"],
+            "验证入口打印 engine: legacy 与 execution: skipped_by_engine。",
+        );
+        proxy.invalid_if =
+            Some("verify.sh status no longer prints `execution: skipped_by_engine`".to_string());
+        assert!(
+            matches!(
+                validate_experience_candidate(&proxy, &pack),
+                Err(ExperienceRejection::UnmodifiedFileReference { ref file })
+                    if file == "verify.sh"
+            ),
+            "a status script the fix does not change is not a stale condition"
+        );
+
+        let mut grounded = candidate(
+            ExperienceCategory::EnvironmentConstraint,
+            &["observation-output-2-s1"],
+            "验证入口打印 engine: legacy 与 execution: skipped_by_engine。",
+        );
+        grounded.invalid_if =
+            Some("verify_client.py reports executed tests with results.".to_string());
+        let memory =
+            validate_experience_candidate(&grounded, &pack).expect("the changed file grounds it");
+        assert_eq!(
+            memory.experience.expect("record").invalid_if.as_deref(),
+            Some("verify_client.py reports executed tests with results.")
+        );
     }
 
     #[test]

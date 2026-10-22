@@ -32,8 +32,17 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn leveler(home: &Path, args: &[&str]) -> Output {
+    leveler_in(
+        &std::env::current_dir().expect("the test process has a working directory"),
+        home,
+        args,
+    )
+}
+
+fn leveler_in(cwd: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_leveler"))
         .args(args)
+        .current_dir(cwd)
         .env("HOME", home)
         .env("LEVELER_HOME", home.join("leveler"))
         .env("LEVELER_CONFIG", home.join("leveler/config.toml"))
@@ -134,6 +143,48 @@ fn background_list_reports_no_tasks() {
 #[test]
 fn memory_list_reports_an_empty_store() {
     assert_lists(&["memory", "list"], &[]);
+}
+
+#[test]
+fn memory_status_names_both_switches_and_the_experimental_lane() {
+    // No config file: user facts keep the historical default, automatic
+    // experience is closed until the project opts in.
+    assert_lists(
+        &["memory", "status"],
+        &[
+            "Memory switches",
+            "total: on",
+            "user facts: on",
+            "auto experience: off",
+        ],
+    );
+}
+
+#[test]
+fn memory_status_reports_a_closed_lane_as_off() {
+    let home = scratch("memory-lane");
+    let ws = scratch("memory-lane-ws");
+    std::fs::create_dir_all(ws.join(".leveler")).unwrap();
+    std::fs::write(
+        ws.join(".leveler/config.yaml"),
+        "memory:\n  enabled: true\n  user_enabled: false\n  experience_enabled: true\n",
+    )
+    .unwrap();
+    let output = leveler_in(&ws, &home, &["memory", "status"]);
+    let rendered = text(&output);
+    assert!(
+        output.status.success(),
+        "memory status must succeed: {rendered}"
+    );
+    assert_no_secret_or_panic(&rendered, &["memory", "status"]);
+    assert!(
+        rendered.contains("user facts: off (active 0 · pending 0 · archived 0)"),
+        "a closed user lane must be reported as off: {rendered}"
+    );
+    assert!(
+        rendered.contains("auto experience: on (experimental)"),
+        "the open experience lane keeps its experimental marker: {rendered}"
+    );
 }
 
 #[test]

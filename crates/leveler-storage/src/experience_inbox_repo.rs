@@ -457,6 +457,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_experience_lane_admits_nothing_while_user_admission_stays_open() {
+        let (db, session) = fixture().await;
+        SessionRepository::new(&db)
+            .set_memory_lanes(&session, true, true, false)
+            .await
+            .unwrap();
+        admit_turn(&db, &session).await;
+
+        let experience: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM experience_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(experience, 0, "experience extraction is off");
+        assert_eq!(user, 1, "the user lane is independent and stays on");
+    }
+
+    #[tokio::test]
     async fn a_running_turn_is_not_claimable_until_it_is_finished() {
         let (db, session) = fixture().await;
         let turn_id = admit_turn(&db, &session).await;

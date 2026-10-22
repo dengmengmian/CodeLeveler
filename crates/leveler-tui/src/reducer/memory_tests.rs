@@ -298,8 +298,38 @@ fn memory_slash_opens_the_management_page() {
     assert_eq!(s.memory.view, MemoryView::Home);
     assert!(list_query(&effects).is_some(), "{effects:?}");
 
+    key(&mut s, KeyCode::Esc);
+    assert_eq!(s.active_screen, Screen::Conversation);
     press(&mut s, "/memory review");
     assert_eq!(s.memory.view, MemoryView::Review);
+}
+
+#[test]
+fn the_home_menu_opens_remembered_then_pending_then_archived() {
+    let mut s = state();
+    seed(&mut s, vec![candidate("cand-1", "约定")]);
+    let effects = press(&mut s, "/memory");
+    let query = list_query(&effects).expect("opening the page lists memory");
+    reduce(
+        &mut s,
+        Action::Runtime(list(
+            Some(query),
+            vec![entry("act-1", "已记住")],
+            vec![entry("arch-1", "已归档")],
+            vec![candidate("cand-1", "待确认")],
+        )),
+    );
+
+    key(&mut s, KeyCode::Enter);
+    assert_eq!(s.memory.view, MemoryView::Active);
+    key(&mut s, KeyCode::Esc);
+    key(&mut s, KeyCode::Down);
+    key(&mut s, KeyCode::Enter);
+    assert_eq!(s.memory.view, MemoryView::Review);
+    key(&mut s, KeyCode::Esc);
+    key(&mut s, KeyCode::Down);
+    key(&mut s, KeyCode::Enter);
+    assert_eq!(s.memory.view, MemoryView::Archived);
 }
 
 #[test]

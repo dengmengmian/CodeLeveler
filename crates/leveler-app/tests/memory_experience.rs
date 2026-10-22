@@ -166,7 +166,7 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
     std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
     std::fs::write(
         tmp.path().join(".leveler/config.yaml"),
-        "memory:\n  enabled: true\n",
+        "memory:\n  enabled: true\n  experience_enabled: true\n",
     )
     .unwrap();
     let layout = Layout::from_parts(
@@ -393,7 +393,7 @@ async fn a_silent_verification_command_can_produce_a_verified_constraint() {
         ),
         text("done"),
         json_text(
-            r#"{"experiences":[{"category":"environment_constraint","subject":"experience.workspace.silent_verifier","title":"检查脚本无输出退出 0","body":"verify.sh 在这次运行中没有任何输出就退出 0；这只能证明脚本退出成功，不能证明检查真的执行了。","applies_when":"运行 verify.sh 且输出为空","invalid_if":"verify.sh 恢复输出检查结果","evidence_ids":["observation-2-c-verify"],"confidence":0.8}]}"#,
+            r#"{"experiences":[{"category":"environment_constraint","subject":"experience.workspace.silent_verifier","title":"检查脚本无输出退出 0","body":"verify.sh 没有输出就退出 0；这只能证明脚本退出成功，不能证明检查真的执行了。","applies_when":"运行 verify.sh 且输出为空","invalid_if":"verify.sh 恢复输出检查结果","evidence_ids":["observation-2-c-verify"],"confidence":0.8}]}"#,
         ),
     ])
     .await;

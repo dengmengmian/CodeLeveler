@@ -209,6 +209,8 @@ impl LoadedConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryPolicy {
     enabled: bool,
+    user_enabled: bool,
+    experience_enabled: bool,
 }
 
 impl MemoryPolicy {
@@ -216,12 +218,38 @@ impl MemoryPolicy {
     pub fn from_project(config: &leveler_project::ProjectConfig) -> Self {
         Self {
             enabled: config.memory.enabled,
+            user_enabled: config.memory.user_enabled,
+            experience_enabled: config.memory.experience_enabled,
         }
     }
 
     /// Whether the user wants memory enabled for this project.
     pub fn enabled(self) -> bool {
         self.enabled
+    }
+
+    /// Whether user facts are effective. The total switch owns both lanes.
+    pub fn user_enabled(self) -> bool {
+        self.enabled && self.user_enabled
+    }
+
+    /// Whether agent experience is effective. The total switch owns both
+    /// lanes: `enabled = false` closes experience even if its own bit is true.
+    pub fn experience_enabled(self) -> bool {
+        self.enabled && self.experience_enabled
+    }
+
+    /// Whether any lane can reach the model or the background worker.
+    pub fn any_lane(self) -> bool {
+        self.user_enabled() || self.experience_enabled()
+    }
+
+    /// The lane value every read, tool and worker uses.
+    pub fn lanes(self) -> leveler_memory::MemoryLanes {
+        leveler_memory::MemoryLanes {
+            user: self.user_enabled(),
+            experience: self.experience_enabled(),
+        }
     }
 }
 
@@ -286,19 +314,81 @@ mod memory_policy_tests {
     #[test]
     fn a_disabled_project_never_exposes_memory() {
         let policy = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig { enabled: false },
+            memory: MemoryConfig {
+                enabled: false,
+                user_enabled: true,
+                experience_enabled: true,
+            },
             ..ProjectConfig::default()
         });
         assert!(!policy.enabled());
+        assert!(!policy.user_enabled());
+        assert!(!policy.experience_enabled());
+        assert!(!policy.any_lane());
     }
 
     #[test]
     fn an_enabled_project_permits_memory() {
         let policy = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig { enabled: true },
+            memory: MemoryConfig {
+                enabled: true,
+                user_enabled: true,
+                experience_enabled: true,
+            },
             ..ProjectConfig::default()
         });
         assert!(policy.enabled());
+        assert!(policy.user_enabled());
+        assert!(policy.experience_enabled());
+        assert!(policy.any_lane());
+    }
+
+    /// The built-in policy is "user facts on, automatic experience off". An
+    /// absent `memory:` block must still give the user a working lane.
+    #[test]
+    fn an_unconfigured_project_opens_only_the_user_lane() {
+        let policy = MemoryPolicy::from_project(&ProjectConfig::default());
+        assert!(policy.enabled());
+        assert!(policy.user_enabled());
+        assert!(!policy.experience_enabled());
+        assert!(policy.any_lane());
+    }
+
+    #[test]
+    fn each_lane_can_be_closed_without_closing_the_other() {
+        let user_only = MemoryPolicy::from_project(&ProjectConfig {
+            memory: MemoryConfig {
+                enabled: true,
+                user_enabled: true,
+                experience_enabled: false,
+            },
+            ..ProjectConfig::default()
+        });
+        assert!(user_only.user_enabled());
+        assert!(!user_only.experience_enabled());
+        assert!(user_only.any_lane());
+
+        let experience_only = MemoryPolicy::from_project(&ProjectConfig {
+            memory: MemoryConfig {
+                enabled: true,
+                user_enabled: false,
+                experience_enabled: true,
+            },
+            ..ProjectConfig::default()
+        });
+        assert!(!experience_only.user_enabled());
+        assert!(experience_only.experience_enabled());
+        assert!(experience_only.any_lane());
+
+        let none = MemoryPolicy::from_project(&ProjectConfig {
+            memory: MemoryConfig {
+                enabled: true,
+                user_enabled: false,
+                experience_enabled: false,
+            },
+            ..ProjectConfig::default()
+        });
+        assert!(!none.any_lane());
     }
 }
 
@@ -851,11 +941,12 @@ impl Application {
     }
 
     fn ensure_memory_consolidator(&self, db: &Database) -> Result<(), AppError> {
-        // A disabled project runs no memory worker at all: no inbox admission
-        // (the SQL trigger checks the session flag), no claim, no provider
-        // request. Existing memory data is untouched and becomes usable again
-        // when the user re-enables the switch (which restarts the process).
-        if !self.memory.enabled() {
+        // A project with both lanes closed runs no memory worker at all: no
+        // inbox admission (the SQL trigger reads the session snapshot), no
+        // claim, no provider request. Existing memory data is untouched and
+        // becomes usable again when the user re-enables a lane (which restarts
+        // the process).
+        if !self.memory.any_lane() {
             return Ok(());
         }
         if self.memory_consolidator.get().is_some() {
@@ -871,7 +962,8 @@ impl Application {
             Arc::new(move |event| {
                 let _ = events.send(event);
             }),
-        );
+        )
+        .with_lanes(self.memory.lanes());
         if self.memory_consolidator.set(worker.clone()).is_ok() {
             drop(worker.spawn());
         }
@@ -898,7 +990,12 @@ impl Application {
         session_id: &leveler_core::SessionId,
     ) {
         if let Err(error) = SessionRepository::new(db)
-            .set_memory_enabled(session_id, self.memory.enabled())
+            .set_memory_lanes(
+                session_id,
+                self.memory.enabled(),
+                self.memory.lanes().user,
+                self.memory.lanes().experience,
+            )
             .await
         {
             // Admission fails closed only when the write fails: the column
@@ -1120,11 +1217,13 @@ impl Application {
                 self.config.web_search.as_ref(),
                 self.environment.as_ref(),
             ));
-        // The handle follows the same project switch as the pack. A disabled
-        // project has no store to hand a tool even if a caller later asks for
-        // one.
-        if self.memory.enabled() {
-            capabilities = capabilities.with_memory_root(self.layout.memory_dir());
+        // The handle follows the same project lanes as the pack. A project
+        // with both lanes closed has no store to hand a tool even if a caller
+        // later asks for one.
+        if self.memory.any_lane() {
+            capabilities = capabilities
+                .with_memory_root(self.layout.memory_dir())
+                .with_memory_lanes(self.memory.lanes());
         }
         let tool_context = match workspace {
             Some(workspace) => {
@@ -1251,10 +1350,11 @@ impl Application {
                 .map(|profile| profile.capabilities.vision)
                 .unwrap_or(false),
             // Memory is a project switch, not a default capability: a
-            // disabled project does not register the tools at all, so Full
-            // Access has nothing to expose and no permission mode can
-            // override the user's explicit disable.
-            memory: self.memory.enabled(),
+            // project with both lanes closed does not register the tools at
+            // all, so Full Access has nothing to expose and no permission mode
+            // can override the user's explicit disable. One open lane is
+            // enough for the pack: the tools themselves follow the lanes.
+            memory: self.memory.any_lane(),
             skills: self.layout.primary_workspace().is_some(),
             // Not "is a browser installed": is the browser this host would
             // SELECT — the call's, then `[browser].default`, then the system
@@ -1365,7 +1465,7 @@ impl Application {
             .filter(|id| {
                 unrestricted
                     || match id {
-                        CapabilityId::Memory => self.memory.enabled(),
+                        CapabilityId::Memory => self.memory.any_lane(),
                         CapabilityId::MultiAgent => {
                             self.project_config().agents.delegation && self.config.agents_delegation
                         }
@@ -1377,7 +1477,7 @@ impl Application {
         // Memory is part of the first-round surface when the project enables
         // it and the host can provide it. It stays a default EXPOSURE: no
         // grant is persisted, and tool approval rules are unchanged.
-        let default_active = if available_packs.memory && self.memory.enabled() {
+        let default_active = if available_packs.memory && self.memory.any_lane() {
             vec![CapabilityId::Memory]
         } else {
             Vec::new()
@@ -1387,7 +1487,10 @@ impl Application {
                 .and_then(|state| state.with_default_active(default_active))
                 .map_err(AppError::Engine)?,
         );
-        let memory_catalog = if available_packs.memory && self.memory.enabled() {
+        // The catalog is the user lane's index; experience entries are
+        // deliberately absent from it (they are found by recall or the
+        // `memory` tool), so a closed user lane produces no catalog at all.
+        let memory_catalog = if available_packs.memory && self.memory.user_enabled() {
             load_memory_catalog(&self.layout.memory_dir())
         } else {
             String::new()
@@ -1431,7 +1534,8 @@ impl Application {
                 capabilities: Some(capabilities),
                 memory_catalog,
                 memory_expose: available_packs.memory,
-                memory_root: self.memory.enabled().then(|| self.layout.memory_dir()),
+                memory_root: self.memory.any_lane().then(|| self.layout.memory_dir()),
+                memory_lanes: self.memory.lanes(),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,
                 resource_grants: Arc::new(db.clone()),
@@ -1520,23 +1624,24 @@ impl Application {
     /// turns these into a visible notice; a headless caller ignores them,
     /// which is also why this layer does not send the notice itself.
     pub(crate) fn enqueue_memory_candidates(&self, user_text: &str) -> Vec<(String, String)> {
-        // Automatic candidate extraction is memory admission. A disabled
-        // project does not admit turns, and this interactive shortcut must
-        // not become a second policy owner that bypasses the switch.
-        if !self.memory.enabled() {
+        // Automatic candidate extraction is user-lane admission. A project
+        // with that lane closed does not admit user facts, and this
+        // interactive shortcut must not become a second policy owner that
+        // bypasses the switch.
+        if !self.memory.user_enabled() {
             return Vec::new();
         }
         let memory_dir = self.layout.memory_dir();
         let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) else {
             return Vec::new();
         };
-        // A deterministic correction of an existing identity is applied by
-        // the executor and reported as `MemoryChanged::superseded`. Do not
-        // first tell the user it is waiting for confirmation.
+        // The executor admits an eligible explicit project decision during
+        // this turn. Proposing it here would tell the user it is waiting for
+        // confirmation immediately before it is applied. An eligible fact
+        // that a later lifecycle conflict parks is still written to
+        // `pending/` and remains discoverable there.
         if let Some(candidate) = leveler_memory::parse_durable_fact(user_text)
-            && let Some(key) = candidate.key.as_deref()
-            && let Ok(Some(active)) = store.find_active_by_key(key)
-            && active.body.trim() != candidate.body.trim()
+            && leveler_memory::candidate_eligible_for_activation(&candidate)
         {
             return Vec::new();
         }
@@ -1636,6 +1741,37 @@ mod memory_catalog_tests {
 
     /// The interactive shortcut proposes candidates before a turn is staged.
     /// It must obey the same project switch as the durable inbox trigger.
+    /// The pre-turn notice must name only facts that will actually wait. An
+    /// explicit project decision is admitted during the turn, so announcing
+    /// it as pending would be a false signal; a destructive grant is parked
+    /// and must be announced.
+    #[test]
+    fn the_pre_turn_notice_names_only_facts_that_will_wait() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".leveler")).unwrap();
+        std::fs::write(
+            dir.path().join(".leveler/config.yaml"),
+            "memory:\n  enabled: true\n  user_enabled: true\n",
+        )
+        .unwrap();
+        let app = Application::assemble(Layout::from_parts(
+            dir.path().to_path_buf(),
+            dir.path().join("configs"),
+            dir.path().join("state"),
+        ))
+        .unwrap();
+
+        assert!(
+            app.enqueue_memory_candidates("以后本项目默认模型固定为 Pro")
+                .is_empty(),
+            "a fact the turn will admit is not waiting for confirmation"
+        );
+
+        let waiting = app.enqueue_memory_candidates("以后数据库清空方式固定为允许清空数据库");
+        assert_eq!(waiting.len(), 1, "{waiting:?}");
+        assert!(waiting[0].1.contains("数据库"), "{waiting:?}");
+    }
+
     #[tokio::test]
     async fn a_disabled_project_admits_no_automatic_candidates() {
         let dir = tempdir().unwrap();
@@ -1709,6 +1845,34 @@ impl Application {
         request.write_scope = mode.write_scope(&cwd);
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
+    }
+
+    /// Build the user's interactive terminal request.
+    ///
+    /// This shell is the person's own process, not an Agent command: the
+    /// Permission Mode and its OS write/network fence do not apply. Session
+    /// ownership, PTY lifecycle, the immutable environment snapshot and
+    /// provider-credential scrubbing still apply. `unrestricted_execution`
+    /// stays false on purpose so a sealed eval host keeps its read denials and
+    /// the child still loses provider secrets.
+    pub(crate) fn user_terminal_execution(
+        &self,
+        shell: String,
+    ) -> Result<leveler_execution::ProcessRequest, AppError> {
+        let cwd = self
+            .layout
+            .require_workspace()
+            .map_err(|error| AppError::NotFound(error.to_string()))?
+            .to_path_buf();
+        let mut request = leveler_execution::ProcessRequest::new(shell, vec!["-l".into()], cwd);
+        request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
+        request.deny_network = false;
+        request.write_scope = leveler_execution::WriteScope::Unrestricted;
+        request.deny_env =
+            provider_secret_env_names(&self.config.providers, self.config.web_search.as_ref());
+        // The persistent Execution Host rebuilds the child environment from its
+        // own snapshot; no app-side CommandRunner is involved in this path.
+        Ok(request)
     }
 }
 
@@ -2052,6 +2216,43 @@ mod model_step_ceiling_tests {
             model_step_ceiling_from_flag(None),
             Some(leveler_agent::DEFAULT_MODEL_STEP_CEILING),
             "a run with no flag must still get the mechanical breaker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod user_terminal_execution_tests {
+    use super::Application;
+    use leveler_execution::WriteScope;
+    use leveler_project::Layout;
+
+    /// The interactive terminal is the person's own shell. Its request must not
+    /// inherit the Agent profile's write fence or network denial, while the
+    /// credential scrub and the trusted-host default stay in force.
+    #[test]
+    fn the_user_terminal_is_not_agent_confined() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = Application::assemble(Layout::from_parts(
+            directory.path().to_path_buf(),
+            directory.path().join("configs"),
+            directory.path().join("state"),
+        ))
+        .unwrap();
+        let request = app.user_terminal_execution("/bin/zsh".into()).unwrap();
+        assert_eq!(request.cwd.as_path(), directory.path());
+        assert_eq!(request.program, "/bin/zsh");
+        assert_eq!(request.args, vec!["-l".to_string()]);
+        assert_eq!(request.write_scope, WriteScope::Unrestricted);
+        assert!(!request.deny_network);
+        assert!(
+            !request.unrestricted_execution,
+            "the user shell must still lose provider credentials"
+        );
+        assert!(
+            request
+                .deny_env
+                .iter()
+                .any(|name| name == "LEVELER_SEARCH_API_KEY")
         );
     }
 }

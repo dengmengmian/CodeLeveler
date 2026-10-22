@@ -575,6 +575,62 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    /// A database created before the lane split must keep both lanes open.
+    /// The columns default to 1, so historical sessions keep admitting work
+    /// exactly as they did before the migration.
+    #[tokio::test]
+    async fn migration_0044_keeps_both_lanes_open_for_historical_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let mut conn = create_legacy_database(&path, 44).await;
+            sqlx::query(
+                "INSERT INTO sessions (id, repository, goal, status, model, state, \
+                 created_at, updated_at, memory_enabled) VALUES \
+                 ('legacy','/r','g','completed','provider/model','complete','t','t',1)",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let db = Database::connect(&path).await.unwrap();
+        let lanes: (i64, i64) = sqlx::query_as(
+            "SELECT user_memory_enabled, experience_memory_enabled \
+             FROM sessions WHERE id = 'legacy'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lanes, (1, 1));
+
+        let payload = serde_json::json!({
+            "version": 1,
+            "initiating_message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "记住用 Flash"}]
+            }
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at) \
+             VALUES ('after-migration','legacy',1,'user',?1,'completed','t')",
+        )
+        .bind(&payload)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let experience: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM experience_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!((user, experience), (1, 1));
+    }
+
     #[tokio::test]
     async fn migration_0036_maps_legacy_profiles_and_preserves_explicit_memory_policy() {
         use sqlx::ConnectOptions;

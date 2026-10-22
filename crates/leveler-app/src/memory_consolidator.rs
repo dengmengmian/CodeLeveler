@@ -109,6 +109,9 @@ pub struct MemoryConsolidator {
     boot: BootId,
     state_dir: PathBuf,
     memory_dir: PathBuf,
+    /// Which lane(s) this project has open. A closed lane is never claimed,
+    /// even if its durable queue still holds rows from before the switch.
+    lanes: leveler_memory::MemoryLanes,
     runtime: Arc<dyn ModelRuntime>,
     extraction_timeout: Duration,
     notify: Notify,
@@ -130,12 +133,22 @@ impl MemoryConsolidator {
             boot,
             state_dir,
             memory_dir,
+            lanes: leveler_memory::MemoryLanes::ALL,
             runtime,
             extraction_timeout: DEFAULT_EXTRACTION_TIMEOUT,
             notify: Notify::new(),
             cancel: CancellationToken::new(),
             event_sink,
         })
+    }
+
+    /// Restrict the worker to the project's effective lanes.
+    #[must_use]
+    pub fn with_lanes(mut self: Arc<Self>, lanes: leveler_memory::MemoryLanes) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("lanes are configured before the worker is shared")
+            .lanes = lanes;
+        self
     }
 
     #[cfg(test)]
@@ -186,12 +199,16 @@ impl MemoryConsolidator {
         // provider call merely because an experience row woke the worker.
         let mut flush_memory = true;
         loop {
-            let experience_claimed = match self.run_experience_once().await {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    tracing::warn!(%error, "experience consolidation failed");
-                    false
+            let experience_claimed = if self.lanes.experience {
+                match self.run_experience_once().await {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        tracing::warn!(%error, "experience consolidation failed");
+                        false
+                    }
                 }
+            } else {
+                false
             };
             let mut memory_claimed = 0usize;
             if flush_memory {
@@ -234,16 +251,24 @@ impl MemoryConsolidator {
     }
 
     async fn next_wake_delay(&self) -> Duration {
-        let memory = self.memory_wake_delay().await;
-        let experience = match ExperienceInboxRepository::new(&self.db)
-            .ready_state(leveler_core::now())
-            .await
-        {
-            Ok(state) if state.count > 0 => Duration::ZERO,
-            Ok(_) => MAX_AGE_FLUSH,
-            Err(error) => {
-                tracing::warn!(%error, "could not schedule pending experience work");
-                MAX_AGE_FLUSH
+        let memory = if self.lanes.user {
+            self.memory_wake_delay().await
+        } else {
+            MAX_AGE_FLUSH
+        };
+        let experience = if !self.lanes.experience {
+            MAX_AGE_FLUSH
+        } else {
+            match ExperienceInboxRepository::new(&self.db)
+                .ready_state(leveler_core::now())
+                .await
+            {
+                Ok(state) if state.count > 0 => Duration::ZERO,
+                Ok(_) => MAX_AGE_FLUSH,
+                Err(error) => {
+                    tracing::warn!(%error, "could not schedule pending experience work");
+                    MAX_AGE_FLUSH
+                }
             }
         };
         memory.min(experience)
@@ -275,6 +300,9 @@ impl MemoryConsolidator {
     }
 
     async fn ready_count(&self) -> u64 {
+        if !self.lanes.user {
+            return 0;
+        }
         match MemoryInboxRepository::new(&self.db)
             .ready_state(leveler_core::now())
             .await
@@ -288,6 +316,9 @@ impl MemoryConsolidator {
     }
 
     async fn experience_ready_count(&self) -> u64 {
+        if !self.lanes.experience {
+            return 0;
+        }
         match ExperienceInboxRepository::new(&self.db)
             .ready_state(leveler_core::now())
             .await
@@ -354,6 +385,9 @@ impl MemoryConsolidator {
     /// completed, no failure signal) is a settled result, not an error: it is
     /// recorded in `result_json` and never retried.
     async fn run_experience_once(&self) -> Result<bool, String> {
+        if !self.lanes.experience {
+            return Ok(false);
+        }
         let repo = ExperienceInboxRepository::new(&self.db);
         repo.recover_claims_for_boot(
             &self.boot,
@@ -734,6 +768,13 @@ impl MemoryConsolidator {
     }
 
     async fn run_once(&self) -> Result<ConsolidationOutcome, String> {
+        if !self.lanes.user {
+            return Ok(ConsolidationOutcome {
+                claimed: 0,
+                accepted: 0,
+                rejected: 0,
+            });
+        }
         let repo = MemoryInboxRepository::new(&self.db);
         // The worker calls this method serially. A claim still owned by this
         // boot therefore belongs to an earlier invocation whose settlement
@@ -1155,7 +1196,7 @@ impl MemoryConsolidator {
                             .insert(entry.id);
                         None
                     }
-                    AdmitOutcome::Corrected(outcome) => match outcome.operation {
+                    AdmitOutcome::Applied(outcome) => match outcome.operation {
                         AppliedOperation::Created
                         | AppliedOperation::Superseded
                         | AppliedOperation::Merged => {
@@ -1603,6 +1644,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_user_lane_claims_no_user_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admit_with_memory_flag(&db, true, "记住用 Flash").await;
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
+
+        let outcome = worker.run_once().await.unwrap();
+        assert_eq!(outcome.claimed, 0);
+        assert_eq!(worker.ready_count().await, 0);
+        let pending = MemoryInboxRepository::new(&db)
+            .counts()
+            .await
+            .unwrap()
+            .pending;
+        assert_eq!(
+            pending, 1,
+            "the row stays durable for when the lane reopens"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_experience_lane_claims_no_experience_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["fix the build".to_string()]).await;
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        )
+        .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+
+        assert!(!worker.run_experience_once().await.unwrap());
+        assert_eq!(worker.experience_ready_count().await, 0);
+        let pending = ExperienceInboxRepository::new(&db)
+            .counts()
+            .await
+            .unwrap()
+            .pending;
+        assert_eq!(
+            pending, 1,
+            "the row stays durable for when the lane reopens"
+        );
+    }
+
+    #[tokio::test]
     async fn a_secret_bearing_turn_never_reaches_the_extractor() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
@@ -1644,7 +1742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_output_is_proposed_in_durable_inbox_order() {
+    async fn model_output_is_applied_in_durable_inbox_order() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_messages(
@@ -1678,20 +1776,25 @@ mod tests {
 
         assert_eq!(outcome.accepted, 2);
         let store = MemoryStore::open(temp.path().join("memory")).unwrap();
-        assert!(store.list_active().unwrap().is_empty());
-        let pending = store.list_pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].body, "项目默认模型是 Flash");
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].body, "项目默认模型是 Flash");
+        assert!(store.list_pending().unwrap().is_empty());
+        // The extractor answered newest-turn-first; the durable inbox order
+        // must still win, so Pro is created before Flash supersedes it.
         let events = events.lock().unwrap();
+        let changes: Vec<(&str, &str)> = events
+            .iter()
+            .map(|event| (event.operation.as_str(), event.title.as_str()))
+            .collect();
         assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.operation == "proposed")
-                .count(),
-            1,
-            "one consolidation batch should produce one candidate summary"
+            changes,
+            [
+                ("created", "项目默认模型是 Pro"),
+                ("superseded", "项目默认模型是 Flash")
+            ]
         );
-        assert_eq!(events[0].count, 1);
+        assert!(!events.iter().any(|event| event.operation == "proposed"));
     }
 
     #[tokio::test]
@@ -1909,7 +2012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_fact_is_proposed_without_a_model_call() {
+    async fn deterministic_fact_activates_without_a_model_call() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         let statement = "以后本项目默认模型固定为 Pro";
@@ -1945,18 +2048,18 @@ mod tests {
 
         worker.run_once().await.unwrap();
 
-        assert!(store.effective_active().unwrap().is_empty());
-        let pending = store.list_pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].body.contains("Pro"));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Pro"));
+        assert!(store.list_pending().unwrap().is_empty());
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
         assert!(
             events
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| event.operation == "proposed"),
-            "the bridge needs a distinct pending-candidate signal"
+                .any(|event| event.operation == "created"),
+            "an admitted fact must be reported as a durable change"
         );
     }
 
@@ -2143,7 +2246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_after_propose_replays_without_duplicate_pending_memory() {
+    async fn crash_after_admission_replays_without_duplicate_memory() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_turns(&db, 1).await;
@@ -2197,14 +2300,14 @@ mod tests {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
 
         let store = MemoryStore::open(temp.path().join("memory")).unwrap();
-        assert!(store.list_active().unwrap().is_empty());
-        let pending = store.list_pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].body, "turn 0");
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1, "the replay must not duplicate the fact");
+        assert_eq!(active[0].body, "turn 0");
+        assert!(store.list_pending().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn staged_apply_cursor_resumes_same_key_updates_as_latest_pending() {
+    async fn staged_apply_cursor_resumes_same_key_updates_as_latest_current_value() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_turns(&db, 1).await;
@@ -2252,10 +2355,11 @@ mod tests {
         worker.run_once().await.unwrap();
 
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
-        assert!(store.effective_active().unwrap().is_empty());
-        let pending = store.list_pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].body.contains("Flash"));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Flash"));
+        // The superseded proposal for the same identity is stale.
+        assert!(store.list_pending().unwrap().is_empty());
         assert!(store.list_archived().unwrap().is_empty());
     }
 

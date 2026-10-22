@@ -104,11 +104,27 @@ pub struct MemoryConfig {
     /// the memory tools are not exposed. Existing memory data is NOT deleted.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// User facts: preferences, decisions, notes, corrections and the
+    /// `remember` path. Only effective while `enabled` is also true.
+    #[serde(default = "default_true")]
+    pub user_enabled: bool,
+    /// Agent experience: automatic extraction and recall of evidence-bound
+    /// lessons. Only effective while `enabled` is also true. Disabling it
+    /// stops extraction and recall but never deletes existing experience.
+    /// OFF by default: an absent key, including in YAML written before this
+    /// lane existed, means experimental lessons stay closed until the project
+    /// opts in with an explicit `true`.
+    #[serde(default)]
+    pub experience_enabled: bool,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            user_enabled: true,
+            experience_enabled: false,
+        }
     }
 }
 
@@ -284,6 +300,51 @@ ignore:
         assert!(!off.memory.enabled);
         let on: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
         assert!(on.memory.enabled);
+    }
+
+    #[test]
+    fn experience_is_off_by_default_and_user_facts_stay_on() {
+        // Automatic experience is an experimental lane. A project that never
+        // opted in keeps user facts and does not get lessons extracted behind
+        // its back; a missing key means closed, not "inherit a historical on".
+        let absent: ProjectConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(absent.memory.enabled);
+        assert!(absent.memory.user_enabled);
+        assert!(!absent.memory.experience_enabled);
+        let default = ProjectConfig::default();
+        assert!(default.memory.user_enabled);
+        assert!(!default.memory.experience_enabled);
+
+        // Old YAML has only `enabled`; user facts keep the historical
+        // behaviour while experience stays closed until explicitly enabled.
+        let old: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
+        assert!(old.memory.user_enabled);
+        assert!(!old.memory.experience_enabled);
+
+        // An explicit opt-in still enables experience.
+        let opted_in: ProjectConfig =
+            serde_yaml::from_str("memory:\n  experience_enabled: true\n").unwrap();
+        assert!(opted_in.memory.user_enabled);
+        assert!(opted_in.memory.experience_enabled);
+
+        let no_experience: ProjectConfig =
+            serde_yaml::from_str("memory:\n  experience_enabled: false\n").unwrap();
+        assert!(no_experience.memory.user_enabled);
+        assert!(!no_experience.memory.experience_enabled);
+
+        let no_user: ProjectConfig =
+            serde_yaml::from_str("memory:\n  user_enabled: false\n").unwrap();
+        assert!(!no_user.memory.user_enabled);
+        assert!(!no_user.memory.experience_enabled);
+
+        // The total switch owns both lanes; a lane value cannot reopen it.
+        let total_off: ProjectConfig = serde_yaml::from_str(
+            "memory:\n  enabled: false\n  user_enabled: true\n  experience_enabled: true\n",
+        )
+        .unwrap();
+        assert!(!total_off.memory.enabled);
+        assert!(total_off.memory.user_enabled);
+        assert!(total_off.memory.experience_enabled);
     }
 
     #[test]

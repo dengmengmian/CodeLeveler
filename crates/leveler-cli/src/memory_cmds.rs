@@ -5,7 +5,7 @@
 //! writes — the human is managing memory directly (including pending accept).
 
 use leveler_memory::{
-    MemoryEntry, MemoryStore, ProposeOutcome, collect_turn_candidates, is_sensitive,
+    MemoryEntry, MemoryKind, MemoryStore, ProposeOutcome, collect_turn_candidates, is_sensitive,
     is_sensitive_candidate, redact_candidate,
 };
 use leveler_project::Layout;
@@ -23,15 +23,18 @@ fn safe_title(entry: &MemoryEntry) -> &str {
 }
 
 /// A short marker so a person can tell an evidence-bound lesson from a
-/// user-stated fact in a one-line listing.
+/// user-stated fact in a one-line listing. The label is the standing the
+/// evidence supports, not the stored flag: an observation-only constraint is
+/// `已观察`, never `已验证`.
 fn experience_suffix(entry: &MemoryEntry) -> String {
     match entry.experience.as_ref() {
         None => String::new(),
         Some(experience) => format!(
             " [经验·{}]",
-            match experience.verification {
-                leveler_memory::ExperienceVerification::Verified => "已验证",
-                leveler_memory::ExperienceVerification::Unverified => "未验证",
+            match experience.standing() {
+                leveler_memory::ExperienceStanding::VerifiedResolution => "已验证",
+                leveler_memory::ExperienceStanding::Observed => "已观察",
+                leveler_memory::ExperienceStanding::Inferred => "推断",
             }
         ),
     }
@@ -101,6 +104,52 @@ pub(crate) fn cmd_memory(
                 a,
                 pending.len(),
                 b
+            );
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        MemoryCommand::Status => {
+            // The switch is project configuration, the same authority the
+            // runtime reads. A missing config means the built-in defaults.
+            let config = layout
+                .primary_workspace()
+                .and_then(leveler_project::ProjectConfig::load)
+                .unwrap_or_default();
+            let total = config.memory.enabled;
+            let user = total && config.memory.user_enabled;
+            let experience = total && config.memory.experience_enabled;
+            let on = |enabled: bool| if enabled { "on" } else { "off" };
+            let active = store.list_active()?;
+            let pending = store.list_pending()?;
+            let archived = store.list_archived()?;
+            let experience_active = active
+                .iter()
+                .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
+                .count();
+            let experience_pending = pending
+                .iter()
+                .filter(|candidate| candidate.experience.is_some())
+                .count();
+            let experience_archived = archived
+                .iter()
+                .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
+                .count();
+            let experimental = if experience { " (experimental)" } else { "" };
+            println!("{}", Line::heading("Memory switches"));
+            println!("  total: {}", on(total));
+            println!(
+                "  user facts: {} (active {} · pending {} · archived {})",
+                on(user),
+                active.len().saturating_sub(experience_active),
+                pending.len().saturating_sub(experience_pending),
+                archived.len().saturating_sub(experience_archived),
+            );
+            println!(
+                "  auto experience: {}{} (active {} · pending {} · archived {})",
+                on(experience),
+                experimental,
+                experience_active,
+                experience_pending,
+                experience_archived,
             );
             Ok(std::process::ExitCode::SUCCESS)
         }
@@ -174,14 +223,15 @@ pub(crate) fn cmd_memory(
                         }
                         if let Some(experience) = e.experience.as_ref() {
                             println!(
-                                "  experience: category={} verification={}",
+                                "  experience: category={} verification={} standing={}",
                                 experience.category.as_str(),
                                 match experience.verification {
                                     leveler_memory::ExperienceVerification::Verified => "verified",
                                     leveler_memory::ExperienceVerification::Unverified => {
                                         "unverified"
                                     }
-                                }
+                                },
+                                experience.standing().as_str()
                             );
                             println!("  applies_when: {}", experience.applies_when);
                             if let Some(invalid_if) = experience.invalid_if.as_deref() {
