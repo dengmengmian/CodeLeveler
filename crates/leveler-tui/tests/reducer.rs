@@ -5697,12 +5697,14 @@ fn memory_list_event_pushes_multiline_transcript_note() {
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "prefer-ws".into(),
                 title: "prefer workspace write".into(),
+                body: "prefer workspace write".into(),
                 kind: None,
                 sensitive: false,
             }],
             archived: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "old-fact".into(),
                 title: "old".into(),
+                body: "old".into(),
                 kind: None,
                 sensitive: false,
             }],
@@ -8828,6 +8830,7 @@ fn the_listing_marks_a_sensitive_entry_as_withheld() {
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "legacy".into(),
                 title: "deploy token".into(),
+                body: "deploy token".into(),
                 kind: Some(leveler_client_protocol::UiMemoryKind::Note),
                 sensitive: true,
             }],

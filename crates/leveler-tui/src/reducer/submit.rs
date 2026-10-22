@@ -1152,7 +1152,16 @@ fn memory_list_effect(state: &mut AppState, include_archived: bool) -> Effect {
 
 fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command.strip_prefix("memory").unwrap_or(command).trim();
-    if rest.is_empty() || rest == "list" {
+    // `/memory` is the human entry point: a page over the runtime's listing,
+    // not a transcript dump. `/memory review` lands directly on the consent
+    // queue. The text commands below stay for scripts and narrow/headless use.
+    if rest.is_empty() {
+        return crate::memory::open_page(state, false);
+    }
+    if rest == "review" {
+        return crate::memory::open_page(state, true);
+    }
+    if rest == "list" {
         return vec![memory_list_effect(state, true)];
     }
     if rest == "status" {

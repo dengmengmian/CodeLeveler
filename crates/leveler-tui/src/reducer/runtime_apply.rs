@@ -754,6 +754,22 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             archived,
             pending,
         } => {
+            // The management page owns its own queries, separate from the
+            // legacy `/memory list` transcript dump. Only the session-open
+            // probe may announce new candidates: a listing the user opened or
+            // a post-decision refresh is not news.
+            let announce = query_id.is_some() && query_id == state.memory.probe_query;
+            let page_query = query_id.is_some() && query_id == state.memory.list_query;
+            if announce || page_query {
+                if announce {
+                    state.memory.probe_query = None;
+                } else {
+                    state.memory.list_query = None;
+                }
+                let _ = memory_dir;
+                state.memory.apply_list(active, archived, pending, announce);
+                return;
+            }
             let ours = query_id.is_some() && query_id == state.memory_query;
             if !ours {
                 return;

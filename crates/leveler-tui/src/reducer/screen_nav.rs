@@ -84,6 +84,7 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
         Screen::Trace => state.trace.move_sel(notches),
         Screen::Context => crate::context::move_sel(&mut state.context, notches),
         Screen::Clean => state.clean.move_selection(notches),
+        Screen::Memory => crate::memory::wheel(state, notches),
         Screen::Help => {
             let t = state.t();
             state.help.move_selection(notches, t);
@@ -147,6 +148,9 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
                 state.help.select(index, state.t());
             }
         }
+        // Memory rows are keyed by stable record id (or `menu:<n>`); the page
+        // decides whether that id still exists.
+        Screen::Memory => crate::memory::select_row(state, key),
         _ => {}
     }
     Vec::new()
@@ -489,6 +493,10 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 scroll_screen_key(state, &key, true);
             }
         },
+        // The memory page owns ESC's one-level rule itself (detail → list →
+        // home → conversation). A/R are the only keys that decide consent;
+        // Esc never does.
+        Screen::Memory => return crate::memory::screen_key(state, key),
         Screen::Conversation => {}
     }
     Vec::new()
@@ -528,6 +536,9 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         }
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
+        // The memory page has internal levels; Esc and the header's `←` both
+        // walk exactly one of them.
+        Screen::Memory if crate::memory::owns_back(state) => crate::memory::back_one(state),
         // A page that was opened FROM another page returns there: the opener
         // recorded itself, so the page never guesses its parent. Pages with no
         // opener (the ones the workbench, a slash command or the state strip

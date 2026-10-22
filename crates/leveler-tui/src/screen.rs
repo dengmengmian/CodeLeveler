@@ -51,6 +51,10 @@ pub enum Screen {
     /// the page paints only the visible rows, so a 50 MiB result costs the
     /// same per frame as a 1 KiB one.
     Output,
+    /// `/memory`: project memory's home, consent queue, entries and detail.
+    /// A projection of the runtime's listing; decisions go through the
+    /// lifecycle commands, never through a local edit.
+    Memory,
 }
 
 /// Help / popup grouping for slash commands.
@@ -1256,6 +1260,7 @@ mod reachability_tests {
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Context => Some("`/context` — screen_nav::open_context"),
             Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
+            Screen::Memory => Some("`/memory` or `/memory review` — reducer/submit.rs"),
         }
     }
 
@@ -1277,6 +1282,7 @@ mod reachability_tests {
             Screen::Trace,
             Screen::Context,
             Screen::Output,
+            Screen::Memory,
         ];
         for screen in all {
             assert!(

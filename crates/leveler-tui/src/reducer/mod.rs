@@ -79,6 +79,10 @@ fn insert_file_references(state: &mut AppState, text: &str) -> bool {
 /// means no second path can observe the same ready state and submit the item
 /// again.
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
+    let idle_tick = match &action {
+        Action::IdleTick(now) => Some(*now),
+        _ => None,
+    };
     if state.update.is_some() {
         state.history_search = None;
     }
@@ -100,6 +104,18 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if grouped {
         state.composer.end_edit_group();
     }
+    // A lifecycle decision whose receipts never arrived must not leave the
+    // page stuck "confirming": at the deadline the proving refresh runs and
+    // the records are reported as unconfirmed, never as accepted.
+    if let Some(now) = idle_tick
+        && state.memory.check_timeout(now)
+        && let Some(effect) = crate::memory::query_list(state)
+    {
+        effects.push(effect);
+    }
+    // A notice discovered inside a running turn waits for the turn's end; the
+    // tick keeps trying after a competing notice expires.
+    crate::memory::flush_notice(state);
     if let Some(advance) = drain_pending_input(state) {
         effects.push(advance);
     }
@@ -129,6 +145,17 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let refresh = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
             let opened = matches!(event, RuntimeEvent::SessionOpened { .. });
+            let receipt = match &event {
+                RuntimeEvent::Notification { level, message } => Some((
+                    message.clone(),
+                    !matches!(
+                        level,
+                        leveler_client_protocol::NotificationLevel::Warning
+                            | leveler_client_protocol::NotificationLevel::Error
+                    ),
+                )),
+                _ => None,
+            };
             let session_updated = matches!(&event, RuntimeEvent::SessionUpdated { .. });
             let restored_history = matches!(
                 &event,
@@ -184,6 +211,22 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             // recomputes one.
             if opened || session_updated {
                 effects.push(Effect::Send(crate::context::issue_query(state)));
+            }
+            // Durable pending candidates outlive the process and the session
+            // that proposed them. Without this probe a candidate created while
+            // this client was away stays invisible until someone types
+            // `/memory`, which is exactly how a queue grows unseen.
+            if opened && let Some(effect) = crate::memory::probe_effect(state) {
+                effects.push(effect);
+            }
+            // One receipt settles one lifecycle command. When every command in
+            // the batch has answered, the listing refresh that proves what was
+            // durably applied is requested — never a local mutation.
+            if let Some((message, success)) = receipt
+                && state.memory.resolve_receipt(&message, success)
+                && let Some(effect) = crate::memory::query_list(state)
+            {
+                effects.push(effect);
             }
             // History owns the restored transcript; ask only after its matching
             // response, while the user has left this input window untouched.
@@ -2882,6 +2925,9 @@ mod context_refresh_tests;
 mod history_replay_tests;
 #[cfg(test)]
 mod input_recovery_tests;
+
+#[cfg(test)]
+mod memory_tests;
 
 #[cfg(test)]
 mod output_view_tests;

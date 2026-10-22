@@ -248,10 +248,11 @@ fn project_memory_consolidation_event(
         RuntimeEvent::Notification {
             level: leveler_client_protocol::NotificationLevel::Info,
             message: if event.count == 1 {
-                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。".to_string()
+                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。"
+                    .to_string()
             } else {
                 format!(
-                    "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。",
+                    "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。",
                     event.count
                 )
             },
@@ -281,7 +282,7 @@ fn proposed_memory_projects_to_truthful_pending_notification() {
         RuntimeEvent::Notification { message, .. } => {
             assert_eq!(
                 message,
-                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。"
+                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。"
             );
         }
         other => panic!("pending candidate became a durable change: {other:?}"),
@@ -302,6 +303,12 @@ fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::U
             leveler_memory::REDACTED_TITLE.to_string()
         } else {
             entry.title.clone()
+        },
+        // The body can be the credential too; withhold it with the title.
+        body: if sensitive {
+            leveler_memory::REDACTED_BODY.to_string()
+        } else {
+            entry.body.clone()
         },
         kind: match MemoryKind::of(entry) {
             MemoryKind::Preference => Some(UiMemoryKind::Preference),
@@ -4345,11 +4352,11 @@ impl InProcessRuntimeClient {
             .send(RuntimeEvent::Notification {
                 level: leveler_client_protocol::NotificationLevel::Info,
                 message: if waiting.len() == 1 {
-                    "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。"
+                    "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。"
                         .to_string()
                 } else {
                     format!(
-                        "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。",
+                        "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。",
                         waiting.len()
                     )
                 },
@@ -5030,13 +5037,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     Ok(entry) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Info,
-                            message: format!("已采纳记忆 [{}]: {}", entry.id, entry.title),
+                            message: format!("已采纳记忆 [{id}]: {}", entry.title),
                         });
                     }
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Warning,
-                            message: format!("accept failed: {err}"),
+                            message: format!("accept failed [{id}]: {err}"),
                         });
                     }
                 }
@@ -5057,7 +5064,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Warning,
-                            message: format!("reject failed: {err}"),
+                            message: format!("reject failed [{id}]: {err}"),
                         });
                     }
                 }
