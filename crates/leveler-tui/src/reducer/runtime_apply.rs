@@ -1300,18 +1300,44 @@ fn memory_status_lines(
     status: &leveler_client_protocol::UiMemoryStatus,
 ) -> String {
     let t = state.t();
-    let mut lines = vec![format!(
-        "{}: {} {} · {} {} · {} {} · {} {}",
-        t.memory_status_title,
-        t.memory_active,
-        status.active,
-        t.memory_pending,
-        status.pending,
-        t.memory_archived,
-        status.archived,
-        t.memory_status_sensitive,
-        status.sensitive,
-    )];
+    let on = |enabled: bool| {
+        if enabled {
+            t.memory_status_on
+        } else {
+            t.memory_status_off
+        }
+    };
+    let experience = if status.experience_enabled {
+        format!("{}{}", on(true), t.memory_status_experimental)
+    } else {
+        on(false).to_string()
+    };
+    let mut lines = vec![
+        format!(
+            "{}: {} {} · {} {} · {} {} · {} {}",
+            t.memory_status_title,
+            t.memory_active,
+            status.active,
+            t.memory_pending,
+            status.pending,
+            t.memory_archived,
+            status.archived,
+            t.memory_status_sensitive,
+            status.sensitive,
+        ),
+        t.memory_status_switches
+            .replace("{total}", on(status.total_enabled))
+            .replace("{user}", on(status.user_enabled))
+            .replace("{experience}", &experience),
+    ];
+    if status.user_enabled {
+        lines.push(
+            t.memory_status_user_counts
+                .replace("{active}", &status.user_active.to_string())
+                .replace("{pending}", &status.user_pending.to_string())
+                .replace("{archived}", &status.user_archived.to_string()),
+        );
+    }
     lines.push(format!(
         "{}: pending={} processing={} retry={} processed={}",
         t.memory_status_inbox,

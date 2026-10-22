@@ -622,6 +622,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_user_lane_admits_nothing_and_the_total_switch_closes_it_too() {
+        let (db, session) = fixture().await;
+        let turns = TurnRepository::new(&db);
+        let now = leveler_core::now();
+        SessionRepository::new(&db)
+            .set_memory_lanes(&session, true, false, true)
+            .await
+            .unwrap();
+        turns
+            .start(&session, "user", Some(&fresh_payload("closed lane")), now)
+            .await
+            .unwrap();
+        let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(admitted, 0, "the user lane is closed");
+
+        // The lane flag cannot reopen the total switch.
+        SessionRepository::new(&db)
+            .set_memory_lanes(&session, false, true, true)
+            .await
+            .unwrap();
+        turns
+            .start(&session, "user", Some(&fresh_payload("total off")), now)
+            .await
+            .unwrap();
+        let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(admitted, 0, "the total switch owns both lanes");
+    }
+
+    #[tokio::test]
     async fn legacy_work_profile_does_not_control_memory_admission() {
         let (db, session) = fixture().await;
         // Simulate an older binary writing the retained column after migration.

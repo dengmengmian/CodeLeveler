@@ -37,6 +37,9 @@ pub struct Capabilities {
     /// Durable project memory root. `None` means memory is unconfigured, and
     /// the memory tools say so rather than inventing a location.
     pub memory_root: Option<PathBuf>,
+    /// Which memory lanes the tools may expose. The root can be present while
+    /// one lane is closed; that lane's entries must stay invisible.
+    pub memory_lanes: leveler_memory::MemoryLanes,
     /// The daemon-owned browser, shared across turns so its tabs, cookies and
     /// login state survive client disconnect. `None` is the same mechanical
     /// fact as `CapabilityPacks::browser == false`: no browser is drivable
@@ -62,6 +65,7 @@ impl Capabilities {
             background_tasks: Arc::new(BackgroundTaskRegistry::with_environment(environment)),
             artifact_store: None,
             memory_root: None,
+            memory_lanes: leveler_memory::MemoryLanes::ALL,
             browser: None,
             search_provider: None,
         }
@@ -76,6 +80,12 @@ impl Capabilities {
     /// The project memory store directory (`active/` + `archive/`).
     pub fn with_memory_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.memory_root = Some(root.into());
+        self
+    }
+
+    /// Restrict the memory tools to the project's effective lanes.
+    pub fn with_memory_lanes(mut self, lanes: leveler_memory::MemoryLanes) -> Self {
+        self.memory_lanes = lanes;
         self
     }
 

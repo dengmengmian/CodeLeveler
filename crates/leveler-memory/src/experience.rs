@@ -109,10 +109,53 @@ pub struct ExperienceRecord {
     pub evidence: Vec<ExperienceEvidence>,
 }
 
+/// What the runtime's evidence actually supports, as presented to a reader.
+///
+/// Stored verification answers "did the mechanical contract accept this
+/// record"; it cannot distinguish a constraint the runtime observed from a
+/// failure that later passed. Presentation must not blur that difference:
+/// an observation-only lesson is not a verified resolution, and a claim with
+/// no mechanical link is model inference, not a fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperienceStanding {
+    /// A failing check and a later pass of the same check, both observed.
+    VerifiedResolution,
+    /// The runtime observed the condition itself, but no resolution.
+    Observed,
+    /// The explanation has no failure-to-pass link; it is model inference.
+    Inferred,
+}
+
+impl ExperienceStanding {
+    /// The short label rendered next to an experience entry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedResolution => "verified",
+            Self::Observed => "observed",
+            Self::Inferred => "inferred",
+        }
+    }
+}
+
 impl ExperienceRecord {
     /// Whether this record claims a mechanically observed resolution.
     pub fn is_verified(&self) -> bool {
         self.verification == ExperienceVerification::Verified
+    }
+
+    /// The strongest claim the evidence supports. `Verified` alone is not
+    /// enough: the stored flag also covers an observed constraint, which is
+    /// not a resolution of a failure.
+    pub fn standing(&self) -> ExperienceStanding {
+        if !self.is_verified() {
+            return ExperienceStanding::Inferred;
+        }
+        let has = |kind: &str| self.evidence.iter().any(|item| item.kind.trim() == kind);
+        if has("failure") && has("resolution") {
+            ExperienceStanding::VerifiedResolution
+        } else {
+            ExperienceStanding::Observed
+        }
     }
 
     /// Whether every evidence reference is an observation.
@@ -272,4 +315,78 @@ pub fn validate_experience_record(record: &ExperienceRecord) -> Result<(), Memor
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(
+        category: ExperienceCategory,
+        verification: ExperienceVerification,
+        kinds: &[&str],
+    ) -> ExperienceRecord {
+        ExperienceRecord {
+            category,
+            verification,
+            applies_when: "the same check runs".to_string(),
+            invalid_if: None,
+            evidence: kinds
+                .iter()
+                .map(|kind| ExperienceEvidence {
+                    kind: (*kind).to_string(),
+                    reference: format!("step 1: {kind}"),
+                })
+                .collect(),
+        }
+    }
+
+    /// A constraint observed by the runtime is real, but it is not a failed
+    /// check that later passed. Presentation must say `observed`.
+    #[test]
+    fn an_observation_only_record_stands_as_observed() {
+        let observed = record(
+            ExperienceCategory::EnvironmentConstraint,
+            ExperienceVerification::Verified,
+            &["observation"],
+        );
+        assert_eq!(observed.standing(), ExperienceStanding::Observed);
+        assert_eq!(observed.standing().as_str(), "observed");
+    }
+
+    /// Only a failure AND a later pass support a verified resolution claim.
+    #[test]
+    fn a_failure_that_later_passed_stands_as_a_verified_resolution() {
+        let resolved = record(
+            ExperienceCategory::Fix,
+            ExperienceVerification::Verified,
+            &["failure", "resolution", "mutation"],
+        );
+        assert_eq!(resolved.standing(), ExperienceStanding::VerifiedResolution);
+        assert_eq!(resolved.standing().as_str(), "verified");
+    }
+
+    /// A verified constraint with only a failure observed is still not a
+    /// resolution.
+    #[test]
+    fn a_verified_record_without_a_pass_is_not_a_resolution() {
+        let failed = record(
+            ExperienceCategory::EnvironmentConstraint,
+            ExperienceVerification::Verified,
+            &["failure"],
+        );
+        assert_eq!(failed.standing(), ExperienceStanding::Observed);
+    }
+
+    /// No mechanical link means the explanation is inference.
+    #[test]
+    fn an_unverified_claim_stands_as_inferred() {
+        let inferred = record(
+            ExperienceCategory::RootCause,
+            ExperienceVerification::Unverified,
+            &["observation"],
+        );
+        assert_eq!(inferred.standing(), ExperienceStanding::Inferred);
+        assert_eq!(inferred.standing().as_str(), "inferred");
+    }
 }

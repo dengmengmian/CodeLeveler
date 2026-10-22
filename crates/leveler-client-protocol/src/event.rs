@@ -860,14 +860,38 @@ pub enum UiMemoryKind {
     Experience,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Durable memory health for `/memory status`. Counts only: no entry text,
 /// no candidate body, no raw provider error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiMemoryStatus {
+    /// The project's effective switches. `*_enabled` is already the
+    /// conjunction with `total_enabled`; an old daemon that sends no switches
+    /// is read as the historical all-on state.
+    #[serde(default = "default_true")]
+    pub total_enabled: bool,
+    #[serde(default = "default_true")]
+    pub user_enabled: bool,
+    #[serde(default = "default_true")]
+    pub experience_enabled: bool,
+    /// Agent experience is still experimental.
+    #[serde(default = "default_true")]
+    pub experience_experimental: bool,
     pub active: u32,
     pub pending: u32,
     pub archived: u32,
+    /// User-lane entries only, so a client can show the two lanes separately
+    /// and still account for every active/pending/archived row.
+    #[serde(default)]
+    pub user_active: u32,
+    #[serde(default)]
+    pub user_pending: u32,
+    #[serde(default)]
+    pub user_archived: u32,
     pub sensitive: u32,
     pub inbox_pending: u32,
     pub inbox_processing: u32,
@@ -1667,6 +1691,25 @@ mod tests {
             },
             "sub_agent_activity",
         );
+    }
+
+    /// An older daemon predates the lane switches. Its status must be read as
+    /// the historical all-on state instead of silently reporting memory off.
+    #[test]
+    fn a_pre_lane_memory_status_keeps_both_lanes_enabled() {
+        let old = r#"{
+            "active": 1, "pending": 0, "archived": 0, "sensitive": 0,
+            "inbox_pending": 0, "inbox_processing": 0,
+            "inbox_failed_retryable": 0, "inbox_processed": 0,
+            "extraction_totals": {"accepted": 0, "rejected": 0, "skipped": 0}
+        }"#;
+        let status: UiMemoryStatus = serde_json::from_str(old).unwrap();
+        assert!(status.total_enabled);
+        assert!(status.user_enabled);
+        assert!(status.experience_enabled);
+        assert!(status.experience_experimental);
+        assert_eq!(status.user_active, 0);
+        assert_eq!(status.active, 1);
     }
 
     #[test]

@@ -1444,13 +1444,13 @@ fn render_memory_home(frame: &mut Frame, body: Rect, state: &mut AppState) {
 
     let items = [
         (
-            t.memory_menu_review,
-            state.memory.pending.len(),
+            t.memory_menu_active,
+            state.memory.active.len(),
             "menu:0".to_string(),
         ),
         (
-            t.memory_menu_active,
-            state.memory.active.len(),
+            t.memory_menu_review,
+            state.memory.pending.len(),
             "menu:1".to_string(),
         ),
         (
@@ -1660,14 +1660,9 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
             );
         }
         lines.push(Line::from(""));
-        let source = if crate::memory::source_is_user(candidate) {
-            t.memory_source_user
-        } else {
-            t.memory_source_model
-        };
         push_memory_wrapped(
             &mut lines,
-            &format!("{source} · {}", t.memory_not_active),
+            t.memory_not_active,
             width,
             Style::default().fg(theme.text.secondary),
         );
@@ -5490,12 +5485,13 @@ mod tests {
         );
         let text = render_text(&mut state, 80, 24);
         assert!(text.contains("demo"), "{text}");
-        assert!(text.contains("已生效 2 条"), "{text}");
+        assert!(text.contains("已记住 2 条"), "{text}");
         assert!(text.contains("待确认 12 条"), "{text}");
-        assert!(text.contains("已归档 1 条"), "{text}");
-        assert!(text.contains("查看待确认的记忆"), "{text}");
-        assert!(text.contains("查看已记住的内容"), "{text}");
-        assert!(text.contains("查看已归档的记忆"), "{text}");
+        assert!(!text.contains("已归档 1 条"), "{text}");
+        let remembered = text.find("查看已记住").expect("remembered entry");
+        let pending = text.find("查看待确认").expect("pending entry");
+        let archived = text.find("查看已归档").expect("archived entry");
+        assert!(remembered < pending && pending < archived, "{text}");
         for internal in [
             "cand-",
             "mem-a",
@@ -5585,6 +5581,20 @@ mod tests {
             "the title is drawn once: {text}"
         );
         assert!(!text.contains("cand-a"), "{text}");
+    }
+
+    #[test]
+    fn memory_detail_hides_internal_provenance_and_keeps_the_pending_state() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Detail,
+            vec![],
+            vec![],
+            vec![memory_candidate("cand-a", "测试约定", "只展示标题和正文")],
+        );
+        let text = render_text(&mut state, 80, 24);
+        assert!(!text.contains("来源"), "{text}");
+        assert!(!text.contains("cand-a"), "{text}");
+        assert!(text.contains("尚未生效"), "{text}");
     }
 
     #[test]

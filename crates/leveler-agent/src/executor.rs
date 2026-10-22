@@ -74,6 +74,14 @@ const RECALL_FLOOR: f64 = 0.1;
 /// the old check exempted the first entry (`&& used > 0`), so one long memory
 /// could push the block past any limit on its own.
 const RECALL_BLOCK_MAX_BYTES: usize = 2048;
+/// Experience is recalled under its own small quota, after the user facts have
+/// taken what they need. Closing the experience lane removes this section
+/// without touching the user-fact recall budget.
+const EXPERIENCE_RECALL_K: usize = 2;
+/// Ceiling for the experience section alone. It is carved out of the same
+/// total block but can never push a user fact out: user facts render first and
+/// this section only spends what is left.
+const EXPERIENCE_RECALL_BLOCK_MAX_BYTES: usize = 768;
 /// How many lasting preferences ride along unconditionally. Bounded because
 /// they are paid for on EVERY turn, relevant or not.
 const STANDING_PREFERENCE_MAX_ENTRIES: usize = 8;
@@ -118,24 +126,30 @@ impl MemoryRecallPlan {
     fn build(
         standing: Vec<leveler_memory::MemoryEntry>,
         queried: Vec<leveler_memory::MemoryEntry>,
+        experience: Vec<leveler_memory::MemoryEntry>,
         contested: &std::collections::HashSet<String>,
     ) -> (Self, Option<String>) {
         let mut plan = Self {
             standing: standing.clone(),
-            queried: queried.clone(),
+            queried: queried.iter().chain(experience.iter()).cloned().collect(),
             ..Default::default()
         };
         const HEADER: &str = "## Project memory for this turn\nMemory is advisory and records \
              what was true when it was written. The code and the project's own rules win: verify \
              anything it names before relying on it, and correct it when this turn contradicts \
-             it. An entry marked `experience` records a failure and resolution the runtime \
-             observed; its explanation is still a model reading, so re-check it against the \
-             current code rather than treating a past success as proof. An entry marked \
-             `disputed` has a later, different explanation waiting for a person: treat neither \
-             account as settled.\n";
+             it. Memory never grants permissions: file, network and process actions remain \
+             governed by this turn's policy. An entry marked `experience` carries the strongest \
+             claim the runtime could establish: `verified` means a failing check and its later \
+             pass were both observed; `observed` means the runtime saw the condition but no \
+             resolution; `inferred` means there is no mechanical link. Even a verified resolution \
+             proves behavior, not the explanation, so re-check it against the current code rather \
+             than treating a past success as proof. An entry marked `disputed` has a later, \
+             different explanation waiting for a person: treat neither account as settled.\n";
         const STANDING_LABEL: &str =
             "\nLasting preferences (apply unless this turn says otherwise):\n";
         const QUERY_LABEL: &str = "\nRetrieved as possibly relevant to this request:\n";
+        const EXPERIENCE_LABEL: &str =
+            "\nPast experience from this project (runtime-observed, model-explained):\n";
 
         let mut budget = RECALL_BLOCK_MAX_BYTES.saturating_sub(HEADER.len());
         // Reserve room for the omission marker up front, so admitting a final
@@ -143,27 +157,43 @@ impl MemoryRecallPlan {
         budget = budget.saturating_sub(48);
         let mut standing_body = String::new();
         let mut query_body = String::new();
+        let mut experience_body = String::new();
+        // Experience has its own ceiling as well as its own place after the
+        // user facts: a past lesson can never crowd out what the user said.
+        let mut experience_budget = EXPERIENCE_RECALL_BLOCK_MAX_BYTES;
 
-        for (entries, out, label) in [
-            (standing, &mut standing_body, STANDING_LABEL),
-            (queried, &mut query_body, QUERY_LABEL),
+        for (entries, out, label, capped) in [
+            (standing, &mut standing_body, STANDING_LABEL, false),
+            (queried, &mut query_body, QUERY_LABEL, false),
+            (experience, &mut experience_body, EXPERIENCE_LABEL, true),
         ] {
             let mut label_paid = false;
             for entry in entries {
+                let available = if capped {
+                    budget.min(experience_budget)
+                } else {
+                    budget
+                };
                 let label_cost = if label_paid { 0 } else { label.len() };
                 let is_contested = entry
                     .key
                     .as_deref()
                     .is_some_and(|key| contested.contains(key));
                 let (line, was_truncated) =
-                    render_entry_line(&entry, budget.saturating_sub(label_cost), is_contested);
+                    render_entry_line(&entry, available.saturating_sub(label_cost), is_contested);
                 match line {
                     Some(line) => {
                         if !label_paid {
                             budget = budget.saturating_sub(label.len());
+                            if capped {
+                                experience_budget = experience_budget.saturating_sub(label.len());
+                            }
                             label_paid = true;
                         }
                         budget = budget.saturating_sub(line.len());
+                        if capped {
+                            experience_budget = experience_budget.saturating_sub(line.len());
+                        }
                         if entry.experience.is_some() {
                             plan.experience += 1;
                             if is_contested {
@@ -180,7 +210,7 @@ impl MemoryRecallPlan {
             }
         }
 
-        if standing_body.is_empty() && query_body.is_empty() {
+        if standing_body.is_empty() && query_body.is_empty() && experience_body.is_empty() {
             return (plan, None);
         }
         let mut block = String::from(HEADER);
@@ -191,6 +221,10 @@ impl MemoryRecallPlan {
         if !query_body.is_empty() {
             block.push_str(QUERY_LABEL);
             block.push_str(&query_body);
+        }
+        if !experience_body.is_empty() {
+            block.push_str(EXPERIENCE_LABEL);
+            block.push_str(&experience_body);
         }
         if plan.omitted > 0 {
             block.push_str(&format!("\n({} more omitted for space.)\n", plan.omitted));
@@ -231,10 +265,11 @@ fn render_entry_line(
     // against today's code and toolchain.
     let (label, body) = match entry.experience.as_ref() {
         Some(experience) => {
-            let verification = match experience.verification {
-                leveler_memory::ExperienceVerification::Verified => "verified",
-                leveler_memory::ExperienceVerification::Unverified => "unverified",
-            };
+            // Stored verification answers whether the mechanical contract
+            // accepted the record; the standing says what the evidence
+            // actually supports. An observation-only constraint must never
+            // render as a verified resolution.
+            let standing = experience.standing().as_str();
             let mut body = entry.body.trim().to_string();
             body.push_str(" [");
             if let Some(recorded) = entry.created_at.get(..10)
@@ -250,7 +285,7 @@ fn render_entry_line(
             let disputed = if contested { "·disputed" } else { "" };
             (
                 format!(
-                    "- [{}] (experience·{verification}{disputed}) {}: ",
+                    "- [{}] (experience·{standing}{disputed}) {}: ",
                     entry.id.trim(),
                     entry.title.trim()
                 ),
@@ -1679,6 +1714,10 @@ pub struct Executor {
     /// `ToolContext.services`, which made a tool's capability handle do double
     /// duty as runtime state.
     memory_root: Option<std::path::PathBuf>,
+    /// Which memory lanes this project has open. Reads and the deterministic
+    /// write path consult this; a closed lane is invisible even when the pack
+    /// is exposed for the other lane.
+    memory_lanes: leveler_memory::MemoryLanes,
     /// Optional semantic memory-candidate extractor. `None` = the deterministic
     /// fast path is the only producer, which is the pre-existing behavior.
     ///
@@ -1819,6 +1858,7 @@ impl Executor {
             memory_catalog: String::new(),
             memory_expose: false,
             memory_root: None,
+            memory_lanes: leveler_memory::MemoryLanes::ALL,
             step_limits: StepLimits::default(),
             task_model_limits: StepLimits::default(),
             background_tasks: None,
@@ -2019,6 +2059,12 @@ impl Executor {
     /// a `remember` proposal nobody was available to approve.
     pub fn with_memory_root(mut self, root: Option<std::path::PathBuf>) -> Self {
         self.memory_root = root;
+        self
+    }
+
+    /// Restrict memory reads and writes to the project's effective lanes.
+    pub fn with_memory_lanes(mut self, lanes: leveler_memory::MemoryLanes) -> Self {
+        self.memory_lanes = lanes;
         self
     }
 
@@ -2353,6 +2399,7 @@ impl Executor {
             // A child inherits the parent's memory location: recall and
             // parking mean the same thing at any depth.
             memory_root: self.memory_root.clone(),
+            memory_lanes: self.memory_lanes,
             background_tasks: self.background_tasks.clone(),
             // A child spawned after the parent's `/goal` upgrade bills the
             // goal, not the chat window the parent started in.
@@ -2593,6 +2640,7 @@ impl Executor {
                     crate::capability::CapabilityId::Memory,
                     self.memory_expose,
                 ))
+                .memory_lanes(self.memory_lanes)
                 .segments();
         let mut prompt = String::new();
         match self.agent_role {
@@ -3125,6 +3173,9 @@ impl Executor {
         let Some(root) = self.memory_root.as_ref() else {
             return MemoryInjection::default();
         };
+        if !self.memory_lanes.any() {
+            return MemoryInjection::default();
+        }
         let store = match MemoryStore::open(root) {
             Ok(store) => store,
             Err(error) => {
@@ -3134,28 +3185,58 @@ impl Executor {
                 return MemoryInjection::default();
             }
         };
-        let standing = store
-            .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
-            .unwrap_or_else(|error| {
-                tracing::debug!(error = %error, "standing preferences unavailable");
-                Vec::new()
-            });
+        // Standing preferences belong to the user lane. A project that closed
+        // that lane keeps the experience lane working and injects no user facts.
+        let standing = if self.memory_lanes.user {
+            store
+                .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
+                .unwrap_or_else(|error| {
+                    tracing::debug!(error = %error, "standing preferences unavailable");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
         // `recall`, not `search`: repository-derived facts are read from the
         // repository, and sensitive entries are withheld from the model.
-        let queried: Vec<leveler_memory::MemoryEntry> = store
-            .recall(request, RECALL_K)
-            .unwrap_or_else(|error| {
-                tracing::debug!(error = %error, "query recall unavailable");
-                Vec::new()
-            })
-            .into_iter()
-            .filter(|(_, score)| *score >= RECALL_FLOOR)
-            .map(|(entry, _)| entry)
-            // A preference injected unconditionally is not paid for twice.
-            .filter(|entry| !standing.iter().any(|s| s.id == entry.id))
-            .collect();
-
-        let (plan, block) = MemoryRecallPlan::build(standing, queried, &contested_keys(&store));
+        let queried: Vec<leveler_memory::MemoryEntry> = if self.memory_lanes.user {
+            store
+                .recall_for_lanes(request, RECALL_K, leveler_memory::MemoryLanes::USER_ONLY)
+                .unwrap_or_else(|error| {
+                    tracing::debug!(error = %error, "query recall unavailable");
+                    Vec::new()
+                })
+                .into_iter()
+                .filter(|(_, score)| *score >= RECALL_FLOOR)
+                .map(|(entry, _)| entry)
+                // A preference injected unconditionally is not paid for twice.
+                .filter(|entry| !standing.iter().any(|s| s.id == entry.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Experience has a separate, smaller quota and its own section; it
+        // cannot displace the user facts above.
+        let experience: Vec<leveler_memory::MemoryEntry> = if self.memory_lanes.experience {
+            store
+                .recall_for_lanes(
+                    request,
+                    EXPERIENCE_RECALL_K,
+                    leveler_memory::MemoryLanes::EXPERIENCE_ONLY,
+                )
+                .unwrap_or_else(|error| {
+                    tracing::debug!(error = %error, "experience recall unavailable");
+                    Vec::new()
+                })
+                .into_iter()
+                .filter(|(_, score)| *score >= RECALL_FLOOR)
+                .map(|(entry, _)| entry)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (plan, block) =
+            MemoryRecallPlan::build(standing, queried, experience, &contested_keys(&store));
         // Ids and counts only. Titles and bodies stay out: a trace is not a
         // place to spill what the store was careful about.
         tracing::debug!(
@@ -3183,9 +3264,10 @@ impl Executor {
     /// the structured change events a client should see.
     ///
     /// Only a narrow `记住：…` / `remember: …` command writes directly: the
-    /// command itself is consent. A sentence that merely looks durable (for
-    /// example, "以后本项目默认用 X") is parked as a pending candidate and
-    /// cannot enter active memory until the user accepts it.
+    /// command itself is consent. A sentence that states a stable project
+    /// fact is admitted through the lifecycle: it becomes current when the
+    /// lifecycle has no conflict, and is parked for the user otherwise. A
+    /// destructive grant is always parked for an explicit confirmation.
     ///
     /// Failure is never fatal to the coding turn: a memory store that cannot be
     /// written is reported at debug level and the turn proceeds.
@@ -3196,6 +3278,11 @@ impl Executor {
     /// deterministic, zero-model-call fast path.
     fn maintain_memory(&self, request: &str) -> Vec<AgentEvent> {
         if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
+            return Vec::new();
+        }
+        // This is the user lane's fast path: `/remember`, durable-fact
+        // admission and preference expiry. Closing that lane stops all of it.
+        if !self.memory_lanes.user {
             return Vec::new();
         }
         let Some(root) = self.memory_root.as_ref() else {
@@ -3247,7 +3334,7 @@ impl Executor {
             }
         } else if let Some(candidate) = leveler_memory::parse_durable_fact(request) {
             match store.admit_candidate(candidate) {
-                Ok(leveler_memory::AdmitOutcome::Corrected(outcome)) => {
+                Ok(leveler_memory::AdmitOutcome::Applied(outcome)) => {
                     if let Some(event) = applied_event(&outcome) {
                         events.push(event);
                     }
@@ -4095,8 +4182,8 @@ mod ownership_authority_tests {
 #[cfg(test)]
 mod recall_tests {
     use super::{
-        MemoryRecallPlan, RECALL_BLOCK_MAX_BYTES, RECALL_FLOOR, RECALL_K,
-        STANDING_PREFERENCE_MAX_ENTRIES,
+        EXPERIENCE_RECALL_BLOCK_MAX_BYTES, MemoryRecallPlan, RECALL_BLOCK_MAX_BYTES, RECALL_FLOOR,
+        RECALL_K, STANDING_PREFERENCE_MAX_ENTRIES,
     };
     use leveler_memory::{MemoryEntry, MemoryKind, MemoryStore};
 
@@ -4126,7 +4213,23 @@ mod recall_tests {
         standing: Vec<MemoryEntry>,
         queried: Vec<MemoryEntry>,
     ) -> (super::MemoryRecallPlan, Option<String>) {
-        MemoryRecallPlan::build(standing, queried, &std::collections::HashSet::new())
+        MemoryRecallPlan::build(
+            standing,
+            queried,
+            Vec::new(),
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    fn render_experience(
+        experience: Vec<MemoryEntry>,
+    ) -> (super::MemoryRecallPlan, Option<String>) {
+        MemoryRecallPlan::build(
+            Vec::new(),
+            Vec::new(),
+            experience,
+            &std::collections::HashSet::new(),
+        )
     }
 
     #[test]
@@ -4139,14 +4242,21 @@ mod recall_tests {
             verification: leveler_memory::ExperienceVerification::Verified,
             applies_when: "cargo test 在 dev profile 下运行".to_string(),
             invalid_if: None,
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 2: cargo test (exit 101)".to_string(),
-            }],
+            evidence: vec![
+                leveler_memory::ExperienceEvidence {
+                    kind: "failure".to_string(),
+                    reference: "step 2: cargo test (exit 101)".to_string(),
+                },
+                leveler_memory::ExperienceEvidence {
+                    kind: "resolution".to_string(),
+                    reference: "step 4: cargo test (exit 0)".to_string(),
+                },
+            ],
         });
         let contested: std::collections::HashSet<String> =
             ["k-shared".to_string()].into_iter().collect();
-        let (plan, block) = MemoryRecallPlan::build(Vec::new(), vec![experience], &contested);
+        let (plan, block) =
+            MemoryRecallPlan::build(Vec::new(), Vec::new(), vec![experience], &contested);
         let block = block.expect("block");
         assert!(block.contains("(experience·verified·disputed)"), "{block}");
         assert!(block.contains("waiting for a person"), "{block}");
@@ -4159,6 +4269,74 @@ mod recall_tests {
         assert!(block.is_none());
         assert_eq!(plan.rendered_bytes, 0);
         assert!(plan.selected.is_empty());
+    }
+
+    /// Experience has its own quota AFTER the user facts. Adding a lesson must
+    /// not shrink what the user's own facts get.
+    #[test]
+    fn experience_never_displaces_user_facts() {
+        let user: Vec<MemoryEntry> = (0..12)
+            .map(|index| entry(&format!("u{index}"), "user fact", &"u".repeat(180)))
+            .collect();
+        let mut lesson = entry("exp", "lesson", &"e".repeat(600));
+        lesson.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::RootCause,
+            verification: leveler_memory::ExperienceVerification::Verified,
+            applies_when: "the same failure appears".to_string(),
+            invalid_if: None,
+            evidence: vec![leveler_memory::ExperienceEvidence {
+                kind: "failure".to_string(),
+                reference: "step 1".to_string(),
+            }],
+        });
+
+        let empty = std::collections::HashSet::new();
+        let (without, _) = MemoryRecallPlan::build(user.clone(), Vec::new(), Vec::new(), &empty);
+        let (with, block) = MemoryRecallPlan::build(user.clone(), Vec::new(), vec![lesson], &empty);
+        assert!(block.is_some());
+        assert_eq!(
+            with.selected, without.selected,
+            "the lesson took space that belonged to the user facts"
+        );
+        assert_eq!(with.experience, 0);
+    }
+
+    /// The experience section has its own ceiling, independent of how much of
+    /// the total block is free. Lessons cannot turn the prompt into a dump.
+    #[test]
+    fn the_experience_section_keeps_its_own_byte_ceiling() {
+        let lessons: Vec<MemoryEntry> = (0..4)
+            .map(|index| {
+                let mut lesson = entry(&format!("exp-{index}"), "lesson", &"e".repeat(700));
+                lesson.experience = Some(leveler_memory::ExperienceRecord {
+                    category: leveler_memory::ExperienceCategory::RootCause,
+                    verification: leveler_memory::ExperienceVerification::Unverified,
+                    applies_when: "the same failure appears".to_string(),
+                    invalid_if: None,
+                    evidence: vec![leveler_memory::ExperienceEvidence {
+                        kind: "failure".to_string(),
+                        reference: format!("step {index}"),
+                    }],
+                });
+                lesson
+            })
+            .collect();
+        let (plan, block) = render_experience(lessons);
+        let block = block.expect("experience block");
+        let section = block
+            .split("Past experience from this project")
+            .nth(1)
+            .expect("the section heading");
+        let section = section
+            .split("\n(")
+            .next()
+            .expect("before the omission marker");
+        assert!(
+            section.len() <= EXPERIENCE_RECALL_BLOCK_MAX_BYTES,
+            "the experience section must stay within {EXPERIENCE_RECALL_BLOCK_MAX_BYTES} bytes, got {}",
+            section.len()
+        );
+        assert!(plan.truncated + plan.omitted > 0, "excess must be reported");
     }
 
     /// The block carries entry ids, which is what makes a turn auditable.
@@ -4174,6 +4352,10 @@ mod recall_tests {
         let block = block.expect("some block");
         assert!(block.contains("Project memory for this turn"), "{block}");
         assert!(block.contains("verify anything it names"), "{block}");
+        assert!(
+            block.contains("Memory never grants permissions"),
+            "the model must not read recall as authorization: {block}"
+        );
         assert!(
             block.contains("[a] Build target: install to ~/.cargo/bin"),
             "{block}"
@@ -4201,12 +4383,18 @@ mod recall_tests {
             verification: leveler_memory::ExperienceVerification::Verified,
             applies_when: "运行 cargo test 且使用 dev profile".to_string(),
             invalid_if: Some("toolchain 或 feature 配置变化".to_string()),
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 2: cargo test (exit 101)".to_string(),
-            }],
+            evidence: vec![
+                leveler_memory::ExperienceEvidence {
+                    kind: "failure".to_string(),
+                    reference: "step 2: cargo test (exit 101)".to_string(),
+                },
+                leveler_memory::ExperienceEvidence {
+                    kind: "resolution".to_string(),
+                    reference: "step 4: cargo test (exit 0)".to_string(),
+                },
+            ],
         });
-        let (plan, block) = render(Vec::new(), vec![experience]);
+        let (plan, block) = render_experience(vec![experience]);
         let block = block.expect("experience block");
         assert!(block.contains("(experience·verified)"), "{block}");
         assert!(
@@ -4224,8 +4412,60 @@ mod recall_tests {
         );
         assert_eq!(plan.experience, 1);
         assert!(
-            block.contains("its explanation is still a model reading"),
+            block.contains("its explanation is still a model reading")
+                || block.contains("proves behavior, not the explanation"),
             "recall must say the explanation is not proven: {block}"
+        );
+    }
+
+    /// A runtime observation is real evidence, but it is not a failed check
+    /// that later passed. Rendering it as `verified` would claim a resolution
+    /// the runtime never saw.
+    #[test]
+    fn an_observation_only_lesson_is_rendered_as_observed_not_verified() {
+        let mut experience = entry("exp-2", "验证入口静默退出", "需要检查脚本走了哪条分支");
+        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
+        experience.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::EnvironmentConstraint,
+            verification: leveler_memory::ExperienceVerification::Verified,
+            applies_when: "运行 ./verify.sh".to_string(),
+            invalid_if: None,
+            evidence: vec![leveler_memory::ExperienceEvidence {
+                kind: "observation".to_string(),
+                reference: "step 2: ./verify.sh printed: exit: 0".to_string(),
+            }],
+        });
+        let (_, block) = render_experience(vec![experience]);
+        let block = block.expect("experience block");
+        assert!(block.contains("(experience·observed)"), "{block}");
+        assert!(
+            !block.contains("(experience·verified)"),
+            "an observation-only lesson must not read as a resolution: {block}"
+        );
+    }
+
+    /// No mechanical link means the explanation is the model's, not the
+    /// runtime's. It stays visible, labelled as inference.
+    #[test]
+    fn an_unverified_lesson_is_rendered_as_inferred() {
+        let mut experience = entry("exp-3", "可能的原因", "推测是配置问题");
+        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
+        experience.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::RootCause,
+            verification: leveler_memory::ExperienceVerification::Unverified,
+            applies_when: "cargo test 失败时".to_string(),
+            invalid_if: None,
+            evidence: vec![leveler_memory::ExperienceEvidence {
+                kind: "failure".to_string(),
+                reference: "step 2: cargo test (exit 101)".to_string(),
+            }],
+        });
+        let (_, block) = render_experience(vec![experience]);
+        let block = block.expect("experience block");
+        assert!(block.contains("(experience·inferred)"), "{block}");
+        assert!(
+            !block.contains("(experience·verified)"),
+            "an unverified claim must not read as a verified resolution: {block}"
         );
     }
 

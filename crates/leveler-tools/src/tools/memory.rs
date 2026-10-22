@@ -21,15 +21,32 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 /// The memory-store root a memory tool is built with, shared by the three.
 #[derive(Clone)]
-pub struct MemoryRoot(Option<Arc<PathBuf>>);
+pub struct MemoryRoot {
+    root: Option<Arc<PathBuf>>,
+    lanes: leveler_memory::MemoryLanes,
+}
 
 impl MemoryRoot {
     pub fn new(root: Option<PathBuf>) -> Self {
-        Self(root.map(Arc::new))
+        Self {
+            root: root.map(Arc::new),
+            lanes: leveler_memory::MemoryLanes::ALL,
+        }
+    }
+
+    /// Restrict every read and write through this handle to the effective
+    /// lanes. The registry uses one handle for all three tools.
+    pub fn with_lanes(mut self, lanes: leveler_memory::MemoryLanes) -> Self {
+        self.lanes = lanes;
+        self
+    }
+
+    fn lanes(&self) -> leveler_memory::MemoryLanes {
+        self.lanes
     }
 
     fn open(&self) -> Result<MemoryStore, ToolError> {
-        let root = self.0.as_ref().ok_or_else(|| {
+        let root = self.root.as_ref().ok_or_else(|| {
             ToolError::Io(
                 "memory store is not configured for this session (app must set Layout::memory_dir)"
                     .to_string(),
@@ -95,6 +112,7 @@ impl Tool for MemoryTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: MemoryArgs = super::parse_input(self.name(), input)?;
         let store = self.root.open()?;
+        let lanes = self.root.lanes();
         match args.action.as_str() {
             "list" => {
                 // `effective_active` is the one current-truth read: it drops
@@ -104,7 +122,7 @@ impl Tool for MemoryTool {
                     .effective_active()
                     .map_err(|e| ToolError::Io(e.to_string()))?
                     .into_iter()
-                    .filter(|entry| !is_sensitive(entry))
+                    .filter(|entry| !is_sensitive(entry) && lanes.allows_entry(entry))
                     .collect::<Vec<_>>();
                 if entries.is_empty() {
                     return Ok(ToolOutput::ok("No active memories.".to_string()));
@@ -126,7 +144,7 @@ impl Tool for MemoryTool {
                 let e = store
                     .read_active(&id)
                     .map_err(|err| ToolError::Io(err.to_string()))?;
-                if is_sensitive(&e) {
+                if is_sensitive(&e) || !lanes.allows_entry(&e) {
                     return Ok(ToolOutput::error("memory not found"));
                 }
                 // An id can still exist on disk as crash residue for an
@@ -168,7 +186,7 @@ impl Tool for MemoryTool {
                         .search(&q, search_limit)
                         .map_err(|e| ToolError::Io(e.to_string()))?
                 };
-                hits.retain(|(entry, _)| !is_sensitive(entry));
+                hits.retain(|(entry, _)| !is_sensitive(entry) && lanes.allows_entry(entry));
                 hits.truncate(args.limit.max(1));
                 if hits.is_empty() {
                     return Ok(ToolOutput::ok("No matching memories.".to_string()));
@@ -284,6 +302,11 @@ impl Tool for RememberTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: RememberArgs = super::parse_input(self.name(), input)?;
+        if !self.root.lanes().user {
+            return Ok(ToolOutput::error(
+                "user memory lane is disabled for this project",
+            ));
+        }
         if args.title.trim().is_empty() || args.body.trim().is_empty() {
             return Ok(ToolOutput::error("title and body are required"));
         }
@@ -394,6 +417,12 @@ impl Tool for ForgetTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: ForgetArgs = super::parse_input(self.name(), input)?;
         let store = self.root.open()?;
+        let entry = store
+            .read_active(&args.id)
+            .map_err(|e| ToolError::Io(e.to_string()))?;
+        if !self.root.lanes().allows_entry(&entry) {
+            return Ok(ToolOutput::error("memory not found"));
+        }
         let entry = store
             .forget(&args.id)
             .map_err(|e| ToolError::Io(e.to_string()))?;
@@ -852,5 +881,155 @@ mod tests {
             .unwrap();
         assert!(read.is_error, "sensitive direct read must be refused");
         assert!(!read.content.contains("demo-provider"), "{}", read.content);
+    }
+
+    fn experience_entry() -> leveler_memory::MemoryEntry {
+        let mut entry = leveler_memory::new_entry(
+            "Deploy lesson",
+            "The blue deployment failed because the token had expired.",
+            Vec::new(),
+        );
+        entry.id = "deploy-lesson".to_string();
+        entry.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
+        entry.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::RootCause,
+            verification: leveler_memory::ExperienceVerification::Verified,
+            applies_when: "deploying to blue".to_string(),
+            invalid_if: None,
+            evidence: vec![leveler_memory::ExperienceEvidence {
+                kind: "failure".to_string(),
+                reference: "step 2: deploy (exit 1)".to_string(),
+            }],
+        });
+        entry
+    }
+
+    #[tokio::test]
+    async fn memory_reads_never_cross_a_closed_lane() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let ctx = ctx_in(dir.path());
+        let store = MemoryStore::open(&mem).unwrap();
+        let mut user = leveler_memory::new_entry(
+            "Release rule",
+            "Tag only after the full suite passes.",
+            Vec::new(),
+        );
+        user.kind = Some("decision".to_string());
+        store.remember(user).unwrap();
+        store.remember(experience_entry()).unwrap();
+
+        let user_only =
+            MemoryRoot::new(Some(mem.clone())).with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+        let listed = MemoryTool::new(user_only.clone())
+            .execute(
+                serde_json::json!({"action": "list"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.content.contains("Release rule"),
+            "{}",
+            listed.content
+        );
+        assert!(
+            !listed.content.contains("Deploy lesson"),
+            "{}",
+            listed.content
+        );
+        let searched = MemoryTool::new(user_only.clone())
+            .execute(
+                serde_json::json!({"action": "search", "query": "blue deployment", "limit": 10}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !searched.content.contains("deploy-lesson"),
+            "{}",
+            searched.content
+        );
+        let read = MemoryTool::new(user_only)
+            .execute(
+                serde_json::json!({"action": "read", "id": "deploy-lesson"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(read.is_error, "a disabled lane is not readable");
+
+        let experience_only =
+            MemoryRoot::new(Some(mem)).with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
+        let listed = MemoryTool::new(experience_only)
+            .execute(
+                serde_json::json!({"action": "list"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.content.contains("Deploy lesson"),
+            "{}",
+            listed.content
+        );
+        assert!(
+            !listed.content.contains("Release rule"),
+            "{}",
+            listed.content
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_is_refused_when_the_user_lane_is_closed() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()))
+            .with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
+        let out = RememberTool::new(root)
+            .execute(
+                serde_json::json!({
+                    "title": "Release rule",
+                    "body": "Tag only after the test suite passes.",
+                    "kind": "decision",
+                    "subject": "release.tagging"
+                }),
+                ctx_in(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            MemoryStore::open(&mem)
+                .unwrap()
+                .effective_active()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_is_refused_for_an_entry_in_a_closed_lane() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let store = MemoryStore::open(&mem).unwrap();
+        store.remember(experience_entry()).unwrap();
+        let root =
+            MemoryRoot::new(Some(mem.clone())).with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+        let out = ForgetTool::new(root)
+            .execute(
+                serde_json::json!({"id": "deploy-lesson"}),
+                ctx_in(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(store.effective_active().unwrap().len(), 1);
     }
 }

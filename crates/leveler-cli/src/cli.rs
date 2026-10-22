@@ -486,6 +486,8 @@ pub enum MemoryCommand {
         #[arg(long)]
         archived: bool,
     },
+    /// Show the configured memory switches and what each lane stores.
+    Status,
     /// Lexical search over active memories.
     Search {
         /// Query string (BM25 over title/body/tags).

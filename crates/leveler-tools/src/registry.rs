@@ -520,10 +520,18 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
         registry.register(Arc::new(tools::ViewImageTool));
     }
     if packs.memory {
-        let root = tools::MemoryRoot::new(capabilities.memory_root.clone());
-        registry.register(Arc::new(tools::MemoryTool::new(root.clone())));
-        registry.register(Arc::new(tools::RememberTool::new(root.clone())));
-        registry.register(Arc::new(tools::ForgetTool::new(root)));
+        let root = tools::MemoryRoot::new(capabilities.memory_root.clone())
+            .with_lanes(capabilities.memory_lanes);
+        let lanes = capabilities.memory_lanes;
+        if lanes.any() {
+            registry.register(Arc::new(tools::MemoryTool::new(root.clone())));
+            registry.register(Arc::new(tools::ForgetTool::new(root.clone())));
+        }
+        // `remember` writes a user fact. An experience-only project must not
+        // expose a write path into the closed user lane.
+        if lanes.user {
+            registry.register(Arc::new(tools::RememberTool::new(root)));
+        }
     }
     if packs.skills {
         registry.register(Arc::new(tools::LoadSkillTool));
@@ -718,6 +726,51 @@ mod tests {
                 "{packs:?}"
             );
         }
+    }
+
+    /// A memory pack only exposes the writes and reads its lanes allow.
+    /// Experience-only projects still need `memory` (to read lessons) and
+    /// `forget`, but never `remember` — that is the user lane's write path.
+    #[test]
+    fn memory_tools_follow_the_effective_lanes() {
+        let present = |lanes| {
+            let surface: Vec<String> = model_surface(
+                CapabilityPacks {
+                    memory: true,
+                    ..CapabilityPacks::NONE
+                },
+                &crate::tools::test_capabilities().with_memory_lanes(lanes),
+            )
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+            (
+                surface.iter().any(|name| name == "memory"),
+                surface.iter().any(|name| name == "remember"),
+                surface.iter().any(|name| name == "forget"),
+            )
+        };
+
+        assert_eq!(
+            present(leveler_memory::MemoryLanes::ALL),
+            (true, true, true)
+        );
+        assert_eq!(
+            present(leveler_memory::MemoryLanes::USER_ONLY),
+            (true, true, true)
+        );
+        // Experience-only keeps the read and the forget path but never the
+        // user lane's write path.
+        assert_eq!(
+            present(leveler_memory::MemoryLanes::EXPERIENCE_ONLY),
+            (true, false, true)
+        );
+        assert_eq!(
+            present(leveler_memory::MemoryLanes::NONE),
+            (false, false, false),
+            "no effective lane composes no memory tools"
+        );
     }
 
     /// No optional packs composes exactly the initial primitives.

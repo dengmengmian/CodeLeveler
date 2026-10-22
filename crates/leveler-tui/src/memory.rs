@@ -517,8 +517,8 @@ fn open_focused(state: &mut AppState) -> Vec<Effect> {
     match state.memory.view {
         MemoryView::Home => {
             let view = match state.memory.menu {
-                0 => MemoryView::Review,
-                1 => MemoryView::Active,
+                0 => MemoryView::Active,
+                1 => MemoryView::Review,
                 _ => MemoryView::Archived,
             };
             state.memory.view = view;
@@ -635,12 +635,6 @@ pub fn is_high_risk(body: &str) -> bool {
     ];
     let lower = body.to_ascii_lowercase();
     MARKERS.iter().any(|marker| lower.contains(marker))
-}
-
-/// True when the candidate's origin is the user's own message. This is an
-/// origin label, not consent: the record is still pending.
-pub fn source_is_user(candidate: &UiMemoryCandidate) -> bool {
-    candidate.source == "user_explicit"
 }
 
 pub fn memory_notice_path(state: &AppState) -> Option<PathBuf> {

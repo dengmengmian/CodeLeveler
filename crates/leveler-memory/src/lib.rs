@@ -11,6 +11,7 @@
 mod audit;
 mod candidates;
 mod experience;
+mod lanes;
 mod lifecycle;
 mod pipeline;
 mod semantic;
@@ -18,20 +19,22 @@ mod semantic;
 pub use audit::{IdentityAudit, IdentityLocation, IdentityRecord, IdentityState, IdentitySummary};
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, candidate_sensitive_fields, fingerprint_of,
-    is_sensitive_candidate, looks_like_secret, package_manager_from_root,
+    is_high_risk_memory, is_sensitive_candidate, looks_like_secret, package_manager_from_root,
     parse_direct_memory_command, parse_inferred_preference, redact_candidate, title_from_body,
 };
 pub use experience::{
-    EXPERIENCE_KIND, ExperienceCategory, ExperienceEvidence, ExperienceRecord,
+    EXPERIENCE_KIND, ExperienceCategory, ExperienceEvidence, ExperienceRecord, ExperienceStanding,
     ExperienceVerification, validate_experience_record,
 };
+pub use lanes::MemoryLanes;
 pub use lifecycle::{
     AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
     MemoryLifecycleOp, MemoryOperation, Provenance, agent_candidate, decide, parse_durable_fact,
     semantic_key_of,
 };
 pub use pipeline::{
-    AdmitOutcome, AgentAdmitOutcome, ProposeOutcome, SuppressRecord, collect_turn_candidates,
+    AdmitOutcome, AgentAdmitOutcome, ProposeOutcome, SuppressRecord,
+    candidate_eligible_for_activation, collect_turn_candidates,
 };
 pub use semantic::{
     CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
@@ -39,7 +42,7 @@ pub use semantic::{
     parse_semantic_candidates, validate_semantic_candidate, validate_semantic_candidates,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -645,8 +648,28 @@ impl MemoryStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(MemoryEntry, f64)>, MemoryError> {
-        let mut hits = self.search(query, limit.saturating_add(DERIVED_RECALL_SLACK))?;
-        hits.retain(|(entry, _)| !is_derived_fact(entry) && !is_sensitive(entry));
+        self.recall_for_lanes(query, limit, MemoryLanes::ALL)
+    }
+
+    /// Retrieval restricted to the lanes a turn may read.
+    ///
+    /// The search runs over every active entry before the lane filter, so a
+    /// high-scoring entry in a disabled lane cannot consume the caller's
+    /// limit and hide an eligible one. This is the same reason sensitive and
+    /// repository-derived entries are filtered after scoring.
+    pub fn recall_for_lanes(
+        &self,
+        query: &str,
+        limit: usize,
+        lanes: MemoryLanes,
+    ) -> Result<Vec<(MemoryEntry, f64)>, MemoryError> {
+        if !lanes.any() {
+            return Ok(Vec::new());
+        }
+        let mut hits = self.search(query, usize::MAX)?;
+        hits.retain(|(entry, _)| {
+            !is_derived_fact(entry) && !is_sensitive(entry) && lanes.allows_entry(entry)
+        });
         hits.truncate(limit);
         Ok(hits)
     }
@@ -661,31 +684,23 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let entries = self.effective_active()?;
-        let docs: Vec<Vec<String>> = entries
+        let doc_texts: Vec<String> = entries
             .iter()
             .map(|e| {
                 // Applicability is part of what a lesson is about: a query can
                 // name the environment without repeating the lesson body.
+                // `invalid_if` is deliberately excluded: it states when the
+                // lesson is no longer true, so indexing it would make the
+                // stale condition a positive match.
                 let experience = e
                     .experience
                     .as_ref()
-                    .map(|record| {
-                        format!(
-                            "{} {}",
-                            record.applies_when,
-                            record.invalid_if.as_deref().unwrap_or_default()
-                        )
-                    })
+                    .map(|record| record.applies_when.as_str())
                     .unwrap_or_default();
-                tokenize(&format!(
-                    "{} {} {} {}",
-                    e.title,
-                    e.body,
-                    e.tags.join(" "),
-                    experience
-                ))
+                format!("{} {} {} {}", e.title, e.body, e.tags.join(" "), experience)
             })
             .collect();
+        let docs: Vec<Vec<String>> = doc_texts.iter().map(|text| tokenize(text)).collect();
         let n = docs.len() as f64;
         if n == 0.0 {
             return Ok(Vec::new());
@@ -696,12 +711,15 @@ impl MemoryStore {
             df.insert(term.as_str(), count);
         }
         let avgdl = docs.iter().map(|d| d.len() as f64).sum::<f64>() / n;
+        let query_terms: HashSet<&str> = q.iter().map(String::as_str).collect();
+        let query_trigrams = cjk_trigrams(query);
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
         let mut scored: Vec<(usize, f64)> = Vec::new();
         for (i, doc) in docs.iter().enumerate() {
             let dl = doc.len() as f64;
             let mut score = 0.0;
+            let mut matched: HashSet<&str> = HashSet::new();
             for term in &q {
                 let tf = doc.iter().filter(|t| *t == term).count() as f64;
                 if tf == 0.0 {
@@ -711,12 +729,20 @@ impl MemoryStore {
                 if dfi == 0.0 {
                     continue;
                 }
+                matched.insert(term.as_str());
                 let idf = ((n - dfi + 0.5) / (dfi + 0.5) + 1.0).ln();
                 let denom = tf + K1 * (1.0 - B + B * dl / avgdl.max(1.0));
                 score += idf * (tf * (K1 + 1.0)) / denom;
             }
-            if score > 0.0 {
-                scored.push((i, score));
+            if score > 0.0
+                && relevant_match(
+                    &query_terms,
+                    &matched,
+                    &query_trigrams,
+                    &cjk_trigrams(&doc_texts[i]),
+                )
+            {
+                scored.push((i, score * relevance_weight(&entries[i])));
             }
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -726,6 +752,89 @@ impl MemoryStore {
             .map(|(i, s)| (entries[i].clone(), s))
             .collect())
     }
+}
+
+/// Bounded prior for automatic recall.
+///
+/// BM25 answers "does this text match"; it cannot tell a user-stated project
+/// fact from a model guess or a mechanically verified lesson. This factor
+/// breaks near-ties using what the store already knows. It is deliberately
+/// small: an unrelated authoritative entry must not outrank a strongly matching
+/// weaker one, so the lexical score remains the dominant term.
+fn relevance_weight(entry: &MemoryEntry) -> f64 {
+    let authority = match entry.authority() {
+        MemoryAuthority::ExplicitUser => 1.20,
+        MemoryAuthority::ProjectSource => 1.10,
+        MemoryAuthority::RuntimeObservation => 1.02,
+        MemoryAuthority::ToolObservation => 1.00,
+        MemoryAuthority::ModelInference => 0.95,
+    };
+    let scope = match entry.scope {
+        MemoryScope::Project => 1.0,
+        MemoryScope::Ephemeral => 0.90,
+    };
+    let evidence = match entry.experience.as_ref().map(ExperienceRecord::standing) {
+        Some(ExperienceStanding::VerifiedResolution) => 1.15,
+        Some(ExperienceStanding::Observed) => 1.02,
+        Some(ExperienceStanding::Inferred) => 0.95,
+        None => 1.0,
+    };
+    authority * scope * evidence
+}
+
+/// Three-character CJK windows. A shared trigram is a phrase, while two
+/// isolated shared bigrams are often just common words appearing nearby.
+fn cjk_trigrams(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut run: Vec<char> = Vec::new();
+    let flush = |run: &mut Vec<char>, out: &mut HashSet<String>| {
+        if run.len() >= 3 {
+            for window in run.windows(3) {
+                out.insert(window.iter().collect());
+            }
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if is_cjk(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// A lexical hit is only recall-worthy when the overlap is specific.
+///
+/// BM25 answers "how often do these words occur", not "is this memory about
+/// the request". A long request can share two generic words with an unrelated
+/// entry and outscore a short, precise technical match. Accept a hit when at
+/// least one of these holds:
+///
+/// - the query is mostly about the entry (half its distinct terms matched);
+/// - a technical identifier (an ASCII word such as `MCP` or `SQLite`) matched;
+/// - a three-character CJK phrase is shared.
+fn relevant_match(
+    query_terms: &HashSet<&str>,
+    matched: &HashSet<&str>,
+    query_trigrams: &HashSet<String>,
+    doc_trigrams: &HashSet<String>,
+) -> bool {
+    if matched.is_empty() || query_terms.is_empty() {
+        return false;
+    }
+    if matched.len() * 2 >= query_terms.len() {
+        return true;
+    }
+    if matched
+        .iter()
+        .any(|term| term.chars().count() >= 2 && term.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return true;
+    }
+    !query_trigrams.is_disjoint(doc_trigrams)
 }
 
 fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
@@ -844,10 +953,6 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
 /// stay readable; excluded from automatic injection so a stale copy can never
 /// contradict the working tree.
 const DERIVED_LABELS: [&str; 1] = ["package_manager"];
-
-/// Over-fetch this many extra hits before filtering, so dropping derived facts
-/// does not silently shrink a full page of results.
-const DERIVED_RECALL_SLACK: usize = 8;
 
 /// What a memory IS, which decides how it reaches the model.
 ///
@@ -2643,6 +2748,27 @@ mod safety_tests {
         );
     }
 
+    /// An invalidation condition describes when a lesson STOPS applying. It
+    /// must not make the lesson a positive match for that very condition: a
+    /// query about the stale state would otherwise surface the entry as if it
+    /// recommended the stale behaviour.
+    #[test]
+    fn an_invalidation_condition_is_not_positive_recall_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut candidate = verified_experience(
+            "build.linker",
+            "链接失败时先检查系统 C 工具链。",
+            "cargo test (exit 0)",
+        );
+        candidate.experience.as_mut().unwrap().invalid_if = Some("仓库迁移到 bun 10".to_string());
+        store.admit_experience_candidate(candidate).unwrap();
+        assert!(
+            store.recall("bun", 5).unwrap().is_empty(),
+            "the invalidation condition must not act as a positive match"
+        );
+    }
+
     #[test]
     fn an_experience_cannot_be_written_without_its_evidence() {
         let dir = tempfile::tempdir().unwrap();
@@ -2698,5 +2824,219 @@ mod safety_tests {
         let outcome = store.admit_experience_candidate(candidate);
         assert!(outcome.is_err(), "a credential in evidence must be refused");
         assert!(store.effective_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recall_can_be_restricted_to_one_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let mut note = new_entry(
+            "Deploy target",
+            "The blue deployment target is the one this project uses.",
+            Vec::new(),
+        );
+        note.kind = Some("note".to_string());
+        store.remember(note).unwrap();
+        let candidate = verified_experience(
+            "deploy.target",
+            "The blue deployment target is the one this project uses.",
+            "cargo test -p demo (exit 0)",
+        );
+        store.admit_experience_candidate(candidate).unwrap();
+
+        let user = store
+            .recall_for_lanes("blue deployment target", 4, MemoryLanes::USER_ONLY)
+            .unwrap();
+        assert!(!user.is_empty());
+        assert!(user.iter().all(|(entry, _)| entry.experience.is_none()));
+
+        let experience = store
+            .recall_for_lanes("blue deployment target", 4, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert!(!experience.is_empty());
+        assert!(
+            experience
+                .iter()
+                .all(|(entry, _)| entry.experience.is_some())
+        );
+
+        assert_eq!(
+            store
+                .recall_for_lanes("blue deployment target", 10, MemoryLanes::ALL)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .recall_for_lanes("blue deployment target", 10, MemoryLanes::NONE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// BM25 alone would rank the shorter, weaker entry first: lexical overlap
+    /// is not the whole of relevance. A fact the user stated outranks the
+    /// model's own inference when both match the request.
+    #[test]
+    fn recall_ranks_user_authority_above_inference_at_a_similar_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let mut inferred = new_entry("发布命令", "发布前运行 cargo test", vec![]);
+        inferred.id = "a-inferred".to_string();
+        inferred.provenance = Some(Provenance {
+            authority: MemoryAuthority::ModelInference,
+            source: "system_inferred".to_string(),
+            evidence: None,
+        });
+        store.remember(inferred).unwrap();
+
+        let mut explicit = new_entry("发布命令", "发布前运行 cargo test，并检查版本号。", vec![]);
+        explicit.id = "z-explicit".to_string();
+        explicit.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "explicit_user".to_string(),
+            evidence: None,
+        });
+        store.remember(explicit).unwrap();
+
+        let hits = store.search("发布前运行 cargo test 发布命令", 5).unwrap();
+        assert_eq!(
+            hits[0].0.id,
+            "z-explicit",
+            "the user's own fact must lead: {:?}",
+            hits.iter()
+                .map(|(entry, score)| (&entry.id, score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A mechanically verified resolution outranks a model explanation of the
+    /// same area, even when the explanation has slightly better term overlap.
+    #[test]
+    fn recall_ranks_verified_experience_above_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let mut inferred = new_entry("测试环境", "dev profile 缺少 test feature", vec![]);
+        inferred.id = "a-inferred".to_string();
+        inferred.kind = Some(EXPERIENCE_KIND.to_string());
+        inferred.experience = Some(ExperienceRecord {
+            category: ExperienceCategory::RootCause,
+            verification: ExperienceVerification::Unverified,
+            applies_when: "dev profile 缺少 test feature".to_string(),
+            invalid_if: None,
+            evidence: Vec::new(),
+        });
+        store.remember(inferred).unwrap();
+
+        let mut verified = new_entry(
+            "测试环境",
+            "dev profile 缺少 test feature；启用后测试通过。",
+            vec![],
+        );
+        verified.id = "z-verified".to_string();
+        verified.kind = Some(EXPERIENCE_KIND.to_string());
+        verified.experience = Some(ExperienceRecord {
+            category: ExperienceCategory::RootCause,
+            verification: ExperienceVerification::Verified,
+            applies_when: "dev profile 缺少 test feature".to_string(),
+            invalid_if: None,
+            evidence: vec![
+                ExperienceEvidence {
+                    kind: "failure".to_string(),
+                    reference: "step 1: cargo test (exit 101)".to_string(),
+                },
+                ExperienceEvidence {
+                    kind: "resolution".to_string(),
+                    reference: "step 2: cargo test (exit 0)".to_string(),
+                },
+            ],
+        });
+        store.remember(verified).unwrap();
+
+        let hits = store.search("dev profile 缺少 test feature", 5).unwrap();
+        assert_eq!(
+            hits[0].0.id,
+            "z-verified",
+            "verified evidence must lead: {:?}",
+            hits.iter()
+                .map(|(entry, score)| (&entry.id, score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn store_with_code_and_mcp() -> (tempfile::TempDir, MemoryStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        for (id, title) in [
+            ("code", "不提交生成的客户端代码"),
+            ("mcp", "MCP 读写必须经过身份验证"),
+            ("db", "数据库访问：repository 层"),
+        ] {
+            let mut entry = new_entry(title, title, vec![]);
+            entry.id = id.to_string();
+            entry.provenance = Some(Provenance {
+                authority: MemoryAuthority::ExplicitUser,
+                source: "explicit_user".to_string(),
+                evidence: None,
+            });
+            store.remember(entry).unwrap();
+        }
+        (dir, store)
+    }
+
+    /// A long request shares "生成" and "代码" with an unrelated code-commit
+    /// rule. Two isolated generic words are not relevance: unrelated memories
+    /// must not be injected just because their words also appear in the task.
+    #[test]
+    fn recall_drops_incidental_shared_words_in_a_long_request() {
+        let (_dir, store) = store_with_code_and_mcp();
+        let query = "用 Python 写一个生成斐波那契数列前十项的函数，只给代码，不要修改任何文件，也不要读取项目文件。";
+        let hits = store.recall(query, 4).unwrap();
+        assert!(
+            hits.iter().all(|(entry, _)| entry.id != "code"),
+            "an unrelated commit rule was recalled: {:?}",
+            hits.iter()
+                .map(|(entry, score)| (&entry.id, score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hits.is_empty(),
+            "nothing in this store is relevant: {hits:?}"
+        );
+    }
+
+    /// The same long request that names the subject still recalls the entry:
+    /// the gate drops incidental words, not technical identifiers.
+    #[test]
+    fn recall_keeps_a_technical_identifier_in_a_long_request() {
+        let (_dir, store) = store_with_code_and_mcp();
+        let hits = store
+            .recall(
+                "实现新的 MCP 查询接口。只给出实现方案，不要修改文件；说明需要遵守的项目约束。",
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|(entry, _)| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp"],
+            "a named technical subject must still be recalled"
+        );
+    }
+
+    /// A short query made almost entirely of one Chinese word is a real match:
+    /// the gate must not turn into a length filter.
+    #[test]
+    fn recall_keeps_a_short_chinese_topic_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let entry = new_entry("部署密钥保管人", "由代号 Zephyr-Q7 的同事保管。", vec![]);
+        store.remember(entry).unwrap();
+        let hits = store.recall("部署", 4).unwrap();
+        assert_eq!(hits.len(), 1, "a short topic query was over-filtered");
     }
 }

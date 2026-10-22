@@ -5569,9 +5569,16 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
         Action::Runtime(RuntimeEvent::MemoryStatus {
             query_id: Some(query_id),
             status: UiMemoryStatus {
+                total_enabled: true,
+                user_enabled: true,
+                experience_enabled: true,
+                experience_experimental: true,
                 active: 2,
                 pending: 1,
                 archived: 3,
+                user_active: 1,
+                user_pending: 0,
+                user_archived: 3,
                 sensitive: 1,
                 inbox_pending: 0,
                 inbox_processing: 0,
@@ -5628,6 +5635,9 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
         .expect("status must leave a note");
     for expected in [
         "记忆状态",
+        "记忆开关",
+        "自动经验 开（实验）",
+        "用户事实：活跃 1",
         "待确认 1",
         "retry=1",
         "最近提取",
@@ -5644,6 +5654,116 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
     ] {
         assert!(note.contains(expected), "missing {expected}: {note}");
     }
+}
+
+/// The lane switches are product state: a closed lane must be visible as
+/// closed, must not advertise itself as experimental, and must not report
+/// user-fact counts it no longer serves.
+#[test]
+fn closed_memory_lanes_render_as_off_switches() {
+    use leveler_client_protocol::{CommandId, UiMemoryExtractionTotals, UiMemoryStatus};
+
+    fn open_status_query(s: &mut AppState) -> CommandId {
+        typed(s, "/memory status");
+        let effects = reduce(s, key(KeyCode::Enter));
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Send(ClientCommand::MemoryStatus { query_id, .. }) => query_id.clone(),
+                _ => None,
+            })
+            .expect("status must send a query")
+    }
+
+    fn status(total: bool, user: bool, experience: bool) -> UiMemoryStatus {
+        UiMemoryStatus {
+            total_enabled: total,
+            user_enabled: user,
+            experience_enabled: experience,
+            experience_experimental: true,
+            active: 4,
+            pending: 1,
+            archived: 2,
+            user_active: 3,
+            user_pending: 1,
+            user_archived: 2,
+            sensitive: 0,
+            inbox_pending: 0,
+            inbox_processing: 0,
+            inbox_failed_retryable: 0,
+            inbox_processed: 1,
+            next_retry_at: None,
+            retry_attempt: None,
+            extraction_totals: UiMemoryExtractionTotals::default(),
+            last_extraction: None,
+            last_error: None,
+            experience_active: 1,
+            experience_verified: 1,
+            experience_unverified: 0,
+            experience_pending: 0,
+            experience_archived: 0,
+            experience_inbox_pending: 0,
+            experience_inbox_processing: 0,
+            experience_inbox_failed_retryable: 0,
+            experience_inbox_processed: 0,
+            experience_next_retry_at: None,
+            last_experience: None,
+        }
+    }
+
+    fn last_note(s: &AppState) -> String {
+        s.transcript
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                TranscriptItem::Note(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("status must leave a note")
+    }
+
+    let mut s = opened();
+    let query_id = open_status_query(&mut s);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryStatus {
+            query_id: Some(query_id),
+            status: status(true, false, true),
+        }),
+    );
+    let note = last_note(&s);
+    assert!(
+        note.contains("记忆开关：总开关 开 · 用户事实 关 · 自动经验 开（实验）"),
+        "closed user lane must render as off: {note}"
+    );
+    assert!(
+        !note.contains("用户事实：活跃"),
+        "a closed user lane must not report user-fact counts: {note}"
+    );
+    assert!(
+        note.contains("经验：生效 1"),
+        "the open experience lane keeps reporting: {note}"
+    );
+
+    let mut s = opened();
+    let query_id = open_status_query(&mut s);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryStatus {
+            query_id: Some(query_id),
+            status: status(false, false, false),
+        }),
+    );
+    let note = last_note(&s);
+    assert!(
+        note.contains("记忆开关：总开关 关 · 用户事实 关 · 自动经验 关"),
+        "the total switch closes both lanes: {note}"
+    );
+    assert!(
+        !note.contains("（实验）"),
+        "a closed experience lane is not advertised as experimental: {note}"
+    );
 }
 
 /// Query responses are client-owned. Opening Web may issue `list_memory` on

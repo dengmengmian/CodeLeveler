@@ -202,16 +202,40 @@ impl<'a> SessionRepository<'a> {
     /// switch, so a config change is reflected before the turn row is inserted
     /// and the admission trigger reads it. `updated_at` is deliberately not
     /// touched: this is a policy snapshot, not session activity.
+    ///
+    /// This is the historical all-or-nothing form; [`Self::set_memory_lanes`]
+    /// is what lets the user and experience lanes close independently.
     pub async fn set_memory_enabled(
         &self,
         id: &SessionId,
         enabled: bool,
     ) -> Result<(), StorageError> {
-        sqlx::query("UPDATE sessions SET memory_enabled = ?2 WHERE id = ?1")
-            .bind(id.as_str())
-            .bind(i64::from(enabled))
-            .execute(self.db.pool())
-            .await?;
+        self.set_memory_lanes(id, enabled, enabled, enabled).await
+    }
+
+    /// Persist the total switch and both lane switches as one snapshot.
+    ///
+    /// `enabled` is the total switch: when it is false both lanes are closed
+    /// regardless of their own values. The trigger reads exactly this
+    /// conjunction, so a closed lane never accumulates turns that would be
+    /// extracted after the switch is reopened.
+    pub async fn set_memory_lanes(
+        &self,
+        id: &SessionId,
+        enabled: bool,
+        user_enabled: bool,
+        experience_enabled: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE sessions SET memory_enabled = ?2, user_memory_enabled = ?3, \
+             experience_memory_enabled = ?4 WHERE id = ?1",
+        )
+        .bind(id.as_str())
+        .bind(i64::from(enabled))
+        .bind(i64::from(user_enabled))
+        .bind(i64::from(experience_enabled))
+        .execute(self.db.pool())
+        .await?;
         Ok(())
     }
 
