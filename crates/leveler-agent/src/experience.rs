@@ -1580,7 +1580,7 @@ const PROJECT_FILE_EXTENSIONS: &[&str] = &[
     "sql", "html", "css", "scss", "rb", "php", "swift", "lock", "cfg", "ini", "conf",
 ];
 
-/// The first file-like reference in a prescriptive sentence that the task did
+/// The first file-like reference in a prescriptive clause that the task did
 /// not change.
 ///
 /// "`./verify.sh` printed `engine: legacy`" is evidence the runtime observed
@@ -1592,7 +1592,7 @@ fn unmodified_file_reference(body: &str, modified_files: &[String]) -> Option<St
         let Some(index) = prescriptive_clause_index(sentence) else {
             continue;
         };
-        for mention in file_mentions(&sentence[index..]) {
+        for mention in file_mentions(prescriptive_clause(&sentence[index..])) {
             if !modified_files.iter().any(|file| same_file(file, &mention)) {
                 return Some(mention);
             }
@@ -1712,6 +1712,19 @@ fn prescriptive_clause_index(sentence: &str) -> Option<usize> {
             }
         })
         .min()
+}
+
+/// Advice ends at the next clause boundary. A later clause that reruns the
+/// verifier describes how to check the fix, not another place to change.
+const CLAUSE_SEPARATORS: &[&str] = &[";", ",", " and ", " then ", "；", "，", "。"];
+
+fn prescriptive_clause(text: &str) -> &str {
+    let end = CLAUSE_SEPARATORS
+        .iter()
+        .filter_map(|separator| text.find(separator))
+        .min()
+        .unwrap_or(text.len());
+    &text[..end]
 }
 
 /// Whether an ASCII marker appears as a word stem. `edit` must not match
@@ -3707,6 +3720,29 @@ mod tests {
         );
         validate_experience_candidate(&lesson, &pack)
             .expect("the verification command is not a claimed fix location");
+    }
+
+    /// A verification command in a later clause is still evidence about how
+    /// to check the fix, not a second place to change.
+    #[test]
+    fn a_verification_command_in_a_later_clause_is_not_a_fix_location() {
+        let events = vec![
+            started("a1", "run_command", run_command("./verify.sh", &[]), 2),
+            finished("a1", "run_command", true, Some(1), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished("a2", "apply_patch", false, None, Some("--- a/engine.config")),
+            started("a3", "run_command", run_command("./verify.sh", &[]), 5),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["engine.config"]),
+        ];
+        let pack = pack_from(&events, "修复 engine profile").expect("a signal exists");
+        let lesson = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "Correct the profile setting in engine.config and rerun ./verify.sh.",
+        );
+        validate_experience_candidate(&lesson, &pack)
+            .expect("rerunning the verifier is not a fix location");
     }
 
     /// A quoted command is evidence, not a fix location: `./verify.sh status`
