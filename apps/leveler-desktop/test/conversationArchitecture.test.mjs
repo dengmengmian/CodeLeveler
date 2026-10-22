@@ -347,6 +347,40 @@ test('a replay that regenerated user message ids does not duplicate the user lin
   assert.equal(merged.messages.length, 2);
 });
 
+test('an interrupted partial and its resumed answer are not duplicated after a replay', () => {
+  // The runtime's history projection re-creates user ids and appends an
+  // interruption note to the interrupted partial. Live rows from the same
+  // turn therefore have neither the same id nor exactly the same text; the
+  // merge must still recognize them as the same two messages.
+  const interrupted = '答案一\n\n[Response interrupted before completion. This is incomplete output.]';
+  const replayed = projectSnapshot({ id: 's', messages: [], task_status: 'answered' }, [
+    { turn_elapsed_ms: 0, turn_start: true, event: { type: 'user_message_added', message: { id: 'replay-u1', role: 'user', text: '问题一' } } },
+    { turn_elapsed_ms: 50, turn_start: false, event: { type: 'assistant_message_started', message_id: 's-partial-1' } },
+    { turn_elapsed_ms: 60, turn_start: false, event: { type: 'assistant_text_delta', message_id: 's-partial-1', delta: interrupted } },
+    { turn_elapsed_ms: 70, turn_start: false, event: { type: 'assistant_message_completed', message_id: 's-partial-1' } },
+    { turn_elapsed_ms: 80, turn_start: false, event: { type: 'turn_cancelled' } },
+    { turn_elapsed_ms: 90, turn_start: true, event: { type: 'user_message_added', message: { id: 'replay-u2', role: 'user', text: '问题二' } } },
+    { turn_elapsed_ms: 100, turn_start: false, event: { type: 'assistant_message_started', message_id: 'replay-m2' } },
+    { turn_elapsed_ms: 110, turn_start: false, event: { type: 'assistant_text_delta', message_id: 'replay-m2', delta: '答案二' } },
+    { turn_elapsed_ms: 120, turn_start: false, event: { type: 'assistant_message_completed', message_id: 'replay-m2' } },
+    { turn_elapsed_ms: 130, turn_start: false, event: { type: 'turn_answered' } },
+  ]);
+  const live = {
+    ...projectSnapshot({ id: 's', messages: [], task_status: 'answered' }, []),
+    messages: [
+      { id: 'live-u1', role: 'user', text: '问题一', seq: 0, live: true },
+      { id: 'live-held', role: 'assistant', text: '答案一', final: true, seq: 1, live: true },
+      { id: 'live-u2', role: 'user', text: '问题二', seq: 2, live: true },
+      { id: 'live-resumed', role: 'assistant', text: '答案二', final: true, seq: 3, live: true },
+    ],
+    nextSeq: 4,
+  };
+  const merged = mergeRestoredConversation(replayed, live);
+  assert.deepEqual(merged.messages.map(message => message.text), ['问题一', interrupted, '问题二', '答案二']);
+  assert.equal(merged.messages.length, 4, 'the replay duplicated the interrupted turn');
+  assert.deepEqual(merged.messages.map(message => message.id), ['replay-u1', 's-partial-1', 'replay-u2', 'replay-m2']);
+});
+
 test('a snapshot active context is not promoted into the transcript once history exists', () => {
   const restored = projectSnapshot({ id: 's', messages: [], task_status: 'answered' }, [
     { turn_elapsed_ms: 0, turn_start: true, event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: '真正的问题' } } },

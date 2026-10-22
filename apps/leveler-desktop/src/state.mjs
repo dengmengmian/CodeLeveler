@@ -140,8 +140,15 @@ export function mergeRestoredConversation(restored, live) {
     const candidate = liveMessages[cursor];
     if (!candidate) break;
     const sameKind = candidate.role === message.role && (candidate.kind ?? null) === (message.kind ?? null);
-    const sameText = candidate.text === message.text
-      || (message.role === 'assistant' && String(candidate.text ?? '').startsWith(String(message.text ?? '')));
+    // A durable partial carries the runtime's interruption note that the live
+    // row never saw, while a live stream can hold a prefix of the durable text.
+    // Assistant identity is therefore prefix-equivalence in either direction;
+    // empty placeholders never match.
+    const liveText = String(candidate.text ?? '');
+    const restoredText = String(message.text ?? '');
+    const sameText = liveText === restoredText
+      || (message.role === 'assistant' && liveText !== '' && restoredText !== ''
+        && (liveText.startsWith(restoredText) || restoredText.startsWith(liveText)));
     if (sameKind && sameText) { matched.add(candidate.id); cursor += 1; }
   }
   const messages = restored.messages.map(message => {
