@@ -148,6 +148,32 @@ try {
   for (let index = 0; index < 40 && tickPids().length; index += 1) await page.waitForTimeout(100);
   assert.deepEqual(tickPids(), []);
   evidence.stop_killed_process = { before: pids, after: [] };
+  // A Workbench on the right leaves a narrow conversation pane: the panel must
+  // shrink to the anchor's available width, never drift right over the pane.
+  await page.keyboard.press('Escape');
+  await page.locator('#header-right-toggle').click();
+  await page.waitForFunction(() => !document.querySelector('#rightbar').hidden);
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1200, 800));
+  await page.waitForFunction(() => innerWidth === 1200);
+  await page.waitForTimeout(300);
+  popover = await openJobs();
+  evidence.popoverAnchoring = await page.evaluate(() => {
+    const trigger = [...document.querySelectorAll('#header-session-actions .header-count-action')]
+      .find(node => node.textContent.includes('后台任务'));
+    const panel = document.querySelector('.jobs-popover');
+    return {
+      triggerRight: Math.round(trigger.getBoundingClientRect().right),
+      panelRight: Math.round(panel.getBoundingClientRect().right),
+      panelLeft: Math.round(panel.getBoundingClientRect().left),
+      panelWidth: Math.round(panel.getBoundingClientRect().width),
+    };
+  });
+  assert.ok(
+    Math.abs(evidence.popoverAnchoring.triggerRight - evidence.popoverAnchoring.panelRight) <= 2,
+    `the jobs panel drifted from its trigger: ${JSON.stringify(evidence.popoverAnchoring)}`,
+  );
+  await page.screenshot({ path: path.join(output, 'background-tasks-narrow-pane.png') });
+  await page.keyboard.press('Escape');
   const snapshotId = await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
   const snapshot = await page.evaluate(id => window.desktop.snapshot(id), snapshotId);
   assert.deepEqual(snapshot.active_background_tasks ?? [], []);
