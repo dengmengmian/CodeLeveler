@@ -1714,9 +1714,29 @@ fn prescriptive_clause_index(sentence: &str) -> Option<usize> {
         .min()
 }
 
-/// Advice ends at the next clause boundary. A later clause that reruns the
-/// verifier describes how to check the fix, not another place to change.
-const CLAUSE_SEPARATORS: &[&str] = &[";", ",", " and ", " then ", "；", "，", "。"];
+/// Advice about where to act ends at punctuation or before a conjunction that
+/// introduces a verification action. A plain conjunction that names another
+/// target stays inside the advice clause.
+const CLAUSE_SEPARATORS: &[&str] = &[
+    ";",
+    ",",
+    "；",
+    "，",
+    "。",
+    " and then ",
+    " and rerun ",
+    " and re-run ",
+    " and run ",
+    " and execute ",
+    " and invoke ",
+    " and verify ",
+    " and check ",
+    " and test ",
+    " then run ",
+    " then rerun ",
+    " then re-run ",
+    " then execute ",
+];
 
 fn prescriptive_clause(text: &str) -> &str {
     let end = CLAUSE_SEPARATORS
@@ -3755,6 +3775,41 @@ mod tests {
         );
         validate_experience_candidate(&lesson, &pack)
             .expect("rerunning the verifier is not a fix location");
+    }
+
+    /// A conjunction is not a clause boundary when it names another file as a
+    /// target. Only a verification action ends the advice clause.
+    #[test]
+    fn a_conjunction_does_not_hide_a_second_fix_location() {
+        let events = vec![
+            started("a1", "run_command", run_command("./verify.sh", &[]), 2),
+            finished("a1", "run_command", true, Some(1), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished(
+                "a2",
+                "apply_patch",
+                false,
+                None,
+                Some("--- a/engine.config"),
+            ),
+            started("a3", "run_command", run_command("./verify.sh", &[]), 5),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["engine.config"]),
+        ];
+        let pack = pack_from(&events, "修复 engine profile").expect("a signal exists");
+        let lesson = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "Modify engine.config and verify.sh instead.",
+        );
+        assert!(
+            matches!(
+                validate_experience_candidate(&lesson, &pack),
+                Err(ExperienceRejection::UnmodifiedFileReference { ref file })
+                    if file == "verify.sh"
+            ),
+            "verify.sh is a second target, not a verification action"
+        );
     }
 
     /// A quoted command is evidence, not a fix location: `./verify.sh status`
