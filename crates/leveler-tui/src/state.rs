@@ -346,6 +346,9 @@ pub struct AppState {
     pub memory_query: Option<leveler_client_protocol::CommandId>,
     /// The `/memory status` query, kept separate from the listing query.
     pub memory_status_query: Option<leveler_client_protocol::CommandId>,
+    /// The `/memory` management page: the last authoritative listing plus
+    /// presentation-only selection and in-flight decision state.
+    pub memory: crate::memory::MemoryPage,
     /// The most recent recall count reported by the runtime, including zero.
     /// `None` means no recall has been observed since this TUI connected.
     pub last_memory_recall: Option<u32>,
@@ -710,6 +713,7 @@ impl AppState {
             history_query: None,
             memory_query: None,
             memory_status_query: None,
+            memory: crate::memory::MemoryPage::default(),
             last_memory_recall: None,
             agents_list_query: None,
             agent_detail_query: None,
@@ -959,6 +963,17 @@ impl AppState {
         // arbitrary filesystem path.
         let home = leveler_core::leveler_home_dir_from(|name| std::env::var_os(name))?;
         Some(home.join("state").join("projects"))
+    }
+
+    /// Where the memory page records which pending candidates the user has
+    /// already been told about. Same state dir as the composer draft; this is
+    /// notice bookkeeping, never memory content or memory authority.
+    pub fn memory_notice_path(&self) -> Option<std::path::PathBuf> {
+        self.boot
+            .draft_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.join("memory-notice.json"))
     }
 
     /// The user shell id that should wear the Command focus marker, when the

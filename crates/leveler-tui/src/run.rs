@@ -142,6 +142,12 @@ pub async fn run(
 
     let theme_id = crate::theme_config::load_theme_id().unwrap_or(crate::theme::ThemeId::DEFAULT);
     let mut state = AppState::new(Theme::resolve(theme_id, Theme::env_no_color()), boot);
+    // Which pending candidates this project has already been told about. It is
+    // notice bookkeeping, not memory state: the store stays the authority for
+    // what is pending.
+    if let Some(path) = crate::memory::memory_notice_path(&state) {
+        state.memory.notified = crate::memory::load_notified(&path);
+    }
     let (cols, rows) = size().unwrap_or((80, 24));
     state.size = (cols, rows);
     state.clock_label = crate::status_line::fmt_clock(chrono::Local::now().time());
@@ -452,6 +458,14 @@ pub async fn run(
             &mut alt,
             &mut stdout,
         );
+
+        // A newly discovered batch was recorded as announced; persist that
+        // before the process can exit so a restart does not repeat it.
+        if let Some(ids) = state.memory.take_notice_update()
+            && let Some(path) = crate::memory::memory_notice_path(&state)
+        {
+            crate::memory::save_notified(&path, &ids);
+        }
 
         // Busy spinner + elapsed clock.
         state.tick = state.tick.wrapping_add(1);

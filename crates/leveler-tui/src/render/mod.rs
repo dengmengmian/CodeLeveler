@@ -1364,10 +1364,418 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Context => crate::context::render_context_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
         Screen::Output => render_output_screen(frame, area, state),
+        Screen::Memory => render_memory_screen(frame, area, state),
     }
     if let Some(overlay) = &state.overlay {
         crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);
     }
+}
+
+fn render_memory_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    use crate::memory::MemoryView;
+    let t = state.t();
+    let layout = crate::secondary::layout(area, 0);
+    let hint = match state.memory.view {
+        // The full hint fits wide terminals; the narrow one keeps every key
+        // visible instead of letting the footer ellipsis hide reject and back.
+        MemoryView::Review
+            if unicode_width::UnicodeWidthStr::width(t.memory_review_hint)
+                > layout.footer.width as usize =>
+        {
+            t.memory_review_hint_narrow
+        }
+        MemoryView::Home => t.memory_home_hint,
+        MemoryView::Review => t.memory_review_hint,
+        MemoryView::Detail => t.memory_detail_hint,
+        MemoryView::Active | MemoryView::Archived => t.memory_list_hint,
+    };
+    let page = crate::secondary::SecondaryPage {
+        title: t.memory_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint,
+    };
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    match state.memory.view {
+        MemoryView::Home => render_memory_home(frame, body, state),
+        MemoryView::Review => render_memory_review(frame, body, state),
+        MemoryView::Detail => render_memory_detail(frame, body, state),
+        MemoryView::Active => render_memory_entries(frame, body, state, true),
+        MemoryView::Archived => render_memory_entries(frame, body, state, false),
+    }
+}
+
+fn render_memory_home(frame: &mut Frame, body: Rect, state: &mut AppState) {
+    let t = state.t();
+    let theme = state.theme.clone();
+    let width = body.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(project) = memory_project_name(state) {
+        lines.push(Line::from(Span::styled(
+            project,
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    let loaded = !state.memory.loading
+        || !state.memory.active.is_empty()
+        || !state.memory.pending.is_empty()
+        || !state.memory.archived.is_empty();
+    if loaded {
+        let counts = t
+            .memory_home_counts
+            .replace("{active}", &state.memory.active.len().to_string())
+            .replace("{pending}", &state.memory.pending.len().to_string())
+            .replace("{archived}", &state.memory.archived.len().to_string());
+        lines.push(Line::from(Span::styled(
+            counts,
+            Style::default().fg(theme.text.secondary),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            t.memory_loading,
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    let items = [
+        (
+            t.memory_menu_review,
+            state.memory.pending.len(),
+            "menu:0".to_string(),
+        ),
+        (
+            t.memory_menu_active,
+            state.memory.active.len(),
+            "menu:1".to_string(),
+        ),
+        (
+            t.memory_menu_archived,
+            state.memory.archived.len(),
+            "menu:2".to_string(),
+        ),
+    ];
+    let mut rows = Vec::new();
+    let mut focus_line = 0usize;
+    for (index, (label, count, key)) in items.into_iter().enumerate() {
+        let line = lines.len();
+        rows.push((line, key));
+        if index == state.memory.menu {
+            focus_line = line;
+        }
+        let cursor = if index == state.memory.menu {
+            "❯ "
+        } else {
+            "  "
+        };
+        let label = truncate_display(label, width.saturating_sub(6));
+        lines.push(Line::from(vec![
+            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
+            Span::raw(label),
+            Span::styled(
+                format!("  {count}"),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]));
+    }
+    let mut hits = Vec::new();
+    render_list_rows(frame, body, lines, &rows, focus_line, &theme, &mut hits);
+    state.screen_rows = hits;
+}
+
+fn render_memory_review(frame: &mut Frame, body: Rect, state: &mut AppState) {
+    let t = state.t();
+    let theme = state.theme.clone();
+    let width = body.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        t.memory_review_summary
+            .replace("{count}", &state.memory.pending.len().to_string()),
+        Style::default().fg(theme.text.secondary),
+    )));
+    if state.memory.busy() {
+        lines.push(Line::from(Span::styled(
+            t.memory_confirming,
+            Style::default().fg(theme.status.warning),
+        )));
+    }
+    if let Some(report) = &state.memory.batch {
+        lines.push(Line::from(Span::styled(
+            memory_batch_line(report, &state.t()),
+            Style::default().fg(if report.failed.is_empty() {
+                theme.status.success
+            } else {
+                theme.status.warning
+            }),
+        )));
+        // A batch that did not fully apply names each record that did not.
+        for title in report.failed.iter().chain(report.unconfirmed.iter()) {
+            for piece in crate::render::text::wrap(title, width.saturating_sub(4).max(1)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {piece}"),
+                    Style::default().fg(theme.status.warning),
+                )));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    if state.memory.pending.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t.memory_empty_pending,
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut focus_line = 0usize;
+    for candidate in &state.memory.pending {
+        let line = lines.len();
+        rows.push((line, candidate.id.clone()));
+        let focused = state.memory.focus.as_deref() == Some(candidate.id.as_str());
+        if focused {
+            focus_line = line;
+        }
+        let cursor = if focused { "❯ " } else { "  " };
+        let checkbox = if state.memory.selected.contains(&candidate.id) {
+            "[✓] "
+        } else {
+            "[ ] "
+        };
+        let title_room = width.saturating_sub(6).max(1);
+        lines.push(Line::from(vec![
+            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
+            Span::styled(checkbox, Style::default().fg(theme.accent.primary)),
+            Span::raw(truncate_display(&candidate.title, title_room)),
+        ]));
+        // The body is the evidence behind the title. When it says the same
+        // thing, showing it twice is noise; when it differs, one wrapped
+        // preview is what makes the consent informed.
+        let title = normalize_memory_text(&candidate.title);
+        let body = normalize_memory_text(&candidate.body);
+        if body != title && !body.is_empty() {
+            for piece in crate::render::text::wrap(&body, width.saturating_sub(6).max(1))
+                .into_iter()
+                .take(2)
+            {
+                lines.push(Line::from(Span::styled(
+                    format!("      {piece}"),
+                    Style::default().fg(theme.text.secondary),
+                )));
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    render_list_rows(frame, body, lines, &rows, focus_line, &theme, &mut hits);
+    state.screen_rows = hits;
+}
+
+fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, active: bool) {
+    let t = state.t();
+    let theme = state.theme.clone();
+    let width = body.width as usize;
+    let entries = if active {
+        &state.memory.active
+    } else {
+        &state.memory.archived
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    let empty = if active {
+        t.memory_empty_active
+    } else {
+        t.memory_empty_archived
+    };
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            empty,
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut focus_line = 0usize;
+    for entry in entries {
+        let line = lines.len();
+        rows.push((line, entry.id.clone()));
+        let focused = state.memory.focus.as_deref() == Some(entry.id.as_str());
+        if focused {
+            focus_line = line;
+        }
+        let cursor = if focused { "❯ " } else { "  " };
+        let mut spans = vec![
+            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
+            Span::raw(truncate_display(
+                &entry.title,
+                width.saturating_sub(4).max(1),
+            )),
+        ];
+        if entry.sensitive {
+            spans.push(Span::styled(
+                format!(" · {}", t.memory_sensitive_note),
+                Style::default().fg(theme.status.warning),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    let mut hits = Vec::new();
+    render_list_rows(frame, body, lines, &rows, focus_line, &theme, &mut hits);
+    state.screen_rows = hits;
+}
+
+fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
+    let t = state.t();
+    let theme = state.theme.clone();
+    let width = body.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(candidate) = state.memory.focused_candidate() {
+        let title = candidate.title.trim();
+        let body_text = candidate.body.trim();
+        // The title appears once. A body that merely repeats it is not shown
+        // a second time.
+        if normalize_memory_text(title) == normalize_memory_text(body_text) || body_text.is_empty()
+        {
+            push_memory_wrapped(
+                &mut lines,
+                title,
+                width,
+                Style::default().fg(theme.text.primary),
+            );
+        } else {
+            push_memory_wrapped(
+                &mut lines,
+                title,
+                width,
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            );
+            lines.push(Line::from(""));
+            push_memory_wrapped(
+                &mut lines,
+                body_text,
+                width,
+                Style::default().fg(theme.text.primary),
+            );
+        }
+        lines.push(Line::from(""));
+        let source = if crate::memory::source_is_user(candidate) {
+            t.memory_source_user
+        } else {
+            t.memory_source_model
+        };
+        push_memory_wrapped(
+            &mut lines,
+            &format!("{source} · {}", t.memory_not_active),
+            width,
+            Style::default().fg(theme.text.secondary),
+        );
+        if crate::memory::is_high_risk(candidate.title.as_str())
+            || crate::memory::is_high_risk(&candidate.body)
+        {
+            lines.push(Line::from(""));
+            push_memory_wrapped(
+                &mut lines,
+                t.memory_scope_warning,
+                width,
+                Style::default().fg(theme.status.warning),
+            );
+        }
+    } else if let Some(entry) = state.memory.focused_entry() {
+        let title = entry.title.trim();
+        let body_text = entry.body.trim();
+        if normalize_memory_text(title) == normalize_memory_text(body_text) || body_text.is_empty()
+        {
+            push_memory_wrapped(
+                &mut lines,
+                title,
+                width,
+                Style::default().fg(theme.text.primary),
+            );
+        } else {
+            push_memory_wrapped(
+                &mut lines,
+                title,
+                width,
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            );
+            lines.push(Line::from(""));
+            push_memory_wrapped(
+                &mut lines,
+                body_text,
+                width,
+                Style::default().fg(theme.text.primary),
+            );
+        }
+        if entry.sensitive {
+            lines.push(Line::from(""));
+            push_memory_wrapped(
+                &mut lines,
+                t.memory_sensitive_note,
+                width,
+                Style::default().fg(theme.status.warning),
+            );
+        }
+        // An active record that reads as permission to destroy data still
+        // only records the convention; it never authorizes the act.
+        if crate::memory::is_high_risk(&entry.title) || crate::memory::is_high_risk(&entry.body) {
+            lines.push(Line::from(""));
+            push_memory_wrapped(
+                &mut lines,
+                t.memory_scope_warning,
+                width,
+                Style::default().fg(theme.status.warning),
+            );
+        }
+    }
+    render_scrolled(frame, body, state, lines);
+}
+
+fn memory_batch_line(report: &crate::memory::MemoryBatchReport, t: &crate::i18n::UiText) -> String {
+    let mut parts = vec![match report.op {
+        crate::memory::MemoryOp::Accept => t
+            .memory_batch_accepted
+            .replace("{ok}", &report.succeeded.len().to_string()),
+        crate::memory::MemoryOp::Reject => t
+            .memory_batch_rejected
+            .replace("{ok}", &report.succeeded.len().to_string()),
+    }];
+    if !report.failed.is_empty() {
+        parts.push(
+            t.memory_batch_failed
+                .replace("{count}", &report.failed.len().to_string()),
+        );
+    }
+    if !report.unconfirmed.is_empty() {
+        parts.push(
+            t.memory_batch_unconfirmed
+                .replace("{count}", &report.unconfirmed.len().to_string()),
+        );
+    }
+    parts.join(" · ")
+}
+
+fn push_memory_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for piece in crate::render::text::wrap(text, width.max(1)) {
+        lines.push(Line::from(Span::styled(piece, style)));
+    }
+}
+
+/// Comparison key for "title and body say the same thing". Whitespace runs
+/// and line breaks are layout, not content.
+fn normalize_memory_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn memory_project_name(state: &AppState) -> Option<String> {
+    let repository = state.repository.as_deref()?.trim_end_matches(['/', '\\']);
+    let name = std::path::Path::new(repository)
+        .file_name()?
+        .to_string_lossy();
+    (!name.is_empty()).then(|| name.into_owned())
 }
 
 fn render_goal_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -5005,6 +5413,274 @@ mod tests {
         assert!(
             text.contains("y ") || text.contains("y接受") || text.contains(t.remote_yn),
             "{text}"
+        );
+    }
+
+    fn memory_state(
+        view: crate::memory::MemoryView,
+        active: Vec<leveler_client_protocol::UiMemoryEntry>,
+        archived: Vec<leveler_client_protocol::UiMemoryEntry>,
+        pending: Vec<leveler_client_protocol::UiMemoryCandidate>,
+    ) -> AppState {
+        let mut state = test_state();
+        state.repository = Some("/work/demo".into());
+        state.active_screen = Screen::Memory;
+        // Focus is chosen on a list view; the detail page inherits it.
+        state.memory.view = if view == crate::memory::MemoryView::Detail {
+            crate::memory::MemoryView::Review
+        } else {
+            view
+        };
+        state.memory.apply_list(active, archived, pending, false);
+        state.memory.view = view;
+        if view == crate::memory::MemoryView::Detail && state.memory.focus.is_none() {
+            state.memory.focus = state
+                .memory
+                .pending
+                .first()
+                .map(|c| c.id.clone())
+                .or_else(|| state.memory.active.first().map(|e| e.id.clone()))
+                .or_else(|| state.memory.archived.first().map(|e| e.id.clone()));
+        }
+        state
+    }
+
+    fn memory_candidate(
+        id: &str,
+        title: &str,
+        body: &str,
+    ) -> leveler_client_protocol::UiMemoryCandidate {
+        leveler_client_protocol::UiMemoryCandidate {
+            id: id.into(),
+            title: title.into(),
+            body: body.into(),
+            kind: "convention".into(),
+            source: "user_explicit".into(),
+        }
+    }
+
+    fn memory_entry(id: &str, title: &str) -> leveler_client_protocol::UiMemoryEntry {
+        leveler_client_protocol::UiMemoryEntry {
+            id: id.into(),
+            title: title.into(),
+            body: title.into(),
+            kind: Some(leveler_client_protocol::UiMemoryKind::Note),
+            sensitive: false,
+        }
+    }
+
+    #[test]
+    fn memory_home_names_the_project_and_counts_without_internal_fields() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Home,
+            vec![
+                memory_entry("mem-a", "已记住的甲"),
+                memory_entry("mem-b", "已记住的乙"),
+            ],
+            vec![memory_entry("mem-c", "归档的丙")],
+            (0..12)
+                .map(|i| {
+                    memory_candidate(
+                        &format!("cand-{i}"),
+                        &format!("候选 {i}"),
+                        &format!("候选 {i} 的正文"),
+                    )
+                })
+                .collect(),
+        );
+        let text = render_text(&mut state, 80, 24);
+        assert!(text.contains("demo"), "{text}");
+        assert!(text.contains("已生效 2 条"), "{text}");
+        assert!(text.contains("待确认 12 条"), "{text}");
+        assert!(text.contains("已归档 1 条"), "{text}");
+        assert!(text.contains("查看待确认的记忆"), "{text}");
+        assert!(text.contains("查看已记住的内容"), "{text}");
+        assert!(text.contains("查看已归档的记忆"), "{text}");
+        for internal in [
+            "cand-",
+            "mem-a",
+            "user_explicit",
+            "convention",
+            "memory_dir",
+            "/work/demo/",
+        ] {
+            assert!(
+                !text.contains(internal),
+                "the default surface leaked {internal:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_review_does_not_repeat_a_title_that_is_also_its_body() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Review,
+            vec![],
+            vec![],
+            vec![memory_candidate(
+                "cand-a",
+                "使用 pnpm 而不是 npm",
+                "使用 pnpm 而不是 npm",
+            )],
+        );
+        let text = render_text(&mut state, 48, 20);
+        assert_eq!(
+            text.matches("使用 pnpm 而不是 npm").count(),
+            1,
+            "title and body were both drawn: {text}"
+        );
+        assert!(!text.contains("cand-a"), "{text}");
+        assert!(!text.contains("user_explicit"), "{text}");
+    }
+
+    #[test]
+    fn memory_review_footer_keeps_reject_and_back_visible_at_48_columns() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Review,
+            vec![],
+            vec![],
+            vec![memory_candidate(
+                "cand-a",
+                "提交约定",
+                "每次提交前运行受影响测试。",
+            )],
+        );
+        let text = render_text(&mut state, 48, 20);
+        let hint = text
+            .lines()
+            .find(|line| line.contains("↑↓"))
+            .expect("the review page has a footer hint");
+        assert!(
+            hint.contains("R 拒绝"),
+            "reject must stay discoverable: {hint:?}"
+        );
+        assert!(
+            hint.contains("Esc 返回"),
+            "back must stay discoverable: {hint:?}"
+        );
+        assert!(
+            !hint.contains('…'),
+            "the hint fits instead of being cut: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn memory_detail_wraps_long_chinese_content_instead_of_truncating_it() {
+        let body = "这条约定要求所有改动先写失败测试再写实现并且每次提交前运行受影响的测试范围不运行无关测试";
+        let mut state = memory_state(
+            crate::memory::MemoryView::Detail,
+            vec![],
+            vec![],
+            vec![memory_candidate("cand-a", "测试约定", body)],
+        );
+        let text = render_text(&mut state, 48, 20);
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(body),
+            "the full body must survive wrapping: {text}"
+        );
+        assert_eq!(
+            text.matches("测试约定").count(),
+            1,
+            "the title is drawn once: {text}"
+        );
+        assert!(!text.contains("cand-a"), "{text}");
+    }
+
+    #[test]
+    fn memory_detail_marks_a_high_risk_rule_as_unconfirmed_scope() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Detail,
+            vec![],
+            vec![],
+            vec![memory_candidate("cand-a", "数据库操作", "允许重置数据库")],
+        );
+        let text = render_text(&mut state, 80, 24);
+        let t = crate::i18n::Locale::Zh.text();
+        assert!(text.contains("尚未生效"), "{text}");
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let warning: String = t
+            .memory_scope_warning
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains(&warning),
+            "remembering a reset rule must not look like a delete authorization: {text}"
+        );
+    }
+
+    #[test]
+    fn memory_detail_marks_a_high_risk_rule_in_the_title_too() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Detail,
+            vec![],
+            vec![],
+            vec![memory_candidate(
+                "cand-a",
+                "允许重置数据库",
+                "用户提到过这件事",
+            )],
+        );
+        let text = render_text(&mut state, 80, 24);
+        let t = crate::i18n::Locale::Zh.text();
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let warning: String = t
+            .memory_scope_warning
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains(&warning), "{text}");
+    }
+
+    #[test]
+    fn an_active_high_risk_record_still_states_that_scope_is_unconfirmed() {
+        let mut state = memory_state(
+            crate::memory::MemoryView::Detail,
+            vec![leveler_client_protocol::UiMemoryEntry {
+                id: "mem-a".into(),
+                title: "数据库操作".into(),
+                body: "允许重置数据库".into(),
+                kind: Some(leveler_client_protocol::UiMemoryKind::Note),
+                sensitive: false,
+            }],
+            vec![],
+            vec![],
+        );
+        let text = render_text(&mut state, 80, 24);
+        let t = crate::i18n::Locale::Zh.text();
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let warning: String = t
+            .memory_scope_warning
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains(&warning), "{text}");
+    }
+
+    #[test]
+    fn memory_review_keeps_focus_visible_after_scrolling_to_the_last_record() {
+        let pending: Vec<_> = (0..30)
+            .map(|i| {
+                memory_candidate(
+                    &format!("cand-{i}"),
+                    &format!("候选编号{i:02}"),
+                    &format!("候选编号{i:02}的正文"),
+                )
+            })
+            .collect();
+        let mut state = memory_state(crate::memory::MemoryView::Review, vec![], vec![], pending);
+        state.memory.focus = Some("cand-29".into());
+        let text = render_text(&mut state, 48, 20);
+        assert!(text.contains("候选编号29"), "{text}");
+        let focused = text
+            .lines()
+            .find(|line| line.contains("候选编号29"))
+            .expect("the focused row is on screen");
+        assert!(focused.contains('❯'), "focus marker missing: {focused:?}");
+        assert!(
+            !text.contains("候选编号00"),
+            "the list scrolled to the focus: {text}"
         );
     }
 }

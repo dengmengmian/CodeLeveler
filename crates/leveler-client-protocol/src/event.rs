@@ -828,6 +828,11 @@ pub fn parse_runtime_event(json: &str) -> Result<Option<RuntimeEvent>, serde_jso
 pub struct UiMemoryEntry {
     pub id: String,
     pub title: String,
+    /// The stored content. A title alone cannot answer "what do I actually
+    /// remember?", and the detail page must not guess it. Additive: absent on
+    /// older runtimes (empty string).
+    #[serde(default)]
+    pub body: String,
     /// What this memory is, which decides how it reaches the model. Additive:
     /// absent on older runtimes.
     #[serde(default, skip_serializing_if = "Option::is_none")]

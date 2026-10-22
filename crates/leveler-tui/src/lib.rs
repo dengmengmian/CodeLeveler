@@ -38,6 +38,7 @@ pub mod i18n;
 mod issue;
 mod layout;
 pub mod markdown;
+pub mod memory;
 pub mod motion;
 pub mod multi_agent;
 mod observability;
