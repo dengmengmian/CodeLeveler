@@ -1589,10 +1589,10 @@ const PROJECT_FILE_EXTENSIONS: &[&str] = &[
 /// never touched sends it to the wrong place. Only the latter is rejected.
 fn unmodified_file_reference(body: &str, modified_files: &[String]) -> Option<String> {
     for sentence in sentences(body) {
-        if !is_prescriptive(sentence) {
+        let Some(index) = prescriptive_clause_index(sentence) else {
             continue;
-        }
-        for mention in file_mentions(sentence) {
+        };
+        for mention in file_mentions(&sentence[index..]) {
             if !modified_files.iter().any(|file| same_file(file, &mention)) {
                 return Some(mention);
             }
@@ -1697,20 +1697,26 @@ const PRESCRIPTIVE_MARKERS: &[&str] = &[
     "修改", "改动", "修正", "调整", "改在", "落在", "应改",
 ];
 
-fn is_prescriptive(sentence: &str) -> bool {
+/// Byte position of the first verb that turns the rest of a sentence into
+/// advice about where to act. Mentions before it are the condition the lesson
+/// describes, not a claimed fix location.
+fn prescriptive_clause_index(sentence: &str) -> Option<usize> {
     let lower = sentence.to_ascii_lowercase();
-    PRESCRIPTIVE_MARKERS.iter().any(|marker| {
-        if marker.is_ascii() {
-            ascii_word_present(&lower, marker)
-        } else {
-            sentence.contains(marker)
-        }
-    })
+    PRESCRIPTIVE_MARKERS
+        .iter()
+        .filter_map(|marker| {
+            if marker.is_ascii() {
+                ascii_word_position(&lower, marker)
+            } else {
+                sentence.find(marker)
+            }
+        })
+        .min()
 }
 
 /// Whether an ASCII marker appears as a word stem. `edit` must not match
 /// `editor`, but `edited` and `editing` still describe where to act.
-fn ascii_word_present(haystack: &str, needle: &str) -> bool {
+fn ascii_word_position(haystack: &str, needle: &str) -> Option<usize> {
     const SUFFIXES: &[&str] = &["", "s", "es", "d", "ed", "ing"];
     let bytes = haystack.as_bytes();
     let mut start = 0;
@@ -1728,7 +1734,7 @@ fn ascii_word_present(haystack: &str, needle: &str) -> bool {
                         .is_some_and(|character| character.is_ascii_alphanumeric())
             });
             if after_ok {
-                return true;
+                return Some(begin);
             }
         }
         start = end;
@@ -1736,7 +1742,7 @@ fn ascii_word_present(haystack: &str, needle: &str) -> bool {
             break;
         }
     }
-    false
+    None
 }
 
 fn same_file(changed: &str, mention: &str) -> bool {
@@ -3678,6 +3684,29 @@ mod tests {
             "the fix action must be in the evidence: {:?}",
             record.evidence
         );
+    }
+
+    /// A command named in the condition is evidence, not a claimed fix
+    /// location. Only the prescriptive clause names where to act.
+    #[test]
+    fn a_command_in_the_condition_is_not_a_fix_location() {
+        let events = vec![
+            started("a1", "run_command", run_command("./verify.sh", &[]), 2),
+            finished("a1", "run_command", true, Some(1), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 4),
+            finished("a2", "apply_patch", false, None, Some("--- a/engine.config")),
+            started("a3", "run_command", run_command("./verify.sh", &[]), 5),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["engine.config"]),
+        ];
+        let pack = pack_from(&events, "修复 engine profile").expect("a signal exists");
+        let lesson = candidate(
+            ExperienceCategory::Fix,
+            &["failure-2-a1", "resolution-5-a3"],
+            "When ./verify.sh exits non-zero with `error: engine profile rejected`, edit engine.config rather than the wrapper.",
+        );
+        validate_experience_candidate(&lesson, &pack)
+            .expect("the verification command is not a claimed fix location");
     }
 
     /// A quoted command is evidence, not a fix location: `./verify.sh status`
