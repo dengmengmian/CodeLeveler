@@ -2598,3 +2598,14 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 /* Reference footer offset (AssistantMarkdown.actions): 16px below the body. */
 .message.assistant .message-actions { margin-top: 16px; }
 .user-extras:empty { display: none; }
+
+/* Terminal failure detail: a readable summary in the status bar, raw runtime
+   text available on demand instead of stretching the conversation. */
+.terminal-error { flex: none; padding: 4px 12px 8px; background: var(--bg-layer-2); color: var(--text-tertiary); font-family: var(--font-text); font-size: 11px; line-height: 16px; }
+.terminal-error[hidden] { display: none; }
+.terminal-error summary { cursor: pointer; width: fit-content; list-style: none; }
+.terminal-error summary::-webkit-details-marker { display: none; }
+.terminal-error summary:hover { color: var(--text-secondary); }
+.terminal-error-text { max-height: 96px; margin: 6px 0; padding: 8px 10px; overflow: auto; border-radius: 8px; background: var(--bg-base); color: var(--text-secondary); font-family: var(--font-code); font-size: 11px; line-height: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.terminal-error-copy { padding: 2px 8px; border-radius: 6px; background: var(--hover); color: var(--text-secondary); font-size: 11px; line-height: 16px; }
+.terminal-error-copy:hover { background: var(--hover-solid); color: var(--text-primary); }

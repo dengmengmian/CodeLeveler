@@ -71,7 +71,40 @@ try {
   assert.ok(['exited', 'killed'].includes(observed.status), JSON.stringify(observed));
   assert.throws(()=>process.kill(childPid,0),{code:'ESRCH'});
   assert.throws(()=>process.kill(observed.pid,0),{code:'ESRCH'});
+  // A stale Execution Host (one started before terminal.pty existed) refuses
+  // creation. The tab must explain that in operator terms, keep the runtime
+  // text copyable, and close without asking the host to stop a task it never
+  // admitted.
+  await app.evaluate(({ ipcMain }) => {
+    globalThis.__realTerminalCreate = ipcMain._invokeHandlers.get('desktop:terminal-create');
+    globalThis.__realTerminalClose = ipcMain._invokeHandlers.get('desktop:terminal-close');
+    globalThis.__terminalCloseCalls = 0;
+    ipcMain.removeHandler('desktop:terminal-create');
+    ipcMain.removeHandler('desktop:terminal-close');
+    ipcMain.handle('desktop:terminal-create', () => { throw new Error('runtime error: Unsupported: Execution Host missing terminal.pty; existing services preserved'); });
+    ipcMain.handle('desktop:terminal-close', (...args) => { globalThis.__terminalCloseCalls += 1; return globalThis.__realTerminalClose(...args); });
+  });
+  await page.getByRole('button', { name: '新建终端' }).click();
+  await page.waitForFunction(() => document.querySelector('.terminal-status')?.textContent.includes('不支持终端'), null, { timeout: 10000 });
+  const staleSummary = await page.locator('.terminal-status').innerText();
+  assert.match(staleSummary, /当前执行宿主不支持终端/);
+  await page.locator('.terminal-error summary').click();
+  const staleRaw = await page.locator('.terminal-error-text').innerText();
+  assert.match(staleRaw, /missing terminal\.pty/);
+  await page.locator('.terminal-error-copy').click();
+  await page.waitForTimeout(150);
+  assert.equal(await app.evaluate(({ clipboard }) => clipboard.readText()), staleRaw);
+  await page.locator('.pane-tab[aria-selected="true"] .tab-close').click();
+  await page.waitForFunction(() => !document.querySelector('.terminal-view'), null, { timeout: 5000 });
+  assert.equal(await app.evaluate(() => globalThis.__terminalCloseCalls), 0, 'a never-admitted terminal must not be stopped');
+  await app.evaluate(({ ipcMain }) => {
+    ipcMain.removeHandler('desktop:terminal-create');
+    ipcMain.removeHandler('desktop:terminal-close');
+    ipcMain.handle('desktop:terminal-create', globalThis.__realTerminalCreate);
+    ipcMain.handle('desktop:terminal-close', globalThis.__realTerminalClose);
+  });
   console.log('Real terminal: shell output, cwd, isatty, stty resize, hidden/reopen identity, Ctrl+C, shell/job process disappearance passed.');
+  console.log('Stale host refusal: friendly summary, copyable raw detail, local close without a stop call passed.');
 } finally {
   if(app && terminalParams) { const page=await app.firstWindow().catch(()=>null); await page?.evaluate(params=>window.desktop.closeTerminal(params),terminalParams).catch(()=>{}); }
   if (app) { await app.evaluate(({ app }) => app.exit(0)).catch(() => {}); await app.close().catch(() => {}); }
