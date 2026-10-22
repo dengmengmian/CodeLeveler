@@ -99,7 +99,10 @@ try {
   const planSession = await selectedId();
   await page.waitForSelector('.plan-card-row', { timeout: 30000 });
   await page.waitForSelector('.todo-dock', { timeout: 10000 });
-  assert.match(await page.locator('.todo-dock').innerText(), /任务 \d\/3/);
+  const todoText = await page.locator('.todo-dock').innerText();
+  assert.match(todoText, /\d+ 已完成/);
+  assert.match(todoText, /\d+ 进行中/);
+  assert.doesNotMatch(todoText, /任务 \d+\/\d+/);
   cases.plan_dock_on_event = true;
   await page.locator('#stop').click();
   await page.waitForFunction(() => document.querySelector('#conversation-status').textContent === '已中断');

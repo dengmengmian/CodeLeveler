@@ -3,7 +3,7 @@ import { renderMarkdown } from './markdown.mjs';
 import {
   modelLabel, workspaceLabel, toolLabel, toolTarget, browserActivity, sourceErrorSummary,
   relativeActivity, permissionLabel, recentWorkspaces, renameCommand, messageKind,
-  historyQuestions, planStepLabel, browserChrome, browserSurfaceBounds, workspaceTaskGroups,
+  historyQuestions, planStepLabel, planProgressLabel, browserChrome, browserSurfaceBounds, workspaceTaskGroups,
   attachmentErrorPresentation, slashIntent, commandCandidates,
   contractToolStatus, failureReason, displayPreview,
   confirmedDiffOf, diffCounts, messageTime, conversationItems, executionStatusLabel, confirmedChangeFiles,
@@ -71,6 +71,8 @@ let paintPending = false;
 let attachmentEarly = null;
 let uploadingKey = null;
 let titleEditing = false;
+let todoDockOpen = false;
+let todoDockSessionId = null;
 let lastEscapeAt = 0;
 let titleComposing = false;
 let findMatches = [];
@@ -1670,21 +1672,32 @@ function renderComposerDocks() {
     }
     host.append(dock);
   }
-  // The dock is current work. A completed or interrupted plan stays readable
-  // in the plan view, but must not look like an active checklist.
-  const planState = current.plan?.state ?? 'active';
-  const steps = planState === 'active' ? (current.plan?.steps ?? []) : [];
+  // Reference task panel: the list stays readable in every plan state, and the
+  // header names per-status counts instead of a bare ratio.
+  const steps = current.plan?.steps ?? [];
   if (steps.length) {
-    const done = steps.filter(step => step.status === 'done').length;
+    if (todoDockSessionId !== current.session.id) { todoDockSessionId = current.session.id; todoDockOpen = false; }
     const dock = el('details', 'composer-dock todo-dock');
-    const summary = el('summary', 'composer-dock-head');
-    summary.append(el('span', undefined, `任务 ${done}/${steps.length}`), el('span', 'composer-dock-meta', steps.find(step => step.status === 'running')?.description ?? ''));
+    const summary = el('summary', 'composer-dock-head todo-head');
+    const chevron = el('span', 'todo-chevron');
+    chevron.append(iconNode(todoDockOpen ? 'chevronDown' : 'chevronUp', { size: 14 }));
+    summary.append(iconNode('list', { size: 16 }), el('span', 'todo-title', '任务'),
+      el('span', 'todo-progress', planProgressLabel(steps)), chevron);
     dock.append(summary);
     for (const step of steps) {
-      const row = el('div', 'composer-dock-row');
-      row.append(el('span', `composer-step-mark ${step.status}`, step.status === 'done' ? '✓' : step.status === 'running' ? '●' : '○'), el('span', 'composer-dock-text', step.description));
+      const row = el('div', 'composer-dock-row todo-row');
+      const dot = el('span', 'composer-step-dot');
+      dot.dataset.state = step.status === 'done' ? 'done'
+        : step.status === 'running' ? 'ongoing'
+          : step.status === 'failed' ? 'error' : 'idle';
+      row.append(dot, el('span', 'composer-dock-text', step.description));
       dock.append(row);
     }
+    dock.open = todoDockOpen;
+    dock.addEventListener('toggle', () => {
+      todoDockOpen = dock.open;
+      chevron.replaceChildren(iconNode(todoDockOpen ? 'chevronDown' : 'chevronUp', { size: 14 }));
+    });
     host.append(dock);
   }
 }

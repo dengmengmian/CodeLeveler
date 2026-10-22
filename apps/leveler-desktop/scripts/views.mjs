@@ -22,7 +22,18 @@ app=await electron.launch({args:[root,'--user-data-dir='+path.join(temporary,'pr
 // The composer dock is the persistent plan-progress surface and must refresh
 // from plan_updated itself, before any work message commits.
 await page.waitForSelector('.todo-dock', { timeout: 10000 });
-assert.match(await page.locator('.todo-dock').innerText(), /任务 \d\/3/);
+const todoText = await page.locator('.todo-dock').innerText();
+  assert.match(todoText, /\d+ 已完成/);
+  assert.match(todoText, /\d+ 进行中/);
+  assert.doesNotMatch(todoText, /任务 \d+\/\d+/);
+const dockGeometry = await page.evaluate(() => {
+  const dock = document.querySelector('.todo-dock').getBoundingClientRect();
+  const card = document.querySelector('#composer-card').getBoundingClientRect();
+  return { dockWidth: Math.round(dock.width), cardWidth: Math.round(card.width), dockLeft: Math.round(dock.left), cardLeft: Math.round(card.left) };
+});
+assert.equal(dockGeometry.cardWidth - dockGeometry.dockWidth, 32, `dock is not the card minus its insets: ${JSON.stringify(dockGeometry)}`);
+assert.equal(dockGeometry.dockLeft - dockGeometry.cardLeft, 16, `dock is not centered on the card: ${JSON.stringify(dockGeometry)}`);
+evidence.plan_dock_geometry = dockGeometry;
 evidence.plan_dock_visible = true;
 await page.locator('.plan-card-row').first().click();await page.waitForFunction(()=>document.querySelector('.plan-view')?.textContent.includes('Inspect temporary Git workspace'));assert.match(await page.locator('.plan-view').textContent(),/已完成|进行中|待执行/);await capture('views-plan');finishPlan();await page.waitForFunction(()=>document.querySelector('.message.assistant .markdown')?.textContent.includes('VIEWS_PLAN_COMPLETE')&&['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent),null,{timeout:60000});
 const diff=await requestDiff();assert.equal(diff.type,'diff_updated');assert.equal(diff.diff.files.length,2);assert.ok(diff.diff.files.some(f=>f.path==='note.txt'&&f.added===2&&f.removed===2));assert.ok(diff.diff.files.some(f=>f.path==='long.txt'&&f.patch.length>60000));await capture('views-overview');await page.locator('.review-file').click();await page.locator('.menu .menu-item').filter({hasText:'long.txt'}).first().click();await page.waitForFunction(()=>document.querySelector('.review-body')?.textContent.includes('updated-0'));const patch=page.locator('.review-body');const patchLength=(await patch.textContent()).length;assert.ok(patchLength>60000);await capture('views-changes');evidence.real_git_diff={files:2,note_added:2,note_removed:2,long_patch_chars:patchLength};
