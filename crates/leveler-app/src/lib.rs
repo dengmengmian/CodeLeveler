@@ -1846,7 +1846,6 @@ impl Application {
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
     }
-
 }
 
 /// Resolve the configured search backend.
