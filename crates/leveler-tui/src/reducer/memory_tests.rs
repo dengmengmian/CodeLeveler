@@ -100,6 +100,11 @@ fn entry(id: &str, title: &str) -> UiMemoryEntry {
         body: title.into(),
         kind: None,
         sensitive: false,
+        status: Some("active".into()),
+        authority: Some("user_explicit".into()),
+        revision: Some(1),
+        updated_at: Some("2026-01-01T00:00:00Z".into()),
+        pinned: false,
     }
 }
 
@@ -686,4 +691,326 @@ fn notice_state_survives_a_restart_round_trip() {
         crate::memory::load_notified(&path).is_empty(),
         "a corrupt notice file costs one extra notice, it never blocks the queue"
     );
+}
+
+// ----- listing filters ----------------------------------------------------
+
+fn entry_in(
+    scope: leveler_client_protocol::UiMemoryScope,
+    id: &str,
+    title: &str,
+    kind: leveler_client_protocol::UiMemoryKind,
+) -> UiMemoryEntry {
+    UiMemoryEntry {
+        id: id.into(),
+        scope,
+        title: title.into(),
+        body: format!("{title} 的正文"),
+        kind: Some(kind),
+        sensitive: false,
+        status: Some("active".into()),
+        authority: Some("user_explicit".into()),
+        revision: Some(2),
+        updated_at: Some("2026-01-02T03:04:05Z".into()),
+        pinned: false,
+    }
+}
+
+/// Open `/memory` on the active list with three rows across scopes and lanes.
+fn open_active(s: &mut AppState) {
+    let effects = press(s, "/memory");
+    // Home's first entry is the active list; the page's own listing query is
+    // the one that answers with these rows.
+    let query = list_query(&effects).expect("/memory must ask for the listing");
+    key(s, KeyCode::Enter);
+    let entries = vec![
+        entry_in(
+            leveler_client_protocol::UiMemoryScope::Project,
+            "mem-build",
+            "构建使用 cargo",
+            leveler_client_protocol::UiMemoryKind::Preference,
+        ),
+        entry_in(
+            leveler_client_protocol::UiMemoryScope::Global,
+            "mem-deploy",
+            "发布使用 pnpm",
+            leveler_client_protocol::UiMemoryKind::Decision,
+        ),
+        entry_in(
+            leveler_client_protocol::UiMemoryScope::Project,
+            "mem-exp",
+            "cargo 构建失败先清 target",
+            leveler_client_protocol::UiMemoryKind::Experience,
+        ),
+    ];
+    reduce(
+        s,
+        Action::Runtime(list(Some(query), entries, vec![], vec![])),
+    );
+    assert_eq!(s.memory.view, MemoryView::Active);
+}
+
+#[test]
+fn a_query_narrows_the_listing_and_keeps_what_it_hides_visible() {
+    let mut s = state();
+    open_active(&mut s);
+    assert_eq!(s.memory.visible_active().len(), 3);
+
+    key(&mut s, KeyCode::Char('/'));
+    for character in "pnpm".chars() {
+        key(&mut s, KeyCode::Char(character));
+    }
+    key(&mut s, KeyCode::Enter);
+
+    let visible = s.memory.visible_active();
+    assert_eq!(visible.len(), 1, "{visible:?}");
+    assert_eq!(visible[0].id, "mem-deploy");
+    assert!(
+        s.memory.filter.is_narrowing(),
+        "the page must be able to say that it is hiding rows"
+    );
+    // The runtime's listing is untouched: filtering is a view.
+    assert_eq!(s.memory.active.len(), 3);
+
+    key(&mut s, KeyCode::Char('x'));
+    assert_eq!(s.memory.visible_active().len(), 3);
+    assert!(s.memory.filter.query.is_empty());
+}
+
+#[test]
+fn scope_and_kind_filters_select_rows_without_touching_the_store() {
+    let mut s = state();
+    open_active(&mut s);
+
+    key(&mut s, KeyCode::Char('s'));
+    assert_eq!(
+        s.memory.filter.scope,
+        Some(leveler_client_protocol::UiMemoryScope::Global)
+    );
+    assert_eq!(s.memory.visible_active().len(), 1);
+
+    key(&mut s, KeyCode::Char('s'));
+    assert_eq!(
+        s.memory.filter.scope,
+        Some(leveler_client_protocol::UiMemoryScope::Project)
+    );
+    assert_eq!(s.memory.visible_active().len(), 2);
+
+    key(&mut s, KeyCode::Char('t'));
+    assert_eq!(s.memory.filter.kind, crate::memory::KindFilter::UserFact);
+    assert_eq!(s.memory.visible_active().len(), 1);
+    key(&mut s, KeyCode::Char('t'));
+    assert_eq!(s.memory.filter.kind, crate::memory::KindFilter::Experience);
+    assert_eq!(s.memory.visible_active().len(), 1);
+    assert_eq!(s.memory.visible_active()[0].id, "mem-exp");
+    assert_eq!(s.memory.active.len(), 3);
+}
+
+#[test]
+fn typing_a_query_does_not_trigger_page_actions() {
+    let mut s = state();
+    open_active(&mut s);
+    key(&mut s, KeyCode::Char('/'));
+    let effects = key(&mut s, KeyCode::Char('a'));
+    assert!(
+        effects.is_empty(),
+        "a letter typed into the query line must not become a page action: {effects:?}"
+    );
+    assert_eq!(s.memory.filter.query, "a");
+}
+
+#[test]
+fn the_detail_page_offers_the_record_text_and_its_identity() {
+    let mut s = state();
+    open_active(&mut s);
+    assert!(key(&mut s, KeyCode::Enter).is_empty());
+    assert_eq!(s.memory.view, MemoryView::Detail);
+
+    let copy = key(&mut s, KeyCode::Char('y'));
+    assert_eq!(
+        copy,
+        vec![Effect::CopyText {
+            text: "构建使用 cargo 的正文".into(),
+            what: crate::action::CopyWhat::Body,
+        }],
+        "the body must be copied exactly as the store returned it"
+    );
+
+    let reference = key(&mut s, KeyCode::Char('Y'));
+    assert_eq!(
+        reference,
+        vec![Effect::CopyText {
+            text: "project:mem-build".into(),
+            what: crate::action::CopyWhat::Reference,
+        }],
+        "a copied id must name its scope; ids are only unique inside one store"
+    );
+}
+
+// ----- detail actions -----------------------------------------------------
+
+fn sent_commands(effects: &[Effect]) -> Vec<&ClientCommand> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send(command) => Some(command),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn pinning_sends_one_command_and_refreshes_the_listing() {
+    let mut s = state();
+    open_active(&mut s);
+    key(&mut s, KeyCode::Enter);
+    assert_eq!(s.memory.view, MemoryView::Detail);
+
+    let effects = key(&mut s, KeyCode::Char('p'));
+    let commands = sent_commands(&effects);
+    assert!(
+        matches!(
+            commands.first(),
+            Some(ClientCommand::SetMemoryPin { pinned: true, id, .. }) if id == "mem-build"
+        ),
+        "{commands:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, ClientCommand::ListMemory { .. })),
+        "the page must re-read the store rather than assume the write landed: {commands:?}"
+    );
+}
+
+#[test]
+fn forgetting_needs_two_presses_and_never_guesses_a_revision() {
+    let mut s = state();
+    open_active(&mut s);
+    key(&mut s, KeyCode::Enter);
+
+    let armed = key(&mut s, KeyCode::Char('f'));
+    assert!(
+        armed.is_empty(),
+        "one keystroke must not archive a memory: {armed:?}"
+    );
+    assert!(s.memory.confirm.is_some());
+
+    let confirmed = key(&mut s, KeyCode::Char('f'));
+    let commands = sent_commands(&confirmed);
+    assert!(
+        matches!(
+            commands.first(),
+            Some(ClientCommand::ForgetMemory { id, .. }) if id == "mem-build"
+        ),
+        "{commands:?}"
+    );
+    assert!(s.memory.confirm.is_none());
+
+    // Deprecate carries the revision the user was looking at.
+    let mut s = state();
+    open_active(&mut s);
+    key(&mut s, KeyCode::Enter);
+    key(&mut s, KeyCode::Char('d'));
+    let confirmed = key(&mut s, KeyCode::Char('d'));
+    let commands = sent_commands(&confirmed);
+    assert!(
+        matches!(
+            commands.first(),
+            Some(ClientCommand::DeprecateMemory { id, revision: 2, .. }) if id == "mem-build"
+        ),
+        "{commands:?}"
+    );
+}
+
+#[test]
+fn a_record_without_a_revision_cannot_be_deprecated() {
+    let mut s = state();
+    let effects = press(&mut s, "/memory");
+    let query = list_query(&effects).expect("listing query");
+    key(&mut s, KeyCode::Enter);
+    let mut entry = entry_in(
+        leveler_client_protocol::UiMemoryScope::Project,
+        "mem-old-runtime",
+        "旧运行时返回的记忆",
+        leveler_client_protocol::UiMemoryKind::Note,
+    );
+    entry.revision = None;
+    reduce(
+        &mut s,
+        Action::Runtime(list(Some(query), vec![entry], vec![], vec![])),
+    );
+    key(&mut s, KeyCode::Enter);
+    key(&mut s, KeyCode::Char('d'));
+    let confirmed = key(&mut s, KeyCode::Char('d'));
+    assert!(
+        confirmed.is_empty(),
+        "a missing revision is a refusal, not a guessed overwrite: {confirmed:?}"
+    );
+    assert_eq!(s.memory.action_error, Some("revision"));
+}
+
+#[test]
+fn any_other_key_disarms_a_pending_confirmation() {
+    let mut s = state();
+    open_active(&mut s);
+    key(&mut s, KeyCode::Enter);
+    key(&mut s, KeyCode::Char('f'));
+    key(&mut s, KeyCode::Char('z'));
+    assert!(s.memory.confirm.is_none());
+
+    // Going back to the list also drops an armed action: nothing may stay
+    // armed while the user is looking at something else.
+    key(&mut s, KeyCode::Char('f'));
+    assert!(s.memory.confirm.is_some());
+    key(&mut s, KeyCode::Esc);
+    assert!(s.memory.confirm.is_none());
+    assert_eq!(s.memory.view, MemoryView::Active);
+}
+
+// ----- recall references --------------------------------------------------
+
+#[test]
+fn a_recall_names_the_records_the_turn_used_and_drops_forgotten_ones() {
+    let mut s = state();
+    open_active(&mut s);
+    key(&mut s, KeyCode::Esc); // back to home
+    assert_eq!(s.memory.view, MemoryView::Home);
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryRecalled {
+            count: 2,
+            ids: vec!["mem-build".into(), "mem-gone".into()],
+            experience_count: 0,
+            injected: vec![
+                leveler_client_protocol::UiMemoryReference {
+                    id: "mem-build".into(),
+                    scope: leveler_client_protocol::UiMemoryScope::Project,
+                    title: Some("构建使用 cargo".into()),
+                    mode: Some("standing".into()),
+                },
+                leveler_client_protocol::UiMemoryReference {
+                    id: "mem-gone".into(),
+                    scope: leveler_client_protocol::UiMemoryScope::Project,
+                    title: Some("已被遗忘的旧约定".into()),
+                    mode: Some("candidate".into()),
+                },
+            ],
+        }),
+    );
+
+    let (rows, gone) = s.memory.recalled_rows();
+    assert_eq!(rows.len(), 1, "only records still in the listing are shown");
+    assert_eq!(rows[0].1.id, "mem-build");
+    assert_eq!(
+        gone, 1,
+        "a forgotten record is counted, never re-shown by title"
+    );
+    assert_eq!(s.last_memory_recall, Some(2));
+
+    // The transcript note keeps its count-only shape: ids and titles are not
+    // copied into a durable line.
+    let text = format!("{:?}", s.transcript.items());
+    assert!(!text.contains("已被遗忘的旧约定"), "{text}");
 }

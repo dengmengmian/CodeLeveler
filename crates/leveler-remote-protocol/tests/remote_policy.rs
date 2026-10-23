@@ -240,6 +240,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "forget_memory",
             ClientCommand::ForgetMemory {
                 session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 id: "m1".to_string(),
             },
             false,
@@ -248,6 +249,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "accept_memory",
             ClientCommand::AcceptMemory {
                 session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 id: "m1".to_string(),
             },
             false,
@@ -258,6 +260,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "reject_memory",
             ClientCommand::RejectMemory {
                 session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 id: "cand-1".to_string(),
             },
             false,
@@ -266,6 +269,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "remember_memory",
             ClientCommand::RememberMemory {
                 session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 body: "keep it compact".to_string(),
                 kind: None,
             },

@@ -5556,6 +5556,7 @@ fn slash_memory_status_is_a_query_and_renders_extraction_health() {
             count: 0,
             ids: vec![],
             experience_count: 0,
+            injected: Vec::new(),
         }),
     );
     assert_eq!(
@@ -5821,6 +5822,11 @@ fn memory_list_event_pushes_multiline_transcript_note() {
                 body: "prefer workspace write".into(),
                 kind: None,
                 sensitive: false,
+                status: None,
+                authority: None,
+                revision: None,
+                updated_at: None,
+                pinned: false,
             }],
             archived: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "old-fact".into(),
@@ -5829,6 +5835,11 @@ fn memory_list_event_pushes_multiline_transcript_note() {
                 body: "old".into(),
                 kind: None,
                 sensitive: false,
+                status: None,
+                authority: None,
+                revision: None,
+                updated_at: None,
+                pinned: false,
             }],
             pending: vec![],
         }),
@@ -5866,6 +5877,7 @@ fn memory_recalled_event_pushes_an_auditable_note_without_a_toast() {
             count: 2,
             ids: vec!["a".into(), "b".into()],
             experience_count: 1,
+            injected: Vec::new(),
         }),
     );
     let note = s
@@ -5920,6 +5932,7 @@ fn memory_recalled_zero_is_silent() {
             count: 0,
             ids: vec![],
             experience_count: 0,
+            injected: Vec::new(),
         }),
     );
     assert!(
@@ -8959,6 +8972,11 @@ fn the_listing_marks_a_sensitive_entry_as_withheld() {
                 body: "deploy token".into(),
                 kind: Some(leveler_client_protocol::UiMemoryKind::Note),
                 sensitive: true,
+                status: None,
+                authority: None,
+                revision: None,
+                updated_at: None,
+                pinned: false,
             }],
             archived: vec![],
             pending: vec![],

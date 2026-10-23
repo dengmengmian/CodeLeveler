@@ -35,5 +35,6 @@ pub use service::{
 pub use store::{
     AdmitRequest, DiagnosticIssue, DiagnosticKind, DiagnosticReport, DiagnosticSeverity,
     EffectiveRecord, ForgetOutcome, ListQuery, MarkdownStore, MemorySummary, NewRecord, ReadRecord,
-    Reason, RecordPatch, ReviewDecision, StoreError, TrustSummary,
+    Reason, RecordPatch, ReviewDecision, StoreError, StoreLifecycleMetrics, StoreLifecycleSnapshot,
+    TrustSummary, lifecycle_metrics,
 };

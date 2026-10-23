@@ -481,16 +481,23 @@ impl MemoryContextBuilder {
                 .standing_candidates(scope, STANDING_MAX_ENTRIES)
             {
                 Ok(rows) => {
-                    for row in rows {
-                        // The index is derived; the body and trust still come
-                        // from Markdown. A row that no longer reads as trusted
-                        // and current is not a standing constraint.
-                        match self
-                            .service
-                            .read_injectable(&v2::Actor::External, scope, &row.id)
-                        {
-                            Ok(view) => all.push(Selected::from_standing(scope, view)),
-                            Err(_) => {}
+                    // The index is derived; the body and trust still come from
+                    // Markdown. A row that no longer reads as trusted and
+                    // current is not a standing constraint. One store read
+                    // covers the whole row set.
+                    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                    match self
+                        .service
+                        .read_many_injectable(&v2::Actor::External, scope, &ids)
+                    {
+                        Ok(views) => {
+                            for view in views.into_iter().flatten() {
+                                all.push(Selected::from_standing(scope, view));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "standing selection could not be read");
+                            degraded.get_or_insert_with(|| "recall_unavailable".into());
                         }
                     }
                 }

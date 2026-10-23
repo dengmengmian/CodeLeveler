@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use leveler_client_protocol::{
     ClientCommand, CommandId, NotificationLevel, SessionId, UiMemoryCandidate, UiMemoryEntry,
-    UiMemoryScope,
+    UiMemoryKind, UiMemoryReference, UiMemoryScope,
 };
 
 /// A row's identity on this page: `(scope, id)`. The same id in two scopes is
@@ -50,7 +50,7 @@ pub fn scope_label(scope: UiMemoryScope, text: &crate::i18n::UiText) -> &'static
     }
 }
 
-use crate::action::Effect;
+use crate::action::{CopyWhat, Effect};
 use crate::screen::Screen;
 use crate::state::{AppState, Notification};
 
@@ -65,12 +65,91 @@ pub enum MemoryView {
     Archived,
 }
 
+/// Which records a listing shows, by lane.
+///
+/// A record with no kind is a legacy/user fact row: the same rule the runtime
+/// uses for lanes, so the page cannot disagree with retrieval about what
+/// counts as experience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KindFilter {
+    #[default]
+    All,
+    UserFact,
+    Experience,
+}
+
+impl KindFilter {
+    fn allows(self, kind: Option<UiMemoryKind>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Experience => kind == Some(UiMemoryKind::Experience),
+            Self::UserFact => kind != Some(UiMemoryKind::Experience),
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::UserFact,
+            Self::UserFact => Self::Experience,
+            Self::Experience => Self::All,
+        }
+    }
+}
+
+/// A view over the last authoritative listing.
+///
+/// The runtime's answer stays the whole truth: filtering only decides which of
+/// those rows the page paints. Nothing here can hide a record from the store,
+/// from recall, or from a refresh.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFilter {
+    pub query: String,
+    pub scope: Option<UiMemoryScope>,
+    pub kind: KindFilter,
+}
+
+impl MemoryFilter {
+    /// Case-insensitive substring over title and body. Substring, not
+    /// tokenization: the page must find what the person can see.
+    pub fn matches(&self, entry: &UiMemoryEntry) -> bool {
+        if let Some(scope) = self.scope
+            && entry.scope != scope
+        {
+            return false;
+        }
+        if !self.kind.allows(entry.kind) {
+            return false;
+        }
+        let query = self.query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        entry.title.to_lowercase().contains(&query) || entry.body.to_lowercase().contains(&query)
+    }
+
+    /// True when any filter is narrowing the list.
+    pub fn is_narrowing(&self) -> bool {
+        !self.query.trim().is_empty() || self.scope.is_some() || self.kind != KindFilter::All
+    }
+}
+
 /// The two consent decisions the review pane can send. Both are lifecycle
 /// operations on the runtime's store, never local edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryOp {
     Accept,
     Reject,
+}
+
+/// A lifecycle action on one active record, offered from the detail page.
+///
+/// Every variant goes through the runtime's memory service; the page never
+/// edits a store file and never decides that a record is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryAction {
+    Pin(bool),
+    Deprecate,
+    Forget,
 }
 
 /// Per-item outcome of one batch. The page reports every requested record;
@@ -127,6 +206,21 @@ pub struct MemoryPage {
     pub notice_pending: Option<usize>,
     /// Set when `notified` changed and the boot layer should persist it.
     pub notice_dirty: bool,
+    /// Which rows of the last authoritative listing this page shows.
+    pub filter: MemoryFilter,
+    /// True while keystrokes go to the filter query instead of the page.
+    pub filter_edit: bool,
+    /// An action the user armed with its first keypress. The second press of
+    /// the same key performs it; anything else disarms. Destructive actions are
+    /// never one keystroke away from happening.
+    pub confirm: Option<(MemoryAction, String)>,
+    /// Why the last action could not even be requested. `revision` means the
+    /// runtime reported no revision for the record.
+    pub action_error: Option<&'static str>,
+    /// The records the most recent turn's request carried, as the runtime
+    /// reported them. Titles here are only a fallback; the listing is the
+    /// authority for what a record is *now*.
+    pub last_recalled: Vec<UiMemoryReference>,
 }
 
 impl MemoryPage {
@@ -136,6 +230,7 @@ impl MemoryPage {
         state.memory.view = view;
         state.memory.detail_return = MemoryView::Home;
         state.memory.batch = None;
+        state.memory.confirm = None;
         state.screen_scroll = 0;
         if view != MemoryView::Home {
             state.memory.sync_focus();
@@ -393,6 +488,104 @@ impl MemoryPage {
         self.selected.clear();
     }
 
+    /// Adopt the runtime's report of what this turn's request carried.
+    pub fn set_recalled(&mut self, injected: Vec<UiMemoryReference>) {
+        self.last_recalled = injected;
+    }
+
+    /// The recalled records that are still current, resolved against the
+    /// authoritative listing, plus how many are no longer there.
+    ///
+    /// A record the user has since forgotten must not keep showing its title
+    /// here: the home page is allowed to say "no longer available", never to
+    /// keep the text alive.
+    pub fn recalled_rows(&self) -> (Vec<(&UiMemoryReference, &UiMemoryEntry)>, usize) {
+        let mut rows = Vec::new();
+        let mut gone = 0;
+        for reference in &self.last_recalled {
+            match self
+                .active
+                .iter()
+                .find(|entry| entry.id == reference.id && entry.scope == reference.scope)
+            {
+                Some(entry) => rows.push((reference, entry)),
+                None => gone += 1,
+            }
+        }
+        (rows, gone)
+    }
+
+    /// The active rows the current filter shows, in the runtime's order.
+    pub fn visible_active(&self) -> Vec<&UiMemoryEntry> {
+        self.active
+            .iter()
+            .filter(|entry| self.filter.matches(entry))
+            .collect()
+    }
+
+    /// The archived rows the current filter shows.
+    pub fn visible_archived(&self) -> Vec<&UiMemoryEntry> {
+        self.archived
+            .iter()
+            .filter(|entry| self.filter.matches(entry))
+            .collect()
+    }
+
+    /// Start typing a filter query. Keystrokes stop moving the list until the
+    /// query is committed.
+    pub fn begin_query(&mut self) {
+        if matches!(self.view, MemoryView::Active | MemoryView::Archived) {
+            self.filter_edit = true;
+        }
+    }
+
+    pub fn push_query(&mut self, character: char) {
+        if !self.filter_edit {
+            return;
+        }
+        self.filter.query.push(character);
+        self.sync_focus();
+    }
+
+    pub fn pop_query(&mut self) {
+        if !self.filter_edit {
+            return;
+        }
+        self.filter.query.pop();
+        self.sync_focus();
+    }
+
+    /// Stop editing. The typed query stays in force until it is cleared; a
+    /// filter the user cannot see would be a trap.
+    pub fn end_query(&mut self) {
+        self.filter_edit = false;
+        self.sync_focus();
+    }
+
+    /// Drop the query but keep the scope and kind filters.
+    pub fn clear_query(&mut self) {
+        self.filter.query.clear();
+        self.filter_edit = false;
+        self.sync_focus();
+    }
+
+    /// Cycle the scope filter: every scope, then each configured one.
+    pub fn cycle_scope(&mut self) {
+        self.filter.scope = match self.filter.scope {
+            None => Some(UiMemoryScope::Global),
+            Some(UiMemoryScope::Global) => Some(UiMemoryScope::Project),
+            Some(UiMemoryScope::Project) => Some(UiMemoryScope::Local),
+            Some(UiMemoryScope::Local) => None,
+        };
+        self.sync_focus();
+    }
+
+    /// Cycle the lane filter.
+    pub fn cycle_kind(&mut self) {
+        self.filter.kind = self.filter.kind.next();
+        self.sync_focus();
+    }
+
     /// Move the focus by one row within the current pane. Home moves the menu.
     pub fn move_focus(&mut self, delta: isize) {
         match self.view {
@@ -404,11 +597,15 @@ impl MemoryPage {
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
             MemoryView::Active => {
-                let ids: Vec<String> = self.active.iter().map(entry_key).collect();
+                let ids: Vec<String> = self.visible_active().iter().map(|e| entry_key(e)).collect();
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
             MemoryView::Archived => {
-                let ids: Vec<String> = self.archived.iter().map(entry_key).collect();
+                let ids: Vec<String> = self
+                    .visible_archived()
+                    .iter()
+                    .map(|e| entry_key(e))
+                    .collect();
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
             MemoryView::Detail => {}
@@ -427,8 +624,8 @@ impl MemoryPage {
         }
         let exists = match self.view {
             MemoryView::Review => self.pending.iter().any(|c| candidate_key(c) == key),
-            MemoryView::Active => self.active.iter().any(|e| entry_key(e) == key),
-            MemoryView::Archived => self.archived.iter().any(|e| entry_key(e) == key),
+            MemoryView::Active => self.visible_active().iter().any(|e| entry_key(e) == key),
+            MemoryView::Archived => self.visible_archived().iter().any(|e| entry_key(e) == key),
             MemoryView::Home | MemoryView::Detail => false,
         };
         if exists {
@@ -457,8 +654,12 @@ impl MemoryPage {
     pub fn sync_focus(&mut self) {
         let ids: Vec<String> = match self.view {
             MemoryView::Review => self.pending.iter().map(candidate_key).collect(),
-            MemoryView::Active => self.active.iter().map(entry_key).collect(),
-            MemoryView::Archived => self.archived.iter().map(entry_key).collect(),
+            MemoryView::Active => self.visible_active().iter().map(|e| entry_key(e)).collect(),
+            MemoryView::Archived => self
+                .visible_archived()
+                .iter()
+                .map(|e| entry_key(e))
+                .collect(),
             MemoryView::Home | MemoryView::Detail => return,
         };
         if self
@@ -474,6 +675,18 @@ impl MemoryPage {
 /// Keystrokes for the memory page. Esc walks one level back and never
 /// confirms anything; only `a`/`r` do.
 pub fn screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if state.memory.filter_edit {
+        // While the query line owns the keyboard, list keys are text. Enter
+        // and Esc leave it; the typed query stays in force so the list does
+        // not silently change what it was showing.
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => state.memory.end_query(),
+            KeyCode::Backspace => state.memory.pop_query(),
+            KeyCode::Char(character) => state.memory.push_query(character),
+            _ => {}
+        }
+        return Vec::new();
+    }
     match key.code {
         KeyCode::Esc => {
             back_one(state);
@@ -507,17 +720,150 @@ pub fn screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.memory.toggle_selected();
             Vec::new()
         }
+        // Narrowing the listing is a view action: it never touches the store.
+        KeyCode::Char('/') if is_list(state) => {
+            state.memory.begin_query();
+            Vec::new()
+        }
+        KeyCode::Char('s') if is_list(state) => {
+            state.memory.cycle_scope();
+            Vec::new()
+        }
+        KeyCode::Char('t') if is_list(state) => {
+            state.memory.cycle_kind();
+            Vec::new()
+        }
+        KeyCode::Char('x') if is_list(state) => {
+            state.memory.clear_query();
+            Vec::new()
+        }
+        KeyCode::Char('y') if state.memory.view == MemoryView::Detail => copy_focused(state, false),
+        KeyCode::Char('Y') if state.memory.view == MemoryView::Detail => copy_focused(state, true),
+        // Pinning is reversible, so it happens on one press. Deprecating and
+        // forgetting are not one keystroke away from happening.
+        KeyCode::Char('p') if state.memory.view == MemoryView::Detail => {
+            let pinned = state
+                .memory
+                .focused_entry()
+                .map(|entry| !entry.pinned)
+                .unwrap_or(true);
+            state.memory.confirm = None;
+            state.memory.action_error = None;
+            run_action(state, MemoryAction::Pin(pinned))
+        }
+        KeyCode::Char('d') if state.memory.view == MemoryView::Detail => {
+            state.memory.action_error = None;
+            arm_or_run(state, MemoryAction::Deprecate)
+        }
+        KeyCode::Char('f') if state.memory.view == MemoryView::Detail => {
+            state.memory.action_error = None;
+            arm_or_run(state, MemoryAction::Forget)
+        }
         KeyCode::Enter => open_focused(state),
         KeyCode::Char('a') | KeyCode::Char('A') => decide(state, MemoryOp::Accept),
         KeyCode::Char('r') | KeyCode::Char('R') => decide(state, MemoryOp::Reject),
-        _ => Vec::new(),
+        _ => {
+            state.memory.confirm = None;
+            Vec::new()
+        }
     }
+}
+
+/// Arm a destructive action on the focused record, or perform it when it is
+/// already armed for the same record and action.
+fn arm_or_run(state: &mut AppState, action: MemoryAction) -> Vec<Effect> {
+    let Some(entry) = state.memory.focused_entry() else {
+        return Vec::new();
+    };
+    let key = entry_key(entry);
+    if state.memory.confirm.as_ref() == Some(&(action, key.clone())) {
+        state.memory.confirm = None;
+        return run_action(state, action);
+    }
+    state.memory.confirm = Some((action, key));
+    Vec::new()
+}
+
+/// The command for one action on the focused record, plus the refresh that
+/// proves the outcome. A record whose revision the runtime did not report
+/// cannot be deprecated: guessing would overwrite a newer version.
+fn run_action(state: &mut AppState, action: MemoryAction) -> Vec<Effect> {
+    let Some(entry) = state.memory.focused_entry() else {
+        return Vec::new();
+    };
+    let session_id = state.session_id.clone();
+    let command = match action {
+        MemoryAction::Pin(pinned) => ClientCommand::SetMemoryPin {
+            session_id,
+            scope: entry.scope,
+            id: entry.id.clone(),
+            pinned,
+        },
+        MemoryAction::Deprecate => match entry.revision {
+            Some(revision) => ClientCommand::DeprecateMemory {
+                session_id,
+                scope: entry.scope,
+                id: entry.id.clone(),
+                revision,
+            },
+            None => {
+                state.memory.action_error = Some("revision");
+                return Vec::new();
+            }
+        },
+        MemoryAction::Forget => ClientCommand::ForgetMemory {
+            session_id,
+            scope: entry.scope,
+            id: entry.id.clone(),
+        },
+    };
+    let mut effects = vec![Effect::Send(command)];
+    effects.extend(query_list_effect(state));
+    effects
+}
+
+fn is_list(state: &AppState) -> bool {
+    matches!(state.memory.view, MemoryView::Active | MemoryView::Archived)
+}
+
+/// Copy the focused record's body (`false`) or its id (`true`).
+///
+/// The text is the record as the store returned it, with no page chrome: no
+/// focus cursor, no border, no indentation. Copying a memory must paste a
+/// memory.
+fn copy_focused(state: &mut AppState, id_only: bool) -> Vec<Effect> {
+    let Some(entry) = state.memory.focused_entry() else {
+        return Vec::new();
+    };
+    let text = if id_only {
+        memory_reference(entry)
+    } else {
+        entry.body.clone()
+    };
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![Effect::CopyText {
+        text,
+        what: if id_only {
+            CopyWhat::Reference
+        } else {
+            CopyWhat::Body
+        },
+    }]
+}
+
+/// The exact identity of a record: scope plus the store's own id.
+pub fn memory_reference(entry: &UiMemoryEntry) -> String {
+    format!("{}:{}", entry.scope.as_str(), entry.id)
 }
 
 /// One level back: detail → its list, list → home, home → conversation.
 pub fn back_one(state: &mut AppState) {
     match state.memory.view {
         MemoryView::Detail => {
+            // Leaving the record leaves the question it was asking.
+            state.memory.confirm = None;
             state.memory.view = state.memory.detail_return;
             if state.memory.view == MemoryView::Home {
                 state.memory.view = MemoryView::Review;
@@ -617,6 +963,11 @@ pub fn query_list(state: &mut AppState) -> Option<Effect> {
         query_id: Some(query_id),
         include_archived: true,
     }))
+}
+
+/// Borrowing form of [`query_list`], for callers that already hold the page.
+fn query_list_effect(state: &mut AppState) -> Vec<Effect> {
+    query_list(state).into_iter().collect()
 }
 
 /// The session-open discovery probe. Kept here so the reducer and tests share

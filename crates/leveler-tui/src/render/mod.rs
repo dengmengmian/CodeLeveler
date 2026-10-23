@@ -1441,6 +1441,37 @@ fn render_memory_home(frame: &mut Frame, body: Rect, state: &mut AppState) {
             Style::default().fg(theme.text.muted),
         )));
     }
+    // What the most recent turn actually used. Titles come from the current
+    // listing, so a record the user has since forgotten is counted, not shown.
+    let (recalled, gone) = state.memory.recalled_rows();
+    if !recalled.is_empty() || gone > 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            t.memory_home_recalled
+                .replace("{count}", &(recalled.len() + gone).to_string()),
+            Style::default().fg(theme.text.secondary),
+        )));
+        for (_, entry) in recalled.iter().take(5) {
+            let scope = crate::memory::scope_label(entry.scope, &t);
+            let kind = memory_entry_kind_label(entry, &t);
+            lines.push(Line::from(Span::styled(
+                format!("  · {}（{scope} · {kind}）", entry.title.trim()),
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+        if gone > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    t.memory_home_recalled_gone
+                        .replace("{count}", &gone.to_string())
+                ),
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
     lines.push(Line::from(""));
 
     let items = [
@@ -1581,13 +1612,54 @@ fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, ac
     let t = state.t();
     let theme = state.theme.clone();
     let width = body.width as usize;
-    let entries = if active {
-        &state.memory.active
+    let filtered = state.memory.filter.is_narrowing();
+    let entries: Vec<_> = if active {
+        state.memory.visible_active()
     } else {
-        &state.memory.archived
+        state.memory.visible_archived()
     };
     let mut lines: Vec<Line> = Vec::new();
-    let empty = if active {
+
+    // The filter line is always visible while a filter is in force. A list
+    // that silently hides records is a trap: the person must be able to see
+    // what is being hidden and how to get it back.
+    if filtered || state.memory.filter_edit {
+        let cursor = if state.memory.filter_edit { "▏" } else { "" };
+        let query = format!(
+            "{} {}{cursor}",
+            t.memory_filter_label, state.memory.filter.query
+        );
+        lines.push(Line::from(Span::styled(
+            query,
+            Style::default().fg(if state.memory.filter_edit {
+                theme.text.primary
+            } else {
+                theme.text.secondary
+            }),
+        )));
+        let scope = match state.memory.filter.scope {
+            Some(scope) => crate::memory::scope_label(scope, &t),
+            None => t.memory_filter_scope_all,
+        };
+        let kind = match state.memory.filter.kind {
+            crate::memory::KindFilter::All => t.memory_filter_kind_all,
+            crate::memory::KindFilter::UserFact => t.memory_filter_kind_user_fact,
+            crate::memory::KindFilter::Experience => t.memory_filter_kind_experience,
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{scope} · {kind} · {} {}",
+                entries.len(),
+                t.memory_filter_clear
+            ),
+            Style::default().fg(theme.text.muted),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    let empty = if filtered {
+        t.memory_empty_filtered
+    } else if active {
         t.memory_empty_active
     } else {
         t.memory_empty_archived
@@ -1609,11 +1681,17 @@ fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, ac
             focus_line = line;
         }
         let cursor = if focused { "❯ " } else { "  " };
-        let scope = crate::memory::scope_label(entry.scope, &t);
-        let heading = format!("[{scope}] {}", entry.title);
+        let marker = if entry.pinned { "●" } else { "○" };
         let mut spans = vec![
             Span::styled(cursor, Style::default().fg(theme.accent.primary)),
-            Span::raw(truncate_display(&heading, width.saturating_sub(4).max(1))),
+            Span::styled(
+                format!("{marker} "),
+                Style::default().fg(theme.text.secondary),
+            ),
+            Span::raw(truncate_display(
+                entry.title.trim(),
+                width.saturating_sub(4).max(1),
+            )),
         ];
         if entry.sensitive {
             spans.push(Span::styled(
@@ -1622,10 +1700,70 @@ fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, ac
             ));
         }
         lines.push(Line::from(spans));
+        // The second line answers "what is this and how does it reach the
+        // model?" without opening the record.
+        let scope = crate::memory::scope_label(entry.scope, &t);
+        let kind = memory_entry_kind_label(entry, &t);
+        let mut detail: Vec<std::borrow::Cow<'static, str>> = vec![scope.into(), kind.into()];
+        if let Some(status) = entry.status.as_deref() {
+            detail.push(memory_status_label(status, &t));
+        }
+        if let Some(authority) = entry.authority.as_deref() {
+            detail.push(memory_authority_label(authority, &t));
+        }
+        if let Some(revision) = entry.revision {
+            detail.push(format!("r{revision}").into());
+        }
+        lines.push(Line::from(Span::styled(
+            format!("    {}", detail.join(" · ")),
+            Style::default().fg(theme.text.muted),
+        )));
     }
     let mut hits = Vec::new();
     render_list_rows(frame, body, lines, &rows, focus_line, &theme, &mut hits);
     state.screen_rows = hits;
+}
+
+/// The human label for a row's kind. A row without one is a user fact: that is
+/// the same rule retrieval uses, so the page cannot disagree with it.
+fn memory_entry_kind_label(
+    entry: &leveler_client_protocol::UiMemoryEntry,
+    t: &crate::i18n::UiText,
+) -> &'static str {
+    use leveler_client_protocol::UiMemoryKind;
+    match entry.kind {
+        Some(UiMemoryKind::Preference) => t.memory_kind_preference,
+        Some(UiMemoryKind::Decision) => t.memory_kind_decision,
+        Some(UiMemoryKind::Note) => t.memory_kind_note,
+        Some(UiMemoryKind::Experience) => t.memory_kind_experience,
+        None => t.memory_kind_user_fact,
+    }
+}
+
+/// The human label for a stored lifecycle state. An unknown value keeps the
+/// store's own spelling: the page must not invent a lifecycle.
+fn memory_status_label(status: &str, t: &crate::i18n::UiText) -> std::borrow::Cow<'static, str> {
+    match status {
+        "active" => t.memory_active.into(),
+        "pending" => t.memory_pending.into(),
+        other => other.to_string().into(),
+    }
+}
+
+/// The human label for a stored authority. An unknown value keeps the store's
+/// own spelling: the page must not invent provenance.
+fn memory_authority_label(
+    authority: &str,
+    t: &crate::i18n::UiText,
+) -> std::borrow::Cow<'static, str> {
+    match authority {
+        "user_explicit" | "user_approved" => t.memory_authority_user_decision.into(),
+        "user_stated" => t.memory_authority_user_stated.into(),
+        "project_source" => t.memory_authority_project_source.into(),
+        "runtime_observed" | "tool_observed" => t.memory_authority_runtime_observed.into(),
+        "model_inferred" => t.memory_authority_model_inferred.into(),
+        other => other.to_string().into(),
+    }
 }
 
 fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
@@ -1714,6 +1852,40 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
                 Style::default().fg(theme.text.primary),
             );
         }
+        lines.push(Line::from(""));
+        for (label, value) in memory_detail_metadata(entry, &t) {
+            push_memory_wrapped(
+                &mut lines,
+                &format!("{label}: {value}"),
+                width,
+                Style::default().fg(theme.text.muted),
+            );
+        }
+        if let Some((action, _)) = state.memory.confirm {
+            let prompt = match action {
+                crate::memory::MemoryAction::Deprecate => Some(t.memory_confirm_deprecate),
+                crate::memory::MemoryAction::Forget => Some(t.memory_confirm_forget),
+                crate::memory::MemoryAction::Pin(_) => None,
+            };
+            if let Some(prompt) = prompt {
+                lines.push(Line::from(""));
+                push_memory_wrapped(
+                    &mut lines,
+                    prompt,
+                    width,
+                    Style::default().fg(theme.status.warning),
+                );
+            }
+        }
+        if state.memory.action_error.is_some() {
+            lines.push(Line::from(""));
+            push_memory_wrapped(
+                &mut lines,
+                t.memory_action_no_revision,
+                width,
+                Style::default().fg(theme.status.warning),
+            );
+        }
         if entry.sensitive {
             lines.push(Line::from(""));
             push_memory_wrapped(
@@ -1736,6 +1908,50 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
         }
     }
     render_scrolled(frame, body, state, lines);
+}
+
+/// Everything the page can prove about a record, in a stable order.
+///
+/// Absent fields are omitted rather than invented: an older runtime that sends
+/// no metadata produces a shorter block, never a wrong one. The values beside
+/// each label are the store's own words.
+fn memory_detail_metadata(
+    entry: &leveler_client_protocol::UiMemoryEntry,
+    t: &crate::i18n::UiText,
+) -> Vec<(&'static str, String)> {
+    let mut rows = vec![
+        (t.memory_detail_id, crate::memory::memory_reference(entry)),
+        (
+            t.memory_detail_scope,
+            crate::memory::scope_label(entry.scope, t).to_string(),
+        ),
+        (
+            t.memory_detail_kind,
+            memory_entry_kind_label(entry, t).to_string(),
+        ),
+    ];
+    if let Some(status) = entry.status.as_deref() {
+        rows.push((
+            t.memory_detail_status,
+            memory_status_label(status, t).into(),
+        ));
+    }
+    if let Some(authority) = entry.authority.as_deref() {
+        rows.push((
+            t.memory_detail_authority,
+            memory_authority_label(authority, t).into(),
+        ));
+    }
+    if let Some(revision) = entry.revision {
+        rows.push((t.memory_detail_revision, format!("r{revision}")));
+    }
+    if let Some(updated) = entry.updated_at.as_deref() {
+        rows.push((t.memory_detail_updated, updated.to_string()));
+    }
+    if entry.pinned {
+        rows.push((t.memory_detail_pinned, "✓".to_string()));
+    }
+    rows
 }
 
 fn memory_batch_line(report: &crate::memory::MemoryBatchReport, t: &crate::i18n::UiText) -> String {
@@ -5472,6 +5688,11 @@ mod tests {
             body: title.into(),
             kind: Some(leveler_client_protocol::UiMemoryKind::Note),
             sensitive: false,
+            status: Some("active".into()),
+            authority: Some("user_explicit".into()),
+            revision: Some(1),
+            updated_at: Some("2026-01-01T00:00:00Z".into()),
+            pinned: false,
         }
     }
 
@@ -5575,6 +5796,84 @@ mod tests {
     }
 
     #[test]
+    fn a_memory_detail_names_the_record_it_shows_and_never_truncates_it() {
+        let body = "发布前先运行受影响范围的测试";
+        let entry = leveler_client_protocol::UiMemoryEntry {
+            id: "mem-release".into(),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
+            title: "发布前先跑测试".into(),
+            body: body.into(),
+            kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
+            sensitive: false,
+            status: Some("active".into()),
+            authority: Some("user_explicit".into()),
+            revision: Some(3),
+            updated_at: Some("2026-01-02T03:04:05Z".into()),
+            pinned: true,
+        };
+        let mut state = memory_state(
+            crate::memory::MemoryView::Detail,
+            vec![entry],
+            vec![],
+            vec![],
+        );
+        let text = render_text(&mut state, 60, 40);
+        for expected in [
+            "project:mem-release",
+            "用户确认",
+            "r3",
+            "2026-01-02T03:04:05Z",
+            "已固定",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(body),
+            "the full body must survive wrapping: {text}"
+        );
+        // Copying is offered as a key, and the body itself carries no page
+        // chrome: what is copied is the record, not the drawing.
+        assert!(text.contains("y 复制正文"), "{text}");
+    }
+
+    #[test]
+    fn a_filtered_list_says_what_it_is_hiding() {
+        let entry = |id: &str, title: &str| leveler_client_protocol::UiMemoryEntry {
+            id: id.into(),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
+            title: title.into(),
+            body: title.into(),
+            kind: Some(leveler_client_protocol::UiMemoryKind::Note),
+            sensitive: false,
+            status: Some("active".into()),
+            authority: Some("user_stated".into()),
+            revision: Some(1),
+            updated_at: None,
+            pinned: false,
+        };
+        let mut state = memory_state(
+            crate::memory::MemoryView::Active,
+            vec![
+                entry("mem-a", "构建使用 cargo"),
+                entry("mem-b", "发布使用 pnpm"),
+            ],
+            vec![],
+            vec![],
+        );
+        state.memory.filter.query = "pnpm".into();
+        let text = render_text(&mut state, 80, 20);
+        assert!(text.contains("发布使用 pnpm"), "{text}");
+        assert!(!text.contains("构建使用 cargo"), "{text}");
+        assert!(
+            text.contains("筛选") && text.contains("全部范围"),
+            "the page must show the filter that hides rows: {text}"
+        );
+        // The second line names the record's identity and reach.
+        assert!(text.contains("用户陈述"), "{text}");
+    }
+
+    #[test]
     fn memory_detail_wraps_long_chinese_content_instead_of_truncating_it() {
         let body = "这条约定要求所有改动先写失败测试再写实现并且每次提交前运行受影响的测试范围不运行无关测试";
         let mut state = memory_state(
@@ -5668,6 +5967,11 @@ mod tests {
                 body: "允许重置数据库".into(),
                 kind: Some(leveler_client_protocol::UiMemoryKind::Note),
                 sensitive: false,
+                status: Some("active".into()),
+                authority: Some("user_explicit".into()),
+                revision: Some(1),
+                updated_at: None,
+                pinned: false,
             }],
             vec![],
             vec![],

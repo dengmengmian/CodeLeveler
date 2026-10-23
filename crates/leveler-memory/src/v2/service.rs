@@ -253,6 +253,17 @@ impl MemoryService {
         self.store.read(id)
     }
 
+    /// Read several current records under one store lock.
+    ///
+    /// Each slot carries its own outcome; see [`MarkdownStore::read_many`].
+    pub fn read_many(
+        &self,
+        _actor: &Actor,
+        ids: &[MemoryId],
+    ) -> Result<Vec<Result<ReadRecord, StoreError>>, StoreError> {
+        self.store.read_many(ids)
+    }
+
     pub fn history(&self, id: &MemoryId, revision: u64) -> Result<MemoryRecord, StoreError> {
         self.store.history(id, revision)
     }

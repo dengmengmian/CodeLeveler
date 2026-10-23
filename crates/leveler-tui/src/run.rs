@@ -912,6 +912,33 @@ fn dispatch_effects(
                 };
                 run_remote(remote_launcher.as_ref(), request, completion_tx);
             }
+            Effect::CopyText { text, what } => {
+                // A memory record is small and already in memory, so the copy
+                // is immediate. The receipt decides what the page reports: a
+                // native copy is confirmed, an OSC 52 write is not.
+                let label = match what {
+                    crate::action::CopyWhat::Body => state.t().memory_copied_body,
+                    crate::action::CopyWhat::Reference => state.t().memory_copied_id,
+                };
+                state.notification = Some(match clipboard_result(&text) {
+                    Ok((receipt, count)) => Notification {
+                        level: NotificationLevel::Info,
+                        message: match receipt.delivery {
+                            crate::clipboard::Delivery::VerifiedNative => {
+                                label.replace("{count}", &count.to_string())
+                            }
+                            crate::clipboard::Delivery::SentUnverified => state
+                                .t()
+                                .memory_copied_unverified
+                                .replace("{count}", &count.to_string()),
+                        },
+                    },
+                    Err(error) => Notification {
+                        level: NotificationLevel::Warning,
+                        message: format!("{}: {error}", state.t().memory_copy_failed),
+                    },
+                });
+            }
             Effect::OpenWebUrl(url) => {
                 let tx = completion_tx.clone();
                 match url_opener {

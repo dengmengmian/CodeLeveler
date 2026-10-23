@@ -324,6 +324,7 @@ impl RememberRequest {
 pub struct MemoryService {
     roots: MemoryRoots,
     indexes: Mutex<HashMap<ServiceScope, Arc<v2::MemoryIndex>>>,
+    stores: Mutex<HashMap<ServiceScope, Arc<v2::MemoryService>>>,
 }
 
 impl Clone for MemoryService {
@@ -349,6 +350,7 @@ impl MemoryService {
         Self {
             roots,
             indexes: Mutex::new(HashMap::new()),
+            stores: Mutex::new(HashMap::new()),
         }
     }
 
@@ -401,6 +403,14 @@ impl MemoryService {
         self.roots.legacy_root.as_deref()
     }
 
+    /// How much store lifecycle work this process has done so far.
+    ///
+    /// Diagnostics only: the counters describe mechanical work, not memory
+    /// content, and nothing in retrieval reads them.
+    pub fn lifecycle_metrics(&self) -> v2::StoreLifecycleSnapshot {
+        v2::lifecycle_metrics().snapshot()
+    }
+
     pub fn roots(&self) -> &MemoryRoots {
         &self.roots
     }
@@ -414,14 +424,41 @@ impl MemoryService {
         MemoryStore::open(root).map_err(Into::into)
     }
 
-    fn markdown_service(&self, scope: ServiceScope) -> Result<v2::MemoryService, ServiceError> {
+    /// The opened store handle for one scope.
+    ///
+    /// A handle is *paths plus scope*, not a cached memory record: every read
+    /// still loads the current Markdown file and checks its trust receipt, so
+    /// an external or cross-process write is visible at the next read. What is
+    /// cached is the expensive, idempotent setup work — directory creation,
+    /// canonicalization, the Git boundary check, journal recovery and orphan
+    /// cleanup — which a long-lived runtime must not repeat per recall.
+    fn markdown_service(
+        &self,
+        scope: ServiceScope,
+    ) -> Result<Arc<v2::MemoryService>, ServiceError> {
+        {
+            let stores = self
+                .stores
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(service) = stores.get(&scope) {
+                return Ok(service.clone());
+            }
+        }
         let roots = self.roots.scope_roots(scope).cloned().ok_or_else(|| {
             ServiceError::Unavailable(format!(
                 "the {} memory scope is not configured for this session",
                 scope.as_str()
             ))
         })?;
-        v2::MemoryService::open(roots).map_err(Into::into)
+        let service = Arc::new(v2::MemoryService::open(roots).map_err(ServiceError::from)?);
+        let mut stores = self
+            .stores
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Two callers may race the first open; both did the same recovery and
+        // either handle is interchangeable, so keep the first one.
+        Ok(stores.entry(scope).or_insert(service).clone())
     }
 
     // ---------------------------------------------------------------- reads
@@ -583,14 +620,49 @@ impl MemoryService {
                     Ok(record) => record,
                     Err(error) => return Err(error.into()),
                 };
-                if record.trust != v2::TrustSummary::Trusted
-                    || !record.record.frontmatter.status.is_active()
-                    || v2::index::is_sensitive_record(&record.record)
-                    || record.record.frontmatter.scope != scope.to_v2()
-                {
-                    return Err(ServiceError::NotCurrent(id.to_string()));
+                injectable_view(scope, record)
+            }
+        }
+    }
+
+    /// Several records that an automatic injection path may show the model.
+    ///
+    /// The same trust rules as [`Self::read_injectable`], applied to a whole
+    /// candidate set under one store lock and one journal check. Results are
+    /// positional; a slot that is not current says so and does not hide its
+    /// neighbours.
+    pub fn read_many_injectable(
+        &self,
+        actor: &Actor,
+        scope: ServiceScope,
+        ids: &[String],
+    ) -> Result<Vec<Result<MemoryView, ServiceError>>, ServiceError> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => Ok(ids
+                .iter()
+                .map(|id| self.read_injectable(actor, scope, id))
+                .collect()),
+            MemoryBackend::Markdown => {
+                let service = self.markdown_service(scope)?;
+                let parsed: Vec<Option<v2::MemoryId>> =
+                    ids.iter().map(|id| v2::MemoryId::parse(id).ok()).collect();
+                let known: Vec<v2::MemoryId> = parsed.iter().flatten().cloned().collect();
+                let mut outcomes = service.read_many(actor, &known)?.into_iter();
+                let mut results = Vec::with_capacity(ids.len());
+                for (id, parsed) in ids.iter().zip(parsed) {
+                    let Some(parsed) = parsed else {
+                        results.push(Err(ServiceError::Invalid(format!("not a memory id: {id}"))));
+                        continue;
+                    };
+                    let outcome = outcomes
+                        .next()
+                        .unwrap_or_else(|| Err(v2::StoreError::NotFound(parsed.clone())));
+                    results.push(match outcome {
+                        Ok(record) => injectable_view(scope, record),
+                        Err(error) => Err(error.into()),
+                    });
                 }
-                Ok(markdown_view(&record.record, record.effective_authority))
+                Ok(results)
             }
         }
     }
@@ -632,60 +704,98 @@ impl MemoryService {
             }
             MemoryBackend::Markdown => {
                 let service = self.markdown_service(scope)?;
-                let index = self.index_for(scope)?;
-                if index.is_dirty().map_err(index_error)? {
-                    let records = service.effective_active()?;
-                    index.reconcile(&records).map_err(index_error)?;
-                }
+                let index = self.fresh_index(scope)?;
                 let hits = index
                     .search(query, limit.max(1).saturating_mul(4))
                     .map_err(index_error)?;
-                let now = chrono::Utc::now();
-                let mut views = Vec::new();
-                for hit in hits {
-                    let Ok(id) = v2::MemoryId::parse(&hit.id) else {
-                        continue;
-                    };
-                    let record = match service.read(actor, &id) {
-                        Ok(record) => record,
-                        Err(_) => {
-                            // The index row points at a file that is no longer
-                            // current: drop the derived row, keep Markdown.
-                            let _ = index.remove(&hit.id);
-                            continue;
-                        }
-                    };
-                    let stored = index.stored(&hit.id).map_err(index_error)?;
-                    let valid = record.trust == v2::TrustSummary::Trusted
-                        && record.record.frontmatter.status.is_active()
-                        && !v2::index::is_sensitive_record(&record.record)
-                        && record.record.frontmatter.scope == scope.to_v2()
-                        && record
-                            .record
-                            .frontmatter
-                            .expires_at
-                            .map(|expires| expires > now)
-                            .unwrap_or(true)
-                        && stored.as_ref().is_some_and(|(revision, digest)| {
-                            *revision == record.cas.revision && digest == &record.digest
-                        });
-                    if !valid {
-                        // A stale derived row may never surface an old body.
-                        let _ = index.remove(&hit.id);
-                        continue;
-                    }
-                    let view = markdown_view(&record.record, record.effective_authority);
-                    if !lanes.allows_experience(view.is_experience()) {
-                        continue;
-                    }
-                    views.push((view, hit.score));
-                    if views.len() >= limit.max(1) {
-                        break;
-                    }
-                }
-                Ok(views)
+                self.validated_hits(actor, scope, &service, &index, &hits, lanes, limit.max(1))
             }
         }
+    }
+
+    /// Revalidate ranked index rows against current Markdown.
+    ///
+    /// Rows are validated in chunks and validation stops as soon as `wanted`
+    /// survive, so a healthy candidate set costs one read per candidate instead
+    /// of four. A row that is no longer trusted, current, in scope, unexpired or
+    /// digest-matching is dropped from the derived index and never returned: the
+    /// index can suggest a candidate, only Markdown can confirm one.
+    #[allow(clippy::too_many_arguments)]
+    fn validated_hits(
+        &self,
+        actor: &Actor,
+        scope: ServiceScope,
+        service: &v2::MemoryService,
+        index: &v2::MemoryIndex,
+        ranked: &[v2::IndexHit],
+        lanes: MemoryLanes,
+        wanted: usize,
+    ) -> Result<Vec<(MemoryView, f64)>, ServiceError> {
+        if wanted == 0 || ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now();
+        let mut views = Vec::new();
+        let mut stale = Vec::new();
+        let mut cursor = 0;
+        while cursor < ranked.len() && views.len() < wanted {
+            let end = (cursor + wanted).min(ranked.len());
+            let slice = &ranked[cursor..end];
+            cursor = end;
+            // One store lock and one journal check per chunk.
+            let parsed: Vec<Option<v2::MemoryId>> = slice
+                .iter()
+                .map(|hit| v2::MemoryId::parse(&hit.id).ok())
+                .collect();
+            let known: Vec<v2::MemoryId> = parsed.iter().flatten().cloned().collect();
+            let hit_ids: Vec<&str> = slice.iter().map(|hit| hit.id.as_str()).collect();
+            let stored = index.stored_many(&hit_ids).map_err(index_error)?;
+            let mut records = service.read_many(actor, &known)?.into_iter();
+            for (position, hit) in slice.iter().enumerate() {
+                if views.len() >= wanted {
+                    break;
+                }
+                if parsed[position].is_none() {
+                    stale.push(hit.id.clone());
+                    continue;
+                }
+                let record = match records.next() {
+                    Some(Ok(record)) => record,
+                    // The index row points at a file that is no longer current:
+                    // drop the derived row, keep Markdown.
+                    Some(Err(_)) | None => {
+                        stale.push(hit.id.clone());
+                        continue;
+                    }
+                };
+                let valid = record.trust == v2::TrustSummary::Trusted
+                    && record.record.frontmatter.status.is_active()
+                    && !v2::index::is_sensitive_record(&record.record)
+                    && record.record.frontmatter.scope == scope.to_v2()
+                    && record
+                        .record
+                        .frontmatter
+                        .expires_at
+                        .map(|expires| expires > now)
+                        .unwrap_or(true)
+                    && stored[position].as_ref().is_some_and(|(revision, digest)| {
+                        *revision == record.cas.revision && digest == &record.digest
+                    });
+                if !valid {
+                    stale.push(hit.id.clone());
+                    continue;
+                }
+                let view = markdown_view(&record.record, record.effective_authority);
+                if !lanes.allows_experience(view.is_experience()) {
+                    continue;
+                }
+                views.push((view, hit.score));
+            }
+        }
+        for id in stale {
+            let _ = index.remove(&id);
+        }
+        Ok(views)
     }
 
     /// Rebuild the derived index for one scope from Markdown current.
@@ -1717,6 +1827,27 @@ fn markdown_view(record: &v2::MemoryRecord, authority: v2::MemoryAuthority) -> M
                     .collect(),
             }),
     }
+}
+
+/// Whether a read record may reach an automatic injection path, and the view
+/// that path sees.
+///
+/// One rule, one place: standing selection, recall and any future batch reader
+/// must agree exactly on what is injectable.
+fn injectable_view(
+    scope: ServiceScope,
+    record: v2::ReadRecord,
+) -> Result<MemoryView, ServiceError> {
+    if record.trust != v2::TrustSummary::Trusted
+        || !record.record.frontmatter.status.is_active()
+        || v2::index::is_sensitive_record(&record.record)
+        || record.record.frontmatter.scope != scope.to_v2()
+    {
+        return Err(ServiceError::NotCurrent(
+            record.record.frontmatter.id.to_string(),
+        ));
+    }
+    Ok(markdown_view(&record.record, record.effective_authority))
 }
 
 fn markdown_status(status: v2::MemoryStatus) -> &'static str {

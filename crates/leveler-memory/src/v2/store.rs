@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,70 @@ use super::record::{
     MemoryKind, MemoryRecord, MemoryScope, MemoryStatus, OpId, Operation, PinOwner, Proposal,
     Relation, SourceRef, SourceRefKind, StatementKind, Tombstone,
 };
+
+/// Process-wide lifecycle counters for the Markdown store.
+///
+/// These answer "how much mechanical work did this process do to a store?"
+/// and nothing about memory content: they are never persisted, never read by
+/// retrieval, and never change behaviour. The scale benchmark and the user's
+/// own diagnostics read them to prove that an operation did not silently
+/// re-open a store or re-scan the state tree.
+#[derive(Debug, Default)]
+pub struct StoreLifecycleMetrics {
+    opens: AtomicU64,
+    journal_recoveries: AtomicU64,
+    orphan_cleanups: AtomicU64,
+    reads: AtomicU64,
+}
+
+/// One point-in-time reading of [`StoreLifecycleMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreLifecycleSnapshot {
+    pub opens: u64,
+    pub journal_recoveries: u64,
+    pub orphan_cleanups: u64,
+    pub reads: u64,
+}
+
+impl StoreLifecycleMetrics {
+    pub fn snapshot(&self) -> StoreLifecycleSnapshot {
+        StoreLifecycleSnapshot {
+            opens: self.opens.load(Ordering::Relaxed),
+            journal_recoveries: self.journal_recoveries.load(Ordering::Relaxed),
+            orphan_cleanups: self.orphan_cleanups.load(Ordering::Relaxed),
+            reads: self.reads.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset every counter. Only tests do this; there is no production reason
+    /// to forget how much work already happened.
+    pub fn reset(&self) {
+        for counter in [
+            &self.opens,
+            &self.journal_recoveries,
+            &self.orphan_cleanups,
+            &self.reads,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+static STORE_METRICS: StoreLifecycleMetrics = StoreLifecycleMetrics {
+    opens: AtomicU64::new(0),
+    journal_recoveries: AtomicU64::new(0),
+    orphan_cleanups: AtomicU64::new(0),
+    reads: AtomicU64::new(0),
+};
+
+/// The process-wide store lifecycle counters.
+pub fn lifecycle_metrics() -> &'static StoreLifecycleMetrics {
+    &STORE_METRICS
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ListQuery {
@@ -331,6 +396,7 @@ pub struct MarkdownStore {
 
 impl MarkdownStore {
     pub fn open(roots: ScopeRoots) -> Result<Self, StoreError> {
+        StoreLifecycleMetrics::count(&STORE_METRICS.opens);
         let paths = StorePaths::prepare(&roots)?;
         let store = Self {
             paths,
@@ -338,7 +404,11 @@ impl MarkdownStore {
         };
         {
             let _lock = store.lock_exclusive()?;
-            let _ = store.recover_locked()?;
+            let mut report = store.recover_locked()?;
+            // Orphan cleanup is a lifecycle event, not a per-read cost: it scans
+            // every state directory (and one directory per historical record).
+            // It belongs to opening a store and to an explicit recovery.
+            report.cleaned = store.cleanup_orphans()?;
         }
         Ok(store)
     }
@@ -352,7 +422,35 @@ impl MarkdownStore {
     }
 
     pub fn read(&self, id: &MemoryId) -> Result<ReadRecord, StoreError> {
+        StoreLifecycleMetrics::count(&STORE_METRICS.reads);
         let _lock = self.lock_shared_recovered()?;
+        self.read_locked(id)
+    }
+
+    /// Read several current records under one shared lock and one recovery
+    /// check.
+    ///
+    /// Results are positional: `results[position]` belongs to `ids[position]`.
+    /// Each slot carries its own outcome, so one missing, non-current or
+    /// conflicting record never hides the others and never becomes an empty
+    /// success. The lock failure is the only outer error: without it nothing was
+    /// read.
+    pub fn read_many(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<Vec<Result<ReadRecord, StoreError>>, StoreError> {
+        let _lock = self.lock_shared_recovered()?;
+        Ok(ids
+            .iter()
+            .map(|id| {
+                StoreLifecycleMetrics::count(&STORE_METRICS.reads);
+                self.read_locked(id)
+            })
+            .collect())
+    }
+
+    /// The read body; the caller holds the shared lock.
+    fn read_locked(&self, id: &MemoryId) -> Result<ReadRecord, StoreError> {
         let loaded = self.load_current(id)?;
         let Some(loaded) = loaded else {
             return self.non_current_error(id);
@@ -857,7 +955,9 @@ impl MarkdownStore {
 
     pub fn recover(&self) -> Result<RecoveryReport, StoreError> {
         let _lock = self.lock_exclusive()?;
-        self.recover_locked()
+        let mut report = self.recover_locked()?;
+        report.cleaned = self.cleanup_orphans()?;
+        Ok(report)
     }
 
     /// Inspect a scope without creating, recovering, or writing anything.
@@ -1194,6 +1294,7 @@ impl MarkdownStore {
     }
 
     fn recover_locked(&self) -> Result<RecoveryReport, StoreError> {
+        StoreLifecycleMetrics::count(&STORE_METRICS.journal_recoveries);
         let mut report = RecoveryReport::default();
         let journal_paths = path::list_json(&self.paths.journal_dir)?;
         let mut parsed = Vec::new();
@@ -1222,7 +1323,7 @@ impl MarkdownStore {
                 }
             }
         }
-        report.cleaned = self.cleanup_orphans()?;
+        report.cleaned = Vec::new();
         Ok(report)
     }
 
@@ -3402,6 +3503,7 @@ impl MarkdownStore {
     }
 
     fn cleanup_orphans(&self) -> Result<Vec<PathBuf>, StoreError> {
+        StoreLifecycleMetrics::count(&STORE_METRICS.orphan_cleanups);
         let mut referenced = HashSet::new();
         for journal_path in path::list_json(&self.paths.journal_dir)? {
             let plan =

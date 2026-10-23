@@ -202,7 +202,9 @@ impl MemoryIndex {
                  content = 'documents',
                  content_rowid = 'rowid',
                  tokenize = 'unicode61'
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS documents_scope_kind_status
+                 ON documents (scope, kind, status, pinned, authority, updated_at);",
         )?;
 
         let schema: Option<String> = conn
@@ -300,6 +302,15 @@ impl MemoryIndex {
         }
         transaction.commit()?;
         drop(conn);
+        if report.indexed > 0 || report.removed > 0 {
+            // A rebuilt index is a pile of small b-tree segments; merging them
+            // once makes every later query cheaper. Derived state only.
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO documents_fts(documents_fts) VALUES('optimize')",
+                [],
+            )?;
+        }
         self.set_dirty(false)?;
         Ok(report)
     }
@@ -453,6 +464,28 @@ impl MemoryIndex {
         .map_err(Into::into)
     }
 
+    /// The stored revision and digest for several ids, read under one lock.
+    ///
+    /// Positions match `ids`; a row that is not indexed is `None`. Retrieval
+    /// uses this so validating a candidate set costs one lock, not one per hit.
+    pub fn stored_many(&self, ids: &[&str]) -> Result<Vec<Option<(u64, String)>>, IndexError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare("SELECT revision, digest FROM documents WHERE id = ?1")?;
+        let mut stored = Vec::with_capacity(ids.len());
+        for id in ids {
+            stored.push(
+                statement
+                    .query_row(params![id], |row| {
+                        Ok((row.get::<_, i64>(0)? as u64, row.get(1)?))
+                    })
+                    .optional()?,
+            );
+        }
+        Ok(stored)
+    }
+
+    /// Whether one scope holds any active record of this kind is not needed by
+    /// retrieval: one lexical pass returns both lanes.
     pub fn diagnostics(&self) -> Result<IndexDiagnostics, IndexError> {
         let conn = self.lock();
         let documents: i64 =

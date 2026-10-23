@@ -339,6 +339,11 @@ fn memory_row_from_view(
         },
         kind: ui_memory_kind(view),
         sensitive: view.sensitive,
+        status: Some(view.status.clone()),
+        authority: Some(view.authority.clone()),
+        revision: view.revision,
+        updated_at: view.updated_at.clone(),
+        pinned: view.pinned_by_user,
     }
 }
 
@@ -4872,6 +4877,24 @@ impl InProcessRuntimeClient {
                 self.forget_memory(session_id, scope, id, Some(origin))
                     .await
             }
+            ClientCommand::SetMemoryPin {
+                session_id,
+                scope,
+                id,
+                pinned,
+            } => {
+                self.set_memory_pin(session_id, scope, id, pinned, Some(origin))
+                    .await
+            }
+            ClientCommand::DeprecateMemory {
+                session_id,
+                scope,
+                id,
+                revision,
+            } => {
+                self.deprecate_memory(session_id, scope, id, revision, Some(origin))
+                    .await
+            }
             command => self.send(command).await,
         }
     }
@@ -4905,6 +4928,88 @@ impl InProcessRuntimeClient {
                 let _ = events.send(RuntimeEvent::Notification {
                     level: leveler_client_protocol::NotificationLevel::Warning,
                     message: format!("accept failed [{id}]: {err}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Pin or unpin one record through the memory service.
+    ///
+    /// A user pin is a standing constraint, so the invocation is minted here
+    /// from the user's own command; the model has no path to it.
+    async fn set_memory_pin(
+        &self,
+        session_id: SessionId,
+        scope: leveler_client_protocol::UiMemoryScope,
+        id: String,
+        pinned: bool,
+        origin: Option<&CommandId>,
+    ) -> Result<(), ClientError> {
+        let events = self.events_for(&session_id);
+        let invocation = Self::memory_invocation(
+            if pinned { "ui:pin" } else { "ui:unpin" },
+            &session_id,
+            origin,
+        );
+        let actor = leveler_memory::v2::Actor::User { invocation };
+        match self
+            .app
+            .memory_service()
+            .pin(&actor, service_memory_scope(scope), &id, pinned)
+        {
+            Ok(outcome) => {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: if pinned {
+                        format!("已固定记忆 [{id}]: {}", outcome_title(&outcome))
+                    } else {
+                        format!("已取消固定记忆 [{id}]: {}", outcome_title(&outcome))
+                    },
+                });
+            }
+            Err(error) => {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    message: format!("pin failed [{id}]: {error}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire one record as no longer true, keeping its history.
+    ///
+    /// The revision the user was looking at is required: a newer record is a
+    /// conflict to show, not a state to overwrite silently.
+    async fn deprecate_memory(
+        &self,
+        session_id: SessionId,
+        scope: leveler_client_protocol::UiMemoryScope,
+        id: String,
+        revision: u64,
+        origin: Option<&CommandId>,
+    ) -> Result<(), ClientError> {
+        let events = self.events_for(&session_id);
+        let invocation = Self::memory_invocation("ui:deprecate", &session_id, origin);
+        let actor = leveler_memory::v2::Actor::User { invocation };
+        match self.app.memory_service().deprecate(
+            &actor,
+            service_memory_scope(scope),
+            &id,
+            revision,
+            "the user marked this memory as no longer true".into(),
+        ) {
+            Ok(outcome) => {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: format!("已标记过期记忆 [{id}]: {}", outcome_title(&outcome)),
+                });
+            }
+            Err(error) => {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    message: format!("deprecate failed [{id}]: {error}"),
                 });
             }
         }
@@ -5452,6 +5557,24 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 scope,
                 id,
             } => self.forget_memory(session_id, scope, id, None).await,
+            ClientCommand::SetMemoryPin {
+                session_id,
+                scope,
+                id,
+                pinned,
+            } => {
+                self.set_memory_pin(session_id, scope, id, pinned, None)
+                    .await
+            }
+            ClientCommand::DeprecateMemory {
+                session_id,
+                scope,
+                id,
+                revision,
+            } => {
+                self.deprecate_memory(session_id, scope, id, revision, None)
+                    .await
+            }
             ClientCommand::RequestDiff {
                 session_id,
                 query_id,

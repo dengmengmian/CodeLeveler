@@ -506,3 +506,77 @@ fn runtime_experiences_need_runtime_evidence_before_becoming_active() {
         MemoryAuthority::RuntimeObserved
     );
 }
+
+/// Orphan cleanup is a lifecycle event, not a per-operation cost.
+///
+/// Opening a store recovers journals and scans the private state tree once.
+/// Reads and writes of an already-open store must not repeat that scan: at
+/// scale the history tree holds one directory per record, so a scan per read
+/// would dominate every recall. The leftovers are still cleaned — at the next
+/// open, and on an explicit recovery.
+#[test]
+fn orphan_cleanup_is_a_lifecycle_event_not_a_read_cost() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let created = create_user(
+        &store,
+        MemoryScope::Project,
+        "billing_model",
+        "monthly",
+        "The provider bills monthly.",
+    );
+    let id = applied_id(&created);
+    let read = store.read(&id).unwrap();
+
+    let orphan = store.paths().stage_dir.join("orphan.md.stage");
+    leveler_memory::v2::path::write_new(&orphan, b"orphan", 0o600).unwrap();
+    let stray = fixture.state.join(".tmp-4242-1-stray");
+    fs::write(&stray, b"partial").unwrap();
+
+    // Read, list and write through the open handle.
+    store.read(&id).unwrap();
+    store.effective_active().unwrap();
+    let updated = store
+        .update(
+            leveler_memory::v2::OpId::parse("op-lifecycle-cleanup").unwrap(),
+            leveler_memory::v2::Caller::UserCommand {
+                invocation: "invocation-lifecycle-cleanup".into(),
+            },
+            &id,
+            RecordPatch {
+                value: Some("yearly".into()),
+                body: Some("The provider bills yearly.".into()),
+                ..Default::default()
+            },
+            read.cas,
+        )
+        .unwrap();
+    assert!(updated.is_applied(), "{updated:?}");
+
+    assert!(
+        orphan.exists(),
+        "a read or a write must not scan the state tree for orphans"
+    );
+    assert!(
+        stray.exists(),
+        "a read or a write must not scan for temporaries"
+    );
+
+    // Reopening is the boundary that pays for the scan.
+    let reopened = fixture.store();
+    assert!(
+        !orphan.exists(),
+        "reopening the store must clean the orphan"
+    );
+    assert!(
+        !stray.exists(),
+        "reopening the store must clean the temporary"
+    );
+
+    // An explicit recovery is the other boundary.
+    let orphan_again = reopened.paths().stage_dir.join("orphan.md.stage");
+    leveler_memory::v2::path::write_new(&orphan_again, b"orphan", 0o600).unwrap();
+    let report = reopened.recover().unwrap();
+    assert!(report.cleaned.contains(&orphan_again), "{report:?}");
+    assert!(!orphan_again.exists());
+}

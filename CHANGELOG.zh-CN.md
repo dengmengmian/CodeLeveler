@@ -10,6 +10,8 @@
 
 ### 新增
 
+- `/memory` 成为运行时 listing 的管理页：按关键词筛选标题与正文、按 Scope 与 Lane 收窄、打开记录查看带自身身份与元数据的完整正文、复制正文或 `scope:id`、固定/标记过期/归档。破坏性动作需要二次确认；所有动作都经记忆服务执行，远端设备一律拒绝
+- 每轮的 `MemoryRecalled` 事件给出请求实际携带的记录（scope、受限标题、mode）。`/memory` 用当前 listing 解析这些名字，因此用户之后遗忘的记录只被计数，不再显示标题
 - `memory.enabled` 为 true 时，记忆属于第一轮请求：`memory`、`remember`、`forget` 以及指导、catalog、召回不再需要先调用 `capability(enable)`。记忆写入的审批规则不变
 - `/memory status` 显示生效 / 待确认 / 已归档 / 敏感数量，持久提取队列，采纳 / 拒绝 / 跳过累计，最近一次提取结果，最早重试及其脱敏错误，以及最近一次召回数量
 - `leveler memory audit` 列出历史敏感记录但不打印内容；`leveler memory scrub [--id <id>] [--apply]` 默认只做 dry-run，只有显式 `--apply` 才改写
@@ -19,6 +21,8 @@
 
 ### 变更
 
+- 读取持久记忆不再每次重新打开 Markdown Store：运行时每个 Scope 保留一个已初始化的句柄，并在共享锁下重读当前 Markdown，外部或跨进程写入在下一次读取仍然可见
+- 孤儿清理变成生命周期事件。打开 Store 或显式 recovery 时扫描一次私有状态树；读、listing、检索与已提交写入不再按历史记录逐个目录扫描
 - `remember` 现在记录模型推断权威和 `agent_remember_tool` 来源。人工批准只授权写入，不代表用户陈述了该事实，也不能覆盖用户直接写下的事实
 - `memory.enabled = false` 在能力披露前就移除 memory pack，因此 Full Access 也无法暴露记忆工具、指导、catalog 或召回。交互式自动候选提取同样遵守该开关
 - 后台提取的默认超时提高到 90 秒，避免把推理模型的正常首 token 延迟误判为失败重试
@@ -26,6 +30,7 @@
 
 ### 修复
 
+- 1 万条记忆的召回：p95 从 1.67s 降到 7.6ms（出厂单 Lane 配置，release，同一 fixture）。派生索引增加 `documents(scope, kind, status, …)` 索引并在 reconcile 后 `optimize`；候选校验改为批量且足够即停。Experience lane 仍需第二次词法扫描（10k 时 15.8ms），因为 FTS5 无法在单次查询内按 kind 排名
 - 被拒绝的 `update_goal(complete)` 计入空转轮次：模型重复同一个被拒的完成声明时，会由既有的有界空转上限停止，而不是一直跑到预算耗尽（在无界 continuation 策略下则是无限循环）。拒绝仍然只是反馈，下一轮真实工作会重置计数
 - Goal 不能再以比用户请求更窄的 acceptance 完成。`commit_task` 会拒绝漏掉用户明确枚举交付项的 acceptance；`update_goal(complete)` 要求逐项记账，并用执行记录核对具名产物与命令。用户自己写下的后续豁免会移除对应要求并随 Goal 持久化，因此恢复与压缩既不会复活也不会抹掉范围
 - 敏感校验覆盖所有写入路径的 title、body、tags 与 provenance evidence
