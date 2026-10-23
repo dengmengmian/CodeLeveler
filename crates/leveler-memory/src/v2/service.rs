@@ -105,7 +105,7 @@ impl Actor {
     ///
     /// Marked `channel: true`: it identifies the write channel, not evidence
     /// for the fact, so the lifecycle must not count it as new evidence.
-    fn provenance(&self) -> SourceRef {
+    pub(crate) fn provenance(&self) -> SourceRef {
         let mut source = empty_source(match self {
             Self::User { .. } => SourceRefKind::UserCommand,
             Self::Model { .. } => SourceRefKind::ToolCall,
@@ -532,9 +532,10 @@ impl MemoryService {
                 Actor::User { .. } | Actor::Migration { .. } | Actor::External => {}
             }
         }
-        if evidence.is_empty() {
-            evidence.push(actor.provenance());
-        }
+        // The actor's own channel reference is always kept, even when the
+        // caller supplied an observation span: the span says what was seen,
+        // this says which trusted operation is responsible for the write.
+        evidence.push(actor.provenance());
         Ok(evidence)
     }
 }

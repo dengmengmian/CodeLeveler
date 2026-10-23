@@ -822,11 +822,39 @@ pub fn parse_runtime_event(json: &str) -> Result<Option<RuntimeEvent>, serde_jso
     }
 }
 
+/// The scope a memory row or decision belongs to.
+///
+/// `(scope, id)` is the record's identity: the same id in two scopes is two
+/// independent memories. An older runtime that sends no scope predates
+/// multi-scope listings and only ever served the project store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiMemoryScope {
+    Global,
+    #[default]
+    Project,
+    Local,
+}
+
+impl UiMemoryScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Local => "local",
+        }
+    }
+}
+
 /// Compact durable-memory row for TUI list surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiMemoryEntry {
     pub id: String,
+    /// Which store this row came from; part of the row's identity.
+    #[serde(default)]
+    pub scope: UiMemoryScope,
     pub title: String,
     /// The stored content. A title alone cannot answer "what do I actually
     /// remember?", and the detail page must not guess it. Additive: absent on
@@ -989,6 +1017,10 @@ pub struct UiMemoryExtraction {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiMemoryCandidate {
     pub id: String,
+    /// Which store is holding this pending record. Accept/reject must carry
+    /// it back so a decision can never land in another scope.
+    #[serde(default)]
+    pub scope: UiMemoryScope,
     pub title: String,
     /// The text that would be stored. Already length-bounded by the domain.
     pub body: String,

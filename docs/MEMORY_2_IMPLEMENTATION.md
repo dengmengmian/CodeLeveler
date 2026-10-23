@@ -1,6 +1,6 @@
 # CodeLeveler Memory 2.0 实施计划
 
-状态：Stage 1 已实现并完成 Phase C 验证（2026-10-23，存在已登记的未验证项）；Stage 2–4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5。
+状态：Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3–4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
 
 前置文档：
 
@@ -303,7 +303,7 @@ pub enum Actor {
 - 用户直接命令 → `user_explicit`；TUI accept → `user_approved`；自动用户事实 → `user_stated`；模型工具 → `model_inferred`；experience → `runtime_observed`/`tool_observed`。
 - 模型工具对受保护用户记录（receipt 为 `user_explicit`/`user_approved`）的 update/deprecate/forget/pin → 生成 pending，返回 `needs_user_review`；Full 模式也不绕过 actor 规则，不提升 authority。
 - `review` 只接受 `Actor::User`；模型工具不注册 review action。
-- 直接命令只对**同一 subject_key** 拥有优先权：extractor 返回同 subject 的候选 → `Skipped`；不同 subject 的独立事实仍按各自 OpId 准入，不做 turn 级去重。模型工具同 subject 也不能覆盖直接命令产生的用户事实。
+- 直接命令只拥有**它自己的那段事实**：有 subject_key 时按同 subject 跳过 extractor 候选；无 subject_key 时按 `(session, turn)` + 精确 evidence span 包含关系判定所有权，span 只属于该命令时 extractor 候选 `Skipped`，同轮其它独立事实仍按各自 OpId 准入，不做 turn 级去重。不使用正文相似度、标题哈希或同义词判定身份。模型工具同 subject 也不能覆盖直接命令产生的用户事实。
 - 外部文件/无 receipt 的记录不进入 service 的可信读取路径；模型不能通过修改 Markdown 的 `authority`/`pinned` 获得用户 authority。
 
 ### 2.4 身份与 known_identities 接线
@@ -383,6 +383,69 @@ Dogfood（小规模，真实 CodeLeveler + DeepSeek Flash）：
 - 如果 v2 写入过测试项目，删除测试项目即可；真实用户 store 未被触碰。
 - 代码回滚：撤掉 service 接线，保留 legacy 路径；不删除 legacy 代码。
 - 不承诺 v2 测试数据可反向迁移；Stage 2 不用于真实数据。
+
+### 2.11 Stage 2.1 正确性收口（2026-10-23）
+
+Stage 2.1 只修正确性与证据链，不进入 Stage 3：没有 FTS5、Context Builder、Logged Injection，没有真实数据迁移，默认 backend 与 Experience 默认开关未变。
+
+#### 2.11.1 无 subject 的显式用户记忆
+
+- 显式 `/remember` 不需要 Subject。直接命令以 Memory ID 作为身份；`(scope, id)` 是其唯一寻址方式。自动提取与模型写入仍必须有 `subject_key`，无 subject 的自动 UserFact 在 Store 入口即 `Rejected{MissingSubjectKey}`，不会伪造 Subject、标题哈希或关键词身份。
+- 直接命令的 `OpId` 由可信 `UserInvocationId` 派生（`OpId::derived`，journal-safe）；同一调用重试返回 replay，两次独立命令是两个身份。
+- 直接命令只拥有它自己的精确 evidence span：extractor 候选的 `evidence_span` 必须包含于该命令正文时才 `Skipped{DirectCommandOwned}`；同轮其它独立事实按各自 OpId 正常准入，不做 turn 级去重，也不做正文相似度或同义词合并。
+- 按 ID 更新：接受 pending update 后目标 ID 不变，旧 revision 进 history，新 revision 的 `source_refs` 追加本次 actor provenance；不是 supersede，也不是新身份。
+- Subject 补齐：`MemoryService::update` 可在 service 层为既有无 subject 记录附加结构化身份；模型工具不能改写身份（`subject: None`），冲突进 Pending（`subject_key_in_use` / `ProtectedUserFact`）。
+
+#### 2.11.2 多 scope Pending review
+
+- Pending 身份是 `(scope, id)`；同一 ID 在不同 scope 是两条独立记忆。
+- `AcceptMemory` / `RejectMemory` / `ForgetMemory` / `RememberMemory` 都携带 `UiMemoryScope`（旧客户端缺省为 project）。Accept/Reject 只作用于指定 scope。
+- Store → MemoryService → Pending List → Client Protocol → TUI → User Review Event → MemoryService 全链路按 scope 传递；TUI 行键为 `"{scope}:{id}"`，中文标签 全局 / 项目 / 本地，窄屏同样可见。
+- Pending 永不注入。接受前按目标 CAS（revision + digest）校验；目标已变时拒绝旧 UI 的覆盖，不静默改写。
+- 权限：真实 TUI 用户评审可以 accept；模型工具没有 accept/reject 动作；CLI/客户端的 `UserInvocationId` 由可信投递路径（`command_id`）在运行时侧铸造，argv 不能伪造；Full Access 不改变域 Authority；headless `run` 保持 Pending；没有第二套审批机制。
+
+#### 2.11.3 Worker 恢复与幂等
+
+- 取消不再被当成“没有可学内容”：`ensure_running` 在提取前后各检查一次，取消时 claim 保持 `failed_retryable`，不写入 Store。
+- 崩溃点测试：
+  - 模型已返回、落盘前崩溃 → 重新提取，事实只写一次；
+  - staged answer 已落盘、应用前崩溃 → 回放 staged answer，不再调用 provider；
+  - 部分候选有效 → 有效者应用，无效者计入 `rejected`，不整体丢弃；
+  - provider 失败 → `failed_retryable`，Store 不出现 Active/Pending。
+- 重复处理同一答案不会产生第二个 Verified；Experience 的 `verified` 只来自 runtime 观测到的 failure → resolution 证据。
+
+#### 2.11.4 真实 E3 / Dogfood 状态
+
+2026-10-23 使用真实 DeepSeek Flash、隔离 `LEVELER_HOME`、隔离项目与 Store 运行（lab 目录 `dogfood/scratch/m2-stage21-*`，未读写真实用户 Memory）：
+
+| 场景 | 结果 | 证据 |
+| --- | --- | --- |
+| U1 无 subject 的 `/remember` | PASS | 一条 `user_explicit`、无 subject、无 pending 的 Active；`user_turn` span + `user_command` invocation |
+| U2 自然重述 / extractor 收敛 | NOT_VERIFIED | 两轮自然重述后 extractor 未产生新候选（既有 current 事实的确认按契约不生成候选），因此没有可观察的重复写入；未出现重复 Active |
+| U2b 工具身份收敛 | PASS | 同一 subject 的相同写入被 `Skipped{Identical}`，不同 subject 保持两条 Active |
+| U3 按 ID 纠正 | PASS | 模型 update 先 Pending；TUI `/memory accept project:<id>` 后同一 ID revision 2，history 保留旧值，队列清空 |
+| U5 跨会话一致性 | PASS | 新会话看到同一 ID、revision 2、旧 revision 与空的待确认队列 |
+| U6a 受保护事实 | PASS | extractor 的结构化 supersede 因 `protected_user_fact` 停在 Pending；非正式建议未改变正式值；模型按 ID 更新仍停在 Pending |
+| D6 多 scope review | PASS | 全局与本地 pending 在 TUI 中带中文 scope 标签，接受后落入各自 scope；64 列窄屏仍显示 `[全局]` / `[项目]` |
+| P11 重启 | PASS | 同一 ID 与 revision 在重启后仍是 current |
+| P14 无人值守 global 写入 | PASS | Assisted 下停在 Pending，未成为 Active |
+| P15 headless | PASS | 非交互 `run` 的 global 写入停在 Pending |
+| P16 user lane 关闭 | PASS | 工具与自动提取都没有写入 |
+| P12/P13 Experience | PASS | 真实 `cargo test` 失败（exit 101）→ 修复 → 通过（exit 0），生成 `runtime_observed` 且 `verification:verified` 的 experience；lane 关闭时不写入 |
+
+未验证 / 不声称：
+
+- U2 的“自动 extractor 在跨轮重述时收敛”没有被真实模型触发；当前证据只到“没有重复 Active”和“工具路径精确收敛”。
+- U6a 的“模型按 ID 更新”一轮中，该目标此前已有 pending proposal，模型的尝试走的是既有队列，没有新增 proposal；受保护值未变这一属性成立。
+- 真实进程崩溃 / 真实 provider 中断的恢复由确定性测试覆盖，没有在生产进程中注入崩溃。
+- 跨平台（Windows 文件语义）未验证。
+
+#### 2.11.5 剩余风险
+
+1. 直接命令正文里嵌套的较窄事实仍可能被 extractor 生成第二条结构化记录；当前明确不做正文相似度合并，需要后续显式身份收敛。
+2. 真实 UI 还没有“给无 subject 的用户记忆补 subject”的入口；service 层已支持，UI 未实现。
+3. Pending 行本身的 UI 内容没有版本校验：accept 时按当前 pending 重新读取；target 的 Update/Supersede 有 CAS，但 UI 展示内容与提交内容之间没有独立 digest 回传。
+4. `direct_owner_for` 依赖精确 span 包含关系；措辞 paraphrase 的跨轮重述不会被判定为同一事实，这是不引入语义相似度的明确边界。
 
 ---
 
@@ -700,7 +763,7 @@ Stage 1 (store/schema/journal/lifecycle)
 
 ### 7.3 如何保证一个事实一个当前版本？
 
-- 身份 = `(scope, kind, subject_key)`；新 user fact 必须有 subject_key（迁移 keyless 例外，标 `legacy.keyless`）。
+- 身份 = `(scope, kind, subject_key)`；自动/模型写入的 user fact 必须有 subject_key（迁移 keyless 例外，标 `legacy.keyless`）。可信用户显式写入（`/remember`、`记住：…`、User Review）可以无 subject_key，记录身份是稳定 `MemoryId`；不伪造 subject、不按正文相似度合并。Stage 2.1 实现见 `crates/leveler-memory/src/v2/store.rs` 的 keyless 守卫与 `service.rs` 的显式命令路径。
 - 同身份 active 唯一是 store invariant；写入在锁内复查，index 只加速。
 - 同身份不同值：受保护用户事实（receipt `user_explicit`/`user_approved`）只能 User 命令/review 直接更新，Model/Runtime 一律 pending；目标不受保护时按 authority/新 evidence 决定 supersede 或 pending。
 - 不同 subject 的相同 body 是两条独立事实，只提示 `possible_duplicate`；不同 subject 的不同值不判冲突。
@@ -714,7 +777,7 @@ Stage 1 (store/schema/journal/lifecycle)
 
 | 缺陷 | v2 修复 | 仍然不能证明 |
 | --- | --- | --- |
-| U1 同轮双写 | 可信用户命令对同 subject 拥有优先权；extractor 同 subject 返回 `Skipped`；不同 subject 仍按各自 OpId 准入；模型工具走同一 service 的显式 OpId 幂等 | 不同措辞、不同 subject 的跨轮重述仍可能两条 |
+| U1 同轮双写 | 直接命令的写入以 Memory ID 为身份；extractor 候选仅当 evidence span 精确包含于命令正文时 `Skipped{DirectCommandOwned}`，同轮其它独立事实按各自 OpId 准入；模型工具走同一 service 的显式 OpId 幂等 | 不同措辞、不同 subject 的跨轮重述仍可能两条 |
 | U2 subject 分裂 | 身份只由 `subject_key` 决定；同 body 跨 subject 不合并，只提示 `possible_duplicate`；known_identities 让模型复用 id/subject；related_subject 只做一次性 target，不造别名 | paraphrase 不合并；相同 body 不同 subject 仍是两条 |
 | U3 不完整纠正 | known_identities 生产接线；`replaces_memory_id` 必须命中；keyless 迁移 successor；target 缺失 → pending，不猜 | 模型不给 id 且无法匹配时，仍需用户确认 |
 | U5 跨会话矛盾 | 只读 active + receipt；superseded 退出 current；Markdown 是跨会话唯一权威；resume 重建；keyless 迁移 | 不同 subject 的矛盾仍并存；需要用户/主模型判断 |
@@ -772,6 +835,7 @@ Stage 1 (store/schema/journal/lifecycle)
 8. 迁移冲突组/人工 review 负担；写后回滚成本高。
 9. 事件日志体积/保留策略；注入 digest 可审计但不能还原 body（需要 history 仍在）。
 10. 自动提取的 provider 质量/成本；malformed/超时不是“没有可学内容”。
+11. 显式无 subject 的用户记录身份是 Memory ID，不与结构化 subject 自动合并；正文中嵌套的较窄事实仍可能生成第二条结构化记录；当前 UI 没有补 subject 的入口，Pending 展示内容也没有独立 digest 回传。
 
 ### 7.10 Stage 1 是否可以开始？
 

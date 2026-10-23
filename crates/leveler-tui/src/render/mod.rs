@@ -1535,22 +1535,25 @@ fn render_memory_review(frame: &mut Frame, body: Rect, state: &mut AppState) {
     let mut focus_line = 0usize;
     for candidate in &state.memory.pending {
         let line = lines.len();
-        rows.push((line, candidate.id.clone()));
-        let focused = state.memory.focus.as_deref() == Some(candidate.id.as_str());
+        let key = crate::memory::row_key(candidate.scope, &candidate.id);
+        rows.push((line, key.clone()));
+        let focused = state.memory.focus.as_deref() == Some(key.as_str());
         if focused {
             focus_line = line;
         }
         let cursor = if focused { "❯ " } else { "  " };
-        let checkbox = if state.memory.selected.contains(&candidate.id) {
+        let checkbox = if state.memory.selected.contains(&key) {
             "[✓] "
         } else {
             "[ ] "
         };
+        let scope = crate::memory::scope_label(candidate.scope, &t);
+        let heading = format!("[{scope}] {}", candidate.title);
         let title_room = width.saturating_sub(6).max(1);
         lines.push(Line::from(vec![
             Span::styled(cursor, Style::default().fg(theme.accent.primary)),
             Span::styled(checkbox, Style::default().fg(theme.accent.primary)),
-            Span::raw(truncate_display(&candidate.title, title_room)),
+            Span::raw(truncate_display(&heading, title_room)),
         ]));
         // The body is the evidence behind the title. When it says the same
         // thing, showing it twice is noise; when it differs, one wrapped
@@ -1599,18 +1602,18 @@ fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, ac
     let mut focus_line = 0usize;
     for entry in entries {
         let line = lines.len();
-        rows.push((line, entry.id.clone()));
-        let focused = state.memory.focus.as_deref() == Some(entry.id.as_str());
+        let key = crate::memory::row_key(entry.scope, &entry.id);
+        rows.push((line, key.clone()));
+        let focused = state.memory.focus.as_deref() == Some(key.as_str());
         if focused {
             focus_line = line;
         }
         let cursor = if focused { "❯ " } else { "  " };
+        let scope = crate::memory::scope_label(entry.scope, &t);
+        let heading = format!("[{scope}] {}", entry.title);
         let mut spans = vec![
             Span::styled(cursor, Style::default().fg(theme.accent.primary)),
-            Span::raw(truncate_display(
-                &entry.title,
-                width.saturating_sub(4).max(1),
-            )),
+            Span::raw(truncate_display(&heading, width.saturating_sub(4).max(1))),
         ];
         if entry.sensitive {
             spans.push(Span::styled(
@@ -1632,6 +1635,10 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(candidate) = state.memory.focused_candidate() {
         let title = candidate.title.trim();
+        let heading = format!(
+            "[{}] {title}",
+            crate::memory::scope_label(candidate.scope, &t)
+        );
         let body_text = candidate.body.trim();
         // The title appears once. A body that merely repeats it is not shown
         // a second time.
@@ -1639,14 +1646,14 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
         {
             push_memory_wrapped(
                 &mut lines,
-                title,
+                &heading,
                 width,
                 Style::default().fg(theme.text.primary),
             );
         } else {
             push_memory_wrapped(
                 &mut lines,
-                title,
+                &heading,
                 width,
                 Style::default()
                     .fg(theme.text.primary)
@@ -1680,19 +1687,20 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
         }
     } else if let Some(entry) = state.memory.focused_entry() {
         let title = entry.title.trim();
+        let heading = format!("[{}] {title}", crate::memory::scope_label(entry.scope, &t));
         let body_text = entry.body.trim();
         if normalize_memory_text(title) == normalize_memory_text(body_text) || body_text.is_empty()
         {
             push_memory_wrapped(
                 &mut lines,
-                title,
+                &heading,
                 width,
                 Style::default().fg(theme.text.primary),
             );
         } else {
             push_memory_wrapped(
                 &mut lines,
-                title,
+                &heading,
                 width,
                 Style::default()
                     .fg(theme.text.primary)
@@ -5448,6 +5456,7 @@ mod tests {
     ) -> leveler_client_protocol::UiMemoryCandidate {
         leveler_client_protocol::UiMemoryCandidate {
             id: id.into(),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
             title: title.into(),
             body: body.into(),
             kind: "convention".into(),
@@ -5458,6 +5467,7 @@ mod tests {
     fn memory_entry(id: &str, title: &str) -> leveler_client_protocol::UiMemoryEntry {
         leveler_client_protocol::UiMemoryEntry {
             id: id.into(),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
             title: title.into(),
             body: title.into(),
             kind: Some(leveler_client_protocol::UiMemoryKind::Note),
@@ -5653,6 +5663,7 @@ mod tests {
             crate::memory::MemoryView::Detail,
             vec![leveler_client_protocol::UiMemoryEntry {
                 id: "mem-a".into(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 title: "数据库操作".into(),
                 body: "允许重置数据库".into(),
                 kind: Some(leveler_client_protocol::UiMemoryKind::Note),
@@ -5684,7 +5695,7 @@ mod tests {
             })
             .collect();
         let mut state = memory_state(crate::memory::MemoryView::Review, vec![], vec![], pending);
-        state.memory.focus = Some("cand-29".into());
+        state.memory.focus = Some("project:cand-29".into());
         let text = render_text(&mut state, 48, 20);
         assert!(text.contains("候选编号29"), "{text}");
         let focused = text

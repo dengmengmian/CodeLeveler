@@ -385,6 +385,10 @@ impl Tool for MemoryTool {
                     value: args.value,
                     tags: args.tags,
                     expires_at: args.expires_at.map(Some),
+                    // Only a person may attach a structured identity to their
+                    // own explicit memory; the model tool cannot rename an
+                    // existing fact's identity.
+                    subject: None,
                 };
                 let outcome = service
                     .update(&actor, scope, &id, expected, patch)
@@ -437,25 +441,18 @@ struct RememberArgs {
     title: String,
     body: String,
     /// The durable subject this fact is about, e.g. `project.default_model`.
-    /// Required: without a stable identity the lifecycle cannot tell an update
-    /// from a new fact, so the model must state what the fact is about.
     subject: String,
-    /// How this memory should reach future turns. Required of the model
-    /// rather than defaulted silently: `preference` is paid for on EVERY
-    /// later turn, so it must be a choice, not an accident.
+    /// How this memory reaches future turns.
     kind: ToolMemoryKind,
     #[serde(default)]
     tags: Vec<String>,
-    /// The structured value this subject holds, when the fact has one. Kept
-    /// apart from the prose body so a later structured comparison (and the
-    /// exact-value checks in admission) does not have to parse prose.
+    /// The structured value of the subject, kept apart from the prose body.
     #[serde(default)]
     value: Option<String>,
     /// Absolute RFC3339 instant after which the fact is no longer current.
     #[serde(default)]
     expires_at: Option<String>,
-    /// A rationale kept by the legacy store. It is not evidence about the
-    /// user: the Markdown backend records the call identity instead.
+    /// A rationale kept by the legacy store; not evidence about the user.
     #[serde(default)]
     evidence: Option<String>,
     /// Storage scope: project (default) | local | global.
@@ -473,8 +470,7 @@ enum ToolMemoryKind {
     Decision,
     /// Anything else worth keeping; same reach as a decision.
     Note,
-    /// A fact about the user or the project. On the Markdown backend this is
-    /// the canonical kind; the other labels survive as tags.
+    /// A fact about the user or the project.
     UserFact,
 }
 
@@ -522,14 +518,10 @@ impl Tool for RememberTool {
          makes the fact stop being current at that instant. `subject` is the stable fact \
          identity (e.g. `project.default_model`): a later value for the same \
          subject updates the current memory instead of adding a second entry. \
-         Auto and Restricted require a person to approve the proposal before it \
-         becomes active; Full permits the write without a separate permission \
-         prompt. With nobody to ask, the proposal may stay pending. The entry \
-         records model-inference authority: approval does not claim the user \
-         stated it, and it never replaces a fact the user wrote directly — a \
-         conflict waits for a person. A new project fact may become current \
-         immediately; a change to a user-owned fact is queued for the user. \
-         `preference` is injected into later turns. `decision` and `note` are \
+         Approval, authority and pending behaviour are governed by the Memory \
+         section of the system prompt; a change to a user-owned fact is queued \
+         for the user. \
+         `preference` is injected into later turns; `decision` and `note` are \
          retrieved by relevance or title. `forget` archives an id. Secrets are \
          not a valid body."
     }
@@ -566,7 +558,9 @@ impl Tool for RememberTool {
             .as_deref()
             .expect("model_actor requires a call identity");
         let request = RememberRequest {
-            op_id: format!("remember:{tool_call}"),
+            // Provider tool-call ids are opaque; derive a journal-safe
+            // spelling that still identifies this exact call on retry.
+            op_id: leveler_memory::v2::OpId::derived("remember", tool_call),
             scope,
             title: args.title,
             body: args.body,
@@ -703,6 +697,60 @@ mod tests {
             .await
             .unwrap();
         assert!(listed.content.contains("Prefer workspace-write"));
+    }
+
+    /// Provider tool-call ids are opaque; the remembered operation id must
+    /// still be journal-safe. A call id outside `[A-Za-z0-9_\-:.]` must write
+    /// instead of failing with `invalid operation id`, and a retry of the exact
+    /// same call must replay rather than write twice.
+    #[tokio::test]
+    async fn an_opaque_tool_call_id_still_writes_and_replays() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("memory");
+        let state = dir.path().join("state");
+        let service = Arc::new(leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::markdown().with_project(
+                leveler_memory::v2::ScopeRoots::new(
+                    leveler_memory::v2::MemoryScope::Project,
+                    current.clone(),
+                    state,
+                ),
+            ),
+        ));
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .with_session_scope("test-session")
+            .with_turn_scope("test-turn")
+            .with_tool_call_scope("call|opaque/with spaces");
+        let tool = RememberTool::new(MemoryRoot::from_service(Some(service)));
+        let arguments = serde_json::json!({
+            "title": "用 pnpm",
+            "body": "本仓库统一用 pnpm，不要用 npm。",
+            "kind": "preference",
+            "subject": "package_manager",
+            "value": "pnpm",
+        });
+        let out = tool
+            .execute(arguments.clone(), ctx.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let replayed = tool
+            .execute(arguments, ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!replayed.is_error, "{}", replayed.content);
+        assert!(
+            replayed.content.contains("replayed; already applied"),
+            "a retried call is the same operation: {}",
+            replayed.content
+        );
+        let active: Vec<_> = std::fs::read_dir(&current)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(active.len(), 1, "the retry must not write twice");
     }
 
     #[tokio::test]

@@ -346,6 +346,30 @@ impl MemoryService {
         }
     }
 
+    /// The scopes this service can address, in review-surface order.
+    ///
+    /// A listing covers exactly these stores. Legacy storage has no scope
+    /// dimension, so it reports only the project store it actually is.
+    pub fn configured_scopes(&self) -> Vec<ServiceScope> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => {
+                if self.roots.legacy_root.is_some() {
+                    vec![ServiceScope::Project]
+                } else {
+                    Vec::new()
+                }
+            }
+            MemoryBackend::Markdown => [
+                ServiceScope::Global,
+                ServiceScope::Project,
+                ServiceScope::Local,
+            ]
+            .into_iter()
+            .filter(|scope| self.roots.scope_roots(*scope).is_some())
+            .collect(),
+        }
+    }
+
     /// The legacy store root, when this service is on the legacy backend.
     pub fn legacy_root(&self) -> Option<&std::path::Path> {
         self.roots.legacy_root.as_deref()
@@ -977,13 +1001,15 @@ impl MemoryService {
                     content_hash(&patch)
                 ))
                 .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let admission = service.update(
-                    actor,
-                    op,
-                    &id,
-                    patch.into_patch(),
-                    record.cas,
-                )?;
+                let mut patch = patch.into_patch();
+                // A revision is a new write: keep the sources that still
+                // support the record and add the operation that produced this
+                // revision. Without it the old revision's source would be the
+                // only audit trail for new content.
+                let mut evidence = record.record.frontmatter.source_refs.clone();
+                evidence.push(actor.provenance());
+                patch.evidence = Some(evidence);
+                let admission = service.update(actor, op, &id, patch, record.cas)?;
                 Ok(markdown_outcome(service, admission))
             }
         }
@@ -1228,15 +1254,22 @@ pub struct UpdateRequest {
     pub value: Option<String>,
     pub tags: Option<Vec<String>>,
     pub expires_at: Option<Option<String>>,
+    /// Give an explicit (keyless) record a structured identity. The same
+    /// string is the display subject and the subject key; `None` means the
+    /// existing identity is unchanged.
+    pub subject: Option<String>,
 }
 
 impl UpdateRequest {
     fn into_patch(self) -> v2::RecordPatch {
+        let subject = self.subject.filter(|subject| !subject.trim().is_empty());
         v2::RecordPatch {
             title: self.title,
             body: self.body,
             value: self.value,
             tags: self.tags,
+            subject: subject.clone(),
+            subject_key: subject,
             expires_at: match self.expires_at {
                 Some(value) => Some(
                     value
@@ -1264,6 +1297,11 @@ fn content_hash(value: &UpdateRequest) -> u64 {
     value.value.hash(&mut hasher);
     value.tags.hash(&mut hasher);
     value.expires_at.hash(&mut hasher);
+    // Only mix in a subject when one is requested, so an update without an
+    // identity change keeps the operation id it had before subjects existed.
+    if let Some(subject) = &value.subject {
+        subject.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
