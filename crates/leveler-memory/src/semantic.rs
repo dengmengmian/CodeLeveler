@@ -667,6 +667,12 @@ pub fn normalize_subject(raw: &str) -> String {
     // the model may capitalize it. Only the dotted form is folded;
     // `project_foo` is its own name.
     let raw = raw.trim().to_lowercase();
+    // A stored identity is fed back to writers as the subject to reuse.
+    // Mapping the key's separators to `_` would make it a new label, so the
+    // extractor's second pass would nest the namespace (`k-k-...`).
+    if crate::lifecycle::is_canonical_key(&raw) {
+        return raw;
+    }
     let raw = raw.strip_prefix("project.").unwrap_or(raw.as_str());
     let mut normalized = String::with_capacity(raw.len());
     for character in raw.chars() {

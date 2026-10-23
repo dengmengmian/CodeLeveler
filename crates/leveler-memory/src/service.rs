@@ -1528,10 +1528,17 @@ pub struct UpdateRequest {
     pub value: Option<String>,
     pub tags: Option<Vec<String>>,
     pub expires_at: Option<Option<String>>,
-    /// Give an explicit (keyless) record a structured identity. The same
-    /// string is the display subject and the subject key; `None` means the
-    /// existing identity is unchanged.
+    /// Give an explicit (keyless) record a structured identity. The string is
+    /// the display subject; its canonical form is the subject key. `None`
+    /// means the existing identity is unchanged.
     pub subject: Option<String>,
+}
+
+/// Stored identity for a caller-supplied subject label. The label is kept for
+/// display; identity folds spelling exactly like the automatic extractor, so
+/// every writer agrees on which facts are the same.
+fn canonical_subject_key(subject: &str) -> String {
+    crate::semantic_key_of(&crate::normalize_subject(subject))
 }
 
 impl UpdateRequest {
@@ -1542,8 +1549,8 @@ impl UpdateRequest {
             body: self.body,
             value: self.value,
             tags: self.tags,
-            subject: subject.clone(),
-            subject_key: subject,
+            subject_key: subject.as_deref().map(canonical_subject_key),
+            subject,
             expires_at: match self.expires_at {
                 Some(value) => Some(
                     value
@@ -1874,8 +1881,14 @@ impl RememberRequest {
         // A trusted direct command (`记住：…`, `/remember`) has no structured
         // subject: it is stored as a keyless fact, exactly like the legacy
         // direct note. The model tool contract requires `subject` at its own
-        // boundary, where the model is the one supplying meaning.
-        let subject_key = self.subject.filter(|subject| !subject.trim().is_empty());
+        // boundary, where the model is the one supplying meaning. The label is
+        // folded into the same canonical identity the automatic extractor
+        // uses; otherwise two spellings become two active facts.
+        let subject_key = self
+            .subject
+            .as_deref()
+            .filter(|subject| !subject.trim().is_empty())
+            .map(canonical_subject_key);
         let mut tags = self.tags;
         // The v2 record kind has no preference/decision/note distinction. The
         // declared label stays visible as a tag instead of becoming an

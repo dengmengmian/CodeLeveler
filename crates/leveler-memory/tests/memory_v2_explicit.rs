@@ -527,7 +527,42 @@ fn a_user_can_give_an_explicit_memory_a_structured_subject() {
     let entries = active(&service);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].id, id);
-    assert_eq!(entries[0].subject_key.as_deref(), Some("package_manager"));
+    assert_eq!(entries[0].subject_key.as_deref(), Some("k-package-manager"));
+}
+
+/// A model-supplied subject is a label; the stored identity is the canonical
+/// semantic key, so the model path and the automatic extractor agree on which
+/// facts are the same. Without this, one spelling is a second active record.
+#[test]
+fn a_model_subject_uses_the_canonical_identity_key() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = open_service(&fixture);
+    let outcome = service
+        .remember(
+            &model(),
+            RememberRequest {
+                op_id: "model:1".to_string(),
+                scope: ServiceScope::Project,
+                title: "发布使用蓝色通道部署".to_string(),
+                body: "发布使用蓝色通道部署。".to_string(),
+                kind: "preference".to_string(),
+                subject: Some("deploy.channel".to_string()),
+                value: None,
+                tags: Vec::new(),
+                evidence: None,
+                expires_at: None,
+                replaces_id: None,
+            },
+        )
+        .unwrap();
+    applied(outcome);
+    let entries = active(&service);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].subject_key.as_deref(),
+        Some("k-deploy-channel"),
+        "the model's label must map to the extractor's canonical key"
+    );
 }
 
 /// The model may suggest an identity, but the conversion is parked for the
@@ -615,7 +650,7 @@ fn a_subject_already_in_use_waits_and_a_forced_merge_is_refused() {
     );
     let keyed_active = active(&service)
         .into_iter()
-        .filter(|entry| entry.subject_key.as_deref() == Some("package_manager"))
+        .filter(|entry| entry.subject_key.as_deref() == Some("k-package-manager"))
         .count();
     assert_eq!(keyed_active, 1, "no second Active under the same subject");
     let _ = structured;
