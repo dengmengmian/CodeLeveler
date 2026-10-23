@@ -186,7 +186,7 @@ pub async fn drive_turn(
     };
 
     let mut executor: Executor = factory
-        .build(profile, task_text.as_deref())
+        .build(profile, task_text.as_deref(), Some(turn_id.clone()))
         .await
         .map_err(|error| TurnFailure {
             cancelled: false,

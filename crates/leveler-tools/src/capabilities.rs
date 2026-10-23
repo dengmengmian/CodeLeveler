@@ -34,9 +34,9 @@ pub struct Capabilities {
     /// Where oversized command output is spilled (content-addressed) instead
     /// of being truncated. `None` truncates with a marker.
     pub artifact_store: Option<Arc<ArtifactStore>>,
-    /// Durable project memory root. `None` means memory is unconfigured, and
+    /// The unified memory service. `None` means memory is unconfigured, and
     /// the memory tools say so rather than inventing a location.
-    pub memory_root: Option<PathBuf>,
+    pub memory: Option<Arc<leveler_memory::MemoryService>>,
     /// Which memory lanes the tools may expose. The root can be present while
     /// one lane is closed; that lane's entries must stay invisible.
     pub memory_lanes: leveler_memory::MemoryLanes,
@@ -64,7 +64,7 @@ impl Capabilities {
             lsp: Arc::new(leveler_lsp::LspSessions::new(environment.clone())),
             background_tasks: Arc::new(BackgroundTaskRegistry::with_environment(environment)),
             artifact_store: None,
-            memory_root: None,
+            memory: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             browser: None,
             search_provider: None,
@@ -77,9 +77,19 @@ impl Capabilities {
         self
     }
 
-    /// The project memory store directory (`active/` + `archive/`).
+    /// A legacy JSON store rooted at `root`. Kept for callers that only know a
+    /// store directory (one-shot runs and tests); the app hands over the
+    /// configured service instead.
     pub fn with_memory_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.memory_root = Some(root.into());
+        self.memory = Some(Arc::new(leveler_memory::MemoryService::legacy(
+            root.into(),
+        )));
+        self
+    }
+
+    /// The unified memory service, already bound to the configured backend.
+    pub fn with_memory_service(mut self, service: leveler_memory::MemoryService) -> Self {
+        self.memory = Some(Arc::new(service));
         self
     }
 

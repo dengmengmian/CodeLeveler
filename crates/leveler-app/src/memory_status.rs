@@ -8,7 +8,7 @@
 use leveler_client_protocol::{
     UiMemoryExperience, UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryStatus,
 };
-use leveler_memory::{MemoryKind, MemoryStore, is_sensitive, is_sensitive_candidate};
+use leveler_memory::{MemoryView, ServiceScope};
 use leveler_storage::{ExperienceInboxRepository, MemoryInboxRepository};
 
 use crate::{AppError, Application};
@@ -115,25 +115,30 @@ fn count_u32(value: u64) -> u32 {
 
 /// Build the status surface from the store and the durable inbox.
 pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
-    let store = MemoryStore::open(app.layout.memory_dir())
+    // Status reads the same service writes go to, so the numbers describe the
+    // store the project is actually using. Current truth only: crash residue
+    // or an expired entry must not inflate the active count.
+    let service = app.memory_service();
+    let actor = leveler_memory::v2::Actor::User {
+        invocation: leveler_memory::v2::UserInvocationId::mint("ui:memory-status"),
+    };
+    let active = service
+        .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
         .map_err(|error| AppError::Engine(format!("memory: {error}")))?;
-    // Status reports current truth, not raw files: crash residue or an expired
-    // entry must not inflate the active count.
-    let active = store
-        .effective_active()
+    let pending = service
+        .pending(&actor, ServiceScope::Project)
         .map_err(|error| AppError::Engine(format!("memory: {error}")))?;
-    let pending = store
-        .list_pending()
+    let archived = service
+        .archived(
+            &actor,
+            ServiceScope::Project,
+            leveler_memory::MemoryLanes::ALL,
+            None,
+        )
         .map_err(|error| AppError::Engine(format!("memory: {error}")))?;
-    let archived = store
-        .list_archived()
-        .map_err(|error| AppError::Engine(format!("memory: {error}")))?;
-    let sensitive = active.iter().filter(|entry| is_sensitive(entry)).count()
-        + archived.iter().filter(|entry| is_sensitive(entry)).count()
-        + pending
-            .iter()
-            .filter(|candidate| is_sensitive_candidate(candidate))
-            .count();
+    let sensitive = active.iter().filter(|view| view.sensitive).count()
+        + archived.iter().filter(|view| view.sensitive).count()
+        + pending.iter().filter(|view| view.sensitive).count();
 
     let db = app.open_database().await?;
     let repo = MemoryInboxRepository::new(&db);
@@ -165,26 +170,18 @@ pub async fn report(app: &Application) -> Result<UiMemoryStatus, AppError> {
         .map(sanitize_error)
         .filter(|error| !error.is_empty());
 
-    let experience_active = active
-        .iter()
-        .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
-        .collect::<Vec<_>>();
+    let is_experience = |view: &&MemoryView| view.is_experience();
+    let experience_active = active.iter().filter(is_experience).collect::<Vec<_>>();
     let experience_verified = experience_active
         .iter()
-        .filter(|entry| {
-            entry.experience.as_ref().is_some_and(|record| {
-                record.standing() == leveler_memory::ExperienceStanding::VerifiedResolution
-            })
+        .filter(|view| {
+            view.experience
+                .as_ref()
+                .is_some_and(|experience| experience.standing == "verified")
         })
         .count();
-    let experience_pending = pending
-        .iter()
-        .filter(|candidate| candidate.experience.is_some())
-        .count();
-    let experience_archived = archived
-        .iter()
-        .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
-        .count();
+    let experience_pending = pending.iter().filter(is_experience).count();
+    let experience_archived = archived.iter().filter(is_experience).count();
     let experience_repo = ExperienceInboxRepository::new(&db);
     let experience_counts = experience_repo.counts().await?;
     let last_experience = experience_repo

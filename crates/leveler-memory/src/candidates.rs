@@ -103,6 +103,12 @@ pub struct MemoryCandidate {
     /// exists; it never infers a relation from wording similarity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_key: Option<String>,
+    /// The exact active memory this candidate replaces, when the model named
+    /// an id from the supplied identity catalog. This reaches entries that
+    /// have no semantic key (legacy direct notes). The runtime resolves the
+    /// id against active memory; an unresolvable id is parked, never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_id: Option<String>,
     /// The value the fact assigns, when it is an assignment. Compared exactly
     /// as a structured field, so "same subject, same value" never depends on
     /// comparing two sentences.
@@ -173,6 +179,7 @@ impl MemoryCandidate {
             semantic_key: key.clone(),
             key,
             related_key: None,
+            replaces_id: None,
             value: None,
             fingerprint,
             source,

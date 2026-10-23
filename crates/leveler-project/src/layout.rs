@@ -206,6 +206,37 @@ impl Layout {
         self.state_dir.join("memory")
     }
 
+    /// Markdown current records for project scope (`<repo>/.leveler/memory`).
+    /// `None` when the layout has no workspace.
+    pub fn markdown_memory_dir(&self) -> Option<PathBuf> {
+        self.repo_root
+            .as_ref()
+            .map(|root| root.join(".leveler").join("memory"))
+    }
+
+    /// Markdown current records for local scope (`<repo>/.leveler/local/memory`).
+    /// `None` when the layout has no workspace.
+    pub fn local_memory_dir(&self) -> Option<PathBuf> {
+        self.repo_root
+            .as_ref()
+            .map(|root| root.join(".leveler").join("local").join("memory"))
+    }
+
+    /// Markdown current records for global scope (`<home>/memory`).
+    pub fn global_memory_dir(&self) -> PathBuf {
+        self.home.root().join("memory")
+    }
+
+    /// Private Markdown state root for a scope. Always outside the repository;
+    /// `global` lives under the home state dir rather than a project state dir.
+    pub fn memory_v2_state_dir(&self, scope: &str) -> PathBuf {
+        if scope == "global" {
+            self.home.state_dir().join("memory-v2").join("global")
+        } else {
+            self.state_dir.join("memory-v2").join(scope)
+        }
+    }
+
     /// ApproveAlways permission-rules file (`<state_dir>/permissions.yaml`,
     /// next to `sessions.db`) — machine-written per-user state, kept out of
     /// the repo.

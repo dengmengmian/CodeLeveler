@@ -121,3 +121,27 @@ hits = 2
 reason = exact line-set containment under one declared identity; no fuzzy similarity and no identity is inferred from it
 owner = memory-lifecycle
 test = a_strict_superset_merges_instead_of_duplicating
+---
+file = crates/leveler-memory/src/v2/path.rs
+symbol = list_markdown
+construct = text-predicate
+hits = 1
+reason = filename protocol: the current and pending roots contain Markdown records; a file with another suffix is not memory content
+owner = memory-lifecycle
+test = non_memory_files_in_store_directories_are_ignored
+---
+file = crates/leveler-memory/src/v2/path.rs
+symbol = list_json
+construct = text-predicate
+hits = 1
+reason = filename protocol: the journal directory contains JSON journals; a file with another suffix is not transaction state
+owner = memory-lifecycle
+test = non_memory_files_in_store_directories_are_ignored
+---
+file = crates/leveler-memory/src/v2/store.rs
+symbol = cleanup_orphans
+construct = text-predicate
+hits = 1
+reason = atomic-write protocol: `.tmp-` names are this store's own partial writes and never memory content
+owner = memory-lifecycle
+test = stray_atomic_write_temporaries_are_cleaned

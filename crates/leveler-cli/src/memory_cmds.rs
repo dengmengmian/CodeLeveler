@@ -1,24 +1,52 @@
 //! CLI surface for project-scoped durable memory (WM-04).
 //!
-//! Store root: [`Layout::memory_dir`]. Agent-side `remember`/`forget` tools still
-//! require interactive approval (K36). These subcommands are **user-authoritative**
-//! writes — the human is managing memory directly (including pending accept).
+//! Every read and write goes through the unified [`MemoryService`], so the
+//! backend the project selects (`legacy` JSON or `markdown`) is the only store
+//! this command touches.
+//!
+//! This is a plain local process, so it cannot mint a user actor: a model with
+//! shell access can run the same argv. Writes therefore run as
+//! [`Actor::External`]; the service may queue them as pending or reject them,
+//! but it never turns a CLI argument into user authority. Trusted user review
+//! (accept/reject/restore and direct activation) is available only from the
+//! TUI/desktop, where the command handler mints `UserInvocationId` in process.
+//!
+//! `audit`, `audit-identity` and `scrub` are legacy-store maintenance
+//! operations with no markdown equivalent; they refuse on a markdown project
+//! instead of opening a store the project does not use.
 
+use std::path::Path;
+
+use leveler_core::MemoryBackend;
 use leveler_memory::{
-    CandidateKind, CandidateSource, MemoryCandidate, MemoryEntry, MemoryKind, MemoryStore,
-    ProposeOutcome, is_sensitive, is_sensitive_candidate, redact_candidate, title_from_body,
+    MemoryLanes, MemoryService, MemoryStore, MemoryView, RememberRequest, ReviewRequest, ServiceError,
+    ServiceScope, WriteOutcome,
+    v2::{Actor, DiagnosticReport, DiagnosticSeverity, MarkdownStore, ScopeRoots},
 };
 use leveler_project::Layout;
 
-use crate::cli::MemoryCommand;
+use crate::cli::{MemoryCommand, MemoryKindArg, MemoryScopeArg};
 use crate::output::Line;
 
+fn external_actor() -> Actor {
+    Actor::External
+}
+
+/// Whether a listed record belongs to an enabled lane.
+fn lane_allows(lanes: MemoryLanes, view: &MemoryView) -> bool {
+    if view.is_experience() {
+        lanes.experience
+    } else {
+        lanes.user
+    }
+}
+
 /// A stored title is safe to print only when the record is not credential-shaped.
-fn safe_title(entry: &MemoryEntry) -> &str {
-    if is_sensitive(entry) {
+fn view_title(view: &MemoryView) -> &str {
+    if view.sensitive {
         leveler_memory::REDACTED_TITLE
     } else {
-        &entry.title
+        &view.title
     }
 }
 
@@ -26,343 +54,630 @@ fn safe_title(entry: &MemoryEntry) -> &str {
 /// user-stated fact in a one-line listing. The label is the standing the
 /// evidence supports, not the stored flag: an observation-only constraint is
 /// `已观察`, never `已验证`.
-fn experience_suffix(entry: &MemoryEntry) -> String {
-    match entry.experience.as_ref() {
+fn experience_suffix(view: &MemoryView) -> String {
+    match view.experience.as_ref() {
         None => String::new(),
         Some(experience) => format!(
             " [经验·{}]",
-            match experience.standing() {
-                leveler_memory::ExperienceStanding::VerifiedResolution => "已验证",
-                leveler_memory::ExperienceStanding::Observed => "已观察",
-                leveler_memory::ExperienceStanding::Inferred => "推断",
+            match experience.standing.as_str() {
+                "verified" => "已验证",
+                "observed" => "已观察",
+                _ => "推断",
             }
         ),
     }
+}
+
+/// A per-invocation operation id for a CLI write.
+///
+/// A repeated command is a new human intent, so this is deliberately not a
+/// content digest: saving the same note twice must not silently replay the
+/// first write.
+fn cli_op_id(verb: &str) -> String {
+    format!(
+        "cli:{verb}:{}:{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_micros()
+    )
+}
+
+fn kind_label(kind: MemoryKindArg) -> &'static str {
+    match kind {
+        MemoryKindArg::Preference => "preference",
+        MemoryKindArg::Decision => "decision",
+        MemoryKindArg::Note => "note",
+    }
+}
+
+/// Print a write result and say whether the command achieved its goal.
+fn report_outcome(outcome: WriteOutcome) -> std::process::ExitCode {
+    match outcome {
+        WriteOutcome::Applied {
+            id,
+            title,
+            operation,
+            revision,
+            superseded,
+            replayed,
+            ..
+        } => {
+            let mut detail = String::new();
+            if let Some(revision) = revision {
+                detail.push_str(&format!(" revision={revision}"));
+            }
+            if replayed {
+                detail.push_str(" (replayed)");
+            }
+            if !superseded.is_empty() {
+                detail.push_str(&format!(" (superseded {})", superseded.join(", ")));
+            }
+            println!("{}", Line::ok(&format!("[{id}] {title}: {operation}{detail}")));
+            std::process::ExitCode::SUCCESS
+        }
+        WriteOutcome::Pending {
+            id,
+            title,
+            reason,
+        } => {
+            println!(
+                "{}",
+                Line::ok(&format!("queued for review [{id}]: {title} ({reason})"))
+            );
+            println!("  review it with /memory accept <id> from the TUI/desktop");
+            std::process::ExitCode::SUCCESS
+        }
+        WriteOutcome::Skipped { existing, reason } => {
+            println!(
+                "{}",
+                Line::ok(&format!("no change: {reason} (existing [{existing}])"))
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        WriteOutcome::Conflict {
+            target,
+            current_revision,
+            expected_revision,
+        } => {
+            println!(
+                "{}",
+                Line::warn(&format!(
+                    "conflict on {target}: current revision {current_revision}, expected {expected_revision}"
+                ))
+            );
+            std::process::ExitCode::FAILURE
+        }
+        WriteOutcome::Rejected { reason } => {
+            println!("{}", Line::warn(&format!("not stored: {reason}")));
+            std::process::ExitCode::FAILURE
+        }
+        WriteOutcome::NotStored { reason } => {
+            println!("{}", Line::warn(&format!("not stored: {reason}")));
+            std::process::ExitCode::FAILURE
+        }
+        WriteOutcome::Forgotten { id, title } => {
+            println!("{}", Line::ok(&format!("archived [{id}]: {title}")));
+            std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+fn print_view(view: &MemoryView) {
+    println!("{}", Line::heading(&format!("Memory [{}]", view.id)));
+    println!("  title: {}", view_title(view));
+    println!("  status: {}", view.status);
+    println!("  kind: {}", view.kind);
+    println!("  authority: {}", view.authority);
+    if let Some(revision) = view.revision {
+        println!("  revision: {revision}");
+    }
+    if view.pinned_by_user {
+        println!("  pinned: user");
+    }
+    if view.sensitive {
+        println!("  sensitive: content withheld");
+        return;
+    }
+    if !view.tags.is_empty() {
+        println!("  tags: {}", view.tags.join(", "));
+    }
+    if let Some(subject) = &view.subject_key {
+        println!("  subject_key: {subject}");
+    }
+    if let Some(value) = &view.value {
+        println!("  value: {value}");
+    }
+    if let Some(expires) = &view.expires_at {
+        println!("  expires_at: {expires}");
+    }
+    if let Some(experience) = &view.experience {
+        println!(
+            "  experience: standing={} applies_when={}",
+            experience.standing, experience.applies_when
+        );
+        if let Some(invalid_if) = &experience.invalid_if {
+            println!("  invalid_if: {invalid_if}");
+        }
+        for (kind, reference) in &experience.evidence {
+            println!("  evidence[{kind}]: {reference}");
+        }
+    }
+    println!();
+    println!("{}", view.body);
+}
+
+fn pending_not_readable() {
+    println!(
+        "{}",
+        Line::warn(
+            "pending review state is only visible from the TUI/desktop; a local process cannot read it (this is not an empty result)"
+        )
+    );
+}
+
+fn review_pending(
+    service: &MemoryService,
+    actor: &Actor,
+    scope: ServiceScope,
+    id: &str,
+    decision: ReviewRequest,
+) -> anyhow::Result<std::process::ExitCode> {
+    match service.review(actor, scope, id, decision) {
+        Ok(outcome) => Ok(report_outcome(outcome)),
+        Err(ServiceError::NeedsReview(_)) => {
+            println!(
+                "{}",
+                Line::warn(
+                    "only the TUI/desktop can accept or reject pending memory; a local process cannot claim user authority"
+                )
+            );
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        Err(ServiceError::NotFound(_)) => {
+            println!("{}", Line::warn(&format!("pending not found: {id}")));
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Legacy-only maintenance commands have no service equivalent; refuse them on
+/// a markdown project rather than opening a store that project does not use.
+fn legacy_maintenance_store(
+    backend: MemoryBackend,
+    layout: &Layout,
+) -> anyhow::Result<Option<MemoryStore>> {
+    if backend != MemoryBackend::Legacy {
+        println!(
+            "{}",
+            Line::warn(
+                "this maintenance command only operates on the legacy JSON store; the project uses the markdown backend"
+            )
+        );
+        return Ok(None);
+    }
+    Ok(Some(MemoryStore::open(&layout.memory_dir())?))
 }
 
 pub(crate) fn cmd_memory(
     layout: Layout,
     cmd: MemoryCommand,
 ) -> anyhow::Result<std::process::ExitCode> {
-    let root = layout.memory_dir();
-    let store = MemoryStore::open(&root)?;
+    // Must run before any store is opened: `MemoryStore::open` creates its
+    // root, and inspecting a broken scope is only useful if it changes
+    // nothing.
+    if let MemoryCommand::Diagnose {
+        current,
+        state,
+        scope,
+    } = &cmd
+    {
+        return cmd_memory_diagnose(&layout, current, state, *scope);
+    }
+
+    let config = layout
+        .primary_workspace()
+        .and_then(leveler_project::ProjectConfig::load)
+        .unwrap_or_default();
+    let backend = config.memory.backend;
+    let lanes = leveler_app::MemoryPolicy::from_project(&config).lanes();
+    let service = leveler_app::memory_service(&layout, backend);
+    let actor = external_actor();
+    let scope = ServiceScope::Project;
+
     match cmd {
         MemoryCommand::List { archived } => {
             println!("{}", Line::heading("Active memory"));
-            let active = store.list_active()?;
+            let active = service.listing_for_user(scope, lanes)?;
             if active.is_empty() {
                 println!("  (none)");
             } else {
-                for e in &active {
-                    println!("  [{}] {}{}", e.id, safe_title(e), experience_suffix(e));
-                    if is_sensitive(e) {
-                        println!("         sensitive: content withheld (leveler memory audit)");
+                for view in &active {
+                    println!(
+                        "  [{}] {}{}",
+                        view.id,
+                        view_title(view),
+                        experience_suffix(view)
+                    );
+                    if view.sensitive {
+                        println!("         sensitive: content withheld");
                     }
                 }
             }
-            // Pending candidates were listed nowhere, so `memory accept <id>`
-            // had no way to learn an id — the consent gate was unreachable in
-            // practice.
-            let pending = store.list_pending().unwrap_or_default();
-            if !pending.is_empty() {
-                println!();
-                println!("{}", Line::heading("Pending (awaiting your consent)"));
-                for c in &pending {
-                    if is_sensitive_candidate(c) {
-                        let mut redacted = c.clone();
-                        redact_candidate(&mut redacted);
-                        println!("  [{}] {}", redacted.id, redacted.title);
-                        println!("         sensitive: content withheld (leveler memory audit)");
-                    } else {
-                        let marker = if c.experience.is_some() {
-                            " [经验]"
-                        } else {
-                            ""
-                        };
-                        println!("  [{}] {}{}", c.id, c.title, marker);
+            match service.pending(&actor, scope) {
+                Ok(pending) => {
+                    let pending: Vec<_> = pending
+                        .into_iter()
+                        .filter(|view| lane_allows(lanes, view))
+                        .collect();
+                    if !pending.is_empty() {
+                        println!();
+                        println!("{}", Line::heading("Pending (awaiting review)"));
+                        for view in &pending {
+                            println!(
+                                "  [{}] {}{}",
+                                view.id,
+                                view_title(view),
+                                experience_suffix(view)
+                            );
+                            if view.sensitive {
+                                println!("         sensitive: content withheld");
+                            }
+                        }
+                        println!("  review with: /memory accept <id> from the TUI/desktop");
                     }
                 }
-                println!("  adopt with: leveler memory accept <id>");
+                Err(ServiceError::NeedsReview(_)) => pending_not_readable(),
+                Err(error) => return Err(error.into()),
             }
             if archived {
                 println!();
                 println!("{}", Line::heading("Archived memory"));
-                let arch = store.list_archived()?;
-                if arch.is_empty() {
+                let archived = service.archived(&actor, scope, lanes, None)?;
+                if archived.is_empty() {
                     println!("  (none)");
                 } else {
-                    for e in &arch {
-                        println!("  [{}] {}{}", e.id, e.title, experience_suffix(e));
+                    for view in &archived {
+                        println!(
+                            "  [{}] {}{}",
+                            view.id,
+                            view_title(view),
+                            experience_suffix(view)
+                        );
                     }
                 }
             }
-            let (a, b) = store.counts()?;
+            let (active_count, archived_count) = service.counts(scope)?;
             println!();
-            println!(
-                "  memory_dir={} active={} pending={} archived={}",
-                root.display(),
-                a,
-                pending.len(),
-                b
-            );
+            match backend {
+                MemoryBackend::Legacy => {
+                    println!("  backend=legacy memory_dir={}", layout.memory_dir().display());
+                }
+                MemoryBackend::Markdown => {
+                    let current = layout
+                        .markdown_memory_dir()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "(no workspace)".to_string());
+                    println!("  backend=markdown current_dir={current}");
+                }
+            }
+            println!("  active={active_count} archived={archived_count}");
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Status => {
             // The switch is project configuration, the same authority the
             // runtime reads. A missing config means the built-in defaults.
-            let config = layout
-                .primary_workspace()
-                .and_then(leveler_project::ProjectConfig::load)
-                .unwrap_or_default();
             let total = config.memory.enabled;
             let user = total && config.memory.user_enabled;
             let experience = total && config.memory.experience_enabled;
             let on = |enabled: bool| if enabled { "on" } else { "off" };
-            let active = store.list_active()?;
-            let pending = store.list_pending()?;
-            let archived = store.list_archived()?;
-            let experience_active = active
-                .iter()
-                .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
-                .count();
-            let experience_pending = pending
-                .iter()
-                .filter(|candidate| candidate.experience.is_some())
-                .count();
-            let experience_archived = archived
-                .iter()
-                .filter(|entry| MemoryKind::of(entry) == MemoryKind::Experience)
-                .count();
+            let active = service.listing_for_user(scope, lanes)?;
+            let archived = service.archived(&actor, scope, lanes, None)?;
+            let experience_active = active.iter().filter(|view| view.is_experience()).count();
+            let experience_archived = archived.iter().filter(|view| view.is_experience()).count();
             let experimental = if experience { " (experimental)" } else { "" };
             println!("{}", Line::heading("Memory switches"));
             println!("  total: {}", on(total));
             println!(
-                "  user facts: {} (active {} · pending {} · archived {})",
+                "  user facts: {} (active {} · archived {})",
                 on(user),
                 active.len().saturating_sub(experience_active),
-                pending.len().saturating_sub(experience_pending),
                 archived.len().saturating_sub(experience_archived),
             );
             println!(
-                "  auto experience: {}{} (active {} · pending {} · archived {})",
+                "  auto experience: {}{} (active {} · archived {})",
                 on(experience),
                 experimental,
                 experience_active,
-                experience_pending,
                 experience_archived,
             );
+            match service.pending(&actor, scope) {
+                Ok(pending) => {
+                    let experience_pending =
+                        pending.iter().filter(|view| view.is_experience()).count();
+                    println!(
+                        "  pending review: {} (user {} · experience {})",
+                        pending.len(),
+                        pending.len().saturating_sub(experience_pending),
+                        experience_pending,
+                    );
+                }
+                Err(ServiceError::NeedsReview(_)) => {
+                    println!("  pending review: only visible from the TUI/desktop")
+                }
+                Err(error) => return Err(error.into()),
+            }
+            println!("  backend: {}", backend.as_str());
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Search { query, limit } => {
-            // Search the full active set before filtering, so sensitive hits
-            // cannot occupy the requested window and hide safe matches.
-            let active_count = store.list_active()?.len();
-            let hits = store.search(&query, active_count.max(limit))?;
-            let withheld = hits.iter().filter(|(entry, _)| is_sensitive(entry)).count();
-            let hits: Vec<_> = hits
-                .into_iter()
-                .filter(|(entry, _)| !is_sensitive(entry))
-                .collect();
+            let hits = match service.search(&actor, scope, lanes, &query, limit, false) {
+                Ok(hits) => hits,
+                Err(ServiceError::Unavailable(reason))
+                    if reason == leveler_memory::MARKDOWN_SEARCH_UNAVAILABLE =>
+                {
+                    println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "search is not available on the markdown backend yet ({reason}); this is not an empty result"
+                        ))
+                    );
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
+                Err(error) => return Err(error.into()),
+            };
             if hits.is_empty() {
                 println!("{}", Line::warn("No matches."));
             } else {
                 println!("{}", Line::heading("Search results"));
-                for (e, score) in hits {
+                for (view, score) in hits {
                     println!(
-                        "  [{:.3}] [{}] {}{}",
-                        score,
-                        e.id,
-                        e.title,
-                        experience_suffix(&e)
+                        "  [{score:.3}] [{}] {}{}",
+                        view.id,
+                        view_title(&view),
+                        experience_suffix(&view)
                     );
-                    let snippet: String = e.body.chars().take(120).collect();
+                    if view.sensitive {
+                        continue;
+                    }
+                    let snippet: String = view.body.chars().take(120).collect();
                     if !snippet.is_empty() {
                         println!("         {snippet}");
                     }
                 }
             }
-            if withheld > 0 {
-                println!("  {withheld} sensitive match(es) withheld; run `leveler memory audit`");
-            }
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Show { id, archived } => {
-            let entry = if archived {
-                store
-                    .list_archived()?
+            if archived {
+                let found = service
+                    .archived(&actor, scope, lanes, None)?
                     .into_iter()
-                    .find(|entry| entry.id == id)
-            } else {
-                match store.read_active(&id) {
-                    Ok(entry) => Some(entry),
-                    Err(leveler_memory::MemoryError::NotFound(_)) => None,
-                    Err(e) => return Err(e.into()),
-                }
-            };
-            match entry {
-                Some(e) => {
-                    let sensitive = is_sensitive(&e);
-                    println!("{}", Line::heading(&format!("Memory [{}]", e.id)));
-                    println!("  title: {}", safe_title(&e));
-                    println!("  created: {}", e.created_at);
-                    println!("  updated: {}", e.updated_at);
-                    if archived {
-                        println!("  status: {:?}", e.effective_status());
-                        if let Some(by) = &e.superseded_by {
-                            println!("  superseded_by: {by}");
-                        }
-                        if let Some(at) = &e.superseded_at {
-                            println!("  superseded_at: {at}");
-                        }
+                    .find(|view| view.id == id);
+                return match found {
+                    Some(view) => {
+                        print_view(&view);
+                        Ok(std::process::ExitCode::SUCCESS)
                     }
-                    if sensitive {
-                        println!("  sensitive: content withheld; run `leveler memory audit`");
-                    } else {
-                        if !e.tags.is_empty() {
-                            println!("  tags: {}", e.tags.join(", "));
-                        }
-                        if let Some(experience) = e.experience.as_ref() {
-                            println!(
-                                "  experience: category={} verification={} standing={}",
-                                experience.category.as_str(),
-                                match experience.verification {
-                                    leveler_memory::ExperienceVerification::Verified => "verified",
-                                    leveler_memory::ExperienceVerification::Unverified => {
-                                        "unverified"
-                                    }
-                                },
-                                experience.standing().as_str()
-                            );
-                            println!("  applies_when: {}", experience.applies_when);
-                            if let Some(invalid_if) = experience.invalid_if.as_deref() {
-                                println!("  invalid_if: {invalid_if}");
-                            }
-                            for evidence in &experience.evidence {
-                                println!("  evidence[{}]: {}", evidence.kind, evidence.reference);
-                            }
-                        }
-                        println!();
-                        println!("{}", e.body);
+                    None => {
+                        println!(
+                            "{}",
+                            Line::warn(&format!("not found in archive: {id}"))
+                        );
+                        Ok(std::process::ExitCode::FAILURE)
                     }
+                };
+            }
+            let found = service
+                .listing_for_user(scope, lanes)?
+                .into_iter()
+                .find(|view| view.id == id);
+            return match found {
+                Some(view) => {
+                    print_view(&view);
                     Ok(std::process::ExitCode::SUCCESS)
                 }
-                None => {
+                None => match service.read(&actor, scope, &id) {
+                    Ok(view) => {
+                        print_view(&view);
+                        Ok(std::process::ExitCode::SUCCESS)
+                    }
+                    Err(ServiceError::NotFound(_)) => {
+                        println!("{}", Line::warn(&format!("not found: {id}")));
+                        Ok(std::process::ExitCode::FAILURE)
+                    }
+                    Err(ServiceError::NotCurrent(_)) => {
+                        println!(
+                            "{}",
+                            Line::warn(&format!(
+                                "not current: {id}; read it with --archived"
+                            ))
+                        );
+                        Ok(std::process::ExitCode::FAILURE)
+                    }
+                    Err(error) => Err(error.into()),
+                },
+            };
+        }
+        MemoryCommand::Forget { id } => {
+            // A credential-shaped title must stay withheld even as the record
+            // is archived; the service already refuses legacy forgets of such
+            // records.
+            let sensitive = service
+                .listing_for_user(scope, lanes)
+                .ok()
+                .and_then(|views| views.into_iter().find(|view| view.id == id))
+                .is_some_and(|view| view.sensitive);
+            match service.forget(&actor, scope, &id) {
+                Ok(WriteOutcome::Forgotten { id, title }) => {
+                    let title = if sensitive {
+                        leveler_memory::REDACTED_TITLE
+                    } else {
+                        title.as_str()
+                    };
+                    println!("{}", Line::ok(&format!("archived [{id}]: {title}")));
+                    Ok(std::process::ExitCode::SUCCESS)
+                }
+                Ok(outcome) => Ok(report_outcome(outcome)),
+                Err(ServiceError::NotFound(_)) => {
+                    println!("{}", Line::warn(&format!("not found: {id}")));
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(ServiceError::NotCurrent(_)) => {
                     println!(
                         "{}",
-                        Line::warn(&format!(
-                            "not found{}: {id}",
-                            if archived { " in archive" } else { "" }
-                        ))
+                        Line::warn(&format!("not current: {id}; nothing to forget"))
                     );
                     Ok(std::process::ExitCode::FAILURE)
                 }
+                Err(ServiceError::Invalid(reason)) => {
+                    println!("{}", Line::warn(&reason));
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(error) => Err(error.into()),
             }
         }
-        MemoryCommand::Forget { id } => {
-            let e = store.forget(&id)?;
-            println!(
-                "{}",
-                Line::ok(&format!("archived [{}]: {}", e.id, safe_title(&e)))
-            );
-            Ok(std::process::ExitCode::SUCCESS)
-        }
-        MemoryCommand::Restore { id } => match store.restore(&id) {
-            Ok(entry) => {
+        MemoryCommand::Restore { id } => {
+            if backend == MemoryBackend::Markdown {
                 println!(
                     "{}",
-                    Line::ok(&format!("restored [{}]: {}", entry.id, safe_title(&entry)))
+                    Line::warn(
+                        "restore is not available on the markdown backend; forget is a tombstone"
+                    )
                 );
-                Ok(std::process::ExitCode::SUCCESS)
+                return Ok(std::process::ExitCode::FAILURE);
             }
-            Err(leveler_memory::MemoryError::NotFound(_)) => {
-                println!("{}", Line::warn(&format!("not found: {id}")));
-                Ok(std::process::ExitCode::FAILURE)
+            match service.restore(&actor, scope, &id) {
+                Ok(outcome) => Ok(report_outcome(outcome)),
+                Err(ServiceError::NotFound(_)) => {
+                    println!("{}", Line::warn(&format!("not found: {id}")));
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(ServiceError::NeedsReview(_)) => {
+                    println!(
+                        "{}",
+                        Line::warn(
+                            "restore requires the TUI/desktop; a local process cannot claim user authority"
+                        )
+                    );
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(ServiceError::Invalid(reason)) => {
+                    println!("{}", Line::warn(&reason));
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(error) => Err(error.into()),
             }
-            Err(leveler_memory::MemoryError::Invalid(reason)) => {
-                println!("{}", Line::warn(&reason));
-                Ok(std::process::ExitCode::FAILURE)
-            }
-            Err(e) => Err(e.into()),
-        },
+        }
         MemoryCommand::Remember {
             title,
             body,
             kind,
             tags,
         } => {
-            let saved = remember_direct(&store, &title, &body, kind, tags)?;
-            let message = match saved.supersedes.as_deref() {
-                Some(old) => format!(
-                    "updated [{}]: {} (superseded [{}])",
-                    saved.id, saved.title, old
-                ),
-                None => format!("remembered [{}]: {}", saved.id, saved.title),
-            };
-            println!("{}", Line::ok(&message));
-            Ok(std::process::ExitCode::SUCCESS)
+            // A local process may only propose: the service decides whether
+            // that becomes pending or is rejected, never user authority.
+            let mut request = RememberRequest::new(
+                cli_op_id("remember"),
+                scope,
+                title,
+                body,
+                kind_label(kind),
+            );
+            request.tags = tags;
+            match service.propose(&actor, request) {
+                Ok(WriteOutcome::Rejected { reason }) => {
+                    println!("{}", Line::warn(&format!("not stored: {reason}")));
+                    println!(
+                        "  a local process cannot claim user authority; use /remember in the TUI/desktop"
+                    );
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Ok(outcome) => Ok(report_outcome(outcome)),
+                Err(ServiceError::Invalid(reason)) => {
+                    println!("{}", Line::warn(&reason));
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         MemoryCommand::Pending => {
-            let pending = store.list_pending()?;
+            let pending = match service.pending(&actor, scope) {
+                Ok(pending) => pending,
+                Err(ServiceError::NeedsReview(_)) => {
+                    pending_not_readable();
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
+                Err(error) => return Err(error.into()),
+            };
             println!("{}", Line::heading("Pending memory candidates"));
+            let pending: Vec<_> = pending
+                .into_iter()
+                .filter(|view| lane_allows(lanes, view))
+                .collect();
             if pending.is_empty() {
                 println!("  (none)");
             } else {
-                for c in &pending {
-                    let sensitive = is_sensitive_candidate(c);
-                    if sensitive {
-                        let mut redacted = c.clone();
-                        redact_candidate(&mut redacted);
-                        println!(
-                            "  [{}] {}  (key={:?}, source={:?})",
-                            redacted.id, redacted.title, redacted.key, redacted.source
-                        );
-                        println!("         sensitive: content withheld (leveler memory audit)");
-                    } else {
-                        println!(
-                            "  [{}] {}  (key={:?}, source={:?})",
-                            c.id, c.title, c.key, c.source
-                        );
-                        let snippet: String = c.body.chars().take(100).collect();
-                        if !snippet.is_empty() {
-                            println!("         {snippet}");
-                        }
+                for view in &pending {
+                    println!(
+                        "  [{}] {}{}  (authority={})",
+                        view.id,
+                        view_title(view),
+                        experience_suffix(view),
+                        view.authority
+                    );
+                    if view.sensitive {
+                        println!("         sensitive: content withheld");
+                        continue;
+                    }
+                    let snippet: String = view.body.chars().take(100).collect();
+                    if !snippet.is_empty() {
+                        println!("         {snippet}");
                     }
                 }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        MemoryCommand::Accept { id } => match store.accept(&id) {
-            Ok(saved) => {
-                println!(
-                    "{}",
-                    Line::ok(&format!("accepted [{}]: {}", saved.id, safe_title(&saved)))
-                );
-                Ok(std::process::ExitCode::SUCCESS)
+        MemoryCommand::Accept { id } => {
+            review_pending(&service, &actor, scope, &id, ReviewRequest::Accept)
+        }
+        MemoryCommand::Reject { id } => review_pending(
+            &service,
+            &actor,
+            scope,
+            &id,
+            ReviewRequest::Reject {
+                reason: "rejected from a local process".into(),
+            },
+        ),
+        MemoryCommand::Propose { text } => {
+            let mut request = RememberRequest::new(
+                cli_op_id("propose"),
+                scope,
+                leveler_memory::title_from_body(&text),
+                text,
+                "note",
+            );
+            request.tags = vec!["manual".to_string()];
+            match service.propose(&actor, request) {
+                Ok(WriteOutcome::Rejected { reason }) => {
+                    println!("{}", Line::warn(&format!("not stored: {reason}")));
+                    println!(
+                        "  a local process cannot claim user authority; use the TUI/desktop"
+                    );
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Ok(outcome) => Ok(report_outcome(outcome)),
+                Err(ServiceError::Invalid(reason)) => {
+                    println!("{}", Line::warn(&reason));
+                    Ok(std::process::ExitCode::FAILURE)
+                }
+                Err(error) => Err(error.into()),
             }
-            Err(leveler_memory::MemoryError::NotFound(_)) => {
-                println!("{}", Line::warn(&format!("pending not found: {id}")));
-                Ok(std::process::ExitCode::FAILURE)
-            }
-            Err(e) => Err(e.into()),
-        },
-        MemoryCommand::Reject { id } => match store.reject(&id) {
-            Ok(rec) => {
-                println!(
-                    "{}",
-                    Line::ok(&format!(
-                        "rejected; suppressed fingerprint={}",
-                        rec.fingerprint
-                    ))
-                );
-                Ok(std::process::ExitCode::SUCCESS)
-            }
-            Err(leveler_memory::MemoryError::NotFound(_)) => {
-                println!("{}", Line::warn(&format!("pending not found: {id}")));
-                Ok(std::process::ExitCode::FAILURE)
-            }
-            Err(e) => Err(e.into()),
-        },
+        }
         MemoryCommand::Audit => {
+            let Some(store) = legacy_maintenance_store(backend, &layout)? else {
+                return Ok(std::process::ExitCode::FAILURE);
+            };
             let findings = store.audit_sensitive()?;
             println!("{}", Line::heading("Sensitive memory audit"));
             if findings.is_empty() {
@@ -385,6 +700,9 @@ pub(crate) fn cmd_memory(
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::AuditIdentity => {
+            let Some(store) = legacy_maintenance_store(backend, &layout)? else {
+                return Ok(std::process::ExitCode::FAILURE);
+            };
             let audit = store.audit_identity()?;
             println!(
                 "{}",
@@ -421,6 +739,9 @@ pub(crate) fn cmd_memory(
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Scrub { id, apply } => {
+            let Some(store) = legacy_maintenance_store(backend, &layout)? else {
+                return Ok(std::process::ExitCode::FAILURE);
+            };
             let report = store.scrub_sensitive(id.as_deref(), apply)?;
             if report.findings == 0 {
                 println!("{}", Line::ok("No sensitive memory records found."));
@@ -440,42 +761,70 @@ pub(crate) fn cmd_memory(
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        MemoryCommand::Propose { text } => {
-            // The CLI has no model call and no structured subject here. Store
-            // the text as a pending proposal verbatim; a person still accepts
-            // it, so nothing becomes current truth on the strength of a rule.
-            let candidate = MemoryCandidate::new(
-                title_from_body(&text),
-                &text,
-                CandidateKind::Free,
-                None,
-                CandidateSource::SystemPropose,
-                vec!["manual".to_string()],
-            )?;
-            let outcomes = vec![store.propose(candidate)?];
-            if outcomes.is_empty() {
-                println!("{}", Line::warn("No candidates extracted."));
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-            println!("{}", Line::heading("Propose results"));
-            for o in outcomes {
-                match o {
-                    ProposeOutcome::Pending(c) => {
-                        println!("  pending [{}] {}", c.id, c.title);
-                    }
-                    ProposeOutcome::Suppressed { fingerprint } => {
-                        println!("  suppressed fingerprint={fingerprint}");
-                    }
-                    ProposeOutcome::AlreadyActive { id } => {
-                        println!("  already active id={id}");
-                    }
-                    ProposeOutcome::AlreadyPending(c) => {
-                        println!("  already pending [{}] {}", c.id, c.title);
-                    }
-                }
-            }
-            Ok(std::process::ExitCode::SUCCESS)
+        MemoryCommand::Diagnose { .. } => {
+            unreachable!("diagnose is handled before any store is opened")
         }
+    }
+}
+
+/// Read-only report for a Markdown (Memory 2.0) scope.
+///
+/// Nothing here creates, recovers or repairs: the store's `diagnose` resolves
+/// paths without `prepare` and only reads. A blocking finding exits non-zero so
+/// a script can tell "broken" from "clean", never from "empty".
+fn cmd_memory_diagnose(
+    layout: &Layout,
+    current: &Path,
+    state: &Path,
+    scope: MemoryScopeArg,
+) -> anyhow::Result<std::process::ExitCode> {
+    let mut roots = ScopeRoots::new(scope.into(), current, state);
+    if let Some(repo) = layout.primary_workspace() {
+        roots = roots.with_repo_root(repo);
+    }
+    let report = MarkdownStore::diagnose(roots)?;
+    print_diagnostic_report(&report);
+    Ok(if report.is_blocking() {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+fn print_diagnostic_report(report: &DiagnosticReport) {
+    println!("{}", Line::heading("Markdown memory diagnostics"));
+    println!("  scope: {:?}", report.scope);
+    println!("  current: {}", report.current_root.display());
+    println!("  state: {}", report.state_root.display());
+    if report.initialized {
+        println!(
+            "  trusted active: {}  pending: {}",
+            report.active_records, report.pending_records
+        );
+    } else {
+        println!(
+            "  {}",
+            Line::warn(
+                "not initialized (current or state root is missing); this report created nothing"
+            )
+        );
+    }
+    if report.issues.is_empty() {
+        println!("  {}", Line::ok("no issues"));
+        return;
+    }
+    for issue in &report.issues {
+        let label = match issue.severity {
+            DiagnosticSeverity::Blocking => Line::fail("BLOCKING"),
+            DiagnosticSeverity::ActionRequired => Line::warn("ACTION REQUIRED"),
+            DiagnosticSeverity::Warning => "warning".to_string(),
+        };
+        match &issue.path {
+            Some(path) => println!("  {label} {:?} {}", issue.kind, path.display()),
+            None => println!("  {label} {:?}", issue.kind),
+        }
+        println!("      {}", issue.detail);
+        println!("      fix: {}", issue.suggestion);
     }
 }
 
@@ -500,17 +849,13 @@ pub(crate) fn memory_round_trip_via_store(root: &std::path::Path) -> anyhow::Res
     Ok(())
 }
 
-/// A user-authoritative direct write (`leveler memory remember`).
+/// The legacy store semantics the trusted in-process direct path relies on.
 ///
-/// Uses `remember_deduplicated`, NOT `remember`: the latter is an upsert by id
-/// and is reserved for the accept-by-key path, where replacing the previous
-/// entry IS the intent. Using it here silently replaced a memory the user had
-/// already saved whenever the new title slugged to the same id — which a
-/// repeated title always does, and which every CJK-only title does via the
-/// timestamp fallback. Ordinary notes never overwrite: a second note competes
-/// in recall. A body that states a durable assignment ("以后…固定为 X") is an
-/// update of that semantic identity; the lifecycle keeps the old value as
-/// superseded history.
+/// Uses `activate`, NOT `remember`: the latter is an upsert by id and would
+/// silently replace an existing memory whenever a new title slugs to the same
+/// id. Kept here as a regression test because the TUI's `/remember` and the
+/// executor's direct command both reach the same store through the service.
+#[cfg(test)]
 fn remember_direct(
     store: &MemoryStore,
     title: &str,
@@ -518,7 +863,6 @@ fn remember_direct(
     kind: crate::cli::MemoryKindArg,
     tags: Vec<String>,
 ) -> Result<leveler_memory::MemoryEntry, leveler_memory::MemoryError> {
-    use crate::cli::MemoryKindArg;
     use leveler_memory::MemoryKind;
     store.activate(
         title,
@@ -620,7 +964,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// User-authoritative accept path used by `leveler memory accept` (not agent AutoApprove).
+    /// User-authoritative accept path used by the TUI (not agent AutoApprove).
     #[test]
     fn user_accept_path_promotes_pending_only_on_explicit_accept() {
         let root =
@@ -643,6 +987,49 @@ mod tests {
         assert_eq!(store.list_active().unwrap().len(), 0);
         store.accept(&pending.id).unwrap();
         assert_eq!(store.list_active().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A plain local process cannot mint user authority: the service queues a
+    /// create as pending and refuses review outright.
+    #[test]
+    fn a_local_cli_write_is_pending_not_user_authorized() {
+        let root =
+            std::env::temp_dir().join(format!("leveler-memory-cli-external-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let service = MemoryService::legacy(root.as_path());
+        let actor = external_actor();
+        let request = RememberRequest::new(
+            cli_op_id("remember"),
+            ServiceScope::Project,
+            "cli note",
+            "written by a local process",
+            "note",
+        );
+        let outcome = service.propose(&actor, request).unwrap();
+        assert!(
+            matches!(outcome, WriteOutcome::Pending { .. }),
+            "expected pending, got {outcome:?}"
+        );
+        let store = MemoryStore::open(&root).unwrap();
+        assert_eq!(
+            store.list_active().unwrap().len(),
+            0,
+            "a local process must not activate memory"
+        );
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+
+        let review = service.review(
+            &actor,
+            ServiceScope::Project,
+            &pending[0].id,
+            ReviewRequest::Accept,
+        );
+        assert!(
+            matches!(review, Err(ServiceError::NeedsReview(_))),
+            "a local process must not review its own proposal: {review:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

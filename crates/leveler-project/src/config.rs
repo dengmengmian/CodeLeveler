@@ -116,6 +116,11 @@ pub struct MemoryConfig {
     /// opts in with an explicit `true`.
     #[serde(default)]
     pub experience_enabled: bool,
+    /// Storage backend. `legacy` is the shipped JSON store and the default;
+    /// `markdown` is the Memory 2.0 pipeline and is opt-in for tests and
+    /// dogfood only.
+    #[serde(default)]
+    pub backend: leveler_core::MemoryBackend,
 }
 
 impl Default for MemoryConfig {
@@ -124,6 +129,7 @@ impl Default for MemoryConfig {
             enabled: true,
             user_enabled: true,
             experience_enabled: false,
+            backend: leveler_core::MemoryBackend::Legacy,
         }
     }
 }

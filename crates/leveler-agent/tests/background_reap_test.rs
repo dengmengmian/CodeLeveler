@@ -249,6 +249,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             memory_catalog: String::new(),
             memory_expose: true,
             memory_root: None,
+            memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: registry.clone(),
             permission_rules: leveler_execution::PermissionRuleSet::default(),

@@ -93,6 +93,56 @@ pub enum OperationHint {
     Unknown,
 }
 
+/// What the user is DOING with the words in `evidence_span`.
+///
+/// Authority alone says who spoke; it says nothing about whether the sentence
+/// asserted a fact. A suggestion under evaluation, a hypothetical, a quotation
+/// or an unclear remark can all be `explicit_user`, yet none of them is a
+/// decision. The default is [`Self::Uncertain`] so a candidate from an older
+/// extractor, or one missing the field, is never treated as a confirmed fact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatementKind {
+    /// A settled fact or decision the user states as true.
+    Assertion,
+    /// An explicit correction of a prior decision.
+    Correction,
+    /// An explicit refusal of an option or a prior fact.
+    Rejection,
+    /// An option being evaluated or suggested, not decided.
+    Proposal,
+    /// A what-if or example, not a real decision.
+    Hypothetical,
+    /// Words attributed to someone else, or material being shown.
+    Quotation,
+    /// Hedged, ambiguous or missing classification.
+    #[default]
+    Uncertain,
+}
+
+impl StatementKind {
+    /// Whether this statement may become current truth without a person.
+    ///
+    /// Only a statement the user put forward as their own settled position
+    /// qualifies. Evaluation, speculation and reported speech are not
+    /// decisions, however explicit the wording sounds.
+    pub fn is_confirmed_user_statement(self) -> bool {
+        matches!(self, Self::Assertion | Self::Correction | Self::Rejection)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assertion => "assertion",
+            Self::Correction => "correction",
+            Self::Rejection => "rejection",
+            Self::Proposal => "proposal",
+            Self::Hypothetical => "hypothetical",
+            Self::Quotation => "quotation",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
 /// One thing the user's sentence expressed, as the extractor understood it.
 ///
 /// Atomic by construction: one fact, one subject, one value. A sentence with
@@ -111,9 +161,19 @@ pub struct SemanticCandidate {
     /// it does not compare wording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_subject: Option<String>,
+    /// The exact id of the active memory this statement replaces, from the
+    /// `known_identities` supplied with the request. This is how a correction
+    /// reaches an entry that has no semantic subject (a legacy direct note).
+    /// The runtime resolves the id; it never guesses a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_memory_id: Option<String>,
     /// The value when the fact is an assignment (`Pro`, `required`, `forbidden`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// What the user is doing with this span. Missing means `uncertain`, which
+    /// is never auto-committed.
+    #[serde(default)]
+    pub statement: StatementKind,
     pub scope: CandidateScope,
     pub durability: CandidateDurability,
     pub memory_type: SemanticMemoryType,
@@ -156,6 +216,15 @@ pub enum CandidateRejection {
     Sensitive,
     /// The model itself reported low confidence.
     LowConfidence { confidence: f32 },
+    /// The statement is a proposal, hypothetical, quotation or unclear. Only
+    /// the user's own settled statement may become current truth.
+    NotAConfirmedStatement { statement: StatementKind },
+    /// The user's turn is a direct memory command. That command has its own
+    /// deterministic writer; a second extracted memory for the same turn
+    /// would be a competing current truth.
+    DirectCommandOwned,
+    /// `replaces_memory_id` was not a usable memory id.
+    InvalidTarget,
 }
 
 impl CandidateRejection {
@@ -173,6 +242,9 @@ impl CandidateRejection {
             Self::QuotedEvidence => "quoted_evidence",
             Self::Sensitive => "sensitive",
             Self::LowConfidence { .. } => "low_confidence",
+            Self::NotAConfirmedStatement { .. } => "not_confirmed",
+            Self::DirectCommandOwned => "direct_command_owned",
+            Self::InvalidTarget => "invalid_target",
         }
     }
 
@@ -201,6 +273,14 @@ impl CandidateRejection {
             Self::LowConfidence { confidence } => {
                 format!("model confidence {confidence:.2} was below threshold")
             }
+            Self::NotAConfirmedStatement { statement } => format!(
+                "a {} is not a confirmed user statement",
+                statement.as_str()
+            ),
+            Self::DirectCommandOwned => {
+                "the direct memory writer owns this turn".to_string()
+            }
+            Self::InvalidTarget => "candidate named an unusable memory id".to_string(),
         }
     }
 }
@@ -360,6 +440,23 @@ pub fn validate_semantic_candidate(
         });
     }
 
+    // A direct memory command is already owned by the deterministic direct
+    // writer. Extraction must not create a second current fact for that turn.
+    // This is checked before the statement kind: whatever the model calls it,
+    // the direct writer owns the turn.
+    if crate::parse_direct_memory_command(user_message).is_some() {
+        return Err(CandidateRejection::DirectCommandOwned);
+    }
+
+    // Authority is a claim; the statement kind is what the user is DOING.
+    // A proposal, hypothetical, quotation or unclassified span is not a
+    // decision even when the model reports `explicit_user`.
+    if !candidate.statement.is_confirmed_user_statement() {
+        return Err(CandidateRejection::NotAConfirmedStatement {
+            statement: candidate.statement,
+        });
+    }
+
     if let Some(confidence) = candidate.confidence
         && confidence < MIN_CONFIDENCE
     {
@@ -402,6 +499,22 @@ pub fn validate_semantic_candidate(
     if related_subject.as_deref().is_some_and(looks_like_secret) {
         return Err(CandidateRejection::Sensitive);
     }
+    let replaces_id = candidate
+        .replaces_memory_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    // Legacy ids are `mem-<hash>`; Markdown ids are `mem_<uuid>`. Accept the
+    // union so a real id from either backend's identity context can be named.
+    if replaces_id.as_deref().is_some_and(|id| {
+        id.chars().count() > 128
+            || !id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '-' || character == '_'
+            })
+    }) {
+        return Err(CandidateRejection::InvalidTarget);
+    }
 
     let key = semantic_key_of(&subject);
     let kind = match candidate.memory_type {
@@ -426,6 +539,7 @@ pub fn validate_semantic_candidate(
     .map_err(|_| CandidateRejection::Sensitive)?;
     memory.semantic_key = Some(key);
     memory.related_key = related_subject.as_deref().map(semantic_key_of);
+    memory.replaces_id = replaces_id;
     memory.authority = MemoryAuthority::ExplicitUser;
     memory.operation = match candidate.operation_hint {
         OperationHint::Update => CandidateOperation::Update,
@@ -573,6 +687,8 @@ mod tests {
             fact: fact.to_string(),
             subject: subject.to_string(),
             related_subject: None,
+            replaces_memory_id: None,
+            statement: StatementKind::Assertion,
             value: None,
             scope: CandidateScope::Project,
             durability: CandidateDurability::Durable,

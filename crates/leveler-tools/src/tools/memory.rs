@@ -1,12 +1,16 @@
-//! Memory tools: `memory` (search/list/read), `remember`, `forget`.
+//! Memory tools: `memory` (list/read/search/update/deprecate/pin/unpin),
+//! `remember`, `forget`.
 //!
-//! Each tool is CONSTRUCTED with the store root (the app passes
-//! `Layout::memory_dir`); it used to read one out of `ToolContext.services`,
-//! where every unrelated tool could reach it too. `None` means memory is not
-//! configured for this run, and the tool says so rather than inventing a
-//! location. Writes require human approval (K36).
+//! Each tool is CONSTRUCTED with the one [`MemoryService`]; it used to read a
+//! store root out of `ToolContext.services`, where every unrelated tool could
+//! reach it too. `None` means memory is not configured for this run, and the
+//! tool says so rather than inventing a location.
+//!
+//! Authority comes from the execution context, never from the tool payload.
+//! A write carries the host-stamped session/turn/call identity, so the store
+//! records it as a model finding; there is no argument a model can pass to
+//! become a user decision. Reads need no identity because they change nothing.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,21 +19,33 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
-use leveler_memory::{MemoryStore, is_sensitive};
+use leveler_memory::{
+    MemoryService, MemoryView, RememberRequest, ServiceError, ServiceScope, UpdateRequest,
+    WriteOutcome,
+};
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
-/// The memory-store root a memory tool is built with, shared by the three.
+/// The memory service and lane policy a memory tool is built with.
 #[derive(Clone)]
 pub struct MemoryRoot {
-    root: Option<Arc<PathBuf>>,
+    service: Option<Arc<MemoryService>>,
     lanes: leveler_memory::MemoryLanes,
 }
 
 impl MemoryRoot {
-    pub fn new(root: Option<PathBuf>) -> Self {
+    /// A legacy JSON store rooted at `root`. Kept for callers that only know a
+    /// store directory; the app hands over the configured service instead.
+    pub fn new(root: Option<std::path::PathBuf>) -> Self {
         Self {
-            root: root.map(Arc::new),
+            service: root.map(|root| Arc::new(MemoryService::legacy(root))),
+            lanes: leveler_memory::MemoryLanes::ALL,
+        }
+    }
+
+    pub fn from_service(service: Option<Arc<MemoryService>>) -> Self {
+        Self {
+            service,
             lanes: leveler_memory::MemoryLanes::ALL,
         }
     }
@@ -45,26 +61,184 @@ impl MemoryRoot {
         self.lanes
     }
 
-    fn open(&self) -> Result<MemoryStore, ToolError> {
-        let root = self.root.as_ref().ok_or_else(|| {
+    fn service(&self) -> Result<&MemoryService, ToolError> {
+        self.service.as_deref().ok_or_else(|| {
             ToolError::Io(
                 "memory store is not configured for this session (app must set Layout::memory_dir)"
                     .to_string(),
             )
-        })?;
-        MemoryStore::open(root.as_path()).map_err(|e| ToolError::Io(e.to_string()))
+        })
     }
+}
+
+fn parse_scope(scope: Option<&str>) -> Result<ServiceScope, ToolError> {
+    match scope.unwrap_or("project") {
+        "project" => Ok(ServiceScope::Project),
+        "local" => Ok(ServiceScope::Local),
+        "global" => Ok(ServiceScope::Global),
+        other => Err(ToolError::InvalidArguments {
+            tool: "memory".into(),
+            message: format!("unknown scope `{other}`; use project|local|global"),
+        }),
+    }
+}
+
+/// The model actor for one dispatched call. All three identities come from the
+/// runtime; a call without them cannot claim to be a model write.
+fn model_actor(context: &ToolContext) -> Result<leveler_memory::v2::Actor, ToolError> {
+    let session = context.session_scope.as_deref().ok_or_else(|| {
+        ToolError::Io("memory write has no session identity in its execution context".into())
+    })?;
+    let turn = context.turn_scope.as_deref().ok_or_else(|| {
+        ToolError::Io("memory write has no turn identity in its execution context".into())
+    })?;
+    let tool_call = context.tool_call_scope.as_deref().ok_or_else(|| {
+        ToolError::Io("memory write has no tool-call identity in its execution context".into())
+    })?;
+    Ok(leveler_memory::v2::Actor::Model {
+        session: leveler_core::SessionId::new(session),
+        turn: leveler_core::TurnId::new(turn),
+        tool_call: leveler_core::ToolCallId::new(tool_call),
+    })
+}
+
+fn service_error(tool: &str, error: ServiceError) -> ToolError {
+    match error {
+        ServiceError::Invalid(message) => ToolError::InvalidArguments {
+            tool: tool.into(),
+            message,
+        },
+        other => ToolError::Io(other.to_string()),
+    }
+}
+
+fn outcome_message(outcome: &WriteOutcome) -> String {
+    match outcome {
+        WriteOutcome::Applied {
+            id,
+            title,
+            operation,
+            superseded,
+            replayed,
+            possible_duplicate,
+            ..
+        } => {
+            let mut line = match operation.as_str() {
+                "created" => format!("Remembered [{id}]: {title}"),
+                "superseded" => format!("Updated [{id}]: {title}"),
+                "merged" => format!("Merged into [{id}]: {title}"),
+                other => format!("Applied {other} [{id}]: {title}"),
+            };
+            if !superseded.is_empty() {
+                line.push_str(&format!(" (superseded [{}])", superseded.join(", ")));
+            }
+            if *replayed {
+                line.push_str(" (replayed; already applied)");
+            }
+            if !possible_duplicate.is_empty() {
+                let ids = possible_duplicate
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                line.push_str(&format!(" (possible duplicate: [{ids}])"));
+            }
+            line
+        }
+        WriteOutcome::Pending {
+            id,
+            title,
+            reason,
+        } => format!(
+            "Queued for approval [{id}]: {title}. A person decides; the current memory is \
+             unchanged. ({reason})"
+        ),
+        WriteOutcome::Skipped { existing, reason } => {
+            if existing.is_empty() {
+                format!("Not stored: {reason}")
+            } else {
+                format!("Not stored: {reason} (current memory [{existing}])")
+            }
+        }
+        WriteOutcome::Conflict {
+            target,
+            current_revision,
+            expected_revision,
+        } => format!(
+            "Conflict on [{target}]: current revision {current_revision}, expected \
+             {expected_revision}. Re-read it and retry."
+        ),
+        WriteOutcome::Rejected { reason } => format!("Rejected: {reason}"),
+        WriteOutcome::NotStored { reason } => format!("Not stored: {reason}"),
+        WriteOutcome::Forgotten { id, title } => format!("Archived memory [{id}]: {title}"),
+    }
+}
+
+fn render_view(view: &MemoryView, with_body: bool, scope: ServiceScope) -> String {
+    if !with_body {
+        return format!("- [{}] {}", view.id, view.title);
+    }
+    let scope = match scope {
+        ServiceScope::Project => "project",
+        ServiceScope::Local => "local",
+        ServiceScope::Global => "global",
+    };
+    // `read` is the handle a caller needs before an update/deprecate: without
+    // the identity, status and scope on the returned record, the revision
+    // alone cannot say what was read or whether it is still current truth.
+    let mut body = format!(
+        "# {}\n\n(id: {}; status: {}; scope: {}; authority: {})\n\n{}",
+        view.title, view.id, view.status, scope, view.authority, view.body
+    );
+    if let Some(experience) = view.experience.as_ref() {
+        body.push_str(&format!(
+            "\n\n(experience·{}; applies when: {}",
+            experience.standing, experience.applies_when
+        ));
+        if let Some(invalid_if) = experience.invalid_if.as_deref() {
+            body.push_str(&format!("; invalid if: {invalid_if}"));
+        }
+        body.push(')');
+    }
+    if !view.tags.is_empty() {
+        body.push_str(&format!("\n\n(tags: {})", view.tags.join(", ")));
+    }
+    if !view.current {
+        body.push_str("\n\n(not current)");
+    }
+    if let Some(revision) = view.revision {
+        body.push_str(&format!("\n\n(revision {revision})"));
+    }
+    body
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MemoryArgs {
-    /// Action: search | list | read
+    /// Action: search | vector_search | list | read | update | deprecate | pin | unpin
     action: String,
-    /// Search query (action=search) or entry id (action=read).
+    /// Storage scope: project (default) | local | global.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Search query (action=search/vector_search) or entry id (action=read).
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
     id: Option<String>,
+    /// Required for update/deprecate: the revision the caller read.
+    #[serde(default)]
+    expected_revision: Option<u64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
@@ -90,10 +264,12 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search, list, or read durable project memories (user-approved facts and \
-         preferences). action=search|vector_search|list|read. Bodies are not in \
-         the system prompt — retrieve them here. vector_search uses local dense \
-         vectors (no cloud embeddings)."
+        "Read and maintain durable memories. action=list|read|search|update|deprecate|pin|unpin. \
+         Bodies are not in the system prompt — retrieve them here. Search and vector_search are \
+         unavailable on the Markdown backend until Stage 3; the tool says so instead of returning \
+         an empty result. update and deprecate require the revision the caller read. A write to a \
+         record the user owns is queued for the user; the model cannot accept or reject pending \
+         memory."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -107,29 +283,26 @@ impl Tool for MemoryTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: ToolContext,
+        context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: MemoryArgs = super::parse_input(self.name(), input)?;
-        let store = self.root.open()?;
+        let service = self.root.service()?;
         let lanes = self.root.lanes();
+        let scope = parse_scope(args.scope.as_deref())?;
+        let read_actor = model_actor(&context).unwrap_or(leveler_memory::v2::Actor::External);
         match args.action.as_str() {
             "list" => {
-                // `effective_active` is the one current-truth read: it drops
-                // expired entries and collapses crash residue by identity, so
-                // a stale copy is never presented to the model as a memory.
-                let entries = store
-                    .effective_active()
-                    .map_err(|e| ToolError::Io(e.to_string()))?
-                    .into_iter()
-                    .filter(|entry| !is_sensitive(entry) && lanes.allows_entry(entry))
-                    .collect::<Vec<_>>();
-                if entries.is_empty() {
+                let views = service
+                    .list(&read_actor, scope, lanes, Some(args.limit.max(1)))
+                    .map_err(|error| service_error(self.name(), error))?;
+                if views.is_empty() {
                     return Ok(ToolOutput::ok("No active memories.".to_string()));
                 }
                 let mut body = String::new();
-                for e in entries {
-                    body.push_str(&format!("- [{}] {}\n", e.id, e.title));
+                for view in views {
+                    body.push_str(&render_view(&view, false, scope));
+                    body.push('\n');
                 }
                 Ok(ToolOutput::ok(body))
             }
@@ -141,98 +314,122 @@ impl Tool for MemoryTool {
                         tool: self.name().into(),
                         message: "read requires id".into(),
                     })?;
-                let e = store
-                    .read_active(&id)
-                    .map_err(|err| ToolError::Io(err.to_string()))?;
-                if is_sensitive(&e) || !lanes.allows_entry(&e) {
-                    return Ok(ToolOutput::error("memory not found"));
-                }
-                // An id can still exist on disk as crash residue for an
-                // identity whose terminal value is another entry. Reading it
-                // as current truth would bypass recall's deduplication.
-                let current = store
-                    .effective_active()
-                    .map_err(|err| ToolError::Io(err.to_string()))?
-                    .into_iter()
-                    .any(|entry| entry.id == e.id);
-                if !current {
-                    return Ok(ToolOutput::error(
-                        "memory is historical or superseded; it is not current truth",
-                    ));
-                }
-                // A recall row carries the conditions so the model can decide
-                // whether to expand; this is the expansion, so it carries the
-                // body and the same conditions. A lesson read without them
-                // would look unconditional.
-                let experience = e.experience.as_ref().map(|record| {
-                    let mut line = format!(
-                        "experience·{}; recorded {}; applies when: {}",
-                        record.standing().as_str(),
-                        e.created_at.trim(),
-                        record.applies_when.trim()
-                    );
-                    if let Some(invalid_if) = record.invalid_if.as_deref() {
-                        line.push_str(&format!("; invalid if: {}", invalid_if.trim()));
+                match service.read(&read_actor, scope, &id) {
+                    Ok(view) => {
+                        if lanes.allows_experience(view.is_experience()) {
+                            Ok(ToolOutput::ok(render_view(&view, true, scope)))
+                        } else {
+                            Ok(ToolOutput::error("memory not found"))
+                        }
                     }
-                    line
-                });
-                let body = match experience {
-                    Some(line) => format!(
-                        "# {}\n\n{}\n\n({line})\n\n(tags: {})",
-                        e.title,
-                        e.body,
-                        e.tags.join(", ")
-                    ),
-                    None => format!(
-                        "# {}\n\n{}\n\n(tags: {})",
-                        e.title,
-                        e.body,
-                        e.tags.join(", ")
-                    ),
-                };
-                Ok(ToolOutput::ok(body))
+                    Err(ServiceError::NotFound(_)) => Ok(ToolOutput::error("memory not found")),
+                    Err(ServiceError::NotCurrent(_)) => Ok(ToolOutput::error(
+                        "memory is historical or superseded; it is not current truth",
+                    )),
+                    Err(error) => Err(service_error(self.name(), error)),
+                }
             }
             "search" | "vector_search" => {
                 let q = args.query.unwrap_or_default();
-                // Search the full active set before filtering. Asking the
-                // store for only the user's limit could let sensitive hits
-                // occupy that window and hide safe matches behind them.
-                let active_count = store
-                    .list_active()
-                    .map_err(|e| ToolError::Io(e.to_string()))?
-                    .len();
-                let search_limit = active_count.max(args.limit.max(1));
-                let mut hits = if args.action == "vector_search" {
-                    store
-                        .vector_search(&q, search_limit)
-                        .map_err(|e| ToolError::Io(e.to_string()))?
-                } else {
-                    store
-                        .search(&q, search_limit)
-                        .map_err(|e| ToolError::Io(e.to_string()))?
+                let hits = match service.search(
+                    &read_actor,
+                    scope,
+                    lanes,
+                    &q,
+                    args.limit.max(1),
+                    args.action == "vector_search",
+                ) {
+                    Ok(hits) => hits,
+                    Err(ServiceError::Unavailable(reason))
+                        if reason == leveler_memory::MARKDOWN_SEARCH_UNAVAILABLE =>
+                    {
+                        return Ok(ToolOutput::error(
+                            "search is not available on the Markdown memory backend until \
+                             Stage 3; use list or read",
+                        ));
+                    }
+                    Err(error) => return Err(service_error(self.name(), error)),
                 };
-                hits.retain(|(entry, _)| !is_sensitive(entry) && lanes.allows_entry(entry));
-                hits.truncate(args.limit.max(1));
                 if hits.is_empty() {
                     return Ok(ToolOutput::ok("No matching memories.".to_string()));
                 }
                 let mut body = String::new();
-                for (e, score) in hits {
+                for (view, score) in hits {
                     body.push_str(&format!(
                         "- [{}] {} (score {:.2})\n  {}\n",
-                        e.id,
-                        e.title,
+                        view.id,
+                        view.title,
                         score,
-                        e.body.lines().next().unwrap_or("")
+                        view.body.lines().next().unwrap_or("")
                     ));
                 }
                 Ok(ToolOutput::ok(body))
             }
+            "update" => {
+                let actor = model_actor(&context)?;
+                let id = require_id(&args)?;
+                let expected = require_revision(&args)?;
+                if args.title.is_none()
+                    && args.body.is_none()
+                    && args.value.is_none()
+                    && args.tags.is_none()
+                    && args.expires_at.is_none()
+                {
+                    return Ok(ToolOutput::error(
+                        "update requires at least one of title, body, value, tags, expires_at",
+                    ));
+                }
+                let patch = UpdateRequest {
+                    title: args.title,
+                    body: args.body,
+                    value: args.value,
+                    tags: args.tags,
+                    expires_at: args.expires_at.map(Some),
+                };
+                let outcome = service
+                    .update(&actor, scope, &id, expected, patch)
+                    .map_err(|error| service_error(self.name(), error))?;
+                Ok(ToolOutput::ok(outcome_message(&outcome)))
+            }
+            "deprecate" => {
+                let actor = model_actor(&context)?;
+                let id = require_id(&args)?;
+                let expected = require_revision(&args)?;
+                let reason = args.reason.unwrap_or_else(|| "deprecated".into());
+                let outcome = service
+                    .deprecate(&actor, scope, &id, expected, reason)
+                    .map_err(|error| service_error(self.name(), error))?;
+                Ok(ToolOutput::ok(outcome_message(&outcome)))
+            }
+            "pin" | "unpin" => {
+                let actor = model_actor(&context)?;
+                let id = require_id(&args)?;
+                let pinned = args.action == "pin";
+                let outcome = service
+                    .pin(&actor, scope, &id, pinned)
+                    .map_err(|error| service_error(self.name(), error))?;
+                Ok(ToolOutput::ok(outcome_message(&outcome)))
+            }
             other => Ok(ToolOutput::error(format!(
-                "unknown action `{other}`; use search|vector_search|list|read"
+                "unknown action `{other}`; use list|read|search|vector_search|update|deprecate|pin|unpin"
             ))),
         }
     }
+}
+
+fn require_id(args: &MemoryArgs) -> Result<String, ToolError> {
+    args.id.clone().ok_or_else(|| ToolError::InvalidArguments {
+        tool: "memory".into(),
+        message: "this action requires id".into(),
+    })
+}
+
+fn require_revision(args: &MemoryArgs) -> Result<u64, ToolError> {
+    args.expected_revision
+        .ok_or_else(|| ToolError::InvalidArguments {
+            tool: "memory".into(),
+            message: "this action requires expected_revision (read the record first)".into(),
+        })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -249,11 +446,21 @@ struct RememberArgs {
     kind: ToolMemoryKind,
     #[serde(default)]
     tags: Vec<String>,
-    /// New evidence for an update of the model's own earlier memory. It is
-    /// persisted with the entry; it never turns model inference into a user
-    /// fact.
+    /// The structured value this subject holds, when the fact has one. Kept
+    /// apart from the prose body so a later structured comparison (and the
+    /// exact-value checks in admission) does not have to parse prose.
+    #[serde(default)]
+    value: Option<String>,
+    /// Absolute RFC3339 instant after which the fact is no longer current.
+    #[serde(default)]
+    expires_at: Option<String>,
+    /// A rationale kept by the legacy store. It is not evidence about the
+    /// user: the Markdown backend records the call identity instead.
     #[serde(default)]
     evidence: Option<String>,
+    /// Storage scope: project (default) | local | global.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// The kinds a proposal may claim.
@@ -266,6 +473,20 @@ enum ToolMemoryKind {
     Decision,
     /// Anything else worth keeping; same reach as a decision.
     Note,
+    /// A fact about the user or the project. On the Markdown backend this is
+    /// the canonical kind; the other labels survive as tags.
+    UserFact,
+}
+
+impl ToolMemoryKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Preference => "preference",
+            Self::Decision => "decision",
+            Self::Note => "note",
+            Self::UserFact => "user_fact",
+        }
+    }
 }
 
 impl From<ToolMemoryKind> for leveler_memory::MemoryKind {
@@ -273,7 +494,7 @@ impl From<ToolMemoryKind> for leveler_memory::MemoryKind {
         match value {
             ToolMemoryKind::Preference => Self::Preference,
             ToolMemoryKind::Decision => Self::Decision,
-            ToolMemoryKind::Note => Self::Note,
+            ToolMemoryKind::Note | ToolMemoryKind::UserFact => Self::Note,
         }
     }
 }
@@ -295,20 +516,22 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &'static str {
-        "Propose a durable project memory: `title`, `body`, `subject`, and \
-         `kind` (`preference`, `decision`, or `note`). `subject` is the stable \
-         fact identity (e.g. `project.default_model`): a later value for the \
-         same subject updates the current memory instead of adding a second \
-         entry. Auto and Restricted require a person to approve the proposal \
-         before it becomes active; Full permits the write without a separate \
-         permission prompt. With nobody to ask, the proposal may stay pending. \
-         The entry records model-inference authority: approval does not claim \
-         the user stated it, and it never replaces a fact the user wrote \
-         directly — a conflict waits for a person. To update the model's own \
-         earlier memory, pass new `evidence`; otherwise it also waits for a \
-         person. `preference` is injected into later turns. `decision` and \
-         `note` are retrieved by relevance or title. `forget` archives an id. \
-         Secrets are not a valid body."
+        "Propose a durable memory: `title`, `body`, `subject`, and `kind` \
+         (`user_fact`, `preference`, `decision`, or `note`). Optional `value` \
+         is the structured value of the subject; optional RFC3339 `expires_at` \
+         makes the fact stop being current at that instant. `subject` is the stable fact \
+         identity (e.g. `project.default_model`): a later value for the same \
+         subject updates the current memory instead of adding a second entry. \
+         Auto and Restricted require a person to approve the proposal before it \
+         becomes active; Full permits the write without a separate permission \
+         prompt. With nobody to ask, the proposal may stay pending. The entry \
+         records model-inference authority: approval does not claim the user \
+         stated it, and it never replaces a fact the user wrote directly — a \
+         conflict waits for a person. A new project fact may become current \
+         immediately; a change to a user-owned fact is queued for the user. \
+         `preference` is injected into later turns. `decision` and `note` are \
+         retrieved by relevance or title. `forget` archives an id. Secrets are \
+         not a valid body."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -323,7 +546,7 @@ impl Tool for RememberTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: ToolContext,
+        context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: RememberArgs = super::parse_input(self.name(), input)?;
@@ -335,73 +558,38 @@ impl Tool for RememberTool {
         if args.title.trim().is_empty() || args.body.trim().is_empty() {
             return Ok(ToolOutput::error("title and body are required"));
         }
-        let store = self.root.open()?;
-        // A model proposal is not a user statement. The candidate carries
-        // model-inference authority and runs the SAME lifecycle decision as
-        // every other write: identity match, merge/replace its own earlier
-        // value, or wait for a person. Approval to execute the tool never
-        // upgrades the fact's authority.
-        let candidate = leveler_memory::agent_candidate(
-            &args.title,
-            &args.body,
-            args.kind.into(),
-            args.tags,
-            &args.subject,
-            args.evidence,
-        )
-        .map_err(|e| ToolError::InvalidArguments {
-            tool: self.name().into(),
-            message: e.to_string(),
-        })?;
-        let outcome = store
-            .admit_agent_candidate(candidate)
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-        let message = match outcome {
-            leveler_memory::AgentAdmitOutcome::Applied(outcome) => {
-                let entry = outcome.entry.ok_or_else(|| {
-                    ToolError::Io("memory lifecycle applied no entry".to_string())
-                })?;
-                match outcome.operation {
-                    leveler_memory::AppliedOperation::Created => {
-                        format!("Remembered [{}]: {}", entry.id, entry.title)
-                    }
-                    leveler_memory::AppliedOperation::Superseded => {
-                        let old = outcome
-                            .superseded
-                            .first()
-                            .map(|old| old.id.as_str())
-                            .unwrap_or("previous value");
-                        format!(
-                            "Updated [{}]: {} (superseded [{}])",
-                            entry.id, entry.title, old
-                        )
-                    }
-                    leveler_memory::AppliedOperation::Merged => {
-                        format!("Merged into [{}]: {}", entry.id, entry.title)
-                    }
-                    leveler_memory::AppliedOperation::Skipped
-                    | leveler_memory::AppliedOperation::NeedsApproval => {
-                        return Err(ToolError::Io(
-                            "memory lifecycle returned an inconsistent outcome".to_string(),
-                        ));
-                    }
-                }
-            }
-            leveler_memory::AgentAdmitOutcome::Queued { candidate, reason } => format!(
-                "Queued for approval [{}]: {}. A person decides; the current memory is unchanged.",
-                candidate.id, reason
-            ),
-            leveler_memory::AgentAdmitOutcome::NotStored { reason } => {
-                format!("Not stored: {reason}")
-            }
+        let service = self.root.service()?;
+        let scope = parse_scope(args.scope.as_deref())?;
+        let actor = model_actor(&context)?;
+        let tool_call = context
+            .tool_call_scope
+            .as_deref()
+            .expect("model_actor requires a call identity");
+        let request = RememberRequest {
+            op_id: format!("remember:{tool_call}"),
+            scope,
+            title: args.title,
+            body: args.body,
+            kind: args.kind.as_str().to_string(),
+            subject: Some(args.subject),
+            value: args.value,
+            tags: args.tags,
+            evidence: args.evidence,
+            expires_at: args.expires_at,
+            replaces_id: None,
         };
-        Ok(ToolOutput::ok(message))
+        let outcome = service
+            .remember(&actor, request)
+            .map_err(|error| service_error(self.name(), error))?;
+        Ok(ToolOutput::ok(outcome_message(&outcome)))
     }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetArgs {
     id: String,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 pub struct ForgetTool {
@@ -421,9 +609,10 @@ impl Tool for ForgetTool {
     }
 
     fn description(&self) -> &'static str {
-        "Archive a durable memory by id. The entry is retained for audit and \
-         is no longer active. Requires user approval. Archiving does not write \
-         a replacement; a replacement is a separate `remember` proposal."
+        "Archive a memory by id. The entry is retained for audit and is no \
+         longer active. Requires user approval. Archiving does not write a \
+         replacement; a replacement is a separate `remember` proposal. A \
+         user-owned memory is queued for the user instead of being removed."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -437,35 +626,53 @@ impl Tool for ForgetTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: ToolContext,
+        context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: ForgetArgs = super::parse_input(self.name(), input)?;
-        let store = self.root.open()?;
-        let entry = store
-            .read_active(&args.id)
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-        if !self.root.lanes().allows_entry(&entry) {
+        let service = self.root.service()?;
+        let scope = parse_scope(args.scope.as_deref())?;
+        let view = match service.read(
+            &leveler_memory::v2::Actor::External,
+            scope,
+            &args.id,
+        ) {
+            Ok(view) => view,
+            Err(ServiceError::NotFound(_)) => {
+                return Ok(ToolOutput::error("memory not found"));
+            }
+            Err(error) => return Err(service_error(self.name(), error)),
+        };
+        if !self
+            .root
+            .lanes()
+            .allows_experience(view.is_experience())
+        {
             return Ok(ToolOutput::error("memory not found"));
         }
-        let entry = store
-            .forget(&args.id)
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-        Ok(ToolOutput::ok(format!(
-            "Archived memory [{}]: {}",
-            entry.id, entry.title
-        )))
+        let actor = model_actor(&context)?;
+        let outcome = service
+            .forget(&actor, scope, &args.id)
+            .map_err(|error| service_error(self.name(), error))?;
+        Ok(ToolOutput::ok(outcome_message(&outcome)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leveler_memory::MemoryStore;
     use tempfile::tempdir;
 
     fn ctx_in(root: &std::path::Path) -> ToolContext {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let call = CALLS.fetch_add(1, Ordering::Relaxed);
         let ws = leveler_execution::Workspace::new(root).unwrap();
         ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .with_session_scope("test-session")
+            .with_turn_scope("test-turn")
+            .with_tool_call_scope(format!("test-call-{call}"))
     }
 
     /// The root a memory tool writes to is the one it was CONSTRUCTED with —

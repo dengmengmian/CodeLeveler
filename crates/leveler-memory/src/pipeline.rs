@@ -28,6 +28,24 @@ pub fn candidate_eligible_for_activation(candidate: &MemoryCandidate) -> bool {
         && !crate::is_high_risk_memory(&candidate.body)
 }
 
+/// One recorded pending-state settlement.
+///
+/// `pending/` is not history: a removed proposal leaves no other trace. This
+/// record is the audit half, written before the file is removed. It carries no
+/// fact body and no value, only identities and the outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDisposition {
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// `covered_by_commit`, `covered_by_direct`, `covered_by_active`,
+    /// `accepted`, `rejected`, or `replaced`.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_id: Option<String>,
+    pub decided_at: String,
+}
+
 /// Result of attempting to enqueue a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposeOutcome {
@@ -231,7 +249,7 @@ impl MemoryStore {
         // wait for consent, but must not be discarded merely because an older
         // value is currently active.
         // Same fingerprint already pending?
-        let mut replaces_pending = None;
+        let mut replaces_pending: Vec<String> = Vec::new();
         for pending in self.list_pending()? {
             if pending.fingerprint == candidate.fingerprint {
                 return Ok(ProposeOutcome::AlreadyPending(pending));
@@ -240,11 +258,11 @@ impl MemoryStore {
                 if pending.body.trim() == candidate.body.trim() {
                     return Ok(ProposeOutcome::AlreadyPending(pending));
                 }
-                // A later correction for the same identity replaces the stale
-                // unapproved proposal. Pending state is not history; keeping
-                // both would let the user accidentally accept the old value.
-                replaces_pending = Some(pending.id);
-                break;
+                // A later correction for the same identity replaces every
+                // stale unapproved proposal for that identity. Pending state
+                // is not history; keeping one would let the user accept an
+                // older value after the newer one arrived.
+                replaces_pending.push(pending.id);
             }
         }
 
@@ -252,8 +270,8 @@ impl MemoryStore {
         // Avoid clobbering a different pending id collision: suffix if needed.
         let mut candidate = candidate;
         let replaces_same_path = replaces_pending
-            .as_deref()
-            .is_some_and(|id| self.pending_path(id) == path);
+            .iter()
+            .any(|id| self.pending_path(id) == path);
         if path.exists() && !replaces_same_path {
             let mut n = 2u32;
             loop {
@@ -270,10 +288,23 @@ impl MemoryStore {
         }
         let json = serde_json::to_string_pretty(&candidate)?;
         write_atomically_pub(&self.pending_path(&candidate.id), json.as_bytes())?;
-        if let Some(old_id) = replaces_pending
-            && old_id != candidate.id
+        for old_id in replaces_pending
+            .into_iter()
+            .filter(|old_id| old_id != &candidate.id)
         {
-            let _ = fs::remove_file(self.pending_path(&old_id));
+            let old = self.read_pending(&old_id)?;
+            self.record_pending_disposition(&PendingDisposition {
+                candidate_id: old.id,
+                key: old.semantic_key.or(old.key),
+                outcome: "replaced".to_string(),
+                committed_id: Some(candidate.id.clone()),
+                decided_at: now_rfc3339(),
+            })?;
+            match fs::remove_file(self.pending_path(&old_id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(MemoryError::Io(error)),
+            }
         }
         Ok(ProposeOutcome::Pending(candidate))
     }
@@ -284,14 +315,28 @@ impl MemoryStore {
     /// already covers is removed, so a crash between activating and clearing
     /// cannot leave the user approving something already stored.
     pub fn list_pending(&self) -> Result<Vec<MemoryCandidate>, MemoryError> {
-        let covered: Vec<String> = self
+        let covered: Vec<(String, String)> = self
             .list_active()?
             .into_iter()
-            .map(|e| e.body.trim().to_string())
+            .map(|entry| (entry.id, entry.body.trim().to_string()))
             .collect();
         for candidate in self.list_pending_raw()? {
-            if covered.iter().any(|b| b == candidate.body.trim()) {
-                let _ = fs::remove_file(self.pending_path(&candidate.id));
+            if let Some((active_id, _)) = covered
+                .iter()
+                .find(|(_, body)| *body == candidate.body.trim())
+            {
+                self.record_pending_disposition(&PendingDisposition {
+                    candidate_id: candidate.id.clone(),
+                    key: candidate.semantic_key.clone().or(candidate.key.clone()),
+                    outcome: "covered_by_active".to_string(),
+                    committed_id: Some(active_id.clone()),
+                    decided_at: now_rfc3339(),
+                })?;
+                match fs::remove_file(self.pending_path(&candidate.id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(MemoryError::Io(error)),
+                }
             }
         }
         self.list_pending_raw()
@@ -395,7 +440,18 @@ impl MemoryStore {
                 }
             }
         };
-        let _ = fs::remove_file(self.pending_path(id));
+        self.record_pending_disposition(&PendingDisposition {
+            candidate_id: candidate.id.clone(),
+            key: candidate.semantic_key.clone().or(candidate.key.clone()),
+            outcome: "accepted".to_string(),
+            committed_id: Some(saved.id.clone()),
+            decided_at: now_rfc3339(),
+        })?;
+        match fs::remove_file(self.pending_path(id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(MemoryError::Io(error)),
+        }
         // Accepting clears suppress for this fingerprint so a later genuine
         // update can be proposed again after forget.
         let _ = fs::remove_file(self.suppress_path(&candidate.fingerprint));
@@ -419,7 +475,18 @@ impl MemoryStore {
         // Suppression is bound to the rejected VALUE (its fingerprint), never
         // to the identity alone. Rejecting "model = Pro" must not silence a
         // later, legitimate "model = Flash".
-        let _ = fs::remove_file(self.pending_path(id));
+        self.record_pending_disposition(&PendingDisposition {
+            candidate_id: candidate.id.clone(),
+            key: candidate.semantic_key.clone().or(candidate.key.clone()),
+            outcome: "rejected".to_string(),
+            committed_id: None,
+            decided_at: now_rfc3339(),
+        })?;
+        match fs::remove_file(self.pending_path(id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(MemoryError::Io(error)),
+        }
         Ok(record)
     }
 
@@ -434,23 +501,69 @@ impl MemoryStore {
             .find(|entry| crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)))
     }
 
-    /// Once an explicit write establishes the current truth, every older
-    /// unapproved proposal for that identity is stale. Removing all of them
-    /// prevents a later accept from reverting the correction.
-    pub(crate) fn clear_pending_for_key(&self, key: &str) -> Result<(), MemoryError> {
+    /// Settle only the pending proposals the committed entry actually covers.
+    ///
+    /// Same identity is not enough: a different value is an alternative the
+    /// user has not decided, and removing it would silently make the new value
+    /// the only option. A proposal is covered only when its body or its
+    /// structured value is exactly what became current. Every removal is
+    /// recorded before the file disappears, so a settlement is traceable to
+    /// both the candidate and the commit that settled it.
+    pub(crate) fn settle_pending_for_commit(
+        &self,
+        committed: &MemoryEntry,
+        key: &str,
+    ) -> Result<(), MemoryError> {
+        let committed_value = committed.value.as_deref().map(str::trim);
         for candidate in self.list_pending_raw()? {
             let candidate_key = candidate
                 .semantic_key
                 .as_deref()
                 .or(candidate.key.as_deref());
-            if candidate_key == Some(key) {
-                match fs::remove_file(self.pending_path(&candidate.id)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(MemoryError::Io(error)),
-                }
+            if candidate_key != Some(key) {
+                continue;
+            }
+            // Compare the PENDING proposal's own structured value to the
+            // committed value. A same-identity proposal with a different value
+            // is an undecided alternative, not a copy of this commit.
+            let same_value = candidate
+                .value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| committed_value == Some(value));
+            if candidate.body.trim() != committed.body.trim() && !same_value {
+                continue;
+            }
+            self.record_pending_disposition(&PendingDisposition {
+                candidate_id: candidate.id.clone(),
+                key: Some(key.to_string()),
+                outcome: "covered_by_commit".to_string(),
+                committed_id: Some(committed.id.clone()),
+                decided_at: now_rfc3339(),
+            })?;
+            match fs::remove_file(self.pending_path(&candidate.id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(MemoryError::Io(error)),
             }
         }
+        Ok(())
+    }
+
+    /// Append one settlement record. `pending/` is not history, so this is the
+    /// only durable account of why a proposal disappeared.
+    pub(crate) fn record_pending_disposition(
+        &self,
+        disposition: &PendingDisposition,
+    ) -> Result<(), MemoryError> {
+        use std::io::Write;
+        let line = serde_json::to_string(disposition)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root().join("pending_history.jsonl"))?;
+        writeln!(file, "{line}")?;
         Ok(())
     }
 }
@@ -809,6 +922,8 @@ mod pipeline_tests {
             fact: "允许清空数据库".into(),
             subject: "database.reset".into(),
             related_subject: None,
+            replaces_memory_id: None,
+            statement: crate::StatementKind::Assertion,
             value: Some("allowed".into()),
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,
@@ -858,8 +973,11 @@ mod pipeline_tests {
         );
     }
 
+    /// A commit removes only the proposals it covers. Another value for the
+    /// same identity is still an undecided alternative; clearing it because
+    /// the subject matches would silently erase the user's option.
     #[test]
-    fn explicit_correction_removes_every_stale_pending_value_for_the_key() {
+    fn an_explicit_correction_keeps_an_unconfirmed_different_value() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         let old = durable("default_model", "以后本项目默认模型固定为 Pro");
@@ -876,7 +994,9 @@ mod pipeline_tests {
             AdmitOutcome::Applied(_)
         ));
 
-        assert!(store.list_pending().unwrap().is_empty());
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1, "the unconfirmed alternative must survive");
+        assert!(pending[0].body.contains("Flash"));
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
         assert!(active[0].body.contains("Ultra"));
@@ -942,6 +1062,8 @@ mod pipeline_tests {
             fact: "以后不要后台启动服务".into(),
             subject: "service.background_start".into(),
             related_subject: None,
+            replaces_memory_id: None,
+            statement: crate::StatementKind::Assertion,
             value: Some("disabled".into()),
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,

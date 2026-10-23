@@ -59,6 +59,16 @@ impl MemoryLanes {
         self.allows(MemoryKind::of(entry))
     }
 
+    /// Whether a lane-kind view may be shown. Used where the view already
+    /// carries its kind, so the caller does not need a synthetic entry.
+    pub fn allows_experience(self, experience: bool) -> bool {
+        if experience {
+            self.experience
+        } else {
+            self.user
+        }
+    }
+
     /// A candidate is experience exactly when it carries the structured
     /// experience record; every other candidate is a user fact proposal.
     pub fn allows_candidate(self, candidate: &MemoryCandidate) -> bool {

@@ -108,6 +108,11 @@ pub enum MemoryOperation {
     Create,
     /// An active memory with the same identity must become historical.
     Supersede { existing_id: String },
+    /// Every listed active entry states the fact this candidate replaces —
+    /// for example the keyed current value plus an unkeyed direct copy left by
+    /// an older writer. One new current entry replaces all of them; none may
+    /// survive beside it.
+    SupersedeMany { existing_ids: Vec<String> },
     /// The candidate is a strict superset of an existing entry with the same
     /// identity: fold the old one into the new current entry. Only fires when
     /// every existing line is already a line of the candidate, so no two
@@ -354,12 +359,24 @@ pub fn decide(
         });
     }
 
+    // The model may name the exact active memory this statement restates or
+    // replaces. The id is a structured target, not a wording guess; it is the
+    // one relation that can reach an entry written before semantic keys
+    // existed. A missing target is resolved after the identity checks below,
+    // so a retry of an already-applied replacement stays idempotent.
+    let explicit_target = candidate
+        .replaces_id
+        .as_deref()
+        .and_then(|id| active.iter().find(|entry| entry.id == id).cloned());
+    let target_missing = candidate.replaces_id.is_some() && explicit_target.is_none();
+
     // The model may name the active subject this statement restates or
     // replaces. The runtime only checks that the named subject is active; it
     // never infers a relation from wording. An unresolvable relation is parked,
     // not guessed: using the candidate's own subject would silently rewrite a
     // different fact, and creating it would accumulate a competing Active entry.
     if let Some(related) = candidate.related_key.as_deref()
+        && explicit_target.is_none()
         && !active
             .iter()
             .any(|entry| durable_entry_key(entry).as_deref() == Some(related))
@@ -382,9 +399,10 @@ pub fn decide(
     if matches!(
         candidate.operation,
         CandidateOperation::Update | CandidateOperation::Negate
-    ) && !active
-        .iter()
-        .any(|entry| entry_matches_candidate(entry, candidate))
+    ) && explicit_target.is_none()
+        && !active
+            .iter()
+            .any(|entry| entry_matches_candidate(entry, candidate))
     {
         return Ok(MemoryDecision {
             operation: MemoryOperation::NeedsApproval {
@@ -394,6 +412,34 @@ pub fn decide(
             },
             related: Vec::new(),
         });
+    }
+
+    if let Some(target) = explicit_target.as_ref() {
+        return decide_replacement(store, candidate, target, &active);
+    }
+
+    // The named target is gone. If this is a retry after the replacement
+    // already landed, the candidate's own identity resolves and the normal
+    // idempotency rules apply. Otherwise the runtime has no evidence about
+    // which current fact the statement meant.
+    if target_missing {
+        let identity_resolves = candidate_identity(candidate).is_some_and(|_| {
+            active
+                .iter()
+                .any(|entry| entry_matches_candidate(entry, candidate))
+        });
+        if !identity_resolves {
+            return Ok(MemoryDecision {
+                operation: MemoryOperation::NeedsApproval {
+                    reason: format!(
+                        "the memory named by `{}` is not active; \
+                         a person must say what this statement replaces",
+                        candidate.replaces_id.as_deref().unwrap_or_default()
+                    ),
+                },
+                related: Vec::new(),
+            });
+        }
     }
 
     let identity = candidate_identity(candidate);
@@ -661,6 +707,143 @@ pub fn decide(
     })
 }
 
+/// Decide a replacement the model bound to an exact active id.
+///
+/// The id is the only relation that can reach an unkeyed legacy entry, so the
+/// authority rules are applied against that entry rather than against a
+/// wording guess. Sibling entries with the candidate's own identity, or with
+/// the target's exact evidence, are the same current fact and leave current
+/// truth together; otherwise one of them would survive beside its replacement.
+fn decide_replacement(
+    store: &MemoryStore,
+    candidate: &MemoryCandidate,
+    target: &MemoryEntry,
+    active: &[MemoryEntry],
+) -> Result<MemoryDecision, MemoryError> {
+    // Experiences carry their own evidence-bound standing rules. A generic id
+    // replacement must not silently change that class; the identity path in
+    // `decide` still handles a corrected experience.
+    if target.experience.is_some() || candidate.experience.is_some() {
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::NeedsApproval {
+                reason: "an experience needs a person to change its identity".to_string(),
+            },
+            related: vec![target.clone()],
+        });
+    }
+
+    let target_evidence = target
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.evidence.as_deref())
+        .map(str::trim)
+        .filter(|evidence| !evidence.is_empty());
+    let mut related = Vec::new();
+    let mut ids = Vec::new();
+    for entry in active {
+        let same_identity = entry_matches_candidate(entry, candidate);
+        let same_evidence = target_evidence.is_some()
+            && entry
+                .provenance
+                .as_ref()
+                .and_then(|provenance| provenance.evidence.as_deref())
+                .map(str::trim)
+                == target_evidence;
+        if entry.id == target.id || same_identity || same_evidence {
+            if !ids.iter().any(|id| id == &entry.id) {
+                ids.push(entry.id.clone());
+                related.push(entry.clone());
+            }
+        }
+    }
+    related.sort_by_key(|entry| entry.id != target.id);
+
+    let same_value = candidate.operation != CandidateOperation::Negate
+        && candidate
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| target.value.as_deref().map(str::trim) == Some(value));
+    if target.body.trim() == candidate.body.trim() || same_value {
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::Skip {
+                reason: format!("memory {} already states this", target.id),
+            },
+            related,
+        });
+    }
+    if store.candidate_retries_history(candidate, &target.id)? {
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::Skip {
+                reason: format!("candidate was already superseded by {}", target.id),
+            },
+            related,
+        });
+    }
+
+    let incoming = candidate.authority.rank();
+    let held = target.authority().rank();
+    if incoming < held {
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::NeedsApproval {
+                reason: format!(
+                    "{} cannot replace the stronger memory {}",
+                    candidate.authority.as_str(),
+                    target.id
+                ),
+            },
+            related,
+        });
+    }
+    let operation = if ids.len() == 1 {
+        MemoryOperation::Supersede {
+            existing_id: ids.into_iter().next().expect("one id"),
+        }
+    } else {
+        MemoryOperation::SupersedeMany { existing_ids: ids }
+    };
+
+    if matches!(
+        candidate.source,
+        CandidateSource::UserExplicit | CandidateSource::UserRestore | CandidateSource::UserAccepted
+    ) && incoming >= held
+    {
+        return Ok(MemoryDecision {
+            operation,
+            related,
+        });
+    }
+    // The model may correct its own earlier tool record with new evidence,
+    // but never a fact of another authority class.
+    if candidate.source == CandidateSource::AgentProposed
+        && target
+            .provenance
+            .as_ref()
+            .map(|provenance| provenance.source.as_str())
+            == Some("agent_remember_tool")
+        && candidate
+            .evidence
+            .as_deref()
+            .is_some_and(|evidence| !evidence.trim().is_empty())
+    {
+        return Ok(MemoryDecision {
+            operation,
+            related,
+        });
+    }
+    Ok(MemoryDecision {
+        operation: MemoryOperation::NeedsApproval {
+            reason: format!(
+                "{} cannot replace {} without a person",
+                candidate.authority.as_str(),
+                target.authority().as_str()
+            ),
+        },
+        related,
+    })
+}
+
 impl MemoryStore {
     pub(crate) fn acquire_lifecycle_lock(&self) -> Result<std::fs::File, MemoryError> {
         let lock = OpenOptions::new()
@@ -741,6 +924,27 @@ impl MemoryStore {
                     skipped_reason: None,
                 })
             }
+            MemoryOperation::SupersedeMany { existing_ids } => {
+                // New-first: the replacement is durable before any old truth
+                // moves to history, so a crash never leaves zero current
+                // entries. `reconcile_active_truths` follows the `supersedes`
+                // link on the next commit and finishes the historical half.
+                let mut olds = Vec::with_capacity(existing_ids.len());
+                for id in &existing_ids {
+                    olds.push(self.read_active(id)?);
+                }
+                let new = self.write_candidate(candidate, olds.first())?;
+                let mut archived = Vec::with_capacity(olds.len());
+                for old in &olds {
+                    archived.push(self.mark_superseded_unlocked(old, &new.id, now)?);
+                }
+                Ok(CommitOutcome {
+                    operation: AppliedOperation::Superseded,
+                    entry: Some(new),
+                    superseded: archived,
+                    skipped_reason: None,
+                })
+            }
             MemoryOperation::Merge { existing_id } => {
                 let old = self.read_active(&existing_id)?;
                 let new = self.write_candidate(candidate, Some(&old))?;
@@ -757,12 +961,13 @@ impl MemoryStore {
         if matches!(
             outcome.operation,
             AppliedOperation::Created | AppliedOperation::Superseded | AppliedOperation::Merged
-        ) && let Some(key) = candidate
-            .semantic_key
-            .as_deref()
-            .or(candidate.key.as_deref())
+        ) && let Some(entry) = outcome.entry.as_ref()
+            && let Some(key) = candidate
+                .semantic_key
+                .as_deref()
+                .or(candidate.key.as_deref())
         {
-            self.clear_pending_for_key(key)?;
+            self.settle_pending_for_commit(entry, key)?;
         }
         Ok(outcome)
     }
@@ -821,6 +1026,40 @@ impl MemoryStore {
     /// authoritative when present; authority and durable timestamps provide a
     /// deterministic fallback for forked legacy residue.
     fn reconcile_active_truths(&self, now: &str) -> Result<(), MemoryError> {
+        // Finish a replacement whose new entry was durable but whose old
+        // copy was not yet moved: the `supersedes` link is the durable record
+        // of that intent. Keyed duplicates are healed by the grouping below;
+        // this also covers an unkeyed target that a correction named by id.
+        let mut active: Vec<MemoryEntry> = self
+            .list_active()?
+            .into_iter()
+            .filter(|entry| {
+                entry.effective_status() == MemoryStatus::Active && !entry.is_expired_at(now)
+            })
+            .collect();
+        active.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let mut healed: HashSet<String> = HashSet::new();
+        for entry in &active {
+            if healed.contains(&entry.id) {
+                continue;
+            }
+            let Some(old_id) = entry.supersedes.as_deref() else {
+                continue;
+            };
+            if old_id == entry.id || healed.contains(old_id) {
+                continue;
+            }
+            let Some(old) = active.iter().find(|candidate| candidate.id == old_id) else {
+                continue;
+            };
+            self.mark_superseded_unlocked(old, &entry.id, now)?;
+            healed.insert(old_id.to_string());
+        }
+
         let mut by_key: HashMap<String, Vec<MemoryEntry>> = HashMap::new();
         for entry in self.list_active()? {
             if entry.effective_status() != MemoryStatus::Active || entry.is_expired_at(now) {
@@ -1145,6 +1384,8 @@ mod tests {
             fact: fact.to_string(),
             subject: subject.to_string(),
             related_subject: None,
+            replaces_memory_id: None,
+            statement: crate::StatementKind::Assertion,
             value: None,
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,

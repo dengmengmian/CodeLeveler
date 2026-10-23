@@ -44,6 +44,12 @@ pub struct ToolContext {
     /// per-session capability state (e.g. browser pages/refs — §18). `None` for
     /// non-session contexts (eval, one-shot CLI); those share a default scope.
     pub session_scope: Option<Arc<str>>,
+    /// The model turn this context belongs to, when the engine provides it.
+    /// Memory tools use it as provenance identity; it never grants authority.
+    pub turn_scope: Option<Arc<str>>,
+    /// The tool call being dispatched. The host stamps this per call, so a
+    /// tool can attribute a write to the exact call that requested it.
+    pub tool_call_scope: Option<Arc<str>>,
     /// Execution writer within the session. Unlike session identity, this
     /// ends when a delegated writer releases its exclusive path ownership.
     pub writer_scope: Option<Arc<str>>,
@@ -394,6 +400,8 @@ impl ToolContext {
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
             },
             session_scope: None,
+            turn_scope: None,
+            tool_call_scope: None,
             writer_scope: None,
             command_lease: None,
             output: None,
@@ -471,6 +479,19 @@ impl ToolContext {
     /// Bind this context to a session identity (browser page/ref isolation).
     pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
         self.session_scope = Some(scope.into());
+        self
+    }
+
+    /// Bind this context to one model turn.
+    pub fn with_turn_scope(mut self, turn: impl Into<Arc<str>>) -> Self {
+        self.turn_scope = Some(turn.into());
+        self
+    }
+
+    /// Bind this context to one dispatched tool call. The host stamps this;
+    /// a tool never takes the identity from its own arguments.
+    pub fn with_tool_call_scope(mut self, call: impl Into<Arc<str>>) -> Self {
+        self.tool_call_scope = Some(call.into());
         self
     }
 

@@ -1502,7 +1502,16 @@ pub fn validate_experience_candidate(
         vec![
             leveler_memory::EXPERIENCE_KIND.to_string(),
             format!("category:{}", candidate.category.as_str()),
-            format!("subject:{subject}"),
+            // The subject is model-supplied and unbounded; a tag is a store
+            // field with a fixed limit. Identity is `semantic_key`, so the
+            // readable prefix is enough for a tag.
+            format!(
+                "subject:{}",
+                clip(
+                    subject,
+                    leveler_memory::v2::record::MAX_TAG_CHARS - "subject:".len()
+                )
+            ),
             format!(
                 "verification:{}",
                 match verification {
@@ -2139,6 +2148,41 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == "resolution" && item.reference.contains("cargo test")),
             "the paired pass is recorded: {record:?}"
+        );
+    }
+
+    /// The subject is model-supplied text of unbounded length, but a tag is a
+    /// bounded store field. Identity lives in `semantic_key`, so a long
+    /// subject keeps a readable prefix instead of making the whole experience
+    /// unadmittable.
+    #[test]
+    fn a_long_subject_tag_stays_within_the_store_limit() {
+        let events = vec![
+            started("a1", "run_command", run_command("cargo", &["test"]), 1),
+            finished("a1", "run_command", true, Some(101), None),
+            started("a2", "apply_patch", json!({"patch": "..."}), 2),
+            finished("a2", "apply_patch", false, None, Some("--- a/src/lib.rs")),
+            started("a3", "run_command", run_command("cargo", &["test"]), 3),
+            finished("a3", "run_command", false, Some(0), None),
+            turn_finished(&["src/lib.rs"]),
+        ];
+        let pack = pack_from(&events, "修复测试").expect("failure evidence");
+        let failure_id = pack.failures[0].id.clone();
+        let mut proposed = candidate(
+            ExperienceCategory::RootCause,
+            &[&failure_id],
+            "测试在默认 feature 下失败，启用测试 feature 后同一命令通过。",
+        );
+        proposed.subject =
+            "experience_shell_verify_exit_code_bare_command_and_a_long_suffix".to_string();
+        let memory = validate_experience_candidate(&proposed, &pack).expect("real evidence");
+        assert!(
+            memory
+                .tags
+                .iter()
+                .all(|tag| tag.chars().count() <= leveler_memory::v2::record::MAX_TAG_CHARS),
+            "tags exceed the store limit: {:?}",
+            memory.tags
         );
     }
 

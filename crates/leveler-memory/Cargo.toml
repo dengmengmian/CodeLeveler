@@ -8,12 +8,26 @@ authors.workspace = true
 repository.workspace = true
 description = "Project-scoped durable synthetic memory: approve-gated write, BM25 search, archive-on-forget."
 
+[features]
+# Test-only failpoints that abort the process at a named point in the
+# commit protocol. Never enabled in a production build: without this feature
+# `failpoints::hit` compiles to a no-op.
+crash-injection = []
+
+[[test]]
+name = "memory_v2_crash_injection"
+required-features = ["crash-injection"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 tempfile = "3"
 fs2 = { workspace = true }
+leveler-core = { workspace = true }
 
 [dev-dependencies]
