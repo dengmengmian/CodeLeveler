@@ -470,7 +470,9 @@ async fn current_prompt_surface_inventory() {
         ("chat", &chat, 22_415_u64),
         ("minimal_baseline", &minimal_baseline, 19_715),
         ("full_baseline", &full_baseline, 22_415),
-        ("goal", &goal, 23_145),
+        // Raised when the memory anti-regression rule landed in AGENTS.md:
+        // the goal case was already 3 tokens under its old ceiling.
+        ("goal", &goal, 24_484),
         ("explorer", &explorer, 13_820),
         ("worker", &worker, 18_444),
         ("reviewer", &reviewer, 13_850),
