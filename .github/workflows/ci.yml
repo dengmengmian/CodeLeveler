@@ -84,6 +84,13 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # Memory identity and lifecycle must be decided by structured facts.
+      # The guard scans decision constructs, not words, and refuses an empty
+      # pass if it can no longer see the shapes it forbids.
+      - name: Architecture guard
+        if: runner.os == 'Linux'
+        run: ./dev arch
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

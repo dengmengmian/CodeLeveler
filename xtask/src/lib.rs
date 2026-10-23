@@ -1,3 +1,4 @@
+mod arch;
 mod clean;
 mod cli;
 mod clock;

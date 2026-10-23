@@ -59,8 +59,11 @@
 | 其他语言、UI、文档或配置 | 使用对应工具链的检查和受影响测试；视觉用渲染 / 手动验证，文档检查真实引用和契约，配置检查语法与实际消费结果 |
 | 目标测试不足以覆盖改动 | 扩大到受影响 crate / target，不运行无关测试 |
 | 真正跨 crate / 运行时契约 | 只验证相关边界；依赖、feature 和构建配置变化可以据技术原因扩大编译范围 |
-| commit / PR gate 或明确完整验证请求 | 使用项目现有 gate；如涉及 Rust，包含 fmt check、workspace check / clippy 和确定性测试 |
+| commit / PR gate 或明确完整验证请求 | 使用项目现有 gate；如涉及 Rust，包含 fmt check、workspace check / clippy 和确定性测试；涉及 Memory 语义时运行 `./dev arch` |
 | Release / RC | release build、完整确定性 gate、eval、TUI / dogfood 与必要的性能、完成率检查；发布资格由外部实验室判定 |
+
+- Memory 的身份、等价、因果、适用条件和生命周期转换只由结构化事实决定：精确 key / value、路径、证据 ID、退出码、执行顺序。禁止用中英文主题词表、停用词表、同义词、句式、连接词或文本相似度替运行时推断含义。
+- `./dev arch` 是结构筛查而非意图证明；例外必须登记在 `docs/ARCHITECTURE_GUARD.exceptions`，写明 reason、Owner 和测试。新增例外前先判断：它验证的是真实结构事实，还是猜测自然语言？
 
 - 普通开发禁止默认跑 workspace tests / all-features check、全量 clippy、release build 或 release-grade dogfood。不得以“更放心”“顺便”扩大范围。
 - 优先使用 `.cargo/config.toml` 的窄范围 alias；不把大型 crate 的全部 integration binaries 当默认下一步。

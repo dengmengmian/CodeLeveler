@@ -1,0 +1,123 @@
+# Architecture guard exceptions for memory business semantics.
+#
+# The guard (`./dev arch`) refuses finite literal tables, substring tests and
+# token-set comparisons that decide what a memory means. An exception is only
+# for a rule that parses a protocol, enforces security, or compares bytes that
+# are already structured. It is NOT for learning a new English or Chinese word
+# that should mean the same fact.
+#
+# Every block must state:
+#   file       repo-relative path
+#   symbol     the function that owns the construct
+#   construct  table | text-predicate | text-set
+#   hits       the exact number the guard finds; a change forces review
+#   reason     why this is parsing, not guessing
+#   owner      the role responsible for keeping it that way
+#   test       a test function that locks the behaviour
+#
+# Adding a synonym, a topic list, a sentence pattern or a similarity threshold
+# is never an acceptable reason.
+
+file = crates/leveler-agent/src/experience.rs
+symbol = looks_like_instruction
+construct = table
+hits = 1
+reason = prompt-injection safety screen; the table only refuses instruction-shaped tool output and never grants or creates memory
+owner = experience-evidence
+test = an_instruction_shaped_preview_never_becomes_a_signature
+---
+file = crates/leveler-agent/src/experience.rs
+symbol = is_noop_edit
+construct = text-predicate
+hits = 2
+reason = exact tool receipt wording from apply_patch and write_file; the fact is the unchanged bytes, not the sentence
+owner = experience-evidence
+test = an_edit_that_reported_success_without_a_change_is_an_observation_pack
+---
+file = crates/leveler-agent/src/experience.rs
+symbol = command_preview_has_no_output
+construct = text-predicate
+hits = 1
+reason = command runner preview protocol: the first line is `exit: N`, stdout/stderr sections are runtime-framed
+owner = experience-evidence
+test = a_silent_success_after_a_failure_is_an_observation_pack
+---
+file = crates/leveler-agent/src/experience.rs
+symbol = looks_like_code_or_log
+construct = text-predicate
+hits = 6
+reason = content-shape safety screen that refuses diffs and test logs as memory bodies; it never decides identity or equivalence
+owner = experience-evidence
+test = a_copied_diff_or_log_is_rejected
+---
+file = crates/leveler-agent/src/experience.rs
+symbol = error_signature
+construct = table
+hits = 1
+reason = bounded selection of a failure line from tool output; standing comes from exit code and command identity, not from these words
+owner = experience-evidence
+test = the_same_failure_signature_is_one_identity_even_with_different_subjects
+---
+file = crates/leveler-agent/src/experience.rs
+symbol = error_signature
+construct = text-predicate
+hits = 1
+reason = bounded selection of a failure line from tool output; standing comes from exit code and command identity, not from these words
+owner = experience-evidence
+test = the_same_failure_signature_is_one_identity_even_with_different_subjects
+---
+file = crates/leveler-memory/src/audit.rs
+symbol = is_canonical_key
+construct = text-predicate
+hits = 1
+reason = normalized key protocol: durable keys are `k-` plus slug or hash; this is spelling, not meaning
+owner = memory-lifecycle
+test = stale_residue_is_reported_without_being_repaired
+---
+file = crates/leveler-memory/src/candidates.rs
+symbol = is_high_risk_memory
+construct = table
+hits = 1
+reason = security policy: destructive-scope wording forces person confirmation; it is conservative and never grants authority
+owner = memory-security
+test = a_destructive_permission_claim_waits_for_confirmation
+---
+file = crates/leveler-memory/src/candidates.rs
+symbol = looks_like_secret
+construct = table
+hits = 1
+reason = secret protection: credential-shaped text is withheld from every automatic path
+owner = memory-security
+test = secrets_rejected
+---
+file = crates/leveler-memory/src/candidates.rs
+symbol = contains_credential_assignment
+construct = table
+hits = 2
+reason = secret protection: conventional credential labels and assignment separators are parsed to find a value, not to interpret meaning
+owner = memory-security
+test = common_credential_forms_are_sensitive
+---
+file = crates/leveler-memory/src/candidates.rs
+symbol = contains_provider_token
+construct = text-predicate
+hits = 4
+reason = secret protection: well-known token prefixes with a minimum payload length
+owner = memory-security
+test = common_credential_forms_are_sensitive
+---
+file = crates/leveler-memory/src/lifecycle.rs
+symbol = agent_candidate
+construct = text-predicate
+hits = 2
+reason = tag protocol: the runtime owns the `kind:` and `subject:` tags and strips a model-supplied copy
+owner = memory-lifecycle
+test = agent_candidate_owns_its_structured_tags
+---
+file = crates/leveler-memory/src/lifecycle.rs
+symbol = decide
+construct = text-set
+hits = 2
+reason = exact line-set containment under one declared identity; no fuzzy similarity and no identity is inferred from it
+owner = memory-lifecycle
+test = a_strict_superset_merges_instead_of_duplicating
