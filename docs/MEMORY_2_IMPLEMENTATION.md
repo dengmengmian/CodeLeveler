@@ -517,15 +517,16 @@ Stage 2.1 只修正确性与证据链，不进入 Stage 3：没有 FTS5、Contex
 
 测试：
 
-| 测试文件 | 覆盖 |
+| 测试文件 | 实际覆盖 |
 | --- | --- |
-| `tests/memory_v2_index.rs` | FTS5 可用性、1/2/3+ 字中文、英文、代码标识符、scope 隔离、active-only、增量、重建、损坏、并发、10k 规模 |
-| `tests/memory_v2_context.rs` | 预算、standing、candidates、experience、sensitive、同 subject 跨 scope 去重、不同 subject 相同 body 不去重、authority 标签、ExternalUnverified 排除、omission、空结果、disabled、index degraded |
-| `tests/memory_v2_injection.rs` | MemoryRecalled 持久化、0 条、catalog version/digest、revision、无 body、resume/compact、历史 vs 当前 |
+| `tests/memory_v2_index.rs` | 中文 1/2/3+ 字、英文/代码标识符（含 CamelCase 及其分词）、混合、scope 隔离、active-only、外部编辑不注入旧正文、索引删除/损坏后从 Markdown 重建、status/lane 过滤、增量 update、supersede、pending/credential 排除、10k 规模（ignored）。尚无独立 FTS5 可用性探测、索引并发读写、版本升级或 rebuild 失败用例。 |
+| `tests/memory_v2_context.rs` | 跨 scope 同一 subject 取最具体、预算随 resolved policy、损坏索引显式降级并保留 standing、外部编辑正文不注入；Builder 单元另覆盖预算公式与同 subject 去重。sensitive/omission/空结果主要经 index 测试与 Builder 单元路径覆盖，没有独立端到端用例。 |
+| `tests/memory_v2_injection.rs` | MemoryRecalled 形状、请求实际内容与 receipt 一致（含 catalog version/digest、block digest 与请求行一致）、supersede 后只召回替代者、词法相关性、experience 模式、关闭 experience lane；0 条由 executor 单元测试覆盖；resume/compact 与历史 vs 当前只有 dogfood 覆盖。 |
 | `tests/memory_v2_tail.rs` | recall 在 tail、guidance/catalog 在 prefix；run 内 delta 不改 prefix、removed delta 无 title/body、run start 重建；catalog version/digest 另见 `tests/memory_v2_injection.rs` |
-| `tests/memory_v2_subagent.rs` | 子代理只读 scope、catalog 空、写入 model_inferred/pending |
+| `tests/memory_v2_subagent.rs` | 子代理继承父 scope/lane 并在 tail 召回、不携带顶层 catalog；尚无子代理写入 model_inferred/pending 的用例。 |
+| `tests/memory_v2_legacy.rs` | Legacy backend 的 recall 仍到达请求、位于 tail、两轮 prefix 稳定、receipt 不声称 catalog/budget。 |
 
-catalog 失效由 `<state>/catalog/<scope>.json` 的版本/digest 与 Builder 的结构化对比实现，没有独立的 `CatalogInvalidated` 事件；超阈值 `catalog_stale`、TTL 变化、run start/resume 的完整 catalog 重建随 `memory_v2_tail.rs` 的 run 生命周期覆盖，尚无独立的过期/超阈值用例。
+catalog 失效由 `<state>/catalog/<scope>.json` 的版本/digest 与 Builder 的结构化对比实现，没有独立的 `CatalogInvalidated` 事件；run start 的完整重建由 `memory_v2_tail.rs` 覆盖，resume/compaction 重建只有 dogfood 覆盖；超阈值 `catalog_stale` 与 TTL 变化尚无独立用例。
 
 Dogfood（真实 CodeLeveler + DeepSeek Flash）：
 
