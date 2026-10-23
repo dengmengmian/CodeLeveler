@@ -471,6 +471,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             ids,
             count,
             experience,
+            ..
         } => serde_json::json!({
             "type": "memory_recalled", "count": count, "ids": ids,
             "experience": experience,

@@ -31,6 +31,39 @@ use leveler_lifecycle::{AgentState, TaskOutcome, TurnOutcome};
 
 use crate::EngineError;
 
+/// One memory line the builder actually rendered into a request.
+///
+/// The body is never stored: id, revision, scope, mode and a line digest are
+/// enough to prove which version reached the model and to find the text again
+/// in Markdown history.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MemoryInjectionRecord {
+    pub id: String,
+    pub revision: u64,
+    pub scope: String,
+    pub kind: String,
+    /// `standing`, `candidate` or `experience`.
+    pub mode: String,
+    pub tokens: u32,
+    pub title: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MemoryOmissionRecord {
+    pub reason: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MemoryInjectionBudgetRecord {
+    pub total_tokens: u32,
+    pub used_tokens: u32,
+    pub standing_tokens: u32,
+    pub candidate_tokens: u32,
+    pub experience_tokens: u32,
+}
+
 /// How a session executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -417,6 +450,35 @@ pub enum EngineEvent {
         /// How many of `ids` were evidence-bound agent experience.
         #[serde(default)]
         experience: u32,
+        /// One receipt per rendered line. This is what the builder selected
+        /// and assembled into the request, not a claim about transport.
+        #[serde(default)]
+        injections: Vec<MemoryInjectionRecord>,
+        #[serde(default)]
+        omitted: Vec<MemoryOmissionRecord>,
+        #[serde(default)]
+        budget: MemoryInjectionBudgetRecord,
+        /// sha256 of the complete advisory block.
+        #[serde(default)]
+        block_digest: String,
+        /// Catalog actually rendered into this run's session prefix.
+        #[serde(default)]
+        catalog_ids: Vec<String>,
+        #[serde(default)]
+        catalog_digest: Option<String>,
+        #[serde(default)]
+        catalog_version: Option<u64>,
+        /// Ids announced in this round's tail delta; empty when the catalog
+        /// did not change.
+        #[serde(default)]
+        catalog_delta_ids: Vec<String>,
+        /// Version the delta brought the model's view to. `catalog_version`
+        /// remains the prefix's version.
+        #[serde(default)]
+        catalog_delta_version: Option<u64>,
+        /// `index_unavailable` or similar when retrieval could not run fully.
+        #[serde(default)]
+        degraded: Option<String>,
     },
     /// A durable memory lifecycle change (created / superseded / expired /
     /// merged). `operation` is an opaque stable key chosen by the memory
@@ -748,7 +810,6 @@ impl EngineEvent {
                 | EngineEvent::SubAgentActivity { .. }
                 | EngineEvent::RunFinished { .. }
                 | EngineEvent::ModelRetrying { .. }
-                | EngineEvent::MemoryRecalled { .. }
         )
     }
 

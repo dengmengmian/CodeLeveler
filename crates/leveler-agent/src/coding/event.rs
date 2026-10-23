@@ -109,10 +109,54 @@ impl From<AgentEvent> for EngineEvent {
                 ids,
                 count,
                 experience,
+                injections,
+                omitted,
+                budget,
+                block_digest,
+                catalog_ids,
+                catalog_digest,
+                catalog_version,
+                catalog_delta_ids,
+                catalog_delta_version,
+                degraded,
             } => EngineEvent::MemoryRecalled {
                 count: count.min(u32::MAX as usize) as u32,
                 ids,
                 experience: experience.min(u32::MAX as usize) as u32,
+                injections: injections
+                    .into_iter()
+                    .map(|injection| leveler_engine::MemoryInjectionRecord {
+                        id: injection.id,
+                        revision: injection.revision,
+                        scope: injection.scope,
+                        kind: injection.kind,
+                        mode: injection.mode,
+                        tokens: injection.tokens,
+                        title: injection.title,
+                        digest: injection.digest,
+                    })
+                    .collect(),
+                omitted: omitted
+                    .into_iter()
+                    .map(|omission| leveler_engine::MemoryOmissionRecord {
+                        reason: omission.reason,
+                        count: omission.count,
+                    })
+                    .collect(),
+                budget: leveler_engine::MemoryInjectionBudgetRecord {
+                    total_tokens: budget.total_tokens,
+                    used_tokens: budget.used_tokens,
+                    standing_tokens: budget.standing_tokens,
+                    candidate_tokens: budget.candidate_tokens,
+                    experience_tokens: budget.experience_tokens,
+                },
+                block_digest: block_digest.unwrap_or_default(),
+                catalog_ids,
+                catalog_digest,
+                catalog_version,
+                catalog_delta_ids,
+                catalog_delta_version,
+                degraded,
             },
             A::MemoryChanged {
                 operation,

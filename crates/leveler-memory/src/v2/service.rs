@@ -371,8 +371,7 @@ impl MemoryService {
         id: &MemoryId,
         expected: Cas,
     ) -> Result<Admission, StoreError> {
-        self.store
-            .unpin(op_id, actor.caller(), id, expected)
+        self.store.unpin(op_id, actor.caller(), id, expected)
     }
 
     pub fn forget(
@@ -382,8 +381,7 @@ impl MemoryService {
         id: &MemoryId,
         expected: Cas,
     ) -> Result<ForgetOutcome, StoreError> {
-        self.store
-            .forget(op_id, actor.caller(), id, expected)
+        self.store.forget(op_id, actor.caller(), id, expected)
     }
 
     /// Accept or reject a pending record. Only a trusted user invocation may

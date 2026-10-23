@@ -140,10 +140,58 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             count,
             ids,
             experience,
+            injections,
+            omitted,
+            budget,
+            block_digest,
+            catalog_ids,
+            catalog_digest,
+            catalog_version,
+            catalog_delta_ids,
+            catalog_delta_version,
+            degraded,
         } => AgentEvent::MemoryRecalled {
             count: count as usize,
             ids,
             experience: experience as usize,
+            injections: injections
+                .into_iter()
+                .map(|injection| leveler_agent::MemoryInjectionReceipt {
+                    id: injection.id,
+                    revision: injection.revision,
+                    scope: injection.scope,
+                    kind: injection.kind,
+                    mode: injection.mode,
+                    tokens: injection.tokens,
+                    title: injection.title,
+                    digest: injection.digest,
+                })
+                .collect(),
+            omitted: omitted
+                .into_iter()
+                .map(|omission| leveler_agent::MemoryOmission {
+                    reason: omission.reason,
+                    count: omission.count,
+                })
+                .collect(),
+            budget: leveler_agent::MemoryInjectionBudget {
+                total_tokens: budget.total_tokens,
+                used_tokens: budget.used_tokens,
+                standing_tokens: budget.standing_tokens,
+                candidate_tokens: budget.candidate_tokens,
+                experience_tokens: budget.experience_tokens,
+            },
+            block_digest: if block_digest.is_empty() {
+                None
+            } else {
+                Some(block_digest)
+            },
+            catalog_ids,
+            catalog_digest,
+            catalog_version,
+            catalog_delta_ids,
+            catalog_delta_version,
+            degraded,
         },
         EngineEvent::MemoryChanged {
             operation,

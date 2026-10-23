@@ -4,8 +4,10 @@
 //! Markdown current records are the content authority; private state files hold
 //! history, receipts, pending proposals, journals and tombstones.
 
+pub mod catalog;
 pub(crate) mod failpoints;
 pub mod frontmatter;
+pub mod index;
 pub mod journal;
 pub mod lifecycle;
 pub mod path;
@@ -14,7 +16,9 @@ pub mod record;
 pub mod service;
 pub mod store;
 
+pub use catalog::{CatalogChange, CatalogEntry, CatalogState, CatalogUpdate};
 pub use frontmatter::{DocumentError, sha256_hex, sha256_hex_text};
+pub use index::{DerivedRow, IndexDiagnostics, IndexError, IndexHit, MemoryIndex, ReconcileReport};
 pub use journal::{JournalPlan, JournalState, RecoveryReport};
 pub use lifecycle::{Admission, PendingReason, RejectReason, SkipReason};
 pub use path::{PathError, ScopeRoots, StorePaths};

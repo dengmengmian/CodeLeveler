@@ -868,6 +868,7 @@ impl EventBridge {
                 count,
                 ids,
                 experience,
+                ..
             } => {
                 // Structured, so no client parses the injected system block.
                 let _ = self.events.send(RuntimeEvent::MemoryRecalled {
@@ -2747,6 +2748,16 @@ mod projection_equivalence {
                 count: 1,
                 ids: vec!["k-probe".into()],
                 experience: 0,
+                injections: Vec::new(),
+                omitted: Vec::new(),
+                budget: leveler_engine::MemoryInjectionBudgetRecord::default(),
+                block_digest: String::new(),
+                catalog_ids: Vec::new(),
+                catalog_digest: None,
+                catalog_version: None,
+                catalog_delta_ids: Vec::new(),
+                catalog_delta_version: None,
+                degraded: None,
             },
             EngineEvent::MemoryChanged {
                 operation: "created".into(),

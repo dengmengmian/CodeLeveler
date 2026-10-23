@@ -1,6 +1,6 @@
 # CodeLeveler Memory 2.0 实施计划
 
-状态：Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3–4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
+状态：Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3（FTS5 derived index、Memory Context Builder、Logged Injection）已于 2026-10-23 实现，验证结果见该轮交付报告。Stage 4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
 
 前置文档：
 

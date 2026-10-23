@@ -12,7 +12,9 @@
 //! the interactive command handlers and the CLI cannot drift into separate
 //! write paths.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use leveler_core::MemoryBackend;
 
@@ -84,7 +86,7 @@ impl MemoryRoots {
 /// The scope a caller addresses. Legacy storage only has one project-shaped
 /// store; the other scopes are unavailable there instead of being silently
 /// mapped onto it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceScope {
     Project,
     Local,
@@ -92,7 +94,7 @@ pub enum ServiceScope {
 }
 
 impl ServiceScope {
-    fn to_v2(self) -> v2::MemoryScope {
+    pub fn to_v2(self) -> v2::MemoryScope {
         match self {
             Self::Project => v2::MemoryScope::Project,
             Self::Local => v2::MemoryScope::Local,
@@ -179,6 +181,9 @@ pub struct MemoryView {
     pub revision: Option<u64>,
     pub current: bool,
     pub expires_at: Option<String>,
+    /// RFC 3339 update time from the content authority; `None` for legacy
+    /// candidates that carry no timestamp.
+    pub updated_at: Option<String>,
     pub pinned_by_user: bool,
     /// Looks like a credential. Automatic paths and model reads withhold it;
     /// the user's own listing keeps the row so it can be found and archived.
@@ -316,14 +321,35 @@ impl RememberRequest {
 }
 
 /// The unified memory entry point.
-#[derive(Debug, Clone)]
 pub struct MemoryService {
     roots: MemoryRoots,
+    indexes: Mutex<HashMap<ServiceScope, Arc<v2::MemoryIndex>>>,
+}
+
+impl Clone for MemoryService {
+    /// A clone shares roots but not the per-process index handles; opening the
+    /// same SQLite file twice is supported by WAL and avoids sharing a mutex
+    /// across unrelated callers.
+    fn clone(&self) -> Self {
+        Self::new(self.roots.clone())
+    }
+}
+
+impl std::fmt::Debug for MemoryService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryService")
+            .field("roots", &self.roots)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryService {
     pub fn new(roots: MemoryRoots) -> Self {
-        Self { roots }
+        Self {
+            roots,
+            indexes: Mutex::new(HashMap::new()),
+        }
     }
 
     /// A legacy service rooted at `root`.
@@ -380,23 +406,21 @@ impl MemoryService {
     }
 
     fn legacy_store(&self) -> Result<MemoryStore, ServiceError> {
-        let root = self.roots.legacy_root.as_ref().ok_or_else(|| {
-            ServiceError::NotConfigured
-        })?;
+        let root = self
+            .roots
+            .legacy_root
+            .as_ref()
+            .ok_or_else(|| ServiceError::NotConfigured)?;
         MemoryStore::open(root).map_err(Into::into)
     }
 
     fn markdown_service(&self, scope: ServiceScope) -> Result<v2::MemoryService, ServiceError> {
-        let roots = self
-            .roots
-            .scope_roots(scope)
-            .cloned()
-            .ok_or_else(|| {
-                ServiceError::Unavailable(format!(
-                    "the {} memory scope is not configured for this session",
-                    scope.as_str()
-                ))
-            })?;
+        let roots = self.roots.scope_roots(scope).cloned().ok_or_else(|| {
+            ServiceError::Unavailable(format!(
+                "the {} memory scope is not configured for this session",
+                scope.as_str()
+            ))
+        })?;
         v2::MemoryService::open(roots).map_err(Into::into)
     }
 
@@ -538,8 +562,45 @@ impl MemoryService {
         }
     }
 
-    /// Lexical or vector search. Markdown search is a Stage 3 capability; it
-    /// returns an explicit unavailable error rather than a fake empty result.
+    /// One record that an automatic injection path may show the model.
+    ///
+    /// Unlike [`Self::read`], this refuses a Markdown record whose receipt is
+    /// not trusted (for example after an external edit). The caller is the
+    /// memory context builder; the user's own listing is a different path.
+    pub fn read_injectable(
+        &self,
+        actor: &Actor,
+        scope: ServiceScope,
+        id: &str,
+    ) -> Result<MemoryView, ServiceError> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => self.read(actor, scope, id),
+            MemoryBackend::Markdown => {
+                let service = self.markdown_service(scope)?;
+                let id = v2::MemoryId::parse(id)
+                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                let record = match service.read(actor, &id) {
+                    Ok(record) => record,
+                    Err(error) => return Err(error.into()),
+                };
+                if record.trust != v2::TrustSummary::Trusted
+                    || !record.record.frontmatter.status.is_active()
+                    || v2::index::is_sensitive_record(&record.record)
+                    || record.record.frontmatter.scope != scope.to_v2()
+                {
+                    return Err(ServiceError::NotCurrent(id.to_string()));
+                }
+                Ok(markdown_view(&record.record, record.effective_authority))
+            }
+        }
+    }
+
+    /// Lexical or vector search.
+    ///
+    /// On the Markdown backend both flags run over the derived lexical index;
+    /// each hit is revalidated against current Markdown before it is returned,
+    /// so a stale row can never surface an old body. A genuine miss is an
+    /// empty result; an index or store failure is an explicit error.
     pub fn search(
         &self,
         actor: &Actor,
@@ -563,17 +624,215 @@ impl MemoryService {
                 };
                 let mut views: Vec<(MemoryView, f64)> = hits
                     .into_iter()
-                    .filter(|(entry, _)| {
-                        !crate::is_sensitive(entry) && lanes.allows_entry(entry)
-                    })
+                    .filter(|(entry, _)| !crate::is_sensitive(entry) && lanes.allows_entry(entry))
                     .map(|(entry, score)| (legacy_view(&entry), score))
                     .collect();
                 views.truncate(limit.max(1));
                 Ok(views)
             }
-            MemoryBackend::Markdown => Err(ServiceError::Unavailable(
-                crate::service::MARKDOWN_SEARCH_UNAVAILABLE.to_string(),
-            )),
+            MemoryBackend::Markdown => {
+                let service = self.markdown_service(scope)?;
+                let index = self.index_for(scope)?;
+                if index.is_dirty().map_err(index_error)? {
+                    let records = service.effective_active()?;
+                    index.reconcile(&records).map_err(index_error)?;
+                }
+                let hits = index
+                    .search(query, limit.max(1).saturating_mul(4))
+                    .map_err(index_error)?;
+                let now = chrono::Utc::now();
+                let mut views = Vec::new();
+                for hit in hits {
+                    let Ok(id) = v2::MemoryId::parse(&hit.id) else {
+                        continue;
+                    };
+                    let record = match service.read(actor, &id) {
+                        Ok(record) => record,
+                        Err(_) => {
+                            // The index row points at a file that is no longer
+                            // current: drop the derived row, keep Markdown.
+                            let _ = index.remove(&hit.id);
+                            continue;
+                        }
+                    };
+                    let stored = index.stored(&hit.id).map_err(index_error)?;
+                    let valid = record.trust == v2::TrustSummary::Trusted
+                        && record.record.frontmatter.status.is_active()
+                        && !v2::index::is_sensitive_record(&record.record)
+                        && record.record.frontmatter.scope == scope.to_v2()
+                        && record
+                            .record
+                            .frontmatter
+                            .expires_at
+                            .map(|expires| expires > now)
+                            .unwrap_or(true)
+                        && stored.as_ref().is_some_and(|(revision, digest)| {
+                            *revision == record.cas.revision && digest == &record.digest
+                        });
+                    if !valid {
+                        // A stale derived row may never surface an old body.
+                        let _ = index.remove(&hit.id);
+                        continue;
+                    }
+                    let view = markdown_view(&record.record, record.effective_authority);
+                    if !lanes.allows_experience(view.is_experience()) {
+                        continue;
+                    }
+                    views.push((view, hit.score));
+                    if views.len() >= limit.max(1) {
+                        break;
+                    }
+                }
+                Ok(views)
+            }
+        }
+    }
+
+    /// Rebuild the derived index for one scope from Markdown current.
+    ///
+    /// This is the controlled recovery path after index damage and the cold
+    /// start path for a new process. It never writes Markdown.
+    pub fn refresh_index(&self, scope: ServiceScope) -> Result<v2::ReconcileReport, ServiceError> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => Ok(v2::ReconcileReport::default()),
+            MemoryBackend::Markdown => {
+                let service = self.markdown_service(scope)?;
+                let records = service.effective_active()?;
+                self.index_for(scope)?
+                    .reconcile(&records)
+                    .map_err(index_error)
+            }
+        }
+    }
+
+    /// Derived-index health, for diagnostics and degradation reporting.
+    pub fn index_diagnostics(
+        &self,
+        scope: ServiceScope,
+    ) -> Result<Option<v2::IndexDiagnostics>, ServiceError> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => Ok(None),
+            MemoryBackend::Markdown => self
+                .index_for(scope)?
+                .diagnostics()
+                .map(Some)
+                .map_err(index_error),
+        }
+    }
+
+    /// Catalog candidates for one scope, from the derived index.
+    ///
+    /// The catalog is a cache-stable list of titles, never content authority:
+    /// every entry is active, non-sensitive and user-stated. The index is
+    /// reconciled first when it is dirty, so a cold start is a controlled
+    /// rebuild rather than an empty prefix.
+    pub fn catalog_candidates(
+        &self,
+        scope: ServiceScope,
+        limit: usize,
+    ) -> Result<Vec<v2::DerivedRow>, ServiceError> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => Ok(Vec::new()),
+            MemoryBackend::Markdown => self
+                .fresh_index(scope)?
+                .catalog_rows(scope.to_v2(), limit)
+                .map_err(index_error),
+        }
+    }
+
+    /// Standing candidates for one scope, from the derived index.
+    pub fn standing_candidates(
+        &self,
+        scope: ServiceScope,
+        limit: usize,
+    ) -> Result<Vec<v2::DerivedRow>, ServiceError> {
+        match self.roots.backend {
+            MemoryBackend::Legacy => Ok(Vec::new()),
+            MemoryBackend::Markdown => self
+                .fresh_index(scope)?
+                .standing_rows(scope.to_v2(), limit)
+                .map_err(index_error),
+        }
+    }
+
+    fn fresh_index(&self, scope: ServiceScope) -> Result<Arc<v2::MemoryIndex>, ServiceError> {
+        let service = self.markdown_service(scope)?;
+        let index = self.index_for(scope)?;
+        if index.is_dirty().map_err(index_error)? {
+            let records = service.effective_active()?;
+            index.reconcile(&records).map_err(index_error)?;
+        }
+        Ok(index)
+    }
+
+    /// Private state root for one scope, when it is configured. Used by the
+    /// catalog owner; it is derived state, never content authority.
+    pub fn scope_state_root(&self, scope: ServiceScope) -> Option<&std::path::Path> {
+        self.roots
+            .scope_roots(scope)
+            .map(|roots| roots.state.as_path())
+    }
+
+    fn index_for(&self, scope: ServiceScope) -> Result<Arc<v2::MemoryIndex>, ServiceError> {
+        let roots = self
+            .roots
+            .scope_roots(scope)
+            .ok_or(ServiceError::NotConfigured)?;
+        let mut indexes = self
+            .indexes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = indexes.get(&scope) {
+            return Ok(index.clone());
+        }
+        let index =
+            Arc::new(v2::MemoryIndex::open(&roots.state.join("index")).map_err(index_error)?);
+        indexes.insert(scope, index.clone());
+        Ok(index)
+    }
+
+    /// Markdown has already committed. Derived-index maintenance must never
+    /// turn that success into a failure or roll it back; an index failure is
+    /// recorded as dirty so the next retrieval rebuilds before trusting it.
+    fn after_markdown_write(
+        &self,
+        scope: ServiceScope,
+        service: &v2::MemoryService,
+        outcome: &WriteOutcome,
+    ) {
+        let Ok(index) = self.index_for(scope) else {
+            return;
+        };
+        match outcome {
+            WriteOutcome::Applied { id, superseded, .. } => {
+                if let Ok(id) = v2::MemoryId::parse(id) {
+                    match service.read(&Actor::External, &id) {
+                        Ok(record)
+                            if record.trust == v2::TrustSummary::Trusted
+                                && record.record.frontmatter.status.is_active()
+                                && !v2::index::is_sensitive_record(&record.record) =>
+                        {
+                            let effective = v2::EffectiveRecord {
+                                record: record.record,
+                                digest: record.digest,
+                                cas: record.cas,
+                                effective_authority: record.effective_authority,
+                            };
+                            let _ = index.sync_record(&effective);
+                        }
+                        _ => {
+                            let _ = index.remove(id.as_str());
+                        }
+                    }
+                }
+                for old in superseded {
+                    let _ = index.remove(old);
+                }
+            }
+            WriteOutcome::Forgotten { id, .. } => {
+                let _ = index.remove(id);
+            }
+            _ => {}
         }
     }
 
@@ -643,9 +902,7 @@ impl MemoryService {
                 }
                 Ok(records
                     .iter()
-                    .map(|record| {
-                        markdown_view(record, record.frontmatter.authority)
-                    })
+                    .map(|record| markdown_view(record, record.frontmatter.authority))
                     .collect())
             }
         }
@@ -692,7 +949,9 @@ impl MemoryService {
                     request.evidence,
                 )
                 .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                Ok(legacy_agent_outcome(store.admit_agent_candidate(candidate)?))
+                Ok(legacy_agent_outcome(
+                    store.admit_agent_candidate(candidate)?,
+                ))
             }
             Actor::User { .. } => {
                 let entry = store.activate(&request.title, &request.body, kind, request.tags)?;
@@ -720,10 +979,13 @@ impl MemoryService {
         actor: &Actor,
         request: RememberRequest,
     ) -> Result<WriteOutcome, ServiceError> {
-        let service = self.markdown_service(request.scope)?;
+        let scope = request.scope;
+        let service = self.markdown_service(scope)?;
         let intent = request.into_intent()?;
         let admission = service.admit(actor, intent);
-        Ok(markdown_outcome(service, admission?))
+        let outcome = markdown_outcome(&service, admission?);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     /// Admit an extracted candidate (user fact or experience) through the
@@ -745,14 +1007,18 @@ impl MemoryService {
                         store.admit_experience_candidate(candidate.clone())?,
                     ))
                 } else {
-                    Ok(legacy_admit_outcome(store.admit_candidate(candidate.clone())?))
+                    Ok(legacy_admit_outcome(
+                        store.admit_candidate(candidate.clone())?,
+                    ))
                 }
             }
             MemoryBackend::Markdown => {
                 let service = self.markdown_service(scope)?;
                 let intent = candidate_intent(candidate, scope, op_seed)?;
                 let admission = service.admit(actor, intent)?;
-                Ok(markdown_outcome(service, admission))
+                let outcome = markdown_outcome(&service, admission);
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -809,7 +1075,8 @@ impl MemoryService {
                 }
             }
             MemoryBackend::Markdown => {
-                let service = self.markdown_service(request.scope)?;
+                let scope = request.scope;
+                let service = self.markdown_service(scope)?;
                 let intent = request.into_intent()?;
                 let reason = match actor {
                     Actor::Model { .. } => v2::PendingReason::ScopeRequiresUserCommand,
@@ -824,7 +1091,9 @@ impl MemoryService {
                 } else {
                     service.admit(actor, intent)?
                 };
-                Ok(markdown_outcome(service, admission))
+                let outcome = markdown_outcome(&service, admission);
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -858,18 +1127,18 @@ impl MemoryService {
                 let op = v2::OpId::parse(format!("forget:{id}:{}", record.cas.revision))
                     .map_err(|error| ServiceError::Invalid(error.to_string()))?;
                 let outcome = service.forget(actor, op, &memory_id, record.cas)?;
-                Ok(match outcome {
+                let outcome = match outcome {
                     v2::ForgetOutcome::Forgotten(tombstone) => WriteOutcome::Forgotten {
                         id: tombstone.id.to_string(),
                         title: record.record.frontmatter.title,
                     },
-                    v2::ForgetOutcome::Pending(admission) => {
-                        markdown_outcome(service, admission)
-                    }
+                    v2::ForgetOutcome::Pending(admission) => markdown_outcome(&service, admission),
                     v2::ForgetOutcome::NotApplied(admission) => {
-                        markdown_outcome(service, admission)
+                        markdown_outcome(&service, admission)
                     }
-                })
+                };
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -966,7 +1235,9 @@ impl MemoryService {
                     },
                 };
                 let admission = service.review(actor, &id, decision)?;
-                Ok(markdown_outcome(service, admission))
+                let outcome = markdown_outcome(&service, admission);
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -1010,7 +1281,9 @@ impl MemoryService {
                 evidence.push(actor.provenance());
                 patch.evidence = Some(evidence);
                 let admission = service.update(actor, op, &id, patch, record.cas)?;
-                Ok(markdown_outcome(service, admission))
+                let outcome = markdown_outcome(&service, admission);
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -1038,18 +1311,13 @@ impl MemoryService {
                         record.cas.revision
                     )));
                 }
-                let op = v2::OpId::parse(format!(
-                    "deprecate:{id}:{expected_revision}"
-                ))
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let admission = service.deprecate(
-                    actor,
-                    op,
-                    &id,
-                    record.cas,
-                    v2::Reason::new(reason),
-                )?;
-                Ok(markdown_outcome(service, admission))
+                let op = v2::OpId::parse(format!("deprecate:{id}:{expected_revision}"))
+                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                let admission =
+                    service.deprecate(actor, op, &id, record.cas, v2::Reason::new(reason))?;
+                let outcome = markdown_outcome(&service, admission);
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -1081,7 +1349,9 @@ impl MemoryService {
                 } else {
                     service.unpin(actor, op, &id, record.cas)?
                 };
-                Ok(markdown_outcome(service, admission))
+                let outcome = markdown_outcome(&service, admission);
+                self.after_markdown_write(scope, &service, &outcome);
+                Ok(outcome)
             }
         }
     }
@@ -1206,6 +1476,11 @@ impl MemoryService {
                     .into_iter()
                     .map(|id| id.to_string())
                     .collect();
+                if let Ok(index) = self.index_for(scope) {
+                    for id in &retired {
+                        let _ = index.remove(id);
+                    }
+                }
                 Ok(due
                     .into_iter()
                     .filter(|view| retired.contains(&view.id))
@@ -1218,16 +1493,12 @@ impl MemoryService {
     pub fn diagnose(&self, scope: ServiceScope) -> Result<v2::DiagnosticReport, ServiceError> {
         match self.roots.backend {
             MemoryBackend::Markdown => {
-                let roots = self
-                    .roots
-                    .scope_roots(scope)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ServiceError::Unavailable(format!(
-                            "the {} memory scope is not configured for this session",
-                            scope.as_str()
-                        ))
-                    })?;
+                let roots = self.roots.scope_roots(scope).cloned().ok_or_else(|| {
+                    ServiceError::Unavailable(format!(
+                        "the {} memory scope is not configured for this session",
+                        scope.as_str()
+                    ))
+                })?;
                 v2::MemoryService::diagnose(roots).map_err(Into::into)
             }
             MemoryBackend::Legacy => Err(ServiceError::Unavailable(
@@ -1237,9 +1508,12 @@ impl MemoryService {
     }
 }
 
-/// Marker used in tool output when the markdown backend has no search yet.
+/// Marker kept for clients built against Stage 2; Markdown search now works.
 pub const MARKDOWN_SEARCH_UNAVAILABLE: &str = "not_available_until_stage_3";
 
+fn index_error(error: v2::IndexError) -> ServiceError {
+    ServiceError::Unavailable(error.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub enum ReviewRequest {
@@ -1333,6 +1607,7 @@ fn legacy_view(entry: &MemoryEntry) -> MemoryView {
         revision: None,
         current: entry.effective_status() == crate::MemoryStatus::Active,
         expires_at: entry.expires_at.clone(),
+        updated_at: Some(entry.updated_at.clone()),
         pinned_by_user: false,
         sensitive: crate::is_sensitive(entry),
         experience: entry.experience.as_ref().map(legacy_experience_view),
@@ -1360,6 +1635,7 @@ fn legacy_candidate_view(candidate: &MemoryCandidate) -> MemoryView {
         revision: None,
         current: false,
         expires_at: candidate.expires_at.clone(),
+        updated_at: None,
         pinned_by_user: false,
         sensitive: crate::is_sensitive_candidate(candidate),
         experience: candidate.experience.as_ref().map(legacy_experience_view),
@@ -1408,11 +1684,18 @@ fn markdown_view(record: &v2::MemoryRecord, authority: v2::MemoryAuthority) -> M
         authority: authority.as_str().to_string(),
         revision: Some(record.frontmatter.revision),
         current: record.frontmatter.status.is_active(),
-        expires_at: record.frontmatter.expires_at.map(|value| value.to_rfc3339()),
+        expires_at: record
+            .frontmatter
+            .expires_at
+            .map(|value| value.to_rfc3339()),
+        updated_at: Some(record.frontmatter.updated_at.to_rfc3339()),
         pinned_by_user: record.frontmatter.pinned_by == Some(v2::PinOwner::User),
         sensitive: record.frontmatter.sensitive,
-        experience: record.frontmatter.experience.as_ref().map(|experience| {
-            ExperienceView {
+        experience: record
+            .frontmatter
+            .experience
+            .as_ref()
+            .map(|experience| ExperienceView {
                 standing: if experience.has_resolution() {
                     "verified".into()
                 } else {
@@ -1425,8 +1708,7 @@ fn markdown_view(record: &v2::MemoryRecord, authority: v2::MemoryAuthority) -> M
                     .iter()
                     .map(|evidence| (evidence.kind.clone(), evidence.reference.clone()))
                     .collect(),
-            }
-        }),
+            }),
     }
 }
 
@@ -1504,9 +1786,7 @@ fn commit_outcome(commit: crate::CommitOutcome) -> WriteOutcome {
         }
         AppliedOperation::Skipped => WriteOutcome::Skipped {
             existing: entry.map(|entry| entry.id).unwrap_or_default(),
-            reason: commit
-                .skipped_reason
-                .unwrap_or_else(|| "skipped".into()),
+            reason: commit.skipped_reason.unwrap_or_else(|| "skipped".into()),
         },
         AppliedOperation::NeedsApproval => WriteOutcome::Pending {
             id: entry.map(|entry| entry.id).unwrap_or_default(),
@@ -1516,7 +1796,7 @@ fn commit_outcome(commit: crate::CommitOutcome) -> WriteOutcome {
     }
 }
 
-fn markdown_outcome(service: v2::MemoryService, admission: v2::Admission) -> WriteOutcome {
+fn markdown_outcome(service: &v2::MemoryService, admission: v2::Admission) -> WriteOutcome {
     match admission {
         v2::Admission::Applied {
             id,
@@ -1535,10 +1815,7 @@ fn markdown_outcome(service: v2::MemoryService, admission: v2::Admission) -> Wri
                 revision: Some(revision),
                 superseded: Vec::new(),
                 replayed: false,
-                possible_duplicate: possible_duplicate
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect(),
+                possible_duplicate: possible_duplicate.iter().map(|id| id.to_string()).collect(),
             }
         }
         v2::Admission::Replayed {
@@ -1598,9 +1875,7 @@ impl RememberRequest {
         // subject: it is stored as a keyless fact, exactly like the legacy
         // direct note. The model tool contract requires `subject` at its own
         // boundary, where the model is the one supplying meaning.
-        let subject_key = self
-            .subject
-            .filter(|subject| !subject.trim().is_empty());
+        let subject_key = self.subject.filter(|subject| !subject.trim().is_empty());
         let mut tags = self.tags;
         // The v2 record kind has no preference/decision/note distinction. The
         // declared label stays visible as a tag instead of becoming an
@@ -1619,9 +1894,7 @@ impl RememberRequest {
         let expires_at = match self.expires_at.as_deref() {
             Some(value) => Some(
                 chrono::DateTime::parse_from_rfc3339(value)
-                    .map_err(|error| {
-                        ServiceError::Invalid(format!("invalid expires_at: {error}"))
-                    })?
+                    .map_err(|error| ServiceError::Invalid(format!("invalid expires_at: {error}")))?
                     .with_timezone(&chrono::Utc),
             ),
             None => None,
@@ -1670,7 +1943,9 @@ fn candidate_intent(
         .clone()
         .or_else(|| candidate.key.clone());
     if kind == v2::MemoryKind::UserFact
-        && subject_key.as_deref().is_none_or(|key| key.trim().is_empty())
+        && subject_key
+            .as_deref()
+            .is_none_or(|key| key.trim().is_empty())
     {
         return Err(ServiceError::Invalid(format!(
             "candidate `{}` has no subject key",
@@ -1709,8 +1984,7 @@ fn candidate_intent(
         crate::v2::sha256_hex_text(&candidate.fingerprint)[..16].to_string()
     );
     Ok(v2::WriteIntent {
-        op_id: v2::OpId::parse(op_id)
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?,
+        op_id: v2::OpId::parse(op_id).map_err(|error| ServiceError::Invalid(error.to_string()))?,
         kind,
         scope: scope.to_v2(),
         subject: None,
