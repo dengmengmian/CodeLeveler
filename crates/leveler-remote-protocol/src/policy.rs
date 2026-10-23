@@ -235,7 +235,11 @@ impl RemotePolicy {
             // Same reasoning, more so: rejecting a candidate is consent
             // withheld, and `RememberMemory` writes durable memory outright.
             | ClientCommand::RejectMemory { .. }
-            | ClientCommand::RememberMemory { .. } => RemoteVerdict::Deny {
+            | ClientCommand::RememberMemory { .. }
+            // Pin is a standing constraint and Deprecate changes what the model
+            // may rely on: both are user decisions, made where the user is.
+            | ClientCommand::SetMemoryPin { .. }
+            | ClientCommand::DeprecateMemory { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
                 reason: "memory is not reachable remotely",
             },

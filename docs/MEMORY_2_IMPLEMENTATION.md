@@ -1,6 +1,6 @@
 # CodeLeveler Memory 2.0 实施计划
 
-状态：Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3（FTS5 derived index、Memory Context Builder、Logged Injection）已于 2026-10-23 实现，验证结果见该轮交付报告。Stage 4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
+状态：Stage 3.1（Store 生命周期性能修复、`/memory` 管理页、召回引用可见性）已于 2026-10-23 实现，见 §3.1；真实多轮 Catalog Delta / Prefix Cache / Lane 关闭 Dogfood 仍未执行。Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3（FTS5 derived index、Memory Context Builder、Logged Injection）已于 2026-10-23 实现，验证结果见该轮交付报告。Stage 4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
 
 前置文档：
 
@@ -562,6 +562,92 @@ Dogfood（真实 CodeLeveler + DeepSeek Flash）：
 - recall 位置/格式回滚：保留旧 `relevant_memory_injection` 的 feature flag（短期），确认新路径稳定后删除；不长期双路径。
 - 事件扩展是可选字段，旧客户端忽略；如果 UI 不兼容，回滚 UI 读取，不删事件。
 - index 文件可删除；Markdown 不受影响。
+
+---
+
+## Stage 3.1：性能根因修复、TUI 管理页与引用可见性
+
+状态：2026-10-23 实现并完成 Phase A 验证（性能基准、生命周期测试、受影响测试）。真实多轮 Dogfood 的 Catalog Delta / Prefix Cache / Lane 关闭三项见 §3.1.7，属于本轮未完成项。
+
+### 3.1.1 实测缺陷与根因
+
+Stage 3 交付后 10k Memory 的 Context Recall p95 为 1980.829ms，而单次 FTS5 查询只有 10.722ms。本轮用同一 Store 形态复现并定位（debug 构建，10k，60 次 recall）：
+
+| 指标 | 修复前 |
+| --- | ---: |
+| recall p95 | 1.668s |
+| `Store open` 次数 / 60 次 recall | 660 |
+| `Orphan cleanup` 次数 / 60 次 recall | 660 |
+| 单次 `MarkdownStore::open`（warm） | 144.6ms |
+
+根因是 Store 生命周期而不是检索算法：`MemoryService` 每次读取都调用 `v2::MemoryService::open`，而 `MarkdownStore::open` 每次都做目录创建、canonicalize、Git 边界检查、独占加锁、journal recovery，并在 `recover_locked` 末尾无条件 `cleanup_orphans`——后者遍历 stage/history/pending/attic/tombstones/receipts/intents/journal/catalog/index 以及**每条记录一个历史子目录**。10k 记录时每次 open 约 145ms，一轮 recall 打开 11 次，且写入路径同样付费。
+
+### 3.1.2 修复
+
+| 位置 | 变更 |
+| --- | --- |
+| `crates/leveler-memory/src/service.rs` | facade 按 Scope 缓存已初始化的 `Arc<v2::MemoryService>`。缓存的是**路径句柄**不是事实：每次 `read` 仍读当前 Markdown 并比对 receipt digest/revision/status/subject_key |
+| `crates/leveler-memory/src/v2/store.rs` | `cleanup_orphans` 移出 `recover_locked`，只在 `open` 与显式 `recover()` 执行；新增 `read_many`（一次共享锁 + 一次 journal 检查）；新增进程级生命周期计数器 `lifecycle_metrics()`（opens / journal_recoveries / orphan_cleanups / reads） |
+| `crates/leveler-memory/src/v2/index.rs` | `documents(scope, kind, status, …)` 二级索引；reconcile 后 `optimize`；`stored_many` 单锁批量校验；`stored` 保留 |
+| `crates/leveler-agent/src/memory_context.rs` | standing 选择改为一次批量读取；检索候选按 chunk 校验，命中即停（正常情况每候选 1 次读，而非 4 次） |
+
+保持不变的一致性契约：Revision、Digest、CAS、外部编辑检测、跨进程写入一致性、Journal Recovery、Forget 不复活、Supersede 只读当前版本、Multi-Scope 隔离、Pending 不注入。Store handle 缓存不跳过跨进程崩溃恢复：另一进程留下的 prepared journal 由本进程下一次加锁读取发现并恢复，见 `tests/memory_v2_crash_injection.rs::a_long_lived_handle_recovers_a_foreign_crash_before_its_next_read`。
+
+### 3.1.3 Orphan Cleanup 生命周期
+
+| 阶段 | 是否扫描 |
+| --- | --- |
+| `open`（含进程启动首次打开） | 是，一次 |
+| 显式 `recover()` | 是，一次 |
+| 正常读 / list / search / standing | 否 |
+| 正常写事务 | 否（写入完成时 `finish_plan` 清理自己准备的 stage/temp） |
+| 异常退出后的下一次 `open` | 是 |
+| 跨进程 prepared journal | 由 `lock_shared_recovered` 触发 recovery（不触发 orphan 扫描） |
+
+`tests/memory_v2_store.rs::orphan_cleanup_is_a_lifecycle_event_not_a_read_cost` 用真实文件锁定该契约。
+
+### 3.1.4 性能结果
+
+同一 fixture（current + history + receipts + tombstones + pending + journal + FTS index）、同一机器、`cargo test --release -p leveler-agent --lib memory_scale -- --ignored --nocapture`：
+
+| 规模 | 修复前 p95（debug） | 修复后 p95（debug） | 修复后 p95（release） | Store opens / 60 recalls |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 27.3ms | 1.29ms | 0.56ms | 0 |
+| 1,000 | 152.9ms | 1.71ms | 1.16ms | 0 |
+| 10,000 | 1,668ms | 25.9ms | 7.63ms（user lane）/ 15.8ms（user+experience） | 0 |
+
+10k release 分解（单 scope）：FTS 查询 6.34ms、候选校验（12 条）≈0.8ms、standing 查询 0.054ms、standing 批量读 8 条 ≈0.6ms、目录/预算组装 <0.3ms。Cold open 仍为 155ms（一次性 recovery + orphan 扫描），catalog 首次 197ms、warm 0.1µs，index rebuild 10k 688ms。
+
+Gate 判定：
+
+| 目标 | 结果 |
+| --- | --- |
+| FTS5 10k p95 < 20ms | PASS（4.32ms，release，`memory_v2_index::ten_thousand_memories_index_scale`） |
+| Index rebuild 10k < 2s | PASS（0.69s，service 路径；纯 reconcile 210ms） |
+| Context Builder 10k p95 < 10ms | PASS（7.63ms，user lane = 出厂配置 `experience_enabled=false`） |
+| 同上，experience lane 有记录时 | 未达标（15.8ms）。原因：两个 lane 需要各自深度的 FTS 排名，而 FTS5 的 `bm25()` 不能用于子查询/窗口函数（实测报错 `unable to use function bm25 in the requested context`），per-kind top-K 必须两次扫描，每次 6.3ms。未达标不做预算/候选削减；下一步可选方案是按 lane 拆分 FTS 表，使 experience lane 的扫描规模与其记录数成正比 |
+
+### 3.1.5 TUI 管理页收口
+
+`/memory` 在既有 Home / Review / Active / Archived / Detail 结构上补齐：
+
+- 列表：`/` 关键词筛选（标题+正文，大小写不敏感子串）、`s` Scope 循环（全部/Global/Project/Local）、`t` Lane 循环（全部/用户记忆/经验）、`x` 清除。筛选是视图，只决定画哪些行；运行时 listing 仍是唯一权威，筛选生效时页头常显「筛选 + 当前条件 + 命中数」，隐藏行必须可见。
+- 行结构：`● 标题` + 第二行 `Scope · Kind · Status · Authority · rN`（`●`=用户固定，`○`=未固定）。
+- 详情：完整正文按宽度折行不截断；元数据块显示 `scope:id`、Scope、Kind、Status、Authority、Revision、Updated、Pinned；`y` 复制正文、`Y` 复制 `scope:id`（不含 TUI 边框/缩进），复制回执区分「原生确认」与「OSC 52 未确认」。
+- 动作：`p` 固定/取消固定（可逆，一次按键）、`d` 标记过期、`f` 归档。后两者需同一键按两次，任何其它按键或离开详情都会撤销确认；运行时未报告 revision 时拒绝发送 Deprecate（不猜写）。
+- 所有动作经 `SetMemoryPin` / `DeprecateMemory` / `ForgetMemory` 到 `MemoryService`；远端设备一律 DENY（`remote-protocol` 策略），TUI 不写 Markdown、不改 authority。
+
+### 3.1.6 引用可见性
+
+`MemoryRecalled` 增加可选字段 `injected`（scope、bounded title、mode），由 builder 的 injection receipt 生成；body 永不进入该事件。`/memory` Home 显示「最近一次召回：N 条」与最多 5 条记录标题，标题**从当前 listing 解析**：已被 forget 的记录只计入「其中 M 条已归档或不再提供」，不再显示标题。transcript 仍只保留 count-only 行。
+
+### 3.1.7 本轮未完成
+
+| 项 | 状态 |
+| --- | --- |
+| 真实多轮 Catalog Delta（真实 TUI + 真实 Provider） | 未执行（单元/集成层已有 `memory_v2_tail.rs`、`memory_v2_injection.rs` 覆盖） |
+| Markdown Backend Prefix Cache 验证 | 未执行（同上，run 内 prefix 稳定性由 `memory_v2_tail.rs` 覆盖，但未取自真实 wire） |
+| User Memory Lane 关闭的真实验收 | 未执行（`leveler-cli` 的 lane 关闭契约测试在本轮 HEAD 已失败，见交付说明） |
 
 ---
 

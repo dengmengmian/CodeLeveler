@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use leveler_memory::v2::{
-    AdmitRequest, Admission, Caller, Cas, ForgetOutcome, ListQuery, MarkdownStore, MemoryId,
+    Admission, AdmitRequest, Caller, Cas, ForgetOutcome, ListQuery, MarkdownStore, MemoryId,
     MemoryScope, MemoryStatus, OpId, RecordPatch, Relation, ScopeRoots, StoreError,
 };
 use memory_v2_common::*;
@@ -46,10 +46,7 @@ fn op(value: &str) -> OpId {
 
 fn cas_from_env() -> Cas {
     Cas {
-        revision: std::env::var("V2_CRASH_REVISION")
-            .unwrap()
-            .parse()
-            .unwrap(),
+        revision: std::env::var("V2_CRASH_REVISION").unwrap().parse().unwrap(),
         digest: std::env::var("V2_CRASH_DIGEST").unwrap(),
     }
 }
@@ -166,8 +163,7 @@ fn crash_child_worker() {
     };
     let current = std::env::var("V2_CRASH_CURRENT").unwrap();
     let state = std::env::var("V2_CRASH_STATE").unwrap();
-    let store =
-        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, current, state)).unwrap();
+    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, current, state)).unwrap();
     let op = op(&std::env::var("V2_CRASH_OP").unwrap());
     let caller = caller(
         std::env::var("V2_CRASH_CALLER")
@@ -238,7 +234,10 @@ fn crash_child_worker() {
         "forget" => {
             let target = MemoryId::parse(std::env::var("V2_CRASH_TARGET").unwrap()).unwrap();
             let outcome = store.forget(op, caller, &target, cas_from_env()).unwrap();
-            assert!(matches!(outcome, ForgetOutcome::Forgotten(_)), "{outcome:?}");
+            assert!(
+                matches!(outcome, ForgetOutcome::Forgotten(_)),
+                "{outcome:?}"
+            );
         }
         other => panic!("unknown crash scenario: {other}"),
     }
@@ -253,8 +252,7 @@ fn crash_recovery_reader_helper() {
     ) else {
         return;
     };
-    let store =
-        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, current, state)).unwrap();
+    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, current, state)).unwrap();
     let active = store.effective_active().unwrap();
     println!("ACTIVE={}", active.len());
     let pending = store.list_pending().unwrap();
@@ -387,9 +385,53 @@ fn crash_recovery_across_devices_converges() {
     );
     assert_aborted_at(&output, "journal_prepared");
 
-    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
+    let store =
+        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
     assert_single_value(&store, "subscription");
     assert_recovered_clean(&store);
+}
+
+// ----- long-lived handle --------------------------------------------------
+
+/// A store handle that stays open must still recover a foreign crash.
+///
+/// The runtime keeps one store handle per scope instead of reopening it on
+/// every recall. That must not become "the first process to open the store owns
+/// the truth": a journal written by another process is picked up by the next
+/// locked read of this handle, and the recovery is the same one a fresh open
+/// would perform.
+#[test]
+fn a_long_lived_handle_recovers_a_foreign_crash_before_its_next_read() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    // Opened before the crash and deliberately never reopened.
+    let long_lived = fixture.store();
+    assert!(effective(&long_lived).is_empty());
+
+    let output = spawn(
+        &fixture,
+        "create",
+        Some("journal_prepared"),
+        &[
+            ("V2_CRASH_OP", "op-crash-cached-handle".into()),
+            ("V2_CRASH_SUBJECT", "billing_model".into()),
+            ("V2_CRASH_VALUE", "subscription".into()),
+            ("V2_CRASH_CALLER", USER_CALLER.into()),
+        ],
+    );
+    assert_aborted_at(&output, "journal_prepared");
+    assert_eq!(
+        files_in(&long_lived.paths().journal_dir).len(),
+        1,
+        "the crashed process must have left a prepared journal behind"
+    );
+
+    // The very next read of the existing handle sees the journal and recovers
+    // it; a cached handle is a cached *path*, not a cached fact.
+    assert_single_value(&long_lived, "subscription");
+    assert_recovered_clean(&long_lived);
+
+    // A second read stays correct and cheap: nothing left to recover.
+    assert_single_value(&long_lived, "subscription");
 }
 
 // ----- current installed --------------------------------------------------

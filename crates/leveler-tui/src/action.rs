@@ -160,6 +160,15 @@ pub struct CleanHost {
     pub run_safe: std::sync::Arc<dyn Fn() -> crate::clean::CleanResultView + Send + Sync>,
 }
 
+/// What a [`Effect::CopyText`] is copying, so the receipt can say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyWhat {
+    /// A memory's stored text.
+    Body,
+    /// A memory's `scope:id` identity.
+    Reference,
+}
+
 /// A side effect for the event loop to carry out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -193,6 +202,10 @@ pub enum Effect {
     /// Open a URL in the default browser (conversation link click, or `/web`
     /// re-invocation when the server is already up).
     OpenWebUrl(String),
+    /// Copy text a page owns (a memory body or its id) to the user's
+    /// clipboard. The event loop performs the copy and reports the delivery
+    /// receipt; the page never claims a copy happened on its own.
+    CopyText { text: String, what: CopyWhat },
     /// Make this machine reachable from a paired phone and produce an invite
     /// (`/remote`). `local` binds the relay to this machine's LAN address
     /// instead of expecting one on the internet — a phone on the same Wi-Fi can

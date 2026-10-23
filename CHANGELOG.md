@@ -12,6 +12,8 @@ display and archive boundaries.
 
 ### Added
 
+- `/memory` is a management page over the runtime's listing: filter titles and bodies by keyword, narrowing by scope and by lane, open a record to read its full text with its own identity and metadata, copy that text or its `scope:id`, and pin, deprecate or archive it. Destructive actions need a second press; every action goes through the memory service and the remote policy denies them
+- A turn's `MemoryRecalled` event names the records the request actually carried (scope, bounded title, mode). `/memory` resolves those names against the current listing, so a record the user has since forgotten is counted, never re-shown
 - Memory is part of the first request when `memory.enabled` is true: `memory`, `remember` and `forget` plus the guidance, catalog and recall no longer require a `capability(enable)` round trip. Approval rules for memory writes are unchanged
 - `/memory status` reports active/pending/archived/sensitive counts, the durable extraction queue, accepted/rejected/skipped totals, the last extraction result, the oldest retry and its sanitized error, and the last recall count
 - `leveler memory audit` lists historical credential-shaped records without printing their content; `leveler memory scrub [--id <id>] [--apply]` is a dry-run by default and redacts only when `--apply` is explicit
@@ -21,6 +23,8 @@ display and archive boundaries.
 
 ### Changed
 
+- Reading durable memory no longer reopens the Markdown store per call: the runtime keeps one initialised handle per scope and re-reads current Markdown under a shared lock, so an external or cross-process write is still visible at the next read
+- Orphan cleanup became a lifecycle event. Opening a store or an explicit recovery scans the private state tree once; reads, listings, searches and committed writes no longer scan one directory per historical record
 - `remember` now records model-inference authority with `agent_remember_tool` provenance. Human approval authorizes the write; it does not claim the user said the fact, and the entry can never replace a fact the user wrote directly
 - `memory.enabled = false` removes the memory pack before capability disclosure, so Full Access cannot expose memory tools, guidance, catalog or recall. Automatic interactive candidate extraction also obeys the switch
 - Background extraction tolerates a reasoning model's first-token latency (90 s) instead of converting a healthy call into a retry at 20 s
@@ -28,6 +32,7 @@ display and archive boundaries.
 
 ### Fixed
 
+- Memory recall at 10k records: p95 1.67s → 7.6ms in the shipped single-lane configuration (release, same fixture). The derived index gained a `documents(scope, kind, status, …)` index and an `optimize` after reconcile, and candidate validation is batched and stops as soon as enough candidates survive. The experience lane still costs a second lexical pass (15.8ms at 10k) because FTS5 cannot rank per kind inside one query
 - A refused `update_goal(complete)` counts as a no-progress round, so a model that repeats the same rejected resolution stops on the existing bounded streak instead of running until its budget (or indefinitely under an unbounded continuation policy). The refusal is still feedback: the next round that does real work resets the streak
 - A Goal can no longer complete on a narrower acceptance than the user's request. `commit_task` refuses an acceptance list that drops an explicitly enumerated deliverable; `update_goal(complete)` requires one accounting entry per requirement and checks named artifacts and commands against the execution record. A user-authored continuation waiver removes a requirement and is persisted with the goal, so resume and compaction cannot resurrect or erase scope
 - Sensitive-material validation covers title, body, tags and provenance evidence on every write path

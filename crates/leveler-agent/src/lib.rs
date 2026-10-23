@@ -21,6 +21,8 @@ pub mod experience;
 mod injected_tools;
 mod memory_context;
 mod memory_extract;
+#[cfg(test)]
+mod memory_scale_bench;
 mod nudges;
 pub mod ownership;
 mod prompt;

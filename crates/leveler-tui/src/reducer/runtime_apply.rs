@@ -1236,11 +1236,15 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::MemoryRecalled {
             count,
             experience_count,
+            injected,
             ..
         } => {
             // Keep the last count even when it is zero: "recall ran and found
             // nothing" is different from "no recall has happened yet".
             state.last_memory_recall = Some(count);
+            // What this turn actually used, so `/memory` can answer "why did it
+            // know that?" without replaying the injected text.
+            state.memory.set_recalled(injected);
             // The runtime emits this only for a real recall, so a search that
             // found nothing never reaches here. Keep one auditable transcript
             // line, but do not duplicate routine recall as a transient toast.

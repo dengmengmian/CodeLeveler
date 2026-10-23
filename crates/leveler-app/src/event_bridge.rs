@@ -868,13 +868,26 @@ impl EventBridge {
                 count,
                 ids,
                 experience,
+                injections,
                 ..
             } => {
                 // Structured, so no client parses the injected system block.
+                // The references let the person see WHICH memory this turn
+                // used; titles are bounded and redacted, bodies never travel.
+                let injected = injections
+                    .into_iter()
+                    .map(|receipt| leveler_client_protocol::UiMemoryReference {
+                        id: receipt.id,
+                        scope: ui_memory_scope_from_name(&receipt.scope),
+                        title: Some(receipt.title),
+                        mode: Some(receipt.mode),
+                    })
+                    .collect();
                 let _ = self.events.send(RuntimeEvent::MemoryRecalled {
                     count,
                     ids,
                     experience_count: experience,
+                    injected,
                 });
             }
             EngineEvent::MemoryChanged {
@@ -3587,5 +3600,18 @@ mod projection_equivalence {
         }]);
         assert_eq!(shapes.len(), 1, "{shapes:?}");
         assert_eq!(shapes[0], "expanded:256000->512000:reread_pressure");
+    }
+}
+
+/// Map the builder's own scope spelling onto the protocol's scope.
+///
+/// An unknown name is `Project`: the only visible effect of a wrong scope is
+/// that the page may not find the record in its listing, which then shows the
+/// count without a title rather than inventing one.
+fn ui_memory_scope_from_name(scope: &str) -> leveler_client_protocol::UiMemoryScope {
+    match scope {
+        "global" => leveler_client_protocol::UiMemoryScope::Global,
+        "local" => leveler_client_protocol::UiMemoryScope::Local,
+        _ => leveler_client_protocol::UiMemoryScope::Project,
     }
 }

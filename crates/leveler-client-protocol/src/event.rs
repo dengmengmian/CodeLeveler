@@ -720,6 +720,12 @@ pub enum RuntimeEvent {
         /// How many of `ids` were evidence-bound agent experience.
         #[serde(default)]
         experience_count: u32,
+        /// The same records with the identity a person needs to find them
+        /// again: scope, bounded title and the mode they were injected in.
+        /// Titles only — a body never travels on this event. Additive: an
+        /// older runtime sends none, and the client then shows counts alone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        injected: Vec<UiMemoryReference>,
     },
     /// A durable memory lifecycle change (created / superseded / expired /
     /// merged). `operation` is an opaque stable key; `title` is a bounded
@@ -847,6 +853,22 @@ impl UiMemoryScope {
     }
 }
 
+/// One record a turn's request actually carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiMemoryReference {
+    pub id: String,
+    /// Which store the record came from; `(scope, id)` is its identity.
+    #[serde(default)]
+    pub scope: UiMemoryScope,
+    /// A bounded summary. Redacted when the record looks like a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// `standing`, `candidate` or `experience`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
 /// Compact durable-memory row for TUI list surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -869,6 +891,25 @@ pub struct UiMemoryEntry {
     /// Kept in the listing so the user can find and archive it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,
+    /// The lifecycle state the store reports for this row (`active`,
+    /// `pending`, `superseded`, `deprecated`). Additive: absent on older
+    /// runtimes, and the page then says nothing it cannot prove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Who established this memory (`user_explicit`, `runtime_observed`, ...).
+    /// This is the store's own vocabulary, not a client guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// The revision this row was read at, so a detail page can name exactly
+    /// what it is showing instead of "the current one".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// When the store last changed this record (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Pinned by the person, not by a model hint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// What a durable memory IS. Strongly typed so no client invents its own

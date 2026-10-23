@@ -259,6 +259,29 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// Pin or unpin one active memory. A user pin is a standing constraint: it
+    /// is recalled first and is never crowded out by a weak candidate. A model
+    /// pin is only a ranking hint, which is why this command exists only on the
+    /// user's surface.
+    SetMemoryPin {
+        session_id: SessionId,
+        #[serde(default)]
+        scope: UiMemoryScope,
+        id: String,
+        pinned: bool,
+    },
+    /// Retire one active memory as no longer true (`deprecated`), keeping its
+    /// history. Distinct from [`Self::ForgetMemory`], which removes the record
+    /// from every read path.
+    DeprecateMemory {
+        session_id: SessionId,
+        #[serde(default)]
+        scope: UiMemoryScope,
+        id: String,
+        /// The revision the user was looking at. A mismatch is a conflict, not
+        /// a silent overwrite of a newer record.
+        revision: u64,
+    },
     /// Archive (forget) one active memory id — user-authoritative (no model).
     ForgetMemory {
         session_id: SessionId,
@@ -575,6 +598,8 @@ impl ClientCommand {
             | ClientCommand::RejectMemory { session_id, .. }
             | ClientCommand::RememberMemory { session_id, .. }
             | ClientCommand::ForgetMemory { session_id, .. }
+            | ClientCommand::SetMemoryPin { session_id, .. }
+            | ClientCommand::DeprecateMemory { session_id, .. }
             | ClientCommand::RequestDiff { session_id, .. }
             | ClientCommand::CompactContext { session_id }
             | ClientCommand::ClearConversation { session_id }
