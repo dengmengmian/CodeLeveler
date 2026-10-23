@@ -416,7 +416,10 @@ impl MarkdownStore {
                 })
             })?;
             let path = entry.path();
-            if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false)
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
                 || path.extension().and_then(std::ffi::OsStr::to_str) != Some("json")
             {
                 continue;
@@ -1103,7 +1106,9 @@ impl MarkdownStore {
                 kind: DiagnosticKind::OrphanStageFile,
                 path: Some(path),
                 detail: "an uncommitted staging file remains".into(),
-                suggestion: "No action: the next recovery removes it, and it was never current truth.".into(),
+                suggestion:
+                    "No action: the next recovery removes it, and it was never current truth."
+                        .into(),
             });
         }
 

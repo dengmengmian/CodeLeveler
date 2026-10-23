@@ -19,6 +19,7 @@ pub mod coding;
 pub mod executor;
 pub mod experience;
 mod injected_tools;
+mod memory_context;
 mod memory_extract;
 mod nudges;
 pub mod ownership;
@@ -60,6 +61,7 @@ pub use leveler_lifecycle::{
     ChildLimit, ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource,
     PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase,
 };
+pub use memory_context::{MemoryInjectionBudget, MemoryInjectionReceipt, MemoryOmission};
 pub use memory_extract::{
     BatchCandidateRejection, BatchCandidateValidation, BatchSemanticCandidate, BatchSourceTurn,
     DEFAULT_EXTRACTION_MAX_TOKENS, DEFAULT_EXTRACTION_TIMEOUT, ExtractionCall, ExtractionContext,

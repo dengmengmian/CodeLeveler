@@ -37,6 +37,10 @@ use leveler_tools::{ToolContext, ToolRegistry};
 use self::dispatch::text_of;
 use crate::coding::PostEditThroughputMode;
 use crate::coding::policy::ResolvedContextPolicy;
+use crate::memory_context::{
+    MemoryContextAssembly, MemoryContextBuilder, MemoryInjectionBudget, MemoryInjectionReceipt,
+    MemoryOmission,
+};
 use crate::nudges::first_user_text;
 use crate::prompt::{PromptBuilder, TurnContext};
 use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOTAL_AGENTS};
@@ -537,6 +541,51 @@ pub(crate) struct MemoryInjection {
     pub attempted: bool,
     /// Selected entries that were agent experience.
     pub experience: usize,
+    pub injections: Vec<MemoryInjectionReceipt>,
+    pub omitted: Vec<MemoryOmission>,
+    pub budget: MemoryInjectionBudget,
+    pub block_digest: Option<String>,
+    pub catalog_ids: Vec<String>,
+    pub catalog_digest: Option<String>,
+    pub catalog_version: Option<u64>,
+    pub catalog_delta_ids: Vec<String>,
+    pub catalog_delta_version: Option<u64>,
+    pub degraded: Option<String>,
+}
+
+fn memory_injection_from_assembly(
+    assembly: MemoryContextAssembly,
+    catalog_ids: Vec<String>,
+    catalog_digest: Option<String>,
+    catalog_version: Option<u64>,
+    degraded: Option<String>,
+) -> MemoryInjection {
+    let experience = assembly
+        .injections
+        .iter()
+        .filter(|injection| injection.mode == "experience")
+        .count();
+    let recalled = assembly
+        .injections
+        .iter()
+        .map(|injection| injection.id.clone())
+        .collect();
+    MemoryInjection {
+        block: assembly.block,
+        recalled,
+        attempted: true,
+        experience,
+        injections: assembly.injections,
+        omitted: assembly.omitted,
+        budget: assembly.budget,
+        block_digest: assembly.block_digest,
+        catalog_ids,
+        catalog_digest,
+        catalog_version,
+        catalog_delta_ids: Vec::new(),
+        catalog_delta_version: None,
+        degraded,
+    }
 }
 
 /// Skills the user named on this turn, plus the injection text.
@@ -827,6 +876,22 @@ pub enum AgentEvent {
         count: usize,
         /// How many of `ids` were agent experience.
         experience: usize,
+        /// One receipt per rendered line: what the builder selected and
+        /// assembled into the request. This is not transport evidence.
+        injections: Vec<MemoryInjectionReceipt>,
+        omitted: Vec<MemoryOmission>,
+        budget: MemoryInjectionBudget,
+        block_digest: Option<String>,
+        /// The catalog rendered into this run's cache-stable prefix.
+        catalog_ids: Vec<String>,
+        catalog_digest: Option<String>,
+        catalog_version: Option<u64>,
+        /// Ids announced in this turn's tail delta; empty when unchanged.
+        catalog_delta_ids: Vec<String>,
+        /// Version the tail delta brought the model's view to, when a delta
+        /// was emitted. `catalog_version` stays the prefix's version.
+        catalog_delta_version: Option<u64>,
+        degraded: Option<String>,
     },
     /// A durable memory was created, superseded or expired by the runtime
     /// lifecycle. `operation` is one of `created` / `superseded` / `expired` /
@@ -1912,6 +1977,9 @@ pub struct Executor {
     /// write path consult this; a closed lane is invisible even when the pack
     /// is exposed for the other lane.
     memory_lanes: leveler_memory::MemoryLanes,
+    /// The one memory injection owner for this run: catalog, recall, budget
+    /// and receipts. Initialized lazily so a Legacy run pays nothing.
+    memory_context: std::sync::OnceLock<MemoryContextBuilder>,
     /// Optional semantic memory-candidate extractor. `None` = the deterministic
     /// fast path is the only producer, which is the pre-existing behavior.
     ///
@@ -2053,6 +2121,7 @@ impl Executor {
             memory_expose: false,
             memory: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
+            memory_context: std::sync::OnceLock::new(),
             step_limits: StepLimits::default(),
             task_model_limits: StepLimits::default(),
             background_tasks: None,
@@ -2605,6 +2674,7 @@ impl Executor {
             // parking mean the same thing at any depth.
             memory: self.memory.clone(),
             memory_lanes: self.memory_lanes,
+            memory_context: std::sync::OnceLock::new(),
             background_tasks: self.background_tasks.clone(),
             // A child spawned after the parent's `/goal` upgrade bills the
             // goal, not the chat window the parent started in.
@@ -2796,6 +2866,37 @@ impl Executor {
             .collect()
     }
 
+    /// The one memory injection owner for this run, when the Markdown backend
+    /// and an open lane make it meaningful. Legacy keeps its existing path.
+    fn memory_context_builder(&self) -> Option<&MemoryContextBuilder> {
+        if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
+            return None;
+        }
+        let service = self.memory.as_ref()?;
+        if service.backend() == leveler_core::MemoryBackend::Legacy {
+            return None;
+        }
+        if !self.memory_lanes.any() {
+            return None;
+        }
+        Some(
+            self.memory_context
+                .get_or_init(|| MemoryContextBuilder::new(service.clone(), self.memory_lanes)),
+        )
+    }
+
+    /// Catalog lines for the cache-stable prefix. A child gets no catalog: it
+    /// inherits scope and lanes for recall, not a second stable prefix.
+    fn memory_catalog_text(&self) -> String {
+        if self.depth > 0 {
+            return String::new();
+        }
+        match self.memory_context_builder() {
+            Some(builder) => builder.catalog_text(),
+            None => self.memory_catalog.clone(),
+        }
+    }
+
     fn system_segments(&self, request: &str) -> Vec<PromptSegment> {
         let root = self
             .tool_context
@@ -2840,7 +2941,7 @@ impl Executor {
                     user_language: crate::prompt::user_language(request),
                     repo_map: root.map(workspace_listing).unwrap_or_default(),
                 })
-                .memory_catalog(self.memory_catalog.clone())
+                .memory_catalog(self.memory_catalog_text())
                 .memory_expose(self.capability_exposed(
                     crate::capability::CapabilityId::Memory,
                     self.memory_expose,
@@ -3017,7 +3118,31 @@ impl Executor {
                 observer(event);
             }
         }
-        let injection = self.relevant_memory_injection(request);
+        // Catalog invalidation is announced once per turn, relative to the
+        // prefix the model already has. The prefix itself is never rewritten
+        // mid-run; the delta is a request-ephemeral tail block.
+        let catalog_delta = if maintain && self.depth == 0 {
+            self.memory_context_builder()
+                .and_then(|builder| builder.catalog_delta())
+        } else {
+            None
+        };
+        // A child receives no catalog in its prefix, so it must not report
+        // one in its receipt either. Recall itself is inherited at any depth.
+        let announce_catalog = maintain && self.depth == 0;
+        let mut injection = self.relevant_memory_injection(request, announce_catalog);
+        if let Some(delta) = &catalog_delta {
+            blocks.push(PromptSegment::control(
+                "catalog_delta",
+                PromptSource::MemoryCatalog,
+                PromptAuthority::AdvisoryContext,
+                SegmentLifecycle::RequestEphemeral,
+                false,
+                delta.text.clone(),
+            ));
+            injection.catalog_delta_ids = delta.ids.clone();
+            injection.catalog_delta_version = Some(delta.version);
+        }
         let recall_ids = injection.recalled.clone();
         if injection.attempted {
             // Zero is a real result. Without this event a client could not
@@ -3026,14 +3151,27 @@ impl Executor {
                 count: injection.recalled.len(),
                 ids: injection.recalled,
                 experience: injection.experience,
+                injections: injection.injections,
+                omitted: injection.omitted,
+                budget: injection.budget,
+                block_digest: injection.block_digest,
+                catalog_ids: injection.catalog_ids,
+                catalog_digest: injection.catalog_digest,
+                catalog_version: injection.catalog_version,
+                catalog_delta_ids: injection.catalog_delta_ids,
+                catalog_delta_version: injection.catalog_delta_version,
+                degraded: injection.degraded,
             });
         }
         if let Some(recall) = injection.block {
+            // The recall block changes every turn; it belongs next to the
+            // current user message, not in the leading system message whose
+            // stability is what makes the provider prefix cache work.
             blocks.push(PromptSegment::control(
                 "memory_recall",
                 PromptSource::MemoryRecall { ids: recall_ids },
                 PromptAuthority::AdvisoryContext,
-                SegmentLifecycle::Turn,
+                SegmentLifecycle::RequestEphemeral,
                 false,
                 recall,
             ));
@@ -3370,7 +3508,7 @@ impl Executor {
     /// recall, derived/sensitive exclusion, dedup, ordering, the byte ceiling
     /// and the trace. Turn assembly carries the result in ControlContext,
     /// independently of conversation persistence and history compaction.
-    fn relevant_memory_injection(&self, request: &str) -> MemoryInjection {
+    fn relevant_memory_injection(&self, request: &str, announce_catalog: bool) -> MemoryInjection {
         if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
             tracing::debug!(memory_exposed = false, "memory recall skipped");
             return MemoryInjection::default();
@@ -3381,16 +3519,33 @@ impl Executor {
         if !self.memory_lanes.any() {
             return MemoryInjection::default();
         }
-        // Stage 2 has no Markdown recall path yet. Reading the legacy store
-        // here would inject a different database than the one being written,
-        // so the honest state is "not consulted" plus a trace that says why.
+        // Markdown is the Memory 2.0 backend: the context builder owns one
+        // assembly path over the derived index and the current Markdown.
         if service.backend() != leveler_core::MemoryBackend::Legacy {
-            tracing::debug!(
-                backend = service.backend().as_str(),
-                event = "memory_recall_unavailable",
-                "memory recall is not available on this backend yet"
+            let Some(builder) = self.memory_context_builder() else {
+                return MemoryInjection::default();
+            };
+            let assembly = builder.recall(request, &self.policy.context_policy);
+            let assembly_degraded = assembly.degraded.clone();
+            let (catalog_ids, catalog_digest, catalog_version) = if announce_catalog {
+                builder
+                    .catalog_metadata()
+                    .map(|(ids, digest, version)| (ids, Some(digest), Some(version)))
+                    .unwrap_or_default()
+            } else {
+                (Vec::new(), None, None)
+            };
+            let mut degraded = assembly_degraded;
+            if builder.catalog_degraded() && degraded.is_none() {
+                degraded = Some("index_unavailable".into());
+            }
+            return memory_injection_from_assembly(
+                assembly,
+                catalog_ids,
+                catalog_digest,
+                catalog_version,
+                degraded,
             );
-            return MemoryInjection::default();
         }
         let Some(root) = service.legacy_root() else {
             return MemoryInjection::default();
@@ -3476,6 +3631,16 @@ impl Executor {
             recalled: plan.selected,
             attempted: true,
             experience: plan.experience,
+            injections: Vec::new(),
+            omitted: Vec::new(),
+            budget: MemoryInjectionBudget::default(),
+            block_digest: None,
+            catalog_ids: Vec::new(),
+            catalog_digest: None,
+            catalog_version: None,
+            catalog_delta_ids: Vec::new(),
+            catalog_delta_version: None,
+            degraded: None,
         }
     }
 
@@ -3503,10 +3668,7 @@ impl Executor {
             return Vec::new();
         };
         let mut events = Vec::new();
-        match service.expire_due(
-            leveler_memory::ServiceScope::Project,
-            leveler_core::now(),
-        ) {
+        match service.expire_due(leveler_memory::ServiceScope::Project, leveler_core::now()) {
             Ok(expired) => {
                 for view in expired {
                     events.push(memory_change_event_from_view(
@@ -3553,9 +3715,7 @@ impl Executor {
             let actor = leveler_memory::v2::Actor::User { invocation };
             match service.remember(&actor, write) {
                 Ok(outcome) => {
-                    if let Some(event) =
-                        memory_change_event_from_write(service, &actor, &outcome)
-                    {
+                    if let Some(event) = memory_change_event_from_write(service, &actor, &outcome) {
                         events.push(event);
                     } else {
                         // The user asked for this write; a rejection it is not
@@ -4476,6 +4636,7 @@ mod ownership_authority_tests {
                     ids,
                     count,
                     experience,
+                    ..
                 } = event
                 {
                     recalled = Some((ids, count, experience));
@@ -4529,6 +4690,7 @@ mod ownership_authority_tests {
                     count: 0,
                     ids,
                     experience: 0,
+                    ..
                 } if ids.is_empty()
             )),
             "expected a zero-hit MemoryRecalled, got {recalled:?}"

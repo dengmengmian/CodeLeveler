@@ -29,5 +29,6 @@ chrono = { workspace = true }
 tempfile = "3"
 fs2 = { workspace = true }
 leveler-core = { workspace = true }
+rusqlite = { version = "0.32.1", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]

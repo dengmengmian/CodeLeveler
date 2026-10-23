@@ -24,8 +24,9 @@ pub use engine::{
     acknowledge_crash_window,
 };
 pub use event::{
-    DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
-    PublicTurnKind, TurnKind,
+    DataClass, EngineEvent, ExecutionKind, MemoryInjectionBudgetRecord, MemoryInjectionRecord,
+    MemoryOmissionRecord, NodeStatus, PublicAcceptanceStatus, PublicEvent, PublicTurnKind,
+    TurnKind,
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.

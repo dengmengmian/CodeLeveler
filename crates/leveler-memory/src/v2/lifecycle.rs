@@ -350,9 +350,10 @@ pub fn has_new_evidence(existing: &MemoryRecord, intent: &MemoryIntent) -> bool 
 }
 
 fn is_channel_source(source: &super::record::SourceRef) -> bool {
-    source.extra.iter().any(|(key, value)| {
-        key.as_str() == Some("channel") && value.as_bool() == Some(true)
-    })
+    source
+        .extra
+        .iter()
+        .any(|(key, value)| key.as_str() == Some("channel") && value.as_bool() == Some(true))
 }
 
 /// A current record must not be replaced through an automatic path when the

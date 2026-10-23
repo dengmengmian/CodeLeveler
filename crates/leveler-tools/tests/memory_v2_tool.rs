@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use leveler_execution::{PermissionProfile, Workspace};
 use leveler_memory::v2::{Actor, MemoryScope, ScopeRoots, UserInvocationId};
-use leveler_memory::{
-    MemoryLanes, MemoryRoots, MemoryService, RememberRequest, ServiceScope,
-};
+use leveler_memory::{MemoryLanes, MemoryRoots, MemoryService, RememberRequest, ServiceScope};
 use leveler_tools::tools::{ForgetTool, MemoryRoot, MemoryTool, RememberTool};
 use leveler_tools::{Tool, ToolContext};
 use tokio_util::sync::CancellationToken;
@@ -36,13 +34,11 @@ fn fixture() -> Fixture {
         dir.path().join("global/current"),
         dir.path().join("global/state"),
     );
-    let service = Arc::new(
-        MemoryService::new(
-            MemoryRoots::markdown()
-                .with_project(project)
-                .with_global(global),
-        ),
-    );
+    let service = Arc::new(MemoryService::new(
+        MemoryRoots::markdown()
+            .with_project(project)
+            .with_global(global),
+    ));
     let workspace = Workspace::new(dir.path()).unwrap();
     let mut ctx = ToolContext::new(workspace, PermissionProfile::FullAccess);
     ctx.session_scope = Some(Arc::from("session-1"));
@@ -80,12 +76,7 @@ impl Fixture {
 
     fn active(&self, scope: ServiceScope) -> Vec<leveler_memory::MemoryView> {
         self.service
-            .list(
-                &Actor::External,
-                scope,
-                MemoryLanes::ALL,
-                None,
-            )
+            .list(&Actor::External, scope, MemoryLanes::ALL, None)
             .unwrap()
     }
 }
@@ -165,7 +156,10 @@ async fn a_model_global_fact_is_queued_and_never_becomes_active() {
         fixture.active(ServiceScope::Global).is_empty(),
         "a model write outside the project scope must not become current"
     );
-    let pending = fixture.service.pending(&user(), ServiceScope::Global).unwrap();
+    let pending = fixture
+        .service
+        .pending(&user(), ServiceScope::Global)
+        .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].status, "pending");
     assert_eq!(pending[0].authority, "model_inferred");
@@ -176,11 +170,15 @@ async fn a_model_global_fact_is_queued_and_never_becomes_active() {
         .await
         .unwrap();
     assert!(accept.is_error, "{}", accept.content);
-    assert!(accept.content.contains("unknown action"), "{}", accept.content);
+    assert!(
+        accept.content.contains("unknown action"),
+        "{}",
+        accept.content
+    );
 }
 
 #[tokio::test]
-async fn markdown_search_reports_unavailable_instead_of_empty() {
+async fn markdown_search_returns_lexical_hits_and_never_a_fake_empty_result() {
     let fixture = fixture();
     fixture
         .remember(serde_json::json!({
@@ -194,25 +192,23 @@ async fn markdown_search_reports_unavailable_instead_of_empty() {
         .await
         .unwrap();
 
+    // On the Markdown backend both actions run over the same derived lexical
+    // index. The important contract is that a hit is a hit and a miss is a
+    // real miss, never a claim of unavailability or an invented empty result.
     for action in ["search", "vector_search"] {
         let output = fixture
             .memory(serde_json::json!({"action": action, "query": "Flash"}))
             .await
             .unwrap();
-        assert!(output.is_error, "{action}: {}", output.content);
+        assert!(!output.is_error, "{action}: {}", output.content);
         assert!(
-            output.content.contains("not available"),
-            "{action}: {}",
-            output.content
-        );
-        assert!(
-            output.content.contains("Stage 3"),
+            output.content.contains("Default model is Flash"),
             "{action}: {}",
             output.content
         );
         assert!(
             !output.content.contains("No matching memories"),
-            "{action} must not fake an empty result: {}",
+            "{action}: {}",
             output.content
         );
     }

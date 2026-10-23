@@ -346,6 +346,7 @@ async fn a_turn_with_no_memory_reports_a_zero_hit_recall() {
                 count,
                 ids,
                 experience,
+                ..
             } => Some((*count, ids.clone(), *experience)),
             _ => None,
         })

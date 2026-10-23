@@ -26,6 +26,19 @@ use leveler_memory::{
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
+/// A single read never returns more than this much body, independent of the
+/// token budget. A larger body is continued with an explicit offset.
+const READ_BODY_MAX_BYTES: usize = 64 * 1024;
+/// One read may spend about this many estimated tokens.
+const READ_CALL_TOKEN_BUDGET: u64 = 600;
+/// A turn may issue this many reads ...
+const READ_CALLS_PER_TURN: u32 = 4;
+/// ... and spend about this many estimated tokens across them.
+const READ_TOKENS_PER_TURN: u64 = 8_000;
+/// Below this remaining allowance a read cannot make progress; the caller is
+/// told the budget is exhausted instead of receiving an empty continuation.
+const READ_MIN_ALLOWANCE: u64 = 64;
+
 /// The memory service and lane policy a memory tool is built with.
 #[derive(Clone)]
 pub struct MemoryRoot {
@@ -145,11 +158,7 @@ fn outcome_message(outcome: &WriteOutcome) -> String {
             }
             line
         }
-        WriteOutcome::Pending {
-            id,
-            title,
-            reason,
-        } => format!(
+        WriteOutcome::Pending { id, title, reason } => format!(
             "Queued for approval [{id}]: {title}. A person decides; the current memory is \
              unchanged. ({reason})"
         ),
@@ -178,6 +187,18 @@ fn render_view(view: &MemoryView, with_body: bool, scope: ServiceScope) -> Strin
     if !with_body {
         return format!("- [{}] {}", view.id, view.title);
     }
+    render_view_body(view, scope, &view.body, None)
+}
+
+/// Render one record with an explicit body slice. `truncated` is
+/// `(start_byte, end_byte, total_bytes)` and adds the continuation contract:
+/// a caller must always be able to fetch the rest, never lose the long tail.
+fn render_view_body(
+    view: &MemoryView,
+    scope: ServiceScope,
+    body_text: &str,
+    truncated: Option<(usize, usize, usize)>,
+) -> String {
     let scope = match scope {
         ServiceScope::Project => "project",
         ServiceScope::Local => "local",
@@ -188,8 +209,13 @@ fn render_view(view: &MemoryView, with_body: bool, scope: ServiceScope) -> Strin
     // alone cannot say what was read or whether it is still current truth.
     let mut body = format!(
         "# {}\n\n(id: {}; status: {}; scope: {}; authority: {})\n\n{}",
-        view.title, view.id, view.status, scope, view.authority, view.body
+        view.title, view.id, view.status, scope, view.authority, body_text
     );
+    if let Some((start, end, total)) = truncated {
+        body.push_str(&format!(
+            "\n\n(truncated: showed bytes {start}..{end} of {total}; continue with offset={end})"
+        ));
+    }
     if let Some(experience) = view.experience.as_ref() {
         body.push_str(&format!(
             "\n\n(experience·{}; applies when: {}",
@@ -241,19 +267,36 @@ struct MemoryArgs {
     reason: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Read action only: byte offset into the body, from a previous
+    /// `(truncated: ... continue with offset=N)` marker.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 fn default_limit() -> usize {
     5
 }
 
+/// What one turn has already spent on full-memory reads.
+#[derive(Debug, Default, Clone, Copy)]
+struct TurnReadBudget {
+    calls: u32,
+    tokens: u64,
+}
+
 pub struct MemoryTool {
     root: MemoryRoot,
+    /// Keyed by (session, turn): a new turn starts with a fresh allowance,
+    /// while every call in the same turn shares one bounded budget.
+    reads: std::sync::Mutex<std::collections::HashMap<(String, String), TurnReadBudget>>,
 }
 
 impl MemoryTool {
     pub fn new(root: MemoryRoot) -> Self {
-        Self { root }
+        Self {
+            root,
+            reads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 }
 
@@ -265,11 +308,11 @@ impl Tool for MemoryTool {
 
     fn description(&self) -> &'static str {
         "Read and maintain durable memories. action=list|read|search|update|deprecate|pin|unpin. \
-         Bodies are not in the system prompt — retrieve them here. Search and vector_search are \
-         unavailable on the Markdown backend until Stage 3; the tool says so instead of returning \
-         an empty result. update and deprecate require the revision the caller read. A write to a \
-         record the user owns is queued for the user; the model cannot accept or reject pending \
-         memory."
+         Bodies are not in the system prompt — retrieve them here. On the Markdown backend both \
+         search and vector_search run over the derived lexical index; a backend without search \
+         says so instead of returning an empty result. update and deprecate require the revision \
+         the caller read. A write to a record the user owns is queued for the user; the model \
+         cannot accept or reject pending memory."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -317,7 +360,7 @@ impl Tool for MemoryTool {
                 match service.read(&read_actor, scope, &id) {
                     Ok(view) => {
                         if lanes.allows_experience(view.is_experience()) {
-                            Ok(ToolOutput::ok(render_view(&view, true, scope)))
+                            self.bounded_read(&view, scope, args.offset, &context)
                         } else {
                             Ok(ToolOutput::error("memory not found"))
                         }
@@ -418,6 +461,122 @@ impl Tool for MemoryTool {
                 "unknown action `{other}`; use list|read|search|vector_search|update|deprecate|pin|unpin"
             ))),
         }
+    }
+}
+
+impl MemoryTool {
+    /// Render a full record under the per-call and per-turn read budget.
+    ///
+    /// The budget is a resource bound, not a content decision: when it runs
+    /// out the caller is told explicitly and receives the offset needed to
+    /// continue, so a long record is never silently cut short.
+    fn bounded_read(
+        &self,
+        view: &MemoryView,
+        scope: ServiceScope,
+        offset: Option<usize>,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let key = (
+            context.session_scope.as_deref().unwrap_or("-").to_string(),
+            context.turn_scope.as_deref().unwrap_or("-").to_string(),
+        );
+        let mut budgets = self
+            .reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only the current turn's budget is live; older turns would otherwise
+        // accumulate forever in a long session.
+        budgets.retain(|(session, turn), _| session == &key.0 && turn == &key.1);
+        let budget = budgets.entry(key).or_default();
+        let remaining_tokens = READ_TOKENS_PER_TURN.saturating_sub(budget.tokens);
+        if budget.calls >= READ_CALLS_PER_TURN || remaining_tokens < READ_MIN_ALLOWANCE {
+            return Ok(ToolOutput::error(format!(
+                "read_budget_exhausted: this turn already used {} memory read(s) and {} tokens. \
+                 Continue with the text already returned, or read again in a new turn. \
+                 For a truncated record, the last marker carries its continuation offset.",
+                budget.calls, budget.tokens
+            )));
+        }
+        let total = view.body.len();
+        let requested = offset.unwrap_or(0);
+        if requested > total {
+            return Ok(ToolOutput::error(format!(
+                "offset {requested} is past the end of the body ({total} bytes)"
+            )));
+        }
+        // An offset a caller typed by hand may land inside a character; the
+        // slice itself must still start on a UTF-8 boundary.
+        let start = char_boundary_floor(&view.body, requested);
+        let allowance = READ_CALL_TOKEN_BUDGET.min(remaining_tokens);
+        let (text, used) = bounded_read_text(view, scope, start, allowance, READ_BODY_MAX_BYTES);
+        budget.calls += 1;
+        budget.tokens = budget.tokens.saturating_add(used);
+        Ok(ToolOutput::ok(text))
+    }
+}
+
+/// Shrink a body slice to the largest prefix that fits the token allowance,
+/// always honouring UTF-8 boundaries and always making progress.
+fn bounded_read_text(
+    view: &MemoryView,
+    scope: ServiceScope,
+    start: usize,
+    allowance: u64,
+    max_bytes: usize,
+) -> (String, u64) {
+    let total = view.body.len();
+    let hard_end = char_boundary_floor(&view.body, (start + max_bytes).min(total));
+    let mut end = hard_end;
+    loop {
+        let text = render_slice(view, scope, start, end);
+        let used = leveler_model::estimate_text(&text);
+        if used <= allowance || end <= start {
+            // Ensure at least one character when the body still has content:
+            // a continuation that cannot advance would trap the caller.
+            if start < total && end == start {
+                end = next_char_boundary(&view.body, start + 1);
+                let text = render_slice(view, scope, start, end);
+                return (text.clone(), leveler_model::estimate_text(&text));
+            }
+            return (text, used);
+        }
+        let chars = view.body[start..end].chars().count();
+        if chars <= 1 {
+            let text = render_slice(view, scope, start, end);
+            return (text.clone(), leveler_model::estimate_text(&text));
+        }
+        let keep = (chars * 4 / 5).max(1);
+        end = start
+            + view.body[start..]
+                .char_indices()
+                .nth(keep)
+                .map(|(index, _)| index)
+                .unwrap_or(total - start);
+    }
+}
+
+fn render_slice(view: &MemoryView, scope: ServiceScope, start: usize, end: usize) -> String {
+    let total = view.body.len();
+    let truncated = (end < total).then_some((start, end, total));
+    render_view_body(view, scope, &view.body[start..end], truncated)
+}
+
+fn char_boundary_floor(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    loop {
+        if index >= text.len() || text.is_char_boundary(index) {
+            return index;
+        }
+        index += 1;
     }
 }
 
@@ -626,22 +785,14 @@ impl Tool for ForgetTool {
         let args: ForgetArgs = super::parse_input(self.name(), input)?;
         let service = self.root.service()?;
         let scope = parse_scope(args.scope.as_deref())?;
-        let view = match service.read(
-            &leveler_memory::v2::Actor::External,
-            scope,
-            &args.id,
-        ) {
+        let view = match service.read(&leveler_memory::v2::Actor::External, scope, &args.id) {
             Ok(view) => view,
             Err(ServiceError::NotFound(_)) => {
                 return Ok(ToolOutput::error("memory not found"));
             }
             Err(error) => return Err(service_error(self.name(), error)),
         };
-        if !self
-            .root
-            .lanes()
-            .allows_experience(view.is_experience())
-        {
+        if !self.root.lanes().allows_experience(view.is_experience()) {
             return Ok(ToolOutput::error("memory not found"));
         }
         let actor = model_actor(&context)?;
@@ -1374,5 +1525,137 @@ mod tests {
             .unwrap();
         assert!(out.is_error, "{}", out.content);
         assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    /// The body slice inside a rendered read, between the id header and the
+    /// first metadata/continuation suffix.
+    fn rendered_body(content: &str) -> &str {
+        let id_at = content.find("\n\n(id:").expect("id header");
+        let body_start = id_at + content[id_at + 2..].find("\n\n").expect("header end") + 4;
+        let rest = &content[body_start..];
+        let end = [
+            "\n\n(truncated",
+            "\n\n(tags:",
+            "\n\n(revision",
+            "\n\n(not current",
+            "\n\n(experience",
+        ]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// A full read is bounded per call and its continuation marker is the
+    /// contract that returns the rest: no silent long-tail loss.
+    #[tokio::test]
+    async fn a_long_read_is_bounded_and_continued_by_offset() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let store = MemoryStore::open(&mem).unwrap();
+        let body = format!("开头{}结尾", "中".repeat(1_500));
+        let entry = leveler_memory::new_entry("长记录", &body, vec![]);
+        let id = entry.id.clone();
+        store.remember(entry).unwrap();
+        let tool = MemoryTool::new(root);
+        let ctx = ctx_in(dir.path());
+
+        let mut collected = String::new();
+        let mut offset = 0usize;
+        let mut calls = 0;
+        let mut saw_truncation = false;
+        loop {
+            let out = tool
+                .execute(
+                    serde_json::json!({"action": "read", "id": id, "offset": offset}),
+                    ctx.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error, "{}", out.content);
+            assert!(
+                leveler_model::estimate_text(&out.content) <= READ_CALL_TOKEN_BUDGET + 40,
+                "a read exceeded its call budget: {} tokens",
+                leveler_model::estimate_text(&out.content)
+            );
+            calls += 1;
+            collected.push_str(rendered_body(&out.content));
+            let marker = "(truncated: showed bytes ";
+            if let Some(index) = out.content.find(marker) {
+                saw_truncation = true;
+                let after = &out.content[index + marker.len()..];
+                let end_bytes = after.split("..").nth(1).unwrap().split(' ').next().unwrap();
+                let end: usize = end_bytes.parse().unwrap();
+                assert!(end > offset, "continuation did not advance");
+                offset = end;
+                assert!(calls < 8, "continuation took too many calls");
+            } else {
+                break;
+            }
+        }
+        assert!(
+            saw_truncation,
+            "a 1.5k-character body must not fit one read"
+        );
+        assert_eq!(collected, body, "continuation lost part of the body");
+    }
+
+    #[tokio::test]
+    async fn read_budget_is_per_turn_and_exhaustion_is_explicit() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let store = MemoryStore::open(&mem).unwrap();
+        let entry = leveler_memory::new_entry("小记录", "很短的内容", vec![]);
+        let id = entry.id.clone();
+        store.remember(entry).unwrap();
+        let tool = MemoryTool::new(root);
+
+        for _ in 0..READ_CALLS_PER_TURN {
+            let out = tool
+                .execute(
+                    serde_json::json!({"action": "read", "id": id}),
+                    ctx_in(dir.path()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error, "{}", out.content);
+        }
+        let exhausted = tool
+            .execute(
+                serde_json::json!({"action": "read", "id": id}),
+                ctx_in(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(exhausted.is_error, "{}", exhausted.content);
+        assert!(
+            exhausted.content.contains("read_budget_exhausted"),
+            "{}",
+            exhausted.content
+        );
+
+        // A new turn is a new budget.
+        let next_turn = ToolContext::new(
+            leveler_execution::Workspace::new(dir.path()).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+        )
+        .with_session_scope("test-session")
+        .with_turn_scope("next-turn")
+        .with_tool_call_scope("next-call");
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "read", "id": id}),
+                next_turn,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
     }
 }
