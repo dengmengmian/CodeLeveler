@@ -257,6 +257,7 @@ async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
             memory_catalog: String::new(),
             memory_expose: false,
             memory_root: None,
+            memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: Default::default(),

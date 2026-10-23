@@ -12,6 +12,7 @@ pub mod build_identity;
 pub mod environment;
 pub mod home;
 pub mod ids;
+pub mod memory;
 pub mod ownership;
 pub mod resource_grant;
 pub mod secret;
@@ -25,6 +26,7 @@ pub use environment::{
     is_credential_env_name, leveler_home_dir, leveler_home_dir_from, scrubbed_environment,
 };
 pub use home::{LevelerHome, TOOL_CACHE_LAST_USED_FILE, TOOL_CACHE_LOCK_FILE};
+pub use memory::MemoryBackend;
 pub use ids::{
     AgentId, ApprovalId, ArtifactId, BootId, CheckpointId, ClarificationId, CommandId, EventId,
     GoalCheckpointId, GoalId, RequestId, RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId,

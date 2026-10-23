@@ -1133,6 +1133,7 @@ impl CodingRuntime {
                     limits: StepLimits::default(),
                 },
                 None,
+                None,
             )
             .await?;
         let tools = executor.request_tool_definitions();
@@ -1207,6 +1208,7 @@ impl CodingRuntime {
                     continuation: ContinuationPolicy::UntilTerminal,
                     limits: StepLimits::default(),
                 },
+                None,
                 None,
             )
             .await?;
@@ -3465,7 +3467,7 @@ async fn run_harness_child(
 ) -> Result<HarnessChildOutcome, ReviewRunError> {
     let profile_for_budget = profile.clone();
     let mut executor = factory
-        .build(profile, None)
+        .build(profile, None, None)
         .await
         .map_err(ReviewRunError::Launch)?
         .with_approver(runner.approver.clone())

@@ -87,6 +87,10 @@ pub struct ExecutorFactory {
     /// settlement — nothing else; the memory TOOLS get their own handle at
     /// construction. `None` = memory unconfigured.
     pub memory_root: Option<std::path::PathBuf>,
+    /// The host's configured memory service. Takes precedence over
+    /// `memory_root`: a Markdown project must not fall back to a second,
+    /// legacy write path.
+    pub memory_service: Option<Arc<leveler_memory::MemoryService>>,
     /// Which memory lanes are open for this project. `memory_expose` says the
     /// pack exists; this says which of its two lanes may read or write.
     pub memory_lanes: leveler_memory::MemoryLanes,
@@ -131,6 +135,7 @@ impl ExecutorFactory {
         &self,
         profile: TurnProfile,
         _task: Option<&str>,
+        turn_id: Option<leveler_core::TurnId>,
     ) -> Result<Executor, EngineError> {
         let model_profile = self
             .runtime
@@ -166,6 +171,9 @@ impl ExecutorFactory {
         // Per-model tool-result budget rides the turn's tool context.
         let mut tool_context = self.tool_context.clone();
         tool_context.policy.tool_output_budget = resolved.max_tool_output_bytes;
+        if let Some(turn_id) = turn_id {
+            tool_context = tool_context.with_turn_scope(turn_id.as_str());
+        }
         let mut executor = Executor::new(
             self.runtime.clone(),
             self.registry.clone(),
@@ -202,8 +210,11 @@ impl ExecutorFactory {
         executor = executor
             .with_memory_catalog(self.memory_catalog.clone())
             .with_memory_expose(self.memory_expose)
-            .with_memory_root(self.memory_root.clone())
             .with_memory_lanes(self.memory_lanes);
+        executor = match self.memory_service.clone() {
+            Some(service) => executor.with_memory_service(Some(service)),
+            None => executor.with_memory_root(self.memory_root.clone()),
+        };
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

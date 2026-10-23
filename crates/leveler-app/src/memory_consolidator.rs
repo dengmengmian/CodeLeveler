@@ -7,15 +7,13 @@ use std::time::Duration;
 
 use leveler_agent::{
     BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, ExperienceEvent, ExperienceExtraction,
-    ExperienceExtractor, ExtractionCall, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS,
-    MAX_EXTRACTOR_INPUT_CHARS, ModelExperienceExtractor, ModelSemanticExtractor, SemanticExtractor,
-    build_evidence_pack, evidence_fingerprint, validate_batch_candidates,
+    ExperienceExtractor, ExtractionCall, ExtractionContext, KnownIdentity, MAX_BATCH_INPUT_CHARS,
+    MAX_BATCH_TURNS, MAX_EXTRACTOR_INPUT_CHARS, ModelExperienceExtractor, ModelSemanticExtractor,
+    SemanticExtractor, build_evidence_pack, evidence_fingerprint, validate_batch_candidates,
     validate_experience_candidates,
 };
 use leveler_core::{BootId, BootLiveness};
-use leveler_memory::{
-    AdmitOutcome, AgentAdmitOutcome, AppliedOperation, MemoryCandidate, MemoryStore, ProposeOutcome,
-};
+use leveler_memory::{MemoryCandidate, MemoryService, ServiceScope, WriteOutcome};
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_storage::{
     Database, EventRepository, ExperienceInboxItem, ExperienceInboxRepository, MemoryInboxItem,
@@ -136,7 +134,9 @@ pub struct MemoryConsolidator {
     db: Database,
     boot: BootId,
     state_dir: PathBuf,
-    memory_dir: PathBuf,
+    /// The unified write path. Legacy by default; the host may install the
+    /// configured Markdown service before the worker starts.
+    memory: MemoryService,
     /// Which lane(s) this project has open. A closed lane is never claimed,
     /// even if its durable queue still holds rows from before the switch.
     lanes: leveler_memory::MemoryLanes,
@@ -168,7 +168,7 @@ impl MemoryConsolidator {
             db,
             boot,
             state_dir,
-            memory_dir,
+            memory: MemoryService::legacy(memory_dir),
             lanes: leveler_memory::MemoryLanes::ALL,
             runtime,
             extraction_timeout: DEFAULT_EXTRACTION_TIMEOUT,
@@ -186,6 +186,16 @@ impl MemoryConsolidator {
         Arc::get_mut(&mut self)
             .expect("lanes are configured before the worker is shared")
             .lanes = lanes;
+        self
+    }
+
+    /// Write through the host's configured backend. The service is installed
+    /// before the worker is shared, like the lane policy.
+    #[must_use]
+    pub fn with_memory_service(mut self: Arc<Self>, service: MemoryService) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("the memory service is configured before the worker is shared")
+            .memory = service;
         self
     }
 
@@ -801,7 +811,7 @@ impl MemoryConsolidator {
         // provider call. A changed receipt, signature or file changes the
         // fingerprint and still extracts.
         let evidence_tag = format!("evidence:{}", evidence_fingerprint(&pack));
-        if evidence_already_learned(&self.memory_dir, &evidence_tag)? {
+        if experience_evidence_learned(&self.memory, &evidence_tag)? {
             tracing::info!(
                 event = "experience_extraction_skipped",
                 turn_id = %item.turn_id,
@@ -881,50 +891,73 @@ impl MemoryConsolidator {
                 item.turn_id
             ));
         }
-        let store = MemoryStore::open(&self.memory_dir).map_err(|error| error.to_string())?;
         let repo = ExperienceInboxRepository::new(&self.db);
+        // Runtime extraction writes under a task identity derived from the
+        // durable inbox row: the authority is the runtime's, never the model's.
+        let actor = leveler_memory::v2::Actor::Runtime {
+            task: leveler_core::TaskId::new(format!("memory-inbox:{}", item.inbox_id)),
+        };
         while staged.applied < staged.accepted.len() {
             let candidate = staged.accepted[staged.applied].clone();
-            let outcome = store
-                .admit_experience_candidate(candidate)
+            // The cursor is persisted after each write, so a retry replays the
+            // same operation identity instead of creating a second record.
+            let op_seed = format!("experience:{}:{}", item.inbox_id, staged.applied);
+            let outcome = self
+                .memory
+                .admit_candidate(&actor, ServiceScope::Project, &candidate, &op_seed)
                 .map_err(|error| error.to_string())?;
             staged.applied += 1;
             let event = match outcome {
-                AgentAdmitOutcome::Applied(outcome) => match outcome.operation {
-                    AppliedOperation::Created => {
+                WriteOutcome::Applied {
+                    id,
+                    title,
+                    operation,
+                    ..
+                } => match operation.as_str() {
+                    "created" => {
                         staged.created += 1;
-                        outcome
-                            .entry
-                            .map(|entry| ("experience_created", entry.id, entry.title))
+                        Some(("experience_created", id, title))
                     }
-                    AppliedOperation::Superseded => {
+                    "merged" => {
                         staged.updated += 1;
-                        outcome
-                            .entry
-                            .map(|entry| ("experience_updated", entry.id, entry.title))
+                        Some(("experience_merged", id, title))
                     }
-                    AppliedOperation::Merged => {
+                    _ => {
                         staged.updated += 1;
-                        outcome
-                            .entry
-                            .map(|entry| ("experience_merged", entry.id, entry.title))
-                    }
-                    AppliedOperation::Skipped => {
-                        staged.skipped += 1;
-                        None
-                    }
-                    AppliedOperation::NeedsApproval => {
-                        staged.pending += 1;
-                        None
+                        Some(("experience_updated", id, title))
                     }
                 },
-                AgentAdmitOutcome::Queued { candidate, .. } => {
+                WriteOutcome::Pending { id, title, .. } => {
                     staged.pending += 1;
-                    Some(("experience_queued", candidate.id, candidate.title))
+                    (!id.is_empty()).then_some(("experience_queued", id, title))
                 }
-                AgentAdmitOutcome::NotStored { .. } => {
+                WriteOutcome::Skipped { reason, .. } => {
                     staged.skipped += 1;
+                    tracing::debug!(
+                        event = "experience_write_skipped",
+                        turn_id = %item.turn_id,
+                        %reason,
+                        "experience write skipped"
+                    );
                     None
+                }
+                WriteOutcome::NotStored { reason } | WriteOutcome::Rejected { reason } => {
+                    staged.skipped += 1;
+                    tracing::info!(
+                        event = "experience_write_not_stored",
+                        turn_id = %item.turn_id,
+                        %reason,
+                        "experience write not stored"
+                    );
+                    None
+                }
+                WriteOutcome::Conflict { target, .. } => {
+                    return Err(format!(
+                        "experience write for `{target}` raced a concurrent change"
+                    ));
+                }
+                WriteOutcome::Forgotten { .. } => {
+                    return Err("experience admission cannot forget a record".to_string());
                 }
             };
             let persisted = serde_json::to_string(&staged).map_err(|error| error.to_string())?;
@@ -1137,7 +1170,33 @@ impl MemoryConsolidator {
         }
 
         let mut candidates = Vec::new();
+        // The bounded identity list below is context, not an allowlist: a real
+        // older identity outside the window must still be replaceable, so such
+        // a target is verified against the store instead of being rejected.
+        let mut known_ids = BTreeSet::new();
         if !sources.is_empty() {
+            // Structured identity retrieval, not authority: the extractor may
+            // reuse a real subject or name a real id as a replacement target,
+            // but the fact still has to be present in the user's own turn.
+            let identities = self
+                .memory
+                .identity_context(
+                    ServiceScope::Project,
+                    leveler_memory::v2::IDENTITY_CONTEXT_LIMIT,
+                )
+                .map_err(|error| error.to_string())?;
+            known_ids.extend(identities.iter().map(|identity| identity.id.clone()));
+            let context = ExtractionContext {
+                known_identities: identities
+                    .into_iter()
+                    .map(|identity| KnownIdentity {
+                        memory_id: identity.id,
+                        subject: identity.subject_key,
+                        title: identity.title,
+                        value: identity.value,
+                    })
+                    .collect(),
+            };
             let semaphore = GLOBAL_MEMORY_CALL.get_or_init(|| Semaphore::new(1));
             let _permit = tokio::select! {
                 _ = self.cancel.cancelled() => return Err("memory consolidation cancelled".to_string()),
@@ -1164,7 +1223,11 @@ impl MemoryConsolidator {
                     batch_end += 1;
                 }
                 let (result, call) = extractor
-                    .extract_batch_recorded(&sources[batch_start..batch_end], &self.cancel)
+                    .extract_batch_recorded_with_context(
+                        &sources[batch_start..batch_end],
+                        &context,
+                        &self.cancel,
+                    )
                     .await;
                 if let Some(call) = call {
                     self.record_extraction_call(batch_session, &call).await;
@@ -1192,7 +1255,47 @@ impl MemoryConsolidator {
                 .iter()
                 .position(|item| item.turn_id == candidate.source_turn_id);
             match (index, candidate.result) {
-                (Some(index), Ok(memory)) => staged[index].accepted.push(memory),
+                (Some(index), Ok(memory)) => {
+                    let replacement_verified = match memory.replaces_id.as_deref() {
+                        None => true,
+                        Some(target) if known_ids.contains(target) => true,
+                        Some(target) => match self.memory.read(
+                            &leveler_memory::v2::Actor::External,
+                            ServiceScope::Project,
+                            target,
+                        ) {
+                            Ok(_) => true,
+                            // A guessed, already-superseded, or malformed id is
+                            // not a real replacement target.
+                            Err(leveler_memory::ServiceError::NotFound(_))
+                            | Err(leveler_memory::ServiceError::NotCurrent(_))
+                            | Err(leveler_memory::ServiceError::Invalid(_)) => false,
+                            // The store could not answer. Rejecting here would
+                            // silently drop a possibly valid replacement, so the
+                            // row stays unprocessed and retries.
+                            Err(error) => {
+                                return Err(format!(
+                                    "memory replacement target check failed: {error}"
+                                ));
+                            }
+                        },
+                    };
+                    if !replacement_verified {
+                        // The model named a target that is neither in this
+                        // request's context nor current in the store. A guessed
+                        // id must not reach the lifecycle as if it were
+                        // verified.
+                        staged[index].rejected += 1;
+                        tracing::info!(
+                            event = "memory_candidate_rejected",
+                            turn_id = %candidate.source_turn_id,
+                            reason = "unknown_replacement_target",
+                            "memory candidate named an identity that is not current in the store"
+                        );
+                    } else {
+                        staged[index].accepted.push(memory);
+                    }
+                }
                 (Some(index), Err(_)) => staged[index].rejected += 1,
                 (None, _) => staged[0].rejected += 1,
             }
@@ -1333,7 +1436,6 @@ impl MemoryConsolidator {
     ) -> Result<ConsolidationOutcome, String> {
         let rejected = staged.iter().map(|result| result.rejected).sum();
         let accepted = staged.iter().map(|result| result.accepted.len()).sum();
-        let store = MemoryStore::open(&self.memory_dir).map_err(|e| e.to_string())?;
         let repo = MemoryInboxRepository::new(&self.db);
         let mut proposed_by_session = BTreeMap::<String, BTreeSet<String>>::new();
         for (item, result) in items.iter().zip(&mut staged) {
@@ -1343,11 +1445,20 @@ impl MemoryConsolidator {
                     item.turn_id
                 ));
             }
+            // Runtime extraction writes under a task identity derived from the
+            // durable inbox row; the candidate cannot claim user authority.
+            let actor = leveler_memory::v2::Actor::Runtime {
+                task: leveler_core::TaskId::new(format!("memory-inbox:{}", item.inbox_id)),
+            };
             while result.applied < result.accepted.len() {
                 let candidate = result.accepted[result.applied].clone();
                 let authority = candidate.authority.as_str().to_string();
-                let outcome = store
-                    .admit_candidate(candidate)
+                // The cursor is persisted after each write, so a retry replays
+                // the same operation identity instead of duplicating a record.
+                let op_seed = format!("inbox:{}:{}", item.inbox_id, result.applied);
+                let outcome = self
+                    .memory
+                    .admit_candidate(&actor, ServiceScope::Project, &candidate, &op_seed)
                     .map_err(|e| e.to_string())?;
                 result.applied += 1;
                 let result_json = serde_json::to_string(result).map_err(|e| e.to_string())?;
@@ -1360,37 +1471,58 @@ impl MemoryConsolidator {
                 .await
                 .map_err(|e| e.to_string())?;
                 let event = match outcome {
-                    AdmitOutcome::Proposed(ProposeOutcome::Pending(entry)) => {
-                        proposed_by_session
-                            .entry(item.session_id.clone())
-                            .or_default()
-                            .insert(entry.id);
+                    WriteOutcome::Applied {
+                        id,
+                        title,
+                        operation,
+                        ..
+                    } => {
+                        let operation = match operation.as_str() {
+                            "created" | "superseded" | "merged" => operation.as_str(),
+                            // v2 names a lifecycle update directly; the
+                            // transcript has no separate verb for it.
+                            _ => "superseded",
+                        };
+                        Some((operation.to_string(), id, title))
+                    }
+                    WriteOutcome::Pending { id, reason, .. } => {
+                        if reason == "awaiting_user_review" || reason == "already_pending" {
+                            proposed_by_session
+                                .entry(item.session_id.clone())
+                                .or_default()
+                                .insert(id);
+                        } else {
+                            result.skipped += 1;
+                        }
                         None
                     }
-                    AdmitOutcome::Applied(outcome) => match outcome.operation {
-                        AppliedOperation::Created
-                        | AppliedOperation::Superseded
-                        | AppliedOperation::Merged => {
-                            let operation = match outcome.operation {
-                                AppliedOperation::Created => "created",
-                                AppliedOperation::Superseded => "superseded",
-                                AppliedOperation::Merged => "merged",
-                                AppliedOperation::Skipped | AppliedOperation::NeedsApproval => {
-                                    unreachable!()
-                                }
-                            };
-                            outcome
-                                .entry
-                                .map(|entry| (operation, entry.id, entry.title))
-                        }
-                        AppliedOperation::Skipped | AppliedOperation::NeedsApproval => {
-                            result.skipped += 1;
-                            None
-                        }
-                    },
-                    AdmitOutcome::Proposed(_) => {
+                    WriteOutcome::Skipped { reason, .. } | WriteOutcome::NotStored { reason } => {
                         result.skipped += 1;
+                        tracing::debug!(
+                            event = "memory_candidate_not_applied",
+                            turn_id = %item.turn_id,
+                            %reason,
+                            "memory candidate not applied"
+                        );
                         None
+                    }
+                    WriteOutcome::Rejected { reason } => {
+                        result.skipped += 1;
+                        tracing::info!(
+                            event = "memory_candidate_rejected_by_store",
+                            turn_id = %item.turn_id,
+                            %reason,
+                            "memory candidate rejected by the store"
+                        );
+                        None
+                    }
+                    WriteOutcome::Conflict { target, .. } => {
+                        return Err(format!(
+                            "memory write for `{target}` raced a concurrent change"
+                        ));
+                    }
+                    WriteOutcome::Forgotten { .. } => {
+                        return Err("memory admission cannot forget a record".to_string());
                     }
                 };
                 if let Some((operation, id, title)) = event {
@@ -1434,14 +1566,18 @@ fn skipped_experience(reason: impl Into<String>) -> StagedExperienceResult {
 /// Whether an ACTIVE lesson already carries this evidence identity. Archived
 /// and superseded entries do not count: once a lesson is invalidated, the same
 /// evidence may be worth re-learning against the current environment.
-fn evidence_already_learned(memory_dir: &std::path::Path, tag: &str) -> Result<bool, String> {
-    let store = MemoryStore::open(memory_dir).map_err(|error| error.to_string())?;
-    let active = store
-        .effective_active()
+fn experience_evidence_learned(memory: &MemoryService, tag: &str) -> Result<bool, String> {
+    let active = memory
+        .list(
+            &leveler_memory::v2::Actor::External,
+            ServiceScope::Project,
+            leveler_memory::MemoryLanes::ALL,
+            None,
+        )
         .map_err(|error| error.to_string())?;
-    Ok(active.iter().any(|entry| {
-        entry.experience.is_some() && entry.tags.iter().any(|candidate| candidate == tag)
-    }))
+    Ok(active
+        .iter()
+        .any(|entry| entry.is_experience() && entry.tags.iter().any(|candidate| candidate == tag)))
 }
 
 fn retry_delay(attempt: i64) -> chrono::Duration {
@@ -1479,7 +1615,8 @@ mod tests {
     use async_trait::async_trait;
     use leveler_agent::{BatchSemanticCandidate, ExtractionError};
     use leveler_memory::{
-        CandidateDurability, CandidateScope, MemoryAuthority, OperationHint, SemanticCandidate,
+        AdmitOutcome, AgentAdmitOutcome, CandidateDurability, CandidateScope, MemoryAuthority,
+        MemoryStore, OperationHint, SemanticCandidate,
     };
     use leveler_model::{
         FinishReason, Message, ModelError, ModelErrorKind, ModelEventStream, ModelProfile,
@@ -1690,6 +1827,47 @@ mod tests {
         }
     }
 
+    /// Names one exact replacement target, as a model answering with an id.
+    struct ReplacementExtractor {
+        target: String,
+    }
+
+    #[async_trait]
+    impl SemanticExtractor for ReplacementExtractor {
+        async fn extract(
+            &self,
+            _: &str,
+            _: &CancellationToken,
+        ) -> Result<Vec<SemanticCandidate>, ExtractionError> {
+            unreachable!()
+        }
+
+        async fn extract_batch(
+            &self,
+            turns: &[BatchSourceTurn],
+            _: &CancellationToken,
+        ) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
+            Ok(vec![BatchSemanticCandidate {
+                source_turn_id: turns[0].source_turn_id.clone(),
+                candidate: SemanticCandidate {
+                    fact: "项目默认模型改成 Flash".to_string(),
+                    subject: "project.default_model".to_string(),
+                    related_subject: None,
+                    replaces_memory_id: Some(self.target.clone()),
+                    value: Some("Flash".to_string()),
+                    statement: leveler_memory::StatementKind::Assertion,
+                    scope: CandidateScope::Project,
+                    durability: CandidateDurability::Durable,
+                    memory_type: leveler_memory::SemanticMemoryType::Project,
+                    authority: MemoryAuthority::ExplicitUser,
+                    operation_hint: OperationHint::Update,
+                    evidence_span: "项目默认模型改成 Flash".to_string(),
+                    confidence: Some(1.0),
+                },
+            }])
+        }
+    }
+
     #[async_trait]
     impl SemanticExtractor for BackgroundCorrectionExtractor {
         async fn extract(
@@ -1711,7 +1889,9 @@ mod tests {
                     fact: "以后不要后台启动服务".to_string(),
                     subject: "service.background_start".to_string(),
                     related_subject: None,
+                    replaces_memory_id: None,
                     value: Some("disabled".to_string()),
+                    statement: leveler_memory::StatementKind::Assertion,
                     scope: CandidateScope::Project,
                     durability: CandidateDurability::Durable,
                     memory_type: leveler_memory::SemanticMemoryType::Feedback,
@@ -1736,7 +1916,9 @@ mod tests {
                 fact: fact.to_string(),
                 subject: "project.default_model".to_string(),
                 related_subject: None,
+                replaces_memory_id: None,
                 value: Some(value.to_string()),
+                statement: leveler_memory::StatementKind::Assertion,
                 scope: CandidateScope::Project,
                 durability: CandidateDurability::Durable,
                 memory_type: leveler_memory::SemanticMemoryType::Project,
@@ -2398,6 +2580,7 @@ mod tests {
                 "durability": "durable",
                 "memory_type": "project",
                 "authority": "explicit_user",
+                "statement": "assertion",
                 "operation_hint": "reaffirm",
                 "evidence_span": "本项目默认模型固定为 Pro",
                 "confidence": 1.0
@@ -2714,7 +2897,15 @@ mod tests {
         flash.semantic_key = Some(key);
         flash.authority = leveler_memory::MemoryAuthority::ExplicitUser;
         let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        // The cursor says candidate 0 was already applied before the crash, so
+        // the fixture commits it. Proposing instead would be a sequence the
+        // worker can never produce: a committed fact never leaves its own
+        // proposal behind.
         store.propose(pro.clone()).unwrap();
+        assert!(matches!(
+            store.admit_candidate(pro.clone()).unwrap(),
+            AdmitOutcome::Applied(_)
+        ));
         let staged = StagedTurnResult {
             accepted: vec![pro, flash],
             rejected: 0,
@@ -2754,8 +2945,16 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert!(active[0].body.contains("Flash"));
         // The superseded proposal for the same identity is stale.
-        assert!(store.list_pending().unwrap().is_empty());
-        assert!(store.list_archived().unwrap().is_empty());
+        let pending = store.list_pending().unwrap();
+        assert!(
+            pending.is_empty(),
+            "stale proposals: {:?}",
+            pending.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+        // The value the resumed cursor replaced is history, not current truth.
+        let archived = store.list_archived().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].body.contains("Pro"));
     }
 
     /// A staged experience result is a model answer already paid for. A crash
@@ -2905,7 +3104,142 @@ mod tests {
             "fixture lesson was not activated: {outcome:?}"
         );
 
-        assert!(evidence_already_learned(dir.path(), tag).unwrap());
-        assert!(!evidence_already_learned(dir.path(), "evidence:ffffffffffffffff").unwrap());
+        let service = MemoryService::legacy(dir.path());
+        assert!(experience_evidence_learned(&service, tag).unwrap());
+        assert!(!experience_evidence_learned(&service, "evidence:ffffffffffffffff").unwrap());
+    }
+
+    /// Seed one active identity with a distinct structured subject key.
+    ///
+    /// Returns the active entry id: a keyed candidate is stored under the
+    /// slug of its key, not under the pending candidate id.
+    fn seed_active_identity(store: &MemoryStore, key: &str) -> String {
+        let candidate = MemoryCandidate::new(
+            format!("{key} is Pro"),
+            format!("{key} must stay Pro"),
+            leveler_memory::CandidateKind::Free,
+            Some(key.to_string()),
+            leveler_memory::CandidateSource::SystemInferred,
+            Vec::new(),
+        )
+        .unwrap();
+        let pending_id = candidate.id.clone();
+        store.propose(candidate).unwrap();
+        store.accept(&pending_id).unwrap().id
+    }
+
+    #[tokio::test]
+    async fn a_replacement_outside_the_identity_window_is_verified_against_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let store = MemoryStore::open(&memory_dir).unwrap();
+        let seeded = (0..30)
+            .map(|index| seed_active_identity(&store, &format!("project.setting.{index}")))
+            .collect::<Vec<_>>();
+        // The extractor context is bounded at 24, so at least one real identity
+        // in this store is deliberately not offered to the model.
+        let offered = MemoryService::legacy(memory_dir.as_path())
+            .identity_context(
+                ServiceScope::Project,
+                leveler_memory::v2::IDENTITY_CONTEXT_LIMIT,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|identity| identity.id)
+            .collect::<BTreeSet<_>>();
+        let target = seeded
+            .iter()
+            .find(|id| !offered.contains(*id))
+            .expect("30 identities exceed the 24-entry context")
+            .clone();
+        let probe = MemoryService::legacy(memory_dir.as_path()).read(
+            &leveler_memory::v2::Actor::External,
+            ServiceScope::Project,
+            &target,
+        );
+        assert!(
+            probe.is_ok(),
+            "the chosen target {target} must be real; offered={} seeded={} error={probe:?}",
+            offered.len(),
+            seeded.len(),
+        );
+
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型改成 Flash".to_string()]).await;
+        let boot = BootId::generate();
+        let claimed = MemoryInboxRepository::new(&db)
+            .claim_batch(&boot, leveler_core::now(), 1)
+            .await
+            .unwrap();
+        let worker = MemoryConsolidator::new(
+            db,
+            boot,
+            temp.path().to_path_buf(),
+            memory_dir,
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        );
+
+        let outcome = worker
+            .process_claimed(
+                &claimed,
+                &ReplacementExtractor {
+                    target: target.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.accepted, 1,
+            "a real identity outside the window must still be replaceable"
+        );
+        assert_eq!(outcome.rejected, 0);
+        assert!(
+            store.read_active(&target).is_err(),
+            "the named current identity must be superseded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guessed_replacement_target_is_rejected_before_the_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let store = MemoryStore::open(&memory_dir).unwrap();
+        seed_active_identity(&store, "project.setting.0");
+
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["项目默认模型改成 Flash".to_string()]).await;
+        let boot = BootId::generate();
+        let claimed = MemoryInboxRepository::new(&db)
+            .claim_batch(&boot, leveler_core::now(), 1)
+            .await
+            .unwrap();
+        let worker = MemoryConsolidator::new(
+            db,
+            boot,
+            temp.path().to_path_buf(),
+            memory_dir,
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        );
+
+        let outcome = worker
+            .process_claimed(
+                &claimed,
+                &ReplacementExtractor {
+                    target: "mem-not-a-real-id".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.rejected, 1);
+        assert_eq!(
+            store.list_active().unwrap().len(),
+            1,
+            "a guessed target must not change the store"
+        );
     }
 }

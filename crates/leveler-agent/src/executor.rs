@@ -546,20 +546,52 @@ struct SelectedSkills {
     text: String,
 }
 
-/// Build the client-facing change event for one lifecycle operation. Carries a
-/// bounded title, never a body.
-fn memory_change_event(
+/// The same client-facing event for a facade view (expiry returns views, not
+/// legacy entries). Still bounded: title only, never the body.
+fn memory_change_event_from_view(
     operation: leveler_memory::MemoryLifecycleOp,
-    entry: &leveler_memory::MemoryEntry,
+    view: &leveler_memory::MemoryView,
 ) -> AgentEvent {
     AgentEvent::MemoryChanged {
         operation: operation.as_str().to_string(),
-        id: entry.id.clone(),
-        title: entry.title.chars().take(80).collect(),
-        authority: entry
-            .provenance
-            .as_ref()
-            .map(|p| p.authority.as_str().to_string()),
+        id: view.id.clone(),
+        title: view.title.chars().take(80).collect(),
+        authority: Some(view.authority.clone()),
+    }
+}
+
+/// The event for a write that became current. A write that produced no
+/// current record (pending, skipped, rejected) yields no change event.
+///
+/// The authority is read back from the store rather than inferred here: the
+/// legacy and Markdown backends name the same decision differently
+/// (`explicit_user` / `user_explicit`), and the event must report the stored
+/// fact, not this module's guess.
+fn memory_change_event_from_write(
+    service: &leveler_memory::MemoryService,
+    actor: &leveler_memory::v2::Actor,
+    outcome: &leveler_memory::WriteOutcome,
+) -> Option<AgentEvent> {
+    let (id, operation) = match outcome {
+        leveler_memory::WriteOutcome::Applied { id, operation, .. } => (id, operation.as_str()),
+        _ => return None,
+    };
+    let operation = match operation {
+        "created" => leveler_memory::MemoryLifecycleOp::Created,
+        "updated" => leveler_memory::MemoryLifecycleOp::Updated,
+        "merged" => leveler_memory::MemoryLifecycleOp::Merged,
+        "superseded" => leveler_memory::MemoryLifecycleOp::Superseded,
+        other => {
+            tracing::debug!(operation = other, id = %id, "unknown memory write operation");
+            return None;
+        }
+    };
+    match service.read(actor, leveler_memory::ServiceScope::Project, id) {
+        Ok(view) => Some(memory_change_event_from_view(operation, &view)),
+        Err(error) => {
+            tracing::debug!(error = %error, id = %id, "written memory could not be read back");
+            None
+        }
     }
 }
 
@@ -1870,15 +1902,12 @@ pub struct Executor {
     memory_catalog: String,
     /// Whether memory reaches the model at all (tools, index, recall, guidance).
     memory_expose: bool,
-    /// Where durable project memory lives, for the RUNTIME's own reads: the
-    /// per-turn recall injection, and parking a `remember` proposal that no
-    /// human was there to approve. `None` = memory unconfigured.
-    ///
-    /// The harness needs this in its own right, so it holds it in its own
-    /// right. It used to read the memory tools' root out of
-    /// `ToolContext.services`, which made a tool's capability handle do double
-    /// duty as runtime state.
-    memory_root: Option<std::path::PathBuf>,
+    /// The runtime's own memory handle: the per-turn recall reads, the direct
+    /// `remember:` command, expiry, and parking a proposal nobody could
+    /// approve. The same service the tools write through, so there is one
+    /// lifecycle rather than a second path the runtime owns. `None` = memory
+    /// unconfigured.
+    memory: Option<Arc<leveler_memory::MemoryService>>,
     /// Which memory lanes this project has open. Reads and the deterministic
     /// write path consult this; a closed lane is invisible even when the pack
     /// is exposed for the other lane.
@@ -2022,7 +2051,7 @@ impl Executor {
             seeded_objective: None,
             memory_catalog: String::new(),
             memory_expose: false,
-            memory_root: None,
+            memory: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             step_limits: StepLimits::default(),
             task_model_limits: StepLimits::default(),
@@ -2223,7 +2252,18 @@ impl Executor {
     /// Where the runtime reads durable memory for recall injection, and parks
     /// a `remember` proposal nobody was available to approve.
     pub fn with_memory_root(mut self, root: Option<std::path::PathBuf>) -> Self {
-        self.memory_root = root;
+        self.memory = root.map(|root| Arc::new(leveler_memory::MemoryService::legacy(root)));
+        self
+    }
+
+    /// Install the host's configured memory service. Preferred over
+    /// [`Self::with_memory_root`] when the project may use the Markdown
+    /// backend.
+    pub fn with_memory_service(
+        mut self,
+        service: Option<Arc<leveler_memory::MemoryService>>,
+    ) -> Self {
+        self.memory = service;
         self
     }
 
@@ -2563,7 +2603,7 @@ impl Executor {
             // own durable statement: a child never creates project memory.
             // A child inherits the parent's memory location: recall and
             // parking mean the same thing at any depth.
-            memory_root: self.memory_root.clone(),
+            memory: self.memory.clone(),
             memory_lanes: self.memory_lanes,
             background_tasks: self.background_tasks.clone(),
             // A child spawned after the parent's `/goal` upgrade bills the
@@ -3335,12 +3375,26 @@ impl Executor {
             tracing::debug!(memory_exposed = false, "memory recall skipped");
             return MemoryInjection::default();
         }
-        let Some(root) = self.memory_root.as_ref() else {
+        let Some(service) = self.memory.as_ref() else {
             return MemoryInjection::default();
         };
         if !self.memory_lanes.any() {
             return MemoryInjection::default();
         }
+        // Stage 2 has no Markdown recall path yet. Reading the legacy store
+        // here would inject a different database than the one being written,
+        // so the honest state is "not consulted" plus a trace that says why.
+        if service.backend() != leveler_core::MemoryBackend::Legacy {
+            tracing::debug!(
+                backend = service.backend().as_str(),
+                event = "memory_recall_unavailable",
+                "memory recall is not available on this backend yet"
+            );
+            return MemoryInjection::default();
+        }
+        let Some(root) = service.legacy_root() else {
+            return MemoryInjection::default();
+        };
         let store = match MemoryStore::open(root) {
             Ok(store) => store,
             Err(error) => {
@@ -3445,41 +3499,70 @@ impl Executor {
         if !self.memory_lanes.user {
             return Vec::new();
         }
-        let Some(root) = self.memory_root.as_ref() else {
+        let Some(service) = self.memory.as_ref() else {
             return Vec::new();
         };
-        let store = match MemoryStore::open(root) {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::debug!(error = %error, "memory maintenance skipped: store unavailable");
-                return Vec::new();
-            }
-        };
         let mut events = Vec::new();
-        match store.expire_due() {
+        match service.expire_due(
+            leveler_memory::ServiceScope::Project,
+            leveler_core::now(),
+        ) {
             Ok(expired) => {
-                for entry in expired {
-                    events.push(memory_change_event(
+                for view in expired {
+                    events.push(memory_change_event_from_view(
                         leveler_memory::MemoryLifecycleOp::Expired,
-                        &entry,
+                        &view,
                     ));
                 }
             }
             Err(error) => tracing::debug!(error = %error, "memory expiry sweep failed"),
         }
-        if let Some(body) = leveler_memory::parse_direct_memory_command(request) {
+        // Only the top-level request is the user's own message. A child's
+        // "request" is a delegation brief written by the parent model, and a
+        // brief is never a user command however it is worded.
+        if self.depth == 0
+            && let Some(body) = leveler_memory::parse_direct_memory_command(request)
+        {
             let title = leveler_memory::title_from_body(&body);
-            match store.activate(
-                &title,
-                &body,
-                leveler_memory::MemoryKind::Preference,
-                Vec::new(),
-            ) {
-                Ok(entry) => events.push(memory_change_event(
-                    leveler_memory::MemoryLifecycleOp::Created,
-                    &entry,
-                )),
-                Err(error) => tracing::debug!(error = %error, "direct memory write failed"),
+            // The invocation identity belongs to this trusted in-process user
+            // command. It is not derived from model output, and the tool path
+            // cannot mint it.
+            let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
+                "direct:{}:{}:{}",
+                self.tool_context.session_scope(),
+                self.tool_context.turn_scope.as_deref().unwrap_or("turn"),
+                &leveler_memory::v2::sha256_hex_text(request)[..16]
+            ));
+            let write = leveler_memory::RememberRequest {
+                op_id: format!("direct:{}", invocation.as_str()),
+                scope: leveler_memory::ServiceScope::Project,
+                title,
+                body,
+                kind: "preference".to_string(),
+                subject: None,
+                value: None,
+                tags: Vec::new(),
+                evidence: None,
+                expires_at: None,
+                replaces_id: None,
+            };
+            let actor = leveler_memory::v2::Actor::User { invocation };
+            match service.remember(&actor, write) {
+                Ok(outcome) => {
+                    if let Some(event) =
+                        memory_change_event_from_write(service, &actor, &outcome)
+                    {
+                        events.push(event);
+                    } else {
+                        // The user asked for this write; a rejection it is not
+                        // visible feedback for still has to be diagnosable.
+                        tracing::warn!(
+                            outcome = ?outcome,
+                            "direct memory write did not become current"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(error = %error, "direct memory write failed"),
             }
         }
         events

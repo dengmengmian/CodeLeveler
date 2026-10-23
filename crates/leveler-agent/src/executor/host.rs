@@ -1173,7 +1173,7 @@ impl Executor {
         if call.name != "remember" {
             return format!("{UNATTENDED}; re-run with --permission full-access to allow it");
         }
-        let Some(root) = self.memory_root.as_ref() else {
+        let Some(service) = self.memory.as_ref() else {
             return format!("{UNATTENDED}; memory is not configured, so it could not be parked");
         };
         let title = call.arguments.get("title").and_then(|v| v.as_str());
@@ -1193,43 +1193,75 @@ impl Executor {
             })
             .unwrap_or_default();
         let kind = match call.arguments.get("kind").and_then(|value| value.as_str()) {
-            Some("preference") => leveler_memory::MemoryKind::Preference,
-            Some("decision") => leveler_memory::MemoryKind::Decision,
-            _ => leveler_memory::MemoryKind::Note,
+            Some("preference") => "preference",
+            Some("decision") => "decision",
+            _ => "note",
         };
         let subject = call
             .arguments
             .get("subject")
             .and_then(|value| value.as_str())
-            .unwrap_or("");
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let value = call
+            .arguments
+            .get("value")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let expires_at = call
+            .arguments
+            .get("expires_at")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        // The proposal keeps the scope it asked for. Parking it in the project
+        // queue would silently rewrite a global proposal into a project fact.
+        let scope = match call.arguments.get("scope").and_then(|value| value.as_str()) {
+            Some("global") => leveler_memory::ServiceScope::Global,
+            Some("local") => leveler_memory::ServiceScope::Local,
+            _ => leveler_memory::ServiceScope::Project,
+        };
         let evidence = call
             .arguments
             .get("evidence")
             .and_then(|value| value.as_str())
             .map(str::to_string);
-
-        let parked = leveler_memory::MemoryStore::open(root)
-            .map_err(|e| e.to_string())
-            .and_then(|store| {
-                // The parked candidate keeps the model's identity and
-                // evidence. Parking is not a create path: it must not lose
-                // the subject that makes a later acceptance an update.
-                let candidate = if subject.trim().is_empty() {
-                    leveler_memory::MemoryCandidate::new(
-                        title,
-                        body,
-                        leveler_memory::CandidateKind::Free,
-                        None,
-                        leveler_memory::CandidateSource::AgentProposed,
-                        tags,
-                    )
-                    .map_err(|e| e.to_string())?
-                } else {
-                    leveler_memory::agent_candidate(title, body, kind, tags, subject, evidence)
-                        .map_err(|e| e.to_string())?
-                };
-                store.propose(candidate).map_err(|e| e.to_string())
-            });
+        // Parking is a model proposal. The actor comes from the runtime's
+        // execution context, exactly as the memory tool's does.
+        let actor = match (
+            self.tool_context.session_scope.as_deref(),
+            self.tool_context.turn_scope.as_deref(),
+        ) {
+            (Some(session), Some(turn)) => leveler_memory::v2::Actor::Model {
+                session: leveler_core::SessionId::new(session),
+                turn: leveler_core::TurnId::new(turn),
+                // The proposal's own call, not the executor's base context:
+                // the pending record must point at the evidence a reader can
+                // find (the tool call that made it).
+                tool_call: call.id.clone(),
+            },
+            _ => {
+                return format!(
+                    "{UNATTENDED}; the proposal had no execution identity to park it under"
+                );
+            }
+        };
+        let request = leveler_memory::RememberRequest {
+            // The tool call is the idempotent operation identity. A title is
+            // arbitrary user-facing text, and `OpId` accepts only
+            // `[A-Za-z0-9_\-:.]`, so it must not be part of the op id.
+            op_id: format!("park:{}", call.id),
+            scope,
+            title: title.to_string(),
+            body: body.to_string(),
+            kind: kind.to_string(),
+            subject,
+            value,
+            tags,
+            evidence,
+            expires_at,
+            replaces_id: None,
+        };
+        let parked = service.propose(&actor, request).map_err(|e| e.to_string());
         match parked {
             // Deliberately NOT "run `leveler memory accept <id>`": this text is
             // a tool result the MODEL reads, and a real run followed that
@@ -1237,14 +1269,23 @@ impl Executor {
             // candidate. The gate in `resolve_policy` now refuses that command,
             // and this message no longer suggests it either. Telling the USER
             // how to adopt it belongs on a user-facing channel.
-            Ok(leveler_memory::ProposeOutcome::Pending(candidate)) => format!(
-                "{UNATTENDED}; kept as a pending candidate [{}] for the user to review. \
-                 Adopting a memory is their decision, not this run's — report that it is \
-                 waiting and move on.",
-                candidate.id
-            ),
-            // Already pending or suppressed: nothing lost either way.
-            Ok(_) => format!("{UNATTENDED}; this memory is already awaiting your review"),
+            // Any pending reason keeps the content. A model proposal can wait
+            // for review (`awaiting_user_review`) or for the user to command a
+            // non-project scope; both are the person's decision, not this
+            // run's.
+            Ok(leveler_memory::WriteOutcome::Pending { id, .. }) => {
+                format!(
+                    "{UNATTENDED}; kept as a pending candidate [{id}] for the user to review. \
+                     Adopting a memory is their decision, not this run's — report that it is \
+                     waiting and move on."
+                )
+            }
+            // The store already had this operation (a replay or a suppressed
+            // fingerprint): nothing was lost either way.
+            Ok(leveler_memory::WriteOutcome::Skipped { .. }) => {
+                format!("{UNATTENDED}; this memory is already awaiting review")
+            }
+            Ok(_) => format!("{UNATTENDED}; the store did not keep a pending candidate"),
             Err(error) => format!("{UNATTENDED}; parking it failed: {error}"),
         }
     }
@@ -1394,6 +1435,7 @@ impl Executor {
             host.tool_call_started(call.id.as_str(), call_cancel.clone());
         }
         let mut ctx = admitted.execution_context().clone();
+        ctx.tool_call_scope = Some(call.id.as_str().into());
         ctx.output = output;
         let executed = self
             .registry
@@ -2262,7 +2304,12 @@ mod authorize_tests {
         let dir = tempfile::tempdir().unwrap();
         let memory_root = dir.path().join("memory");
         let workspace = Workspace::new(dir.path()).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        // Parking is a model proposal; the runtime's own execution identity is
+        // what makes the actor trustworthy, so a real turn always carries it.
+        tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
+        tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
+        tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
         let executor = Executor::new(
             Arc::new(StubRuntime),
             Arc::new(default_registry()),
@@ -2305,6 +2352,83 @@ mod authorize_tests {
         assert!(
             store.list_active().unwrap().is_empty(),
             "parking must never activate without consent (K36)"
+        );
+    }
+
+    /// The Markdown store applies the request's own identity and scope. A
+    /// parked proposal is not a lesser fact: it keeps the value the model
+    /// supplied, and a global proposal waits in the global pending queue.
+    ///
+    /// The op id is built from the tool call, not the title: a title is
+    /// arbitrary Unicode, while `OpId` accepts only `[A-Za-z0-9_\-:.]`.
+    #[tokio::test]
+    async fn an_unattended_markdown_proposal_parks_with_its_scope_and_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_current = dir.path().join("memory");
+        let project_state = dir.path().join("state");
+        let global_current = dir.path().join("global-memory");
+        let global_state = dir.path().join("global-state");
+        let service = leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::markdown()
+                .with_project(leveler_memory::v2::ScopeRoots::new(
+                    leveler_memory::v2::MemoryScope::Project,
+                    project_current,
+                    project_state,
+                ))
+                .with_global(leveler_memory::v2::ScopeRoots::new(
+                    leveler_memory::v2::MemoryScope::Global,
+                    global_current,
+                    global_state.clone(),
+                )),
+        );
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
+        tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
+        tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
+        let executor = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_memory_service(Some(Arc::new(service)))
+        .with_approver(Arc::new(HeadlessDeny));
+        let mut session = HashSet::new();
+        let call = ToolCall {
+            id: ToolCallId::new("call-1"),
+            name: "remember".to_string(),
+            arguments: serde_json::json!({
+                "title": "全局语言偏好",
+                "body": "所有项目用中文。",
+                "subject": "dogfood.global_language",
+                "value": "zh",
+                "kind": "preference",
+                "scope": "global",
+            }),
+        };
+
+        let err = executor
+            .authorize(&call, &mut session)
+            .await
+            .expect_err("an unattended write still needs a person");
+        assert!(
+            err.contains("kept as a pending candidate"),
+            "the proposal must survive as a pending candidate: {err}"
+        );
+
+        let pending: Vec<_> = std::fs::read_dir(global_state.join("pending"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(pending.len(), 1, "the global proposal is parked globally");
+        let text = std::fs::read_to_string(&pending[0]).unwrap();
+        assert!(text.contains("scope: global"), "{text}");
+        assert!(text.contains("value: zh"), "{text}");
+        assert!(
+            text.contains("tool_call_id: call-1"),
+            "the parked proposal must name the tool call it came from: {text}"
         );
     }
 

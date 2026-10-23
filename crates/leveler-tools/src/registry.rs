@@ -520,7 +520,7 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
         registry.register(Arc::new(tools::ViewImageTool));
     }
     if packs.memory {
-        let root = tools::MemoryRoot::new(capabilities.memory_root.clone())
+        let root = tools::MemoryRoot::from_service(capabilities.memory.clone())
             .with_lanes(capabilities.memory_lanes);
         let lanes = capabilities.memory_lanes;
         if lanes.any() {

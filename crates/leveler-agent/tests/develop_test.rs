@@ -180,6 +180,7 @@ async fn harness_with(
             memory_catalog: String::new(),
             memory_expose: true,
             memory_root: None,
+            memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),

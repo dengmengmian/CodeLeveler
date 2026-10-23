@@ -211,6 +211,7 @@ pub struct MemoryPolicy {
     enabled: bool,
     user_enabled: bool,
     experience_enabled: bool,
+    backend: leveler_core::MemoryBackend,
 }
 
 impl MemoryPolicy {
@@ -220,7 +221,14 @@ impl MemoryPolicy {
             enabled: config.memory.enabled,
             user_enabled: config.memory.user_enabled,
             experience_enabled: config.memory.experience_enabled,
+            backend: config.memory.backend,
         }
+    }
+
+    /// The storage backend the project selected. Defaults to the shipped
+    /// JSON store; Markdown is opt-in for tests and dogfood.
+    pub fn backend(self) -> leveler_core::MemoryBackend {
+        self.backend
     }
 
     /// Whether the user wants memory enabled for this project.
@@ -249,6 +257,54 @@ impl MemoryPolicy {
         leveler_memory::MemoryLanes {
             user: self.user_enabled(),
             experience: self.experience_enabled(),
+        }
+    }
+}
+
+/// The one memory service this runtime hands to tools and background work.
+///
+/// The Markdown roots are configured lazily: nothing opens (or creates) a
+/// scope until an operation addresses it, so a project run that never touches
+/// global memory never creates the user's home store.
+pub fn memory_service(
+    layout: &leveler_project::Layout,
+    backend: leveler_core::MemoryBackend,
+) -> leveler_memory::MemoryService {
+    match backend {
+        leveler_core::MemoryBackend::Legacy => {
+            leveler_memory::MemoryService::legacy(layout.memory_dir())
+        }
+        leveler_core::MemoryBackend::Markdown => {
+            use leveler_memory::v2::{MemoryScope, ScopeRoots};
+            let mut roots = leveler_memory::MemoryRoots::markdown();
+            if let Some(current) = layout.markdown_memory_dir() {
+                let mut scopes = ScopeRoots::new(
+                    MemoryScope::Project,
+                    current,
+                    layout.memory_v2_state_dir("project"),
+                );
+                if let Some(repo) = layout.repo_root.clone() {
+                    scopes = scopes.with_repo_root(repo);
+                }
+                roots = roots.with_project(scopes);
+            }
+            if let Some(current) = layout.local_memory_dir() {
+                let mut scopes = ScopeRoots::new(
+                    MemoryScope::Local,
+                    current,
+                    layout.memory_v2_state_dir("local"),
+                );
+                if let Some(repo) = layout.repo_root.clone() {
+                    scopes = scopes.with_repo_root(repo);
+                }
+                roots = roots.with_local(scopes);
+            }
+            roots = roots.with_global(ScopeRoots::new(
+                MemoryScope::Global,
+                layout.global_memory_dir(),
+                layout.memory_v2_state_dir("global"),
+            ));
+            leveler_memory::MemoryService::new(roots)
         }
     }
 }
@@ -318,6 +374,7 @@ mod memory_policy_tests {
                 enabled: false,
                 user_enabled: true,
                 experience_enabled: true,
+                backend: leveler_core::MemoryBackend::Legacy,
             },
             ..ProjectConfig::default()
         });
@@ -334,6 +391,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: true,
                 experience_enabled: true,
+                backend: leveler_core::MemoryBackend::Legacy,
             },
             ..ProjectConfig::default()
         });
@@ -361,6 +419,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: true,
                 experience_enabled: false,
+                backend: leveler_core::MemoryBackend::Legacy,
             },
             ..ProjectConfig::default()
         });
@@ -373,6 +432,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: false,
                 experience_enabled: true,
+                backend: leveler_core::MemoryBackend::Legacy,
             },
             ..ProjectConfig::default()
         });
@@ -385,6 +445,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: false,
                 experience_enabled: false,
+                backend: leveler_core::MemoryBackend::Legacy,
             },
             ..ProjectConfig::default()
         });
@@ -566,6 +627,24 @@ impl Drop for Application {
 }
 
 impl Application {
+    /// The configured memory backend. One answer for every caller, so a
+    /// command cannot read one store while writes go to another.
+    pub fn memory_backend(&self) -> leveler_core::MemoryBackend {
+        self.memory.backend()
+    }
+
+    /// A handle on the configured memory store. The service is stateless
+    /// beyond its roots; constructing it per command keeps the layout and the
+    /// backend the only inputs.
+    pub fn memory_service(&self) -> leveler_memory::MemoryService {
+        memory_service(&self.layout, self.memory.backend())
+    }
+
+    /// The lanes this project has open. Reads and writes both honor them.
+    pub fn memory_lanes(&self) -> leveler_memory::MemoryLanes {
+        self.memory.lanes()
+    }
+
     /// The live permission profile for a session, SEEDED once from `mode` (the
     /// caller's authority — the session row or its cached runtime config) and
     /// reused by every later turn of that session.
@@ -963,7 +1042,8 @@ impl Application {
                 let _ = events.send(event);
             }),
         )
-        .with_lanes(self.memory.lanes());
+        .with_lanes(self.memory.lanes())
+        .with_memory_service(memory_service(&self.layout, self.memory.backend()));
         if self.memory_consolidator.set(worker.clone()).is_ok() {
             drop(worker.spawn());
         }
@@ -1235,7 +1315,7 @@ impl Application {
         // later asks for one.
         if self.memory.any_lane() {
             capabilities = capabilities
-                .with_memory_root(self.layout.memory_dir())
+                .with_memory_service(memory_service(&self.layout, self.memory.backend()))
                 .with_memory_lanes(self.memory.lanes());
         }
         let tool_context = match workspace {
@@ -1503,8 +1583,22 @@ impl Application {
         // The catalog is the user lane's index; experience entries are
         // deliberately absent from it (they are found by recall or the
         // `memory` tool), so a closed user lane produces no catalog at all.
+        // Stage 2 has no Markdown catalog yet: reading the legacy store while
+        // the project writes Markdown would inject a different database than
+        // the one being maintained, so the honest state is "no catalog".
         let memory_catalog = if available_packs.memory && self.memory.user_enabled() {
-            load_memory_catalog(&self.layout.memory_dir())
+            match self.memory.backend() {
+                leveler_core::MemoryBackend::Legacy => {
+                    load_memory_catalog(&self.layout.memory_dir())
+                }
+                leveler_core::MemoryBackend::Markdown => {
+                    tracing::debug!(
+                        event = "memory_catalog_unavailable",
+                        "memory catalog is not available on the markdown backend yet"
+                    );
+                    String::new()
+                }
+            }
         } else {
             String::new()
         };
@@ -1547,7 +1641,13 @@ impl Application {
                 capabilities: Some(capabilities),
                 memory_catalog,
                 memory_expose: available_packs.memory,
-                memory_root: self.memory.any_lane().then(|| self.layout.memory_dir()),
+                memory_root: (self.memory.any_lane()
+                    && self.memory.backend() == leveler_core::MemoryBackend::Legacy)
+                    .then(|| self.layout.memory_dir()),
+                memory_service: self
+                    .memory
+                    .any_lane()
+                    .then(|| Arc::new(memory_service(&self.layout, self.memory.backend()))),
                 memory_lanes: self.memory.lanes(),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,

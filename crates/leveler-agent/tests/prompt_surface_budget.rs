@@ -467,14 +467,19 @@ async fn current_prompt_surface_inventory() {
          fixed = control + tools; messages are the turn input, not history growth\n\n",
     );
     let cases = [
-        ("chat", &chat, 22_415_u64),
+        // Raised when the unified Memory 2.0 tool surface landed: `memory`
+        // gained update/deprecate/pin/unpin and the memory schemas carry
+        // scope, value, expiry and revision. `minimal_baseline` (memory off)
+        // is unchanged, so the growth is the memory pack itself.
+        ("chat", &chat, 23_961_u64),
         ("minimal_baseline", &minimal_baseline, 19_715),
-        ("full_baseline", &full_baseline, 22_415),
+        ("full_baseline", &full_baseline, 23_961),
         // Raised when the memory anti-regression rule landed in AGENTS.md:
         // the goal case was already 3 tokens under its old ceiling.
         ("goal", &goal, 24_484),
         ("explorer", &explorer, 13_820),
-        ("worker", &worker, 18_444),
+        // Same Memory 2.0 pack as chat; the worker surface carries it too.
+        ("worker", &worker, 19_762),
         ("reviewer", &reviewer, 13_850),
     ];
     for (name, request, baseline) in cases {

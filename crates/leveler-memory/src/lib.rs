@@ -15,6 +15,8 @@ mod lanes;
 mod lifecycle;
 mod pipeline;
 mod semantic;
+pub mod service;
+pub mod v2;
 
 pub use audit::{IdentityAudit, IdentityLocation, IdentityRecord, IdentityState, IdentitySummary};
 pub use candidates::{
@@ -32,13 +34,19 @@ pub use lifecycle::{
     MemoryLifecycleOp, MemoryOperation, Provenance, agent_candidate, decide, semantic_key_of,
 };
 pub use pipeline::{
-    AdmitOutcome, AgentAdmitOutcome, ProposeOutcome, SuppressRecord,
+    AdmitOutcome, AgentAdmitOutcome, PendingDisposition, ProposeOutcome, SuppressRecord,
     candidate_eligible_for_activation,
 };
 pub use semantic::{
     CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
-    SemanticError, SemanticMemoryType, ValidatedCandidates, evidence_matches, normalize_subject,
-    parse_semantic_candidates, validate_semantic_candidate, validate_semantic_candidates,
+    SemanticError, SemanticMemoryType, StatementKind, ValidatedCandidates, evidence_matches,
+    normalize_subject, parse_semantic_candidates, validate_semantic_candidate,
+    validate_semantic_candidates,
+};
+pub use service::{
+    ExperienceView, IdentityContextEntry, MARKDOWN_SEARCH_UNAVAILABLE, MemoryRoots, MemoryService,
+    MemoryView, RememberRequest, ReviewRequest, ServiceError, ServiceScope, UpdateRequest,
+    WriteOutcome,
 };
 
 use std::collections::HashMap;
@@ -445,19 +453,20 @@ impl MemoryStore {
         entry.provenance = Some(Provenance {
             authority: MemoryAuthority::ExplicitUser,
             source: "user_direct".to_string(),
-            evidence: None,
+            // The user's own statement is the evidence this entry may be
+            // reconciled against later. Storing it does not infer a subject;
+            // it only records what the person actually wrote.
+            evidence: Some(body.trim().to_string()),
         });
         // `remember_deduplicated` already owns the hard parts: a hard-link
         // reservation so concurrent writers cannot claim one id, an identical
         // title+body returning what is there, and a `-N` suffix otherwise.
         // `validate_entry` inside it is where a credential is refused.
         let saved = self.remember_deduplicated_unlocked(entry)?;
-        // Best effort, deliberately after the active copy is durable: a
-        // candidate left behind would ask the user to approve what is already
-        // stored, but failing to remove it is not a reason to lose the write.
-        // The domain deliberately takes no logger; a failure here is healed by
-        // `list_pending`, which drops covered candidates on the next read.
-        let _ = self.clear_equivalent_pending(&saved);
+        // After the active copy is durable: a candidate left behind would ask
+        // the user to approve what is already stored. The settlement is
+        // recorded before the pending file is removed.
+        self.clear_equivalent_pending(&saved)?;
         Ok(saved)
     }
 
@@ -489,18 +498,31 @@ impl MemoryStore {
             evidence: None,
         });
         let saved = self.remember_deduplicated_unlocked(entry)?;
-        let _ = self.clear_equivalent_pending(&saved);
+        self.clear_equivalent_pending(&saved)?;
         Ok(saved)
     }
 
     /// Drop pending candidates whose content this active entry now covers.
     ///
     /// Also run from [`Self::list_pending`], so a crash between the two steps
-    /// heals on the next read instead of leaving a permanent duplicate.
+    /// heals on the next read instead of leaving a permanent duplicate. Each
+    /// removal is recorded before the file is deleted; pending is not history.
     fn clear_equivalent_pending(&self, active: &MemoryEntry) -> Result<(), MemoryError> {
         for candidate in self.list_pending_raw()? {
-            if candidate.body.trim() == active.body.trim() {
-                let _ = fs::remove_file(self.pending_path(&candidate.id));
+            if candidate.body.trim() != active.body.trim() {
+                continue;
+            }
+            self.record_pending_disposition(&crate::PendingDisposition {
+                candidate_id: candidate.id.clone(),
+                key: candidate.semantic_key.clone().or(candidate.key.clone()),
+                outcome: "covered_by_direct".to_string(),
+                committed_id: Some(active.id.clone()),
+                decided_at: now_rfc3339(),
+            })?;
+            match fs::remove_file(self.pending_path(&candidate.id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(MemoryError::Io(error)),
             }
         }
         Ok(())

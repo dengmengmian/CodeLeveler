@@ -212,31 +212,138 @@ fn hit_after_turn_started_test_barrier() {}
 #[cfg(not(feature = "test-crash-barrier"))]
 fn hit_before_receipt_settled_test_barrier() {}
 
-/// Pending candidates include the body, kind and source needed for informed
-/// consent. Preserve store errors rather than presenting them as no candidates.
-fn pending_entries(
-    store: &leveler_memory::MemoryStore,
-) -> Result<Vec<leveler_client_protocol::UiMemoryCandidate>, leveler_memory::MemoryError> {
-    Ok(store
-        .list_pending()?
-        .into_iter()
-        .map(|mut c| {
-            let sensitive = leveler_memory::is_sensitive_candidate(&c);
-            let kind = if c.experience.is_some() {
-                leveler_memory::EXPERIENCE_KIND.to_string()
+/// The user's own listing actor. These commands arrive through an in-process
+/// interaction surface, so the trusted invocation is minted here, once.
+fn user_listing_actor(query_id: Option<&leveler_core::CommandId>) -> leveler_memory::v2::Actor {
+    leveler_memory::v2::Actor::User {
+        invocation: leveler_memory::v2::UserInvocationId::mint(format!(
+            "ui:memory-list:{}",
+            query_id
+                .map(leveler_core::CommandId::as_str)
+                .unwrap_or("open")
+        )),
+    }
+}
+
+/// A bounded label for a write outcome, for a one-line status message.
+fn outcome_title(outcome: &leveler_memory::WriteOutcome) -> String {
+    match outcome {
+        leveler_memory::WriteOutcome::Applied { id, title, .. } if title.is_empty() => id.clone(),
+        leveler_memory::WriteOutcome::Applied { title, .. } => title.clone(),
+        leveler_memory::WriteOutcome::Pending { title, .. } => title.clone(),
+        leveler_memory::WriteOutcome::Forgotten { title, .. } => title.clone(),
+        leveler_memory::WriteOutcome::Skipped { reason, .. }
+        | leveler_memory::WriteOutcome::Rejected { reason }
+        | leveler_memory::WriteOutcome::NotStored { reason } => reason.clone(),
+        leveler_memory::WriteOutcome::Conflict { target, .. } => target.clone(),
+    }
+}
+
+/// The status line for a trusted direct write.
+///
+/// Only `Applied` changed current memory. Pending, skipped, rejected,
+/// conflicting and unstored writes did not, so they must not be reported as
+/// saved. The write itself already happened through the service; this only
+/// tells the person what it did.
+fn direct_write_notification(
+    outcome: &leveler_memory::WriteOutcome,
+    title: &str,
+    busy: bool,
+) -> (leveler_client_protocol::NotificationLevel, String) {
+    use leveler_client_protocol::NotificationLevel;
+    use leveler_memory::WriteOutcome;
+    match outcome {
+        WriteOutcome::Applied { id, .. } => (
+            NotificationLevel::Info,
+            if busy {
+                // This turn's context was assembled already, so say when the
+                // memory actually starts being recalled.
+                format!("已保存记忆 [{id}]：{title}。将从下一次用户回合开始参与自动召回。")
             } else {
-                format!("{:?}", c.kind).to_lowercase()
-            };
-            if sensitive {
-                leveler_memory::redact_candidate(&mut c);
-            }
-            leveler_client_protocol::UiMemoryCandidate {
-                id: c.id,
-                title: c.title,
-                body: c.body,
-                kind,
-                source: c.source.as_str().to_string(),
-            }
+                format!("已保存记忆 [{id}]：{title}")
+            },
+        ),
+        WriteOutcome::Pending { id, reason, .. } => (
+            NotificationLevel::Info,
+            format!("记忆待确认 [{id}]：{title}；确认后才会生效（{reason}）"),
+        ),
+        WriteOutcome::Skipped { reason, .. }
+        | WriteOutcome::Rejected { reason }
+        | WriteOutcome::NotStored { reason } => (
+            NotificationLevel::Warning,
+            format!("未保存记忆：{title}（{reason}）"),
+        ),
+        WriteOutcome::Conflict { target, .. } => (
+            NotificationLevel::Warning,
+            format!("未保存记忆：{title} 与 [{target}] 的当前版本冲突，请刷新后重试"),
+        ),
+        WriteOutcome::Forgotten { id, .. } => (
+            NotificationLevel::Info,
+            format!("已删除记忆 [{id}]：{title}"),
+        ),
+    }
+}
+
+fn ui_memory_kind(
+    view: &leveler_memory::MemoryView,
+) -> Option<leveler_client_protocol::UiMemoryKind> {
+    use leveler_client_protocol::UiMemoryKind;
+    match view.kind.as_str() {
+        "preference" => Some(UiMemoryKind::Preference),
+        "decision" => Some(UiMemoryKind::Decision),
+        "note" | "user_fact" => Some(UiMemoryKind::Note),
+        "experience" => Some(UiMemoryKind::Experience),
+        // Legacy and derived entries have no product kind to claim.
+        _ => None,
+    }
+}
+
+/// One listing row. A credential-shaped record keeps its row so the user can
+/// find and archive it, but never its text.
+fn memory_row_from_view(
+    view: &leveler_memory::MemoryView,
+) -> leveler_client_protocol::UiMemoryEntry {
+    leveler_client_protocol::UiMemoryEntry {
+        id: view.id.clone(),
+        title: if view.sensitive {
+            leveler_memory::REDACTED_TITLE.to_string()
+        } else {
+            view.title.clone()
+        },
+        body: if view.sensitive {
+            leveler_memory::REDACTED_BODY.to_string()
+        } else {
+            view.body.clone()
+        },
+        kind: ui_memory_kind(view),
+        sensitive: view.sensitive,
+    }
+}
+
+/// Pending candidates include the body, kind and source needed for informed
+/// consent. Preserve service errors rather than presenting them as no
+/// candidates.
+fn pending_entries(
+    service: &leveler_memory::MemoryService,
+    actor: &leveler_memory::v2::Actor,
+) -> Result<Vec<leveler_client_protocol::UiMemoryCandidate>, leveler_memory::ServiceError> {
+    Ok(service
+        .pending(actor, leveler_memory::ServiceScope::Project)?
+        .into_iter()
+        .map(|view| leveler_client_protocol::UiMemoryCandidate {
+            id: view.id,
+            title: if view.sensitive {
+                leveler_memory::REDACTED_TITLE.to_string()
+            } else {
+                view.title
+            },
+            body: if view.sensitive {
+                leveler_memory::REDACTED_BODY.to_string()
+            } else {
+                view.body
+            },
+            kind: view.kind,
+            source: view.authority,
         })
         .collect())
 }
@@ -289,56 +396,34 @@ fn proposed_memory_projects_to_truthful_pending_notification() {
     }
 }
 
-/// One active/archived row, carrying what a client must render differently:
-/// the kind, and whether it is withheld from the model as sensitive.
-fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::UiMemoryEntry {
-    use leveler_client_protocol::UiMemoryKind;
-    use leveler_memory::MemoryKind;
-    let sensitive = leveler_memory::is_sensitive(entry);
-    leveler_client_protocol::UiMemoryEntry {
-        id: entry.id.clone(),
-        // A credential-shaped title is the credential. Clients still receive
-        // the `sensitive` flag and can say the entry exists without echoing it.
-        title: if sensitive {
-            leveler_memory::REDACTED_TITLE.to_string()
-        } else {
-            entry.title.clone()
-        },
-        // The body can be the credential too; withhold it with the title.
-        body: if sensitive {
-            leveler_memory::REDACTED_BODY.to_string()
-        } else {
-            entry.body.clone()
-        },
-        kind: match MemoryKind::of(entry) {
-            MemoryKind::Preference => Some(UiMemoryKind::Preference),
-            MemoryKind::Decision => Some(UiMemoryKind::Decision),
-            MemoryKind::Note => Some(UiMemoryKind::Note),
-            MemoryKind::Experience => Some(UiMemoryKind::Experience),
-            // Legacy and derived entries have no product kind to claim.
-            MemoryKind::LegacyUnknown | MemoryKind::Derived => None,
-        },
-        sensitive,
-    }
-}
-
-/// A complete listing is evidence only when every requested store read succeeds.
-/// Pending reads retain MemoryStore's existing crash-residue healing semantics.
+/// A complete listing is evidence only when every requested read succeeds.
+/// The configured backend decides which store is read: the same one writes go
+/// to, never a second database.
 fn send_memory_list(
     events: &tokio::sync::broadcast::Sender<RuntimeEvent>,
+    service: &leveler_memory::MemoryService,
+    lanes: leveler_memory::MemoryLanes,
     memory_dir: &std::path::Path,
     include_archived: bool,
     query_id: Option<leveler_core::CommandId>,
 ) {
-    let listing = (|| -> Result<RuntimeEvent, leveler_memory::MemoryError> {
-        let store = leveler_memory::MemoryStore::open(memory_dir)?;
-        let active = store.list_active()?.iter().map(memory_row).collect();
+    let actor = user_listing_actor(query_id.as_ref());
+    let listing = (|| -> Result<RuntimeEvent, leveler_memory::ServiceError> {
+        let active = service
+            .listing_for_user(leveler_memory::ServiceScope::Project, lanes)?
+            .iter()
+            .map(memory_row_from_view)
+            .collect();
         let archived = if include_archived {
-            store.list_archived()?.iter().map(memory_row).collect()
+            service
+                .archived(&actor, leveler_memory::ServiceScope::Project, lanes, None)?
+                .iter()
+                .map(memory_row_from_view)
+                .collect()
         } else {
             Vec::new()
         };
-        let pending = pending_entries(&store)?;
+        let pending = pending_entries(service, &actor)?;
         Ok(RuntimeEvent::MemoryList {
             query_id,
             memory_dir: memory_dir.display().to_string(),
@@ -4287,34 +4372,39 @@ impl InProcessRuntimeClient {
         let Some(body) = leveler_memory::parse_direct_memory_command(content) else {
             return false;
         };
-        let memory_dir = self.app.layout.memory_dir();
         let events = self.events_for(session_id);
         let title = leveler_memory::title_from_body(&body);
-        // A commanded save defaults to a lasting preference: "remember this"
-        // almost always means "apply it from now on".
-        match leveler_memory::MemoryStore::open(&memory_dir).and_then(|store| {
-            store.activate(
-                &title,
-                &body,
-                leveler_memory::MemoryKind::Preference,
-                Vec::new(),
-            )
-        }) {
-            Ok(entry) => {
+        // The message arrived through this process's user input surface, so
+        // the invocation is minted HERE and never derived from the text.
+        let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
+            "direct:{}:{}",
+            session_id,
+            &leveler_memory::v2::sha256_hex_text(content)[..16]
+        ));
+        let request = leveler_memory::RememberRequest {
+            op_id: format!("direct:{}", invocation.as_str()),
+            scope: leveler_memory::ServiceScope::Project,
+            title: title.clone(),
+            body,
+            // A commanded save defaults to a lasting preference: "remember
+            // this" almost always means "apply it from now on".
+            kind: "preference".to_string(),
+            subject: None,
+            value: None,
+            tags: Vec::new(),
+            evidence: None,
+            expires_at: None,
+            replaces_id: None,
+        };
+        match self
+            .app
+            .memory_service()
+            .remember(&leveler_memory::v2::Actor::User { invocation }, request)
+        {
+            Ok(outcome) => {
                 let busy = self.active.is_running(session_id);
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: if busy {
-                        // This turn's context was assembled already, so say
-                        // when it actually starts being recalled.
-                        format!(
-                            "已保存记忆 [{}]：{}。将从下一次用户回合开始参与自动召回。",
-                            entry.id, entry.title
-                        )
-                    } else {
-                        format!("已保存记忆 [{}]：{}", entry.id, entry.title)
-                    },
-                });
+                let (level, message) = direct_write_notification(&outcome, &title, busy);
+                let _ = events.send(RuntimeEvent::Notification { level, message });
                 // Deliberately no list refresh here: the confirmation above
                 // IS the feedback, and a follow-up listing notification would
                 // overwrite it on a one-line status bar. Clients that show a
@@ -4936,7 +5026,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let memory_dir = self.app.layout.memory_dir();
                 let events = self.events_for(&session_id);
-                send_memory_list(&events, &memory_dir, include_archived, query_id);
+                send_memory_list(
+                    &events,
+                    &self.app.memory_service(),
+                    self.app.memory_lanes(),
+                    &memory_dir,
+                    include_archived,
+                    query_id,
+                );
                 Ok(())
             }
             ClientCommand::MemoryStatus {
@@ -4999,15 +5096,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await;
             }
             ClientCommand::AcceptMemory { session_id, id } => {
-                // User-authoritative promotion: this call IS the consent K36
-                // requires, which is why the model can never reach it.
-                let memory_dir = self.app.layout.memory_dir();
+                // User-authoritative promotion: this command arrived through
+                // an in-process review surface, which is why the model can
+                // never reach it. The invocation is minted here, not passed in.
                 let events = self.events_for(&session_id);
-                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.accept(&id)) {
-                    Ok(entry) => {
+                let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
+                    "ui:accept:{}:{id}",
+                    session_id
+                ));
+                let actor = leveler_memory::v2::Actor::User { invocation };
+                match self.app.memory_service().review(
+                    &actor,
+                    leveler_memory::ServiceScope::Project,
+                    &id,
+                    leveler_memory::ReviewRequest::Accept,
+                ) {
+                    Ok(outcome) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Info,
-                            message: format!("已采纳记忆 [{id}]: {}", entry.title),
+                            message: format!("已采纳记忆 [{id}]: {}", outcome_title(&outcome)),
                         });
                     }
                     Err(err) => {
@@ -5022,9 +5129,20 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::RejectMemory { session_id, id } => {
                 // Declines a PENDING candidate and suppresses that signal, so
                 // the same proposal does not return on the next turn.
-                let memory_dir = self.app.layout.memory_dir();
                 let events = self.events_for(&session_id);
-                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.reject(&id)) {
+                let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
+                    "ui:reject:{}:{id}",
+                    session_id
+                ));
+                let actor = leveler_memory::v2::Actor::User { invocation };
+                match self.app.memory_service().review(
+                    &actor,
+                    leveler_memory::ServiceScope::Project,
+                    &id,
+                    leveler_memory::ReviewRequest::Reject {
+                        reason: "rejected by the user".to_string(),
+                    },
+                ) {
                     Ok(_) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Info,
@@ -5046,9 +5164,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 kind,
             } => {
                 // The user's own write: no model, no agent turn, no candidate.
-                // The command IS the authorization.
+                // The command IS the authorization; the invocation identity is
+                // minted here from the trusted in-process command.
                 use leveler_client_protocol::UiMemoryKind;
-                let memory_dir = self.app.layout.memory_dir();
                 let events = self.events_for(&session_id);
                 let body = body.trim().to_string();
                 if body.is_empty() {
@@ -5059,9 +5177,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     return Ok(());
                 }
                 let domain_kind = match kind.unwrap_or(UiMemoryKind::Preference) {
-                    UiMemoryKind::Preference => leveler_memory::MemoryKind::Preference,
-                    UiMemoryKind::Decision => leveler_memory::MemoryKind::Decision,
-                    UiMemoryKind::Note => leveler_memory::MemoryKind::Note,
+                    UiMemoryKind::Preference => "preference",
+                    UiMemoryKind::Decision => "decision",
+                    UiMemoryKind::Note => "note",
                     // An experience needs the structured evidence a task
                     // records. A hand-typed /remember has none, and storing it
                     // as one would claim a verification that never happened.
@@ -5078,14 +5196,33 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // The title is derived HERE, once, so TUI / Web / CLI cannot
                 // drift into three conventions. Never model-generated.
                 let title = leveler_memory::title_from_body(&body);
-                match leveler_memory::MemoryStore::open(&memory_dir)
-                    .and_then(|s| s.activate(&title, &body, domain_kind, Vec::new()))
+                let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
+                    "ui:remember:{}:{}",
+                    session_id,
+                    &leveler_memory::v2::sha256_hex_text(&body)[..16]
+                ));
+                let request = leveler_memory::RememberRequest {
+                    op_id: format!("ui:remember:{}", invocation.as_str()),
+                    scope: leveler_memory::ServiceScope::Project,
+                    title: title.clone(),
+                    body,
+                    kind: domain_kind.to_string(),
+                    subject: None,
+                    value: None,
+                    tags: Vec::new(),
+                    evidence: None,
+                    expires_at: None,
+                    replaces_id: None,
+                };
+                match self
+                    .app
+                    .memory_service()
+                    .remember(&leveler_memory::v2::Actor::User { invocation }, request)
                 {
-                    Ok(entry) => {
-                        let _ = events.send(RuntimeEvent::Notification {
-                            level: leveler_client_protocol::NotificationLevel::Info,
-                            message: format!("已保存记忆 [{}]：{}", entry.id, entry.title),
-                        });
+                    Ok(outcome) => {
+                        let busy = self.active.is_running(&session_id);
+                        let (level, message) = direct_write_notification(&outcome, &title, busy);
+                        let _ = events.send(RuntimeEvent::Notification { level, message });
                     }
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
@@ -5100,10 +5237,16 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // Archives an ACTIVE entry. A pending id used to land here and
                 // silently do nothing — the Web "忽略" button's bug — so a
                 // candidate id is refused with a pointer to the right action.
-                let memory_dir = self.app.layout.memory_dir();
                 let events = self.events_for(&session_id);
-                let is_pending = leveler_memory::MemoryStore::open(&memory_dir)
-                    .map(|s| s.read_pending(&id).is_ok())
+                let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
+                    "ui:forget:{}:{id}",
+                    session_id
+                ));
+                let actor = leveler_memory::v2::Actor::User { invocation };
+                let service = self.app.memory_service();
+                let is_pending = service
+                    .pending(&actor, leveler_memory::ServiceScope::Project)
+                    .map(|pending| pending.iter().any(|view| view.id == id))
                     .unwrap_or(false);
                 if is_pending {
                     let _ = events.send(RuntimeEvent::Notification {
@@ -5112,11 +5255,20 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     });
                     return Ok(());
                 }
-                match leveler_memory::MemoryStore::open(&memory_dir).and_then(|s| s.forget(&id)) {
-                    Ok(entry) => {
+                match service.forget(&actor, leveler_memory::ServiceScope::Project, &id) {
+                    Ok(leveler_memory::WriteOutcome::Forgotten { id, title }) => {
                         let _ = events.send(RuntimeEvent::Notification {
                             level: leveler_client_protocol::NotificationLevel::Info,
-                            message: format!("已归档记忆 [{}]: {}", entry.id, entry.title),
+                            message: format!("已归档记忆 [{id}]: {title}"),
+                        });
+                    }
+                    Ok(outcome) => {
+                        let _ = events.send(RuntimeEvent::Notification {
+                            level: leveler_client_protocol::NotificationLevel::Warning,
+                            message: format!(
+                                "forget was queued, not applied: {}",
+                                outcome_title(&outcome)
+                            ),
                         });
                     }
                     Err(err) => {
@@ -8415,6 +8567,8 @@ mod memory_listing_tests {
         for include_archived in [false, true] {
             send_memory_list(
                 &events,
+                &leveler_memory::MemoryService::legacy(directory.path()),
+                leveler_memory::MemoryLanes::ALL,
                 directory.path(),
                 include_archived,
                 Some("memory-query".into()),
@@ -8452,7 +8606,14 @@ mod memory_listing_tests {
             };
             assert!(failure, "existing store rejects malformed {folder} data");
             let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-            send_memory_list(&events, directory.path(), true, Some("memory-query".into()));
+            send_memory_list(
+                &events,
+                &leveler_memory::MemoryService::legacy(directory.path()),
+                leveler_memory::MemoryLanes::ALL,
+                directory.path(),
+                true,
+                Some("memory-query".into()),
+            );
             assert!(
                 matches!(
                     receiver.try_recv().unwrap(),
@@ -8509,7 +8670,14 @@ mod memory_listing_tests {
         assert_eq!(store.list_active().unwrap().len(), 1, "fixture active");
         assert_eq!(store.list_pending().unwrap().len(), 1, "fixture pending");
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-        send_memory_list(&events, directory.path(), true, Some("query".into()));
+        send_memory_list(
+            &events,
+            &leveler_memory::MemoryService::legacy(directory.path()),
+            leveler_memory::MemoryLanes::ALL,
+            directory.path(),
+            true,
+            Some("query".into()),
+        );
         match receiver.try_recv().unwrap() {
             RuntimeEvent::MemoryList {
                 active, pending, ..
@@ -8546,6 +8714,8 @@ mod memory_listing_tests {
             let (events, mut receiver) = tokio::sync::broadcast::channel(4);
             send_memory_list(
                 &events,
+                &leveler_memory::MemoryService::legacy(directory.path()),
+                leveler_memory::MemoryLanes::ALL,
                 directory.path(),
                 true,
                 Some("directory-query".into()),

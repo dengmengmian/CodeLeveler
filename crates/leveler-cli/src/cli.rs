@@ -569,6 +569,40 @@ pub enum MemoryCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Inspect a Markdown (Memory 2.0) scope without changing it.
+    ///
+    /// Reports blocked journals, invalid documents, external edits and
+    /// duplicate identities. It never creates, recovers or repairs anything,
+    /// so it is safe to run on a scope that failed to open.
+    Diagnose {
+        /// Directory holding the active `*.md` records.
+        #[arg(long)]
+        current: PathBuf,
+        /// Private state root (journal, history, pending, receipts).
+        #[arg(long)]
+        state: PathBuf,
+        /// Scope the roots belong to.
+        #[arg(long, value_enum, default_value_t = MemoryScopeArg::Project)]
+        scope: MemoryScopeArg,
+    },
+}
+
+/// The `--scope` values `leveler memory diagnose` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemoryScopeArg {
+    Global,
+    Project,
+    Local,
+}
+
+impl From<MemoryScopeArg> for leveler_memory::v2::MemoryScope {
+    fn from(value: MemoryScopeArg) -> Self {
+        match value {
+            MemoryScopeArg::Global => Self::Global,
+            MemoryScopeArg::Project => Self::Project,
+            MemoryScopeArg::Local => Self::Local,
+        }
+    }
 }
 
 /// The `--kind` values `leveler memory remember` accepts.
@@ -1055,6 +1089,34 @@ mod tests {
                 assert!(archived);
             }
             other => panic!("expected Memory::Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_diagnose_parses_explicit_roots_and_scope() {
+        let cli = super::Cli::try_parse_from([
+            "leveler",
+            "memory",
+            "diagnose",
+            "--current",
+            "/tmp/memory-current",
+            "--state",
+            "/tmp/memory-state",
+            "--scope",
+            "local",
+        ])
+        .expect("diagnose must parse");
+        match cli.command {
+            Some(super::Command::Memory(super::MemoryCommand::Diagnose {
+                current,
+                state,
+                scope,
+            })) => {
+                assert_eq!(current, std::path::PathBuf::from("/tmp/memory-current"));
+                assert_eq!(state, std::path::PathBuf::from("/tmp/memory-state"));
+                assert_eq!(scope, super::MemoryScopeArg::Local);
+            }
+            other => panic!("expected Memory::Diagnose, got {other:?}"),
         }
     }
 
