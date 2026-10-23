@@ -400,12 +400,17 @@ async fn an_ordinary_task_does_not_pay_for_an_experience_extraction_call() {
     );
 }
 
-/// A verification command that exits 0 with no output is a structured
-/// observation, not an ordinary success. The extraction lane may learn a
-/// constraint from it without any command failure.
+/// A command that fails, then exits 0 with no output after the task changes
+/// the workspace, is a structured silent resolution. The script's name is not
+/// read; the identity is the exact invocation.
 #[tokio::test]
 async fn a_silent_verification_command_can_produce_a_verified_constraint() {
     let (tmp, _server, app) = harness(vec![
+        tool_call(
+            "c-fail",
+            "run_command",
+            serde_json::json!({"program": "sh", "args": ["verify.sh"], "reason": "run the check before the script exists"}),
+        ),
         tool_call(
             "c-write",
             "write_file",
@@ -418,7 +423,7 @@ async fn a_silent_verification_command_can_produce_a_verified_constraint() {
         ),
         text("done"),
         json_text(
-            r#"{"experiences":[{"category":"environment_constraint","subject":"experience.workspace.silent_verifier","title":"检查脚本无输出退出 0","body":"verify.sh 没有输出就退出 0；这只能证明脚本退出成功，不能证明检查真的执行了。","applies_when":"运行 verify.sh 且输出为空","invalid_if":"verify.sh 恢复输出检查结果","evidence_ids":["observation-2-c-verify"],"confidence":0.8}]}"#,
+            r#"{"experiences":[{"category":"environment_constraint","subject":"experience.workspace.silent_verifier","title":"同一个检查命令先失败后静默退出 0","body":"同一个 `sh verify.sh` 调用在脚本缺失时失败；创建脚本后再次运行没有任何输出就退出 0。这只能证明该命令现在退出成功，不能证明脚本检查了工作区。","applies_when":"运行同一个 `sh verify.sh` 调用且脚本存在","invalid_if":"verify.sh 输出检查结果或命令不再静默退出","evidence_ids":["observation-3-c-verify"],"confidence":0.8}]}"#,
         ),
     ])
     .await;
