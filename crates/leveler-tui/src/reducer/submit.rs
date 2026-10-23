@@ -1182,9 +1182,11 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         }
+        let (scope, id) = crate::memory::parse_key(id);
         return vec![
             Effect::Send(ClientCommand::AcceptMemory {
                 session_id: state.session_id.clone(),
+                scope,
                 id: id.to_string(),
             }),
             memory_list_effect(state, false),
@@ -1201,9 +1203,11 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         }
+        let (scope, id) = crate::memory::parse_key(id);
         return vec![
             Effect::Send(ClientCommand::RejectMemory {
                 session_id: state.session_id.clone(),
+                scope,
                 id: id.to_string(),
             }),
             memory_list_effect(state, false),
@@ -1217,9 +1221,11 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         }
+        let (scope, id) = crate::memory::parse_key(id);
         return vec![
             Effect::Send(ClientCommand::ForgetMemory {
                 session_id: state.session_id.clone(),
+                scope,
                 id: id.to_string(),
             }),
             memory_list_effect(state, true),
@@ -1262,6 +1268,7 @@ fn remember_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     }
     vec![Effect::Send(ClientCommand::RememberMemory {
         session_id: state.session_id.clone(),
+        scope: leveler_client_protocol::UiMemoryScope::Project,
         body: body.to_string(),
         kind: Some(kind),
     })]

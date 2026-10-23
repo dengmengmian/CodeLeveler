@@ -3533,8 +3533,12 @@ impl Executor {
                 self.tool_context.turn_scope.as_deref().unwrap_or("turn"),
                 &leveler_memory::v2::sha256_hex_text(request)[..16]
             ));
+            // The exact parsed span is the operation's provenance: the
+            // extractor can recognise that this text is already stored
+            // instead of creating a second fact for the same words.
+            let evidence_span = body.clone();
             let write = leveler_memory::RememberRequest {
-                op_id: format!("direct:{}", invocation.as_str()),
+                op_id: leveler_memory::v2::OpId::derived("direct", invocation.as_str()),
                 scope: leveler_memory::ServiceScope::Project,
                 title,
                 body,
@@ -3542,7 +3546,7 @@ impl Executor {
                 subject: None,
                 value: None,
                 tags: Vec::new(),
-                evidence: None,
+                evidence: Some(evidence_span),
                 expires_at: None,
                 replaces_id: None,
             };

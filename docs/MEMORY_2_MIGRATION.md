@@ -1,6 +1,6 @@
 # CodeLeveler Memory 2.0 迁移方案
 
-状态：设计稿。本轮不迁移任何真实用户数据，不修改旧 store，不删除旧数据。
+状态：设计稿；Stage 4 未开始，未执行任何真实数据迁移。本轮不修改旧 store、不删除旧数据；legacy 与 Markdown backend 在配置层共存，默认 backend 未改变。
 
 结论先行：
 
@@ -148,7 +148,7 @@
 | `created_at` | `created_at` | RFC3339 校验；非法则用文件 mtime + `legacy.timestamp_fallback=true` |
 | `updated_at` | `updated_at` | 同上 |
 | `archived_at` | `legacy.archived_at` | 仅历史；不映射为当前字段 |
-| `key` | `subject_key` | 有则规范化保留；无则 `null` + `legacy.keyless=true`，不猜 |
+| `key` | `subject_key` | 有则规范化保留；无则 `null` + `legacy.keyless=true`，不猜。Stage 2.1 之后新写入的无 subject 显式用户记录本来就是 `MemoryId` 身份，不是 legacy keyless；迁移只处理旧 store，不能用 `legacy.keyless` 覆盖新记录 |
 | `value` | `value` | 原样；缺失为 null；不解析 body |
 | `kind` | `kind` + `legacy.kind` | Preference/Decision/Note/LegacyUnknown → `user_fact`；Experience → `experience`；Derived → `user_fact` + `status=deprecated` |
 | `status` | `status` | 见 §4.2 |

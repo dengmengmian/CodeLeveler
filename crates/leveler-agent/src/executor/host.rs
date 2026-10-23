@@ -1246,10 +1246,10 @@ impl Executor {
             }
         };
         let request = leveler_memory::RememberRequest {
-            // The tool call is the idempotent operation identity. A title is
-            // arbitrary user-facing text, and `OpId` accepts only
-            // `[A-Za-z0-9_\-:.]`, so it must not be part of the op id.
-            op_id: format!("park:{}", call.id),
+            // The tool call is the idempotent operation identity. Provider
+            // ids are opaque, so derive a journal-safe spelling of the exact
+            // id instead of embedding it raw.
+            op_id: leveler_memory::v2::OpId::derived("park", call.id.as_str()),
             scope,
             title: title.to_string(),
             body: body.to_string(),
@@ -2352,6 +2352,85 @@ mod authorize_tests {
         assert!(
             store.list_active().unwrap().is_empty(),
             "parking must never activate without consent (K36)"
+        );
+    }
+
+    /// Provider tool-call ids are opaque strings; operation ids are not. A call
+    /// id containing characters outside `[A-Za-z0-9_\-:.]` must still park the
+    /// proposal — the parked operation derives a safe spelling from the exact
+    /// id, and a retry of the same call stays one candidate.
+    #[tokio::test]
+    async fn an_opaque_provider_call_id_still_parks_the_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_current = dir.path().join("memory");
+        let project_state = dir.path().join("state");
+        let global_current = dir.path().join("global-memory");
+        let global_state = dir.path().join("global-state");
+        let service = leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::markdown()
+                .with_project(leveler_memory::v2::ScopeRoots::new(
+                    leveler_memory::v2::MemoryScope::Project,
+                    project_current,
+                    project_state.clone(),
+                ))
+                .with_global(leveler_memory::v2::ScopeRoots::new(
+                    leveler_memory::v2::MemoryScope::Global,
+                    global_current,
+                    global_state,
+                )),
+        );
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
+        tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
+        tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
+        let executor = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_memory_service(Some(Arc::new(service)))
+        .with_approver(Arc::new(HeadlessDeny));
+        let mut session = HashSet::new();
+        let call = ToolCall {
+            id: ToolCallId::new("call|opaque/with spaces"),
+            name: "remember".to_string(),
+            arguments: serde_json::json!({
+                "title": "用 pnpm",
+                "body": "本仓库统一用 pnpm，不要用 npm。",
+                "subject": "package_manager",
+                "value": "pnpm",
+                "kind": "preference",
+            }),
+        };
+
+        for attempt in 0..2 {
+            let err = executor
+                .authorize(&call, &mut session)
+                .await
+                .expect_err("an unattended write still needs a person");
+            assert!(
+                err.contains("kept as a pending candidate")
+                    || err.contains("already awaiting review"),
+                "attempt {attempt} must keep the proposal, not lose it: {err}"
+            );
+            assert!(
+                !err.contains("invalid operation id"),
+                "attempt {attempt} must not fail on the opaque call id: {err}"
+            );
+        }
+
+        let pending: Vec<_> = std::fs::read_dir(project_state.join("pending"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(pending.len(), 1, "a retried call is one candidate");
+        let text = std::fs::read_to_string(&pending[0]).unwrap();
+        assert!(
+            text.contains("tool_call_id: call|opaque/with spaces"),
+            "the parked proposal must keep the exact call identity: {text}"
         );
     }
 

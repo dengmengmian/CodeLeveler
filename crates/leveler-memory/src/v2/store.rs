@@ -25,7 +25,7 @@ use super::receipt::{self, Receipt, Trust, TrustView};
 use super::record::{
     Caller, Cas, Experience, Frontmatter, IntentRecord, MemoryAuthority, MemoryId, MemoryIntent,
     MemoryKind, MemoryRecord, MemoryScope, MemoryStatus, OpId, Operation, PinOwner, Proposal,
-    Relation, SourceRef, StatementKind, Tombstone,
+    Relation, SourceRef, SourceRefKind, StatementKind, Tombstone,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -99,6 +99,11 @@ pub struct RecordPatch {
     pub tags: Option<Vec<String>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
     pub evidence: Option<Vec<SourceRef>>,
+    /// Attach a structured identity to an explicit record. `None` leaves the
+    /// current identity unchanged; an identity is never cleared or replaced
+    /// here (use an explicit supersede for that).
+    pub subject: Option<String>,
+    pub subject_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1323,9 +1328,17 @@ impl MarkdownStore {
             self.finish_noop(&request.op_id, &digest, admission.clone())?;
             return Ok(admission);
         }
+        // A keyless user fact is the user's own unstructured memory: its
+        // identity is the record id, never an invented subject key. Only a
+        // trusted user operation (or a migration of such a record) may create
+        // one; an automatic writer must supply a structured subject. An
+        // automatic UPDATE keeps the target's keyless identity instead of
+        // inventing one: it is parked for user review by the lifecycle.
         if intent.kind == MemoryKind::UserFact
             && intent.subject_key.is_none()
+            && !caller.is_user()
             && !matches!(caller, Caller::Migration { .. })
+            && !matches!(intent.relation, Relation::Update { .. })
         {
             let admission = Admission::Rejected {
                 reason: RejectReason::MissingSubjectKey,
@@ -1490,23 +1503,34 @@ impl MarkdownStore {
             }
             CreationDecision::Active(authority) => {
                 if intent.kind == MemoryKind::UserFact {
+                    // An automatic extraction from a span already owned by a
+                    // trusted direct user write is not a second fact. The
+                    // match is exact provenance (the same user-turn span),
+                    // never text similarity, and it only covers that one
+                    // operation: other spans from the same turn still flow
+                    // through normal admission.
+                    if let Some(owner) = self.direct_owner_for(&caller, &intent)? {
+                        let existing_id = owner.record.frontmatter.id.clone();
+                        let admission = Admission::Skipped {
+                            existing: existing_id.clone(),
+                            reason: SkipReason::DirectCommandOwned,
+                        };
+                        return self.finish_skip(op_id, &digest, admission, &existing_id);
+                    }
                     let Some(subject_key) = intent.subject_key.clone() else {
-                        if matches!(caller, Caller::Migration { .. }) {
-                            // Legacy keyless facts remain addressable only by
-                            // their exact id; they never participate in
-                            // subject-key identity.
-                            return self.commit_new_with_targets(
-                                op_id,
-                                caller,
-                                digest,
-                                intent,
-                                authority,
-                                Vec::new(),
-                                Operation::Create,
-                                now,
-                            );
-                        }
-                        return Err(StoreError::Invalid("missing subject key".into()));
+                        // Unstructured user memory is addressable only by its
+                        // exact id; it never participates in subject-key
+                        // identity. Automatic writers were rejected above.
+                        return self.commit_new_with_targets(
+                            op_id,
+                            caller,
+                            digest,
+                            intent,
+                            authority,
+                            Vec::new(),
+                            Operation::Create,
+                            now,
+                        );
                     };
                     let existing = self.active_by_subject(intent.kind, &subject_key, now)?;
                     if existing.len() > 1 {
@@ -1610,18 +1634,65 @@ impl MarkdownStore {
                 reason: "target is not a trusted current record".into(),
             });
         }
-        if target.record.frontmatter.kind != intent.kind
-            || target.record.frontmatter.subject_key != intent.subject_key
-        {
+        if target.record.frontmatter.kind != intent.kind {
             let admission = Admission::Rejected {
                 reason: RejectReason::InvalidIntent,
             };
             self.finish_noop(&op_id, &digest, admission.clone())?;
             return Ok(admission);
         }
+        // An explicit record may gain a structured identity, by exact id, but
+        // an existing identity is never cleared or swapped through an update:
+        // that would leave the old identity's history unexplained. Use an
+        // explicit supersede instead.
+        let identity_added =
+            target.record.frontmatter.subject_key.is_none() && intent.subject_key.is_some();
+        if !identity_added && target.record.frontmatter.subject_key != intent.subject_key {
+            let admission = Admission::Rejected {
+                reason: RejectReason::InvalidIntent,
+            };
+            self.finish_noop(&op_id, &digest, admission.clone())?;
+            return Ok(admission);
+        }
+        let mut forced_pending = None;
+        if identity_added {
+            if !caller.is_user() {
+                // The target is the user's unstructured memory. A model or
+                // runtime may suggest an identity, but a person must decide.
+                forced_pending = Some(PendingReason::ProtectedUserFact);
+            } else {
+                let subject_key = intent.subject_key.as_deref().unwrap_or_default();
+                let collisions = self.active_by_subject(intent.kind, subject_key, now)?;
+                if collisions.len() > 1 {
+                    return Err(StoreError::InvariantViolation {
+                        subject_key: subject_key.to_string(),
+                        ids: collisions
+                            .iter()
+                            .map(|loaded| loaded.record.frontmatter.id.clone())
+                            .collect(),
+                    });
+                }
+                if let Some(collision) = collisions.first() {
+                    // Two Actives under one subject are never created by an
+                    // update. The person reviews the conversion first.
+                    forced_pending = Some(PendingReason::Other(format!(
+                        "subject_key_in_use:{}",
+                        collision.record.frontmatter.id
+                    )));
+                }
+            }
+        }
         let has_new_evidence = lifecycle::has_new_evidence(&target.record, &intent);
-        match lifecycle::decide_target(&caller, &target.view(now), new_authority, has_new_evidence)
-        {
+        let decision = match forced_pending {
+            Some(reason) => TargetDecision::Pending(reason),
+            None => lifecycle::decide_target(
+                &caller,
+                &target.view(now),
+                new_authority,
+                has_new_evidence,
+            ),
+        };
+        match decision {
             TargetDecision::Pending(reason) => {
                 let proposal = Proposal {
                     operation: Operation::Update,
@@ -1785,14 +1856,16 @@ impl MarkdownStore {
             let admission = Admission::Pending { id, reason };
             return self.commit_pending(op_id, caller, digest, record, bytes, admission);
         }
-        let new_id = MemoryId::new();
+        // `commit_new_with_targets` allocates the replacement id and fills
+        // `superseded_by` itself; allocating one here would leave history
+        // pointing at an id that never becomes current.
         let target_actions = loaded_targets
             .into_iter()
             .map(|loaded| TargetAction {
                 loaded,
                 disposition: TargetDisposition::Retire,
                 final_status: Some(MemoryStatus::Superseded),
-                superseded_by: Some(new_id.clone()),
+                superseded_by: None,
                 reason: None,
             })
             .collect();
@@ -2334,6 +2407,44 @@ impl MarkdownStore {
                         expected,
                     });
                 }
+                // A reviewed identity conversion must not leave two Actives
+                // under one subject key. Exact structural equality may be
+                // retired into the converted record; anything else needs an
+                // explicit supersede, never a forced merge.
+                let mut identical_collision = None;
+                if let Some(subject_key) = pending.frontmatter.subject_key.as_deref() {
+                    let collisions: Vec<Loaded> = self
+                        .scan_current(true)?
+                        .into_iter()
+                        .filter(|loaded| {
+                            loaded.trust.trust == Trust::Trusted
+                                && loaded.record.frontmatter.id != target_id
+                                && loaded.record.frontmatter.kind == pending.frontmatter.kind
+                                && loaded.record.frontmatter.subject_key.as_deref()
+                                    == Some(subject_key)
+                        })
+                        .collect();
+                    if collisions.len() > 1 {
+                        return Err(StoreError::InvariantViolation {
+                            subject_key: subject_key.to_string(),
+                            ids: collisions
+                                .iter()
+                                .map(|loaded| loaded.record.frontmatter.id.clone())
+                                .collect(),
+                        });
+                    }
+                    if let Some(collision) = collisions.into_iter().next() {
+                        let same_value =
+                            collision.record.frontmatter.value == pending.frontmatter.value;
+                        if !same_value || collision.record.body != pending.body {
+                            return Err(StoreError::Invalid(format!(
+                                "subject key `{subject_key}` is already used by {}; supersede it explicitly before accepting",
+                                collision.record.frontmatter.id
+                            )));
+                        }
+                        identical_collision = Some(collision);
+                    }
+                }
                 let mut record = pending.clone();
                 record.frontmatter.id = target_id.clone();
                 record.frontmatter.status = MemoryStatus::Active;
@@ -2344,6 +2455,10 @@ impl MarkdownStore {
                 record.frontmatter.pinned = target.record.frontmatter.pinned;
                 record.frontmatter.pinned_by = target.record.frontmatter.pinned_by;
                 record.frontmatter.updated_at = now;
+                if let Some(collision) = &identical_collision {
+                    record.frontmatter.supersedes =
+                        vec![collision.record.frontmatter.id.to_string()];
+                }
                 record.validate()?;
                 let bytes = frontmatter::render(&record)?;
                 let admission = Admission::Applied {
@@ -2371,6 +2486,21 @@ impl MarkdownStore {
                     superseded_by: None,
                     reason: None,
                 });
+                if let Some(collision) = identical_collision {
+                    tx.attic.push(attic_entry(
+                        &collision,
+                        MemoryStatus::Superseded,
+                        Some(target_id.clone()),
+                        None,
+                    ));
+                    tx.targets.push(TargetAction {
+                        loaded: collision,
+                        disposition: TargetDisposition::Retire,
+                        final_status: Some(MemoryStatus::Superseded),
+                        superseded_by: Some(target_id.clone()),
+                        reason: None,
+                    });
+                }
                 tx.pending_deletes.push(pending_id);
                 self.execute_tx(tx)?;
                 Ok(admission)
@@ -3407,6 +3537,51 @@ impl MarkdownStore {
             .collect())
     }
 
+    /// The trusted direct user record whose stored span this write's user-turn
+    /// span contains, if any. Quoting or widening the direct write restates
+    /// the same operation; a narrower span is a separate fact.
+    fn direct_owner_for(
+        &self,
+        caller: &Caller,
+        intent: &MemoryIntent,
+    ) -> Result<Option<Loaded>, StoreError> {
+        if caller.is_user() || matches!(caller, Caller::Migration { .. }) {
+            return Ok(None);
+        }
+        let candidate_spans: Vec<&str> = intent
+            .evidence
+            .iter()
+            .filter(|source| source.kind == SourceRefKind::UserTurn)
+            .filter_map(|source| source.evidence_span.as_deref())
+            .map(str::trim)
+            .filter(|span| !span.is_empty())
+            .collect();
+        if candidate_spans.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.scan_current(true)?.into_iter().find(|loaded| {
+            loaded.trust.trust == Trust::Trusted
+                && loaded.record.frontmatter.kind == MemoryKind::UserFact
+                && loaded.record.frontmatter.subject_key.is_none()
+                && matches!(
+                    loaded.record.frontmatter.authority,
+                    MemoryAuthority::UserExplicit | MemoryAuthority::UserApproved
+                )
+                && loaded.record.frontmatter.source_refs.iter().any(|source| {
+                    source.kind == SourceRefKind::UserTurn
+                        && source
+                            .evidence_span
+                            .as_deref()
+                            .map(str::trim)
+                            .is_some_and(|stored| {
+                                candidate_spans
+                                    .iter()
+                                    .any(|candidate| candidate.contains(stored))
+                            })
+                })
+        }))
+    }
+
     fn load_current(&self, id: &MemoryId) -> Result<Option<Loaded>, StoreError> {
         let path = self.paths.current_file(id);
         if !self.exists(&path)? {
@@ -3664,18 +3839,6 @@ impl MarkdownStore {
         proposal: Option<Proposal>,
         supersedes: Vec<String>,
     ) -> Result<MemoryRecord, StoreError> {
-        let mut extra = serde_yaml::Mapping::new();
-        if intent.kind == MemoryKind::UserFact && intent.subject_key.is_none() {
-            let mut legacy = serde_yaml::Mapping::new();
-            legacy.insert(
-                serde_yaml::Value::String("keyless".into()),
-                serde_yaml::Value::Bool(true),
-            );
-            extra.insert(
-                serde_yaml::Value::String("legacy".into()),
-                serde_yaml::Value::Mapping(legacy),
-            );
-        }
         let record = MemoryRecord {
             frontmatter: Frontmatter {
                 schema: super::record::SCHEMA_VERSION,
@@ -3702,7 +3865,7 @@ impl MarkdownStore {
                 source_refs: intent.evidence.clone(),
                 created_at,
                 updated_at,
-                extra,
+                extra: serde_yaml::Mapping::new(),
             },
             body: intent.body.clone(),
         };
@@ -3872,8 +4035,14 @@ fn intent_from_patch(record: &MemoryRecord, patch: &RecordPatch) -> MemoryIntent
     MemoryIntent {
         kind: record.frontmatter.kind,
         scope: record.frontmatter.scope,
-        subject: record.frontmatter.subject.clone(),
-        subject_key: record.frontmatter.subject_key.clone(),
+        subject: patch
+            .subject
+            .clone()
+            .or_else(|| record.frontmatter.subject.clone()),
+        subject_key: patch
+            .subject_key
+            .clone()
+            .or_else(|| record.frontmatter.subject_key.clone()),
         value: patch
             .value
             .clone()

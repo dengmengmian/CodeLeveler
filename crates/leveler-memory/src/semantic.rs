@@ -219,9 +219,10 @@ pub enum CandidateRejection {
     /// The statement is a proposal, hypothetical, quotation or unclear. Only
     /// the user's own settled statement may become current truth.
     NotAConfirmedStatement { statement: StatementKind },
-    /// The user's turn is a direct memory command. That command has its own
-    /// deterministic writer; a second extracted memory for the same turn
-    /// would be a competing current truth.
+    /// The candidate's evidence contains the span a direct memory command
+    /// already stored. That command has its own deterministic writer, so a
+    /// second extracted memory for the same words would be a competing
+    /// current truth.
     DirectCommandOwned,
     /// `replaces_memory_id` was not a usable memory id.
     InvalidTarget,
@@ -278,7 +279,7 @@ impl CandidateRejection {
                 statement.as_str()
             ),
             Self::DirectCommandOwned => {
-                "the direct memory writer owns this turn".to_string()
+                "the direct memory writer already stored this span".to_string()
             }
             Self::InvalidTarget => "candidate named an unusable memory id".to_string(),
         }
@@ -440,12 +441,16 @@ pub fn validate_semantic_candidate(
         });
     }
 
-    // A direct memory command is already owned by the deterministic direct
-    // writer. Extraction must not create a second current fact for that turn.
-    // This is checked before the statement kind: whatever the model calls it,
-    // the direct writer owns the turn.
-    if crate::parse_direct_memory_command(user_message).is_some() {
-        return Err(CandidateRejection::DirectCommandOwned);
+    // A direct memory command owns the span it stored. A candidate quoting
+    // that text, or a wider span containing it, restates the same operation;
+    // a narrower clause is a separate fact and stays eligible. Ownership is
+    // span containment, never text similarity.
+    if let Some(body) = crate::parse_direct_memory_command(user_message) {
+        let body = body.trim();
+        let span = candidate.evidence_span.trim();
+        if !body.is_empty() && span.contains(body) {
+            return Err(CandidateRejection::DirectCommandOwned);
+        }
     }
 
     // Authority is a claim; the statement kind is what the user is DOING.
@@ -770,6 +775,30 @@ mod tests {
         assert!(evidence_matches(" 模型 就 PRO ", msg));
         assert!(!evidence_matches("用户长期偏好 Rust", msg));
         assert!(!evidence_matches("", msg));
+    }
+
+    #[test]
+    fn a_direct_command_owns_its_exact_span_not_other_facts_in_the_turn() {
+        let msg = "记住：项目使用 pnpm。默认模型使用 Flash。";
+        let body = "项目使用 pnpm。默认模型使用 Flash。";
+        let owned = candidate("项目使用 pnpm", "project.package_manager", body);
+        assert_eq!(
+            validate_semantic_candidate(&owned, msg).unwrap_err(),
+            CandidateRejection::DirectCommandOwned
+        );
+
+        // The direct writer stored the whole body verbatim. A clause quoted
+        // from it is a separate fact, not a duplicate of that write.
+        let independent = candidate(
+            "默认模型使用 Flash",
+            "project.default_model",
+            "默认模型使用 Flash。",
+        );
+        assert!(
+            validate_semantic_candidate(&independent, msg).is_ok(),
+            "{:?}",
+            validate_semantic_candidate(&independent, msg).unwrap_err()
+        );
     }
 
     #[test]

@@ -1,18 +1,20 @@
 //! Direct memory commands must report what actually happened.
 //!
 //! `/remember` and `记住：…` are trusted user writes, so they go through the
-//! Memory service like every other path. On the Markdown backend a new user
-//! fact needs a structured `subject_key`; a keyless direct command is rejected
-//! rather than given an identity derived from its text. The status line must
-//! say so instead of claiming the memory was saved.
+//! Memory service like every other path. On the Markdown backend a direct
+//! command without a subject is stored under its stable memory id; the status
+//! line reports the real outcome. Delivery idempotency is the command id, not
+//! a hash of the text: a retry replays, two independent commands both write.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{
-    ClientCommand, InteractiveRuntimeClient, NotificationLevel, RuntimeEvent, UiMemoryKind,
+    ClientCommand, CommandEnvelope, InteractiveRuntimeClient, NotificationLevel, RuntimeEvent,
+    UiMemoryKind,
 };
+use leveler_core::{CommandId, SessionId};
 use leveler_execution::PermissionProfile;
 use leveler_memory::v2::Actor;
 use leveler_memory::{MemoryLanes, ServiceScope};
@@ -83,6 +85,7 @@ async fn remember(runtime: &InProcessRuntimeClient, session: &leveler_core::Sess
     runtime
         .send(ClientCommand::RememberMemory {
             session_id: session.clone(),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
             body: body.to_string(),
             kind: Some(UiMemoryKind::Preference),
         })
@@ -91,7 +94,7 @@ async fn remember(runtime: &InProcessRuntimeClient, session: &leveler_core::Sess
 }
 
 #[tokio::test]
-async fn a_rejected_direct_command_is_not_reported_as_saved() {
+async fn a_direct_command_without_subject_is_saved_on_the_markdown_backend() {
     let (_tmp, app) = assemble("markdown");
     let runtime = InProcessRuntimeClient::new(
         app.clone(),
@@ -105,26 +108,146 @@ async fn a_rejected_direct_command_is_not_reported_as_saved() {
     remember(&runtime, &session, "以后用中文回复").await;
 
     let (level, message) = next_notification(&mut events).await;
-    assert_eq!(level, NotificationLevel::Warning, "{message}");
-    assert!(message.contains("未保存"), "{message}");
-    assert!(message.contains("missing_subject_key"), "{message}");
-    assert!(
-        !message.contains("已保存"),
-        "a rejected write must not claim success: {message}"
-    );
+    assert_eq!(level, NotificationLevel::Info, "{message}");
+    assert!(message.starts_with("已保存记忆 ["), "{message}");
 
     let active = app
         .memory_service()
-        .list(
-            &Actor::External,
-            ServiceScope::Project,
-            MemoryLanes::ALL,
-            None,
-        )
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
         .unwrap();
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0].body, "以后用中文回复");
     assert!(
-        active.is_empty(),
-        "a rejected write must not become current: {active:?}"
+        active[0].subject_key.is_none(),
+        "a direct command must not invent a subject: {active:?}"
+    );
+    assert_eq!(active[0].authority, "user_explicit");
+}
+
+fn envelope(command_id: &str, session: &SessionId, command: ClientCommand) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id: CommandId::new(command_id),
+        session_id: session.clone(),
+        expected_version: None,
+        issued_at: "2026-10-23T00:00:00Z".to_string(),
+        command,
+    }
+}
+
+fn direct_message(command_id: &str, session: &SessionId, content: &str) -> CommandEnvelope {
+    envelope(
+        command_id,
+        session,
+        ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: content.to_string(),
+            attachments: vec![],
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_retried_direct_message_writes_once_but_two_commands_both_write() {
+    let (_tmp, app) = assemble("markdown");
+    let model = ModelRef::new("mock", "m");
+    let session = app.create_session(&model, "goal").await.unwrap();
+    let runtime =
+        InProcessRuntimeClient::new(app.clone(), model, PermissionProfile::Assisted, false);
+    let mut events = runtime.subscribe_session(&session);
+
+    let first = direct_message("cmd-direct-1", &session, "记住：这个项目使用 pnpm");
+    runtime.deliver(first.clone()).await.unwrap();
+    let (level, message) = next_notification(&mut events).await;
+    assert_eq!(level, NotificationLevel::Info, "{message}");
+    assert!(message.starts_with("已保存记忆 ["), "{message}");
+
+    // At-least-once redelivery of the same command must not dispatch again.
+    runtime.deliver(first).await.unwrap();
+    let active = app
+        .memory_service()
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "a redelivered command wrote twice: {active:?}"
+    );
+
+    // A second, independent command with identical text is a second fact.
+    runtime
+        .deliver(direct_message(
+            "cmd-direct-2",
+            &session,
+            "记住：这个项目使用 pnpm",
+        ))
+        .await
+        .unwrap();
+    let (level, message) = next_notification(&mut events).await;
+    assert_eq!(level, NotificationLevel::Info, "{message}");
+    assert!(message.starts_with("已保存记忆 ["), "{message}");
+
+    let active = app
+        .memory_service()
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap();
+    assert_eq!(
+        active.len(),
+        2,
+        "independent commands were conflated into one fact: {active:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retried_remember_command_writes_once_but_two_commands_both_write() {
+    let (_tmp, app) = assemble("markdown");
+    let model = ModelRef::new("mock", "m");
+    let session = app.create_session(&model, "goal").await.unwrap();
+    let runtime =
+        InProcessRuntimeClient::new(app.clone(), model, PermissionProfile::Assisted, false);
+    let mut events = runtime.subscribe_session(&session);
+
+    let remember = |command_id: &str| {
+        envelope(
+            command_id,
+            &session,
+            ClientCommand::RememberMemory {
+                session_id: session.clone(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
+                body: "以后用中文回复".to_string(),
+                kind: Some(UiMemoryKind::Preference),
+            },
+        )
+    };
+
+    let first = remember("cmd-remember-1");
+    runtime.deliver(first.clone()).await.unwrap();
+    let (level, message) = next_notification(&mut events).await;
+    assert_eq!(level, NotificationLevel::Info, "{message}");
+    assert!(message.starts_with("已保存记忆 ["), "{message}");
+
+    runtime.deliver(first).await.unwrap();
+    let active = app
+        .memory_service()
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "a redelivered /remember wrote twice: {active:?}"
+    );
+
+    runtime.deliver(remember("cmd-remember-2")).await.unwrap();
+    let (level, message) = next_notification(&mut events).await;
+    assert_eq!(level, NotificationLevel::Info, "{message}");
+
+    let active = app
+        .memory_service()
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap();
+    assert_eq!(
+        active.len(),
+        2,
+        "two independent /remember commands were conflated: {active:?}"
     );
 }
 

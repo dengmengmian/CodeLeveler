@@ -95,6 +95,27 @@ impl OpId {
     }
 }
 
+impl OpId {
+    /// Derive a journal-safe operation id from an external identity.
+    ///
+    /// Provider tool-call ids and client command ids are opaque strings, while
+    /// the intent journal and pending files require a filename-safe alphabet.
+    /// A valid identity keeps its spelling; anything else is replaced by a
+    /// digest of the exact identity, so a retry of the same call still replays
+    /// the same operation instead of being refused.
+    pub fn derived(prefix: &str, identity: &str) -> String {
+        let candidate = format!("{prefix}:{identity}");
+        if Self::parse(candidate.clone()).is_ok() {
+            candidate
+        } else {
+            format!(
+                "{prefix}:h:{}",
+                super::frontmatter::sha256_hex_text(identity)
+            )
+        }
+    }
+}
+
 impl std::fmt::Display for OpId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -606,10 +627,6 @@ impl Frontmatter {
         {
             return Err(DocumentError::InvalidTags);
         }
-        if self.kind == MemoryKind::UserFact && self.subject_key.is_none() && !self.legacy_keyless()
-        {
-            return Err(DocumentError::MissingSubjectKey);
-        }
         if self
             .subject_key
             .as_deref()
@@ -653,15 +670,6 @@ impl Frontmatter {
             }
         }
         Ok(())
-    }
-
-    fn legacy_keyless(&self) -> bool {
-        self.extra
-            .get(serde_yaml::Value::String("legacy".to_string()))
-            .and_then(|legacy| legacy.as_mapping())
-            .and_then(|legacy| legacy.get(serde_yaml::Value::String("keyless".to_string())))
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false)
     }
 }
 
@@ -743,6 +751,23 @@ mod tests {
     fn op_ids_do_not_accept_paths() {
         assert!(OpId::parse("../../op").is_err());
         assert!(OpId::parse("call_01J").is_ok());
+    }
+
+    /// Provider tool-call ids are opaque. Deriving an operation id from one
+    /// must stay journal-safe without changing the exact identity.
+    #[test]
+    fn derived_op_ids_stay_journal_safe_for_opaque_identities() {
+        assert_eq!(OpId::derived("park", "call_01J"), "park:call_01J");
+
+        let opaque = "call|with/slashes and spaces";
+        let first = OpId::derived("park", opaque);
+        assert!(OpId::parse(first.clone()).is_ok(), "{first}");
+        assert_eq!(
+            first,
+            OpId::derived("park", opaque),
+            "stable across retries"
+        );
+        assert_ne!(first, OpId::derived("park", "call_other"));
     }
 
     #[test]

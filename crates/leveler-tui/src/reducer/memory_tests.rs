@@ -73,6 +73,7 @@ fn snapshot(status: &str) -> UiSessionSnapshot {
 fn candidate(id: &str, title: &str) -> UiMemoryCandidate {
     UiMemoryCandidate {
         id: id.into(),
+        scope: leveler_client_protocol::UiMemoryScope::Project,
         title: title.into(),
         body: title.into(),
         kind: "free".into(),
@@ -80,9 +81,21 @@ fn candidate(id: &str, title: &str) -> UiMemoryCandidate {
     }
 }
 
+fn candidate_in(
+    scope: leveler_client_protocol::UiMemoryScope,
+    id: &str,
+    title: &str,
+) -> UiMemoryCandidate {
+    UiMemoryCandidate {
+        scope,
+        ..candidate(id, title)
+    }
+}
+
 fn entry(id: &str, title: &str) -> UiMemoryEntry {
     UiMemoryEntry {
         id: id.into(),
+        scope: leveler_client_protocol::UiMemoryScope::Project,
         title: title.into(),
         body: title.into(),
         kind: None,
@@ -344,7 +357,7 @@ fn review_selection_follows_record_ids_across_a_reorder() {
         ],
     );
     open_review(&mut s);
-    assert_eq!(s.memory.focused_id(), Some("cand-a"));
+    assert_eq!(s.memory.focused_id(), Some("project:cand-a"));
 
     key(&mut s, KeyCode::Char(' ')); // select A
     key(&mut s, KeyCode::Down);
@@ -374,7 +387,7 @@ fn review_selection_follows_record_ids_across_a_reorder() {
     );
     assert_eq!(
         s.memory.selected.iter().cloned().collect::<Vec<_>>(),
-        vec!["cand-a", "cand-b"]
+        vec!["project:cand-a", "project:cand-b"]
     );
 
     let effects = key(&mut s, KeyCode::Char('a'));
@@ -411,6 +424,44 @@ fn accepting_selected_records_sends_one_command_each_and_refuses_a_second_batch(
     );
 }
 
+/// The same record id in two stores is two records. The decision must carry
+/// the scope of the row the user actually consented to.
+#[test]
+fn the_same_record_id_in_two_scopes_is_two_rows() {
+    use leveler_client_protocol::UiMemoryScope;
+
+    let mut s = state();
+    seed(
+        &mut s,
+        vec![
+            candidate_in(UiMemoryScope::Global, "same-id", "全局约定"),
+            candidate_in(UiMemoryScope::Project, "same-id", "项目约定"),
+        ],
+    );
+    open_review(&mut s);
+    assert_eq!(s.memory.focused_id(), Some("global:same-id"));
+
+    key(&mut s, KeyCode::Char(' '));
+    let effects = key(&mut s, KeyCode::Char('a'));
+    let accepted: Vec<(UiMemoryScope, String)> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send(ClientCommand::AcceptMemory { scope, id, .. }) => {
+                Some((*scope, id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(accepted, vec![(UiMemoryScope::Global, "same-id".into())]);
+    assert!(
+        s.memory
+            .pending
+            .iter()
+            .any(|c| c.scope == UiMemoryScope::Project && c.id == "same-id"),
+        "the project record was not decided"
+    );
+}
+
 #[test]
 fn escape_walks_back_one_level_and_never_confirms() {
     let mut s = state();
@@ -423,7 +474,7 @@ fn escape_walks_back_one_level_and_never_confirms() {
     assert!(sent_rejects(&effects).is_empty());
     assert_eq!(s.memory.view, MemoryView::Home);
     assert!(
-        s.memory.selected.contains("cand-a"),
+        s.memory.selected.contains("project:cand-a"),
         "Esc is not a decision"
     );
 
@@ -616,7 +667,7 @@ fn records_that_left_pending_leave_the_persisted_notified_set() {
         .expect("a removed record must also leave the saved file");
     assert_eq!(
         pruned.into_iter().collect::<Vec<_>>(),
-        vec!["cand-b".to_string()]
+        vec!["project:cand-b".to_string()]
     );
 }
 

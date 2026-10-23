@@ -14,7 +14,41 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use leveler_client_protocol::{
     ClientCommand, CommandId, NotificationLevel, SessionId, UiMemoryCandidate, UiMemoryEntry,
+    UiMemoryScope,
 };
+
+/// A row's identity on this page: `(scope, id)`. The same id in two scopes is
+/// two independent records, so the bare id is never a key here.
+pub fn row_key(scope: UiMemoryScope, id: &str) -> String {
+    format!("{}:{id}", scope.as_str())
+}
+
+fn candidate_key(candidate: &UiMemoryCandidate) -> String {
+    row_key(candidate.scope, &candidate.id)
+}
+
+fn entry_key(entry: &UiMemoryEntry) -> String {
+    row_key(entry.scope, &entry.id)
+}
+
+/// Split a row key back into the scope and the store's own id. A key written
+/// before scopes existed is a project id.
+pub fn parse_key(key: &str) -> (UiMemoryScope, &str) {
+    match key.split_once(':') {
+        Some(("global", id)) => (UiMemoryScope::Global, id),
+        Some(("local", id)) => (UiMemoryScope::Local, id),
+        Some(("project", id)) => (UiMemoryScope::Project, id),
+        _ => (UiMemoryScope::Project, key),
+    }
+}
+
+pub fn scope_label(scope: UiMemoryScope, text: &crate::i18n::UiText) -> &'static str {
+    match scope {
+        UiMemoryScope::Global => text.memory_scope_global,
+        UiMemoryScope::Project => text.memory_scope_project,
+        UiMemoryScope::Local => text.memory_scope_local,
+    }
+}
 
 use crate::action::Effect;
 use crate::screen::Screen;
@@ -143,7 +177,7 @@ impl MemoryPage {
         self.pending = pending;
         self.loading = false;
 
-        let pending_ids: BTreeSet<String> = self.pending.iter().map(|c| c.id.clone()).collect();
+        let pending_ids: BTreeSet<String> = self.pending.iter().map(candidate_key).collect();
         // Drop state about records that no longer exist. This also keeps the
         // persisted notified set bounded by the real pending set.
         self.selected.retain(|id| pending_ids.contains(id));
@@ -202,7 +236,10 @@ impl MemoryPage {
         let settled: Vec<String> = self
             .ops
             .keys()
-            .filter(|id| message.contains(&format!("[{id}]")))
+            .filter(|key| {
+                let (_, id) = parse_key(key);
+                message.contains(&format!("[{id}]"))
+            })
             .cloned()
             .collect();
         for id in settled {
@@ -239,16 +276,20 @@ impl MemoryPage {
     }
 
     pub fn focused_candidate(&self) -> Option<&UiMemoryCandidate> {
-        let id = self.focus.as_deref()?;
-        self.pending.iter().find(|c| c.id == id)
+        let key = self.focus.as_deref()?;
+        let (scope, id) = parse_key(key);
+        self.pending
+            .iter()
+            .find(|candidate| candidate.scope == scope && candidate.id == id)
     }
 
     pub fn focused_entry(&self) -> Option<&UiMemoryEntry> {
-        let id = self.focus.as_deref()?;
+        let key = self.focus.as_deref()?;
+        let (scope, id) = parse_key(key);
         self.active
             .iter()
             .chain(self.archived.iter())
-            .find(|e| e.id == id)
+            .find(|entry| entry.scope == scope && entry.id == id)
     }
 
     /// Ids a decision key acts on: every toggled row, in the listing's own
@@ -257,16 +298,16 @@ impl MemoryPage {
         let mut targets: Vec<String> = self
             .pending
             .iter()
-            .filter(|c| self.selected.contains(&c.id))
-            .map(|c| c.id.clone())
+            .map(candidate_key)
+            .filter(|key| self.selected.contains(key))
             .collect();
         if targets.is_empty()
-            && let Some(id) = self
+            && let Some(key) = self
                 .focus
                 .as_deref()
-                .filter(|id| self.pending.iter().any(|c| c.id == *id))
+                .filter(|key| self.pending.iter().any(|c| candidate_key(c) == *key))
         {
-            targets.push(id.to_string());
+            targets.push(key.to_string());
         }
         targets
     }
@@ -283,19 +324,26 @@ impl MemoryPage {
             return Vec::new();
         }
         let mut commands = Vec::with_capacity(targets.len());
-        for id in &targets {
-            if let Some(candidate) = self.pending.iter().find(|c| c.id == *id) {
-                self.op_titles.insert(id.clone(), candidate.title.clone());
+        for key in &targets {
+            let (scope, id) = parse_key(key);
+            if let Some(candidate) = self
+                .pending
+                .iter()
+                .find(|candidate| candidate.scope == scope && candidate.id == id)
+            {
+                self.op_titles.insert(key.clone(), candidate.title.clone());
             }
-            self.ops.insert(id.clone(), op);
+            self.ops.insert(key.clone(), op);
             commands.push(match op {
                 MemoryOp::Accept => ClientCommand::AcceptMemory {
                     session_id: session_id.clone(),
-                    id: id.clone(),
+                    scope,
+                    id: id.to_string(),
                 },
                 MemoryOp::Reject => ClientCommand::RejectMemory {
                     session_id: session_id.clone(),
-                    id: id.clone(),
+                    scope,
+                    id: id.to_string(),
                 },
             });
         }
@@ -316,7 +364,7 @@ impl MemoryPage {
         let Some(op) = self.op_kind.take() else {
             return;
         };
-        let pending: BTreeSet<&str> = self.pending.iter().map(|c| c.id.as_str()).collect();
+        let pending: BTreeSet<String> = self.pending.iter().map(candidate_key).collect();
         let mut report = MemoryBatchReport {
             op,
             succeeded: Vec::new(),
@@ -329,7 +377,7 @@ impl MemoryPage {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| id.clone());
-            let still_pending = pending.contains(id.as_str());
+            let still_pending = pending.contains(&id);
             let receipt = self.receipts.remove(&id);
             match (receipt, still_pending) {
                 (Some(true), false) => report.succeeded.push(title),
@@ -352,15 +400,15 @@ impl MemoryPage {
                 self.menu = step(self.menu, delta, HOME_ITEMS);
             }
             MemoryView::Review => {
-                let ids: Vec<String> = self.pending.iter().map(|c| c.id.clone()).collect();
+                let ids: Vec<String> = self.pending.iter().map(candidate_key).collect();
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
             MemoryView::Active => {
-                let ids: Vec<String> = self.active.iter().map(|e| e.id.clone()).collect();
+                let ids: Vec<String> = self.active.iter().map(entry_key).collect();
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
             MemoryView::Archived => {
-                let ids: Vec<String> = self.archived.iter().map(|e| e.id.clone()).collect();
+                let ids: Vec<String> = self.archived.iter().map(entry_key).collect();
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
             MemoryView::Detail => {}
@@ -378,9 +426,9 @@ impl MemoryPage {
             return;
         }
         let exists = match self.view {
-            MemoryView::Review => self.pending.iter().any(|c| c.id == key),
-            MemoryView::Active => self.active.iter().any(|e| e.id == key),
-            MemoryView::Archived => self.archived.iter().any(|e| e.id == key),
+            MemoryView::Review => self.pending.iter().any(|c| candidate_key(c) == key),
+            MemoryView::Active => self.active.iter().any(|e| entry_key(e) == key),
+            MemoryView::Archived => self.archived.iter().any(|e| entry_key(e) == key),
             MemoryView::Home | MemoryView::Detail => false,
         };
         if exists {
@@ -393,14 +441,14 @@ impl MemoryPage {
         if self.view != MemoryView::Review {
             return;
         }
-        let Some(id) = self.focus.clone() else {
+        let Some(key) = self.focus.clone() else {
             return;
         };
-        if !self.pending.iter().any(|c| c.id == id) {
+        if !self.pending.iter().any(|c| candidate_key(c) == key) {
             return;
         }
-        if !self.selected.remove(&id) {
-            self.selected.insert(id);
+        if !self.selected.remove(&key) {
+            self.selected.insert(key);
         }
     }
 
@@ -408,9 +456,9 @@ impl MemoryPage {
     /// cursor on a real row rather than on a dead id.
     pub fn sync_focus(&mut self) {
         let ids: Vec<String> = match self.view {
-            MemoryView::Review => self.pending.iter().map(|c| c.id.clone()).collect(),
-            MemoryView::Active => self.active.iter().map(|e| e.id.clone()).collect(),
-            MemoryView::Archived => self.archived.iter().map(|e| e.id.clone()).collect(),
+            MemoryView::Review => self.pending.iter().map(candidate_key).collect(),
+            MemoryView::Active => self.active.iter().map(entry_key).collect(),
+            MemoryView::Archived => self.archived.iter().map(entry_key).collect(),
             MemoryView::Home | MemoryView::Detail => return,
         };
         if self

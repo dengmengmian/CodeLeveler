@@ -158,6 +158,43 @@ fn explicit_supersede_retires_the_target_and_keeps_it_in_history() {
 }
 
 #[test]
+fn superseded_attic_points_at_the_replacement_that_became_current() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let old_id = applied_id(&create_user(
+        &store,
+        MemoryScope::Project,
+        "billing_model",
+        "subscription",
+        "The provider bills by subscription.",
+    ));
+    let replacement = fact_intent(
+        MemoryScope::Project,
+        Some("billing_model"),
+        "usage",
+        "The provider bills by usage.",
+    );
+    let replacement_id = applied_id(
+        &store
+            .supersede(
+                op(),
+                user(),
+                new_record_for(&replacement),
+                &[old_id.clone()],
+            )
+            .unwrap(),
+    );
+    let attic =
+        fs::read_to_string(fixture.state.join("attic").join(format!("{old_id}.json"))).unwrap();
+    let attic: serde_json::Value = serde_json::from_str(&attic).unwrap();
+    assert_eq!(
+        attic["superseded_by"].as_str(),
+        Some(replacement_id.as_str()),
+        "the retired record must point at the id that is actually current"
+    );
+}
+
+#[test]
 fn deprecate_removes_current_truth_but_keeps_history() {
     let fixture = Fixture::new(MemoryScope::Project);
     let store = fixture.store();

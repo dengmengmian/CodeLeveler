@@ -10,7 +10,7 @@ use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, Session
 use leveler_model::{ModelRef, ThinkingLevel};
 
 use super::media::AttachmentRef;
-use super::{ApprovalDecision, PermissionProfile, UiMemoryKind};
+use super::{ApprovalDecision, PermissionProfile, UiMemoryKind, UiMemoryScope};
 
 /// Why a runtime is being asked to retire.
 ///
@@ -260,21 +260,42 @@ pub enum ClientCommand {
         query_id: Option<CommandId>,
     },
     /// Archive (forget) one active memory id — user-authoritative (no model).
-    ForgetMemory { session_id: SessionId, id: String },
+    ForgetMemory {
+        session_id: SessionId,
+        /// Which store holds the record; `(scope, id)` is the identity.
+        #[serde(default)]
+        scope: UiMemoryScope,
+        id: String,
+    },
     /// Promote one pending candidate to durable memory. User-authoritative:
     /// this IS the consent K36 requires, so it is never model-callable.
-    AcceptMemory { session_id: SessionId, id: String },
+    AcceptMemory {
+        session_id: SessionId,
+        /// The scope the user reviewed. Never inferred from the id.
+        #[serde(default)]
+        scope: UiMemoryScope,
+        id: String,
+    },
     /// Decline one pending candidate and suppress the same signal from being
     /// re-proposed. Distinct from [`Self::ForgetMemory`], which archives an
     /// ACTIVE entry: sending a pending id to forget did nothing at all, which
     /// is what the Web "忽略" button was doing.
-    RejectMemory { session_id: SessionId, id: String },
+    RejectMemory {
+        session_id: SessionId,
+        #[serde(default)]
+        scope: UiMemoryScope,
+        id: String,
+    },
     /// Create a durable memory directly. The user's own command IS the
     /// authorization, so this never reaches the model and never becomes a
     /// pending candidate — it is the deterministic counterpart to the
     /// natural-language path, which can only propose.
     RememberMemory {
         session_id: SessionId,
+        /// Where the user's explicit write lands. A client that shows no
+        /// scope picker writes to the project store, as it always has.
+        #[serde(default)]
+        scope: UiMemoryScope,
         body: String,
         /// Omitted means [`UiMemoryKind::Preference`]: `/remember` exists for
         /// "apply this from now on", which is what a preference is.

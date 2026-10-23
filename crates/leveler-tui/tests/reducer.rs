@@ -5816,6 +5816,7 @@ fn memory_list_event_pushes_multiline_transcript_note() {
             memory_dir: "/proj/memory".into(),
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "prefer-ws".into(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 title: "prefer workspace write".into(),
                 body: "prefer workspace write".into(),
                 kind: None,
@@ -5823,6 +5824,7 @@ fn memory_list_event_pushes_multiline_transcript_note() {
             }],
             archived: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "old-fact".into(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 title: "old".into(),
                 body: "old".into(),
                 kind: None,
@@ -8784,6 +8786,7 @@ fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
             archived: vec![],
             pending: vec![leveler_client_protocol::UiMemoryCandidate {
                 id: "use-pnpm".into(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 title: "本仓库用 pnpm".into(),
                 body: "安装与脚本一律用 pnpm，不要默认 npm。".into(),
                 kind: "preference".into(),
@@ -8849,6 +8852,7 @@ fn remember_slash_sends_one_direct_write_and_nothing_else() {
         effects,
         vec![Effect::Send(ClientCommand::RememberMemory {
             session_id: SessionId::new("s1"),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
             body: "终端输出保持紧凑".to_string(),
             kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
         })],
@@ -8915,6 +8919,7 @@ fn remember_while_busy_is_a_write_not_steering() {
         effects,
         vec![Effect::Send(ClientCommand::RememberMemory {
             session_id: SessionId::new("s1"),
+            scope: leveler_client_protocol::UiMemoryScope::Project,
             body: "输出保持紧凑".to_string(),
             kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
         })],
@@ -8949,6 +8954,7 @@ fn the_listing_marks_a_sensitive_entry_as_withheld() {
             memory_dir: "/tmp/mem".into(),
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "legacy".into(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
                 title: "deploy token".into(),
                 body: "deploy token".into(),
                 kind: Some(leveler_client_protocol::UiMemoryKind::Note),

@@ -1,6 +1,6 @@
 # CodeLeveler Memory 2.0 设计
 
-状态：设计已定稿；Stage 1（Markdown Store Foundation）已于 2026-10-23 实现并完成验证（未验证项见 `docs/MEMORY_2_IMPLEMENTATION.md` §1.5），Stage 2–4 未开始。Stage 1 只在 `crates/leveler-memory/src/v2/` 增加独立实现与测试；legacy store、运行时接线、默认 backend 和真实记忆数据均未改变。
+状态：设计已定稿；Stage 1（Markdown Store Foundation）与 Stage 2（Unified Memory Service）已于 2026-10-23 实现，Stage 2.1（正确性收口）随本轮实现（未验证项见 `docs/MEMORY_2_IMPLEMENTATION.md` §1.5 与 §7）。Stage 3–4 未开始：FTS5 检索、Context Builder 与 Logged Injection 未实现；legacy 默认 backend、Experience 默认开关和真实记忆数据均未改变。
 
 结论先行：
 
@@ -387,7 +387,7 @@ Project current root 内有一个**窄** `.gitignore`，只用于临时提交文
 | `created_at` | 是 | RFC3339 UTC | 创建时间 |
 | `updated_at` | 是 | RFC3339 UTC | 最近一次服务写入时间 |
 | `subject` | user_fact 建议 | string | 人类可读 subject label，≤ 96 字符 |
-| `subject_key` | 新 user_fact 必填 | string | 身份键，由 `semantic_key_of` 规范化；迁移 keyless 可空 |
+| `subject_key` | 自动/模型写入的 user_fact 必填 | string | 身份键，由 `semantic_key_of` 规范化；可信用户显式写入可空（以 Memory ID 为身份）；迁移 keyless 可空 |
 | `value` | 否 | string | 结构化值；精确比较用，≤ 512 字符 |
 | `statement` | 否 | enum | `assertion`（默认）\| `correction` \| `rejection` \| `note` |
 | `tags` | 否 | string[] | 最多 16 个，每个 ≤ 32 字符 |
@@ -690,7 +690,7 @@ user_explicit > user_approved > user_stated > project_source
 | 语义等价 | 无法用结构化事实证明时不做判断 | 保留为独立记录，报告 `possible_duplicate` |
 | CAS | `revision` + 文件 digest | 不匹配 → `Conflict`，重新读取后再决定 |
 
-- 身份：`(scope, kind, subject_key)`；`subject_key` 由调用方提供的结构化 identity 规范化得到，store/service 不从 `title`/`body`/`applies_when` 文本推导。新 user_fact 缺少 `subject_key` → `Rejected`（迁移 keyless 记录除外，保留 `legacy` 标记）。
+- 身份：`(scope, kind, subject_key)`；`subject_key` 由调用方提供的结构化 identity 规范化得到，store/service 不从 `title`/`body`/`applies_when` 文本推导。**可信用户显式写入**（`Actor::User` 的 `/remember`、`记住：…`、User Review）可以没有 `subject_key`：此时记录身份就是稳定的 `MemoryId`，不用标题哈希、关键词或文本相似度伪造 subject；同一 `UserInvocationId` 的重试按 `OpId` 幂等。自动提取、Runtime 与 Model 写入缺少 `subject_key` 仍然 `Rejected`（迁移 keyless 记录除外，保留 `legacy` 标记）。
 - 同 scope 同 subject_key 的 active 唯一；`subject_key` 创建后不可变。`subject` label 可改，不改变身份。
 - `MemoryId` 是稳定正文身份，与 `subject_key` 不同：同一 subject 的更新保持同一 ID；新事实生成新 ID。
 - **不做 body 级去重**：同一 `body` 出现在不同 `subject_key` 下是两条独立事实，不是同一事实。沿用 U2 的“body 相同即同一条”在这里明确废弃；v2 返回两条记录并附 `possible_duplicate` 提示（仅提示，不 Skip、不合并、不删）。
@@ -711,6 +711,7 @@ user_explicit > user_approved > user_stated > project_source
 | 目标状态 | 新 authority / actor | 条件 | 结果 |
 | --- | --- | --- | --- |
 | 无 active | User / Runtime / Model | 新 `subject_key`，结构合法 | Create active；Model 记录标 `model_inferred` |
+| 无 active | User 显式 | 可信用户命令/review，无 `subject_key` | Create active；记录身份 = `MemoryId`，不参与 subject 唯一性，不猜测 subject |
 | active 同 subject_key，同 value/proposed body | 任意 | 精确相同 | Skipped（不新增 revision） |
 | active 同 subject_key，不同 value | User 显式命令 / User review | 目标受保护或不受保护 | Supersede；新 authority `user_explicit`/`user_approved` |
 | active 同 subject_key，不同 value | Model / Runtime | **目标受保护**（receipt authority 为 `user_explicit`/`user_approved`） | Pending，不覆盖 |
@@ -726,6 +727,7 @@ user_explicit > user_approved > user_stated > project_source
 | `replaces` 目标不存在/已非 active | 任意 | 无法解析 | Pending 或 Rejected（保留原记录，不猜） |
 | 同一 invocation 已由显式用户命令写入同一 subject_key | Runtime extractor | 同一结构化 subject | Skipped；只影响该 subject，不做 turn 级去重 |
 | 同 scope 同 subject_key | — | 同时存在两个 active | Invariant violation；报告 Issue，不自动挑一个 |
+| 同 scope 两条无 `subject_key` 的显式记录 | 任意 | 正文相同或不同 | 两条都保留；`MemoryId` 不同即不同记录，不做 body 级合并 |
 
 - “同身份不同值”是结构化更新，可以在授权足够时自动 Supersede；**不同 subject_key 的不同值不是冲突**，它们是独立事实。只有 body 精确相同才给 `possible_duplicate` 提示。
 - 模型自更新要求“新的结构化 evidence”，不是任意非空字符串；当前 `agent_self_update_requires_evidence` 只检查非空，v2 收紧为新的 evidence reference，且不能是复制旧值。

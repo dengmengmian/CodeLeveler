@@ -42,6 +42,7 @@ fn opened() -> AppState {
 fn candidate(id: &str, title: &str, body: &str) -> UiMemoryCandidate {
     UiMemoryCandidate {
         id: id.into(),
+        scope: leveler_client_protocol::UiMemoryScope::Project,
         title: title.into(),
         body: body.into(),
         kind: "constraint".into(),
@@ -198,7 +199,7 @@ fn a_long_memory_is_wrapped_not_cut_in_the_detail_view() {
     state.memory.view = MemoryView::Detail;
     state.memory.detail_return = MemoryView::Review;
     state.memory.pending = vec![candidate("long", title, title)];
-    state.memory.focus = Some("long".into());
+    state.memory.focus = Some("project:long".into());
 
     let lines = frame(&mut state, 48, 20);
     let joined = lines.join("\n");
@@ -222,7 +223,7 @@ fn a_long_memory_is_wrapped_not_cut_in_the_detail_view() {
 fn a_wrapped_footer_does_not_break_list_scrolling() {
     let mut state = review_state(30);
     state.memory.move_focus(29);
-    assert_eq!(state.memory.focused_id(), Some("m29"));
+    assert_eq!(state.memory.focused_id(), Some("project:m29"));
     let lines = frame(&mut state, 48, 20);
     let text = lines.join("\n");
     assert!(

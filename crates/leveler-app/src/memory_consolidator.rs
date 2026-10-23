@@ -232,6 +232,17 @@ impl MemoryConsolidator {
         self.cancel.cancel();
     }
 
+    /// Cancellation is not an answer. A worker that is shutting down must
+    /// leave its claim retryable instead of settling a raced or empty
+    /// extraction as "nothing to learn".
+    fn ensure_running(&self) -> Result<(), String> {
+        if self.cancel.is_cancelled() {
+            Err("memory consolidation cancelled".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Drain ready memory work before a headless process exits.
     ///
     /// The idle debounce exists to batch provider calls while a session is
@@ -835,11 +846,14 @@ impl MemoryConsolidator {
             .ok_or_else(|| format!("invalid persisted model reference `{}`", item.model))?;
         let extractor = ModelExperienceExtractor::new(self.runtime.clone(), model)
             .with_timeout(self.extraction_timeout);
+        self.ensure_running()?;
         let ExperienceExtraction { candidates, call } =
             extractor.extract(&pack, &self.cancel).await;
         if let Some(call) = call.as_ref() {
             self.record_experience_call(&item.session_id, call).await;
         }
+        // A shutdown raced the answer; the row stays retryable.
+        self.ensure_running()?;
         let candidates = candidates.map_err(|error| error.to_string())?;
         let mut validated = validate_experience_candidates(&candidates, &pack);
         for candidate in &mut validated.accepted {
@@ -1222,6 +1236,7 @@ impl MemoryConsolidator {
                     input_chars += next_chars;
                     batch_end += 1;
                 }
+                self.ensure_running()?;
                 let (result, call) = extractor
                     .extract_batch_recorded_with_context(
                         &sources[batch_start..batch_end],
@@ -1232,6 +1247,9 @@ impl MemoryConsolidator {
                 if let Some(call) = call {
                     self.record_extraction_call(batch_session, &call).await;
                 }
+                // A shutdown raced the answer. The claim must stay retryable;
+                // a late answer is re-asked, never counted as an empty result.
+                self.ensure_running()?;
                 candidates.extend(result.map_err(|e| e.to_string())?);
                 batch_start = batch_end;
             }
@@ -1928,6 +1946,32 @@ mod tests {
                 confidence: Some(1.0),
             },
         }
+    }
+
+    /// One candidate in the exact wire shape the model extractor produces.
+    fn batch_candidate(
+        source_turn_id: &str,
+        fact: &str,
+        subject: &str,
+        value: &str,
+        evidence_span: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "source_turn_id": source_turn_id,
+            "candidate": {
+                "fact": fact,
+                "subject": subject,
+                "value": value,
+                "scope": "project",
+                "durability": "durable",
+                "memory_type": "project",
+                "authority": "explicit_user",
+                "statement": "assertion",
+                "operation_hint": "create",
+                "evidence_span": evidence_span,
+                "confidence": 1.0
+            }
+        })
     }
 
     async fn admitted_messages(
@@ -2630,7 +2674,7 @@ mod tests {
             Ok("[]"),
         ]);
         let worker = MemoryConsolidator::new(
-            db,
+            db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
             temp.path().join("memory"),
@@ -2639,6 +2683,13 @@ mod tests {
         );
 
         assert!(worker.run_once().await.is_err());
+        // A failed provider call is an unknown answer, not an empty one.
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
+        assert_eq!(counts.processed, 0);
+        assert_eq!(counts.failed_retryable, 1);
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        assert!(store.effective_active().unwrap().is_empty());
+        assert!(store.list_pending().unwrap().is_empty());
         tokio::time::sleep(Duration::from_millis(1_050)).await;
         assert_eq!(worker.run_once().await.unwrap().claimed, 1);
         assert_eq!(worker.run_once().await.unwrap().claimed, 0);
@@ -2860,6 +2911,218 @@ mod tests {
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1, "the replay must not duplicate the fact");
         assert_eq!(active[0].body, "turn 0");
+        assert!(store.list_pending().unwrap().is_empty());
+    }
+
+    /// The provider answered, and the process died before that answer became
+    /// durable. The recovered claim asks again; the fact is stored once. A
+    /// lost answer is retried work, never an empty extraction.
+    #[tokio::test]
+    async fn a_crash_after_the_model_answer_before_staging_reextracts_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        let turn_ids = admitted_messages(&db, ["turn 0".to_string()]).await;
+        let dead = BootId::generate();
+        assert_eq!(
+            MemoryInboxRepository::new(&db)
+                .claim_batch(&dead, leveler_core::now(), 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Nothing was staged: the answer was still in memory when the boot
+        // died. A fresh boot must recover the claim and ask again.
+        let raw = serde_json::json!({"candidates": [batch_candidate(
+            &turn_ids[0].0,
+            "turn 0",
+            "project.default_model",
+            "Pro",
+            "turn 0",
+        )]})
+        .to_string();
+        let runtime = ScriptedRuntime::new(vec![Ok(raw.as_str())]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        );
+        worker.recover_dead_claims().await.unwrap();
+        worker.run_once().await.unwrap();
+
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            1,
+            "an answer that never became durable must be asked again"
+        );
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert!(store.list_pending().unwrap().is_empty());
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
+        assert_eq!(counts.processed, 1);
+        assert_eq!(counts.failed_retryable, 0);
+        assert_eq!(counts.pending, 0);
+    }
+
+    /// The crash landed between staging the model answer and applying the
+    /// first candidate. Recovery replays the staged answer without a second
+    /// provider call.
+    #[tokio::test]
+    async fn a_crash_after_staging_before_apply_replays_the_staged_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["turn 0".to_string()]).await;
+        let dead = BootId::generate();
+        let claimed = MemoryInboxRepository::new(&db)
+            .claim_batch(&dead, leveler_core::now(), 1)
+            .await
+            .unwrap();
+        let first = MemoryConsolidator::new(
+            db.clone(),
+            dead,
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        );
+        first
+            .extract_and_stage(&claimed, &OneCandidateExtractor)
+            .await
+            .unwrap();
+
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let second = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        );
+        second.recover_dead_claims().await.unwrap();
+        second.run_once().await.unwrap();
+
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            0,
+            "the staged answer is replayed, not re-asked"
+        );
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].body, "turn 0");
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
+        assert_eq!(counts.processed, 1);
+        assert_eq!(counts.failed_retryable, 0);
+    }
+
+    /// One invalid candidate does not discard the valid one, and it is
+    /// recorded as rejected rather than quietly counted as "no candidate".
+    #[tokio::test]
+    async fn a_partially_valid_batch_keeps_the_valid_candidate_and_rejects_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        let turn_ids = admitted_messages(&db, ["turn 0".to_string(), "turn 1".to_string()]).await;
+        let raw = serde_json::json!({"candidates": [
+            batch_candidate(
+                &turn_ids[0].0,
+                "turn 0",
+                "project.default_model",
+                "Pro",
+                "turn 0",
+            ),
+            // The evidence span is not in the user's own turn: the candidate
+            // is fabricated and must be rejected, not stored.
+            batch_candidate(
+                &turn_ids[1].0,
+                "用户从未说过这句话",
+                "project.fabricated",
+                "x",
+                "用户从未说过这句话",
+            ),
+        ]})
+        .to_string();
+        let runtime = ScriptedRuntime::new(vec![Ok(raw.as_str())]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        );
+        worker.run_once().await.unwrap();
+
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].body, "turn 0");
+        assert!(
+            active
+                .iter()
+                .all(|entry| !entry.body.contains("用户从未说过")),
+            "{active:?}"
+        );
+        let processed = MemoryInboxRepository::new(&db)
+            .processed_results(2)
+            .await
+            .unwrap();
+        assert_eq!(processed.len(), 2, "both turns settled");
+        let staged: Vec<serde_json::Value> = processed
+            .iter()
+            .map(|row| {
+                let json = row.result_json.as_deref().expect("a staged result");
+                serde_json::from_str(json).unwrap()
+            })
+            .collect();
+        let rejected: u64 = staged
+            .iter()
+            .map(|row| row["rejected"].as_u64().unwrap())
+            .sum();
+        let applied: u64 = staged
+            .iter()
+            .map(|row| row["applied"].as_u64().unwrap())
+            .sum();
+        assert_eq!(rejected, 1);
+        assert_eq!(applied, 1);
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
+        assert_eq!(counts.processed, 2);
+        assert_eq!(counts.failed_retryable, 0);
+    }
+
+    /// Shutdown during extraction is not an empty extraction: the row stays
+    /// retryable and nothing is written.
+    #[tokio::test]
+    async fn a_cancelled_extraction_leaves_the_turn_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["turn 0".to_string()]).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime.clone(),
+            Arc::new(|_| {}),
+        );
+        worker.cancel();
+
+        let error = worker.run_once().await.unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            0,
+            "a cancelled worker must not spend a provider call"
+        );
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
+        assert_eq!(counts.processed, 0, "cancellation is not success");
+        assert_eq!(counts.failed_retryable, 1);
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        assert!(store.effective_active().unwrap().is_empty());
         assert!(store.list_pending().unwrap().is_empty());
     }
 
