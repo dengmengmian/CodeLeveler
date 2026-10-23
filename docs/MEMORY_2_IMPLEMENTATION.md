@@ -499,7 +499,7 @@ Stage 2.1 只修正确性与证据链，不进入 Stage 3：没有 FTS5、Contex
 - 预算：`usable = pressure_threshold or 8192`；memory 4% clamp 192–1200；standing ≤600；experience ≤300；用 `estimate_tokens`；omission 记录原因。
 - 格式：固定 header（untrusted/advisory/no permissions）；`[scope][authority][id rN]`；model_inferred 标签；sensitive 只计 omission。
 - catalog：active user_fact、非 sensitive、最多 16 条，SessionPrefix；只 title/id；首次 run 记录 `catalog_ids`/`catalog_digest`/`catalog_version`。
-- catalog 失效：任何 active 集合/可见字段变化递增 `catalog_version` 并写 `CatalogInvalidated`；run 内不重写 prefix，下一轮 tail 生成受限 `catalog_delta`（≤8 条/1KiB），超过阈值只标 `catalog_stale` + 版本；run start/resume/compaction 重建完整 catalog；forget 的 delta 不含 title/body。
+- catalog 失效：任何 active 集合/可见字段变化递增该 scope 的 `catalog_version` 并更新 `catalog_digest`（写入 `<state>/catalog/<scope>.json`，无独立事件）；run 内不重写 prefix，下一轮 tail 由 Builder 对比已注入快照生成受限 `catalog_delta`（≤8 条/1KiB），超过阈值只标 `catalog_stale` + 版本；run start/resume/compaction 重建完整 catalog；forget 的 delta 不含 title/body。
 - tail：recall segment 不进入 leading system prefix；`PrefixSegment` 只保留 guidance/catalog。需要确认 `ControlContext`/encoder 支持 tail system block；如果不支持，新增一个 tail segment 类型，但只保留一个注入 Owner。
 - 按需 read：`memory.read` 返回完整正文 + revision；非 active 返回 `not_current`；`ExternalUnverified` 可读但标注未验证、不进入 effective；每轮 read 4 次/8k tokens。
 - 子代理：继承读取 scope；catalog 为空；写入 model_inferred/pending。
@@ -522,9 +522,10 @@ Stage 2.1 只修正确性与证据链，不进入 Stage 3：没有 FTS5、Contex
 | `tests/memory_v2_index.rs` | FTS5 可用性、1/2/3+ 字中文、英文、代码标识符、scope 隔离、active-only、增量、重建、损坏、并发、10k 规模 |
 | `tests/memory_v2_context.rs` | 预算、standing、candidates、experience、sensitive、同 subject 跨 scope 去重、不同 subject 相同 body 不去重、authority 标签、ExternalUnverified 排除、omission、空结果、disabled、index degraded |
 | `tests/memory_v2_injection.rs` | MemoryRecalled 持久化、0 条、catalog version/digest、revision、无 body、resume/compact、历史 vs 当前 |
-| `tests/memory_v2_catalog.rs` | catalog 失效触发、run 内 delta 不改 prefix、超阈值只标 stale、run start/resume 重建、forget delta 无 title/body、TTL 变化 |
-| `tests/memory_v2_tail.rs` | recall 在 tail、guidance/catalog 在 prefix；prefix cache 不被每轮 recall 改变 |
+| `tests/memory_v2_tail.rs` | recall 在 tail、guidance/catalog 在 prefix；run 内 delta 不改 prefix、removed delta 无 title/body、run start 重建；catalog version/digest 另见 `tests/memory_v2_injection.rs` |
 | `tests/memory_v2_subagent.rs` | 子代理只读 scope、catalog 空、写入 model_inferred/pending |
+
+catalog 失效由 `<state>/catalog/<scope>.json` 的版本/digest 与 Builder 的结构化对比实现，没有独立的 `CatalogInvalidated` 事件；超阈值 `catalog_stale`、TTL 变化、run start/resume 的完整 catalog 重建随 `memory_v2_tail.rs` 的 run 生命周期覆盖，尚无独立的过期/超阈值用例。
 
 Dogfood（真实 CodeLeveler + DeepSeek Flash）：
 

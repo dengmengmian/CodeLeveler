@@ -442,8 +442,8 @@ pub enum EngineEvent {
         steps: Vec<leveler_lifecycle::PlanStep>,
     },
     /// The runtime recalled durable project memory into this turn's model
-    /// context. Emitted only when at least one memory was selected; carries
-    /// ids/count, never bodies.
+    /// context. Emitted whenever memory was consulted for the turn, including
+    /// a zero-hit result; carries ids/count, never bodies.
     MemoryRecalled {
         count: u32,
         ids: Vec<String>,
