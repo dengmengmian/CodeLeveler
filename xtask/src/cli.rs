@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::arch;
 use crate::clean;
 use crate::error::{Fail, Report};
 use crate::exec::{self, CommandSpec, Host, SystemHost};
@@ -44,6 +45,7 @@ pub fn dispatch_with(repo: &Path, args: &[String], env: &Env, host: &dyn Host) -
         "check" => cmd_cargo(host, &repo, env, rest, false),
         "test" => cmd_cargo(host, &repo, env, rest, true),
         "verify" => cmd_verify(host, &repo, env, rest),
+        "arch" => arch::run(&repo),
         "clean" => clean::parse_args(rest).and_then(|mode| clean::apply(host, &repo, mode)),
         "pre-release" => gate(host, &repo, env, rest, GateKind::PreRelease),
         "dogfood" => gate(host, &repo, env, rest, GateKind::Dogfood),
@@ -241,6 +243,7 @@ Development
   check [path...]   cargo check the affected packages
   test [path...]    cargo test the affected packages
   verify [path...]  fmt, then check, then affected tests, then local version consistency
+  arch              memory-semantics architecture guard (structured facts only)
 
 Maintenance
   clean             remove registered disposable artifacts
