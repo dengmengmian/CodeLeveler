@@ -32,11 +32,12 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn leveler(home: &Path, args: &[&str]) -> Output {
-    leveler_in(
-        &std::env::current_dir().expect("the test process has a working directory"),
-        home,
-        args,
-    )
+    // Run in a workspace that is NOT the state root and NOT the repository: a
+    // read opens the project's Markdown memory root, and Memory 2.0 refuses a
+    // private state root inside the repository.
+    let workspace = home.join("ws");
+    std::fs::create_dir_all(workspace.join(".leveler")).unwrap();
+    leveler_in(&workspace, home, args)
 }
 
 fn leveler_in(cwd: &Path, home: &Path, args: &[&str]) -> Output {
@@ -177,13 +178,20 @@ fn memory_status_reports_a_closed_lane_as_off() {
         "memory status must succeed: {rendered}"
     );
     assert_no_secret_or_panic(&rendered, &["memory", "status"]);
+    // A local process cannot read the pending queue, so the lane line reports
+    // only what it read and the limitation is stated separately. Printing
+    // `pending 0` here would claim a store this process never opened.
     assert!(
-        rendered.contains("user facts: off (active 0 · pending 0 · archived 0)"),
+        rendered.contains("user facts: off (active 0 · archived 0)"),
         "a closed user lane must be reported as off: {rendered}"
     );
     assert!(
         rendered.contains("auto experience: on (experimental)"),
         "the open experience lane keeps its experimental marker: {rendered}"
+    );
+    assert!(
+        rendered.contains("pending review: only visible from the TUI/desktop"),
+        "the unreadable pending queue must be stated, not implied as empty: {rendered}"
     );
 }
 

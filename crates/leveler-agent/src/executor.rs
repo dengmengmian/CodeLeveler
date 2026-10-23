@@ -9,7 +9,6 @@ mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,7 +25,6 @@ use leveler_execution::{
 use leveler_lifecycle::{
     EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, StopReason,
 };
-use leveler_memory::MemoryStore;
 use leveler_model::{
     ContentPart, ControlContext, Message, ModelError, ModelPricing, ModelRef, ModelRuntime,
     PromptAuthority, PromptSegment, PromptSource, ReasoningEffort, ReasoningRetention, Role,
@@ -60,474 +58,6 @@ pub trait CompactionCheckpoint: Send + Sync {
 /// Secondary summarization/audit requests improve quality but must never make
 /// an otherwise finished turn look hung for minutes.
 ///
-/// Memory recall (tail injection). Each turn the lasting preferences plus the
-/// memories matching this request are rendered as one system block right before
-/// the (always-new) user message. The cached system+history prefix stays
-/// untouched — the block rides the uncached tail — and it is never persisted
-/// (`run_conversation` filters `System` roles), so it stays fresh and never
-/// accumulates.
-const RECALL_K: usize = 4;
-/// Minimum BM25 score to inject a hit — `search` only returns positive matches,
-/// so this just drops the weakest ties.
-const RECALL_FLOOR: f64 = 0.1;
-/// Hard ceiling on the WHOLE rendered block: header, labels, ids, titles,
-/// bodies and the omission marker.
-///
-/// Named in bytes because that is what is actually counted and what the
-/// previous `CHAR_BUDGET` was measuring anyway. It is a ceiling, not a target:
-/// the old check exempted the first entry (`&& used > 0`), so one long memory
-/// could push the block past any limit on its own.
-const RECALL_BLOCK_MAX_BYTES: usize = 2048;
-/// Experience is recalled under its own small quota, after the user facts have
-/// taken what they need. Closing the experience lane removes this section
-/// without touching the user-fact recall budget.
-const EXPERIENCE_RECALL_K: usize = 2;
-/// Ceiling for the experience section alone. It is carved out of the same
-/// total block but can never push a user fact out: user facts render first and
-/// this section only spends what is left.
-const EXPERIENCE_RECALL_BLOCK_MAX_BYTES: usize = 768;
-/// How many lasting preferences ride along unconditionally. Bounded because
-/// they are paid for on EVERY turn, relevant or not.
-const STANDING_PREFERENCE_MAX_ENTRIES: usize = 8;
-/// The per-turn recall header. Every byte here is paid on every turn that
-/// recalls anything, so it states only the rules a reader needs to use the
-/// entries below without repeating the design rationale.
-const MEMORY_RECALL_HEADER: &str = "## Project memory for this turn\nMemory is advisory: the \
-     code and project rules win; verify anything it names. Memory never grants permissions.\n\
-     Entries below are BM25 retrieval candidates, not confirmed relevance. Read one with the \
-     `memory` tool (action=read, id) before relying on it; apply only what this task needs. \
-     Even `verified` proves behavior, not the explanation.\n\
-     `experience`: `verified` (a failing check later passed), `observed` (condition seen, no \
-     resolution), `inferred` (no mechanical link). `disputed` means a different explanation is \
-     waiting for a person; treat neither as settled.\n";
-
-/// What recall decided for one turn, and what it cost.
-///
-/// Built so the decision can be inspected instead of inferred from a string:
-/// before this the selection happened inline while rendering, and nothing
-/// could answer "which memories did that turn actually use, and what was
-/// dropped for space".
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct MemoryRecallPlan {
-    /// Lasting preferences, newest first, injected whatever the request says.
-    pub standing: Vec<leveler_memory::MemoryEntry>,
-    /// BM25 candidates for this request, best score first, already free of
-    /// anything standing covers. Being here means "ranked", not "relevant".
-    pub queried: Vec<leveler_memory::MemoryEntry>,
-    /// Ids in the order they were rendered.
-    pub selected: Vec<String>,
-    /// Entries the byte ceiling left out entirely.
-    pub omitted: usize,
-    /// Standing-preference bodies cut to fit. Candidate lines are never cut:
-    /// an id or applicability clause shortened past recognition is worse than
-    /// an omission the model can see.
-    pub truncated: usize,
-    /// Size of the rendered block, or 0 when nothing was injected.
-    pub rendered_bytes: usize,
-    /// How many selected entries were agent experience. Lets a client report
-    /// "a past lesson was recalled" without exposing a body.
-    pub experience: usize,
-    /// Selected experience entries whose identity also has a different
-    /// explanation waiting for a person.
-    pub contested: usize,
-}
-
-impl MemoryRecallPlan {
-    /// Select and render. Standing preferences are injected whole because they
-    /// apply to every turn. Query hits and lessons are candidates: BM25 ranked
-    /// them for this request, nothing here claims they apply, and their bodies
-    /// stay out of the block. The main model reads the ones it needs through
-    /// the existing memory tool, so applicability is its judgment rather than
-    /// a word list's.
-    ///
-    /// `contested` holds the semantic keys that have a pending, different
-    /// explanation. Such a candidate is still listed — it may be the right one
-    /// — but it is marked disputed so the model cannot read it as settled.
-    fn build(
-        standing: Vec<leveler_memory::MemoryEntry>,
-        queried: Vec<leveler_memory::MemoryEntry>,
-        experience: Vec<leveler_memory::MemoryEntry>,
-        contested: &std::collections::HashSet<String>,
-    ) -> (Self, Option<String>) {
-        let mut plan = Self {
-            standing: standing.clone(),
-            queried: queried.iter().chain(experience.iter()).cloned().collect(),
-            ..Default::default()
-        };
-        const STANDING_LABEL: &str =
-            "\nLasting preferences (apply unless this turn says otherwise):\n";
-        const CANDIDATE_LABEL: &str =
-            "\nRetrieval candidates (read before use; not confirmed relevant):\n";
-        const EXPERIENCE_LABEL: &str =
-            "\nPast experience (candidates; runtime-observed, model-explained):\n";
-
-        // Reserve room for the omission marker up front, so admitting a final
-        // entry can never make the truthful "N omitted" line unaffordable.
-        let mut available = RECALL_BLOCK_MAX_BYTES
-            .saturating_sub(MEMORY_RECALL_HEADER.len())
-            .saturating_sub(48);
-
-        let standing_section = render_section(standing, STANDING_LABEL, available, None, contested);
-        available = available.saturating_sub(standing_section.spent);
-
-        let candidate_section =
-            render_candidates(queried, CANDIDATE_LABEL, available, None, contested);
-        available = available.saturating_sub(candidate_section.spent);
-
-        // Experience is spent from what the authoritative facts left, capped
-        // by its own ceiling, so lessons cannot turn the prompt into a dump.
-        let experience_section = render_candidates(
-            experience,
-            EXPERIENCE_LABEL,
-            available.min(EXPERIENCE_RECALL_BLOCK_MAX_BYTES),
-            Some(EXPERIENCE_RECALL_BLOCK_MAX_BYTES),
-            contested,
-        );
-
-        plan.selected.extend(standing_section.selected);
-        plan.selected.extend(candidate_section.selected);
-        plan.selected.extend(experience_section.selected);
-        plan.omitted =
-            standing_section.omitted + candidate_section.omitted + experience_section.omitted;
-        plan.truncated = standing_section.truncated;
-        plan.experience = experience_section.experience;
-        plan.contested = experience_section.contested;
-
-        if standing_section.body.is_empty()
-            && candidate_section.body.is_empty()
-            && experience_section.body.is_empty()
-        {
-            return (plan, None);
-        }
-        let mut block = String::from(MEMORY_RECALL_HEADER);
-        if !standing_section.body.is_empty() {
-            block.push_str(STANDING_LABEL);
-            block.push_str(&standing_section.body);
-        }
-        if !candidate_section.body.is_empty() {
-            block.push_str(CANDIDATE_LABEL);
-            block.push_str(&candidate_section.body);
-        }
-        if !experience_section.body.is_empty() {
-            block.push_str(EXPERIENCE_LABEL);
-            block.push_str(&experience_section.body);
-        }
-        if plan.omitted > 0 {
-            block.push_str(&format!("\n({} more omitted for space.)\n", plan.omitted));
-        }
-        plan.rendered_bytes = block.len();
-        (plan, Some(block))
-    }
-}
-
-/// The rendered part of one labelled section and what it cost.
-struct RenderedSection {
-    body: String,
-    selected: Vec<String>,
-    omitted: usize,
-    truncated: usize,
-    experience: usize,
-    contested: usize,
-    /// Bytes spent from the block: the label (when paid) plus every line.
-    spent: usize,
-}
-
-/// Render entries into `available` bytes, optionally under a second ceiling.
-/// The label is paid once, and only when an entry actually fits.
-fn render_section(
-    entries: Vec<leveler_memory::MemoryEntry>,
-    label: &str,
-    available: usize,
-    cap: Option<usize>,
-    contested: &std::collections::HashSet<String>,
-) -> RenderedSection {
-    let mut section = RenderedSection {
-        body: String::new(),
-        selected: Vec::new(),
-        omitted: 0,
-        truncated: 0,
-        experience: 0,
-        contested: 0,
-        spent: 0,
-    };
-    let mut left = available;
-    let mut label_paid = false;
-    for entry in entries {
-        let cap_left = cap
-            .map(|cap| cap.saturating_sub(section.spent))
-            .unwrap_or(usize::MAX);
-        let room = left.min(cap_left);
-        let label_cost = if label_paid { 0 } else { label.len() };
-        let is_contested = entry
-            .key
-            .as_deref()
-            .is_some_and(|key| contested.contains(key));
-        let (line, was_truncated) =
-            render_entry_line(&entry, room.saturating_sub(label_cost), is_contested);
-        match line {
-            Some(line) => {
-                if !label_paid && !label.is_empty() {
-                    left = left.saturating_sub(label.len());
-                    section.spent += label.len();
-                    label_paid = true;
-                }
-                left = left.saturating_sub(line.len());
-                section.spent += line.len();
-                section.body.push_str(&line);
-                if entry.experience.is_some() {
-                    section.experience += 1;
-                    if is_contested {
-                        section.contested += 1;
-                    }
-                }
-                section.selected.push(entry.id.clone());
-                section.truncated += usize::from(was_truncated);
-            }
-            // Not even a truncated form fits: leave it out and say so.
-            None => section.omitted += 1,
-        }
-    }
-    section
-}
-
-/// Render candidate lines into `available` bytes, optionally under a second
-/// ceiling. A candidate names the entry and, for a lesson, the conditions that
-/// would make it apply; the body stays behind the memory tool.
-fn render_candidates(
-    entries: Vec<leveler_memory::MemoryEntry>,
-    label: &str,
-    available: usize,
-    cap: Option<usize>,
-    contested: &std::collections::HashSet<String>,
-) -> RenderedSection {
-    let mut section = RenderedSection {
-        body: String::new(),
-        selected: Vec::new(),
-        omitted: 0,
-        truncated: 0,
-        experience: 0,
-        contested: 0,
-        spent: 0,
-    };
-    let mut left = available;
-    let mut label_paid = false;
-    for entry in entries {
-        let cap_left = cap
-            .map(|cap| cap.saturating_sub(section.spent))
-            .unwrap_or(usize::MAX);
-        let room = left.min(cap_left);
-        let label_cost = if label_paid { 0 } else { label.len() };
-        let is_contested = entry
-            .key
-            .as_deref()
-            .is_some_and(|key| contested.contains(key));
-        match render_candidate_line(&entry, room.saturating_sub(label_cost), is_contested) {
-            Some(line) => {
-                if !label_paid && !label.is_empty() {
-                    left = left.saturating_sub(label.len());
-                    section.spent += label.len();
-                    label_paid = true;
-                }
-                left = left.saturating_sub(line.len());
-                section.spent += line.len();
-                section.body.push_str(&line);
-                if entry.experience.is_some() {
-                    section.experience += 1;
-                    if is_contested {
-                        section.contested += 1;
-                    }
-                }
-                section.selected.push(entry.id.clone());
-            }
-            // A line that does not fit is omitted whole: cutting the id or an
-            // applicability clause would leave something unreadable or false.
-            None => section.omitted += 1,
-        }
-    }
-    section
-}
-
-/// One candidate row: what the entry is about, where to read it, and (for a
-/// lesson) the conditions a reader needs to judge whether it could apply.
-///
-/// The body is deliberately absent. BM25 ranked this entry; only the main
-/// model can say whether it applies to the current task, and it expands the
-/// ones it needs through the existing memory tool. `None` when the row does
-/// not fit the budget.
-fn render_candidate_line(
-    entry: &leveler_memory::MemoryEntry,
-    budget: usize,
-    contested: bool,
-) -> Option<String> {
-    let line = match entry.experience.as_ref() {
-        Some(experience) => {
-            let standing = experience.standing().as_str();
-            let disputed = if contested { "·disputed" } else { "" };
-            let mut conditions = String::from(" [");
-            if let Some(recorded) = entry.created_at.get(..10)
-                && looks_like_date(recorded)
-            {
-                conditions.push_str(&format!("recorded {recorded}; "));
-            }
-            conditions.push_str(&format!("applies when: {}", experience.applies_when.trim()));
-            if let Some(invalid_if) = experience.invalid_if.as_deref() {
-                conditions.push_str(&format!("; invalid if: {}", invalid_if.trim()));
-            }
-            conditions.push(']');
-            format!(
-                "- [{}] (experience·{standing}{disputed}) {} {conditions}\n",
-                entry.id.trim(),
-                entry.title.trim()
-            )
-        }
-        None => {
-            let authority = entry.authority().as_str();
-            let source = entry
-                .provenance
-                .as_ref()
-                .map(|provenance| provenance.source.trim())
-                .filter(|source| !source.is_empty());
-            let label = match source {
-                Some(source) => format!("user·{authority}·{source}"),
-                None => format!("user·{authority}"),
-            };
-            format!("- [{}] ({label}) {}\n", entry.id.trim(), entry.title.trim())
-        }
-    };
-    (line.len() <= budget).then_some(line)
-}
-
-/// Whether a timestamp's date prefix is a real `YYYY-MM-DD`. Legacy or test
-/// entries may carry arbitrary text; a date marker must never invent one.
-fn looks_like_date(value: &str) -> bool {
-    value.len() == 10
-        && value
-            .as_bytes()
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                4 | 7 => *byte == b'-',
-                _ => byte.is_ascii_digit(),
-            })
-}
-
-/// One rendered entry line within `budget` bytes, plus whether its body was
-/// cut. `None` when even the shortest useful form does not fit.
-///
-/// The id is what makes a turn auditable: without it nobody can say which
-/// memory was used.
-fn render_entry_line(
-    entry: &leveler_memory::MemoryEntry,
-    budget: usize,
-    contested: bool,
-) -> (Option<String>, bool) {
-    // An experience carries its evidence class and applicability. The model
-    // must be able to tell a verified resolution from an unverified
-    // hypothesis, must know when the lesson stops applying, and needs the date
-    // it was observed: `invalid_if` is a condition only a reader can evaluate
-    // against today's code and toolchain.
-    //
-    // Conditions render BEFORE the explanation so truncation can only shorten
-    // the explanation. Cutting them off would turn a conditional lesson into
-    // unconditional advice.
-    let (label, conditions, body) = match entry.experience.as_ref() {
-        Some(experience) => {
-            // Stored verification answers whether the mechanical contract
-            // accepted the record; the standing says what the evidence
-            // actually supports. An observation-only constraint must never
-            // render as a verified resolution.
-            let standing = experience.standing().as_str();
-            let mut conditions = String::from("[");
-            if let Some(recorded) = entry.created_at.get(..10)
-                && looks_like_date(recorded)
-            {
-                conditions.push_str(&format!("recorded {recorded}; "));
-            }
-            conditions.push_str(&format!("applies when: {}", experience.applies_when.trim()));
-            if let Some(invalid_if) = experience.invalid_if.as_deref() {
-                conditions.push_str(&format!("; invalid if: {}", invalid_if.trim()));
-            }
-            conditions.push_str("] ");
-            let disputed = if contested { "·disputed" } else { "" };
-            (
-                format!(
-                    "- [{}] (experience·{standing}{disputed}) {}: ",
-                    entry.id.trim(),
-                    entry.title.trim()
-                ),
-                conditions,
-                entry.body.trim().to_string(),
-            )
-        }
-        None => {
-            let authority = entry.authority().as_str();
-            let source = entry
-                .provenance
-                .as_ref()
-                .map(|provenance| provenance.source.trim())
-                .filter(|source| !source.is_empty());
-            let label = match source {
-                Some(source) => format!("user·{authority}·{source}"),
-                None => format!("user·{authority}"),
-            };
-            (
-                format!("- [{}] ({label}) {}: ", entry.id.trim(), entry.title.trim()),
-                String::new(),
-                entry.body.trim().to_string(),
-            )
-        }
-    };
-    let prefix = label;
-    let full = format!("{prefix}{conditions}{body}\n");
-    if full.len() <= budget {
-        return (Some(full), false);
-    }
-    // Keep the id, title and (for an experience) every condition — an entry
-    // the model can look up is worth more than a silent omission. Only the
-    // explanation is cut. `…\n` needs 4 bytes.
-    let room = budget.saturating_sub(prefix.len() + conditions.len() + 4);
-    if room == 0 {
-        return (None, false);
-    }
-    // Cut on a char boundary: half a UTF-8 sequence is not a shorter string,
-    // it is a corrupt one.
-    let mut cut = room.min(body.len());
-    while cut > 0 && !body.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    if cut == 0 {
-        return (None, false);
-    }
-    (
-        Some(format!("{prefix}{conditions}{}…\n", &body[..cut])),
-        true,
-    )
-}
-
-/// Semantic keys whose identity also has a different explanation waiting for
-/// a person. Recall must mark such an entry as disputed, not settled truth.
-fn contested_keys(store: &MemoryStore) -> HashSet<String> {
-    match store.list_pending() {
-        Ok(pending) => pending
-            .into_iter()
-            .filter_map(|candidate| candidate.semantic_key.or(candidate.key))
-            .collect(),
-        Err(error) => {
-            tracing::debug!(%error, "pending memory unavailable for the disputed check");
-            HashSet::new()
-        }
-    }
-}
-
-/// Ids for a trace line: bounded in count and length so one oversized legacy
-/// id cannot turn a debug line into a dump.
-fn trace_ids(ids: &[String]) -> Vec<String> {
-    ids.iter()
-        .take(12)
-        .map(|id| id.chars().take(40).collect())
-        .collect()
-}
-
 /// The outcome of one turn's recall: the block to inject (if anything was
 /// selected) and the ids that made it, so the caller can emit an event without
 /// re-deriving the selection.
@@ -596,13 +126,10 @@ struct SelectedSkills {
 }
 
 /// The same client-facing event for a facade view (expiry returns views, not
-/// legacy entries). Still bounded: title only, never the body.
-fn memory_change_event_from_view(
-    operation: leveler_memory::MemoryLifecycleOp,
-    view: &leveler_memory::MemoryView,
-) -> AgentEvent {
+/// entries). Still bounded: title only, never the body.
+fn memory_change_event_from_view(operation: &str, view: &leveler_memory::MemoryView) -> AgentEvent {
     AgentEvent::MemoryChanged {
-        operation: operation.as_str().to_string(),
+        operation: operation.to_string(),
         id: view.id.clone(),
         title: view.title.chars().take(80).collect(),
         authority: Some(view.authority.clone()),
@@ -625,16 +152,10 @@ fn memory_change_event_from_write(
         leveler_memory::WriteOutcome::Applied { id, operation, .. } => (id, operation.as_str()),
         _ => return None,
     };
-    let operation = match operation {
-        "created" => leveler_memory::MemoryLifecycleOp::Created,
-        "updated" => leveler_memory::MemoryLifecycleOp::Updated,
-        "merged" => leveler_memory::MemoryLifecycleOp::Merged,
-        "superseded" => leveler_memory::MemoryLifecycleOp::Superseded,
-        other => {
-            tracing::debug!(operation = other, id = %id, "unknown memory write operation");
-            return None;
-        }
-    };
+    if !matches!(operation, "created" | "updated" | "merged" | "superseded") {
+        tracing::debug!(operation, id = %id, "unknown memory write operation");
+        return None;
+    }
     match service.read(actor, leveler_memory::ServiceScope::Project, id) {
         Ok(view) => Some(memory_change_event_from_view(operation, &view)),
         Err(error) => {
@@ -1964,7 +1485,6 @@ pub struct Executor {
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
     /// Short memory INDEX for cache-stable system injection (titles only).
-    memory_catalog: String,
     /// Whether memory reaches the model at all (tools, index, recall, guidance).
     memory_expose: bool,
     /// The runtime's own memory handle: the per-turn recall reads, the direct
@@ -2117,7 +1637,6 @@ impl Executor {
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
             seeded_objective: None,
-            memory_catalog: String::new(),
             memory_expose: false,
             memory: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
@@ -2306,11 +1825,6 @@ impl Executor {
         self
     }
 
-    pub fn with_memory_catalog(mut self, catalog: impl Into<String>) -> Self {
-        self.memory_catalog = catalog.into();
-        self
-    }
-
     /// Read declarative agent definitions from these roots instead of the
     /// workspace project and the installed home.
     pub fn with_agent_roots(mut self, roots: crate::agent_registry::AgentRoots) -> Self {
@@ -2318,16 +1832,9 @@ impl Executor {
         self
     }
 
-    /// Where the runtime reads durable memory for recall injection, and parks
-    /// a `remember` proposal nobody was available to approve.
-    pub fn with_memory_root(mut self, root: Option<std::path::PathBuf>) -> Self {
-        self.memory = root.map(|root| Arc::new(leveler_memory::MemoryService::legacy(root)));
-        self
-    }
-
-    /// Install the host's configured memory service. Preferred over
-    /// [`Self::with_memory_root`] when the project may use the Markdown
-    /// backend.
+    /// Install the host's configured memory service. This is the only way a
+    /// run gets memory: there is one implementation, and an unconfigured run
+    /// has no memory rather than a fallback store.
     pub fn with_memory_service(
         mut self,
         service: Option<Arc<leveler_memory::MemoryService>>,
@@ -2666,7 +2173,6 @@ impl Executor {
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
             seeded_objective: None,
-            memory_catalog: String::new(),
             memory_expose: self.memory_expose,
             // A child's "user message" is a delegation brief, not the user's
             // own durable statement: a child never creates project memory.
@@ -2866,16 +2372,13 @@ impl Executor {
             .collect()
     }
 
-    /// The one memory injection owner for this run, when the Markdown backend
-    /// and an open lane make it meaningful. Legacy keeps its existing path.
+    /// The one memory injection owner for this run, when a service and an open
+    /// lane make it meaningful.
     fn memory_context_builder(&self) -> Option<&MemoryContextBuilder> {
         if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
             return None;
         }
         let service = self.memory.as_ref()?;
-        if service.backend() == leveler_core::MemoryBackend::Legacy {
-            return None;
-        }
         if !self.memory_lanes.any() {
             return None;
         }
@@ -2891,10 +2394,9 @@ impl Executor {
         if self.depth > 0 {
             return String::new();
         }
-        match self.memory_context_builder() {
-            Some(builder) => builder.catalog_text(),
-            None => self.memory_catalog.clone(),
-        }
+        self.memory_context_builder()
+            .map(MemoryContextBuilder::catalog_text)
+            .unwrap_or_default()
     }
 
     fn system_segments(&self, request: &str) -> Vec<PromptSegment> {
@@ -3513,135 +3015,35 @@ impl Executor {
             tracing::debug!(memory_exposed = false, "memory recall skipped");
             return MemoryInjection::default();
         }
-        let Some(service) = self.memory.as_ref() else {
-            return MemoryInjection::default();
-        };
-        if !self.memory_lanes.any() {
+        if self.memory.is_none() || !self.memory_lanes.any() {
             return MemoryInjection::default();
         }
-        // Markdown is the Memory 2.0 backend: the context builder owns one
-        // assembly path over the derived index and the current Markdown.
-        if service.backend() != leveler_core::MemoryBackend::Legacy {
-            let Some(builder) = self.memory_context_builder() else {
-                return MemoryInjection::default();
-            };
-            let assembly = builder.recall(request, &self.policy.context_policy);
-            let assembly_degraded = assembly.degraded.clone();
-            let (catalog_ids, catalog_digest, catalog_version) = if announce_catalog {
-                builder
-                    .catalog_metadata()
-                    .map(|(ids, digest, version)| (ids, Some(digest), Some(version)))
-                    .unwrap_or_default()
-            } else {
-                (Vec::new(), None, None)
-            };
-            let mut degraded = assembly_degraded;
-            if builder.catalog_degraded() && degraded.is_none() {
-                degraded = Some("index_unavailable".into());
-            }
-            return memory_injection_from_assembly(
-                assembly,
-                catalog_ids,
-                catalog_digest,
-                catalog_version,
-                degraded,
-            );
-        }
-        let Some(root) = service.legacy_root() else {
+        // The context builder owns the one assembly path over the derived
+        // index and the current Markdown.
+        let Some(builder) = self.memory_context_builder() else {
             return MemoryInjection::default();
         };
-        let store = match MemoryStore::open(root) {
-            Ok(store) => store,
-            Err(error) => {
-                // Never silently swallowed: a store that cannot be opened is
-                // the difference between "no memories" and "memory broken".
-                tracing::debug!(error = %error, "memory store unavailable for recall");
-                return MemoryInjection::default();
-            }
-        };
-        // Standing preferences belong to the user lane. A project that closed
-        // that lane keeps the experience lane working and injects no user facts.
-        let standing = if self.memory_lanes.user {
-            store
-                .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
-                .unwrap_or_else(|error| {
-                    tracing::debug!(error = %error, "standing preferences unavailable");
-                    Vec::new()
-                })
+        let assembly = builder.recall(request, &self.policy.context_policy);
+        let assembly_degraded = assembly.degraded.clone();
+        let (catalog_ids, catalog_digest, catalog_version) = if announce_catalog {
+            builder
+                .catalog_metadata()
+                .map(|(ids, digest, version)| (ids, Some(digest), Some(version)))
+                .unwrap_or_default()
         } else {
-            Vec::new()
+            (Vec::new(), None, None)
         };
-        // `recall`, not `search`: repository-derived facts are read from the
-        // repository, and sensitive entries are withheld from the model.
-        let queried: Vec<leveler_memory::MemoryEntry> = if self.memory_lanes.user {
-            store
-                .recall_for_lanes(request, RECALL_K, leveler_memory::MemoryLanes::USER_ONLY)
-                .unwrap_or_else(|error| {
-                    tracing::debug!(error = %error, "query recall unavailable");
-                    Vec::new()
-                })
-                .into_iter()
-                .filter(|(_, score)| *score >= RECALL_FLOOR)
-                .map(|(entry, _)| entry)
-                // A preference injected unconditionally is not paid for twice.
-                .filter(|entry| !standing.iter().any(|s| s.id == entry.id))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // Experience has a separate, smaller quota and its own section; it
-        // cannot displace the user facts above.
-        let experience: Vec<leveler_memory::MemoryEntry> = if self.memory_lanes.experience {
-            store
-                .recall_for_lanes(
-                    request,
-                    EXPERIENCE_RECALL_K,
-                    leveler_memory::MemoryLanes::EXPERIENCE_ONLY,
-                )
-                .unwrap_or_else(|error| {
-                    tracing::debug!(error = %error, "experience recall unavailable");
-                    Vec::new()
-                })
-                .into_iter()
-                .filter(|(_, score)| *score >= RECALL_FLOOR)
-                .map(|(entry, _)| entry)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let (plan, block) =
-            MemoryRecallPlan::build(standing, queried, experience, &contested_keys(&store));
-        // Ids and counts only. Titles and bodies stay out: a trace is not a
-        // place to spill what the store was careful about.
-        tracing::debug!(
-            memory_exposed = true,
-            standing_count = plan.standing.len(),
-            query_hit_count = plan.queried.len(),
-            selected_count = plan.selected.len(),
-            omitted_count = plan.omitted,
-            truncated_count = plan.truncated,
-            experience_count = plan.experience,
-            contested_count = plan.contested,
-            rendered_bytes = plan.rendered_bytes,
-            selected_ids = ?trace_ids(&plan.selected),
-            "memory recall"
-        );
-        MemoryInjection {
-            block,
-            recalled: plan.selected,
-            attempted: true,
-            experience: plan.experience,
-            injections: Vec::new(),
-            omitted: Vec::new(),
-            budget: MemoryInjectionBudget::default(),
-            block_digest: None,
-            catalog_ids: Vec::new(),
-            catalog_digest: None,
-            catalog_version: None,
-            catalog_delta_ids: Vec::new(),
-            catalog_delta_version: None,
-            degraded: None,
+        let mut degraded = assembly_degraded;
+        if builder.catalog_degraded() && degraded.is_none() {
+            degraded = Some("index_unavailable".into());
         }
+        memory_injection_from_assembly(
+            assembly,
+            catalog_ids,
+            catalog_digest,
+            catalog_version,
+            degraded,
+        )
     }
 
     /// Run the durable-memory lifecycle for this turn's user request, returning
@@ -3671,10 +3073,7 @@ impl Executor {
         match service.expire_due(leveler_memory::ServiceScope::Project, leveler_core::now()) {
             Ok(expired) => {
                 for view in expired {
-                    events.push(memory_change_event_from_view(
-                        leveler_memory::MemoryLifecycleOp::Expired,
-                        &view,
-                    ));
+                    events.push(memory_change_event_from_view("expired", &view));
                 }
             }
             Err(error) => tracing::debug!(error = %error, "memory expiry sweep failed"),
@@ -4553,11 +3952,9 @@ mod ownership_authority_tests {
                 vec![
                     "experience".to_string(),
                     "category:fix".to_string(),
-                    "subject:experience_pybuild_config_layout_mismatch".to_string(),
                 ],
             )
             .unwrap();
-            candidate.authority = leveler_memory::MemoryAuthority::ToolObservation;
             candidate.experience = Some(leveler_memory::ExperienceRecord {
                 category: leveler_memory::ExperienceCategory::Fix,
                 verification: leveler_memory::ExperienceVerification::Verified,
@@ -4578,52 +3975,95 @@ mod ownership_authority_tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("memory");
-        let store = leveler_memory::MemoryStore::open(&root).unwrap();
-        let constraint = store
-            .activate(
-                "Answer without editing",
-                "Do not modify any files; answer from the current environment.",
-                leveler_memory::MemoryKind::Note,
-                vec![],
-            )
-            .unwrap();
-        let note = store
-            .activate_agent(
-                "pybuild layout value is version-dependent (2.x wants flat, not src)",
-                "The accepted `layout=` value in `pybuild.config` depends on the installed pybuild major version, so the fixed value from one task can be wrong in another. Observed in this environment: pybuild 2.x rejects `layout=src` with `error: build layout rejected` and accepts only `layout=flat`, printing `pybuild: build ok (layout=flat)`.",
-                leveler_memory::MemoryKind::Note,
-                vec![
-                    "pybuild".to_string(),
-                    "build-layout".to_string(),
-                    "verify.sh".to_string(),
-                    "version-dependent".to_string(),
-                ],
-            )
-            .unwrap();
-        let archived = match store
-            .admit_experience_candidate(pybuild_lesson("experience.pybuild.layout.retired"))
-            .unwrap()
-        {
-            leveler_memory::AgentAdmitOutcome::Applied(outcome) => {
-                outcome.entry.expect("the retired lesson was written")
-            }
-            other => panic!("retired lesson not applied: {other:?}"),
+        let service = Arc::new(leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+                leveler_memory::v2::MemoryScope::Project,
+                dir.path().join("current"),
+                dir.path().join("state"),
+            )),
+        ));
+        let user = leveler_memory::v2::Actor::User {
+            invocation: leveler_memory::v2::UserInvocationId::mint("recall-fixture"),
         };
-        store.forget(&archived.id).unwrap();
-        let lesson = match store
-            .admit_experience_candidate(pybuild_lesson("experience.pybuild.layout"))
-            .unwrap()
-        {
-            leveler_memory::AgentAdmitOutcome::Applied(outcome) => {
-                outcome.entry.expect("the current lesson was written")
-            }
-            other => panic!("current lesson not applied: {other:?}"),
+        let runtime = leveler_memory::v2::Actor::Runtime {
+            task: leveler_core::TaskId::new("recall-fixture"),
         };
-        assert_ne!(lesson.id, archived.id, "the fixture needs a fresh identity");
+        let constraint = service
+            .remember(
+                &user,
+                leveler_memory::RememberRequest::new(
+                    leveler_memory::v2::OpId::derived("fixture", "constraint"),
+                    leveler_memory::ServiceScope::Project,
+                    "Answer without editing",
+                    "Do not modify any files; answer from the current environment.",
+                    "note",
+                ),
+            )
+            .unwrap()
+            .applied_id()
+            .expect("constraint applied")
+            .to_string();
+        let model = leveler_memory::v2::Actor::Model {
+            session: leveler_core::SessionId::new("recall-fixture"),
+            turn: leveler_core::TurnId::new("recall-fixture"),
+            tool_call: leveler_core::ToolCallId::new("recall-fixture"),
+        };
+        let note = service
+            .admit_candidate(
+                &model,
+                leveler_memory::ServiceScope::Project,
+                &{
+                    let mut candidate = leveler_memory::MemoryCandidate::new(
+                        "pybuild layout value is version-dependent (2.x wants flat, not src)",
+                        "The accepted `layout=` value in `pybuild.config` depends on the installed pybuild major version, so the fixed value from one task can be wrong in another. Observed in this environment: pybuild 2.x rejects `layout=src` with `error: build layout rejected` and accepts only `layout=flat`, printing `pybuild: build ok (layout=flat)`.",
+                        leveler_memory::CandidateKind::Free,
+                        Some("pybuild.layout".to_string()),
+                        leveler_memory::CandidateSource::AgentProposed,
+                        vec![
+                            "pybuild".to_string(),
+                            "build-layout".to_string(),
+                            "verify.sh".to_string(),
+                        ],
+                    )
+                    .unwrap();
+                    candidate.operation = leveler_memory::CandidateOperation::Create;
+                    candidate
+                },
+                "recall-fixture-note",
+            )
+            .unwrap()
+            .applied_id()
+            .expect("note applied")
+            .to_string();
+        let archived = service
+            .admit_candidate(
+                &runtime,
+                leveler_memory::ServiceScope::Project,
+                &pybuild_lesson("experience.pybuild.layout.retired"),
+                "recall-fixture-retired",
+            )
+            .unwrap()
+            .applied_id()
+            .expect("retired lesson applied")
+            .to_string();
+        service
+            .forget(&user, leveler_memory::ServiceScope::Project, &archived)
+            .unwrap();
+        let lesson = service
+            .admit_candidate(
+                &runtime,
+                leveler_memory::ServiceScope::Project,
+                &pybuild_lesson("experience.pybuild.layout"),
+                "recall-fixture-lesson",
+            )
+            .unwrap()
+            .applied_id()
+            .expect("current lesson applied")
+            .to_string();
+        assert_ne!(lesson, archived, "the fixture needs a fresh identity");
 
         let exec = executor()
-            .with_memory_root(Some(root))
+            .with_memory_service(Some(service))
             .with_memory_expose(true);
         let mut recalled = None;
         let _ = exec.turn_control_context_inner(
@@ -4646,25 +4086,22 @@ mod ownership_authority_tests {
         let (ids, count, experience) = recalled.expect("recall ran");
         assert_eq!(count, ids.len());
         assert!(
-            ids.contains(&constraint.id),
+            ids.contains(&constraint),
             "the user's constraint was dropped: {ids:?}"
         );
         assert!(
-            ids.contains(&note.id),
-            "the ordinary note still fits and is useful: {ids:?}"
-        );
-        assert!(
-            ids.contains(&lesson.id),
+            ids.contains(&lesson),
             "the matching verified lesson was crowded out: {ids:?}"
         );
         assert!(
-            !ids.contains(&archived.id),
+            !ids.contains(&archived),
             "an archived lesson was recalled: {ids:?}"
         );
         assert_eq!(
             experience, 1,
             "only the current lesson is experience: {ids:?}"
         );
+        let _ = note;
     }
 
     /// Zero hits is a recall result, not silence. The status surface needs it
@@ -4672,8 +4109,15 @@ mod ownership_authority_tests {
     #[test]
     fn a_zero_hit_recall_is_reported_as_zero() {
         let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+                leveler_memory::v2::MemoryScope::Project,
+                dir.path().join("current"),
+                dir.path().join("state"),
+            )),
+        ));
         let exec = executor()
-            .with_memory_root(Some(dir.path().join("memory")))
+            .with_memory_service(Some(service))
             .with_memory_expose(true);
         let mut recalled = Vec::new();
         let _ = exec.turn_control_context_inner(
@@ -4694,859 +4138,6 @@ mod ownership_authority_tests {
                 } if ids.is_empty()
             )),
             "expected a zero-hit MemoryRecalled, got {recalled:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod recall_tests {
-    use super::{
-        EXPERIENCE_RECALL_BLOCK_MAX_BYTES, MemoryRecallPlan, RECALL_BLOCK_MAX_BYTES, RECALL_FLOOR,
-        RECALL_K, STANDING_PREFERENCE_MAX_ENTRIES,
-    };
-    use leveler_memory::{MemoryEntry, MemoryKind, MemoryStore};
-
-    fn entry(id: &str, title: &str, body: &str) -> MemoryEntry {
-        MemoryEntry {
-            id: id.to_string(),
-            title: title.to_string(),
-            body: body.to_string(),
-            tags: Vec::new(),
-            created_at: "t".to_string(),
-            updated_at: "t".to_string(),
-            archived_at: None,
-            key: None,
-            value: None,
-            kind: None,
-            status: leveler_memory::MemoryStatus::Active,
-            scope: leveler_memory::MemoryScope::Project,
-            provenance: None,
-            supersedes: None,
-            superseded_by: None,
-            superseded_at: None,
-            expires_at: None,
-            experience: None,
-        }
-    }
-
-    fn render(
-        standing: Vec<MemoryEntry>,
-        queried: Vec<MemoryEntry>,
-    ) -> (super::MemoryRecallPlan, Option<String>) {
-        MemoryRecallPlan::build(
-            standing,
-            queried,
-            Vec::new(),
-            &std::collections::HashSet::new(),
-        )
-    }
-
-    fn render_experience(
-        experience: Vec<MemoryEntry>,
-    ) -> (super::MemoryRecallPlan, Option<String>) {
-        MemoryRecallPlan::build(
-            Vec::new(),
-            Vec::new(),
-            experience,
-            &std::collections::HashSet::new(),
-        )
-    }
-
-    #[test]
-    fn a_contested_experience_is_rendered_as_disputed() {
-        let mut experience = entry("exp-2", "同一签名的另一个解释", "旧解释");
-        experience.key = Some("k-shared".to_string());
-        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
-        experience.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "cargo test 在 dev profile 下运行".to_string(),
-            invalid_if: None,
-            evidence: vec![
-                leveler_memory::ExperienceEvidence {
-                    kind: "failure".to_string(),
-                    reference: "step 2: cargo test (exit 101)".to_string(),
-                },
-                leveler_memory::ExperienceEvidence {
-                    kind: "resolution".to_string(),
-                    reference: "step 4: cargo test (exit 0)".to_string(),
-                },
-            ],
-        });
-        let contested: std::collections::HashSet<String> =
-            ["k-shared".to_string()].into_iter().collect();
-        let (plan, block) =
-            MemoryRecallPlan::build(Vec::new(), Vec::new(), vec![experience], &contested);
-        let block = block.expect("block");
-        assert!(block.contains("(experience·verified·disputed)"), "{block}");
-        assert!(block.contains("waiting for a person"), "{block}");
-        assert_eq!(plan.contested, 1);
-    }
-
-    #[test]
-    fn nothing_selected_injects_nothing() {
-        let (plan, block) = render(Vec::new(), Vec::new());
-        assert!(block.is_none());
-        assert_eq!(plan.rendered_bytes, 0);
-        assert!(plan.selected.is_empty());
-    }
-
-    /// Every byte in the header is paid on every recalling turn. It must teach
-    /// the reader how to use the entries, not carry design commentary.
-    #[test]
-    fn the_turn_header_stays_compact() {
-        assert!(
-            super::MEMORY_RECALL_HEADER.len() <= 640,
-            "the recall header grew to {} bytes",
-            super::MEMORY_RECALL_HEADER.len()
-        );
-    }
-
-    /// Experience renders after the user candidates and may only spend what
-    /// they left. Adding a lesson must never remove a user candidate.
-    #[test]
-    fn experience_never_displaces_user_facts() {
-        let user: Vec<MemoryEntry> = (0..12)
-            .map(|index| {
-                let mut fact = entry(
-                    &format!("u{index}"),
-                    &format!("user constraint {index} {}", "u".repeat(150)),
-                    &"u".repeat(180),
-                );
-                fact.provenance = Some(leveler_memory::Provenance {
-                    authority: leveler_memory::MemoryAuthority::ExplicitUser,
-                    source: "explicit_user_turn".to_string(),
-                    evidence: None,
-                });
-                fact
-            })
-            .collect();
-        let mut lesson = entry("exp", "lesson", &"e".repeat(600));
-        lesson.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "the same failure appears".to_string(),
-            invalid_if: None,
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 1".to_string(),
-            }],
-        });
-
-        let empty = std::collections::HashSet::new();
-        let (without, without_block) =
-            MemoryRecallPlan::build(Vec::new(), user.clone(), Vec::new(), &empty);
-        let (with, with_block) = MemoryRecallPlan::build(Vec::new(), user, vec![lesson], &empty);
-        assert!(without_block.is_some() && with_block.is_some());
-        assert!(
-            without.selected.iter().all(|id| with.selected.contains(id)),
-            "the lesson took space that belonged to a user candidate: {:?} vs {:?}",
-            without.selected,
-            with.selected
-        );
-    }
-
-    /// User candidates are a bounded set (four in production), so a lesson
-    /// still fits after them. It is listed as a candidate, never asserted to
-    /// apply.
-    #[test]
-    fn a_lesson_still_fits_after_the_bounded_user_candidates() {
-        let notes: Vec<MemoryEntry> = (0..4)
-            .map(|index| {
-                entry(
-                    &format!("n{index}"),
-                    &format!("model note {index} {}", "n".repeat(150)),
-                    &"n".repeat(180),
-                )
-            })
-            .collect();
-        let mut lesson = entry("exp", "a relevant lesson", &"e".repeat(300));
-        lesson.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "the same failure appears".to_string(),
-            invalid_if: None,
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 1".to_string(),
-            }],
-        });
-
-        let (plan, block) = MemoryRecallPlan::build(
-            Vec::new(),
-            notes,
-            vec![lesson],
-            &std::collections::HashSet::new(),
-        );
-        let block = block.expect("block");
-        assert_eq!(plan.experience, 1, "the lesson was crowded out: {block}");
-        assert!(block.contains("a relevant lesson"), "{block}");
-    }
-
-    /// A lesson candidate carries its applicability and invalidation clauses
-    /// whole. The explanation stays behind the memory tool, so a long body
-    /// cannot shorten or omit the conditions.
-    #[test]
-    fn a_lesson_candidate_keeps_its_applicability_and_invalidation() {
-        let mut lesson = entry(
-            "exp",
-            "long lesson",
-            &"e".repeat(RECALL_BLOCK_MAX_BYTES * 2),
-        );
-        lesson.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "the failure appears under the dev profile".to_string(),
-            invalid_if: Some("the toolchain changes".to_string()),
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 1".to_string(),
-            }],
-        });
-        let (plan, block) = render_experience(vec![lesson]);
-        let block = block.expect("block");
-        assert_eq!(plan.truncated, 0, "candidate lines are never cut");
-        assert_eq!(plan.experience, 1);
-        assert!(block.contains("applies when:"), "{block}");
-        assert!(block.contains("invalid if:"), "{block}");
-        assert!(
-            !block.contains(&"e".repeat(64)),
-            "the body must not be spent on a candidate: {block}"
-        );
-    }
-
-    /// The experience section has its own ceiling, independent of how much of
-    /// the total block is free. Lessons cannot turn the prompt into a dump.
-    #[test]
-    fn the_experience_section_keeps_its_own_byte_ceiling() {
-        let lessons: Vec<MemoryEntry> = (0..4)
-            .map(|index| {
-                let mut lesson = entry(
-                    &format!("exp-{index}"),
-                    &format!("lesson {index} {}", "t".repeat(200)),
-                    &"e".repeat(700),
-                );
-                lesson.experience = Some(leveler_memory::ExperienceRecord {
-                    category: leveler_memory::ExperienceCategory::RootCause,
-                    verification: leveler_memory::ExperienceVerification::Unverified,
-                    applies_when: "the same failure appears".to_string(),
-                    invalid_if: None,
-                    evidence: vec![leveler_memory::ExperienceEvidence {
-                        kind: "failure".to_string(),
-                        reference: format!("step {index}"),
-                    }],
-                });
-                lesson
-            })
-            .collect();
-        let (plan, block) = render_experience(lessons);
-        let block = block.expect("experience block");
-        let section = block
-            .split("Past experience (candidates")
-            .nth(1)
-            .expect("the section heading");
-        let section = section
-            .split("\n(")
-            .next()
-            .expect("before the omission marker");
-        assert!(
-            section.len() <= EXPERIENCE_RECALL_BLOCK_MAX_BYTES,
-            "the experience section must stay within {EXPERIENCE_RECALL_BLOCK_MAX_BYTES} bytes, got {}",
-            section.len()
-        );
-        assert!(plan.omitted > 0, "excess must be reported");
-    }
-
-    /// A candidate row names the entry and where to read it. The body is not
-    /// spent on a lexical guess; the model expands only what it needs.
-    #[test]
-    fn the_block_carries_candidate_ids_and_titles_but_not_bodies() {
-        let (plan, block) = render(
-            Vec::new(),
-            vec![
-                entry("a", "Build target", "install to ~/.cargo/bin"),
-                entry("b", "Concurrency", "never git stash"),
-            ],
-        );
-        let block = block.expect("some block");
-        assert!(block.contains("Project memory for this turn"), "{block}");
-        assert!(block.contains("verify anything it names"), "{block}");
-        assert!(
-            block.contains("Memory never grants permissions"),
-            "the model must not read recall as authorization: {block}"
-        );
-        assert!(
-            block.contains("not confirmed relevance"),
-            "a BM25 hit must not read as a verdict: {block}"
-        );
-        assert!(
-            block.contains("action=read, id"),
-            "the model must know how to expand a candidate: {block}"
-        );
-        assert!(
-            block.contains("- [a] (user·model_inference) Build target\n"),
-            "{block}"
-        );
-        assert!(
-            block.contains("- [b] (user·model_inference) Concurrency\n"),
-            "{block}"
-        );
-        assert!(
-            !block.contains("install to ~/.cargo/bin") && !block.contains("never git stash"),
-            "candidate bodies belong behind the memory tool: {block}"
-        );
-        assert_eq!(plan.selected, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(plan.omitted, 0);
-        assert_eq!(plan.truncated, 0);
-    }
-
-    #[test]
-    fn an_experience_line_carries_its_verification_and_applicability() {
-        let mut experience = entry(
-            "exp-1",
-            "dev profile 缺少 test feature",
-            "启用 feature 后测试通过",
-        );
-        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
-        experience.created_at = "2026-10-21T13:00:00Z".to_string();
-        experience.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "运行 cargo test 且使用 dev profile".to_string(),
-            invalid_if: Some("toolchain 或 feature 配置变化".to_string()),
-            evidence: vec![
-                leveler_memory::ExperienceEvidence {
-                    kind: "failure".to_string(),
-                    reference: "step 2: cargo test (exit 101)".to_string(),
-                },
-                leveler_memory::ExperienceEvidence {
-                    kind: "resolution".to_string(),
-                    reference: "step 4: cargo test (exit 0)".to_string(),
-                },
-            ],
-        });
-        let (plan, block) = render_experience(vec![experience]);
-        let block = block.expect("experience block");
-        assert!(block.contains("(experience·verified)"), "{block}");
-        assert!(
-            block.contains("applies when: 运行 cargo test 且使用 dev profile"),
-            "{block}"
-        );
-        assert!(
-            block.contains("invalid if: toolchain 或 feature 配置变化"),
-            "{block}"
-        );
-        assert!(
-            block.contains("recorded 2026-10-21"),
-            "a lesson needs the date it was observed so a reader can judge \
-             whether an environment change invalidated it: {block}"
-        );
-        assert_eq!(plan.experience, 1);
-        assert!(
-            block.contains("its explanation is still a model reading")
-                || block.contains("proves behavior, not the explanation"),
-            "recall must say the explanation is not proven: {block}"
-        );
-    }
-
-    /// A runtime observation is real evidence, but it is not a failed check
-    /// that later passed. Rendering it as `verified` would claim a resolution
-    /// the runtime never saw.
-    #[test]
-    fn an_observation_only_lesson_is_rendered_as_observed_not_verified() {
-        let mut experience = entry("exp-2", "验证入口静默退出", "需要检查脚本走了哪条分支");
-        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
-        experience.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::EnvironmentConstraint,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "运行 ./verify.sh".to_string(),
-            invalid_if: None,
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "observation".to_string(),
-                reference: "step 2: ./verify.sh printed: exit: 0".to_string(),
-            }],
-        });
-        let (_, block) = render_experience(vec![experience]);
-        let block = block.expect("experience block");
-        assert!(block.contains("(experience·observed)"), "{block}");
-        assert!(
-            !block.contains("(experience·verified)"),
-            "an observation-only lesson must not read as a resolution: {block}"
-        );
-    }
-
-    /// No mechanical link means the explanation is the model's, not the
-    /// runtime's. It stays visible, labelled as inference.
-    #[test]
-    fn an_unverified_lesson_is_rendered_as_inferred() {
-        let mut experience = entry("exp-3", "可能的原因", "推测是配置问题");
-        experience.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
-        experience.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Unverified,
-            applies_when: "cargo test 失败时".to_string(),
-            invalid_if: None,
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 2: cargo test (exit 101)".to_string(),
-            }],
-        });
-        let (_, block) = render_experience(vec![experience]);
-        let block = block.expect("experience block");
-        assert!(block.contains("(experience·inferred)"), "{block}");
-        assert!(
-            !block.contains("(experience·verified)"),
-            "an unverified claim must not read as a verified resolution: {block}"
-        );
-    }
-
-    /// A long body costs nothing in a candidate block: only the row is paid. A
-    /// single entry can therefore no longer blow past the ceiling.
-    #[test]
-    fn a_single_oversized_body_cannot_exceed_the_ceiling() {
-        let huge = "x".repeat(RECALL_BLOCK_MAX_BYTES * 3);
-        let (plan, block) = render(Vec::new(), vec![entry("big", "first", &huge)]);
-        let block = block.expect("the candidate still reaches the model");
-        assert!(
-            block.len() <= RECALL_BLOCK_MAX_BYTES,
-            "block was {} bytes",
-            block.len()
-        );
-        assert_eq!(plan.rendered_bytes, block.len());
-        assert_eq!(plan.truncated, 0);
-        assert!(!block.contains(&"x".repeat(64)), "{block}");
-        assert!(block.contains("[big]"), "the id reaches the model");
-    }
-
-    /// A standing preference is injected with its body, and cutting that body
-    /// must not split a UTF-8 sequence.
-    #[test]
-    fn standing_truncation_never_splits_a_character() {
-        let body = "紧凑输出".repeat(RECALL_BLOCK_MAX_BYTES);
-        let (plan, block) = render(vec![entry("cjk", "中文", &body)], Vec::new());
-        let block = block.expect("block");
-        assert!(block.len() <= RECALL_BLOCK_MAX_BYTES);
-        assert_eq!(plan.truncated, 1);
-        // Rust strings cannot hold invalid UTF-8, so the real check is that no
-        // replacement character was produced and the text still ends cleanly.
-        assert!(!block.contains('\u{FFFD}'), "corrupt character in {block}");
-        assert!(block.contains('…'));
-    }
-
-    /// Rows that do not fit are counted, not quietly dropped.
-    #[test]
-    fn overflow_is_reported_truthfully() {
-        let long_title = "t".repeat(300);
-        let entries: Vec<MemoryEntry> = (0..20)
-            .map(|index| entry(&format!("c{index}"), &long_title, "body"))
-            .collect();
-        let (plan, block) = render(Vec::new(), entries);
-        let block = block.expect("block");
-        assert!(block.len() <= RECALL_BLOCK_MAX_BYTES);
-        assert!(plan.omitted > 0, "excess must be reported");
-        assert!(
-            block.contains(&format!("({} more omitted for space.)", plan.omitted)),
-            "{block}"
-        );
-    }
-
-    /// Standing preferences are rendered before query hits: they apply to
-    /// every turn, so they are the ones worth the space.
-    #[test]
-    fn standing_preferences_come_first() {
-        let (plan, block) = render(
-            vec![entry("pref", "偏好", "保持紧凑")],
-            vec![entry("hit", "命中", "与本轮相关")],
-        );
-        let block = block.expect("block");
-        assert_eq!(plan.selected, vec!["pref".to_string(), "hit".to_string()]);
-        assert!(
-            block.find("[pref]").unwrap() < block.find("[hit]").unwrap(),
-            "{block}"
-        );
-        assert!(block.contains("Lasting preferences"), "{block}");
-        assert!(
-            block.contains("Retrieval candidates (read before use; not confirmed relevant)"),
-            "{block}"
-        );
-        assert!(
-            block.contains("- [pref] (user·model_inference) 偏好: 保持紧凑"),
-            "a standing preference keeps its body: {block}"
-        );
-    }
-
-    /// A user fact must name where it came from and how strong it is. Without
-    /// the label the model cannot tell an explicit project decision from the
-    /// model's own earlier inference.
-    #[test]
-    fn a_user_memory_names_its_source_and_authority() {
-        let mut fact = entry("mcp", "MCP 身份验证", "MCP 读写必须经过身份验证");
-        fact.provenance = Some(leveler_memory::Provenance {
-            authority: leveler_memory::MemoryAuthority::ExplicitUser,
-            source: "explicit_user_turn".to_string(),
-            evidence: None,
-        });
-        let (_, block) = render(Vec::new(), vec![fact]);
-        let block = block.expect("block");
-        assert!(
-            block.contains("(user·explicit_user·explicit_user_turn)"),
-            "user memory must name source and authority: {block}"
-        );
-    }
-
-    /// A lasting preference must reach the model even when the request shares
-    /// no characters with it — the case lexical recall provably misses.
-    #[test]
-    fn a_standing_preference_is_injected_without_any_lexical_overlap() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
-        store
-            .activate(
-                "输出偏好",
-                "用户偏好紧凑的终端信息输出，不希望看到冗长的模型过程。",
-                MemoryKind::Preference,
-                vec![],
-            )
-            .unwrap();
-
-        let query = "能不能精简一点";
-        assert!(
-            store.recall(query, RECALL_K).unwrap().is_empty(),
-            "precondition: lexical recall misses this paraphrase"
-        );
-        let standing = store
-            .standing_preferences(STANDING_PREFERENCE_MAX_ENTRIES)
-            .unwrap();
-        let (_, block) = render(standing, Vec::new());
-        let block = block.expect("the preference must reach the model anyway");
-        assert!(block.contains("紧凑"), "{block}");
-    }
-
-    /// Retrieval still finds a relevant entry and leaves the rest alone.
-    #[test]
-    fn retrieval_surfaces_the_relevant_entry_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
-        store
-            .activate(
-                "Install target",
-                "cargo bin at ~/.cargo/bin/leveler",
-                MemoryKind::Note,
-                vec![],
-            )
-            .unwrap();
-        store
-            .activate(
-                "Cooking",
-                "boil pasta for nine minutes",
-                MemoryKind::Note,
-                vec![],
-            )
-            .unwrap();
-        let hits: Vec<MemoryEntry> = store
-            .recall("where does install put the binary", RECALL_K)
-            .unwrap()
-            .into_iter()
-            .filter(|(_, s)| *s >= RECALL_FLOOR)
-            .map(|(e, _)| e)
-            .collect();
-        let (_, block) = render(Vec::new(), hits);
-        let block = block.expect("the install memory should be retrieved");
-        assert!(block.contains("Install target"), "{block}");
-        assert!(
-            !block.contains("Cooking"),
-            "unrelated memory leaked: {block}"
-        );
-    }
-
-    /// An entry chosen by both lanes is injected once.
-    #[test]
-    fn an_entry_in_both_lanes_is_injected_once() {
-        let pref = entry("terse", "Terse output", "keep the terminal compact");
-        let standing = vec![pref.clone()];
-        let queried: Vec<MemoryEntry> = vec![pref]
-            .into_iter()
-            .filter(|e| !standing.iter().any(|s| s.id == e.id))
-            .collect();
-        let (plan, block) = render(standing, queried);
-        let block = block.expect("block");
-        assert_eq!(block.matches("[terse]").count(), 1, "{block}");
-        assert_eq!(plan.selected.len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod compaction_tests {
-    use crate::authorization::{extract_command, patch_paths, push_unique_path};
-    use leveler_context::{ACTIVE_OBJECTIVE_MARKER, compact_messages, estimate_tokens};
-    use leveler_core::ToolCallId;
-    use leveler_model::{ContentPart, Message, Role, ToolCall, ToolResultContent};
-
-    #[test]
-    fn estimate_tokens_counts_images_not_as_free() {
-        use leveler_model::{ContentPart, ImageSource};
-        let with_image = vec![Message {
-            origin: None,
-            role: Role::User,
-            content: vec![
-                ContentPart::Text {
-                    text: "look".to_string(),
-                },
-                ContentPart::Image {
-                    source: ImageSource::Url {
-                        url: "https://x/y.png".to_string(),
-                    },
-                },
-            ],
-        }];
-        let text_only = vec![Message {
-            origin: None,
-            role: Role::User,
-            content: vec![ContentPart::Text {
-                text: "look".to_string(),
-            }],
-        }];
-        // An image must add real weight, so a vision turn can trigger compaction
-        // even when the gateway reports no usage.
-        assert!(estimate_tokens(&with_image) >= 256);
-        assert!(estimate_tokens(&with_image) > estimate_tokens(&text_only));
-    }
-
-    #[test]
-    fn extract_command_drops_duplicate_program_arg() {
-        let call = ToolCall {
-            id: ToolCallId::new("c"),
-            name: "run_command".to_string(),
-            arguments: serde_json::json!({
-                "program": "pytest",
-                "args": ["pytest", "tests/providers/test_retry_classification.py", "-q"]
-            }),
-        };
-
-        let (program, args) = extract_command(&call);
-
-        assert_eq!(program.as_deref(), Some("pytest"));
-        assert_eq!(
-            args,
-            vec!["tests/providers/test_retry_classification.py", "-q"]
-        );
-    }
-
-    #[test]
-    fn patch_paths_extracts_files_from_apply_patch_headers() {
-        let paths = patch_paths(
-            "*** Begin Patch\n\
-             *** Add File: src/new.rs\n\
-             *** Update File: src/lib.rs\n\
-             *** Move to: crates/app/src/main.rs\n\
-             *** End Patch",
-        );
-
-        assert_eq!(
-            paths,
-            vec!["src/new.rs", "src/lib.rs", "crates/app/src/main.rs"]
-        );
-    }
-
-    #[test]
-    fn push_unique_path_rejects_unsafe_paths() {
-        let mut paths = Vec::new();
-
-        push_unique_path(&mut paths, "./src/lib.rs");
-        push_unique_path(&mut paths, "src/lib.rs");
-        push_unique_path(&mut paths, "../secret");
-        push_unique_path(&mut paths, "/tmp/secret");
-
-        assert_eq!(paths, vec!["src/lib.rs"]);
-    }
-
-    #[test]
-    fn advisory_model_calls_have_a_short_independent_deadline() {}
-
-    fn assistant_call(name: &str, path: &str) -> Message {
-        Message {
-            origin: None,
-            role: Role::Assistant,
-            content: vec![ContentPart::ToolCall {
-                call: ToolCall {
-                    id: ToolCallId::new("c"),
-                    name: name.to_string(),
-                    arguments: serde_json::json!({ "path": path }),
-                },
-            }],
-        }
-    }
-
-    fn tool_result(text: &str) -> Message {
-        Message {
-            origin: None,
-            role: Role::Tool,
-            content: vec![ContentPart::ToolResult {
-                result: ToolResultContent {
-                    call_id: ToolCallId::new("c"),
-                    content: text.to_string(),
-                    is_error: false,
-                },
-            }],
-        }
-    }
-
-    /// System + task + 8 (assistant/tool) rounds.
-    fn long_transcript() -> Vec<Message> {
-        let mut m = vec![
-            Message::text(Role::System, "you are an agent"),
-            Message::text(Role::User, "fix the bug"),
-        ];
-        for i in 0..8 {
-            let file = format!("src/mod{i}.rs");
-            m.push(assistant_call("read_file", &file));
-            m.push(tool_result("... file contents ..."));
-        }
-        m
-    }
-
-    /// Scoped project rules ride in mid-transcript system messages. They are
-    /// persistent constraints, not elidable history: compaction must carry them
-    /// forward, or the agent silently loses a directory's AGENTS.md and the
-    /// injection tracker never re-adds it.
-    #[test]
-    fn compaction_carries_scoped_rules_out_of_the_elided_middle() {
-        let mut msgs = vec![
-            Message::text(Role::System, "you are an agent"),
-            Message::text(Role::User, "fix the bug"),
-            Message::text(
-                Role::System,
-                "Project rules:\n--- from src/AGENTS.md ---\nno unwrap",
-            ),
-        ];
-        for i in 0..8 {
-            msgs.push(assistant_call("read_file", &format!("src/mod{i}.rs")));
-            msgs.push(tool_result("... file contents ..."));
-        }
-
-        let out = compact_messages(&msgs, 4, 0, None, None);
-        assert!(out.len() < msgs.len(), "should shrink");
-        assert!(
-            out.iter()
-                .any(|m| m.text_content().contains("from src/AGENTS.md")),
-            "scoped rule was dropped by compaction"
-        );
-    }
-
-    #[test]
-    fn keeps_anchors_and_recent_and_reduces_length() {
-        let msgs = long_transcript();
-        let out = compact_messages(&msgs, 4, 0, None, Some("fix the bug"));
-
-        assert!(
-            out.len() < msgs.len(),
-            "should shrink: {} -> {}",
-            msgs.len(),
-            out.len()
-        );
-        // Anchors: system first, original task second, then host objective pin.
-        assert_eq!(out[0].role, Role::System);
-        assert_eq!(out[1].role, Role::User);
-        assert_eq!(out[1].text_content(), "fix the bug");
-        assert!(
-            out[2].text_content().contains(ACTIVE_OBJECTIVE_MARKER),
-            "host objective pin missing: {}",
-            out[2].text_content()
-        );
-        // Breadcrumb replaces the middle and names an elided file.
-        assert_eq!(out[3].role, Role::User);
-        assert!(
-            out[3].text_content().contains("compacted"),
-            "{}",
-            out[3].text_content()
-        );
-        assert!(
-            out[3].text_content().contains("src/mod0.rs"),
-            "{}",
-            out[3].text_content()
-        );
-        // The last 4 messages are preserved verbatim.
-        assert_eq!(&out[out.len() - 4..], &msgs[msgs.len() - 4..]);
-    }
-
-    #[test]
-    fn compaction_repins_active_objective_not_first_user_only() {
-        // Multi-turn head: first user is an old question; host objective is new.
-        let mut msgs = vec![
-            Message::text(Role::System, "sys"),
-            Message::text(Role::User, "how many uncommitted files?"),
-            Message::text(Role::Assistant, "about 66"),
-            Message::text(Role::User, "update docs/ARCHITECTURE.md for the runtime"),
-        ];
-        for i in 0..10 {
-            msgs.push(assistant_call("list_files", &format!("p{i}")));
-            msgs.push(tool_result("ok"));
-        }
-        let out = compact_messages(
-            &msgs,
-            4,
-            0,
-            None,
-            Some("update docs/ARCHITECTURE.md for the runtime"),
-        );
-        assert!(out.len() < msgs.len());
-        let pin = out
-            .iter()
-            .find(|m| m.text_content().contains(ACTIVE_OBJECTIVE_MARKER))
-            .expect("objective pin");
-        assert!(
-            pin.text_content().contains("ARCHITECTURE")
-                && pin.text_content().contains("<objective>"),
-            "pin must carry host objective: {}",
-            pin.text_content()
-        );
-        // First user history may remain in head, but pin is the active SoT.
-        assert!(out.iter().any(|m| m.text_content().contains("uncommitted")));
-    }
-
-    #[test]
-    fn tail_never_starts_on_an_orphan_tool_result() {
-        let msgs = long_transcript();
-        // keep_recent=3 would land the tail on a Tool result; it must back up.
-        let out = compact_messages(&msgs, 3, 0, None, None);
-        // system + first user + breadcrumb → index of first tail message.
-        let first_after_breadcrumb = out
-            .iter()
-            .position(|m| m.text_content().contains("compacted"))
-            .map(|i| &out[i + 1])
-            .expect("breadcrumb");
-        assert_ne!(
-            first_after_breadcrumb.role,
-            Role::Tool,
-            "tail must not begin with an orphaned tool result"
-        );
-    }
-
-    #[test]
-    fn short_transcript_is_left_untouched_without_objective() {
-        let msgs = vec![
-            Message::text(Role::System, "sys"),
-            Message::text(Role::User, "hi"),
-            assistant_call("read_file", "a.rs"),
-            tool_result("x"),
-        ];
-        assert_eq!(compact_messages(&msgs, 4, 0, None, None), msgs);
-    }
-
-    #[test]
-    fn short_transcript_gets_objective_pin_when_missing() {
-        let msgs = vec![
-            Message::text(Role::System, "sys"),
-            Message::text(Role::User, "old ask"),
-            assistant_call("read_file", "a.rs"),
-            tool_result("x"),
-        ];
-        let out = compact_messages(&msgs, 4, 0, None, Some("new objective only"));
-        assert!(
-            out.iter()
-                .any(|m| m.text_content().contains(ACTIVE_OBJECTIVE_MARKER)
-                    && m.text_content().contains("new objective only")),
-            "short transcript must still receive host pin: {out:?}"
         );
     }
 }

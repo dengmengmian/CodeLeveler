@@ -35,9 +35,7 @@ fn fixture() -> Fixture {
         dir.path().join("global/state"),
     );
     let service = Arc::new(MemoryService::new(
-        MemoryRoots::markdown()
-            .with_project(project)
-            .with_global(global),
+        MemoryRoots::new().with_project(project).with_global(global),
     ));
     let workspace = Workspace::new(dir.path()).unwrap();
     let mut ctx = ToolContext::new(workspace, PermissionProfile::FullAccess);

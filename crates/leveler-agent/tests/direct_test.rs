@@ -166,6 +166,33 @@ fn patch_resolve_and_proven_ac() -> Vec<ModelResponse> {
     v
 }
 
+/// A project-scope Markdown memory service with one current user fact, so the
+/// capability-gated catalog has a real title to list.
+fn memory_service_with_one_fact(dir: &std::path::Path) -> Arc<leveler_memory::MemoryService> {
+    let service = leveler_memory::MemoryService::new(
+        leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+            leveler_memory::v2::MemoryScope::Project,
+            dir.join("memory"),
+            dir.join("state"),
+        )),
+    );
+    service
+        .remember(
+            &leveler_memory::v2::Actor::User {
+                invocation: leveler_memory::v2::UserInvocationId::mint("direct-test"),
+            },
+            leveler_memory::RememberRequest::new(
+                leveler_memory::v2::OpId::derived("direct-test", "title"),
+                leveler_memory::ServiceScope::Project,
+                "test memory title",
+                "The catalog lists current titles.",
+                "preference",
+            ),
+        )
+        .unwrap();
+    Arc::new(service)
+}
+
 struct Harness {
     engine: CodingRuntime,
     db: Database,
@@ -234,9 +261,7 @@ async fn harness_with_overrides(
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides,
-            memory_catalog: String::new(),
             memory_expose: true,
-            memory_root: None,
             memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
@@ -1698,9 +1723,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_catalog: String::new(),
             memory_expose: true,
-            memory_root: None,
             memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
@@ -2380,9 +2403,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_catalog: String::new(),
             memory_expose: true,
-            memory_root: None,
             memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
@@ -3336,9 +3357,7 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_catalog: String::new(),
             memory_expose: true,
-            memory_root: None,
             memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
@@ -3725,7 +3744,7 @@ async fn progressive_surface_loads_next_request_and_persists_exact_goal() {
         )
         .unwrap(),
     ));
-    h.engine.factory.memory_catalog = "test memory title".into();
+    h.engine.factory.memory_service = Some(memory_service_with_one_fact(h.dir.path()));
     let mut s = spec(&h);
     s.runtime.goal = "inspect old".into();
     let session = h.engine.create_task(&s).await.unwrap();
@@ -3970,7 +3989,7 @@ async fn progressive_demand_exposes_memory_skills_and_delegation() {
         )
         .unwrap(),
     ));
-    h.engine.factory.memory_catalog = "test memory title".into();
+    h.engine.factory.memory_service = Some(memory_service_with_one_fact(h.dir.path()));
     let mut s = spec(&h);
     s.runtime.goal = "load optional capabilities on demand".into();
     let session = h.engine.create_task(&s).await.unwrap();
@@ -4873,9 +4892,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_catalog: String::new(),
             memory_expose: true,
-            memory_root: None,
             memory_service: None,
             memory_lanes: leveler_memory::MemoryLanes::ALL,
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),

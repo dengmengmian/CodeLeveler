@@ -19,12 +19,29 @@ use leveler_agent::{
     ExperienceEvent, ExperienceExtractor, ModelExperienceExtractor, build_evidence_pack,
     validate_experience_candidates,
 };
-use leveler_memory::{ExperienceVerification, MemoryStore, semantic_key_of};
+use leveler_memory::{
+    ExperienceVerification, MemoryLanes, MemoryRoots, MemoryService, ServiceScope, semantic_key_of,
+    v2::{Actor, MemoryScope, ScopeRoots},
+};
 use leveler_model::{
     ModelCapabilities, ModelLimits, ModelPricing, ModelProfile, ModelRef, ProtocolKind,
     ReasoningConfig, ReasoningEffort, ReasoningStyle,
 };
 use leveler_provider::{ModelConfigFile, ProviderConfig, ProviderRegistry, RegistryInputs};
+
+fn probe_service(dir: &std::path::Path) -> MemoryService {
+    MemoryService::new(MemoryRoots::new().with_project(ScopeRoots::new(
+        MemoryScope::Project,
+        dir.join("memory"),
+        dir.join("state"),
+    )))
+}
+
+fn probe_actor() -> Actor {
+    Actor::Runtime {
+        task: leveler_core::TaskId::new("experience-probe"),
+    }
+}
 
 fn model_profile(model_id: &str) -> ModelProfile {
     ModelProfile {
@@ -299,7 +316,7 @@ async fn real_model_experience_extraction_probe() {
         ModelExperienceExtractor::new(runtime.clone(), model).with_timeout(Duration::from_secs(90));
 
     let dir = tempfile::tempdir().unwrap();
-    let store = MemoryStore::open(dir.path()).unwrap();
+    let service = probe_service(dir.path());
     let turns = 3usize;
     let mut total_in = 0u64;
     let mut total_out = 0u64;
@@ -393,32 +410,39 @@ async fn real_model_experience_extraction_probe() {
                     .experience
                     .as_ref()
                     .is_some_and(|record| record.verification == ExperienceVerification::Verified);
-                match store.admit_experience_candidate(candidate.clone()) {
-                    Ok(leveler_memory::AgentAdmitOutcome::Applied(outcome)) => {
+                let seed = format!("probe:{}", candidate.fingerprint);
+                match service.admit_candidate(
+                    &probe_actor(),
+                    ServiceScope::Project,
+                    &candidate,
+                    &seed,
+                ) {
+                    Ok(leveler_memory::WriteOutcome::Applied { id, operation, .. }) => {
                         if verified {
                             stored_verified += 1;
                             saved += 1;
                         } else {
                             pending += 1;
                         }
-                        let operation = outcome.operation;
-                        match &operation {
-                            leveler_memory::AppliedOperation::Superseded => updates += 1,
-                            leveler_memory::AppliedOperation::Created => {}
-                            other => println!("  APPLIED {other:?}"),
+                        match operation.as_str() {
+                            "updated" | "superseded" | "merged" => updates += 1,
+                            "created" => {}
+                            other => println!("  APPLIED {other}"),
                         }
-                        if let Some(entry) = outcome.entry.as_ref() {
-                            expected_ids.insert(scenario.name, entry.id.clone());
-                        }
-                        println!("  STORED operation={operation:?} verified={verified}");
+                        expected_ids.insert(scenario.name, id.clone());
+                        println!("  STORED operation={operation} verified={verified}");
                     }
-                    Ok(leveler_memory::AgentAdmitOutcome::Queued { .. }) => {
+                    Ok(leveler_memory::WriteOutcome::Pending { .. }) => {
                         pending += 1;
                         println!("  QUEUED for consent");
                     }
-                    Ok(leveler_memory::AgentAdmitOutcome::NotStored { reason }) => {
+                    Ok(leveler_memory::WriteOutcome::NotStored { reason }) => {
                         duplicates += 1;
                         println!("  NOT STORED: {reason}");
+                    }
+                    Ok(other) => {
+                        duplicates += 1;
+                        println!("  NOT STORED: {other:?}");
                     }
                     Err(error) => println!("  STORE ERROR: {error}"),
                 }
@@ -445,31 +469,44 @@ async fn real_model_experience_extraction_probe() {
             };
             if expected_ids.contains_key(scenario.name) {
                 recall_total += 1;
-                let hits = store.recall(query, 5).unwrap();
+                let hits = service
+                    .search(
+                        &Actor::External,
+                        ServiceScope::Project,
+                        MemoryLanes::EXPERIENCE_ONLY,
+                        query,
+                        5,
+                    )
+                    .unwrap();
                 if !hits.is_empty() {
                     recall_hits += 1;
                 }
                 let expected = expected_ids.get(scenario.name).unwrap();
-                let correct = hits.iter().any(|(entry, _)| &entry.id == expected);
+                let correct = hits.iter().any(|(view, _)| &view.id == expected);
                 if correct {
                     recall_correct += 1;
                 }
                 println!(
                     "  RECALL `{query}` expected={expected} -> {:?} correct={correct}",
-                    hits.iter().map(|(entry, _)| &entry.id).collect::<Vec<_>>()
+                    hits.iter().map(|(view, _)| &view.id).collect::<Vec<_>>()
                 );
             }
         }
     }
 
     println!("\n===== STORE =====");
-    for entry in store.effective_active().unwrap() {
+    for view in service
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap()
+    {
         println!(
-            "  active id={} key={:?} verification={:?} title={:?}",
-            entry.id,
-            entry.key,
-            entry.experience.as_ref().map(|record| record.verification),
-            entry.title
+            "  active id={} key={:?} standing={:?} title={:?}",
+            view.id,
+            view.subject_key,
+            view.experience
+                .as_ref()
+                .map(|record| record.standing.clone()),
+            view.title
         );
     }
     println!("===== METRICS =====");

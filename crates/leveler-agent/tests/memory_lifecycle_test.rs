@@ -16,7 +16,8 @@ use leveler_agent::{AgentEvent, Executor, NoopSink};
 use leveler_core::RequestId;
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
 use leveler_memory::{
-    CandidateKind, CandidateSource, MemoryAuthority, MemoryCandidate, MemoryStore,
+    MemoryLanes, MemoryRoots, MemoryService, RememberRequest, ServiceScope,
+    v2::{Actor, MemoryScope, OpId, ScopeRoots, UserInvocationId},
 };
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
@@ -94,6 +95,62 @@ fn assistant_text(text: &str) -> ModelResponse {
     }
 }
 
+/// The project-scope Markdown service this test's `mem` path holds.
+fn service(dir: &std::path::Path, mem: &std::path::Path) -> Arc<MemoryService> {
+    Arc::new(MemoryService::new(MemoryRoots::new().with_project(
+        ScopeRoots::new(MemoryScope::Project, mem.to_path_buf(), dir.join("state")),
+    )))
+}
+
+fn user() -> Actor {
+    Actor::User {
+        invocation: UserInvocationId::mint(format!("lifecycle-{}", std::process::id())),
+    }
+}
+
+fn active(service: &MemoryService) -> Vec<leveler_memory::MemoryView> {
+    service
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap()
+}
+
+fn pending(service: &MemoryService) -> Vec<leveler_memory::MemoryView> {
+    service.pending(&user(), ServiceScope::Project).unwrap()
+}
+
+fn body_of(service: &MemoryService, id: &str) -> String {
+    service
+        .read(&Actor::External, ServiceScope::Project, id)
+        .unwrap()
+        .body
+}
+
+/// The same service the executor will use, opened up front so a test can seed
+/// a fact before the run.
+fn executor_with_service(runtime: Arc<CaptureRuntime>, service: Arc<MemoryService>) -> Executor {
+    let workspace_dir = std::env::temp_dir();
+    let workspace = Workspace::new(&workspace_dir).unwrap();
+    let tool_context = ToolContext::with_environment(
+        workspace,
+        PermissionProfile::Assisted,
+        Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )),
+    );
+    Executor::new(
+        runtime,
+        Arc::new(leveler_tools::default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        6,
+    )
+    .with_memory_expose(true)
+    .with_memory_service(Some(service))
+    .with_approver(Arc::new(AutoApprove))
+}
+
 /// An executor with memory exposed and pointed at `mem`; everything else is the
 /// production default surface.
 fn executor(
@@ -119,7 +176,7 @@ fn executor(
         6,
     )
     .with_memory_expose(true)
-    .with_memory_root(Some(mem.to_path_buf()))
+    .with_memory_service(Some(service(dir, mem)))
     .with_approver(Arc::new(AutoApprove))
 }
 
@@ -160,22 +217,26 @@ fn provider_saw(runtime: &CaptureRuntime, needle: &str) -> bool {
     })
 }
 
-/// A structured durable fact: the model owns the subject, and the test
-/// supplies it directly. No prose is parsed into identity.
-fn structured_fact(subject: &str, body: &str) -> MemoryCandidate {
-    let key = leveler_memory::semantic_key_of(subject);
-    let mut candidate = MemoryCandidate::new(
+/// A structured durable fact: the test supplies the identity and the user
+/// invocation, exactly as a user command would. No prose is parsed into
+/// identity anywhere.
+fn structured_fact(service: &MemoryService, subject: &str, body: &str) -> String {
+    // Two statements about one subject are two operations: the op id names the
+    // statement, not the identity it is about.
+    let mut request = RememberRequest::new(
+        OpId::derived("fixture", body),
+        ServiceScope::Project,
         body,
         body,
-        CandidateKind::Free,
-        Some(key.clone()),
-        CandidateSource::UserExplicit,
-        vec![format!("subject:{subject}")],
-    )
-    .unwrap();
-    candidate.semantic_key = Some(key);
-    candidate.authority = MemoryAuthority::ExplicitUser;
-    candidate
+        "note",
+    );
+    request.subject = Some(subject.to_string());
+    service
+        .remember(&user(), request)
+        .unwrap()
+        .applied_id()
+        .expect("the fixture fact is current")
+        .to_string()
 }
 
 /// The executor no longer interprets natural language into memory. Meaning
@@ -194,12 +255,12 @@ async fn a_natural_sentence_is_not_written_by_the_executor() {
     )
     .await;
 
-    let store = MemoryStore::open(&mem).unwrap();
+    let service = service(&dir, &mem);
     assert!(
-        store.effective_active().unwrap().is_empty(),
+        active(&service).is_empty(),
         "the executor must not parse prose into a memory identity"
     );
-    assert!(store.list_pending().unwrap().is_empty());
+    assert!(pending(&service).is_empty());
     assert!(
         !events
             .iter()
@@ -219,11 +280,11 @@ async fn explicit_remember_command_writes_active_memory() {
     let mut events = Vec::new();
     run_turn(&executor, "记住：终端输出保持紧凑", &mut events).await;
 
-    let store = MemoryStore::open(&mem).unwrap();
-    let active = store.effective_active().unwrap();
+    let service = service(&dir, &mem);
+    let active = active(&service);
     assert_eq!(active.len(), 1);
-    assert!(active[0].body.contains("终端输出保持紧凑"));
-    assert!(store.list_pending().unwrap().is_empty());
+    assert!(body_of(&service, &active[0].id).contains("终端输出保持紧凑"));
+    assert!(pending(&service).is_empty());
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::MemoryChanged { operation, .. } if operation == "created"
@@ -242,12 +303,15 @@ async fn a_direct_command_is_stored_and_recalled_in_a_later_session() {
     let mut events_a = Vec::new();
     run_turn(&executor_a, "记住：终端输出保持紧凑", &mut events_a).await;
 
-    let store = MemoryStore::open(&mem).unwrap();
-    let active = store.effective_active().unwrap();
+    let service = service(&dir, &mem);
+    let active = active(&service);
     assert_eq!(active.len(), 1);
-    assert!(active[0].body.contains("终端输出保持紧凑"));
-    assert!(active[0].key.is_none(), "no identity is parsed from prose");
-    assert!(store.list_pending().unwrap().is_empty());
+    assert!(body_of(&service, &active[0].id).contains("终端输出保持紧凑"));
+    assert!(
+        active[0].subject_key.is_none(),
+        "no identity is parsed from prose"
+    );
+    assert!(pending(&service).is_empty());
 
     let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
     let executor_b = executor(&dir, &mem, runtime_b.clone());
@@ -266,16 +330,26 @@ async fn a_direct_command_is_stored_and_recalled_in_a_later_session() {
 #[tokio::test]
 async fn a_structured_correction_replaces_the_old_recall_truth() {
     let (dir, mem) = workspace("natural-update");
-    let store = MemoryStore::open(&mem).unwrap();
-    store
-        .commit_candidate(&structured_fact("default_model", "默认模型：Pro"))
-        .unwrap();
-    let outcome = store
-        .commit_candidate(&structured_fact("default_model", "默认模型：Flash"))
-        .unwrap();
+    let service = service(&dir, &mem);
+    structured_fact(&service, "default_model", "默认模型：Pro");
+    let before = active(&service);
+    assert_eq!(before.len(), 1);
+    structured_fact(&service, "default_model", "默认模型：Flash");
+    let current = active(&service);
+    assert_eq!(current.len(), 1, "one current truth");
+    assert!(body_of(&service, &current[0].id).contains("Flash"));
     assert_eq!(
-        outcome.operation,
-        leveler_memory::AppliedOperation::Superseded
+        service
+            .archived(
+                &Actor::External,
+                ServiceScope::Project,
+                MemoryLanes::ALL,
+                None
+            )
+            .unwrap()
+            .len(),
+        1,
+        "the old value is history"
     );
 
     let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("Flash")]));
@@ -287,8 +361,6 @@ async fn a_structured_correction_replaces_the_old_recall_truth() {
         !provider_saw(&runtime_c, "默认模型：Pro"),
         "the superseded value must not be recalled"
     );
-    assert_eq!(store.effective_active().unwrap().len(), 1);
-    assert_eq!(store.list_archived().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -296,36 +368,44 @@ async fn a_structured_correction_replaces_the_old_recall_truth() {
 #[tokio::test]
 async fn an_identityless_candidate_does_not_overwrite_current_truth() {
     let (dir, mem) = workspace("ambiguous-update");
-    let store = MemoryStore::open(&mem).unwrap();
-    store
-        .commit_candidate(&structured_fact("default_model", "默认模型：Pro"))
-        .unwrap();
+    let service = service(&dir, &mem);
+    structured_fact(&service, "default_model", "默认模型：Pro");
 
-    let proposed = store
-        .propose(
-            MemoryCandidate::new(
-                "默认模型",
-                "以后用 Flash 吧",
-                CandidateKind::Free,
-                None,
-                CandidateSource::SystemInferred,
-                vec![],
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    // The automatic path cannot store a keyless user fact at all: identity is
+    // the model's job, and a missing one is a refusal, not a guess.
+    let mut request = RememberRequest::new(
+        OpId::derived("fixture", "keyless"),
+        ServiceScope::Project,
+        "默认模型",
+        "以后用 Flash 吧",
+        "note",
+    );
+    request.subject = None;
+    let proposed = service.propose(
+        &leveler_memory::v2::Actor::Runtime {
+            task: leveler_core::TaskId::new("lifecycle-proposal"),
+        },
+        request,
+    );
     assert!(
-        matches!(proposed, leveler_memory::ProposeOutcome::Pending(_)),
-        "{proposed:?}"
+        proposed.is_err(),
+        "an identityless automatic write is refused: {proposed:?}"
     );
 
-    assert!(store.effective_active().unwrap()[0].body.contains("Pro"));
-    assert_eq!(store.list_archived().unwrap().len(), 0);
-    assert_eq!(
-        store.list_pending().unwrap().len(),
-        1,
-        "an uncertain identity waits for a person"
+    let current = active(&service);
+    assert!(body_of(&service, &current[0].id).contains("Pro"));
+    assert!(
+        service
+            .archived(
+                &Actor::External,
+                ServiceScope::Project,
+                MemoryLanes::ALL,
+                None
+            )
+            .unwrap()
+            .is_empty()
     );
+    assert!(pending(&service).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -364,12 +444,11 @@ async fn a_turn_with_no_memory_reports_a_zero_hit_recall() {
 #[tokio::test]
 async fn a_later_run_recalls_the_fact_into_the_provider_request() {
     let (dir, mem) = workspace("recall");
-    let store = MemoryStore::open(&mem).unwrap();
-    let fact = structured_fact(
+    structured_fact(
+        &service(&dir, &mem),
         "release_probe_codename",
         "以后这个项目的发布探针代号固定为 ORANGE-7319",
     );
-    store.commit_candidate(&fact).unwrap();
 
     // A NEW executor over the same store — a new session reading durable memory.
     let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("ORANGE-7319")]));
@@ -401,12 +480,12 @@ async fn a_later_run_recalls_the_fact_into_the_provider_request() {
 #[tokio::test]
 async fn a_direct_command_does_not_guess_a_relation_to_structured_memory() {
     let (dir, mem) = workspace("update");
-    let store = MemoryStore::open(&mem).unwrap();
-    let first = structured_fact(
+    let service = service(&dir, &mem);
+    structured_fact(
+        &service,
         "release_probe_codename",
         "以后这个项目的发布探针代号固定为 ORANGE-7319",
     );
-    store.commit_candidate(&first).unwrap();
 
     let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
     let executor_c = executor(&dir, &mem, runtime_c.clone());
@@ -418,22 +497,32 @@ async fn a_direct_command_does_not_guess_a_relation_to_structured_memory() {
     )
     .await;
 
-    assert!(store.list_pending().unwrap().is_empty());
-    let active = store.effective_active().unwrap();
+    assert!(pending(&service).is_empty());
+    let active = active(&service);
     assert_eq!(active.len(), 2, "the command is its own plain record");
     assert!(
         active
             .iter()
-            .any(|entry| entry.body.contains("ORANGE-7319"))
+            .any(|view| body_of(&service, &view.id).contains("ORANGE-7319"))
     );
     let direct = active
         .iter()
-        .find(|entry| entry.body.contains("BLUE-4821"))
+        .find(|view| body_of(&service, &view.id).contains("BLUE-4821"))
         .expect("the command was stored");
     assert!(
-        direct.key.is_none(),
+        direct.subject_key.is_none(),
         "no identity is parsed from the command"
     );
-    assert!(store.list_archived().unwrap().is_empty());
+    assert!(
+        service
+            .archived(
+                &Actor::External,
+                ServiceScope::Project,
+                MemoryLanes::ALL,
+                None
+            )
+            .unwrap()
+            .is_empty()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -211,7 +211,6 @@ pub struct MemoryPolicy {
     enabled: bool,
     user_enabled: bool,
     experience_enabled: bool,
-    backend: leveler_core::MemoryBackend,
 }
 
 impl MemoryPolicy {
@@ -221,14 +220,7 @@ impl MemoryPolicy {
             enabled: config.memory.enabled,
             user_enabled: config.memory.user_enabled,
             experience_enabled: config.memory.experience_enabled,
-            backend: config.memory.backend,
         }
-    }
-
-    /// The storage backend the project selected. Defaults to the shipped
-    /// JSON store; Markdown is opt-in for tests and dogfood.
-    pub fn backend(self) -> leveler_core::MemoryBackend {
-        self.backend
     }
 
     /// Whether the user wants memory enabled for this project.
@@ -266,47 +258,37 @@ impl MemoryPolicy {
 /// The Markdown roots are configured lazily: nothing opens (or creates) a
 /// scope until an operation addresses it, so a project run that never touches
 /// global memory never creates the user's home store.
-pub fn memory_service(
-    layout: &leveler_project::Layout,
-    backend: leveler_core::MemoryBackend,
-) -> leveler_memory::MemoryService {
-    match backend {
-        leveler_core::MemoryBackend::Legacy => {
-            leveler_memory::MemoryService::legacy(layout.memory_dir())
+pub fn memory_service(layout: &leveler_project::Layout) -> leveler_memory::MemoryService {
+    use leveler_memory::v2::{MemoryScope, ScopeRoots};
+    let mut roots = leveler_memory::MemoryRoots::new();
+    if let Some(current) = layout.markdown_memory_dir() {
+        let mut scopes = ScopeRoots::new(
+            MemoryScope::Project,
+            current,
+            layout.memory_v2_state_dir("project"),
+        );
+        if let Some(repo) = layout.repo_root.clone() {
+            scopes = scopes.with_repo_root(repo);
         }
-        leveler_core::MemoryBackend::Markdown => {
-            use leveler_memory::v2::{MemoryScope, ScopeRoots};
-            let mut roots = leveler_memory::MemoryRoots::markdown();
-            if let Some(current) = layout.markdown_memory_dir() {
-                let mut scopes = ScopeRoots::new(
-                    MemoryScope::Project,
-                    current,
-                    layout.memory_v2_state_dir("project"),
-                );
-                if let Some(repo) = layout.repo_root.clone() {
-                    scopes = scopes.with_repo_root(repo);
-                }
-                roots = roots.with_project(scopes);
-            }
-            if let Some(current) = layout.local_memory_dir() {
-                let mut scopes = ScopeRoots::new(
-                    MemoryScope::Local,
-                    current,
-                    layout.memory_v2_state_dir("local"),
-                );
-                if let Some(repo) = layout.repo_root.clone() {
-                    scopes = scopes.with_repo_root(repo);
-                }
-                roots = roots.with_local(scopes);
-            }
-            roots = roots.with_global(ScopeRoots::new(
-                MemoryScope::Global,
-                layout.global_memory_dir(),
-                layout.memory_v2_state_dir("global"),
-            ));
-            leveler_memory::MemoryService::new(roots)
-        }
+        roots = roots.with_project(scopes);
     }
+    if let Some(current) = layout.local_memory_dir() {
+        let mut scopes = ScopeRoots::new(
+            MemoryScope::Local,
+            current,
+            layout.memory_v2_state_dir("local"),
+        );
+        if let Some(repo) = layout.repo_root.clone() {
+            scopes = scopes.with_repo_root(repo);
+        }
+        roots = roots.with_local(scopes);
+    }
+    roots = roots.with_global(ScopeRoots::new(
+        MemoryScope::Global,
+        layout.global_memory_dir(),
+        layout.memory_v2_state_dir("global"),
+    ));
+    leveler_memory::MemoryService::new(roots)
 }
 
 /// Stable digest of the configuration sources a repository runtime loads.
@@ -374,7 +356,7 @@ mod memory_policy_tests {
                 enabled: false,
                 user_enabled: true,
                 experience_enabled: true,
-                backend: leveler_core::MemoryBackend::Legacy,
+                deprecated_backend: None,
             },
             ..ProjectConfig::default()
         });
@@ -391,7 +373,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: true,
                 experience_enabled: true,
-                backend: leveler_core::MemoryBackend::Legacy,
+                deprecated_backend: None,
             },
             ..ProjectConfig::default()
         });
@@ -419,7 +401,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: true,
                 experience_enabled: false,
-                backend: leveler_core::MemoryBackend::Legacy,
+                deprecated_backend: None,
             },
             ..ProjectConfig::default()
         });
@@ -432,7 +414,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: false,
                 experience_enabled: true,
-                backend: leveler_core::MemoryBackend::Legacy,
+                deprecated_backend: None,
             },
             ..ProjectConfig::default()
         });
@@ -445,7 +427,7 @@ mod memory_policy_tests {
                 enabled: true,
                 user_enabled: false,
                 experience_enabled: false,
-                backend: leveler_core::MemoryBackend::Legacy,
+                deprecated_backend: None,
             },
             ..ProjectConfig::default()
         });
@@ -627,17 +609,17 @@ impl Drop for Application {
 }
 
 impl Application {
-    /// The configured memory backend. One answer for every caller, so a
-    /// command cannot read one store while writes go to another.
-    pub fn memory_backend(&self) -> leveler_core::MemoryBackend {
-        self.memory.backend()
+    /// A handle on the memory store. The service is stateless beyond its
+    /// roots; constructing it per command keeps the layout the only input, so
+    /// every caller reaches the same Markdown scopes.
+    pub fn memory_service(&self) -> leveler_memory::MemoryService {
+        memory_service(&self.layout)
     }
 
-    /// A handle on the configured memory store. The service is stateless
-    /// beyond its roots; constructing it per command keeps the layout and the
-    /// backend the only inputs.
-    pub fn memory_service(&self) -> leveler_memory::MemoryService {
-        memory_service(&self.layout, self.memory.backend())
+    /// A notice for a config that still carries the removed `memory.backend`
+    /// key. `None` when the config never named a backend.
+    pub fn deprecated_memory_backend(&self) -> Option<String> {
+        self.project_config().memory.deprecated_backend()
     }
 
     /// The lanes this project has open. Reads and writes both honor them.
@@ -1036,14 +1018,14 @@ impl Application {
             db.clone(),
             self.boot_id()?,
             self.layout.state_dir.clone(),
-            self.layout.memory_dir(),
+            memory_service(&self.layout),
             self.registry.clone(),
             Arc::new(move |event| {
                 let _ = events.send(event);
             }),
         )
         .with_lanes(self.memory.lanes())
-        .with_memory_service(memory_service(&self.layout, self.memory.backend()));
+        .with_memory_service(memory_service(&self.layout));
         if self.memory_consolidator.set(worker.clone()).is_ok() {
             drop(worker.spawn());
         }
@@ -1315,7 +1297,7 @@ impl Application {
         // later asks for one.
         if self.memory.any_lane() {
             capabilities = capabilities
-                .with_memory_service(memory_service(&self.layout, self.memory.backend()))
+                .with_memory_service(memory_service(&self.layout))
                 .with_memory_lanes(self.memory.lanes());
         }
         let tool_context = match workspace {
@@ -1580,28 +1562,6 @@ impl Application {
                 .and_then(|state| state.with_default_active(default_active))
                 .map_err(AppError::Engine)?,
         );
-        // The catalog is the user lane's index; experience entries are
-        // deliberately absent from it (they are found by recall or the
-        // `memory` tool), so a closed user lane produces no catalog at all.
-        // Stage 2 has no Markdown catalog yet: reading the legacy store while
-        // the project writes Markdown would inject a different database than
-        // the one being maintained, so the honest state is "no catalog".
-        let memory_catalog = if available_packs.memory && self.memory.user_enabled() {
-            match self.memory.backend() {
-                leveler_core::MemoryBackend::Legacy => {
-                    load_memory_catalog(&self.layout.memory_dir())
-                }
-                leveler_core::MemoryBackend::Markdown => {
-                    tracing::debug!(
-                        event = "memory_catalog_unavailable",
-                        "memory catalog is not available on the markdown backend yet"
-                    );
-                    String::new()
-                }
-            }
-        } else {
-            String::new()
-        };
         // The global home root (never a cwd-relative `.leveler`, which would
         // read/write user config inside whatever directory we launched from).
         let leveler_home = leveler_core::LevelerHome::resolve(leveler_core::environment())
@@ -1639,15 +1599,13 @@ impl Application {
                     .execution_overrides_for_session(session_scope, Some(model))
                     .await?,
                 capabilities: Some(capabilities),
-                memory_catalog,
                 memory_expose: available_packs.memory,
-                memory_root: (self.memory.any_lane()
-                    && self.memory.backend() == leveler_core::MemoryBackend::Legacy)
-                    .then(|| self.layout.memory_dir()),
+                // One service for tools, recall and the background worker: a
+                // run has no second store to fall back to.
                 memory_service: self
                     .memory
                     .any_lane()
-                    .then(|| Arc::new(memory_service(&self.layout, self.memory.backend()))),
+                    .then(|| Arc::new(memory_service(&self.layout))),
                 memory_lanes: self.memory.lanes(),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,
@@ -1703,63 +1661,10 @@ pub(crate) fn canonical_work_profile(_raw: &str) -> String {
     "single".to_string()
 }
 
-/// How many catalog titles reach the system prefix.
-///
-/// Smaller than the old all-active index: the catalog is a discovery aid for
-/// decisions and notes whose wording a request might miss, not an inventory.
-/// It is paid for on every request of every turn, so it stays short.
-const MEMORY_CATALOG_MAX_ENTRIES: usize = 16;
-
-/// Titles of stored decisions/notes for system injection (no bodies, no
-/// preferences — those are injected in full in the turn tail — and nothing
-/// derived or sensitive). Empty when there is nothing to offer.
-pub(crate) fn load_memory_catalog(memory_dir: &std::path::Path) -> String {
-    match leveler_memory::MemoryStore::open(memory_dir) {
-        Ok(store) => store
-            .catalog_lines(MEMORY_CATALOG_MAX_ENTRIES)
-            .unwrap_or_default(),
-        Err(err) => {
-            tracing::debug!(error = %err, "memory catalog unavailable");
-            String::new()
-        }
-    }
-}
-
 // Turn-time candidate extraction lives in the durable consolidator: the SQL
 // inbox trigger records the turn, and the background worker calls the model
 // extractor. A synchronous, rule-based second extractor here would be a
 // competing policy owner and a second source of truth.
-
-#[cfg(test)]
-mod memory_catalog_tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn the_catalog_lists_titles_not_bodies() {
-        let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let store = leveler_memory::MemoryStore::open(&mem).unwrap();
-        store
-            .remember(leveler_memory::new_entry(
-                "Use workspace write",
-                "SECRET_BODY_NEVER_IN_INDEX",
-                vec![],
-            ))
-            .unwrap();
-        let index = load_memory_catalog(&mem);
-        assert!(index.contains("Use workspace write"), "{index}");
-        assert!(!index.contains("SECRET_BODY"), "{index}");
-    }
-
-    #[test]
-    fn a_missing_store_yields_an_empty_catalog() {
-        let dir = tempdir().unwrap();
-        // path does not exist yet — open creates it empty
-        let index = load_memory_catalog(&dir.path().join("nope-yet"));
-        assert!(index.is_empty() || !index.contains("SECRET"));
-    }
-}
 
 fn top_level_limits_from_config(
     config: &leveler_project::RunLimitsConfig,

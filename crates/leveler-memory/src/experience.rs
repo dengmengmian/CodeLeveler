@@ -17,7 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{MemoryError, looks_like_secret};
+use crate::looks_like_secret;
+use crate::validation::ValidationError;
 
 /// The stored `kind` label. Kept as a string on disk so old readers keep
 /// loading; [`crate::MemoryKind::Experience`] is the parse boundary.
@@ -186,33 +187,33 @@ impl ExperienceRecord {
 
 /// Validate the structural evidence contract. This is deterministic and runs
 /// on every write path, including a candidate restored from disk.
-pub fn validate_experience_record(record: &ExperienceRecord) -> Result<(), MemoryError> {
+pub fn validate_experience_record(record: &ExperienceRecord) -> Result<(), ValidationError> {
     let applies = record.applies_when.trim();
     if applies.is_empty() || applies.chars().count() > MAX_APPLIES_WHEN_CHARS {
-        return Err(MemoryError::Invalid(
+        return Err(ValidationError::Invalid(
             "experience applies_when must be 1..=400 characters".to_string(),
         ));
     }
     if looks_like_secret(applies) {
-        return Err(MemoryError::Invalid(
+        return Err(ValidationError::Invalid(
             "experience applies_when looks like a secret".to_string(),
         ));
     }
     if let Some(invalid_if) = record.invalid_if.as_deref() {
         let invalid_if = invalid_if.trim();
         if invalid_if.is_empty() || invalid_if.chars().count() > MAX_INVALID_IF_CHARS {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "experience invalid_if must be 1..=400 characters when present".to_string(),
             ));
         }
         if looks_like_secret(invalid_if) {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "experience invalid_if looks like a secret".to_string(),
             ));
         }
     }
     if record.evidence.is_empty() || record.evidence.len() > MAX_EVIDENCE_REFS {
-        return Err(MemoryError::Invalid(
+        return Err(ValidationError::Invalid(
             "experience requires 1..=8 evidence references".to_string(),
         ));
     }
@@ -220,22 +221,22 @@ pub fn validate_experience_record(record: &ExperienceRecord) -> Result<(), Memor
         let kind = evidence.kind.trim();
         let reference = evidence.reference.trim();
         if kind.is_empty() || kind.chars().count() > MAX_EVIDENCE_KIND_CHARS {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "experience evidence kind is empty or too long".to_string(),
             ));
         }
         if !matches!(kind, "failure" | "resolution" | "mutation" | "observation") {
-            return Err(MemoryError::Invalid(format!(
+            return Err(ValidationError::Invalid(format!(
                 "experience evidence kind `{kind}` is not a runtime fact"
             )));
         }
         if reference.is_empty() || reference.chars().count() > MAX_EVIDENCE_REF_CHARS {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "experience evidence reference is empty or too long".to_string(),
             ));
         }
         if looks_like_secret(reference) {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "experience evidence reference looks like a secret".to_string(),
             ));
         }
@@ -251,7 +252,7 @@ pub fn validate_experience_record(record: &ExperienceRecord) -> Result<(), Memor
             _ => has("failure") && has("resolution"),
         };
         if !shaped {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "verified experience needs the runtime facts its category claims".to_string(),
             ));
         }

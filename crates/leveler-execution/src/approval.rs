@@ -214,9 +214,9 @@ impl Approver for EvalApprove {
 /// Tools that write durable project memory and always need human confirmation.
 ///
 /// Pending-candidate **accept** is deliberately **not** an agent tool: durable
-/// promotion goes through user-authoritative CLI (`leveler memory accept`) or a
-/// future UI consent surface that calls `MemoryStore::accept` after a human
-/// click. AutoApprove therefore cannot silently activate candidates.
+/// promotion goes through a user-authoritative surface (the TUI/desktop review
+/// action) that mints a user actor. AutoApprove therefore cannot silently
+/// activate candidates.
 /// Whether this command would invoke CodeLeveler's OWN user-consent surface.
 ///
 /// `leveler memory accept|reject|remember|forget` IS the user's consent that

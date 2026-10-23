@@ -1,15 +1,13 @@
 //! Pure memory-candidate extraction (no I/O except optional path reads).
 //!
-//! System-proposed candidates must still go through
-//! [`crate::MemoryStore::accept`] (user consent) before becoming active
+//! System-proposed candidates still go through the memory lifecycle (user
+//! consent for a higher-authority replacement) before becoming active
 //! entries. Extractors never write durable memory themselves.
-
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lifecycle::{CandidateOperation, MemoryAuthority};
-use crate::{MemoryError, now_rfc3339, slugify};
+use crate::util::{now_rfc3339, short_hash, slugify};
+use crate::validation::ValidationError;
 
 /// How a candidate was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +137,16 @@ pub struct MemoryCandidate {
     pub experience: Option<crate::ExperienceRecord>,
 }
 
+/// Stable fingerprint used for suppress-after-reject and dedup.
+fn fingerprint_of(kind: CandidateKind, key: Option<&str>, title: &str, body: &str) -> String {
+    let kind_s = match kind {
+        CandidateKind::Preference => "preference",
+        CandidateKind::PackageManager => "package_manager",
+        CandidateKind::Free => "free",
+    };
+    short_hash(&format!("{kind_s}|{}|{title}|{body}", key.unwrap_or("")))
+}
+
 impl MemoryCandidate {
     /// Build a candidate with slug id and fingerprint derived from kind/key/body.
     pub fn new(
@@ -148,11 +156,11 @@ impl MemoryCandidate {
         key: Option<String>,
         source: CandidateSource,
         tags: Vec<String>,
-    ) -> Result<Self, MemoryError> {
+    ) -> Result<Self, ValidationError> {
         let title = title.into().trim().to_string();
         let body = body.into().trim().to_string();
         if title.is_empty() || body.is_empty() {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "candidate title and body are required".into(),
             ));
         }
@@ -160,7 +168,7 @@ impl MemoryCandidate {
             || looks_like_secret(&body)
             || tags.iter().any(|tag| looks_like_secret(tag))
         {
-            return Err(MemoryError::Invalid(
+            return Err(ValidationError::Invalid(
                 "refusing candidate that looks like a secret".into(),
             ));
         }
@@ -191,120 +199,6 @@ impl MemoryCandidate {
             experience: None,
         })
     }
-}
-
-/// Which durable fields of a candidate carry credential-shaped material.
-pub fn candidate_sensitive_fields(candidate: &MemoryCandidate) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if looks_like_secret(&candidate.title) {
-        fields.push("title");
-    }
-    if looks_like_secret(&candidate.body) {
-        fields.push("body");
-    }
-    if candidate.tags.iter().any(|tag| looks_like_secret(tag)) {
-        fields.push("tags");
-    }
-    if candidate.key.as_deref().is_some_and(looks_like_secret) {
-        fields.push("key");
-    }
-    if candidate.evidence.as_deref().is_some_and(looks_like_secret) {
-        fields.push("evidence");
-    }
-    if let Some(experience) = candidate.experience.as_ref()
-        && (looks_like_secret(&experience.applies_when)
-            || experience
-                .invalid_if
-                .as_deref()
-                .is_some_and(looks_like_secret)
-            || experience.evidence.iter().any(|evidence| {
-                looks_like_secret(&evidence.kind) || looks_like_secret(&evidence.reference)
-            }))
-    {
-        fields.push("experience");
-    }
-    fields
-}
-
-/// A pending proposal whose durable fields are safe to show a client.
-pub fn is_sensitive_candidate(candidate: &MemoryCandidate) -> bool {
-    !candidate_sensitive_fields(candidate).is_empty()
-}
-
-/// Redact a pending proposal that carries credential-shaped material.
-///
-/// Unlike an archived entry, a proposal exists ONLY to ask for consent. A
-/// credential anywhere in it means there is nothing safe to approve, so the
-/// identifying text is withheld entirely; the owner can scrub or reject it.
-pub fn redact_candidate(candidate: &mut MemoryCandidate) {
-    if !is_sensitive_candidate(candidate) {
-        return;
-    }
-    candidate.title = crate::REDACTED_TITLE.to_string();
-    candidate.body = crate::REDACTED_BODY.to_string();
-    candidate.tags.clear();
-    candidate.evidence = None;
-    candidate.experience = None;
-    if candidate.key.as_deref().is_some_and(looks_like_secret) {
-        candidate.key = None;
-        candidate.semantic_key = None;
-    }
-}
-
-/// Validate every field that can reach durable storage, not only title/body.
-pub(crate) fn validate_candidate(candidate: &MemoryCandidate) -> Result<(), MemoryError> {
-    if !candidate_sensitive_fields(candidate).is_empty() {
-        return Err(MemoryError::Invalid(
-            "refusing candidate that looks like a secret".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Stable fingerprint used for suppress-after-reject and dedup.
-pub fn fingerprint_of(kind: CandidateKind, key: Option<&str>, title: &str, body: &str) -> String {
-    let kind_s = match kind {
-        CandidateKind::Preference => "preference",
-        CandidateKind::PackageManager => "package_manager",
-        CandidateKind::Free => "free",
-    };
-    let raw = format!(
-        "{kind_s}|{}|{}|{}",
-        key.unwrap_or(""),
-        title.trim(),
-        body.trim()
-    );
-    // Short stable hex-ish hash (FNV-1a 64) — not cryptographic.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in raw.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
-}
-
-/// Heuristic: content whose scope reaches a destructive operation.
-///
-/// A memory that mentions wiping a database or deleting production is still
-/// worth remembering — it may be a real project rule — but it must not become
-/// current truth from extraction alone. It waits for the user to confirm the
-/// exact wording. This is the single classifier for that policy: the store
-/// uses it to decide admission and clients use it to mark the same records.
-pub fn is_high_risk_memory(text: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "重置数据库",
-        "清空数据库",
-        "删除数据库",
-        "删除生产",
-        "清空数据",
-        "drop database",
-        "reset database",
-        "delete database",
-        "truncate table",
-        "rm -rf",
-    ];
-    let lower = text.to_ascii_lowercase();
-    MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 /// Heuristic: refuse API keys / tokens in candidate text.
@@ -499,43 +393,100 @@ pub fn title_from_body(body: &str) -> String {
     }
 }
 
-/// The package manager this repository uses: `pnpm` / `yarn` / `npm` from a
-/// lockfile (in that order), else `package.json#packageManager`.
+/// How much weight a candidate carries when it conflicts with existing memory.
 ///
-/// This is a fact about the working tree, so it is READ on demand and never
-/// remembered. The candidate factory that used to turn it into a durable
-/// memory was removed: a stored copy is a second source of truth, and it would
-/// keep reporting `pnpm` after a project moved to `bun`.
-pub fn package_manager_from_root(root: &Path) -> Option<&'static str> {
-    if root.join("pnpm-lock.yaml").is_file() {
-        return Some("pnpm");
-    }
-    if root.join("yarn.lock").is_file() {
-        return Some("yarn");
-    }
-    if root.join("package-lock.json").is_file() {
-        return Some("npm");
-    }
-    if let Some(pm) = package_manager_field(root) {
-        return Some(pm);
-    }
-    // package.json alone is not enough to propose a manager.
-    None
+/// This is a property of the SOURCE, not a promise about the fact: the model's
+/// own inference is the weakest class and can never replace an explicit user
+/// decision on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAuthority {
+    /// The model's own guess. Never overwrites anything by itself.
+    #[default]
+    ModelInference,
+    /// A fact read out of tool output (command, file read).
+    ToolObservation,
+    /// A fact the runtime observed about itself (session, environment).
+    RuntimeObservation,
+    /// A fact the project's own sources state (config, code, AGENTS.md).
+    ProjectSource,
+    /// The user stated it in so many words. The strongest.
+    ExplicitUser,
 }
 
-fn package_manager_field(root: &Path) -> Option<&'static str> {
-    let path = root.join("package.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let field = v.get("packageManager")?.as_str()?;
-    let name = field.split('@').next().unwrap_or(field).trim();
-    match name {
-        "pnpm" => Some("pnpm"),
-        "yarn" => Some("yarn"),
-        "npm" => Some("npm"),
-        "bun" => Some("npm"), // treat as npm-compatible signal only for install scripts
-        _ => None,
+impl MemoryAuthority {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::ModelInference => 0,
+            Self::ToolObservation => 1,
+            Self::RuntimeObservation => 2,
+            Self::ProjectSource => 3,
+            Self::ExplicitUser => 4,
+        }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelInference => "model_inference",
+            Self::ToolObservation => "tool_observation",
+            Self::RuntimeObservation => "runtime_observation",
+            Self::ProjectSource => "project_source",
+            Self::ExplicitUser => "explicit_user",
+        }
+    }
+}
+
+/// What the producer says it is doing to the identity it named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateOperation {
+    #[default]
+    Create,
+    Update,
+    Negate,
+}
+
+/// Normalize a subject into a stable identity. Deterministic, not semantic:
+/// it folds spelling only — case, whitespace and separator characters. It
+/// NEVER strips a trailing word: `billing_model` and `billing_setting` are two
+/// different facts, and an identity that collapses them makes one silently
+/// overwrite the other.
+pub fn semantic_key_of(subject: &str) -> String {
+    let subject = subject.trim();
+    // The extractor receives stored identities as the subject to reuse, so
+    // normalization must be idempotent. A string already in the canonical key
+    // namespace is its own identity; folding it again would nest `k-k-...`.
+    if is_canonical_key(subject) {
+        return subject.to_string();
+    }
+    let normalized: String = subject
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            '.' | '-' | '/' | '\\' => '_',
+            other => other,
+        })
+        .flat_map(char::to_lowercase)
+        .collect();
+    if normalized.is_empty() {
+        "fact".to_string()
+    } else if normalized.is_ascii() && normalized.len() <= 48 {
+        format!("k-{}", slugify(&normalized))
+    } else {
+        // Long subjects (and all CJK) use a hash. `slugify` truncates ids for
+        // readability, and truncating an identity would merge two facts that
+        // merely share a prefix.
+        format!("k-{}", short_hash(&normalized))
+    }
+}
+
+pub fn is_canonical_key(value: &str) -> bool {
+    value.starts_with("k-")
+        && value.len() > 2
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -630,6 +581,22 @@ mod tests {
 
     /// Old `pending/` files still load.
     #[test]
+    fn a_canonical_key_is_its_own_identity() {
+        // The extractor receives stored identities as subjects to reuse, so
+        // folding must be idempotent: a key already in the namespace is its
+        // own identity, never `k-k-...`.
+        let key = semantic_key_of("default_model");
+        assert!(is_canonical_key(&key), "{key}");
+        assert_eq!(semantic_key_of(&key), key);
+        // Case and separators fold; whitespace is dropped rather than turned
+        // into a separator, so `Default Model` is not `default_model`.
+        assert_eq!(semantic_key_of("DEFAULT_MODEL"), key);
+        assert_eq!(semantic_key_of("default.model"), key);
+        assert_eq!(semantic_key_of(" default_model "), key);
+        assert!(!is_canonical_key("default model"));
+    }
+
+    #[test]
     fn legacy_sources_still_deserialize() {
         for wire in ["\"user_explicit\"", "\"system_propose\""] {
             let parsed: CandidateSource = serde_json::from_str(wire).expect(wire);
@@ -652,8 +619,6 @@ mod tests {
     }
 
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
 
     #[test]
     fn explicit_chinese_remember_colon_is_a_direct_write() {
@@ -733,38 +698,5 @@ mod tests {
         ] {
             assert!(!looks_like_secret(text), "ordinary text was hidden: {text}");
         }
-    }
-
-    #[test]
-    fn pnpm_lockfile_is_read_not_remembered() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: '9'\n").unwrap();
-        assert_eq!(package_manager_from_root(dir.path()), Some("pnpm"));
-    }
-
-    #[test]
-    fn package_manager_field_without_lockfile() {
-        let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"name":"x","packageManager":"pnpm@9.0.0"}"#,
-        )
-        .unwrap();
-        assert_eq!(package_manager_from_root(dir.path()), Some("pnpm"));
-    }
-
-    #[test]
-    fn no_signal_no_package_manager() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
-        assert_eq!(package_manager_from_root(dir.path()), None);
-    }
-
-    #[test]
-    fn yarn_over_npm_when_yarn_lock_present() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("yarn.lock"), "# yarn\n").unwrap();
-        fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
-        assert_eq!(package_manager_from_root(dir.path()), Some("yarn"));
     }
 }

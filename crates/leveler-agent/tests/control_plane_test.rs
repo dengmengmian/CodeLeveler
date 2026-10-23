@@ -278,7 +278,6 @@ async fn resume_reloads_selected_skill_and_honors_current_memory_exposure() {
     let saved = Arc::new(Mutex::new(Vec::new()));
     executor(dir.path(), first.clone(), PermissionProfile::Assisted, 3)
         .with_memory_expose(true)
-        .with_memory_catalog("OLD_MEMORY_CATALOG_SENTINEL")
         .run(
             "use $demo to inspect",
             &mut |_| {},
@@ -313,7 +312,6 @@ async fn resume_reloads_selected_skill_and_honors_current_memory_exposure() {
         "resume lost the active selected procedure"
     );
     assert!(!control.contains("SKILL_A_SENTINEL"));
-    assert!(!control.contains("OLD_MEMORY_CATALOG_SENTINEL"));
     assert!(
         !requests[0]
             .control_context

@@ -5462,7 +5462,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 include_archived,
                 query_id,
             } => {
-                let memory_dir = self.app.layout.memory_dir();
+                // The location shown is the current Markdown root: the store
+                // this process actually reads.
+                let memory_dir = self
+                    .app
+                    .layout
+                    .markdown_memory_dir()
+                    .unwrap_or_else(|| self.app.layout.state_dir.clone());
                 let events = self.events_for(&session_id);
                 send_memory_list(
                     &events,
@@ -8855,6 +8861,22 @@ mod session_declaration_tests {
 mod memory_listing_tests {
     use super::*;
 
+    fn project_service(dir: &std::path::Path) -> leveler_memory::MemoryService {
+        leveler_memory::MemoryService::new(leveler_memory::MemoryRoots::new().with_project(
+            leveler_memory::v2::ScopeRoots::new(
+                leveler_memory::v2::MemoryScope::Project,
+                dir.join("memory"),
+                dir.join("memory-v2"),
+            ),
+        ))
+    }
+
+    fn user() -> leveler_memory::v2::Actor {
+        leveler_memory::v2::Actor::User {
+            invocation: leveler_memory::v2::UserInvocationId::mint("listing-test"),
+        }
+    }
+
     #[test]
     fn memory_listing_real_empty_preserves_shape_and_query_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -8862,7 +8884,7 @@ mod memory_listing_tests {
         for include_archived in [false, true] {
             send_memory_list(
                 &events,
-                &leveler_memory::MemoryService::legacy(directory.path()),
+                &project_service(directory.path()),
                 leveler_memory::MemoryLanes::ALL,
                 directory.path(),
                 include_archived,
@@ -8884,90 +8906,67 @@ mod memory_listing_tests {
         }
     }
 
+    /// A current record that cannot be read is a broken store, not an empty
+    /// one: the listing must say so instead of presenting a short list.
     #[test]
-    fn memory_listing_corrupt_active_archive_pending_never_emit_fake_empty() {
-        for folder in ["active", "archive", "pending"] {
-            let directory = tempfile::tempdir().unwrap();
-            let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
-            std::fs::write(
-                directory.path().join(folder).join("broken.json"),
-                b"not JSON",
-            )
-            .unwrap();
-            let failure = match folder {
-                "active" => store.list_active().is_err(),
-                "archive" => store.list_archived().is_err(),
-                _ => store.list_pending().is_err(),
-            };
-            assert!(failure, "existing store rejects malformed {folder} data");
-            let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-            send_memory_list(
-                &events,
-                &leveler_memory::MemoryService::legacy(directory.path()),
-                leveler_memory::MemoryLanes::ALL,
-                directory.path(),
-                true,
-                Some("memory-query".into()),
-            );
-            assert!(
-                matches!(
-                    receiver.try_recv().unwrap(),
-                    RuntimeEvent::Notification {
-                        level: leveler_client_protocol::NotificationLevel::Warning,
-                        ..
-                    }
-                ),
-                "{folder} failure must be visible"
-            );
-            assert!(
-                receiver.try_recv().is_err(),
-                "failed listing must not emit MemoryList"
-            );
-        }
-    }
-
-    #[test]
-    fn a_sensitive_listing_row_never_carries_its_title_or_body() {
+    fn memory_listing_a_broken_record_is_reported_not_shown_as_empty() {
         let directory = tempfile::tempdir().unwrap();
-        let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
-        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
-
-        let mut active = leveler_memory::new_entry("Deploy token", "safe body", vec![]);
-        active.body = format!("token={secret}");
+        let service = project_service(directory.path());
+        // A malformed document in the current root.
+        std::fs::create_dir_all(directory.path().join("memory")).unwrap();
         std::fs::write(
-            directory
-                .path()
-                .join("active")
-                .join(format!("{}.json", active.id)),
-            serde_json::to_vec_pretty(&active).unwrap(),
+            directory.path().join("memory").join("broken.md"),
+            b"---\nid: [unterminated\n---\nbody",
         )
         .unwrap();
-
-        let mut pending = leveler_memory::MemoryCandidate::new(
-            "Pending note",
-            "safe body",
-            leveler_memory::CandidateKind::Free,
-            None,
-            leveler_memory::CandidateSource::AgentProposed,
-            vec![],
-        )
-        .unwrap();
-        pending.body = format!("password=another-{secret}");
-        std::fs::write(
-            directory
-                .path()
-                .join("pending")
-                .join(format!("{}.json", pending.id)),
-            serde_json::to_vec_pretty(&pending).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(store.list_active().unwrap().len(), 1, "fixture active");
-        assert_eq!(store.list_pending().unwrap().len(), 1, "fixture pending");
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         send_memory_list(
             &events,
-            &leveler_memory::MemoryService::legacy(directory.path()),
+            &service,
+            leveler_memory::MemoryLanes::ALL,
+            directory.path(),
+            true,
+            Some("memory-query".into()),
+        );
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap(),
+                RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    ..
+                }
+            ),
+            "an unreadable store must be visible"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "failed listing must not emit MemoryList"
+        );
+    }
+
+    /// A credential-shaped record cannot enter the store at all, so no listing
+    /// row can carry one. The refusal is the protection; the listing proves it.
+    #[test]
+    fn a_credential_shaped_write_never_reaches_a_listing_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = project_service(directory.path());
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let refused = service.remember(
+            &user(),
+            leveler_memory::RememberRequest::new(
+                leveler_memory::v2::OpId::derived("listing", "secret"),
+                leveler_memory::ServiceScope::Project,
+                "Deploy token",
+                format!("token={secret}"),
+                "note",
+            ),
+        );
+        assert!(refused.is_err(), "a credential must not be stored");
+
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        send_memory_list(
+            &events,
+            &service,
             leveler_memory::MemoryLanes::ALL,
             directory.path(),
             true,
@@ -8977,15 +8976,9 @@ mod memory_listing_tests {
             RuntimeEvent::MemoryList {
                 active, pending, ..
             } => {
-                assert_eq!(active[0].title, leveler_memory::REDACTED_TITLE);
-                assert_eq!(pending[0].title, leveler_memory::REDACTED_TITLE);
-                assert_eq!(pending[0].body, leveler_memory::REDACTED_BODY);
                 let wire = format!("{active:?} {pending:?}");
-                assert!(
-                    !wire.contains(secret),
-                    "listing leaked the credential: {wire}"
-                );
-                assert!(!wire.contains("Deploy token"), "{wire}");
+                assert!(active.is_empty() && pending.is_empty(), "{wire}");
+                assert!(!wire.contains(secret), "listing leaked the credential");
             }
             other => panic!("expected memory listing, got {other:?}"),
         }
@@ -8995,40 +8988,45 @@ mod memory_listing_tests {
     #[test]
     fn memory_listing_directory_read_errors_are_not_empty_results() {
         use std::os::unix::fs::PermissionsExt;
-        for folder in ["active", "archive", "pending"] {
-            let directory = tempfile::tempdir().unwrap();
-            let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
-            let path = directory.path().join(folder);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
-            let open_ok = leveler_memory::MemoryStore::open(directory.path()).is_ok();
-            let failed = match folder {
-                "active" => store.list_active().is_err(),
-                "archive" => store.list_archived().is_err(),
-                _ => store.list_pending().is_err(),
-            };
-            let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-            send_memory_list(
-                &events,
-                &leveler_memory::MemoryService::legacy(directory.path()),
-                leveler_memory::MemoryLanes::ALL,
-                directory.path(),
-                true,
-                Some("directory-query".into()),
-            );
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(
-                open_ok && failed,
-                "fixture must mechanically prove directory read failure; a privileged OS user cannot establish this fixture"
-            );
-            assert!(matches!(
+        let directory = tempfile::tempdir().unwrap();
+        let service = project_service(directory.path());
+        // One current record so the store is initialized, then make the
+        // current root unreadable.
+        service
+            .remember(
+                &user(),
+                leveler_memory::RememberRequest::new(
+                    leveler_memory::v2::OpId::derived("listing", "one"),
+                    leveler_memory::ServiceScope::Project,
+                    "Deploy preference",
+                    "Use foreground service startup.",
+                    "note",
+                ),
+            )
+            .unwrap();
+        let path = directory.path().join("memory");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        send_memory_list(
+            &events,
+            &service,
+            leveler_memory::MemoryLanes::ALL,
+            directory.path(),
+            true,
+            Some("directory-query".into()),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(
                 receiver.try_recv().unwrap(),
                 RuntimeEvent::Notification {
                     level: leveler_client_protocol::NotificationLevel::Warning,
                     ..
                 }
-            ));
-            assert!(receiver.try_recv().is_err());
-        }
+            ),
+            "a directory read failure must be visible"
+        );
+        assert!(receiver.try_recv().is_err());
     }
 }
 

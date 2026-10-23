@@ -73,8 +73,6 @@ pub struct ExecutorFactory {
     pub model: ModelRef,
     pub commit_co_author: bool,
     pub overrides: Option<ExecutionOverrides>,
-    /// Short memory INDEX for system injection (titles only).
-    pub memory_catalog: String,
     /// Whether the memory capability reaches the model at all this turn.
     ///
     /// ONE answer for tools, index, recall root and prompt guidance. Without
@@ -82,14 +80,9 @@ pub struct ExecutorFactory {
     /// guidance while the tools were unregistered — telling the model to call
     /// a `remember` it did not have.
     pub memory_expose: bool,
-    /// Durable project memory root. The RUNTIME reads it for per-turn recall
-    /// injection, for parking an unapproved `remember`, and — at terminal
-    /// settlement — nothing else; the memory TOOLS get their own handle at
-    /// construction. `None` = memory unconfigured.
-    pub memory_root: Option<std::path::PathBuf>,
-    /// The host's configured memory service. Takes precedence over
-    /// `memory_root`: a Markdown project must not fall back to a second,
-    /// legacy write path.
+    /// The host's configured memory service. It is the one store this run
+    /// reads and writes; `None` means memory is unconfigured, never "use a
+    /// fallback location".
     pub memory_service: Option<Arc<leveler_memory::MemoryService>>,
     /// Which memory lanes are open for this project. `memory_expose` says the
     /// pack exists; this says which of its two lanes may read or write.
@@ -208,13 +201,9 @@ impl ExecutorFactory {
         .with_step_limits(profile_step_limits(&profile));
 
         executor = executor
-            .with_memory_catalog(self.memory_catalog.clone())
             .with_memory_expose(self.memory_expose)
             .with_memory_lanes(self.memory_lanes);
-        executor = match self.memory_service.clone() {
-            Some(service) => executor.with_memory_service(Some(service)),
-            None => executor.with_memory_root(self.memory_root.clone()),
-        };
+        executor = executor.with_memory_service(self.memory_service.clone());
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

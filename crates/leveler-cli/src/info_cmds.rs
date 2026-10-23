@@ -23,11 +23,17 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
             .unwrap_or_else(|| "No Workspace".to_string())
     );
     println!("  config:  {}", layout.config_dir.display());
-    println!("  memory:  {}", layout.memory_dir().display());
+    println!(
+        "  memory:  {}",
+        layout
+            .markdown_memory_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(no workspace memory)".to_string())
+    );
     println!();
 
     let mut results =
-        leveler_app::doctor::run_with_memory(&config, Some(layout.memory_dir().as_path()));
+        leveler_app::doctor::run_with_memory(&config, Some(&leveler_app::memory_service(&layout)));
     if let Some(root) = layout.primary_workspace() {
         results.push(leveler_app::doctor::agents_check(
             &leveler_agent::agent_registry::AgentRoots::for_project(root),

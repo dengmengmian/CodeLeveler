@@ -8,8 +8,7 @@ mod memory_v2_common;
 
 use leveler_memory::v2::{
     DiagnosticKind, DiagnosticSeverity, ForgetOutcome, JournalPlan, ListQuery, MarkdownStore,
-    MemoryKind, MemoryScope, MemoryStatus, Operation, Receipt, StoreError, frontmatter,
-    sha256_hex,
+    MemoryKind, MemoryScope, MemoryStatus, Operation, Receipt, StoreError, frontmatter, sha256_hex,
 };
 use memory_v2_common::*;
 
@@ -235,7 +234,10 @@ fn pending_obligations_count_without_being_activated() {
             cas,
         )
         .unwrap();
-    assert!(matches!(pending, leveler_memory::v2::Admission::Pending { .. }));
+    assert!(matches!(
+        pending,
+        leveler_memory::v2::Admission::Pending { .. }
+    ));
     drop(store);
 
     let report = diagnose(&fixture);
@@ -293,9 +295,7 @@ fn a_forgotten_record_does_not_look_like_an_empty_scope() {
     );
     let id = applied_id(&admission);
     let cas = store.read(&id).unwrap().cas;
-    let outcome = store
-        .forget(op(), user(), &id, cas)
-        .unwrap();
+    let outcome = store.forget(op(), user(), &id, cas).unwrap();
     assert!(matches!(outcome, ForgetOutcome::Forgotten(_)));
     drop(store);
 

@@ -13,7 +13,10 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent::{AgentEvent, Executor, NoopSink};
 use leveler_core::RequestId;
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
-use leveler_memory::MemoryStore;
+use leveler_memory::{
+    MemoryLanes, MemoryRoots, MemoryService, RememberRequest, ServiceScope,
+    v2::{Actor, MemoryScope, OpId, ScopeRoots, UserInvocationId},
+};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelErrorKind, ModelEventStream, ModelProfile,
     ModelRef, ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage,
@@ -99,6 +102,23 @@ fn assistant_text(text: &str) -> ModelResponse {
     }
 }
 
+/// The project-scope Markdown service this test's `memory` path holds.
+fn memory_service(dir: &std::path::Path, memory: &std::path::Path) -> Arc<MemoryService> {
+    Arc::new(MemoryService::new(MemoryRoots::new().with_project(
+        ScopeRoots::new(
+            MemoryScope::Project,
+            memory.to_path_buf(),
+            dir.join("state"),
+        ),
+    )))
+}
+
+fn active(service: &MemoryService) -> Vec<leveler_memory::MemoryView> {
+    service
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap()
+}
+
 fn executor(
     dir: &std::path::Path,
     memory: &std::path::Path,
@@ -122,7 +142,7 @@ fn executor(
         6,
     )
     .with_memory_expose(true)
-    .with_memory_root(Some(memory.to_path_buf()))
+    .with_memory_service(Some(memory_service(dir, memory)))
     .with_approver(Arc::new(AutoApprove))
 }
 
@@ -166,12 +186,22 @@ async fn a_durable_looking_sentence_waits_for_the_background_extractor() {
     let events = run_turn(&executor, "以后本项目默认模型固定为 flash").await;
 
     assert_eq!(runtime.generate_calls(), 0);
-    let store = MemoryStore::open(&memory).unwrap();
+    let service = memory_service(dir.path(), &memory);
     assert!(
-        store.effective_active().unwrap().is_empty(),
+        active(&service).is_empty(),
         "the main turn must not parse prose into memory"
     );
-    assert!(store.list_pending().unwrap().is_empty());
+    assert!(
+        service
+            .pending(
+                &Actor::User {
+                    invocation: UserInvocationId::mint("semantic-test")
+                },
+                ServiceScope::Project
+            )
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         !events
             .iter()
@@ -184,22 +214,26 @@ async fn a_durable_looking_sentence_waits_for_the_background_extractor() {
 async fn recall_remains_on_the_main_turn_without_triggering_extraction() {
     let dir = tempfile::tempdir().unwrap();
     let memory = dir.path().join("memory");
-    let store = MemoryStore::open(&memory).unwrap();
-    let subject = "默认模型";
-    let key = leveler_memory::semantic_key_of(subject);
-    let mut fact = leveler_memory::MemoryCandidate::new(
+    let service = memory_service(dir.path(), &memory);
+    let mut request = RememberRequest::new(
+        OpId::derived("fixture", "default-model"),
+        ServiceScope::Project,
         "默认模型",
         "以后本项目默认模型固定为 flash",
-        leveler_memory::CandidateKind::Free,
-        Some(key.clone()),
-        leveler_memory::CandidateSource::UserExplicit,
-        vec![format!("subject:{subject}")],
-    )
-    .unwrap();
-    fact.semantic_key = Some(key);
-    fact.authority = leveler_memory::MemoryAuthority::ExplicitUser;
-    let committed = store.commit_candidate(&fact).unwrap();
-    let entry_id = committed.entry.expect("the fact was written").id;
+        "note",
+    );
+    request.subject = Some("默认模型".to_string());
+    let entry_id = service
+        .remember(
+            &Actor::User {
+                invocation: UserInvocationId::mint("semantic-fixture"),
+            },
+            request,
+        )
+        .unwrap()
+        .applied_id()
+        .expect("the fact was written")
+        .to_string();
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("flash")]));
     let executor = executor(dir.path(), &memory, runtime.clone());
 
@@ -207,17 +241,15 @@ async fn recall_remains_on_the_main_turn_without_triggering_extraction() {
 
     assert_eq!(runtime.generate_calls(), 0);
     let request = &runtime.requests()[0];
-    // The main turn receives the candidate row, not the body: applicability
-    // is the model's judgment and the full text is one memory read away.
+    // The main turn carries the recalled record in the uncached tail, with its
+    // revision: applicability is the model's judgment and the full text is one
+    // memory read away.
+    let trailing = request.control_context.trailing_text();
     assert!(
-        request
-            .control_context
-            .text()
-            .contains(&format!("[{entry_id}]")),
-        "the recalled candidate must reach the provider request: {}",
-        request.control_context.text()
+        trailing.contains(&format!("[{entry_id} r1]")),
+        "the recalled candidate must reach the provider request: {trailing}"
     );
-    assert!(request.control_context.text().contains("默认模型"));
+    assert!(trailing.contains("默认模型"), "{trailing}");
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::MemoryRecalled { count, .. } if *count >= 1

@@ -64,16 +64,16 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 
 /// Run all diagnostics against the loaded config.
 ///
-/// When `memory_dir` is provided (from [`crate::Layout`]), report active and
-/// archived memory counts for the project store.
+/// When a memory service is provided (from [`crate::memory_service`]), report
+/// each configured scope's current-record count and blocking issues.
 pub fn run(config: &LoadedConfig) -> Vec<CheckResult> {
     run_with_memory(config, None)
 }
 
-/// Like [`run`], optionally including a memory-store diagnostic line.
+/// Like [`run`], optionally including a memory diagnostic line.
 pub fn run_with_memory(
     config: &LoadedConfig,
-    memory_dir: Option<&std::path::Path>,
+    memory: Option<&leveler_memory::MemoryService>,
 ) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
@@ -127,8 +127,8 @@ pub fn run_with_memory(
         detail: sand,
     });
 
-    if let Some(dir) = memory_dir {
-        results.push(memory_check(dir));
+    if let Some(service) = memory {
+        results.push(memory_check(service));
     }
 
     results
@@ -176,21 +176,55 @@ pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> CheckR
     CheckResult::warn("agents", detail)
 }
 
-fn memory_check(dir: &std::path::Path) -> CheckResult {
-    match leveler_memory::MemoryStore::open(dir) {
-        Ok(store) => match store.counts() {
-            Ok((active, archived)) => CheckResult::ok(
-                "memory",
-                format!(
-                    "memory_dir={} active={} archived={}",
-                    dir.display(),
-                    active,
-                    archived
-                ),
-            ),
-            Err(e) => CheckResult::warn("memory", format!("{} ({e})", dir.display())),
-        },
-        Err(e) => CheckResult::warn("memory", format!("open {}: {e}", dir.display())),
+/// Report current-record counts per configured scope from the one service.
+///
+/// A scope that cannot be opened is a warning, not a failure: a brand-new
+/// project has no store yet, and a broken one must be visible without making
+/// every other check fail.
+fn memory_check(service: &leveler_memory::MemoryService) -> CheckResult {
+    use leveler_memory::{MemoryLanes, ServiceScope};
+    let scope_name = |scope: ServiceScope| match scope {
+        ServiceScope::Project => "project",
+        ServiceScope::Local => "local",
+        ServiceScope::Global => "global",
+    };
+    let mut parts = Vec::new();
+    let mut blocking = 0usize;
+    let mut errors = Vec::new();
+    for scope in service.configured_scopes() {
+        match service.listing_for_user(scope, MemoryLanes::ALL) {
+            Ok(views) => {
+                let mut part = format!("{}=active {}", scope_name(scope), views.len());
+                match service.diagnose(scope) {
+                    Ok(report) => {
+                        blocking += report
+                            .issues
+                            .iter()
+                            .filter(|issue| {
+                                issue.severity == leveler_memory::v2::DiagnosticSeverity::Blocking
+                            })
+                            .count();
+                        if !report.issues.is_empty() {
+                            part.push_str(&format!(" issues={}", report.issues.len()));
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", scope_name(scope)));
+                    }
+                }
+                parts.push(part);
+            }
+            Err(error) => errors.push(format!("{}: {error}", scope_name(scope))),
+        }
+    }
+    if !errors.is_empty() {
+        return CheckResult::warn("memory", errors.join("; "));
+    }
+    let detail = format!("{}", parts.join("; "));
+    if blocking > 0 {
+        CheckResult::warn("memory", format!("{detail}; {blocking} blocking issue(s)"))
+    } else {
+        CheckResult::ok("memory", detail)
     }
 }
 
@@ -470,7 +504,6 @@ pub fn has_failure(results: &[CheckResult]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_memory::{MemoryStore, new_entry};
 
     /// A retired per-model `instructions` key must produce a visible doctor
     /// warning instead of being silently ignored.
@@ -763,18 +796,33 @@ mod tests {
     }
 
     #[test]
-    fn memory_check_reports_counts_and_dir() {
+    fn memory_check_reports_current_counts_per_scope() {
         let root = std::env::temp_dir().join(format!("leveler-doctor-mem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let store = MemoryStore::open(&root).unwrap();
-        store
-            .remember(new_entry("t", "body with unique token xyzzy", vec![]))
+        let service = leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+                leveler_memory::v2::MemoryScope::Project,
+                root.join("current"),
+                root.join("state"),
+            )),
+        );
+        service
+            .remember(
+                &leveler_memory::v2::Actor::User {
+                    invocation: leveler_memory::v2::UserInvocationId::mint("doctor-test"),
+                },
+                leveler_memory::RememberRequest::new(
+                    leveler_memory::v2::OpId::derived("doctor", "t"),
+                    leveler_memory::ServiceScope::Project,
+                    "t",
+                    "body with unique token xyzzy",
+                    "note",
+                ),
+            )
             .unwrap();
-        let line = memory_check(&root);
-        assert_eq!(line.status, CheckStatus::Ok);
-        assert!(line.detail.contains("active=1"), "{}", line.detail);
-        assert!(line.detail.contains("archived=0"), "{}", line.detail);
-        assert!(line.detail.contains("memory_dir="), "{}", line.detail);
+        let line = memory_check(&service);
+        assert_eq!(line.status, CheckStatus::Ok, "{}", line.detail);
+        assert!(line.detail.contains("project=active 1"), "{}", line.detail);
         assert!(
             !line.detail.to_lowercase().contains("sandbox=yes"),
             "{}",

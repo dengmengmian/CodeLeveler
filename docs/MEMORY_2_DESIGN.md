@@ -1,12 +1,12 @@
 # CodeLeveler Memory 2.0 设计
 
-状态：设计已定稿；Stage 1（Markdown Store Foundation）与 Stage 2（Unified Memory Service）已于 2026-10-23 实现，Stage 2.1（正确性收口）随本轮实现（未验证项见 `docs/MEMORY_2_IMPLEMENTATION.md` §1.5 与 §7）。Stage 3–4 未开始：FTS5 检索、Context Builder 与 Logged Injection 未实现；legacy 默认 backend、Experience 默认开关和真实记忆数据均未改变。
+状态：**已实施并完成 cutover（2026-10-23）**。Markdown + YAML frontmatter 是唯一事实来源；`MemoryService` 是唯一业务入口；SQLite FTS5 是可重建派生索引；`MemoryContextBuilder` 是唯一召回/注入 owner，注入结果有 receipt。Stage 1–3 已实现；Stage 4 删除了 Legacy JSON backend、`memory.backend` 选择、迁移工具与 Shadow Compare，并按用户决策精确删除旧 JSON 数据。实施记录见 `docs/MEMORY_2_IMPLEMENTATION.md`，旧数据处置见 `docs/MEMORY_2_MIGRATION.md`。
 
 结论先行：
 
 1. **Markdown-first 足以承载当前全部 durable Memory 语义**，但前提是：Markdown 是当前事实的唯一权威，SQLite 只是可重建索引，所有写入与生命周期转换只经过一个 `MemoryService`。
 2. 当前工作区的 E3 验收测试（`crates/leveler-memory/tests/e3_lifecycle.rs`，11 个，**未跟踪的 WIP**）全绿。但它证明的是 store 级契约，不等于生产可达：U3/U5 依赖的 `replaces_memory_id` 在生产抽取中拿不到（`known_identities` 恒为空），U2 实际走的是 title+body 全等，U6a 只覆盖模型正确标注 statement 的情况。Memory 2.0 要**移植这些契约、补上生产接线、统一写入、跨文件事务、索引与注入日志**，不能把“测试绿”当成“问题已解决”。
-3. 当前真实数据里已经存在疑似 API Key（`k-apikey`、`k-llmprovidervolcanoapikey` 的 evidence 中出现 `ark-...`）。迁移必须默认隔离/脱敏，绝不能把原值写进项目 Markdown 或 Git。
+3. 设计时的真实旧数据里已经存在疑似 API Key（`k-apikey`、`k-llmprovidervolcanoapikey` 的 evidence 中出现 `ark-...`）。因此旧数据的任何处置（当时设想的是迁移）都不得把原值写进项目 Markdown、日志或 Git。Stage 4 的处置是精确删除，同样不复制正文；删除不等于凭据失效，需要时单独轮换。
 4. 项目 Memory 从 `~/.leveler/state/projects/<id>/memory` 迁到 `<repo>/.leveler/memory` 是一项**架构语义变化**：Memory 从“运行时私有状态”变成“用户可编辑、可提交的 workspace 内容”。需要单独批准；Stage 1 只实现可配置的 store，不切换运行时路径。
 5. 不引入独立 LLM Judge、不引入人工语义同义词/停用词表、不新建第二套 MemoryStore、不新建第二套 Session Log。FTS5 只负责召回候选，任何词法命中都不能单独创建、替换或合并 Memory。
 
@@ -88,7 +88,7 @@
 - `MemoryRecalled` 是 transient，不落库；只要尝试注入就发，**包括 0 条**。`MemoryChanged` 落库（LocalOnly）。不存在 `Injected` 事件。
 - `MemoryList` 事件携带 `memory_dir` 绝对路径（`interactive.rs:341`；`client-protocol/src/event.rs:697`），属于低风险信息暴露。
 - 实际磁盘：当前仓库状态目录有 9 个 active JSON；`pending/archive/suppress` 为空。仓库内 `.leveler/` 只有 `config.yaml`，没有 memory 数据。
-- 同一个仓库存在大小写不同的第二个 state namespace（`...CodeLeveler-...` 与 `...codeleveler-...`），迁移时必须识别，不能静默合并。
+- 同一个仓库存在大小写不同的第二个 state namespace（`...CodeLeveler-...` 与 `...codeleveler-...`）。旧数据清理按目录精确匹配，不做跨 namespace 合并。
 
 ### 1.3 多写入路径（这是 Memory 2.0 要收口的核心问题）
 
@@ -128,15 +128,15 @@ Memory 2.0 必须把“决策”和“持久化”都收口到 `MemoryService`�
 这三个“生产不可达”不是测试失败，而是接线/语义边界：
 
 - `memory_consolidator.rs:1166-1168` 调用 `extract_batch_recorded`，该实现使用 `ExtractionContext::default()`（`memory_extract.rs:533-547`），所以 prompt 里的 `known_identities` 为空。模型没有旧 id，`replaces_memory_id` 只能靠猜；猜不中就走 `NeedsApproval`。v2 必须由 service 构造并传入 identity context。
-- `effective_active` 对 keyless 条目无条件 `push`（`lifecycle.rs:1262-1302`），所以“旧 keyless + 新 keyed”会同时作为 current 出现；现有 `memory/pipeline.rs:1009-1036` 甚至把“2 个 active”锁成了预期行为。v2 要为 keyless 迁移记录建立可追踪的 successor 关系，不能只靠 key。
+- 旧实现的 `effective_active` 对 keyless 条目无条件 `push`，所以“旧 keyless + 新 keyed”会同时作为 current 出现。v2 用 `(scope, kind, subject_key)` 作为身份，keyless 记录以 `MemoryId` 为身份；同一用户命令的结构化更新通过显式 relation 表达，不靠标题或正文相似度。
 - `StatementKind` 只在 semantic 校验里使用，`MemoryCandidate` 没有 statement 字段（`candidates.rs:81-140`），验证通过后分类信息就丢了。v2 必须把 statement 持久化，并承认“模型误标”是不可确定性识别的残余风险。
 
-这些测试锁的是**可观察 store 状态**，不是决策枚举或调用成功。Memory 2.0 必须逐条移植到 v2 store，并在 Stage 2 同时跑 legacy/v2 参数化版本，证明不是“换实现后契约退化了”。
+这些测试锁的是**可观察 store 状态**，不是决策枚举或调用成功。这些契约已逐条移植到 v2 store（`crates/leveler-memory/tests/memory_v2_e3_contracts.rs` 等）；legacy 参数化版本随旧实现一并删除。
 
 仍存在的语义边界（设计必须诚实说明，不能假装解决）：
 
 - U2 的现有测试实际是 **title+body 全等** 或 **同 subject 同 value**；同一事实换一种说法、同时换 subject，仍可能成为两条 active。没有 embedding / LLM Judge 时，不能证明等价；强行用文本相似度会违反架构门禁。v2 会把规则收紧到“精确 body 相等”，但仍不解决 paraphrase。
-- U5 的通用“跨 subject 矛盾”无法证明；v2 只能保证：目标明确（replaces id / 同 subject）时旧版本退出 active，以及注入只读 active。keyless 旧值必须通过迁移映射或显式 successor 才能退出 current。
+- U5 的通用“跨 subject 矛盾”无法证明；v2 只能保证：目标明确（replaces id / 同 subject）时旧版本退出 active，以及注入只读 active。keyless 记录只有在显式替换/遗忘时才退出 current。
 - U6a 依赖模型自报的 `statement` + evidence span；运行时只校验 span 是否逐字存在，**不能判断这句话是建议还是决定**。模型把 proposal 标成 assertion 时，确定性校验不会发现。v2 能做的是：由 actor 路径推导 authority、把 statement 持久化、在注入时标注 authority，并接受“模型误标”是不可确定性识别的残余风险；不引入 LLM Judge。
 
 ### 1.5 审计发现的真实缺陷/风险
@@ -152,9 +152,9 @@ Memory 2.0 必须把“决策”和“持久化”都收口到 `MemoryService`�
 | 版本 | 条目无 schema_version | 字段演进只能靠 serde default 猜 |
 | TTL | `expires_at` 字符串比较，未校验 RFC3339 | 非标准时间可能导致错误过期 |
 | Scope | `MemoryScope::Ephemeral` 未强制 expiry | 临时事实可能长期 active |
-| 安全 | 旧数据已有真实凭据；`MemoryList` 暴露绝对路径 | 迁移/投影泄露风险 |
+| 安全 | 旧数据已有真实凭据；`MemoryList` 暴露绝对路径 | 处置/投影泄露风险 |
 | 一致性 | `MemoryRecalled` 文档说“至少一条才发”，实际 0 条也发 | 文档/行为不一致 |
-| 路径 | 同一 repo 有大小写不同的 state 目录 | 迁移可能重复/遗漏 |
+| 路径 | 同一 repo 有大小写不同的 state 目录 | 清理清单可能重复/遗漏 |
 | 架构 | 项目 memory 在 repo 外 | 不可人工编辑、不可团队共享、不可版本化 |
 | 接线 | 生产 `known_identities` 恒为空（`ExtractionContext::default()`） | U3/U5 的 `replaces_memory_id` 正常拿不到，修正退化为 pending/猜 id |
 | 身份 | `related_subject` 只用于一次性匹配，不持久化别名 | 用旧 subject 后续更新会找不到 active，产生第二条事实 |
@@ -179,7 +179,7 @@ Memory 2.0 必须把“决策”和“持久化”都收口到 `MemoryService`�
 4. 所有写入、生命周期、pending、TTL、scope 转换经过同一个 `MemoryService`。
 5. Markdown 可读、可编辑、可 diff；SQLite FTS5 只做可重建索引。
 6. 每一轮实际注入可审计：id、revision、scope、kind、mode、token、omission、digest；同时区分历史注入与当前 Memory。
-7. 迁移可预演、可回滚、可对照，不修改旧数据，不把密钥写进 Git。
+7. 旧数据处置必须可审计、可预演（dry run）；Stage 4 的最终决策是不迁移、精确删除，不把密钥写进 Git。
 8. 规模上不靠“每轮扫描整个目录”。
 
 ### 2.2 非目标
@@ -342,20 +342,18 @@ Project current root 内有一个**窄** `.gitignore`，只用于临时提交文
 - `superseded`/`deprecated`/`expired` 的正文从 current 移出：最终状态写 `attic` 元数据，正文留在 `history`；`read` 非 active 走 attic + history。
 - `pending` 只在 `state_root/pending/`，不进入 current root，也不进入项目 Git。
 - `history` 可能包含已纠正/已遗忘前的敏感内容：只存在私有 state root，0700；Forget 时删除。
-- 旧 JSON store 保持原位，迁移期间只读，不删除。
 - `current_root` 与 `state_root` 可以跨文件系统；`current_root/.stage/` 只用于同文件系统 rename，`state_root` 的 journal 只提供恢复信息。
 
 ### 4.4 与现有路径的关系
 
-- `Layout::memory_dir()` 当前返回 `<state_dir>/memory`（legacy JSON store）。Memory 2.0 增加：
+- `Layout` 只暴露 Markdown 路径：
   - `Layout::markdown_memory_dir()` → `<repo>/.leveler/memory`（project current root）
   - `Layout::local_memory_dir()` → `<repo>/.leveler/local/memory`（local current root）
   - `Layout::global_memory_dir()` → `~/.leveler/memory`（global current root）
   - `Layout::memory_v2_state_dir(scope)` → project/local: `<state_dir>/memory-v2/<scope>/`；global: `~/.leveler/state/memory-v2/global/`
-  - `Layout::legacy_memory_dir()` → 现有 `memory_dir()`，迁移期只读
-- 不直接改变 `memory_dir()` 的返回值，避免 Stage 1/2 之外的所有旧调用点被动切换。Stage 2 增加 `memory.backend`（默认 legacy，用于测试/dogfood）；Stage 4 cutover 时由 config 切换，再统一改调用点。
+- 旧的 `Layout::memory_dir()`（`<state_dir>/memory`）已随 legacy store 删除；不存在可切换的第二个存储路径或 `memory.backend` 字段。
 - `state_dir` 已在 `~/.leveler/state/projects/<encoded>/`，天然在 repo 外；`memory_v2_state_dir` 必须验证它不在 `repo_root` 内。`Layout::from_parts` 的测试态也必须做同一验证，不能因为测试传入 repo 内 state_dir 就放宽生产路径校验。
-- `docs/ARCHITECTURE.md` 中“runtime state lives outside the project”需要补充例外：project/local 的**当前 active Markdown** 是用户 workspace 内容；history/pending/journal/index 等运行时状态仍在 state dir。该文档修改在 Stage 2/4 与代码同 PR 完成，本轮不改。
+- `docs/ARCHITECTURE.md` 中“runtime state lives outside the project”的例外：project/local 的**当前 active Markdown** 是 workspace 内容；history/pending/journal/index 等运行时状态仍在 state dir。
 
 ---
 
@@ -377,7 +375,7 @@ Project current root 内有一个**窄** `.gitignore`，只用于临时提交文
 | 字段 | 必填 | 类型 | 含义 |
 | --- | --- | --- | --- |
 | `schema` | 是 | int | 固定 `2` |
-| `id` | 是 | string | `mem_<UUIDv4 simple>`（复用现有 `uuid` 依赖）或迁移保留的 legacy id；`^[A-Za-z0-9_-]{1,96}$`。示例统一用 UUIDv4 simple；迁移保留的 legacy id 也合法 |
+| `id` | 是 | string | `mem_<UUIDv4 simple>`（复用现有 `uuid` 依赖）；`^[A-Za-z0-9_-]{1,96}$`。示例统一用 UUIDv4 simple |
 | `kind` | 是 | enum | `user_fact` \| `experience` |
 | `scope` | 是 | enum | `global` \| `project` \| `local` |
 | `status` | 是 | enum | `active` \| `pending` \| `superseded` \| `deprecated` \| `expired` |
@@ -400,7 +398,7 @@ Project current root 内有一个**窄** `.gitignore`，只用于临时提交文
 | `proposal` | pending 必填 | object | 见 §5.4 |
 | `experience` | experience 必填 | object | 见 §5.5 |
 | `source_refs` | service 创建时是；外部新增可空 | object[] | 见 §5.6；service 创建至少一个；外部新增缺失时读为 `external_edit`，不伪造用户/工具来源 |
-| `legacy` | 否 | object | 迁移来源与原始状态；只读展示 |
+| `legacy` | 否 | object | 历史来源标记（`source_refs.legacy_*`）。迁移已取消，当前产品不再写入该字段；保留它是为了兼容将来导入的外部记录，读取时只做只读展示 |
 
 `statement` 只允许 `assertion/correction/rejection/note`。`proposal`、`hypothetical`、`quotation`、`uncertain` 不写入 Memory；它们由提取流程记录为 `not_stored` 原因，不产生 pending。
 
@@ -533,7 +531,7 @@ source_refs:
 | `user_review` | `pending_id` | 用户接受 pending |
 | `tool_call` | `session_id`/`turn_id`/`tool_call_id` | 模型工具 |
 | `runtime_task` | `task_id` | experience 的真实任务 |
-| `migration` | `legacy_store`/`legacy_id`/`legacy_sha256` | 历史迁移 |
+| `migration` | `legacy_store`/`legacy_id`/`legacy_sha256` | 历史来源引用；当前产品不写入（无迁移） |
 | `external_edit` | `file_sha256` | 外部编辑被服务接管 |
 
 `evidence_span` ≤ 512 字符，必须经过 secret scan；超过或命中凭据则只保留 `message_digest`+`span_range`，不保存原文。
@@ -570,7 +568,7 @@ source_refs:
 
 ### 6.1 位置与依赖
 
-- 实现在 `crates/leveler-memory/src/v2/service.rs`（Stage 1 的 `v2` 模块内），通过 `v2::service` 暴露；legacy store 不反向依赖它。
+- store 实现在 `crates/leveler-memory/src/v2/`；对调用方暴露的是 `crates/leveler-memory/src/service.rs` 的 `MemoryService`，即唯一业务入口。
 - `SessionId`/`TurnId`/`ToolCallId`/`TaskId` 复用 `leveler-core` 的 newtype；service 不依赖 `leveler-agent`/`leveler-engine`，避免反向依赖。
 - 依赖 `MarkdownStore`、`Lifecycle`、`MemoryIndex`（可选）；时间用 `chrono::Utc`，`expire_due` 显式传 `now`，不新增 Clock trait。
 - Experience 的 evidence pack 由 agent/runtime 从真实 tool receipt 构造，作为结构化值传入；service 只校验结构，不解析模型自由文本。

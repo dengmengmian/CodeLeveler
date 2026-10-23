@@ -19,7 +19,7 @@ use leveler_memory::{
 use memory_v2_common::Fixture;
 
 fn open_service(fixture: &Fixture) -> MemoryService {
-    MemoryService::new(MemoryRoots::markdown().with_project(fixture.roots()))
+    MemoryService::new(MemoryRoots::new().with_project(fixture.roots()))
 }
 
 fn user(tag: &str) -> Actor {

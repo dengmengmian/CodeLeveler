@@ -16,7 +16,6 @@
 //! the pack flag is what decides whether the tools are registered at all; the
 //! handle is what they are built from once they are.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use leveler_execution::{ArtifactStore, BackgroundTaskRegistry};
@@ -74,16 +73,6 @@ impl Capabilities {
     /// Spill oversized command output to `store` instead of truncating it.
     pub fn with_artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
-        self
-    }
-
-    /// A legacy JSON store rooted at `root`. Kept for callers that only know a
-    /// store directory (one-shot runs and tests); the app hands over the
-    /// configured service instead.
-    pub fn with_memory_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.memory = Some(Arc::new(leveler_memory::MemoryService::legacy(
-            root.into(),
-        )));
         self
     }
 

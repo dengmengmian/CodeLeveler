@@ -1,8 +1,8 @@
 //! CLI surface for project-scoped durable memory (WM-04).
 //!
-//! Every read and write goes through the unified [`MemoryService`], so the
-//! backend the project selects (`legacy` JSON or `markdown`) is the only store
-//! this command touches.
+//! Every read and write goes through the unified [`MemoryService`], and the
+//! Markdown store is the only implementation behind it. This command has no
+//! second store to touch.
 //!
 //! This is a plain local process, so it cannot mint a user actor: a model with
 //! shell access can run the same argv. Writes therefore run as
@@ -11,15 +11,12 @@
 //! (accept/reject/restore and direct activation) is available only from the
 //! TUI/desktop, where the command handler mints `UserInvocationId` in process.
 //!
-//! `audit`, `audit-identity` and `scrub` are legacy-store maintenance
-//! operations with no markdown equivalent; they refuse on a markdown project
-//! instead of opening a store the project does not use.
+//! `diagnose` inspects a Markdown scope without changing it.
 
 use std::path::Path;
 
-use leveler_core::MemoryBackend;
 use leveler_memory::{
-    MemoryLanes, MemoryService, MemoryStore, MemoryView, RememberRequest, ReviewRequest, ServiceError,
+    MemoryLanes, MemoryService, MemoryView, RememberRequest, ReviewRequest, ServiceError,
     ServiceScope, WriteOutcome,
     v2::{Actor, DiagnosticReport, DiagnosticSeverity, MarkdownStore, ScopeRoots},
 };
@@ -111,14 +108,13 @@ fn report_outcome(outcome: WriteOutcome) -> std::process::ExitCode {
             if !superseded.is_empty() {
                 detail.push_str(&format!(" (superseded {})", superseded.join(", ")));
             }
-            println!("{}", Line::ok(&format!("[{id}] {title}: {operation}{detail}")));
+            println!(
+                "{}",
+                Line::ok(&format!("[{id}] {title}: {operation}{detail}"))
+            );
             std::process::ExitCode::SUCCESS
         }
-        WriteOutcome::Pending {
-            id,
-            title,
-            reason,
-        } => {
+        WriteOutcome::Pending { id, title, reason } => {
             println!(
                 "{}",
                 Line::ok(&format!("queued for review [{id}]: {title} ({reason})"))
@@ -240,31 +236,13 @@ fn review_pending(
     }
 }
 
-/// Legacy-only maintenance commands have no service equivalent; refuse them on
-/// a markdown project rather than opening a store that project does not use.
-fn legacy_maintenance_store(
-    backend: MemoryBackend,
-    layout: &Layout,
-) -> anyhow::Result<Option<MemoryStore>> {
-    if backend != MemoryBackend::Legacy {
-        println!(
-            "{}",
-            Line::warn(
-                "this maintenance command only operates on the legacy JSON store; the project uses the markdown backend"
-            )
-        );
-        return Ok(None);
-    }
-    Ok(Some(MemoryStore::open(&layout.memory_dir())?))
-}
-
 pub(crate) fn cmd_memory(
     layout: Layout,
     cmd: MemoryCommand,
 ) -> anyhow::Result<std::process::ExitCode> {
-    // Must run before any store is opened: `MemoryStore::open` creates its
-    // root, and inspecting a broken scope is only useful if it changes
-    // nothing.
+    // Must run before any store is opened: `diagnose` resolves paths without
+    // creating them, and inspecting a broken scope is only useful if it
+    // changes nothing.
     if let MemoryCommand::Diagnose {
         current,
         state,
@@ -273,14 +251,16 @@ pub(crate) fn cmd_memory(
     {
         return cmd_memory_diagnose(&layout, current, state, *scope);
     }
+    if let MemoryCommand::PurgeLegacy { apply } = cmd {
+        return cmd_memory_purge_legacy(&layout, apply);
+    }
 
     let config = layout
         .primary_workspace()
         .and_then(leveler_project::ProjectConfig::load)
         .unwrap_or_default();
-    let backend = config.memory.backend;
     let lanes = leveler_app::MemoryPolicy::from_project(&config).lanes();
-    let service = leveler_app::memory_service(&layout, backend);
+    let service = leveler_app::memory_service(&layout);
     let actor = external_actor();
     let scope = ServiceScope::Project;
 
@@ -348,18 +328,11 @@ pub(crate) fn cmd_memory(
             }
             let (active_count, archived_count) = service.counts(scope)?;
             println!();
-            match backend {
-                MemoryBackend::Legacy => {
-                    println!("  backend=legacy memory_dir={}", layout.memory_dir().display());
-                }
-                MemoryBackend::Markdown => {
-                    let current = layout
-                        .markdown_memory_dir()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "(no workspace)".to_string());
-                    println!("  backend=markdown current_dir={current}");
-                }
-            }
+            let current = layout
+                .markdown_memory_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(no workspace)".to_string());
+            println!("  current_dir={current}");
             println!("  active={active_count} archived={archived_count}");
             Ok(std::process::ExitCode::SUCCESS)
         }
@@ -375,56 +348,60 @@ pub(crate) fn cmd_memory(
             let experience_active = active.iter().filter(|view| view.is_experience()).count();
             let experience_archived = archived.iter().filter(|view| view.is_experience()).count();
             let experimental = if experience { " (experimental)" } else { "" };
+            // A local process cannot read the pending queue, which is the same
+            // rule that makes it unable to approve one. Reporting `pending 0`
+            // would then be a claim about a store this process did not read,
+            // so the lane lines carry only what was read and the limitation is
+            // stated once.
+            let pending_readable = service.pending(&actor, scope).is_ok();
+            let (user_pending, experience_pending) = match service.pending(&actor, scope) {
+                Ok(pending) => {
+                    let experience = pending.iter().filter(|view| view.is_experience()).count();
+                    (pending.len() - experience, experience)
+                }
+                _ => (0, 0),
+            };
+            let lane_counts = |active: usize, pending: usize, archived: usize| {
+                if pending_readable {
+                    format!("active {active} · pending {pending} · archived {archived}")
+                } else {
+                    format!("active {active} · archived {archived}")
+                }
+            };
             println!("{}", Line::heading("Memory switches"));
             println!("  total: {}", on(total));
             println!(
-                "  user facts: {} (active {} · archived {})",
+                "  user facts: {} ({})",
                 on(user),
-                active.len().saturating_sub(experience_active),
-                archived.len().saturating_sub(experience_archived),
+                lane_counts(
+                    active.len().saturating_sub(experience_active),
+                    user_pending,
+                    archived.len().saturating_sub(experience_archived),
+                ),
             );
             println!(
-                "  auto experience: {}{} (active {} · archived {})",
+                "  auto experience: {}{} ({})",
                 on(experience),
                 experimental,
-                experience_active,
-                experience_archived,
+                lane_counts(experience_active, experience_pending, experience_archived),
             );
-            match service.pending(&actor, scope) {
-                Ok(pending) => {
-                    let experience_pending =
-                        pending.iter().filter(|view| view.is_experience()).count();
-                    println!(
-                        "  pending review: {} (user {} · experience {})",
-                        pending.len(),
-                        pending.len().saturating_sub(experience_pending),
-                        experience_pending,
-                    );
-                }
-                Err(ServiceError::NeedsReview(_)) => {
-                    println!("  pending review: only visible from the TUI/desktop")
-                }
-                Err(error) => return Err(error.into()),
+            if !pending_readable {
+                println!(
+                    "  pending review: only visible from the TUI/desktop; a local process cannot read it (this is not zero)"
+                );
             }
-            println!("  backend: {}", backend.as_str());
+            let current = layout
+                .markdown_memory_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(no workspace)".to_string());
+            println!("  store: markdown current_dir={current}");
+            if let Some(notice) = config.memory.deprecated_backend() {
+                println!("  {}", Line::warn(&notice));
+            }
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Search { query, limit } => {
-            let hits = match service.search(&actor, scope, lanes, &query, limit, false) {
-                Ok(hits) => hits,
-                Err(ServiceError::Unavailable(reason))
-                    if reason == leveler_memory::MARKDOWN_SEARCH_UNAVAILABLE =>
-                {
-                    println!(
-                        "{}",
-                        Line::warn(&format!(
-                            "search is not available on the markdown backend yet ({reason}); this is not an empty result"
-                        ))
-                    );
-                    return Ok(std::process::ExitCode::FAILURE);
-                }
-                Err(error) => return Err(error.into()),
-            };
+            let hits = service.search(&actor, scope, lanes, &query, limit)?;
             if hits.is_empty() {
                 println!("{}", Line::warn("No matches."));
             } else {
@@ -459,10 +436,7 @@ pub(crate) fn cmd_memory(
                         Ok(std::process::ExitCode::SUCCESS)
                     }
                     None => {
-                        println!(
-                            "{}",
-                            Line::warn(&format!("not found in archive: {id}"))
-                        );
+                        println!("{}", Line::warn(&format!("not found in archive: {id}")));
                         Ok(std::process::ExitCode::FAILURE)
                     }
                 };
@@ -488,9 +462,7 @@ pub(crate) fn cmd_memory(
                     Err(ServiceError::NotCurrent(_)) => {
                         println!(
                             "{}",
-                            Line::warn(&format!(
-                                "not current: {id}; read it with --archived"
-                            ))
+                            Line::warn(&format!("not current: {id}; read it with --archived"))
                         );
                         Ok(std::process::ExitCode::FAILURE)
                     }
@@ -536,38 +508,6 @@ pub(crate) fn cmd_memory(
                 Err(error) => Err(error.into()),
             }
         }
-        MemoryCommand::Restore { id } => {
-            if backend == MemoryBackend::Markdown {
-                println!(
-                    "{}",
-                    Line::warn(
-                        "restore is not available on the markdown backend; forget is a tombstone"
-                    )
-                );
-                return Ok(std::process::ExitCode::FAILURE);
-            }
-            match service.restore(&actor, scope, &id) {
-                Ok(outcome) => Ok(report_outcome(outcome)),
-                Err(ServiceError::NotFound(_)) => {
-                    println!("{}", Line::warn(&format!("not found: {id}")));
-                    Ok(std::process::ExitCode::FAILURE)
-                }
-                Err(ServiceError::NeedsReview(_)) => {
-                    println!(
-                        "{}",
-                        Line::warn(
-                            "restore requires the TUI/desktop; a local process cannot claim user authority"
-                        )
-                    );
-                    Ok(std::process::ExitCode::FAILURE)
-                }
-                Err(ServiceError::Invalid(reason)) => {
-                    println!("{}", Line::warn(&reason));
-                    Ok(std::process::ExitCode::FAILURE)
-                }
-                Err(error) => Err(error.into()),
-            }
-        }
         MemoryCommand::Remember {
             title,
             body,
@@ -576,13 +516,8 @@ pub(crate) fn cmd_memory(
         } => {
             // A local process may only propose: the service decides whether
             // that becomes pending or is rejected, never user authority.
-            let mut request = RememberRequest::new(
-                cli_op_id("remember"),
-                scope,
-                title,
-                body,
-                kind_label(kind),
-            );
+            let mut request =
+                RememberRequest::new(cli_op_id("remember"), scope, title, body, kind_label(kind));
             request.tags = tags;
             match service.propose(&actor, request) {
                 Ok(WriteOutcome::Rejected { reason }) => {
@@ -661,9 +596,7 @@ pub(crate) fn cmd_memory(
             match service.propose(&actor, request) {
                 Ok(WriteOutcome::Rejected { reason }) => {
                     println!("{}", Line::warn(&format!("not stored: {reason}")));
-                    println!(
-                        "  a local process cannot claim user authority; use the TUI/desktop"
-                    );
+                    println!("  a local process cannot claim user authority; use the TUI/desktop");
                     Ok(std::process::ExitCode::FAILURE)
                 }
                 Ok(outcome) => Ok(report_outcome(outcome)),
@@ -674,97 +607,67 @@ pub(crate) fn cmd_memory(
                 Err(error) => Err(error.into()),
             }
         }
-        MemoryCommand::Audit => {
-            let Some(store) = legacy_maintenance_store(backend, &layout)? else {
-                return Ok(std::process::ExitCode::FAILURE);
-            };
-            let findings = store.audit_sensitive()?;
-            println!("{}", Line::heading("Sensitive memory audit"));
-            if findings.is_empty() {
-                println!("  (none)");
-            } else {
-                for finding in &findings {
-                    println!(
-                        "  [{:?}] [{}] fields={}",
-                        finding.location,
-                        finding.id,
-                        finding.fields.join(",")
-                    );
-                }
-                println!();
-                println!(
-                    "  {} record(s) need redaction; run `leveler memory scrub --apply`",
-                    findings.len()
-                );
-            }
-            Ok(std::process::ExitCode::SUCCESS)
-        }
-        MemoryCommand::AuditIdentity => {
-            let Some(store) = legacy_maintenance_store(backend, &layout)? else {
-                return Ok(std::process::ExitCode::FAILURE);
-            };
-            let audit = store.audit_identity()?;
-            println!(
-                "{}",
-                Line::heading("Memory identity audit (dry run; no files are modified)")
-            );
-            println!(
-                "  total={} ready={} needs_confirmation={} possible_duplicate={} \
-                 possibly_stale={} sensitive={}",
-                audit.summary.total,
-                audit.summary.ready,
-                audit.summary.needs_confirmation,
-                audit.summary.possible_duplicate,
-                audit.summary.possibly_stale,
-                audit.summary.sensitive
-            );
-            for record in &audit.records {
-                println!(
-                    "  [{:?}] {} [{}] {}",
-                    record.location,
-                    record.state.as_str(),
-                    record.id,
-                    record.title
-                );
-                if let Some(key) = &record.key {
-                    println!("         key={key}");
-                }
-                if !record.related.is_empty() {
-                    println!("         related={}", record.related.join(","));
-                }
-                println!("         {}", record.reason);
-            }
-            println!();
-            println!("  dry run only: this command does not rewrite user memory.");
-            Ok(std::process::ExitCode::SUCCESS)
-        }
-        MemoryCommand::Scrub { id, apply } => {
-            let Some(store) = legacy_maintenance_store(backend, &layout)? else {
-                return Ok(std::process::ExitCode::FAILURE);
-            };
-            let report = store.scrub_sensitive(id.as_deref(), apply)?;
-            if report.findings == 0 {
-                println!("{}", Line::ok("No sensitive memory records found."));
-            } else if apply {
-                println!(
-                    "{}",
-                    Line::ok(&format!("Redacted {} record(s).", report.redacted))
-                );
-            } else {
-                println!(
-                    "{}",
-                    Line::warn(&format!(
-                        "Dry run: {} record(s) would be redacted; pass --apply to write.",
-                        report.findings
-                    ))
-                );
-            }
-            Ok(std::process::ExitCode::SUCCESS)
-        }
-        MemoryCommand::Diagnose { .. } => {
-            unreachable!("diagnose is handled before any store is opened")
+        MemoryCommand::PurgeLegacy { .. } | MemoryCommand::Diagnose { .. } => {
+            unreachable!("these are handled before any store is opened")
         }
     }
+}
+
+/// Remove the retired JSON memory stores under this machine's state root.
+///
+/// Dry run by default. The report names every store it would delete and every
+/// candidate it refuses, so a blocked entry is a visible decision instead of a
+/// silent skip.
+fn cmd_memory_purge_legacy(layout: &Layout, apply: bool) -> anyhow::Result<std::process::ExitCode> {
+    let state_root = layout.home().state_dir();
+    let report = leveler_project::purge(&state_root, apply)?;
+    println!("{}", Line::heading("Retired JSON memory stores"));
+    println!("  state_root: {}", state_root.display());
+    if report.stores.is_empty() {
+        println!("  {}", Line::ok("no legacy store found"));
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    for store in &report.stores {
+        match &store.verdict {
+            leveler_project::StoreVerdict::LegacyStore { files, bytes } => {
+                let action = if store.removed {
+                    Line::ok("removed")
+                } else {
+                    "would remove".to_string()
+                };
+                println!(
+                    "  {action} {} ({files} file(s), {bytes} bytes)",
+                    store.path.display()
+                );
+            }
+            leveler_project::StoreVerdict::Blocked { reason } => {
+                println!("  {} {}", Line::warn("BLOCKED"), store.path.display());
+                println!("      {reason}");
+            }
+        }
+    }
+    let blocked = report.blocked().len();
+    println!();
+    if apply {
+        println!(
+            "  removed {} store(s), {} file(s), {} bytes",
+            report.removed_stores(),
+            report.removed_files(),
+            report.removed_bytes()
+        );
+    } else {
+        println!("  dry run: pass --apply to delete the stores listed above");
+    }
+    if blocked > 0 {
+        println!(
+            "  {}",
+            Line::warn(&format!(
+                "{blocked} candidate(s) were left alone; inspect them by hand"
+            ))
+        );
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Read-only report for a Markdown (Memory 2.0) scope.
@@ -828,58 +731,76 @@ fn print_diagnostic_report(report: &DiagnosticReport) {
     }
 }
 
-/// Pure helper used by CLI and unit tests: open store under an explicit root.
+/// A project-scope service rooted under a test directory.
 #[cfg(test)]
-pub(crate) fn memory_round_trip_via_store(root: &std::path::Path) -> anyhow::Result<()> {
-    let store = MemoryStore::open(root)?;
-    let e = leveler_memory::new_entry(
-        "use-workspace-write-default",
-        "Prefer WorkspaceWrite for routine edits.",
-        vec!["preference".into()],
-    );
-    store.remember(e.clone())?;
-    let hits = store.search("WorkspaceWrite", 5)?;
-    anyhow::ensure!(hits.len() == 1, "expected one search hit");
-    anyhow::ensure!(hits[0].0.id == e.id);
-    let shown = store.read_active(&e.id)?;
-    anyhow::ensure!(shown.body.contains("WorkspaceWrite"));
-    store.forget(&e.id)?;
-    anyhow::ensure!(store.search("WorkspaceWrite", 5)?.is_empty());
-    anyhow::ensure!(store.counts()? == (0, 1));
-    Ok(())
+fn test_service(root: &std::path::Path) -> MemoryService {
+    MemoryService::new(leveler_memory::MemoryRoots::new().with_project(
+        leveler_memory::v2::ScopeRoots::new(
+            leveler_memory::v2::MemoryScope::Project,
+            root.join("memory"),
+            root.join("state"),
+        ),
+    ))
 }
 
-/// The legacy store semantics the trusted in-process direct path relies on.
-///
-/// Uses `activate`, NOT `remember`: the latter is an upsert by id and would
-/// silently replace an existing memory whenever a new title slugs to the same
-/// id. Kept here as a regression test because the TUI's `/remember` and the
-/// executor's direct command both reach the same store through the service.
 #[cfg(test)]
-fn remember_direct(
-    store: &MemoryStore,
-    title: &str,
-    body: &str,
-    kind: crate::cli::MemoryKindArg,
-    tags: Vec<String>,
-) -> Result<leveler_memory::MemoryEntry, leveler_memory::MemoryError> {
-    use leveler_memory::MemoryKind;
-    store.activate(
-        title,
-        body,
-        match kind {
-            MemoryKindArg::Preference => MemoryKind::Preference,
-            MemoryKindArg::Decision => MemoryKind::Decision,
-            MemoryKindArg::Note => MemoryKind::Note,
-        },
-        tags,
-    )
+fn test_user() -> Actor {
+    Actor::User {
+        invocation: leveler_memory::v2::UserInvocationId::mint(format!(
+            "cli-test-{}",
+            std::process::id()
+        )),
+    }
+}
+
+/// The round trip the command surface relies on: remember, search, show,
+/// forget.
+#[cfg(test)]
+pub(crate) fn memory_round_trip_via_service(root: &std::path::Path) -> anyhow::Result<()> {
+    let service = test_service(root);
+    let id = service
+        .remember(
+            &test_user(),
+            RememberRequest::new(
+                cli_op_id("round-trip"),
+                ServiceScope::Project,
+                "use-workspace-write-default",
+                "Prefer WorkspaceWrite for routine edits.",
+                "preference",
+            ),
+        )?
+        .applied_id()
+        .expect("the write is current")
+        .to_string();
+    let hits = service.search(
+        &external_actor(),
+        ServiceScope::Project,
+        MemoryLanes::ALL,
+        "WorkspaceWrite",
+        5,
+    )?;
+    anyhow::ensure!(hits.len() == 1, "expected one search hit");
+    anyhow::ensure!(hits[0].0.id == id);
+    let shown = service.read(&external_actor(), ServiceScope::Project, &id)?;
+    anyhow::ensure!(shown.body.contains("WorkspaceWrite"));
+    service.forget(&test_user(), ServiceScope::Project, &id)?;
+    anyhow::ensure!(
+        service
+            .search(
+                &external_actor(),
+                ServiceScope::Project,
+                MemoryLanes::ALL,
+                "WorkspaceWrite",
+                5
+            )?
+            .is_empty()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_memory::ProposeOutcome;
     use std::path::PathBuf;
 
     #[test]
@@ -888,116 +809,134 @@ mod tests {
             std::env::temp_dir().join(format!("leveler-memory-cli-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        memory_round_trip_via_store(&root).unwrap();
+        memory_round_trip_via_service(&root).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        // Ensure Layout::memory_dir is the path CLI will open for a real repo.
+        // The CLI addresses the project's Markdown current root.
         let layout = Layout::resolve(PathBuf::from("/tmp/leveler-mem-layout-check"), None);
-        let mem = layout.memory_dir();
+        let mem = layout
+            .markdown_memory_dir()
+            .expect("a workspace has a project memory root");
         assert!(
             mem.to_string_lossy().contains("memory")
                 || mem.file_name().and_then(|s| s.to_str()) == Some("memory"),
-            "memory_dir should end with memory: {}",
+            "the project memory root should end with memory: {}",
             mem.display()
         );
     }
 
-    /// A direct write must never replace a memory the user already saved.
-    /// `base.md` promises remember does not overwrite; the CLI used the upsert
-    /// path instead, so saving a second note under a title that slugs to the
-    /// same id silently destroyed the first one. A CJK-only title hits this
-    /// every time: it slugs to empty and falls back to a second-precision
-    /// timestamp, so two notes written in the same second collided.
+    /// A direct write must never replace a memory the user already saved, and
+    /// two CJK-only titles written in the same second must not collide.
     #[test]
     fn a_direct_write_never_replaces_an_existing_memory() {
         let root =
             std::env::temp_dir().join(format!("leveler-memory-cli-nodup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let store = MemoryStore::open(&root).unwrap();
-
-        let first = remember_direct(
-            &store,
-            "Deploy notes",
-            "第一版正文",
-            crate::cli::MemoryKindArg::Note,
-            vec![],
-        )
-        .unwrap();
-        let second = remember_direct(
-            &store,
-            "Deploy notes",
-            "第二版正文完全不同",
-            crate::cli::MemoryKindArg::Note,
-            vec![],
-        )
-        .unwrap();
-        assert_ne!(first.id, second.id, "a second note needs its own id");
-        assert_eq!(store.list_active().unwrap().len(), 2, "neither is lost");
+        let service = test_service(&root);
+        let remember = |op: &str, title: &str, body: &str| {
+            service
+                .remember(
+                    &test_user(),
+                    RememberRequest::new(cli_op_id(op), ServiceScope::Project, title, body, "note"),
+                )
+                .unwrap()
+                .applied_id()
+                .expect("the write is current")
+                .to_string()
+        };
+        let first = remember("first", "Deploy notes", "第一版正文");
+        let second = remember("second", "Deploy notes", "第二版正文完全不同");
+        assert_ne!(first, second, "a second note needs its own id");
+        assert_eq!(
+            service
+                .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+                .unwrap()
+                .len(),
+            2,
+            "neither is lost"
+        );
         assert!(
-            store
-                .read_active(&first.id)
+            service
+                .read(&external_actor(), ServiceScope::Project, &first)
                 .unwrap()
                 .body
                 .contains("第一版"),
             "the first body survived"
         );
 
-        // Two CJK-only titles in the same second both slug to empty and share
-        // the timestamp fallback; both must still land.
-        let a = remember_direct(
-            &store,
-            "状态色约定",
-            "映射表实现",
-            crate::cli::MemoryKindArg::Note,
-            vec![],
-        )
-        .unwrap();
-        let b = remember_direct(
-            &store,
-            "搜索框过滤范围",
-            "只按 payer 过滤",
-            crate::cli::MemoryKindArg::Note,
-            vec![],
-        )
-        .unwrap();
-        assert_ne!(a.id, b.id, "same-second CJK titles must not collide");
-        assert_eq!(store.list_active().unwrap().len(), 4);
+        let a = remember("cjk-a", "状态色约定", "映射表实现");
+        let b = remember("cjk-b", "搜索框过滤范围", "只按 payer 过滤");
+        assert_ne!(a, b, "same-second CJK titles must not collide");
+        assert_eq!(
+            service
+                .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+                .unwrap()
+                .len(),
+            4
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// User-authoritative accept path used by the TUI (not agent AutoApprove).
+    /// A proposal becomes current only when a trusted user accepts it.
     #[test]
     fn user_accept_path_promotes_pending_only_on_explicit_accept() {
         let root =
             std::env::temp_dir().join(format!("leveler-memory-cli-accept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let store = MemoryStore::open(&root).unwrap();
-        let c = leveler_memory::MemoryCandidate::new(
+        let service = test_service(&root);
+        let mut request = RememberRequest::new(
+            cli_op_id("pending"),
+            ServiceScope::Project,
             "gated memory writes",
             "prefer gated memory writes",
-            leveler_memory::CandidateKind::Preference,
-            None,
-            leveler_memory::CandidateSource::SystemInferred,
-            vec![],
-        )
-        .unwrap();
-        let pending = match store.propose(c).unwrap() {
-            ProposeOutcome::Pending(c) => c,
-            other => panic!("{other:?}"),
+            "preference",
+        );
+        // An automatic write names the identity it is about.
+        request.subject = Some("memory.gated_writes".to_string());
+        // The proposal comes from the model path; a local shell process cannot
+        // even propose (it could be a model with shell access).
+        let model = Actor::Model {
+            session: leveler_core::SessionId::new("cli-test-session"),
+            turn: leveler_core::TurnId::new("cli-test-turn"),
+            tool_call: leveler_core::ToolCallId::new("cli-test-call"),
         };
-        assert_eq!(store.list_active().unwrap().len(), 0);
-        store.accept(&pending.id).unwrap();
-        assert_eq!(store.list_active().unwrap().len(), 1);
+        let outcome = service.propose(&model, request).unwrap();
+        let WriteOutcome::Pending { id, .. } = outcome else {
+            panic!("expected pending, got {outcome:?}");
+        };
+        assert!(
+            service
+                .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+                .unwrap()
+                .is_empty()
+        );
+        service
+            .review(
+                &test_user(),
+                ServiceScope::Project,
+                &id,
+                ReviewRequest::Accept,
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A plain local process cannot mint user authority: the service queues a
-    /// create as pending and refuses review outright.
+    /// A plain local process cannot mint user authority: the service refuses
+    /// the write outright, and it cannot review anything either.
     #[test]
-    fn a_local_cli_write_is_pending_not_user_authorized() {
-        let root =
-            std::env::temp_dir().join(format!("leveler-memory-cli-external-{}", std::process::id()));
+    fn a_local_cli_write_is_refused_not_user_authorized() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-memory-cli-external-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
-        let service = MemoryService::legacy(root.as_path());
+        let service = test_service(&root);
         let actor = external_actor();
         let request = RememberRequest::new(
             cli_op_id("remember"),
@@ -1008,27 +947,22 @@ mod tests {
         );
         let outcome = service.propose(&actor, request).unwrap();
         assert!(
-            matches!(outcome, WriteOutcome::Pending { .. }),
-            "expected pending, got {outcome:?}"
-        );
-        let store = MemoryStore::open(&root).unwrap();
-        assert_eq!(
-            store.list_active().unwrap().len(),
-            0,
-            "a local process must not activate memory"
-        );
-        let pending = store.list_pending().unwrap();
-        assert_eq!(pending.len(), 1);
-
-        let review = service.review(
-            &actor,
-            ServiceScope::Project,
-            &pending[0].id,
-            ReviewRequest::Accept,
+            matches!(outcome, WriteOutcome::Rejected { .. }),
+            "a local process is an external caller: {outcome:?}"
         );
         assert!(
-            matches!(review, Err(ServiceError::NeedsReview(_))),
-            "a local process must not review its own proposal: {review:?}"
+            service
+                .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+                .unwrap()
+                .is_empty(),
+            "a local process must not activate memory"
+        );
+        assert!(
+            service
+                .pending(&test_user(), ServiceScope::Project)
+                .unwrap()
+                .is_empty(),
+            "a refused write leaves no proposal behind"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
