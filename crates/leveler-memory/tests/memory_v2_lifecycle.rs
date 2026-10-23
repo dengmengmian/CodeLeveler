@@ -3,8 +3,8 @@
 mod memory_v2_common;
 
 use leveler_memory::v2::{
-    Admission, Caller, MemoryAuthority, MemoryKind, MemoryScope, MemoryStatus, PendingReason,
-    Reason, ReviewDecision, StoreError,
+    Admission, Caller, MemoryAuthority, MemoryKind, MemoryScope, MemoryStatus, Operation,
+    PendingReason, PinOwner, Reason, ReviewDecision, StoreError,
 };
 use memory_v2_common::*;
 
@@ -70,6 +70,144 @@ fn a_model_proposal_cannot_replace_a_user_decision_without_review() {
             ..
         })
     ));
+}
+
+/// A confirmed user statement is evidence, not a user decision. A later
+/// statement under the same identity with a new span supersedes it directly;
+/// only `user_explicit` / `user_approved` targets need a person's review.
+#[test]
+fn a_user_stated_fact_is_corrected_by_a_new_user_statement() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let mut first = fact_intent(
+        MemoryScope::Project,
+        Some("release_window"),
+        "tuesday",
+        "The release runs in the Tuesday window.",
+    );
+    first.evidence = vec![source_ref()];
+    let original_id = applied_id(&admit(&store, runtime(), first));
+
+    let mut correction = fact_intent(
+        MemoryScope::Project,
+        Some("release_window"),
+        "friday",
+        "The release runs in the Friday window.",
+    );
+    let mut later = source_ref();
+    later.turn_id = Some("turn-2".into());
+    later.evidence_span = Some("move the release to Friday".into());
+    correction.evidence = vec![later];
+    let admission = admit(&store, runtime(), correction);
+    assert!(
+        matches!(
+            admission,
+            Admission::Applied {
+                operation: Operation::Supersede,
+                ..
+            }
+        ),
+        "{admission:?}"
+    );
+    let corrected_id = applied_id(&admission);
+    assert_ne!(corrected_id, original_id);
+
+    let effective = effective(&store);
+    assert_eq!(effective.len(), 1);
+    assert_eq!(
+        effective[0].record.frontmatter.value.as_deref(),
+        Some("friday")
+    );
+    assert_eq!(
+        effective[0].record.frontmatter.authority,
+        MemoryAuthority::UserStated
+    );
+    assert!(
+        effective[0]
+            .record
+            .frontmatter
+            .supersedes
+            .contains(&original_id.to_string())
+    );
+    assert!(matches!(
+        store.read(&original_id),
+        Err(StoreError::NotCurrent {
+            status: MemoryStatus::Superseded,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_model_still_cannot_replace_a_user_stated_fact() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let mut first = fact_intent(
+        MemoryScope::Project,
+        Some("release_window"),
+        "tuesday",
+        "The release runs in the Tuesday window.",
+    );
+    first.evidence = vec![source_ref()];
+    let original_id = applied_id(&admit(&store, runtime(), first));
+
+    let proposal = admit(
+        &store,
+        model(),
+        fact_intent(
+            MemoryScope::Project,
+            Some("release_window"),
+            "friday",
+            "The release runs in the Friday window.",
+        ),
+    );
+    assert!(
+        matches!(
+            proposal,
+            Admission::Pending {
+                reason: PendingReason::LowerAuthority,
+                ..
+            }
+        ),
+        "{proposal:?}"
+    );
+    let current = store.read(&original_id).unwrap();
+    assert_eq!(current.record.frontmatter.value.as_deref(), Some("tuesday"));
+}
+
+/// A model pin of any user-owned fact still waits for a person (§7.3), even
+/// though a user statement is not protected from a same-authority correction.
+#[test]
+fn a_model_pin_of_a_user_stated_fact_waits_for_a_person() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let mut intent = fact_intent(
+        MemoryScope::Project,
+        Some("coding_style"),
+        "direct",
+        "Prefer direct answers.",
+    );
+    intent.evidence = vec![source_ref()];
+    let id = applied_id(&admit(&store, runtime(), intent));
+    let cas = store.read(&id).unwrap().cas;
+
+    let model_pin = store
+        .pin(op(), model(), &id, PinOwner::Model, cas.clone())
+        .unwrap();
+    assert!(
+        matches!(
+            model_pin,
+            Admission::Pending {
+                reason: PendingReason::ProtectedUserFact,
+                ..
+            }
+        ),
+        "{model_pin:?}"
+    );
+    assert!(!store.read(&id).unwrap().record.frontmatter.pinned);
+
+    let user_pin = store.pin(op(), user(), &id, PinOwner::User, cas).unwrap();
+    assert!(user_pin.is_applied());
 }
 
 #[test]
