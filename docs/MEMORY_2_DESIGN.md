@@ -1074,9 +1074,9 @@ Catalog 选择（独立于 recall）：
 Catalog 位于 SessionPrefix，不能每轮重写，也不能假设它在整个 run 内始终等于当前事实。
 
 - **版本**：每个 scope 的 catalog 有单调递增的 `catalog_version` 和 `catalog_digest`（对排序后的 `(id, revision, status, title, pinned)` 计算 sha256）。版本与 digest 记录在 `<state_root>/catalog/<scope>.json`；它是由 Markdown 派生的缓存，不是事实源，删除后可从 current Markdown 重建。
-- **失效触发**：任何改变 active 集合或 catalog 可见字段的已提交操作——create、title/pin/authority/sensitive 更新、supersede、deprecate、expire、forget、pending accept/reject 导致 active 变化、外部编辑经 review 被确认——都递增 `catalog_version` 并写一条 `CatalogInvalidated { scope, from_version, to_version, changed_ids }`。`changed_ids` 只含 id 与状态，不含正文；forget 只给 `id + removed`，不给 title。
+- **失效触发**：任何改变 active 集合或 catalog 可见字段的已提交操作——create、title/pin/authority/sensitive 更新、supersede、deprecate、expire、forget、pending accept/reject 导致 active 变化、外部编辑经 review 被确认——都递增该 scope 的 `catalog_version` 并更新 `catalog_digest`。版本与 digest 写入 `<state_root>/catalog/<scope>.json`；这是 Markdown 的派生缓存，不产生独立事件。变化由 Builder 在下一次组装（run start / resume / compaction）或下一轮 `catalog_delta` 中通过与已注入快照做结构化比对得到：tail delta 对 added/changed 给 `id + revision + title`，对 removed 只给 `id`，任何情况都不含正文；forget 的 title 不重新出现。
 - **run 内**：已发送的 SessionPrefix 不重写。失效后，下一轮在 uncached tail 生成一个受限的 `catalog_delta` segment：`changed: id → status/title/revision`（≤ 8 条、≤ 1 KiB）；超过阈值只输出 `catalog_stale: true` 与版本号，要求模型用 `memory.read` 获取当前内容。delta 只描述“相对已注入 catalog 的变化”，不是新的 catalog。
-- **run 边界**：下一次 run start / resume / compaction 后首次组装时重建完整 catalog，使用当前 Markdown 与 receipt 校验结果，递增版本并写入 SessionPrefix。run 内绝不因为一次修改重建整个 system prefix。
+- **run 边界**：下一次 run start / resume / compaction 后首次组装时重建完整 catalog，使用当前 Markdown 与 receipt 校验结果；内容变化时递增版本，然后写入 SessionPrefix。run 内绝不因为一次修改重建整个 system prefix。
 - **已注入旧内容 vs 当前事实**：旧 catalog 行属于历史注入；tail delta 明确标注 superseded/removed/changed。recall block 永远从当前 Markdown/index 读取，不从旧 catalog 取内容。`MemoryRecalled` 记录 `catalog_version` 与 `catalog_digest`，事后可区分“当时注入的是旧版本”与“当前事实”。
 - **TTL**：`expire_due` 在 run start 与每轮结束执行；状态变化触发失效与 delta。即使 catalog 尚未重建，recall 读取时仍按 `expires_at` 过滤，不会把过期事实当当前事实注入。
 - **resume/compaction**：resume 首次 run 重新组装 catalog 并与 last recorded version 比对；completion/compaction 不把旧 catalog 注入内容当当前事实恢复，重建只从 Markdown/receipt 读。旧 transcript 中出现过的 catalog 文本只作为历史消息保留，不重新成为 SessionPrefix。
