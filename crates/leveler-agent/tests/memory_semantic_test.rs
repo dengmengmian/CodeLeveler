@@ -153,8 +153,11 @@ async fn ordinary_main_turn_makes_zero_semantic_model_calls() {
     assert_eq!(runtime.requests().len(), 1, "only the coding call is made");
 }
 
+/// The removed deterministic parser must not come back. A durable-looking
+/// sentence makes no semantic call and writes no memory in the main turn;
+/// meaning is the background extractor's job.
 #[tokio::test]
-async fn deterministic_fast_path_admits_without_a_semantic_call() {
+async fn a_durable_looking_sentence_waits_for_the_background_extractor() {
     let dir = tempfile::tempdir().unwrap();
     let memory = dir.path().join("memory");
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
@@ -164,19 +167,16 @@ async fn deterministic_fast_path_admits_without_a_semantic_call() {
 
     assert_eq!(runtime.generate_calls(), 0);
     let store = MemoryStore::open(&memory).unwrap();
-    let active = store.effective_active().unwrap();
-    assert_eq!(active.len(), 1);
-    assert!(active[0].body.contains("flash"));
-    assert_eq!(
-        active[0].authority(),
-        leveler_memory::MemoryAuthority::ExplicitUser
+    assert!(
+        store.effective_active().unwrap().is_empty(),
+        "the main turn must not parse prose into memory"
     );
     assert!(store.list_pending().unwrap().is_empty());
     assert!(
-        events.iter().any(
-            |event| matches!(event, AgentEvent::MemoryChanged { operation, .. } if operation == "created")
-        ),
-        "the user's own durable statement is a memory change: {events:?}"
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::MemoryChanged { .. })),
+        "no memory changed: {events:?}"
     );
 }
 
@@ -185,8 +185,21 @@ async fn recall_remains_on_the_main_turn_without_triggering_extraction() {
     let dir = tempfile::tempdir().unwrap();
     let memory = dir.path().join("memory");
     let store = MemoryStore::open(&memory).unwrap();
-    let fact = leveler_memory::parse_durable_fact("以后本项目默认模型固定为 flash").unwrap();
-    store.commit_candidate(&fact).unwrap();
+    let subject = "默认模型";
+    let key = leveler_memory::semantic_key_of(subject);
+    let mut fact = leveler_memory::MemoryCandidate::new(
+        "默认模型",
+        "以后本项目默认模型固定为 flash",
+        leveler_memory::CandidateKind::Free,
+        Some(key.clone()),
+        leveler_memory::CandidateSource::UserExplicit,
+        vec![format!("subject:{subject}")],
+    )
+    .unwrap();
+    fact.semantic_key = Some(key);
+    fact.authority = leveler_memory::MemoryAuthority::ExplicitUser;
+    let committed = store.commit_candidate(&fact).unwrap();
+    let entry_id = committed.entry.expect("the fact was written").id;
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("flash")]));
     let executor = executor(dir.path(), &memory, runtime.clone());
 
@@ -194,13 +207,17 @@ async fn recall_remains_on_the_main_turn_without_triggering_extraction() {
 
     assert_eq!(runtime.generate_calls(), 0);
     let request = &runtime.requests()[0];
+    // The main turn receives the candidate row, not the body: applicability
+    // is the model's judgment and the full text is one memory read away.
     assert!(
-        request.control_context.text().contains("flash")
-            || request
-                .messages
-                .iter()
-                .any(|message| message.text_content().contains("flash"))
+        request
+            .control_context
+            .text()
+            .contains(&format!("[{entry_id}]")),
+        "the recalled candidate must reach the provider request: {}",
+        request.control_context.text()
     );
+    assert!(request.control_context.text().contains("默认模型"));
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::MemoryRecalled { count, .. } if *count >= 1

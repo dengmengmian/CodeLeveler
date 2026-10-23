@@ -34,6 +34,9 @@ const MAX_FACT_CHARS: usize = 240;
 const MAX_EVIDENCE_CHARS: usize = 300;
 /// Bounds of the subject identity string.
 const MAX_SUBJECT_CHARS: usize = 96;
+/// Bounds of the structured value of an assignment.
+const MAX_VALUE_CHARS: usize = 240;
+
 /// A candidate below this self-reported confidence is not trusted enough to
 /// become durable memory without a human. Only consulted when the model
 /// reports one; a missing confidence is not a reason to refuse.
@@ -102,6 +105,12 @@ pub struct SemanticCandidate {
     /// A stable identity for the fact's subject, e.g. `project.default_model`.
     /// The runtime normalizes it; it is not trusted as-is.
     pub subject: String,
+    /// When this statement restates, replaces, or reverses an existing
+    /// decision that was originally recorded under another subject, the model
+    /// names that subject here. The runtime resolves it against active memory;
+    /// it does not compare wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_subject: Option<String>,
     /// The value when the fact is an assignment (`Pro`, `required`, `forbidden`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -127,8 +136,6 @@ pub enum CandidateRejection {
     EmptyFact,
     /// `fact` was too long to be one atomic statement.
     FactTooLong { chars: usize },
-    /// `fact` read as several statements joined together.
-    NotAtomic,
     /// `subject` was empty or too long to be a stable identity.
     InvalidSubject,
     /// Only `explicit_user` may auto-commit this round.
@@ -157,7 +164,6 @@ impl CandidateRejection {
         match self {
             Self::EmptyFact => "empty_fact",
             Self::FactTooLong { .. } => "fact_too_long",
-            Self::NotAtomic => "not_atomic",
             Self::InvalidSubject => "invalid_subject",
             Self::NotExplicitUser { .. } => "not_explicit_user",
             Self::NotDurable { .. } => "not_durable",
@@ -176,7 +182,6 @@ impl CandidateRejection {
         match self {
             Self::EmptyFact => "candidate fact was empty".to_string(),
             Self::FactTooLong { chars } => format!("candidate fact was {chars} chars"),
-            Self::NotAtomic => "candidate read as more than one statement".to_string(),
             Self::InvalidSubject => "candidate subject was not a usable identity".to_string(),
             Self::NotExplicitUser { authority } => {
                 format!("authority {} may not auto-commit", authority.as_str())
@@ -331,10 +336,6 @@ pub fn validate_semantic_candidate(
             chars: fact.chars().count(),
         });
     }
-    if !is_atomic(fact) {
-        return Err(CandidateRejection::NotAtomic);
-    }
-
     if candidate.authority != MemoryAuthority::ExplicitUser {
         return Err(CandidateRejection::NotExplicitUser {
             authority: candidate.authority,
@@ -383,9 +384,23 @@ pub fn validate_semantic_candidate(
         return Err(CandidateRejection::Sensitive);
     }
 
-    let subject = canonical_subject(&candidate.subject);
+    let subject = normalize_subject(&candidate.subject);
     if subject.is_empty() || subject.chars().count() > MAX_SUBJECT_CHARS {
         return Err(CandidateRejection::InvalidSubject);
+    }
+    let related_subject = candidate
+        .related_subject
+        .as_deref()
+        .map(normalize_subject)
+        .filter(|subject| !subject.is_empty());
+    if related_subject
+        .as_deref()
+        .is_some_and(|subject| subject.chars().count() > MAX_SUBJECT_CHARS)
+    {
+        return Err(CandidateRejection::InvalidSubject);
+    }
+    if related_subject.as_deref().is_some_and(looks_like_secret) {
+        return Err(CandidateRejection::Sensitive);
     }
 
     let key = semantic_key_of(&subject);
@@ -410,15 +425,23 @@ pub fn validate_semantic_candidate(
     )
     .map_err(|_| CandidateRejection::Sensitive)?;
     memory.semantic_key = Some(key);
+    memory.related_key = related_subject.as_deref().map(semantic_key_of);
     memory.authority = MemoryAuthority::ExplicitUser;
     memory.operation = match candidate.operation_hint {
-        OperationHint::Update | OperationHint::Negate => CandidateOperation::Update,
+        OperationHint::Update => CandidateOperation::Update,
+        OperationHint::Negate => CandidateOperation::Negate,
         OperationHint::Create
         | OperationHint::Reaffirm
         | OperationHint::Temporary
         | OperationHint::Unknown => CandidateOperation::Create,
     };
     memory.evidence = Some(clip(&candidate.evidence_span, MAX_EVIDENCE_CHARS));
+    memory.value = candidate
+        .value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| clip(value, MAX_VALUE_CHARS));
     Ok(memory)
 }
 
@@ -511,83 +534,31 @@ fn normalize_for_match(text: &str) -> String {
         .collect()
 }
 
-/// A fact is atomic when it is one statement, not a concatenation of several.
-/// Sentence terminators and list separators inside the fact are the tell: an
-/// atomic fact is one clause and never needs them.
-fn is_atomic(fact: &str) -> bool {
-    const TERMINATORS: [char; 9] = ['。', '；', ';', '！', '!', '？', '?', '\n', '\r'];
-    if fact.contains(TERMINATORS) {
-        return false;
-    }
-    // Two or more commas read as an enumeration, which is a blob wherever the
-    // individual items have different identities.
-    let commas = fact.matches([',', '，']).count();
-    commas < 2
-}
-
-/// Normalize a subject into the shared identity space used by the deterministic
-/// fast path, so a fact stated once in canonical form and later in Chinese (or
-/// vice versa) still maps to one memory.
+/// Normalize a subject's spelling into the shared identity space.
 ///
-/// This is identity normalization, not extraction: it is a small, explicit
-/// alias table, and an unknown subject is kept verbatim so it can never
-/// collide with a different fact by accident.
-pub fn canonical_subject(raw: &str) -> String {
-    let stripped = raw.trim();
-    let stripped = stripped
-        .strip_prefix("project.")
-        .or_else(|| stripped.strip_prefix("project_"))
-        .unwrap_or(stripped);
-    let dotted = stripped.replace('.', "_");
-    let compact: String = dotted
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_lowercase();
-    for (alias, canonical) in SUBJECT_ALIASES {
-        if compact == *alias {
-            return (*canonical).to_string();
+/// This is spelling normalization only: case, whitespace and separator
+/// punctuation are folded so `project.default_model`, `Project Default Model`
+/// and `project-default-model` are one identity. Wording is not interpreted
+/// here. Two different names stay two different subjects even when they share
+/// a suffix, and no alias table can make one name out of two meanings. The
+/// model owns semantic identity; the runtime only guarantees comparison is
+/// exact after this fold.
+pub fn normalize_subject(raw: &str) -> String {
+    // Fold case first: the namespace prefix is documented as `project.`, but
+    // the model may capitalize it. Only the dotted form is folded;
+    // `project_foo` is its own name.
+    let raw = raw.trim().to_lowercase();
+    let raw = raw.strip_prefix("project.").unwrap_or(raw.as_str());
+    let mut normalized = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            c if c.is_whitespace() => normalized.push('_'),
+            '.' | '-' | '/' | '\\' => normalized.push('_'),
+            c => normalized.push(c),
         }
     }
-    dotted
+    normalized
 }
-
-/// Alias groups keyed by the whitespace-free lowercase spelling. Each group
-/// collapses on one canonical subject; the fast path's Chinese slot names and
-/// the extractor's dotted identities land on the same key.
-const SUBJECT_ALIASES: &[(&str, &str)] = &[
-    ("default_model", "默认模型"),
-    ("defaultmodel", "默认模型"),
-    // Models routinely emit the words in the other order. Both spellings are
-    // the same subject, not two facts.
-    ("model_default", "默认模型"),
-    ("modeldefault", "默认模型"),
-    ("默认模型", "默认模型"),
-    ("默认", "默认模型"),
-    ("model", "默认模型"),
-    ("windows_support", "windows支持"),
-    ("windowssupport", "windows支持"),
-    ("windows", "windows支持"),
-    ("windows支持", "windows支持"),
-    ("平台支持", "windows支持"),
-    ("platform.windows.support", "windows支持"),
-    ("service_background_start", "后台启动服务"),
-    ("servicebackgroundstart", "后台启动服务"),
-    ("background_start", "后台启动服务"),
-    ("backgroundstart", "后台启动服务"),
-    ("后台启动服务", "后台启动服务"),
-    ("protected_branch_push", "保护分支推送"),
-    ("protectedbranchpush", "保护分支推送"),
-    ("保护分支推送", "保护分支推送"),
-    ("push_policy", "保护分支推送"),
-    ("pushpolicy", "保护分支推送"),
-    ("分支推送", "保护分支推送"),
-    ("language", "编程语言"),
-    ("language_standard", "编程语言"),
-    ("languagestandard", "编程语言"),
-    ("编程语言", "编程语言"),
-    ("技术栈", "编程语言"),
-];
 
 fn clip(text: &str, max_chars: usize) -> String {
     text.trim().chars().take(max_chars).collect()
@@ -601,6 +572,7 @@ mod tests {
         SemanticCandidate {
             fact: fact.to_string(),
             subject: subject.to_string(),
+            related_subject: None,
             value: None,
             scope: CandidateScope::Project,
             durability: CandidateDurability::Durable,
@@ -693,7 +665,7 @@ mod tests {
         assert_eq!(memory.source, CandidateSource::UserExplicit);
         assert_eq!(
             memory.semantic_key.as_deref(),
-            Some(semantic_key_of("默认模型").as_str())
+            Some(semantic_key_of("default_model").as_str())
         );
         assert_eq!(memory.evidence.as_deref(), Some("模型就 Pro"));
     }
@@ -803,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn secrets_and_blobs_are_refused() {
+    fn secrets_are_refused() {
         let msg = "以后 token 用 sk-abcdefghijklmnop 吧";
         let c = candidate(
             "token 是 sk-abcdefghijklmnop",
@@ -826,18 +798,19 @@ mod tests {
             validate_semantic_candidate(&secret_subject, "deploy key is set").unwrap_err(),
             CandidateRejection::Sensitive
         );
+    }
 
-        let msg2 = "以后统一用 Rust，Windows 也必须支持，而且 protected branch 不要直接 push。";
-        let mut blob = candidate(
-            "项目以后用 Rust 且支持 Windows 且禁止 push",
-            "language",
-            "以后统一用 Rust",
-        );
-        blob.fact = "用 Rust，支持 Windows，禁止 push".to_string();
-        assert_eq!(
-            validate_semantic_candidate(&blob, msg2).unwrap_err(),
-            CandidateRejection::NotAtomic
-        );
+    /// Punctuation is not a semantic test. The model's structured candidate is
+    /// the unit of a fact; the runtime validates provenance, not how many
+    /// clauses a sentence contains.
+    #[test]
+    fn punctuation_does_not_decide_atomicity() {
+        let msg = "以后统一用 Rust；Windows 也必须支持，而且 protected branch 不要直接 push。";
+        let mut c = candidate("用 Rust；支持 Windows，禁止 push", "language", msg);
+        c.fact = "用 Rust；支持 Windows，禁止 push".to_string();
+        let converted =
+            validate_semantic_candidate(&c, msg).expect("punctuation must not reject a fact");
+        assert_eq!(converted.body, "用 Rust；支持 Windows，禁止 push");
     }
 
     #[test]
@@ -851,33 +824,63 @@ mod tests {
         ));
     }
 
+    /// Normalization folds spelling, not meaning. The same name written with
+    /// another case, spacing, or separator is one identity; a name that differs
+    /// by a word is a different identity, however similar it looks.
     #[test]
-    fn canonical_subject_unifies_fast_path_and_semantic_spellings() {
+    fn subject_normalization_folds_spelling_only() {
         for subject in [
             "project.default_model",
             "default_model",
-            "model_default",
-            "modeldefault",
-            "默认模型",
-            "默认",
+            "Default Model",
+            "default-model",
+            "DEFAULT.MODEL",
         ] {
             assert_eq!(
-                semantic_key_of(&canonical_subject(subject)),
-                semantic_key_of("默认模型"),
+                semantic_key_of(&normalize_subject(subject)),
+                semantic_key_of("default_model"),
                 "{subject}"
             );
         }
-        assert_eq!(
-            canonical_subject("service.background_start"),
-            "后台启动服务"
+        for subject in ["model_default", "defaultmodel", "默认模型", "默认"] {
+            assert_ne!(
+                semantic_key_of(&normalize_subject(subject)),
+                semantic_key_of("default_model"),
+                "a different spelling of the words is a different subject: {subject}"
+            );
+        }
+    }
+
+    /// A shared suffix is not an identity. Stripping it would make two
+    /// different facts update each other.
+    #[test]
+    fn subjects_with_a_shared_suffix_stay_distinct() {
+        assert_ne!(
+            semantic_key_of(&normalize_subject("billing_model")),
+            semantic_key_of(&normalize_subject("billing_setting"))
+        );
+        assert_ne!(
+            semantic_key_of(&normalize_subject("release_probe_codename")),
+            semantic_key_of(&normalize_subject("deploy_window"))
         );
     }
 
+    /// A declared relation is normalized like every subject and carried onto
+    /// the candidate for the lifecycle to resolve.
     #[test]
-    fn unknown_subjects_stay_distinct() {
-        assert_ne!(
-            semantic_key_of(&canonical_subject("project.release_probe_codename")),
-            semantic_key_of(&canonical_subject("project.deploy_window"))
+    fn a_related_subject_is_a_structured_identity() {
+        let msg = "JSON 响应字段命名也用 snake_case";
+        let mut c = candidate(
+            "JSON 响应字段命名使用 snake_case",
+            "project.json_response_field_naming",
+            "JSON 响应字段命名也用 snake_case",
+        );
+        c.related_subject = Some("Project.API Response Field Naming".to_string());
+        c.operation_hint = OperationHint::Reaffirm;
+        let memory = validate_semantic_candidate(&c, msg).unwrap();
+        assert_eq!(
+            memory.related_key.as_deref(),
+            Some(semantic_key_of("api_response_field_naming").as_str())
         );
     }
 
@@ -907,12 +910,15 @@ mod tests {
         assert!(validated.accepted[0].body.contains("Windows"));
     }
 
+    /// Two candidates that name the same subject with different spelling are
+    /// one fact. Identity folds spelling only; different subject strings are
+    /// different facts, because meaning belongs to the model.
     #[test]
-    fn duplicate_facts_for_one_subject_collapse() {
+    fn duplicate_facts_for_the_same_subject_spelling_collapse() {
         let msg = "默认模型用 Pro";
         let batch = vec![
             candidate("默认模型是 Pro", "project.default_model", "默认模型用 Pro"),
-            candidate("默认模型是 Pro", "默认模型", "默认模型用 Pro"),
+            candidate("默认模型是 Pro", "Project.Default-Model", "默认模型用 Pro"),
         ];
         let validated = validate_semantic_candidates(&batch, msg);
         assert_eq!(validated.accepted.len(), 1);

@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent::{AgentEvent, Executor, NoopSink};
 use leveler_core::RequestId;
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
-use leveler_memory::{MemoryStore, parse_durable_fact};
+use leveler_memory::{
+    CandidateKind, CandidateSource, MemoryAuthority, MemoryCandidate, MemoryStore,
+};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage,
@@ -158,12 +160,29 @@ fn provider_saw(runtime: &CaptureRuntime, needle: &str) -> bool {
     })
 }
 
-/// A durable sentence in the user's own turn is the user's decision: the turn
-/// admits it with explicit-user authority. A second wording must not add a
-/// competing entry, and a different value must not overwrite the current one
-/// without a person.
+/// A structured durable fact: the model owns the subject, and the test
+/// supplies it directly. No prose is parsed into identity.
+fn structured_fact(subject: &str, body: &str) -> MemoryCandidate {
+    let key = leveler_memory::semantic_key_of(subject);
+    let mut candidate = MemoryCandidate::new(
+        body,
+        body,
+        CandidateKind::Free,
+        Some(key.clone()),
+        CandidateSource::UserExplicit,
+        vec![format!("subject:{subject}")],
+    )
+    .unwrap();
+    candidate.semantic_key = Some(key);
+    candidate.authority = MemoryAuthority::ExplicitUser;
+    candidate
+}
+
+/// The executor no longer interprets natural language into memory. Meaning
+/// belongs to the model extractor; the turn must not invent an identity from
+/// the sentence, so an ordinary durable-looking statement writes nothing here.
 #[tokio::test]
-async fn a_natural_rule_is_current_and_a_conflict_waits_for_acceptance() {
+async fn a_natural_sentence_is_not_written_by_the_executor() {
     let (dir, mem) = workspace("create");
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
     let executor_a = executor(&dir, &mem, runtime.clone());
@@ -176,55 +195,17 @@ async fn a_natural_rule_is_current_and_a_conflict_waits_for_acceptance() {
     .await;
 
     let store = MemoryStore::open(&mem).unwrap();
-    let active = store.effective_active().unwrap();
-    assert_eq!(active.len(), 1);
-    assert!(active[0].body.contains("snake_case"));
-    assert_eq!(
-        active[0].authority(),
-        leveler_memory::MemoryAuthority::ExplicitUser
+    assert!(
+        store.effective_active().unwrap().is_empty(),
+        "the executor must not parse prose into a memory identity"
     );
     assert!(store.list_pending().unwrap().is_empty());
     assert!(
-        events.iter().any(
-            |e| matches!(e, AgentEvent::MemoryChanged { operation, .. } if operation == "created")
-        ),
-        "the user's own durable statement is a durable-memory change: {events:?}"
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::MemoryChanged { .. })),
+        "no memory changed: {events:?}"
     );
-
-    // The same constraint under another model-chosen object is not a second
-    // memory and does not ask the user to settle a duplicate.
-    let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
-    let executor_b = executor(&dir, &mem, runtime_b);
-    let mut events_b = Vec::new();
-    run_turn(
-        &executor_b,
-        "以后 JSON 响应字段命名统一使用 snake_case",
-        &mut events_b,
-    )
-    .await;
-    assert_eq!(store.effective_active().unwrap().len(), 1);
-    assert!(store.list_pending().unwrap().is_empty());
-
-    // A different value for the same constraint is a conflict: it waits for a
-    // person and leaves current truth untouched.
-    let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
-    let executor_c = executor(&dir, &mem, runtime_c);
-    let mut events_c = Vec::new();
-    run_turn(
-        &executor_c,
-        "以后 JSON 响应字段命名统一使用 camelCase",
-        &mut events_c,
-    )
-    .await;
-    let active = store.effective_active().unwrap();
-    assert_eq!(active.len(), 1);
-    assert!(
-        active[0].body.contains("snake_case"),
-        "the conflicting value must not overwrite current truth: {active:?}"
-    );
-    let pending = store.list_pending().unwrap();
-    assert_eq!(pending.len(), 1, "exactly one conflict waits for consent");
-    assert!(pending[0].body.contains("camelCase"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -250,81 +231,52 @@ async fn explicit_remember_command_writes_active_memory() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A direct save and a later correction share the same semantic identity. The
-/// explicit command must not become a keyless island that keeps being recalled
-/// after the user changes their mind.
+/// A direct command is stored verbatim and is visible to a later, separate
+/// session. The command does not parse an identity out of its prose, so the
+/// entry is a plain record with no key.
 #[tokio::test]
-async fn direct_save_then_later_correction_recalls_only_the_new_truth() {
-    let (dir, mem) = workspace("direct-then-correct");
+async fn a_direct_command_is_stored_and_recalled_in_a_later_session() {
+    let (dir, mem) = workspace("direct-then-recall");
     let runtime_a = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
     let executor_a = executor(&dir, &mem, runtime_a);
     let mut events_a = Vec::new();
-    run_turn(
-        &executor_a,
-        "记住：以后本项目默认模型固定为 Pro",
-        &mut events_a,
-    )
-    .await;
-
-    let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("已更新")]));
-    let executor_b = executor(&dir, &mem, runtime_b);
-    let mut events_b = Vec::new();
-    run_turn(&executor_b, "以后本项目默认模型改为 Flash", &mut events_b).await;
+    run_turn(&executor_a, "记住：终端输出保持紧凑", &mut events_a).await;
 
     let store = MemoryStore::open(&mem).unwrap();
     let active = store.effective_active().unwrap();
     assert_eq!(active.len(), 1);
-    assert!(active[0].body.contains("Flash"));
+    assert!(active[0].body.contains("终端输出保持紧凑"));
+    assert!(active[0].key.is_none(), "no identity is parsed from prose");
     assert!(store.list_pending().unwrap().is_empty());
-    assert!(events_b.iter().any(|event| matches!(
-        event,
-        AgentEvent::MemoryChanged { operation, .. } if operation == "superseded"
-    )));
 
-    let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("Flash")]));
-    let executor_c = executor(&dir, &mem, runtime_c.clone());
-    let mut events_c = Vec::new();
-    run_turn(&executor_c, "默认模型是什么？", &mut events_c).await;
-    assert!(provider_saw(&runtime_c, "默认模型：Flash"));
-    assert!(!provider_saw(&runtime_c, "默认模型：Pro"));
+    let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
+    let executor_b = executor(&dir, &mem, runtime_b.clone());
+    let mut events_b = Vec::new();
+    run_turn(&executor_b, "终端输出应该怎么处理？", &mut events_b).await;
+    assert!(
+        provider_saw(&runtime_b, "终端输出保持紧凑"),
+        "a new session must recall the direct write"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Path A: a natural sentence that states a new decision updates the existing
-/// identity WITHOUT a `/remember` command or a second active entry.
+/// A structured correction — the shape the model extractor produces — replaces
+/// the old truth through the lifecycle, and a later session recalls only the
+/// new value. No prose is compared to decide the relation.
 #[tokio::test]
-async fn a_natural_statement_updates_the_existing_decision() {
+async fn a_structured_correction_replaces_the_old_recall_truth() {
     let (dir, mem) = workspace("natural-update");
-    let runtime_a = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
-    let executor_a = executor(&dir, &mem, runtime_a);
-    let mut events_a = Vec::new();
-    run_turn(
-        &executor_a,
-        "记住：以后本项目默认模型固定为 Pro",
-        &mut events_a,
-    )
-    .await;
-
-    let runtime_b = Arc::new(CaptureRuntime::new(vec![assistant_text("已更新")]));
-    let executor_b = executor(&dir, &mem, runtime_b);
-    let mut events_b = Vec::new();
-    run_turn(
-        &executor_b,
-        "以后默认使用 Flash，不再使用 Pro。",
-        &mut events_b,
-    )
-    .await;
-
     let store = MemoryStore::open(&mem).unwrap();
-    let active = store.effective_active().unwrap();
-    assert_eq!(active.len(), 1, "one current truth: {active:?}");
-    assert!(active[0].body.contains("Flash"));
-    assert!(store.list_pending().unwrap().is_empty());
-    assert_eq!(store.list_archived().unwrap().len(), 1);
-    assert!(events_b.iter().any(|event| matches!(
-        event,
-        AgentEvent::MemoryChanged { operation, .. } if operation == "superseded"
-    )));
+    store
+        .commit_candidate(&structured_fact("default_model", "默认模型：Pro"))
+        .unwrap();
+    let outcome = store
+        .commit_candidate(&structured_fact("default_model", "默认模型：Flash"))
+        .unwrap();
+    assert_eq!(
+        outcome.operation,
+        leveler_memory::AppliedOperation::Superseded
+    );
 
     let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("Flash")]));
     let executor_c = executor(&dir, &mem, runtime_c.clone());
@@ -335,23 +287,35 @@ async fn a_natural_statement_updates_the_existing_decision() {
         !provider_saw(&runtime_c, "默认模型：Pro"),
         "the superseded value must not be recalled"
     );
+    assert_eq!(store.effective_active().unwrap().len(), 1);
+    assert_eq!(store.list_archived().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An ambiguous sentence has no trustworthy identity. It may be proposed, but
-/// it must not overwrite the current value.
+/// A candidate with no structured identity is a proposal, never current truth.
 #[tokio::test]
-async fn an_ambiguous_update_does_not_overwrite_current_truth() {
+async fn an_identityless_candidate_does_not_overwrite_current_truth() {
     let (dir, mem) = workspace("ambiguous-update");
     let store = MemoryStore::open(&mem).unwrap();
-    let fact = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
-    store.commit_candidate(&fact).unwrap();
+    store
+        .commit_candidate(&structured_fact("default_model", "默认模型：Pro"))
+        .unwrap();
 
-    // The app's soft-signal path proposes a candidate with no identity. It
-    // must never become current truth by itself.
-    let proposed = store.propose_from_user_text("以后用 Flash 吧").unwrap();
+    let proposed = store
+        .propose(
+            MemoryCandidate::new(
+                "默认模型",
+                "以后用 Flash 吧",
+                CandidateKind::Free,
+                None,
+                CandidateSource::SystemInferred,
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
     assert!(
-        matches!(proposed, Some(leveler_memory::ProposeOutcome::Pending(_))),
+        matches!(proposed, leveler_memory::ProposeOutcome::Pending(_)),
         "{proposed:?}"
     );
 
@@ -400,7 +364,10 @@ async fn a_turn_with_no_memory_reports_a_zero_hit_recall() {
 async fn a_later_run_recalls_the_fact_into_the_provider_request() {
     let (dir, mem) = workspace("recall");
     let store = MemoryStore::open(&mem).unwrap();
-    let fact = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+    let fact = structured_fact(
+        "release_probe_codename",
+        "以后这个项目的发布探针代号固定为 ORANGE-7319",
+    );
     store.commit_candidate(&fact).unwrap();
 
     // A NEW executor over the same store — a new session reading durable memory.
@@ -428,46 +395,44 @@ async fn a_later_run_recalls_the_fact_into_the_provider_request() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An explicit correction of a known subject takes effect immediately: the
-/// current turn must win over stale memory while the old value remains only as
-/// non-recallable history.
+/// A direct command is a plain create: it does not guess a relation to a
+/// structured memory, so the two coexist and nothing is silently replaced.
 #[tokio::test]
-async fn an_explicit_correction_replaces_old_recall_truth() {
+async fn a_direct_command_does_not_guess_a_relation_to_structured_memory() {
     let (dir, mem) = workspace("update");
     let store = MemoryStore::open(&mem).unwrap();
-    let first = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
-    let created = store.commit_candidate(&first).unwrap();
-    let old_id = created.entry.unwrap().id;
+    let first = structured_fact(
+        "release_probe_codename",
+        "以后这个项目的发布探针代号固定为 ORANGE-7319",
+    );
+    store.commit_candidate(&first).unwrap();
 
     let runtime_c = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
     let executor_c = executor(&dir, &mem, runtime_c.clone());
     let mut events_c = Vec::new();
-    run_turn(&executor_c, "以后发布探针代号改成 BLUE-4821", &mut events_c).await;
+    run_turn(
+        &executor_c,
+        "记住：以后发布探针代号改成 BLUE-4821",
+        &mut events_c,
+    )
+    .await;
 
     assert!(store.list_pending().unwrap().is_empty());
     let active = store.effective_active().unwrap();
-    assert_eq!(active.len(), 1, "one current truth");
-    assert!(active[0].body.contains("BLUE-4821"));
+    assert_eq!(active.len(), 2, "the command is its own plain record");
     assert!(
-        events_c.iter().any(|e| matches!(
-            e,
-            AgentEvent::MemoryChanged { operation, .. } if operation == "superseded"
-        )),
-        "the stale-memory correction must be explicit: {events_c:?}"
+        active
+            .iter()
+            .any(|entry| entry.body.contains("ORANGE-7319"))
     );
-    let history = store.list_archived().unwrap();
-    assert_eq!(history.len(), 1, "history preserved");
-    assert_eq!(history[0].id, old_id);
-
-    // A later recall returns the new value and never the old one.
-    let runtime_d = Arc::new(CaptureRuntime::new(vec![assistant_text("BLUE-4821")]));
-    let executor_d = executor(&dir, &mem, runtime_d.clone());
-    let mut events_d = Vec::new();
-    run_turn(&executor_d, "发布探针代号是什么？", &mut events_d).await;
-    assert!(provider_saw(&runtime_d, "BLUE-4821"), "new truth recalled");
+    let direct = active
+        .iter()
+        .find(|entry| entry.body.contains("BLUE-4821"))
+        .expect("the command was stored");
     assert!(
-        !provider_saw(&runtime_d, "ORANGE-7319"),
-        "superseded truth must not be recalled"
+        direct.key.is_none(),
+        "no identity is parsed from the command"
     );
+    assert!(store.list_archived().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

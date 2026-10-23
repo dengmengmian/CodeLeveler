@@ -2934,7 +2934,6 @@ impl InProcessRuntimeClient {
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
-        self.notify_memory_candidates(&session_id, &content);
         let parts = match self.content_parts(&content, &attachments) {
             Ok(parts) => parts,
             Err(error) => {
@@ -2958,7 +2957,6 @@ impl InProcessRuntimeClient {
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         // Single interactive path: direct goal loop (update_goal + tools +
         // spawn_agent). Orchestrate is not used for sessions.
-        self.notify_memory_candidates(&session_id, &content);
         self.spawn_direct_goal_turn(session_id, content, admission, config)
     }
 
@@ -4333,34 +4331,6 @@ impl InProcessRuntimeClient {
                 true
             }
         }
-    }
-
-    /// Tell the user when a turn's words produced a memory candidate.
-    ///
-    /// A candidate that only exists on disk is indistinguishable from nothing
-    /// happening: the user said "记住 X", the system stored a proposal, and
-    /// said not a word. `/memory accept <id>` could always adopt it — nothing
-    /// ever pointed there. Notifying is this layer's job because this is the
-    /// layer with a client attached.
-    fn notify_memory_candidates(&self, session_id: &SessionId, user_text: &str) {
-        let waiting = self.app.enqueue_memory_candidates(user_text);
-        if waiting.is_empty() {
-            return;
-        }
-        let _ = self
-            .events_for(session_id)
-            .send(RuntimeEvent::Notification {
-                level: leveler_client_protocol::NotificationLevel::Info,
-                message: if waiting.len() == 1 {
-                    "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。"
-                        .to_string()
-                } else {
-                    format!(
-                        "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。",
-                        waiting.len()
-                    )
-                },
-            });
     }
 
     fn spawn_content_turn(

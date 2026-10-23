@@ -9,7 +9,7 @@ use std::fs;
 
 use serde::{Deserialize, Serialize};
 
-use crate::candidates::{MemoryCandidate, parse_inferred_preference};
+use crate::candidates::MemoryCandidate;
 use crate::{
     AppliedOperation, CommitOutcome, MemoryAuthority, MemoryEntry, MemoryError, MemoryStore,
     now_rfc3339, write_atomically_pub,
@@ -278,17 +278,6 @@ impl MemoryStore {
         Ok(ProposeOutcome::Pending(candidate))
     }
 
-    /// Parse user text for explicit remember intent and propose if any.
-    pub fn propose_from_user_text(
-        &self,
-        text: &str,
-    ) -> Result<Option<ProposeOutcome>, MemoryError> {
-        let Some(c) = parse_inferred_preference(text) else {
-            return Ok(None);
-        };
-        Ok(Some(self.propose(c)?))
-    }
-
     /// Candidates awaiting consent.
     ///
     /// Heals crash residue first: a candidate whose content an active entry
@@ -466,103 +455,60 @@ impl MemoryStore {
     }
 }
 
-/// Convenience: extract + propose from user text and optional repo root (PM).
-///
-/// Returns all propose outcomes (explicit intent first, then package manager).
-/// Never writes active memory.
-pub fn collect_turn_candidates(
-    store: &MemoryStore,
-    user_text: &str,
-    repo_root: Option<&std::path::Path>,
-) -> Result<Vec<ProposeOutcome>, MemoryError> {
-    // Repository-derived facts are deliberately NOT proposed here. A lockfile
-    // or `packageManager` field is readable from the working tree on demand, so
-    // storing a copy only creates a second source of truth that goes stale
-    // (a project that moved pnpm -> bun would keep being told `pnpm`).
-    // `candidates::package_manager_from_root` remains for callers that need the
-    // fact — they read it fresh instead of remembering it.
-    let _ = repo_root;
-    let mut out = Vec::new();
-    if let Some(candidate) = crate::parse_durable_fact(user_text) {
-        out.push(store.propose(candidate)?);
-    } else if let Some(o) = store.propose_from_user_text(user_text)? {
-        out.push(o);
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
-    use crate::candidates::{CandidateSource, parse_inferred_preference};
+    use crate::candidates::CandidateSource;
     use std::fs;
     use tempfile::tempdir;
 
-    /// A lockfile is a fact about the working tree, not a decision a person
-    /// made. Copying it into durable memory creates a second source of truth
-    /// that goes stale the moment the project switches package managers, so a
-    /// normal turn must propose nothing for it.
+    /// A structured explicit-user fact: the model owns the subject, the test
+    /// only supplies it directly.
+    fn durable(subject: &str, body: &str) -> MemoryCandidate {
+        let key = crate::semantic_key_of(&crate::normalize_subject(subject));
+        let mut candidate = MemoryCandidate::new(
+            body,
+            body,
+            crate::CandidateKind::Free,
+            Some(key.clone()),
+            CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        candidate.semantic_key = Some(key);
+        candidate.authority = MemoryAuthority::ExplicitUser;
+        candidate
+    }
+
+    fn preference(body: &str) -> MemoryCandidate {
+        MemoryCandidate::new(
+            body,
+            body,
+            crate::CandidateKind::Preference,
+            None,
+            CandidateSource::SystemInferred,
+            vec!["preference".into(), "inferred".into()],
+        )
+        .unwrap()
+    }
+
+    /// A lockfile is read from the working tree; the detector exists, but no
+    /// proposal path turns repository state into durable memory.
     #[test]
-    fn a_lockfile_proposes_no_memory() {
-        let dir = tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
+    fn a_lockfile_is_read_not_remembered() {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
-
-        let outcomes =
-            collect_turn_candidates(&store, "帮我看一下这个组件", Some(repo.path())).unwrap();
-        assert!(
-            outcomes.is_empty(),
-            "an ordinary turn proposes nothing from a lockfile: {outcomes:?}"
-        );
-        assert_eq!(store.list_pending().unwrap().len(), 0);
-        assert_eq!(store.list_active().unwrap().len(), 0);
-
-        // The detector itself is kept — other features may need to know the
-        // package manager, they just read it from the repository each time.
         assert_eq!(
             crate::candidates::package_manager_from_root(repo.path()),
             Some("pnpm")
         );
     }
 
-    /// Explicit user intent is still collected in the same turn.
-    #[test]
-    fn user_intent_is_still_collected_alongside_a_lockfile() {
-        let dir = tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
-        let repo = tempdir().unwrap();
-        fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
-
-        let outcomes =
-            collect_turn_candidates(&store, "我通常希望提交前先跑 lint", Some(repo.path()))
-                .unwrap();
-        assert_eq!(
-            outcomes.len(),
-            1,
-            "only the user's own intent: {outcomes:?}"
-        );
-        assert_eq!(store.list_pending().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_strong_durable_fact_is_not_duplicated_by_the_soft_fallback() {
-        let dir = tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
-
-        let outcomes = collect_turn_candidates(&store, "以后最好默认使用 pnpm", None).unwrap();
-
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(store.list_pending().unwrap().len(), 1);
-    }
-
     #[test]
     fn accept_explicit_intent_then_search_and_index_hit() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        // Explicit-intent extractor is the public entry; then accept → recall/index.
-        let extracted = parse_inferred_preference("我通常希望用 pnpm").expect("intent");
-        let outcome = store.propose(extracted).unwrap();
+        let outcome = store.propose(preference("我通常希望用 pnpm")).unwrap();
         let pending = match outcome {
             ProposeOutcome::Pending(c) => c,
             other => panic!("expected pending, got {other:?}"),
@@ -614,13 +560,8 @@ mod pipeline_tests {
     fn reject_leaves_active_empty_and_suppresses_repropose() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        // Any candidate exercises reject/suppress; a user preference is used
-        // because repository-derived facts are no longer proposed at all.
         let text = "我通常希望提交前先跑 lint";
-        let outcome = store
-            .propose_from_user_text(text)
-            .unwrap()
-            .expect("candidate");
+        let outcome = store.propose(preference(text)).unwrap();
         let pending = match outcome {
             ProposeOutcome::Pending(c) => c,
             other => panic!("expected pending: {other:?}"),
@@ -629,19 +570,11 @@ mod pipeline_tests {
         assert_eq!(store.list_active().unwrap().len(), 0);
         assert_eq!(store.list_pending().unwrap().len(), 0);
 
-        match store.propose_from_user_text(text).unwrap() {
-            Some(ProposeOutcome::Suppressed { .. }) => {}
-            Some(ProposeOutcome::Pending(_)) => panic!("must not re-spam after reject"),
+        match store.propose(preference(text)).unwrap() {
+            ProposeOutcome::Suppressed { .. } => {}
+            ProposeOutcome::Pending(_) => panic!("must not re-spam after reject"),
             other => panic!("unexpected {other:?}"),
         }
-        // collect_turn_candidates respects the same suppression.
-        let batch = collect_turn_candidates(&store, text, None).unwrap();
-        assert!(
-            batch
-                .iter()
-                .all(|o| !matches!(o, ProposeOutcome::Pending(_))),
-            "no new pending after suppress: {batch:?}"
-        );
     }
 
     /// Rejecting one value suppresses that signal, not the whole identity.
@@ -650,7 +583,7 @@ mod pipeline_tests {
     fn rejecting_one_value_does_not_suppress_a_later_value_for_the_same_identity() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let pro = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let pro = durable("default_model", "以后本项目默认模型固定为 Pro");
         let pending = match store.propose(pro.clone()).unwrap() {
             ProposeOutcome::Pending(candidate) => candidate,
             other => panic!("expected pending: {other:?}"),
@@ -665,7 +598,7 @@ mod pipeline_tests {
             "the exact rejected signal stays quiet"
         );
 
-        let flash = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let flash = durable("default_model", "以后本项目默认模型改为 Flash");
         assert!(
             matches!(store.propose(flash).unwrap(), ProposeOutcome::Pending(_)),
             "a new value for the same identity is a new decision"
@@ -708,7 +641,7 @@ mod pipeline_tests {
         let store = MemoryStore::open(dir.path()).unwrap();
         let body = "以后都默认使用 Flash";
         assert!(matches!(
-            store.propose_from_user_text(body).unwrap().unwrap(),
+            store.propose(preference(body)).unwrap(),
             ProposeOutcome::Pending(_)
         ));
         assert_eq!(store.list_pending_raw().unwrap().len(), 1);
@@ -730,8 +663,7 @@ mod pipeline_tests {
             let dir = tempdir().unwrap();
             let store = MemoryStore::open(dir.path()).unwrap();
             let candidate = match store
-                .propose_from_user_text("我通常希望提交前先跑 lint")
-                .unwrap()
+                .propose(preference("我通常希望提交前先跑 lint"))
                 .unwrap()
             {
                 ProposeOutcome::Pending(candidate) => candidate,
@@ -772,7 +704,7 @@ mod pipeline_tests {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         let _ = store
-            .propose_from_user_text("我通常希望用 gated writes")
+            .propose(preference("我通常希望用 gated writes"))
             .unwrap();
         assert_eq!(
             store.counts().unwrap(),
@@ -786,9 +718,9 @@ mod pipeline_tests {
     fn changed_value_for_active_key_waits_then_supersedes_on_accept() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let old = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old = durable("default_model", "以后本项目默认模型固定为 Pro");
         let old_id = store.commit_candidate(&old).unwrap().entry.unwrap().id;
-        let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let changed = durable("default_model", "以后本项目默认模型改为 Flash");
 
         let pending = match store.propose(changed).unwrap() {
             ProposeOutcome::Pending(candidate) => candidate,
@@ -822,7 +754,7 @@ mod pipeline_tests {
     fn explicit_project_fact_activates_without_a_second_decision() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let candidate = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let candidate = durable("default_model", "以后本项目默认模型固定为 Pro");
 
         store.admit_candidate(candidate).unwrap();
 
@@ -840,7 +772,7 @@ mod pipeline_tests {
     fn an_admitted_project_decision_is_listed_in_the_project_catalog() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let candidate = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let candidate = durable("default_model", "以后本项目默认模型固定为 Pro");
 
         store.admit_candidate(candidate).unwrap();
 
@@ -854,7 +786,7 @@ mod pipeline_tests {
     fn an_inferred_preference_still_waits_for_confirmation() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let candidate = parse_inferred_preference("我通常希望提交前先跑 lint").unwrap();
+        let candidate = preference("我通常希望提交前先跑 lint");
 
         let outcome = store.admit_candidate(candidate).unwrap();
 
@@ -876,6 +808,7 @@ mod pipeline_tests {
         let semantic = crate::SemanticCandidate {
             fact: "允许清空数据库".into(),
             subject: "database.reset".into(),
+            related_subject: None,
             value: Some("allowed".into()),
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,
@@ -902,9 +835,9 @@ mod pipeline_tests {
     fn explicit_runtime_correction_supersedes_without_a_second_candidate() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let old = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old = durable("default_model", "以后本项目默认模型固定为 Pro");
         let old_id = store.commit_candidate(&old).unwrap().entry.unwrap().id;
-        let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let changed = durable("default_model", "以后本项目默认模型改为 Flash");
 
         let outcome = match store.admit_candidate(changed).unwrap() {
             AdmitOutcome::Applied(outcome) => outcome,
@@ -929,15 +862,15 @@ mod pipeline_tests {
     fn explicit_correction_removes_every_stale_pending_value_for_the_key() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let old = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old = durable("default_model", "以后本项目默认模型固定为 Pro");
         store.commit_candidate(&old).unwrap();
-        let pending = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let pending = durable("default_model", "以后本项目默认模型改为 Flash");
         assert!(matches!(
             store.propose(pending).unwrap(),
             ProposeOutcome::Pending(_)
         ));
 
-        let newest = crate::parse_durable_fact("以后本项目默认模型改为 Ultra").unwrap();
+        let newest = durable("default_model", "以后本项目默认模型改为 Ultra");
         assert!(matches!(
             store.admit_candidate(newest).unwrap(),
             AdmitOutcome::Applied(_)
@@ -949,13 +882,13 @@ mod pipeline_tests {
         assert!(active[0].body.contains("Ultra"));
     }
 
+    /// A legacy direct write predates identity tracking, so it has no key.
+    /// The runtime must not guess one from its prose: the new structured fact
+    /// is a second memory, and the unidentifiable record waits for a person.
     #[test]
-    fn a_legacy_keyless_direct_write_is_found_and_superseded() {
+    fn a_legacy_keyless_write_is_not_replaced_by_a_guessed_identity() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        // A legacy direct write predates identity tracking, so it has no key.
-        // `activate` itself now establishes one from a durable assignment;
-        // place this historical fixture directly.
         let mut legacy = crate::new_entry("旧默认模型", "以后本项目默认模型固定为 Pro", Vec::new());
         legacy.kind = Some("preference".into());
         legacy.provenance = Some(crate::Provenance {
@@ -969,20 +902,24 @@ mod pipeline_tests {
             "fixture represents a legacy direct write"
         );
 
-        let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let changed = durable("default_model", "以后本项目默认模型改为 Flash");
         assert!(matches!(
             store.admit_candidate(changed).unwrap(),
             AdmitOutcome::Applied(_)
         ));
 
         let active = store.effective_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert!(active[0].body.contains("Flash"));
-        assert_eq!(store.list_archived().unwrap()[0].id, old.id);
+        assert_eq!(active.len(), 2, "no silent replacement by guessed identity");
+        assert!(active.iter().any(|entry| entry.body.contains("Pro")));
+        assert!(active.iter().any(|entry| entry.body.contains("Flash")));
+        assert!(store.list_archived().unwrap().is_empty());
     }
 
+    /// An update that names no active identity is parked for a person. The
+    /// runtime must not apply it to an unrelated note that merely mentions the
+    /// same words, and it must not silently create a correction.
     #[test]
-    fn a_subject_mention_in_a_note_or_broader_preference_is_not_superseded() {
+    fn an_update_without_an_active_target_is_parked_not_applied() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         store
@@ -1004,6 +941,7 @@ mod pipeline_tests {
         let semantic = crate::SemanticCandidate {
             fact: "以后不要后台启动服务".into(),
             subject: "service.background_start".into(),
+            related_subject: None,
             value: Some("disabled".into()),
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,
@@ -1016,21 +954,13 @@ mod pipeline_tests {
         let candidate =
             crate::validate_semantic_candidate(&semantic, "以后不要后台启动服务了").unwrap();
 
-        // The user's decision is admitted as a NEW identity. The unrelated
-        // note and the broader log-retention rule are not replaced by it.
         let outcome = store.admit_candidate(candidate).unwrap();
-        assert!(matches!(
-            outcome,
-            AdmitOutcome::Applied(outcome)
-                if outcome.operation == crate::AppliedOperation::Created
-        ));
-        let active = store.effective_active().unwrap();
-        assert_eq!(active.len(), 3);
         assert!(
-            active
-                .iter()
-                .any(|entry| entry.body.contains("不要后台启动服务"))
+            matches!(outcome, AdmitOutcome::Proposed(ProposeOutcome::Pending(_))),
+            "an unresolvable update must wait for a person: {outcome:?}"
         );
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 2, "unrelated entries stay current");
         assert!(
             active
                 .iter()
@@ -1042,13 +972,14 @@ mod pipeline_tests {
                 .any(|entry| entry.body.contains("日志保留 7 天"))
         );
         assert!(store.list_archived().unwrap().is_empty());
+        assert_eq!(store.list_pending().unwrap().len(), 1);
     }
 
     #[test]
     fn unchanged_value_for_active_key_is_already_active() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let fact = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let fact = durable("default_model", "以后本项目默认模型固定为 Pro");
         let active_id = store.commit_candidate(&fact).unwrap().entry.unwrap().id;
 
         assert_eq!(
@@ -1059,21 +990,12 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn extractors_drive_real_pipeline_entry_points() {
-        // Structural: shipped public functions are what CLI/app should call.
-        let c = parse_inferred_preference("我通常希望用 pnpm").expect("intent");
-        assert_eq!(c.source, CandidateSource::SystemInferred);
+    fn the_package_manager_is_read_from_the_repository() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("yarn.lock"), "").unwrap();
-        // The package manager is READ from the repository, never remembered.
         assert_eq!(
             crate::candidates::package_manager_from_root(dir.path()),
             Some("yarn")
         );
-    }
-
-    #[test]
-    fn secret_body_never_accepted_via_extractor() {
-        assert!(parse_inferred_preference("记住：api_key=sk-live-secret-value-here").is_none());
     }
 }

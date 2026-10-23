@@ -9,7 +9,8 @@ use leveler_agent::{
     BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, ExperienceEvent, ExperienceExtraction,
     ExperienceExtractor, ExtractionCall, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS,
     MAX_EXTRACTOR_INPUT_CHARS, ModelExperienceExtractor, ModelSemanticExtractor, SemanticExtractor,
-    build_evidence_pack, validate_batch_candidates, validate_experience_candidates,
+    build_evidence_pack, evidence_fingerprint, validate_batch_candidates,
+    validate_experience_candidates,
 };
 use leveler_core::{BootId, BootLiveness};
 use leveler_memory::{
@@ -794,6 +795,23 @@ impl MemoryConsolidator {
                 .settle_skipped_experience(item, "no_experience_signal")
                 .await;
         };
+        // Identical evidence cannot teach anything the active store does not
+        // already hold: the same failure, fix location and post-fix receipt
+        // produced the lesson sitting there now. Skip before paying for a
+        // provider call. A changed receipt, signature or file changes the
+        // fingerprint and still extracts.
+        let evidence_tag = format!("evidence:{}", evidence_fingerprint(&pack));
+        if evidence_already_learned(&self.memory_dir, &evidence_tag)? {
+            tracing::info!(
+                event = "experience_extraction_skipped",
+                turn_id = %item.turn_id,
+                reason = "duplicate_evidence",
+                "experience extraction skipped"
+            );
+            return self
+                .settle_skipped_experience(item, "duplicate_evidence")
+                .await;
+        }
         tracing::info!(
             event = "experience_extraction_started",
             turn_id = %item.turn_id,
@@ -813,7 +831,13 @@ impl MemoryConsolidator {
             self.record_experience_call(&item.session_id, call).await;
         }
         let candidates = candidates.map_err(|error| error.to_string())?;
-        let validated = validate_experience_candidates(&candidates, &pack);
+        let mut validated = validate_experience_candidates(&candidates, &pack);
+        for candidate in &mut validated.accepted {
+            // The tag is what makes a later identical evidence pack
+            // recognisable as already learned. It is generated, never model
+            // supplied.
+            candidate.tags.push(evidence_tag.clone());
+        }
         for (index, rejection) in &validated.rejected {
             tracing::debug!(
                 event = "experience_candidate_rejected",
@@ -1087,13 +1111,6 @@ impl MemoryConsolidator {
                 .chars()
                 .take(MAX_EXTRACTOR_INPUT_CHARS)
                 .collect();
-            // Deterministic durable wording avoids a model call, but is still
-            // only a candidate. Only an explicit memory command may write
-            // active memory without a separate accept decision.
-            if let Some(candidate) = leveler_memory::parse_durable_fact(&user_text) {
-                staged[index].accepted.push(candidate);
-                continue;
-            }
             if user_text.trim().is_empty() {
                 continue;
             }
@@ -1414,6 +1431,19 @@ fn skipped_experience(reason: impl Into<String>) -> StagedExperienceResult {
     }
 }
 
+/// Whether an ACTIVE lesson already carries this evidence identity. Archived
+/// and superseded entries do not count: once a lesson is invalidated, the same
+/// evidence may be worth re-learning against the current environment.
+fn evidence_already_learned(memory_dir: &std::path::Path, tag: &str) -> Result<bool, String> {
+    let store = MemoryStore::open(memory_dir).map_err(|error| error.to_string())?;
+    let active = store
+        .effective_active()
+        .map_err(|error| error.to_string())?;
+    Ok(active.iter().any(|entry| {
+        entry.experience.is_some() && entry.tags.iter().any(|candidate| candidate == tag)
+    }))
+}
+
 fn retry_delay(attempt: i64) -> chrono::Duration {
     let exponent = u32::try_from(attempt.saturating_sub(1))
         .unwrap_or(u32::MAX)
@@ -1680,6 +1710,7 @@ mod tests {
                 candidate: SemanticCandidate {
                     fact: "以后不要后台启动服务".to_string(),
                     subject: "service.background_start".to_string(),
+                    related_subject: None,
                     value: Some("disabled".to_string()),
                     scope: CandidateScope::Project,
                     durability: CandidateDurability::Durable,
@@ -1704,6 +1735,7 @@ mod tests {
             candidate: SemanticCandidate {
                 fact: fact.to_string(),
                 subject: "project.default_model".to_string(),
+                related_subject: None,
                 value: Some(value.to_string()),
                 scope: CandidateScope::Project,
                 durability: CandidateDurability::Durable,
@@ -1952,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_correction_supersedes_a_keyless_direct_save() {
+    async fn an_update_never_guesses_which_keyless_direct_save_it_replaces() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_messages(&db, ["以后不要后台启动服务了".to_string()]).await;
@@ -1971,15 +2003,13 @@ mod tests {
             )
             .unwrap()
             .id;
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let captured = events.clone();
         let worker = MemoryConsolidator::new(
             db,
             boot,
             temp.path().to_path_buf(),
             temp.path().join("memory"),
             Arc::new(UnusedRuntime),
-            Arc::new(move |event| captured.lock().unwrap().push(event)),
+            Arc::new(|_| {}),
         );
 
         worker
@@ -1987,23 +2017,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.list_pending().unwrap().is_empty());
+        // The direct save has no structured identity. The model's update names
+        // no active subject, so the runtime parks it instead of guessing that
+        // the prose describes the same decision.
+        assert_eq!(store.list_pending().unwrap().len(), 1);
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].body, "以后不要后台启动服务");
-        let history = store.list_archived().unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].id, old_id);
-        assert!(
-            store
-                .search("后台启动服务", 10)
-                .unwrap()
-                .into_iter()
-                .all(|(entry, _)| entry.id != old_id)
-        );
-        assert!(events.lock().unwrap().iter().any(|event| {
-            event.operation == "superseded" && event.title.contains("不要后台启动")
-        }));
+        assert_eq!(active[0].id, old_id);
+        assert!(store.list_archived().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2031,10 +2052,7 @@ mod tests {
         assert_eq!(outcome.remaining, 0);
         assert!(outcome.is_complete(), "{outcome:?}");
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
-        let counts = MemoryInboxRepository::new(&db)
-            .counts()
-            .await
-            .unwrap();
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
         assert_eq!(counts.processed, 1);
         assert_eq!(counts.pending, 0);
     }
@@ -2130,10 +2148,7 @@ mod tests {
         assert_eq!(outcome.remaining, 1);
         assert!(!outcome.timed_out);
         assert!(!outcome.is_complete());
-        let counts = MemoryInboxRepository::new(&db)
-            .counts()
-            .await
-            .unwrap();
+        let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
         assert_eq!(counts.failed_retryable, 1, "the row stays durable");
         assert_eq!(counts.processing, 0, "the claim must not be left stuck");
     }
@@ -2158,10 +2173,7 @@ mod tests {
 
         assert_eq!(outcome.settled, 1);
         assert!(outcome.is_complete(), "{outcome:?}");
-        let experience = ExperienceInboxRepository::new(&db)
-            .counts()
-            .await
-            .unwrap();
+        let experience = ExperienceInboxRepository::new(&db).counts().await.unwrap();
         assert_eq!(
             experience.pending, 1,
             "the closed experience lane keeps its durable row"
@@ -2366,8 +2378,11 @@ mod tests {
         );
     }
 
+    /// There is no deterministic parser left. Every durable statement goes to
+    /// the model extractor, which owns meaning; the runtime only validates the
+    /// structured result.
     #[tokio::test]
-    async fn deterministic_fact_activates_without_a_model_call() {
+    async fn every_durable_statement_goes_through_the_model_extractor() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         let statement = "以后本项目默认模型固定为 Pro";
@@ -2407,7 +2422,11 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert!(active[0].body.contains("Pro"));
         assert!(store.list_pending().unwrap().is_empty());
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            1,
+            "the extractor is the only path from prose to memory"
+        );
         assert!(
             events
                 .lock()
@@ -2671,8 +2690,29 @@ mod tests {
             .claim_batch(&old_boot, leveler_core::now(), 1)
             .await
             .unwrap();
-        let pro = leveler_memory::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
-        let flash = leveler_memory::parse_durable_fact("以后本项目默认模型改成 Flash").unwrap();
+        let key = leveler_memory::semantic_key_of("default_model");
+        let mut pro = leveler_memory::MemoryCandidate::new(
+            "默认模型：Pro",
+            "默认模型：Pro",
+            leveler_memory::CandidateKind::Free,
+            Some(key.clone()),
+            leveler_memory::CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        pro.semantic_key = Some(key.clone());
+        pro.authority = leveler_memory::MemoryAuthority::ExplicitUser;
+        let mut flash = leveler_memory::MemoryCandidate::new(
+            "默认模型：Flash",
+            "默认模型：Flash",
+            leveler_memory::CandidateKind::Free,
+            Some(key.clone()),
+            leveler_memory::CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        flash.semantic_key = Some(key);
+        flash.authority = leveler_memory::MemoryAuthority::ExplicitUser;
         let store = MemoryStore::open(temp.path().join("memory")).unwrap();
         store.propose(pro.clone()).unwrap();
         let staged = StagedTurnResult {
@@ -2823,5 +2863,49 @@ mod tests {
                 .is_some_and(|json| json.contains("crash_replay")),
             "the staged decision must be replayed: {processed:?}"
         );
+    }
+
+    /// Only an ACTIVE lesson proves its evidence is already learned. A
+    /// different evidence identity is new, and an archived lesson no longer
+    /// suppresses a later re-learning.
+    #[test]
+    fn duplicate_evidence_is_recognised_only_while_its_lesson_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let tag = "evidence:0123456789abcdef";
+        let mut candidate = MemoryCandidate::new(
+            "engine profile lesson",
+            "fix the profile in engine.config",
+            leveler_memory::CandidateKind::Free,
+            Some("experience.engine.profile".to_string()),
+            leveler_memory::CandidateSource::RuntimeObserved,
+            vec!["experience".to_string(), tag.to_string()],
+        )
+        .unwrap();
+        candidate.authority = MemoryAuthority::ToolObservation;
+        candidate.experience = Some(leveler_memory::ExperienceRecord {
+            category: leveler_memory::ExperienceCategory::Fix,
+            verification: leveler_memory::ExperienceVerification::Verified,
+            applies_when: "the verifier rejects the profile".to_string(),
+            invalid_if: None,
+            evidence: vec![
+                leveler_memory::ExperienceEvidence {
+                    kind: "failure".to_string(),
+                    reference: "step 2: ./verify.sh (exit 1)".to_string(),
+                },
+                leveler_memory::ExperienceEvidence {
+                    kind: "resolution".to_string(),
+                    reference: "step 4: ./verify.sh (exit 0)".to_string(),
+                },
+            ],
+        });
+        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        assert!(
+            matches!(outcome, AgentAdmitOutcome::Applied(_)),
+            "fixture lesson was not activated: {outcome:?}"
+        );
+
+        assert!(evidence_already_learned(dir.path(), tag).unwrap());
+        assert!(!evidence_already_learned(dir.path(), "evidence:ffffffffffffffff").unwrap());
     }
 }

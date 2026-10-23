@@ -97,6 +97,17 @@ pub struct MemoryCandidate {
     /// one can supersede an earlier one instead of accumulating beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_key: Option<String>,
+    /// A structured relation suggested by the model: the subject of the
+    /// active memory this candidate restates, replaces, or contradicts.
+    /// Normalized like every subject. The runtime validates that the target
+    /// exists; it never infers a relation from wording similarity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_key: Option<String>,
+    /// The value the fact assigns, when it is an assignment. Compared exactly
+    /// as a structured field, so "same subject, same value" never depends on
+    /// comparing two sentences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
     /// How much weight this candidate carries when it conflicts with an
     /// existing memory. Defaults to the weakest class for old `pending/` files.
     #[serde(default)]
@@ -161,6 +172,8 @@ impl MemoryCandidate {
             kind,
             semantic_key: key.clone(),
             key,
+            related_key: None,
+            value: None,
             fingerprint,
             source,
             created_at: now_rfc3339(),
@@ -403,10 +416,12 @@ fn contains_provider_token(text: &str) -> bool {
 /// "以后都…", because those are how people talk, not how they issue a command,
 /// and a parser that rewrites long-term state must not guess.
 ///
-/// Refuses when the message is negated, quotes the phrase, wraps it in code,
-/// or carries a second task. Where it cannot be sure, it returns `None` and
-/// the message stays an ordinary turn: failing to save is recoverable, while
-/// swallowing someone's real task is not.
+/// Refuses when the message is negated, quotes the phrase, or wraps it in
+/// code. Where it cannot be sure, it returns `None` and the message stays an
+/// ordinary turn: failing to save is recoverable, while swallowing someone's
+/// real task is not. The body after the prefix is stored verbatim: whether it
+/// contains a second task is a question about meaning, and that belongs to the
+/// model, not to a connector list here.
 pub fn parse_direct_memory_command(text: &str) -> Option<String> {
     let t = text.trim();
     if t.is_empty() || looks_like_secret(t) {
@@ -423,11 +438,6 @@ pub fn parse_direct_memory_command(text: &str) -> Option<String> {
     let body = strip_command_prefix(t)?;
     let body = body.trim();
     if body.chars().count() < 2 || body.chars().count() > 400 || looks_like_secret(body) {
-        return None;
-    }
-    // A second instruction rides along ("记住 X，然后修复 tests/a.rs"). The
-    // task is what matters; the memory can be proposed by the agent later.
-    if carries_another_task(body) {
         return None;
     }
     Some(body.to_string())
@@ -451,85 +461,6 @@ fn strip_command_prefix(text: &str) -> Option<&str> {
     None
 }
 
-/// Whether the remainder also asks for work to be done.
-///
-/// Conservative by design: a false positive here costs a direct write (the
-/// user can retry with `/remember`), while a false negative eats a real task.
-fn carries_another_task(body: &str) -> bool {
-    const CONNECTORS: [&str; 6] = ["，然后", "，顺便", "；顺便", ";", ", then ", " and then "];
-    if CONNECTORS.iter().any(|c| body.contains(c)) {
-        return true;
-    }
-    // A path or a file extension in a memory body almost always means work.
-    body.split_whitespace()
-        .any(|w| w.contains('/') && w.contains('.') || w.ends_with(".rs") || w.ends_with(".ts"))
-}
-
-/// A SOFT signal: the user described a preference without commanding a save.
-///
-/// These need consent, so they become candidates. Kept separate from
-/// [`parse_direct_memory_command`] precisely so "我通常希望…" can never take
-/// the direct path and "记住：…" can never be demoted to a guess.
-pub fn parse_inferred_preference(text: &str) -> Option<MemoryCandidate> {
-    let t = text.trim();
-    if t.is_empty() || looks_like_secret(t) || t.contains('`') {
-        return None;
-    }
-    // Not a soft signal if it is actually a command.
-    if strip_command_prefix(t).is_some() {
-        return None;
-    }
-    let body = extract_soft_preference(t)?;
-    if body.chars().count() < 2 || body.chars().count() > 400 || looks_like_secret(&body) {
-        return None;
-    }
-    MemoryCandidate::new(
-        preference_title(&body),
-        body,
-        CandidateKind::Preference,
-        None,
-        CandidateSource::SystemInferred,
-        vec!["preference".into(), "inferred".into()],
-    )
-    .ok()
-}
-
-fn extract_soft_preference(text: &str) -> Option<String> {
-    // Phrasings that describe a habit rather than issue an order.
-    const ZH_HINTS: [&str; 6] = [
-        "我通常",
-        "我一般",
-        "我更喜欢",
-        "以后最好",
-        "以后都",
-        // A habit-shaped follow-up such as "以后用 Flash 吧". It has no stable
-        // subject, so it stays a candidate and can never overwrite a fact.
-        "以后用",
-    ];
-    for hint in ZH_HINTS {
-        if text.contains(hint) {
-            return Some(text.to_string());
-        }
-    }
-    if let Some(rest) = strip_ci_prefix(text, "always use ") {
-        return Some(format!("Always use {rest}"));
-    }
-    if text.to_ascii_lowercase().starts_with("i usually ")
-        || text.to_ascii_lowercase().starts_with("i prefer ")
-    {
-        return Some(text.to_string());
-    }
-    None
-}
-fn strip_ci_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    let lower = text.to_ascii_lowercase();
-    let p = prefix.to_ascii_lowercase();
-    if lower.starts_with(&p) {
-        Some(text[prefix.len()..].trim())
-    } else {
-        None
-    }
-}
 /// The title a direct user write gets, derived deterministically from the body.
 ///
 /// One implementation so TUI, Web and CLI cannot drift into three conventions,
@@ -558,16 +489,6 @@ pub fn title_from_body(body: &str) -> String {
         "记忆".to_string()
     } else {
         short
-    }
-}
-
-fn preference_title(body: &str) -> String {
-    let one_line: String = body.lines().next().unwrap_or(body).trim().to_string();
-    let short: String = one_line.chars().take(48).collect();
-    if short.is_empty() {
-        "偏好".into()
-    } else {
-        format!("偏好：{short}")
     }
 }
 
@@ -633,9 +554,9 @@ mod tests {
         }
     }
 
-    /// Negated, quoted, code-wrapped, or task-carrying forms must NOT write.
-    /// Guessing wrong here either rewrites someone's long-term state or eats
-    /// the work they actually asked for.
+    /// Negated, quoted, or code-wrapped forms must NOT write. Guessing wrong
+    /// here either rewrites someone's long-term state or eats the work they
+    /// actually asked for.
     #[test]
     fn ambiguous_forms_never_write_directly() {
         for input in [
@@ -648,9 +569,6 @@ mod tests {
             // code
             "把源码里的 `remember: foo` 改成 `remember: bar`",
             "代码中包含字符串 `记住：foo`",
-            // a second task rides along
-            "记住输出要简洁，然后修复 tests/a.rs",
-            "记住：使用 pnpm；顺便修复构建错误",
             // not a command at all
             "我通常希望输出短一点",
             "always use pnpm",
@@ -663,41 +581,30 @@ mod tests {
         }
     }
 
-    /// A soft signal describes a habit, so it needs consent — and is marked as
-    /// the system's inference, not as something the user commanded.
+    /// The body after the prefix is stored verbatim. Deciding that part of it
+    /// is a second task is a judgment about meaning, so the parser does not
+    /// make it; the user's command is consent for the text they wrote.
     #[test]
-    fn a_soft_signal_becomes_an_inferred_candidate() {
-        for input in [
-            "我通常希望提交前先运行 pnpm lint。",
-            "我一般不希望自动提交",
-            "这个项目里我更喜欢函数式写法",
-            "always use pnpm",
-            "以后都用 pnpm",
-        ] {
-            let candidate = parse_inferred_preference(input)
-                .unwrap_or_else(|| panic!("should be inferred: {input}"));
-            assert_eq!(candidate.source, CandidateSource::SystemInferred, "{input}");
-            assert_eq!(candidate.kind, CandidateKind::Preference);
-        }
+    fn a_command_body_is_stored_without_parsing_a_second_task() {
+        let body = parse_direct_memory_command("记住：输出要简洁，然后修复 tests/a.rs")
+            .expect("the commanding prefix is a direct write");
+        assert_eq!(body, "输出要简洁，然后修复 tests/a.rs");
     }
 
-    /// The two parsers must not both claim the same input.
+    /// Only a commanding prefix is a direct write. Plain natural language is
+    /// not classified here at all; the model extractor owns meaning.
     #[test]
-    fn a_strict_command_is_never_also_an_inference() {
-        let input = "记住：以后提交前先运行 pnpm lint";
-        assert!(parse_direct_memory_command(input).is_some());
-        assert!(
-            parse_inferred_preference(input).is_none(),
-            "a command must not also become a candidate to approve"
-        );
+    fn only_a_command_prefix_is_a_direct_write() {
+        assert!(parse_direct_memory_command("记住：以后提交前先运行 pnpm lint").is_some());
+        assert!(parse_direct_memory_command("我通常希望提交前先运行 pnpm lint").is_none());
+        assert!(parse_direct_memory_command("always use pnpm").is_none());
     }
 
-    /// A credential is refused on both paths, before it can reach a file.
+    /// A credential is refused on the direct path, before it can reach a file.
     #[test]
-    fn neither_path_accepts_a_secret() {
+    fn a_direct_write_does_not_accept_a_secret() {
         let input = "记住：OPENAI_API_KEY=sk-live-abcdefghijklmnopqrstuvwxyz0123456789";
         assert!(parse_direct_memory_command(input).is_none());
-        assert!(parse_inferred_preference(input).is_none());
     }
 
     /// An agent proposal must be distinguishable from a system guess: the user
@@ -745,8 +652,6 @@ mod tests {
     fn explicit_chinese_remember_colon_is_a_direct_write() {
         let body = parse_direct_memory_command("记住：用 pnpm").expect("direct");
         assert!(body.contains("pnpm"), "{body}");
-        // It is a command, so it must NOT also be offered for approval.
-        assert!(parse_inferred_preference("记住：用 pnpm").is_none());
     }
 
     #[test]
@@ -754,16 +659,6 @@ mod tests {
         let body =
             parse_direct_memory_command("remember: always use WorkspaceWrite").expect("direct");
         assert!(body.contains("WorkspaceWrite"), "{body}");
-    }
-
-    /// "always use …" and "以后都…" describe a habit, so they stay proposals.
-    #[test]
-    fn soft_always_use_and_chinese_prefer_stay_candidates() {
-        assert!(parse_direct_memory_command("always use pnpm").is_none());
-        let c = parse_inferred_preference("always use pnpm").expect("inferred");
-        assert_eq!(c.source, CandidateSource::SystemInferred);
-        let c = parse_inferred_preference("以后都用 pnpm").expect("c");
-        assert!(c.body.contains("pnpm"));
     }
 
     #[test]
