@@ -1,6 +1,6 @@
 # CodeLeveler Memory 2.0 实施计划
 
-状态：Stage 3.1（Store 生命周期性能修复、`/memory` 管理页、召回引用可见性）已于 2026-10-23 实现，见 §3.1；真实多轮 Catalog Delta / Prefix Cache / Lane 关闭 Dogfood 仍未执行。Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3（FTS5 derived index、Memory Context Builder、Logged Injection）已于 2026-10-23 实现，验证结果见该轮交付报告。Stage 4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
+状态：Stage 3.1（Store 生命周期性能修复、`/memory` 管理页、召回引用可见性）已于 2026-10-23 实现，见 §3.1；真实 Catalog / Prefix / Lane 关闭 Dogfood 见 §3.1.7。Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3（FTS5 derived index、Memory Context Builder、Logged Injection）已于 2026-10-23 实现，验证结果见该轮交付报告。Stage 4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
 
 前置文档：
 
@@ -641,13 +641,20 @@ Gate 判定：
 
 `MemoryRecalled` 增加可选字段 `injected`（scope、bounded title、mode），由 builder 的 injection receipt 生成；body 永不进入该事件。`/memory` Home 显示「最近一次召回：N 条」与最多 5 条记录标题，标题**从当前 listing 解析**：已被 forget 的记录只计入「其中 M 条已归档或不再提供」，不再显示标题。transcript 仍只保留 count-only 行。
 
-### 3.1.7 本轮未完成
+### 3.1.7 真实 Dogfood 结果
 
-| 项 | 状态 |
-| --- | --- |
-| 真实多轮 Catalog Delta（真实 TUI + 真实 Provider） | 未执行（单元/集成层已有 `memory_v2_tail.rs`、`memory_v2_injection.rs` 覆盖） |
-| Markdown Backend Prefix Cache 验证 | 未执行（同上，run 内 prefix 稳定性由 `memory_v2_tail.rs` 覆盖，但未取自真实 wire） |
-| User Memory Lane 关闭的真实验收 | 未执行（`leveler-cli` 的 lane 关闭契约测试在本轮 HEAD 已失败，见交付说明） |
+脚本：`dogfood/eval/memory/stage3_1_recall.py`（真实 `leveler tui` + PTY + 记录代理 + 真实 DeepSeek Flash；项目显式配置 `memory.backend=markdown`）。断言只读 provider 实际收到的请求字节与磁盘上的 Markdown 记录。
+
+| Case | 结果 | 证据 |
+| --- | --- | --- |
+| WITHIN-TURN-PREFIX | 4 PASS | 同一回合 2 个模型步骤的首个 system 消息字节完全相同（含 catalog），只有末个 system 消息（tail）变化；召回只在 tail |
+| CATALOG-REBUILD | 4 PASS | 两条 `/remember` 落在磁盘；下一回合（新 run）重建完整 catalog 同时包含两条记录；召回仍在 tail |
+| LANE-OFF | 5 PASS | `memory.user_enabled: false` 时请求中无 recall block、无 catalog、无 `memory`/`remember` 工具（18 个工具）；磁盘记录保留 |
+| MID-TURN-DELTA | NOT_VERIFIED | 模型确实调用了 `remember`，但该写入被挂为 pending 候选（非交互运行没有审批人），active catalog 未变化，因此没有 tail delta。要验证该路径需要交互式审批，本轮未执行 |
+
+含义：**catalog 只在 run 起始重建**，同一 run 内 prefix 稳定；跨回合写入不产生 tail delta，而是下一 run 重建 catalog。这正是 §3.4 的设计，不是缺陷；tail delta 只在同一 run 内 active 集合真正变化时出现。
+
+`leveler-cli` 的 `memory_status_reports_a_closed_lane_as_off` 在本轮 HEAD 已失败（渲染缺少 pending 计数，期望字符串与实现不一致），不属于本次改动，未修改。
 
 ---
 
