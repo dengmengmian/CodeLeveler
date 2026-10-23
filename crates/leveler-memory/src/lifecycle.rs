@@ -186,6 +186,13 @@ impl MemoryLifecycleOp {
 /// subject; the runtime only decides whether two spellings are the same
 /// string.
 pub fn semantic_key_of(subject: &str) -> String {
+    let subject = subject.trim();
+    // The extractor receives stored identities as the subject to reuse, so
+    // normalization must be idempotent. A string already in the canonical key
+    // namespace is its own identity; folding it again would nest `k-k-...`.
+    if is_canonical_key(subject) {
+        return subject.to_string();
+    }
     let normalized: String = subject
         .trim()
         .chars()
@@ -206,6 +213,14 @@ pub fn semantic_key_of(subject: &str) -> String {
         // merely share a prefix.
         format!("k-{}", crate::short_hash(&normalized))
     }
+}
+
+pub(crate) fn is_canonical_key(value: &str) -> bool {
+    value.starts_with("k-")
+        && value.len() > 2
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Identity for a stored entry. Entries written before identities were
@@ -1445,6 +1460,19 @@ mod tests {
             semantic_key_of(&crate::normalize_subject("default_model")),
             semantic_key_of(&crate::normalize_subject("default_model_setting"))
         );
+    }
+
+    /// A stored identity is fed back to writers as the subject to reuse.
+    /// The extractor composes `semantic_key_of(normalize_subject(..))`, so a
+    /// second pass must produce the same key; folding it again would nest the
+    /// namespace (`k-k-...`) and split one fact into two.
+    #[test]
+    fn semantic_keys_are_idempotent() {
+        for subject in ["deploy.channel", "package_manager", "平台支持"] {
+            let key = semantic_key_of(&crate::normalize_subject(subject));
+            let reused = semantic_key_of(&crate::normalize_subject(&key));
+            assert_eq!(reused, key, "subject: {subject}");
+        }
     }
 
     #[test]

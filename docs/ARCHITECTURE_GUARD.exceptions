@@ -145,3 +145,11 @@ hits = 1
 reason = atomic-write protocol: `.tmp-` names are this store's own partial writes and never memory content
 owner = memory-lifecycle
 test = stray_atomic_write_temporaries_are_cleaned
+---
+file = crates/leveler-memory/src/lifecycle.rs
+symbol = is_canonical_key
+construct = text-predicate
+hits = 1
+reason = normalized key protocol: a stored identity is `k-` plus slug or hash; recognizing the namespace is byte structure, not meaning, and keeps the extractor's second pass idempotent
+owner = memory-lifecycle
+test = semantic_keys_are_idempotent
