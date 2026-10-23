@@ -12,7 +12,7 @@
 //!                          MemoryCandidate[]  ──► MemoryCommitDecision
 //! ```
 //!
-//! Nothing here touches a `MemoryStore`. The extractor cannot write, supersede,
+//! Nothing here touches the store. The extractor cannot write, supersede,
 //! forget or approve anything; it can only propose. In particular the
 //! `evidence_span` gate makes "the user said this" a checked fact rather than a
 //! model claim: a candidate whose evidence is not found in the current user
@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::candidates::{CandidateKind, CandidateSource, MemoryCandidate, looks_like_secret};
-use crate::lifecycle::{CandidateOperation, MemoryAuthority, semantic_key_of};
+use crate::candidates::{CandidateOperation, MemoryAuthority, semantic_key_of};
 
 /// Bounds of a single atomic fact. Long enough for a real sentence, short
 /// enough that a multi-sentence blob cannot slip through as one memory.
@@ -274,10 +274,9 @@ impl CandidateRejection {
             Self::LowConfidence { confidence } => {
                 format!("model confidence {confidence:.2} was below threshold")
             }
-            Self::NotAConfirmedStatement { statement } => format!(
-                "a {} is not a confirmed user statement",
-                statement.as_str()
-            ),
+            Self::NotAConfirmedStatement { statement } => {
+                format!("a {} is not a confirmed user statement", statement.as_str())
+            }
             Self::DirectCommandOwned => {
                 "the direct memory writer already stored this span".to_string()
             }
@@ -670,7 +669,7 @@ pub fn normalize_subject(raw: &str) -> String {
     // A stored identity is fed back to writers as the subject to reuse.
     // Mapping the key's separators to `_` would make it a new label, so the
     // extractor's second pass would nest the namespace (`k-k-...`).
-    if crate::lifecycle::is_canonical_key(&raw) {
+    if crate::candidates::is_canonical_key(&raw) {
         return raw;
     }
     let raw = raw.strip_prefix("project.").unwrap_or(raw.as_str());

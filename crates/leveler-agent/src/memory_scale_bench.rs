@@ -80,7 +80,7 @@ fn measure(count: usize) {
     let warm_open = warm.elapsed();
 
     let service = Arc::new(MemoryService::new(
-        MemoryRoots::markdown().with_project(roots.clone()),
+        MemoryRoots::new().with_project(roots.clone()),
     ));
     let builder = MemoryContextBuilder::new(service.clone(), MemoryLanes::ALL);
     let policy = ResolvedContextPolicy::default();
@@ -205,7 +205,6 @@ fn search_hits(service: &MemoryService, limit: usize) -> Vec<(leveler_memory::Me
             MemoryLanes::USER_ONLY,
             HOT_QUERY,
             limit,
-            false,
         )
         .expect("search")
 }

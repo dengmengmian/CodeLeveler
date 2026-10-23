@@ -1,62 +1,33 @@
 //! Unified memory service.
 //!
-//! Every production write goes through this facade, whichever storage backend
-//! the project selected. The backend distinction is about storage and
-//! lifecycle mechanics, not authority: authority is derived from the [`Actor`]
-//! path, and no model payload, CLI argument, or Markdown field can construct
-//! an [`Actor::User`].
-//!
-//! `Legacy` delegates to the shipped JSON store so the default behavior does
-//! not change. `Markdown` uses the v2 store and its cross-file transaction.
-//! Both are reached through the same methods, so the tools, the consolidator,
-//! the interactive command handlers and the CLI cannot drift into separate
-//! write paths.
+//! Every production read and write goes through this facade, and the Markdown
+//! store is the only implementation behind it. Authority is derived from the
+//! [`Actor`] path: no model payload, CLI argument, or Markdown field can
+//! construct an [`Actor::User`]. Tools, the consolidator, the interactive
+//! command handlers and the CLI therefore cannot drift into separate write
+//! paths.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
-use leveler_core::MemoryBackend;
 
 use crate::v2;
 use crate::v2::Actor;
-use crate::{
-    AgentAdmitOutcome, AppliedOperation, CandidateOperation, ExperienceRecord, MemoryCandidate,
-    MemoryEntry, MemoryError, MemoryKind as LegacyKind, MemoryLanes, MemoryStore, ProposeOutcome,
-};
+use crate::{CandidateOperation, ExperienceRecord, MemoryCandidate, MemoryLanes};
 
-/// The storage location the service was constructed with.
-#[derive(Debug, Clone)]
+/// The Markdown scope roots the service was constructed with. A scope is
+/// optional so a project run that never touches global memory never creates
+/// the user's home store.
+#[derive(Debug, Clone, Default)]
 pub struct MemoryRoots {
-    pub backend: MemoryBackend,
-    /// Legacy JSON store root.
-    pub legacy_root: Option<PathBuf>,
     pub project: Option<v2::ScopeRoots>,
     pub local: Option<v2::ScopeRoots>,
     pub global: Option<v2::ScopeRoots>,
 }
 
 impl MemoryRoots {
-    /// Legacy JSON store at `root`.
-    pub fn legacy(root: impl Into<PathBuf>) -> Self {
-        Self {
-            backend: MemoryBackend::Legacy,
-            legacy_root: Some(root.into()),
-            project: None,
-            local: None,
-            global: None,
-        }
-    }
-
-    /// Markdown store with no scope configured yet.
-    pub fn markdown() -> Self {
-        Self {
-            backend: MemoryBackend::Markdown,
-            legacy_root: None,
-            project: None,
-            local: None,
-            global: None,
-        }
+    /// Roots with no scope configured yet.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn with_project(mut self, roots: v2::ScopeRoots) -> Self {
@@ -83,9 +54,8 @@ impl MemoryRoots {
     }
 }
 
-/// The scope a caller addresses. Legacy storage only has one project-shaped
-/// store; the other scopes are unavailable there instead of being silently
-/// mapped onto it.
+/// The scope a caller addresses. A scope the session did not configure is
+/// reported as unavailable instead of being silently mapped onto another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceScope {
     Project,
@@ -153,16 +123,6 @@ impl From<v2::StoreError> for ServiceError {
     }
 }
 
-impl From<MemoryError> for ServiceError {
-    fn from(error: MemoryError) -> Self {
-        match error {
-            MemoryError::NotFound(id) => Self::NotFound(id),
-            MemoryError::Invalid(reason) => Self::Invalid(reason),
-            other => Self::Backend(other.to_string()),
-        }
-    }
-}
-
 /// One memory as the service exposes it to a caller. Bodies are present only
 /// when the caller asked for a record, not for a list.
 #[derive(Debug, Clone, PartialEq)]
@@ -171,7 +131,7 @@ pub struct MemoryView {
     pub title: String,
     pub body: String,
     pub tags: Vec<String>,
-    /// `user_fact`, `experience`, or a legacy kind label.
+    /// `user_fact` or `experience`.
     pub kind: String,
     /// `active`, `pending`, `superseded`, `deprecated`, `expired`, `archived`.
     pub status: String,
@@ -181,8 +141,7 @@ pub struct MemoryView {
     pub revision: Option<u64>,
     pub current: bool,
     pub expires_at: Option<String>,
-    /// RFC 3339 update time from the content authority; `None` for legacy
-    /// candidates that carry no timestamp.
+    /// RFC 3339 update time from the content authority.
     pub updated_at: Option<String>,
     pub pinned_by_user: bool,
     /// Looks like a credential. Automatic paths and model reads withhold it;
@@ -307,17 +266,6 @@ impl RememberRequest {
             replaces_id: None,
         }
     }
-
-    fn legacy_kind(&self) -> Result<LegacyKind, ServiceError> {
-        match self.kind.as_str() {
-            "preference" => Ok(LegacyKind::Preference),
-            "decision" => Ok(LegacyKind::Decision),
-            "note" | "user_fact" => Ok(LegacyKind::Note),
-            other => Err(ServiceError::Invalid(format!(
-                "unsupported memory kind `{other}`"
-            ))),
-        }
-    }
 }
 
 /// The unified memory entry point.
@@ -354,53 +302,22 @@ impl MemoryService {
         }
     }
 
-    /// A legacy service rooted at `root`.
-    pub fn legacy(root: impl Into<PathBuf>) -> Self {
-        Self::new(MemoryRoots::legacy(root))
-    }
-
-    pub fn backend(&self) -> MemoryBackend {
-        self.roots.backend
-    }
-
     pub fn is_configured(&self) -> bool {
-        match self.roots.backend {
-            MemoryBackend::Legacy => self.roots.legacy_root.is_some(),
-            MemoryBackend::Markdown => {
-                self.roots.project.is_some()
-                    || self.roots.local.is_some()
-                    || self.roots.global.is_some()
-            }
-        }
+        self.roots.project.is_some() || self.roots.local.is_some() || self.roots.global.is_some()
     }
 
     /// The scopes this service can address, in review-surface order.
     ///
-    /// A listing covers exactly these stores. Legacy storage has no scope
-    /// dimension, so it reports only the project store it actually is.
+    /// A listing covers exactly these stores, in review-surface order.
     pub fn configured_scopes(&self) -> Vec<ServiceScope> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                if self.roots.legacy_root.is_some() {
-                    vec![ServiceScope::Project]
-                } else {
-                    Vec::new()
-                }
-            }
-            MemoryBackend::Markdown => [
-                ServiceScope::Global,
-                ServiceScope::Project,
-                ServiceScope::Local,
-            ]
-            .into_iter()
-            .filter(|scope| self.roots.scope_roots(*scope).is_some())
-            .collect(),
-        }
-    }
-
-    /// The legacy store root, when this service is on the legacy backend.
-    pub fn legacy_root(&self) -> Option<&std::path::Path> {
-        self.roots.legacy_root.as_deref()
+        [
+            ServiceScope::Global,
+            ServiceScope::Project,
+            ServiceScope::Local,
+        ]
+        .into_iter()
+        .filter(|scope| self.roots.scope_roots(*scope).is_some())
+        .collect()
     }
 
     /// How much store lifecycle work this process has done so far.
@@ -413,15 +330,6 @@ impl MemoryService {
 
     pub fn roots(&self) -> &MemoryRoots {
         &self.roots
-    }
-
-    fn legacy_store(&self) -> Result<MemoryStore, ServiceError> {
-        let root = self
-            .roots
-            .legacy_root
-            .as_ref()
-            .ok_or_else(|| ServiceError::NotConfigured)?;
-        MemoryStore::open(root).map_err(Into::into)
     }
 
     /// The opened store handle for one scope.
@@ -473,40 +381,25 @@ impl MemoryService {
         limit: Option<usize>,
     ) -> Result<Vec<MemoryView>, ServiceError> {
         let _ = actor;
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let mut entries = store.effective_active()?;
-                entries.retain(|entry| !crate::is_sensitive(entry) && lanes.allows_entry(entry));
-                entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                if let Some(limit) = limit {
-                    entries.truncate(limit);
-                }
-                Ok(entries.iter().map(legacy_view).collect())
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let mut records = service.effective_active()?;
-                records.retain(|entry| match entry.record.frontmatter.kind {
-                    v2::MemoryKind::Experience => lanes.experience,
-                    v2::MemoryKind::UserFact => lanes.user,
-                });
-                records.sort_by(|a, b| {
-                    b.record
-                        .frontmatter
-                        .updated_at
-                        .cmp(&a.record.frontmatter.updated_at)
-                });
-                if let Some(limit) = limit {
-                    records.truncate(limit);
-                }
-                Ok(records
-                    .iter()
-                    .map(|entry| markdown_view(&entry.record, entry.effective_authority))
-                    .collect())
-            }
+        let service = self.markdown_service(scope)?;
+        let mut records = service.effective_active()?;
+        records.retain(|entry| match entry.record.frontmatter.kind {
+            v2::MemoryKind::Experience => lanes.experience,
+            v2::MemoryKind::UserFact => lanes.user,
+        });
+        records.sort_by(|a, b| {
+            b.record
+                .frontmatter
+                .updated_at
+                .cmp(&a.record.frontmatter.updated_at)
+        });
+        if let Some(limit) = limit {
+            records.truncate(limit);
         }
+        Ok(records
+            .iter()
+            .map(|entry| markdown_view(&entry.record, entry.effective_authority))
+            .collect())
     }
 
     /// Current records for a person's own listing.
@@ -519,42 +412,30 @@ impl MemoryService {
         scope: ServiceScope,
         lanes: MemoryLanes,
     ) -> Result<Vec<MemoryView>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let mut entries = store.effective_active()?;
-                entries.retain(|entry| lanes.allows_entry(entry));
-                entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                Ok(entries.iter().map(legacy_view).collect())
+        let service = self.markdown_service(scope)?;
+        let summaries = service.list(
+            &actor_user(),
+            v2::ListQuery {
+                scope: Some(scope.to_v2()),
+                kind: None,
+                status: Some(v2::MemoryStatus::Active),
+                limit: None,
+                include_external: false,
+            },
+        )?;
+        let mut views = Vec::new();
+        for summary in summaries {
+            let allowed = match summary.kind {
+                v2::MemoryKind::Experience => lanes.experience,
+                v2::MemoryKind::UserFact => lanes.user,
+            };
+            if !allowed {
+                continue;
             }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let summaries = service.list(
-                    &actor_user(),
-                    v2::ListQuery {
-                        scope: Some(scope.to_v2()),
-                        kind: None,
-                        status: Some(v2::MemoryStatus::Active),
-                        limit: None,
-                        include_external: false,
-                    },
-                )?;
-                let mut views = Vec::new();
-                for summary in summaries {
-                    let allowed = match summary.kind {
-                        v2::MemoryKind::Experience => lanes.experience,
-                        v2::MemoryKind::UserFact => lanes.user,
-                    };
-                    if !allowed {
-                        continue;
-                    }
-                    let record = service.read(&actor_user(), &summary.id)?;
-                    views.push(markdown_view(&record.record, record.effective_authority));
-                }
-                Ok(views)
-            }
+            let record = service.read(&actor_user(), &summary.id)?;
+            views.push(markdown_view(&record.record, record.effective_authority));
         }
+        Ok(views)
     }
 
     /// One record by id. Only a current record is returned as current truth.
@@ -565,38 +446,16 @@ impl MemoryService {
         id: &str,
     ) -> Result<MemoryView, ServiceError> {
         let _ = actor;
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let entry = store.read_active(id)?;
-                if crate::is_sensitive(&entry) {
-                    return Err(ServiceError::NotFound(id.to_string()));
-                }
-                let current = store
-                    .effective_active()?
-                    .into_iter()
-                    .any(|candidate| candidate.id == entry.id);
-                if !current {
-                    return Err(ServiceError::NotCurrent(id.to_string()));
-                }
-                let mut view = legacy_view(&entry);
-                view.current = true;
-                Ok(view)
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let id = v2::MemoryId::parse(id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let record = service.read(actor, &id)?;
-                if record.record.frontmatter.sensitive {
-                    return Err(ServiceError::NotFound(id.to_string()));
-                }
-                let mut view = markdown_view(&record.record, record.effective_authority);
-                view.current = true;
-                Ok(view)
-            }
+        let service = self.markdown_service(scope)?;
+        let id =
+            v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let record = service.read(actor, &id)?;
+        if record.record.frontmatter.sensitive {
+            return Err(ServiceError::NotFound(id.to_string()));
         }
+        let mut view = markdown_view(&record.record, record.effective_authority);
+        view.current = true;
+        Ok(view)
     }
 
     /// One record that an automatic injection path may show the model.
@@ -610,19 +469,14 @@ impl MemoryService {
         scope: ServiceScope,
         id: &str,
     ) -> Result<MemoryView, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => self.read(actor, scope, id),
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let id = v2::MemoryId::parse(id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let record = match service.read(actor, &id) {
-                    Ok(record) => record,
-                    Err(error) => return Err(error.into()),
-                };
-                injectable_view(scope, record)
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let id =
+            v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let record = match service.read(actor, &id) {
+            Ok(record) => record,
+            Err(error) => return Err(error.into()),
+        };
+        injectable_view(scope, record)
     }
 
     /// Several records that an automatic injection path may show the model.
@@ -637,42 +491,33 @@ impl MemoryService {
         scope: ServiceScope,
         ids: &[String],
     ) -> Result<Vec<Result<MemoryView, ServiceError>>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Ok(ids
-                .iter()
-                .map(|id| self.read_injectable(actor, scope, id))
-                .collect()),
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let parsed: Vec<Option<v2::MemoryId>> =
-                    ids.iter().map(|id| v2::MemoryId::parse(id).ok()).collect();
-                let known: Vec<v2::MemoryId> = parsed.iter().flatten().cloned().collect();
-                let mut outcomes = service.read_many(actor, &known)?.into_iter();
-                let mut results = Vec::with_capacity(ids.len());
-                for (id, parsed) in ids.iter().zip(parsed) {
-                    let Some(parsed) = parsed else {
-                        results.push(Err(ServiceError::Invalid(format!("not a memory id: {id}"))));
-                        continue;
-                    };
-                    let outcome = outcomes
-                        .next()
-                        .unwrap_or_else(|| Err(v2::StoreError::NotFound(parsed.clone())));
-                    results.push(match outcome {
-                        Ok(record) => injectable_view(scope, record),
-                        Err(error) => Err(error.into()),
-                    });
-                }
-                Ok(results)
-            }
+        let service = self.markdown_service(scope)?;
+        let parsed: Vec<Option<v2::MemoryId>> =
+            ids.iter().map(|id| v2::MemoryId::parse(id).ok()).collect();
+        let known: Vec<v2::MemoryId> = parsed.iter().flatten().cloned().collect();
+        let mut outcomes = service.read_many(actor, &known)?.into_iter();
+        let mut results = Vec::with_capacity(ids.len());
+        for (id, parsed) in ids.iter().zip(parsed) {
+            let Some(parsed) = parsed else {
+                results.push(Err(ServiceError::Invalid(format!("not a memory id: {id}"))));
+                continue;
+            };
+            let outcome = outcomes
+                .next()
+                .unwrap_or_else(|| Err(v2::StoreError::NotFound(parsed.clone())));
+            results.push(match outcome {
+                Ok(record) => injectable_view(scope, record),
+                Err(error) => Err(error.into()),
+            });
         }
+        Ok(results)
     }
 
-    /// Lexical or vector search.
+    /// Lexical search over the derived index.
     ///
-    /// On the Markdown backend both flags run over the derived lexical index;
-    /// each hit is revalidated against current Markdown before it is returned,
-    /// so a stale row can never surface an old body. A genuine miss is an
-    /// empty result; an index or store failure is an explicit error.
+    /// Each hit is revalidated against current Markdown before it is returned,
+    /// so a stale row can never surface an old body. A genuine miss is an empty
+    /// result; an index or store failure is an explicit error.
     pub fn search(
         &self,
         actor: &Actor,
@@ -680,37 +525,13 @@ impl MemoryService {
         lanes: MemoryLanes,
         query: &str,
         limit: usize,
-        vector: bool,
     ) -> Result<Vec<(MemoryView, f64)>, ServiceError> {
-        let _ = actor;
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let active_count = store.list_active()?.len();
-                let search_limit = active_count.max(limit.max(1));
-                let hits = if vector {
-                    store.vector_search(query, search_limit)?
-                } else {
-                    store.search(query, search_limit)?
-                };
-                let mut views: Vec<(MemoryView, f64)> = hits
-                    .into_iter()
-                    .filter(|(entry, _)| !crate::is_sensitive(entry) && lanes.allows_entry(entry))
-                    .map(|(entry, score)| (legacy_view(&entry), score))
-                    .collect();
-                views.truncate(limit.max(1));
-                Ok(views)
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let index = self.fresh_index(scope)?;
-                let hits = index
-                    .search(query, limit.max(1).saturating_mul(4))
-                    .map_err(index_error)?;
-                self.validated_hits(actor, scope, &service, &index, &hits, lanes, limit.max(1))
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let index = self.fresh_index(scope)?;
+        let hits = index
+            .search(query, limit.max(1).saturating_mul(4))
+            .map_err(index_error)?;
+        self.validated_hits(actor, scope, &service, &index, &hits, lanes, limit.max(1))
     }
 
     /// Revalidate ranked index rows against current Markdown.
@@ -803,16 +624,11 @@ impl MemoryService {
     /// This is the controlled recovery path after index damage and the cold
     /// start path for a new process. It never writes Markdown.
     pub fn refresh_index(&self, scope: ServiceScope) -> Result<v2::ReconcileReport, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Ok(v2::ReconcileReport::default()),
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let records = service.effective_active()?;
-                self.index_for(scope)?
-                    .reconcile(&records)
-                    .map_err(index_error)
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let records = service.effective_active()?;
+        self.index_for(scope)?
+            .reconcile(&records)
+            .map_err(index_error)
     }
 
     /// Derived-index health, for diagnostics and degradation reporting.
@@ -820,14 +636,10 @@ impl MemoryService {
         &self,
         scope: ServiceScope,
     ) -> Result<Option<v2::IndexDiagnostics>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Ok(None),
-            MemoryBackend::Markdown => self
-                .index_for(scope)?
-                .diagnostics()
-                .map(Some)
-                .map_err(index_error),
-        }
+        self.index_for(scope)?
+            .diagnostics()
+            .map(Some)
+            .map_err(index_error)
     }
 
     /// Catalog candidates for one scope, from the derived index.
@@ -841,13 +653,9 @@ impl MemoryService {
         scope: ServiceScope,
         limit: usize,
     ) -> Result<Vec<v2::DerivedRow>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Ok(Vec::new()),
-            MemoryBackend::Markdown => self
-                .fresh_index(scope)?
-                .catalog_rows(scope.to_v2(), limit)
-                .map_err(index_error),
-        }
+        self.fresh_index(scope)?
+            .catalog_rows(scope.to_v2(), limit)
+            .map_err(index_error)
     }
 
     /// Standing candidates for one scope, from the derived index.
@@ -856,13 +664,9 @@ impl MemoryService {
         scope: ServiceScope,
         limit: usize,
     ) -> Result<Vec<v2::DerivedRow>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Ok(Vec::new()),
-            MemoryBackend::Markdown => self
-                .fresh_index(scope)?
-                .standing_rows(scope.to_v2(), limit)
-                .map_err(index_error),
-        }
+        self.fresh_index(scope)?
+            .standing_rows(scope.to_v2(), limit)
+            .map_err(index_error)
     }
 
     fn fresh_index(&self, scope: ServiceScope) -> Result<Arc<v2::MemoryIndex>, ServiceError> {
@@ -948,31 +752,23 @@ impl MemoryService {
 
     /// `(current, archived)` counts.
     pub fn counts(&self, scope: ServiceScope) -> Result<(usize, usize), ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                Ok(self.legacy_store()?.counts()?)
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let active = service.effective_active()?.len();
-                let archived = service
-                    .list(
-                        &actor_user(),
-                        v2::ListQuery {
-                            scope: Some(scope.to_v2()),
-                            kind: None,
-                            status: None,
-                            limit: None,
-                            include_external: false,
-                        },
-                    )?
-                    .into_iter()
-                    .filter(|summary| !summary.status.is_active())
-                    .count();
-                Ok((active, archived))
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let active = service.effective_active()?.len();
+        let archived = service
+            .list(
+                &actor_user(),
+                v2::ListQuery {
+                    scope: Some(scope.to_v2()),
+                    kind: None,
+                    status: None,
+                    limit: None,
+                    include_external: false,
+                },
+            )?
+            .into_iter()
+            .filter(|summary| !summary.status.is_active())
+            .count();
+        Ok((active, archived))
     }
 
     /// Records that are no longer current, for the user's own listing.
@@ -988,34 +784,30 @@ impl MemoryService {
         limit: Option<usize>,
     ) -> Result<Vec<MemoryView>, ServiceError> {
         let _ = actor;
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let mut entries = store.list_archived()?;
-                entries.retain(|entry| lanes.allows_entry(entry));
-                entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                if let Some(limit) = limit {
-                    entries.truncate(limit);
-                }
-                Ok(entries.iter().map(legacy_view).collect())
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let mut records = service.archived()?;
-                records.retain(|record| match record.frontmatter.kind {
-                    v2::MemoryKind::Experience => lanes.experience,
-                    v2::MemoryKind::UserFact => lanes.user,
-                });
-                if let Some(limit) = limit {
-                    records.truncate(limit);
-                }
-                Ok(records
-                    .iter()
-                    .map(|record| markdown_view(record, record.frontmatter.authority))
-                    .collect())
-            }
+        let service = self.markdown_service(scope)?;
+        let mut records = service.archived()?;
+        records.retain(|record| match record.frontmatter.kind {
+            v2::MemoryKind::Experience => lanes.experience,
+            v2::MemoryKind::UserFact => lanes.user,
+        });
+        if let Some(limit) = limit {
+            records.truncate(limit);
         }
+        Ok(records
+            .iter()
+            .map(|record| {
+                // An attic copy is a snapshot of what the file said when it was
+                // current, so its own frontmatter can still read `active`. A row in
+                // this listing is by construction history: it must never present
+                // itself as current truth.
+                let mut view = markdown_view(record, record.frontmatter.authority);
+                view.current = false;
+                if view.status == "active" {
+                    view.status = "archived".into();
+                }
+                view
+            })
+            .collect())
     }
 
     // --------------------------------------------------------------- writes
@@ -1026,62 +818,7 @@ impl MemoryService {
         actor: &Actor,
         request: RememberRequest,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => self.remember_legacy(actor, request),
-            MemoryBackend::Markdown => self.remember_markdown(actor, request),
-        }
-    }
-
-    fn remember_legacy(
-        &self,
-        actor: &Actor,
-        request: RememberRequest,
-    ) -> Result<WriteOutcome, ServiceError> {
-        require_project(request.scope)?;
-        let store = self.legacy_store()?;
-        let kind = request.legacy_kind()?;
-        if request.title.trim().is_empty() || request.body.trim().is_empty() {
-            return Err(ServiceError::Invalid("title and body are required".into()));
-        }
-        match actor {
-            Actor::Model { .. } | Actor::External => {
-                // A model write never claims the user said it. The CLI has no
-                // way to mint a user actor, so it follows the same path here.
-                let subject = request.subject.as_deref().ok_or_else(|| {
-                    ServiceError::Invalid("a model memory write requires a subject".into())
-                })?;
-                let candidate = crate::agent_candidate(
-                    &request.title,
-                    &request.body,
-                    kind,
-                    request.tags,
-                    subject,
-                    request.evidence,
-                )
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                Ok(legacy_agent_outcome(
-                    store.admit_agent_candidate(candidate)?,
-                ))
-            }
-            Actor::User { .. } => {
-                let entry = store.activate(&request.title, &request.body, kind, request.tags)?;
-                Ok(WriteOutcome::Applied {
-                    id: entry.id,
-                    title: entry.title,
-                    operation: "created".into(),
-                    revision: None,
-                    superseded: Vec::new(),
-                    replayed: false,
-                    possible_duplicate: Vec::new(),
-                })
-            }
-            Actor::Migration { .. } => Err(ServiceError::Unavailable(
-                "migration writes are not supported on the legacy backend".into(),
-            )),
-            Actor::Runtime { .. } => Err(ServiceError::Invalid(
-                "runtime extraction writes go through admit_candidate".into(),
-            )),
-        }
+        self.remember_markdown(actor, request)
     }
 
     fn remember_markdown(
@@ -1108,29 +845,12 @@ impl MemoryService {
         candidate: &MemoryCandidate,
         op_seed: &str,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                if candidate.experience.is_some() {
-                    Ok(legacy_agent_outcome(
-                        store.admit_experience_candidate(candidate.clone())?,
-                    ))
-                } else {
-                    Ok(legacy_admit_outcome(
-                        store.admit_candidate(candidate.clone())?,
-                    ))
-                }
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let intent = candidate_intent(candidate, scope, op_seed)?;
-                let admission = service.admit(actor, intent)?;
-                let outcome = markdown_outcome(&service, admission);
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let intent = candidate_intent(candidate, scope, op_seed)?;
+        let admission = service.admit(actor, intent)?;
+        let outcome = markdown_outcome(&service, admission);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     /// Park a proposal for a person. Used when no approver exists.
@@ -1139,73 +859,25 @@ impl MemoryService {
         actor: &Actor,
         request: RememberRequest,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(request.scope)?;
-                let store = self.legacy_store()?;
-                let kind = request.legacy_kind()?;
-                let candidate = match request.subject.as_deref() {
-                    Some(subject) if !subject.trim().is_empty() => crate::agent_candidate(
-                        &request.title,
-                        &request.body,
-                        kind,
-                        request.tags,
-                        subject,
-                        request.evidence,
-                    )
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?,
-                    _ => MemoryCandidate::new(
-                        &request.title,
-                        &request.body,
-                        kind.candidate_kind(),
-                        None,
-                        crate::CandidateSource::AgentProposed,
-                        request.tags,
-                    )
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?,
-                };
-                match store.propose(candidate)? {
-                    ProposeOutcome::Pending(candidate) => Ok(WriteOutcome::Pending {
-                        id: candidate.id,
-                        title: candidate.title,
-                        reason: "awaiting_user_review".into(),
-                    }),
-                    ProposeOutcome::AlreadyPending(candidate) => Ok(WriteOutcome::Pending {
-                        id: candidate.id,
-                        title: candidate.title,
-                        reason: "already_pending".into(),
-                    }),
-                    ProposeOutcome::AlreadyActive { id } => Ok(WriteOutcome::Skipped {
-                        existing: id,
-                        reason: "already_active".into(),
-                    }),
-                    ProposeOutcome::Suppressed { fingerprint } => Ok(WriteOutcome::NotStored {
-                        reason: format!("rejected_previously:{fingerprint}"),
-                    }),
-                }
-            }
-            MemoryBackend::Markdown => {
-                let scope = request.scope;
-                let service = self.markdown_service(scope)?;
-                let intent = request.into_intent()?;
-                let reason = match actor {
-                    Actor::Model { .. } => v2::PendingReason::ScopeRequiresUserCommand,
-                    Actor::Runtime { .. } => v2::PendingReason::ScopeRequiresUserCommand,
-                    _ => v2::PendingReason::Other("parked_without_approver".into()),
-                };
-                // A replacement names a real target; it must run through the
-                // lifecycle so the target's authority and CAS are checked. Only
-                // a bare create can be parked without a decision.
-                let admission = if matches!(intent.relation, v2::Relation::None) {
-                    service.propose(actor, intent, reason)?
-                } else {
-                    service.admit(actor, intent)?
-                };
-                let outcome = markdown_outcome(&service, admission);
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
-        }
+        let scope = request.scope;
+        let service = self.markdown_service(scope)?;
+        let intent = request.into_intent()?;
+        let reason = match actor {
+            Actor::Model { .. } => v2::PendingReason::ScopeRequiresUserCommand,
+            Actor::Runtime { .. } => v2::PendingReason::ScopeRequiresUserCommand,
+            _ => v2::PendingReason::Other("parked_without_approver".into()),
+        };
+        // A replacement names a real target; it must run through the
+        // lifecycle so the target's authority and CAS are checked. Only
+        // a bare create can be parked without a decision.
+        let admission = if matches!(intent.relation, v2::Relation::None) {
+            service.propose(actor, intent, reason)?
+        } else {
+            service.admit(actor, intent)?
+        };
+        let outcome = markdown_outcome(&service, admission);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     /// Forget (archive or tombstone) one record.
@@ -1215,78 +887,27 @@ impl MemoryService {
         scope: ServiceScope,
         id: &str,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let entry = store.read_active(id)?;
-                if crate::is_sensitive(&entry) {
-                    return Err(ServiceError::NotFound(id.to_string()));
-                }
-                let entry = store.forget(id)?;
-                Ok(WriteOutcome::Forgotten {
-                    id: entry.id,
-                    title: entry.title,
-                })
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let memory_id = v2::MemoryId::parse(id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let record = service.read(actor, &memory_id)?;
-                let op = v2::OpId::parse(format!("forget:{id}:{}", record.cas.revision))
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let outcome = service.forget(actor, op, &memory_id, record.cas)?;
-                let outcome = match outcome {
-                    v2::ForgetOutcome::Forgotten(tombstone) => WriteOutcome::Forgotten {
-                        id: tombstone.id.to_string(),
-                        title: record.record.frontmatter.title,
-                    },
-                    v2::ForgetOutcome::Pending(admission) => markdown_outcome(&service, admission),
-                    v2::ForgetOutcome::NotApplied(admission) => {
-                        markdown_outcome(&service, admission)
-                    }
-                };
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let memory_id =
+            v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let record = service.read(actor, &memory_id)?;
+        let op = v2::OpId::parse(format!("forget:{id}:{}", record.cas.revision))
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let outcome = service.forget(actor, op, &memory_id, record.cas)?;
+        let outcome = match outcome {
+            v2::ForgetOutcome::Forgotten(tombstone) => WriteOutcome::Forgotten {
+                id: tombstone.id.to_string(),
+                title: record.record.frontmatter.title,
+            },
+            v2::ForgetOutcome::Pending(admission) => markdown_outcome(&service, admission),
+            v2::ForgetOutcome::NotApplied(admission) => markdown_outcome(&service, admission),
+        };
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     /// Restore a forgotten legacy entry. Markdown forget is a tombstone and has
     /// no restore path in Stage 2.
-    pub fn restore(
-        &self,
-        actor: &Actor,
-        scope: ServiceScope,
-        id: &str,
-    ) -> Result<WriteOutcome, ServiceError> {
-        let Actor::User { .. } = actor else {
-            return Err(ServiceError::NeedsReview(
-                "only a trusted user invocation may restore forgotten memory".into(),
-            ));
-        };
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let entry = store.restore(id)?;
-                Ok(WriteOutcome::Applied {
-                    id: entry.id,
-                    title: entry.title,
-                    operation: "restored".into(),
-                    revision: None,
-                    superseded: Vec::new(),
-                    replayed: false,
-                    possible_duplicate: Vec::new(),
-                })
-            }
-            MemoryBackend::Markdown => Err(ServiceError::Unavailable(
-                "restore is not available on the markdown backend".into(),
-            )),
-        }
-    }
-
     /// Accept or reject one pending record. Only a trusted user invocation may
     /// review; the model never gets a review action.
     pub fn review(
@@ -1296,60 +917,19 @@ impl MemoryService {
         pending_id: &str,
         decision: ReviewRequest,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let Actor::User { .. } = actor else {
-                    return Err(ServiceError::NeedsReview(
-                        "only a trusted user review may accept or reject pending memory".into(),
-                    ));
-                };
-                let store = self.legacy_store()?;
-                match decision {
-                    ReviewRequest::Accept => {
-                        let entry = store.accept(pending_id)?;
-                        Ok(WriteOutcome::Applied {
-                            id: entry.id,
-                            title: entry.title,
-                            operation: "accepted".into(),
-                            revision: None,
-                            superseded: Vec::new(),
-                            replayed: false,
-                            possible_duplicate: Vec::new(),
-                        })
-                    }
-                    ReviewRequest::Reject { reason: _ } => {
-                        // The legacy store records a suppression fingerprint and
-                        // has no field for a free-text reason.
-                        store.reject(pending_id)?;
-                        Ok(WriteOutcome::Applied {
-                            id: pending_id.to_string(),
-                            title: String::new(),
-                            operation: "rejected".into(),
-                            revision: None,
-                            superseded: Vec::new(),
-                            replayed: false,
-                            possible_duplicate: Vec::new(),
-                        })
-                    }
-                }
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let id = v2::MemoryId::parse(pending_id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let decision = match decision {
-                    ReviewRequest::Accept => v2::ReviewDecision::Accept,
-                    ReviewRequest::Reject { reason } => v2::ReviewDecision::Reject {
-                        reason: v2::Reason::new(reason),
-                    },
-                };
-                let admission = service.review(actor, &id, decision)?;
-                let outcome = markdown_outcome(&service, admission);
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let id = v2::MemoryId::parse(pending_id)
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let decision = match decision {
+            ReviewRequest::Accept => v2::ReviewDecision::Accept,
+            ReviewRequest::Reject { reason } => v2::ReviewDecision::Reject {
+                reason: v2::Reason::new(reason),
+            },
+        };
+        let admission = service.review(actor, &id, decision)?;
+        let outcome = markdown_outcome(&service, admission);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     /// Update a record the caller may edit. Legacy records have no revision
@@ -1362,40 +942,33 @@ impl MemoryService {
         expected_revision: u64,
         patch: UpdateRequest,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Err(ServiceError::Unavailable(
-                "update is not available on the legacy backend".into(),
-            )),
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let id = v2::MemoryId::parse(id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let record = service.read(actor, &id)?;
-                if record.cas.revision != expected_revision {
-                    return Err(ServiceError::Conflict(format!(
-                        "{id}: current revision {}, expected {expected_revision}",
-                        record.cas.revision
-                    )));
-                }
-                let op = v2::OpId::parse(format!(
-                    "update:{id}:{expected_revision}:{:x}",
-                    content_hash(&patch)
-                ))
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let mut patch = patch.into_patch();
-                // A revision is a new write: keep the sources that still
-                // support the record and add the operation that produced this
-                // revision. Without it the old revision's source would be the
-                // only audit trail for new content.
-                let mut evidence = record.record.frontmatter.source_refs.clone();
-                evidence.push(actor.provenance());
-                patch.evidence = Some(evidence);
-                let admission = service.update(actor, op, &id, patch, record.cas)?;
-                let outcome = markdown_outcome(&service, admission);
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
+        let service = self.markdown_service(scope)?;
+        let id =
+            v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let record = service.read(actor, &id)?;
+        if record.cas.revision != expected_revision {
+            return Err(ServiceError::Conflict(format!(
+                "{id}: current revision {}, expected {expected_revision}",
+                record.cas.revision
+            )));
         }
+        let op = v2::OpId::parse(format!(
+            "update:{id}:{expected_revision}:{:x}",
+            content_hash(&patch)
+        ))
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let mut patch = patch.into_patch();
+        // A revision is a new write: keep the sources that still
+        // support the record and add the operation that produced this
+        // revision. Without it the old revision's source would be the
+        // only audit trail for new content.
+        let mut evidence = record.record.frontmatter.source_refs.clone();
+        evidence.push(actor.provenance());
+        patch.evidence = Some(evidence);
+        let admission = service.update(actor, op, &id, patch, record.cas)?;
+        let outcome = markdown_outcome(&service, admission);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     pub fn deprecate(
@@ -1406,30 +979,22 @@ impl MemoryService {
         expected_revision: u64,
         reason: String,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Err(ServiceError::Unavailable(
-                "deprecate is not available on the legacy backend".into(),
-            )),
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let id = v2::MemoryId::parse(id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let record = service.read(actor, &id)?;
-                if record.cas.revision != expected_revision {
-                    return Err(ServiceError::Conflict(format!(
-                        "{id}: current revision {}, expected {expected_revision}",
-                        record.cas.revision
-                    )));
-                }
-                let op = v2::OpId::parse(format!("deprecate:{id}:{expected_revision}"))
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let admission =
-                    service.deprecate(actor, op, &id, record.cas, v2::Reason::new(reason))?;
-                let outcome = markdown_outcome(&service, admission);
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
+        let service = self.markdown_service(scope)?;
+        let id =
+            v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let record = service.read(actor, &id)?;
+        if record.cas.revision != expected_revision {
+            return Err(ServiceError::Conflict(format!(
+                "{id}: current revision {}, expected {expected_revision}",
+                record.cas.revision
+            )));
         }
+        let op = v2::OpId::parse(format!("deprecate:{id}:{expected_revision}"))
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let admission = service.deprecate(actor, op, &id, record.cas, v2::Reason::new(reason))?;
+        let outcome = markdown_outcome(&service, admission);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     pub fn pin(
@@ -1439,31 +1004,24 @@ impl MemoryService {
         id: &str,
         pinned: bool,
     ) -> Result<WriteOutcome, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => Err(ServiceError::Unavailable(
-                "pin is not available on the legacy backend".into(),
-            )),
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let id = v2::MemoryId::parse(id)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let record = service.read(actor, &id)?;
-                let op = v2::OpId::parse(format!(
-                    "{}:{id}:{}",
-                    if pinned { "pin" } else { "unpin" },
-                    record.cas.revision
-                ))
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-                let admission = if pinned {
-                    service.pin(actor, op, &id, record.cas)?
-                } else {
-                    service.unpin(actor, op, &id, record.cas)?
-                };
-                let outcome = markdown_outcome(&service, admission);
-                self.after_markdown_write(scope, &service, &outcome);
-                Ok(outcome)
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        let id =
+            v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let record = service.read(actor, &id)?;
+        let op = v2::OpId::parse(format!(
+            "{}:{id}:{}",
+            if pinned { "pin" } else { "unpin" },
+            record.cas.revision
+        ))
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let admission = if pinned {
+            service.pin(actor, op, &id, record.cas)?
+        } else {
+            service.unpin(actor, op, &id, record.cas)?
+        };
+        let outcome = markdown_outcome(&service, admission);
+        self.after_markdown_write(scope, &service, &outcome);
+        Ok(outcome)
     }
 
     // -------------------------------------------------------------- pending
@@ -1474,25 +1032,12 @@ impl MemoryService {
         actor: &Actor,
         scope: ServiceScope,
     ) -> Result<Vec<MemoryView>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                Ok(store
-                    .list_pending()?
-                    .iter()
-                    .map(legacy_candidate_view)
-                    .collect())
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                Ok(service
-                    .pending(actor)?
-                    .iter()
-                    .map(|record| markdown_view(record, record.frontmatter.authority))
-                    .collect())
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        Ok(service
+            .pending(actor)?
+            .iter()
+            .map(|record| markdown_view(record, record.frontmatter.authority))
+            .collect())
     }
 
     /// Structured identities the extractor may reference by id.
@@ -1501,56 +1046,24 @@ impl MemoryService {
         scope: ServiceScope,
         limit: usize,
     ) -> Result<Vec<IdentityContextEntry>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                let mut entries: Vec<MemoryEntry> = store
-                    .effective_active()?
-                    .into_iter()
-                    .filter(|entry| !crate::is_sensitive(entry))
-                    .collect();
-                entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                Ok(entries
-                    .into_iter()
-                    .take(limit.max(1))
-                    .map(|entry| {
-                        let kind = LegacyKind::of(&entry).as_str().to_string();
-                        let authority = entry.authority().as_str().to_string();
-                        IdentityContextEntry {
-                            id: entry.id,
-                            title: entry.title,
-                            subject_key: entry.key.clone(),
-                            subject: None,
-                            value: entry.value,
-                            revision: 0,
-                            kind,
-                            authority,
-                        }
-                    })
-                    .collect())
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                Ok(service
-                    .identity_context(limit)?
-                    .into_iter()
-                    .map(|identity| IdentityContextEntry {
-                        id: identity.id,
-                        title: identity.title,
-                        subject_key: identity.subject_key,
-                        subject: identity.subject,
-                        value: identity.value,
-                        revision: identity.revision,
-                        kind: match identity.kind {
-                            v2::MemoryKind::Experience => "experience".into(),
-                            v2::MemoryKind::UserFact => "user_fact".into(),
-                        },
-                        authority: identity.authority.as_str().to_string(),
-                    })
-                    .collect())
-            }
-        }
+        let service = self.markdown_service(scope)?;
+        Ok(service
+            .identity_context(limit)?
+            .into_iter()
+            .map(|identity| IdentityContextEntry {
+                id: identity.id,
+                title: identity.title,
+                subject_key: identity.subject_key,
+                subject: identity.subject,
+                value: identity.value,
+                revision: identity.revision,
+                kind: match identity.kind {
+                    v2::MemoryKind::Experience => "experience".into(),
+                    v2::MemoryKind::UserFact => "user_fact".into(),
+                },
+                authority: identity.authority.as_str().to_string(),
+            })
+            .collect())
     }
 
     /// Expire due records and return the records this call actually retired.
@@ -1561,65 +1074,46 @@ impl MemoryService {
         scope: ServiceScope,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<MemoryView>, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Legacy => {
-                require_project(scope)?;
-                let store = self.legacy_store()?;
-                Ok(store.expire_due()?.iter().map(legacy_view).collect())
-            }
-            MemoryBackend::Markdown => {
-                let service = self.markdown_service(scope)?;
-                let due: Vec<MemoryView> = service
-                    .effective_active()?
-                    .into_iter()
-                    .filter(|entry| {
-                        entry
-                            .record
-                            .frontmatter
-                            .expires_at
-                            .is_some_and(|expires| expires <= now)
-                    })
-                    .map(|entry| markdown_view(&entry.record, entry.effective_authority))
-                    .collect();
-                let retired: std::collections::BTreeSet<String> = service
-                    .expire_due(now)?
-                    .into_iter()
-                    .map(|id| id.to_string())
-                    .collect();
-                if let Ok(index) = self.index_for(scope) {
-                    for id in &retired {
-                        let _ = index.remove(id);
-                    }
-                }
-                Ok(due
-                    .into_iter()
-                    .filter(|view| retired.contains(&view.id))
-                    .collect())
+        let service = self.markdown_service(scope)?;
+        let due: Vec<MemoryView> = service
+            .effective_active()?
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .record
+                    .frontmatter
+                    .expires_at
+                    .is_some_and(|expires| expires <= now)
+            })
+            .map(|entry| markdown_view(&entry.record, entry.effective_authority))
+            .collect();
+        let retired: std::collections::BTreeSet<String> = service
+            .expire_due(now)?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        if let Ok(index) = self.index_for(scope) {
+            for id in &retired {
+                let _ = index.remove(id);
             }
         }
+        Ok(due
+            .into_iter()
+            .filter(|view| retired.contains(&view.id))
+            .collect())
     }
 
     /// Read-only diagnostics for a scope that may not be openable.
     pub fn diagnose(&self, scope: ServiceScope) -> Result<v2::DiagnosticReport, ServiceError> {
-        match self.roots.backend {
-            MemoryBackend::Markdown => {
-                let roots = self.roots.scope_roots(scope).cloned().ok_or_else(|| {
-                    ServiceError::Unavailable(format!(
-                        "the {} memory scope is not configured for this session",
-                        scope.as_str()
-                    ))
-                })?;
-                v2::MemoryService::diagnose(roots).map_err(Into::into)
-            }
-            MemoryBackend::Legacy => Err(ServiceError::Unavailable(
-                "structured diagnostics are only available on the markdown backend".into(),
-            )),
-        }
+        let roots = self.roots.scope_roots(scope).cloned().ok_or_else(|| {
+            ServiceError::Unavailable(format!(
+                "the {} memory scope is not configured for this session",
+                scope.as_str()
+            ))
+        })?;
+        v2::MemoryService::diagnose(roots).map_err(Into::into)
     }
 }
-
-/// Marker kept for clients built against Stage 2; Markdown search now works.
-pub const MARKDOWN_SEARCH_UNAVAILABLE: &str = "not_available_until_stage_3";
 
 fn index_error(error: v2::IndexError) -> ServiceError {
     ServiceError::Unavailable(error.to_string())
@@ -1696,93 +1190,8 @@ fn content_hash(value: &UpdateRequest) -> u64 {
     hasher.finish()
 }
 
-fn require_project(scope: ServiceScope) -> Result<(), ServiceError> {
-    match scope {
-        ServiceScope::Project => Ok(()),
-        other => Err(ServiceError::Unavailable(format!(
-            "the legacy backend only stores project memory; {} scope is unavailable",
-            other.as_str()
-        ))),
-    }
-}
-
 fn actor_user() -> Actor {
     Actor::External
-}
-
-fn legacy_view(entry: &MemoryEntry) -> MemoryView {
-    MemoryView {
-        id: entry.id.clone(),
-        title: entry.title.clone(),
-        body: entry.body.clone(),
-        tags: entry.tags.clone(),
-        kind: LegacyKind::of(entry).as_str().to_string(),
-        status: legacy_status(entry.effective_status()).to_string(),
-        value: entry.value.clone(),
-        subject_key: entry.key.clone(),
-        authority: entry.authority().as_str().to_string(),
-        revision: None,
-        current: entry.effective_status() == crate::MemoryStatus::Active,
-        expires_at: entry.expires_at.clone(),
-        updated_at: Some(entry.updated_at.clone()),
-        pinned_by_user: false,
-        sensitive: crate::is_sensitive(entry),
-        experience: entry.experience.as_ref().map(legacy_experience_view),
-    }
-}
-
-fn legacy_candidate_view(candidate: &MemoryCandidate) -> MemoryView {
-    MemoryView {
-        id: candidate.id.clone(),
-        title: candidate.title.clone(),
-        body: candidate.body.clone(),
-        tags: candidate.tags.clone(),
-        kind: if candidate.experience.is_some() {
-            "experience".into()
-        } else {
-            "user_fact".into()
-        },
-        status: "pending".into(),
-        value: candidate.value.clone(),
-        subject_key: candidate
-            .semantic_key
-            .clone()
-            .or_else(|| candidate.key.clone()),
-        authority: legacy_authority(candidate.authority).to_string(),
-        revision: None,
-        current: false,
-        expires_at: candidate.expires_at.clone(),
-        updated_at: None,
-        pinned_by_user: false,
-        sensitive: crate::is_sensitive_candidate(candidate),
-        experience: candidate.experience.as_ref().map(legacy_experience_view),
-    }
-}
-
-fn legacy_status(status: crate::MemoryStatus) -> &'static str {
-    match status {
-        crate::MemoryStatus::Active => "active",
-        crate::MemoryStatus::Superseded => "superseded",
-        crate::MemoryStatus::Expired => "expired",
-        crate::MemoryStatus::Archived => "archived",
-    }
-}
-
-fn legacy_authority(authority: crate::MemoryAuthority) -> &'static str {
-    authority.as_str()
-}
-
-fn legacy_experience_view(record: &ExperienceRecord) -> ExperienceView {
-    ExperienceView {
-        standing: record.standing().as_str().to_string(),
-        applies_when: record.applies_when.clone(),
-        invalid_if: record.invalid_if.clone(),
-        evidence: record
-            .evidence
-            .iter()
-            .map(|evidence| (evidence.kind.clone(), evidence.reference.clone()))
-            .collect(),
-    }
 }
 
 fn markdown_view(record: &v2::MemoryRecord, authority: v2::MemoryAuthority) -> MemoryView {
@@ -1857,80 +1266,6 @@ fn markdown_status(status: v2::MemoryStatus) -> &'static str {
         v2::MemoryStatus::Superseded => "superseded",
         v2::MemoryStatus::Deprecated => "deprecated",
         v2::MemoryStatus::Expired => "expired",
-    }
-}
-
-fn legacy_agent_outcome(outcome: AgentAdmitOutcome) -> WriteOutcome {
-    match outcome {
-        AgentAdmitOutcome::Applied(commit) => commit_outcome(commit),
-        AgentAdmitOutcome::Queued { candidate, reason } => WriteOutcome::Pending {
-            id: candidate.id,
-            title: candidate.title,
-            reason,
-        },
-        AgentAdmitOutcome::NotStored { reason } => WriteOutcome::NotStored { reason },
-    }
-}
-
-fn legacy_admit_outcome(outcome: crate::AdmitOutcome) -> WriteOutcome {
-    match outcome {
-        crate::AdmitOutcome::Applied(commit) => commit_outcome(commit),
-        crate::AdmitOutcome::Proposed(outcome) => match outcome {
-            ProposeOutcome::Pending(candidate) => WriteOutcome::Pending {
-                id: candidate.id,
-                title: candidate.title,
-                reason: "awaiting_user_review".into(),
-            },
-            ProposeOutcome::AlreadyPending(candidate) => WriteOutcome::Pending {
-                id: candidate.id,
-                title: candidate.title,
-                reason: "already_pending".into(),
-            },
-            ProposeOutcome::AlreadyActive { id } => WriteOutcome::Skipped {
-                existing: id,
-                reason: "already_active".into(),
-            },
-            ProposeOutcome::Suppressed { fingerprint } => WriteOutcome::NotStored {
-                reason: format!("rejected_previously:{fingerprint}"),
-            },
-        },
-    }
-}
-
-fn commit_outcome(commit: crate::CommitOutcome) -> WriteOutcome {
-    let entry = commit.entry.clone();
-    match commit.operation {
-        AppliedOperation::Created | AppliedOperation::Superseded | AppliedOperation::Merged => {
-            let Some(entry) = entry else {
-                return WriteOutcome::NotStored {
-                    reason: "memory lifecycle applied no entry".into(),
-                };
-            };
-            WriteOutcome::Applied {
-                id: entry.id,
-                title: entry.title,
-                operation: match commit.operation {
-                    AppliedOperation::Created => "created",
-                    AppliedOperation::Superseded => "superseded",
-                    AppliedOperation::Merged => "merged",
-                    _ => "applied",
-                }
-                .into(),
-                revision: None,
-                superseded: commit.superseded.iter().map(|old| old.id.clone()).collect(),
-                replayed: false,
-                possible_duplicate: Vec::new(),
-            }
-        }
-        AppliedOperation::Skipped => WriteOutcome::Skipped {
-            existing: entry.map(|entry| entry.id).unwrap_or_default(),
-            reason: commit.skipped_reason.unwrap_or_else(|| "skipped".into()),
-        },
-        AppliedOperation::NeedsApproval => WriteOutcome::Pending {
-            id: entry.map(|entry| entry.id).unwrap_or_default(),
-            title: String::new(),
-            reason: "needs_approval".into(),
-        },
     }
 }
 

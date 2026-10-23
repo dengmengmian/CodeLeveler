@@ -1608,25 +1608,43 @@ impl MarkdownStore {
                 self.commit_pending(op_id, caller, digest, record, bytes, admission)
             }
             CreationDecision::Active(authority) => {
-                if intent.kind == MemoryKind::UserFact {
-                    // An automatic extraction from a span already owned by a
-                    // trusted direct user write is not a second fact. The
-                    // match is exact provenance (the same user-turn span),
-                    // never text similarity, and it only covers that one
-                    // operation: other spans from the same turn still flow
-                    // through normal admission.
-                    if let Some(owner) = self.direct_owner_for(&caller, &intent)? {
-                        let existing_id = owner.record.frontmatter.id.clone();
-                        let admission = Admission::Skipped {
-                            existing: existing_id.clone(),
-                            reason: SkipReason::DirectCommandOwned,
-                        };
-                        return self.finish_skip(op_id, &digest, admission, &existing_id);
-                    }
+                // A user fact that restates a span already owned by a trusted
+                // direct user write is not a second fact. The match is exact
+                // provenance (the same user-turn span), never text similarity,
+                // and it only covers that one operation: other spans from the
+                // same turn still flow through normal admission.
+                if intent.kind == MemoryKind::UserFact
+                    && let Some(owner) = self.direct_owner_for(&caller, &intent)?
+                {
+                    let existing_id = owner.record.frontmatter.id.clone();
+                    let admission = Admission::Skipped {
+                        existing: existing_id.clone(),
+                        reason: SkipReason::DirectCommandOwned,
+                    };
+                    return self.finish_skip(op_id, &digest, admission, &existing_id);
+                }
+                if intent.kind == MemoryKind::UserFact && intent.subject_key.is_none() {
+                    // Unstructured user memory is addressable only by its exact
+                    // id; it never participates in subject-key identity.
+                    // Automatic writers were rejected above.
+                    return self.commit_new_with_targets(
+                        op_id,
+                        caller,
+                        digest,
+                        intent,
+                        authority,
+                        Vec::new(),
+                        Operation::Create,
+                        now,
+                    );
+                }
+                {
+                    // One identity has one current record, per kind: a lesson
+                    // whose extractor-derived identity matches a current lesson
+                    // updates it instead of stacking a second copy. The
+                    // comparison is the structured subject key the producer
+                    // supplied, never text similarity.
                     let Some(subject_key) = intent.subject_key.clone() else {
-                        // Unstructured user memory is addressable only by its
-                        // exact id; it never participates in subject-key
-                        // identity. Automatic writers were rejected above.
                         return self.commit_new_with_targets(
                             op_id,
                             caller,

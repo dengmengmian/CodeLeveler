@@ -116,11 +116,27 @@ pub struct MemoryConfig {
     /// opts in with an explicit `true`.
     #[serde(default)]
     pub experience_enabled: bool,
-    /// Storage backend. `legacy` is the shipped JSON store and the default;
-    /// `markdown` is the Memory 2.0 pipeline and is opt-in for tests and
-    /// dogfood only.
-    #[serde(default)]
-    pub backend: leveler_core::MemoryBackend,
+    /// Removed `backend` selector (Memory 2.0 cutover).
+    ///
+    /// Markdown is the only implementation, so this key carries no authority.
+    /// It is still accepted — and reported by [`Self::deprecated_backend`] —
+    /// because an existing `config.yaml` that names `legacy` or `markdown`
+    /// must keep loading its other settings instead of silently losing them.
+    #[serde(default, rename = "backend")]
+    pub deprecated_backend: Option<String>,
+}
+
+impl MemoryConfig {
+    /// A notice for a config that still carries the removed `backend` key.
+    ///
+    /// Callers show this to the user; the value never selects a store, so an
+    /// old `legacy` line cannot reactivate the deleted backend.
+    pub fn deprecated_backend(&self) -> Option<String> {
+        let value = self.deprecated_backend.as_deref()?.trim();
+        Some(format!(
+            "memory.backend = \"{value}\" 已移除：Markdown Memory 2.0 是唯一实现。请从 .leveler/config.yaml 删除该字段。"
+        ))
+    }
 }
 
 impl Default for MemoryConfig {
@@ -129,7 +145,7 @@ impl Default for MemoryConfig {
             enabled: true,
             user_enabled: true,
             experience_enabled: false,
-            backend: leveler_core::MemoryBackend::Legacy,
+            deprecated_backend: None,
         }
     }
 }
@@ -351,6 +367,29 @@ ignore:
         assert!(!total_off.memory.enabled);
         assert!(total_off.memory.user_enabled);
         assert!(total_off.memory.experience_enabled);
+    }
+
+    #[test]
+    fn a_removed_backend_key_is_accepted_and_reported() {
+        // Markdown is the only implementation. A config written against the
+        // two-backend era must still load (so unrelated settings survive) and
+        // must say that the key no longer selects anything.
+        let legacy: ProjectConfig = serde_yaml::from_str(
+            "memory:\n  backend: legacy\n  enabled: true\n  experience_enabled: true\n",
+        )
+        .unwrap();
+        assert!(legacy.memory.enabled);
+        assert!(legacy.memory.experience_enabled);
+        let notice = legacy.memory.deprecated_backend().unwrap();
+        assert!(notice.contains("memory.backend"), "{notice}");
+        assert!(notice.contains("legacy"), "{notice}");
+        assert!(notice.contains("Markdown"), "{notice}");
+
+        // Nothing selects a store: there is no field left to read it from.
+        let modern: ProjectConfig = serde_yaml::from_str("memory:\n  backend: markdown\n").unwrap();
+        assert!(modern.memory.deprecated_backend().is_some());
+        let clean: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
+        assert!(clean.memory.deprecated_backend().is_none());
     }
 
     #[test]

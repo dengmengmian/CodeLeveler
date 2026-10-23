@@ -510,13 +510,6 @@ pub enum MemoryCommand {
         /// Memory id.
         id: String,
     },
-    /// Restore an archived memory as the current truth.
-    ///
-    /// A current value for the same identity is superseded; history is kept.
-    Restore {
-        /// Archived memory id.
-        id: String,
-    },
     /// Create a new active memory (user-authoritative write; no model round).
     ///
     /// Never overwrites: saving the same title again with different text keeps
@@ -552,20 +545,13 @@ pub enum MemoryCommand {
         #[arg(long)]
         text: String,
     },
-    /// Report stored records that look like they contain credentials. Never
-    /// prints the content; safe to run in a shared terminal.
-    Audit,
-    /// Report what semantic identity historical memory can establish.
+    /// Remove the retired JSON memory stores (dry run by default).
     ///
-    /// Read-only dry run: it never writes, migrates or rewrites a record.
-    AuditIdentity,
-    /// Redact credential-shaped content in active, archived and pending
-    /// records. Dry-run unless `--apply` is passed.
-    Scrub {
-        /// Only this memory id (all stores). Omit to scan every record.
-        #[arg(long)]
-        id: Option<String>,
-        /// Write the redaction. Without it this is a read-only report.
+    /// Only directories that ARE a legacy store are deleted; anything
+    /// unrecognized is reported and left alone. Markdown memory, sessions and
+    /// configuration are never touched.
+    PurgeLegacy {
+        /// Delete what the report listed. Without it nothing is written.
         #[arg(long)]
         apply: bool,
     },
@@ -1069,19 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_identity_audit_and_restore_parse() {
-        let cli = parse(&["leveler", "memory", "audit-identity"]);
-        assert!(matches!(
-            cli.command,
-            Some(Command::Memory(MemoryCommand::AuditIdentity))
-        ));
-        let cli = parse(&["leveler", "memory", "restore", "old-id"]);
-        match cli.command {
-            Some(Command::Memory(MemoryCommand::Restore { id })) => {
-                assert_eq!(id, "old-id");
-            }
-            other => panic!("expected Memory::Restore, got {other:?}"),
-        }
+    fn memory_show_parses_the_archived_flag() {
         let cli = parse(&["leveler", "memory", "show", "old-id", "--archived"]);
         match cli.command {
             Some(Command::Memory(MemoryCommand::Show { id, archived })) => {

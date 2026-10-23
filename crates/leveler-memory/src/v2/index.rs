@@ -684,7 +684,7 @@ fn is_corruption(error: &rusqlite::Error) -> bool {
 /// indexing side so a one-character query can still reach a longer term. No
 /// word list, synonym dictionary or language model participates.
 pub fn index_terms(text: &str) -> Vec<String> {
-    let mut terms: BTreeSet<String> = crate::tokenize(text).into_iter().collect();
+    let mut terms: BTreeSet<String> = crate::util::tokenize(text).into_iter().collect();
     let mut run = Vec::new();
     let flush = |run: &mut Vec<char>, terms: &mut BTreeSet<String>| {
         for character in run.drain(..) {
@@ -692,7 +692,7 @@ pub fn index_terms(text: &str) -> Vec<String> {
         }
     };
     for character in text.chars() {
-        if crate::is_cjk(character) {
+        if crate::util::is_cjk(character) {
             run.push(character);
         } else {
             flush(&mut run, &mut terms);
@@ -704,7 +704,7 @@ pub fn index_terms(text: &str) -> Vec<String> {
 
 /// Query terms use exactly the shared tokenizer; indexing adds the unigrams.
 pub fn query_terms(text: &str) -> Vec<String> {
-    let terms: BTreeSet<String> = crate::tokenize(text).into_iter().collect();
+    let terms: BTreeSet<String> = crate::util::tokenize(text).into_iter().collect();
     terms.into_iter().collect()
 }
 

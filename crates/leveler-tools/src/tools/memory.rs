@@ -47,15 +47,6 @@ pub struct MemoryRoot {
 }
 
 impl MemoryRoot {
-    /// A legacy JSON store rooted at `root`. Kept for callers that only know a
-    /// store directory; the app hands over the configured service instead.
-    pub fn new(root: Option<std::path::PathBuf>) -> Self {
-        Self {
-            service: root.map(|root| Arc::new(MemoryService::legacy(root))),
-            lanes: leveler_memory::MemoryLanes::ALL,
-        }
-    }
-
     pub fn from_service(service: Option<Arc<MemoryService>>) -> Self {
         Self {
             service,
@@ -77,7 +68,7 @@ impl MemoryRoot {
     fn service(&self) -> Result<&MemoryService, ToolError> {
         self.service.as_deref().ok_or_else(|| {
             ToolError::Io(
-                "memory store is not configured for this session (app must set Layout::memory_dir)"
+                "memory is not configured for this session (the host must hand over a service)"
                     .to_string(),
             )
         })
@@ -240,12 +231,12 @@ fn render_view_body(
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MemoryArgs {
-    /// Action: search | vector_search | list | read | update | deprecate | pin | unpin
+    /// Action: search | list | read | update | deprecate | pin | unpin
     action: String,
     /// Storage scope: project (default) | local | global.
     #[serde(default)]
     scope: Option<String>,
-    /// Search query (action=search/vector_search) or entry id (action=read).
+    /// Search query (action=search) or entry id (action=read).
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
@@ -308,9 +299,8 @@ impl Tool for MemoryTool {
 
     fn description(&self) -> &'static str {
         "Read and maintain durable memories. action=list|read|search|update|deprecate|pin|unpin. \
-         Bodies are not in the system prompt — retrieve them here. On the Markdown backend both \
-         search and vector_search run over the derived lexical index; a backend without search \
-         says so instead of returning an empty result. update and deprecate require the revision \
+         Bodies are not in the system prompt — retrieve them here. search runs over the derived \
+         lexical index of the current Markdown records. update and deprecate require the revision \
          the caller read. A write to a record the user owns is queued for the user; the model \
          cannot accept or reject pending memory."
     }
@@ -372,27 +362,11 @@ impl Tool for MemoryTool {
                     Err(error) => Err(service_error(self.name(), error)),
                 }
             }
-            "search" | "vector_search" => {
+            "search" => {
                 let q = args.query.unwrap_or_default();
-                let hits = match service.search(
-                    &read_actor,
-                    scope,
-                    lanes,
-                    &q,
-                    args.limit.max(1),
-                    args.action == "vector_search",
-                ) {
-                    Ok(hits) => hits,
-                    Err(ServiceError::Unavailable(reason))
-                        if reason == leveler_memory::MARKDOWN_SEARCH_UNAVAILABLE =>
-                    {
-                        return Ok(ToolOutput::error(
-                            "search is not available on the Markdown memory backend until \
-                             Stage 3; use list or read",
-                        ));
-                    }
-                    Err(error) => return Err(service_error(self.name(), error)),
-                };
+                let hits = service
+                    .search(&read_actor, scope, lanes, &q, args.limit.max(1))
+                    .map_err(|error| service_error(self.name(), error))?;
                 if hits.is_empty() {
                     return Ok(ToolOutput::ok("No matching memories.".to_string()));
                 }
@@ -611,9 +585,6 @@ struct RememberArgs {
     /// Absolute RFC3339 instant after which the fact is no longer current.
     #[serde(default)]
     expires_at: Option<String>,
-    /// A rationale kept by the legacy store; not evidence about the user.
-    #[serde(default)]
-    evidence: Option<String>,
     /// Storage scope: project (default) | local | global.
     #[serde(default)]
     scope: Option<String>,
@@ -640,16 +611,6 @@ impl ToolMemoryKind {
             Self::Decision => "decision",
             Self::Note => "note",
             Self::UserFact => "user_fact",
-        }
-    }
-}
-
-impl From<ToolMemoryKind> for leveler_memory::MemoryKind {
-    fn from(value: ToolMemoryKind) -> Self {
-        match value {
-            ToolMemoryKind::Preference => Self::Preference,
-            ToolMemoryKind::Decision => Self::Decision,
-            ToolMemoryKind::Note | ToolMemoryKind::UserFact => Self::Note,
         }
     }
 }
@@ -727,7 +688,11 @@ impl Tool for RememberTool {
             subject: Some(args.subject),
             value: args.value,
             tags: args.tags,
-            evidence: args.evidence,
+            // A model cannot supply evidence about the user: a quoted span it
+            // writes is its own text, not a record of what the user said. Real
+            // user-turn evidence is stamped by the runtime that observed the
+            // turn, so this field stays empty here.
+            evidence: None,
             expires_at: args.expires_at,
             replaces_id: None,
         };
@@ -806,8 +771,108 @@ impl Tool for ForgetTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_memory::MemoryStore;
+    use leveler_memory::v2::{MemoryScope, ScopeRoots, UserInvocationId};
     use tempfile::tempdir;
+
+    /// A project-scoped Markdown store plus the tool handle over it.
+    fn fixture(dir: &std::path::Path) -> (Arc<MemoryService>, MemoryRoot) {
+        let service = Arc::new(MemoryService::new(
+            leveler_memory::MemoryRoots::new().with_project(ScopeRoots::new(
+                MemoryScope::Project,
+                dir.join("current"),
+                dir.join("state"),
+            )),
+        ));
+        let root = MemoryRoot::from_service(Some(service.clone()));
+        (service, root)
+    }
+
+    fn user() -> leveler_memory::v2::Actor {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        leveler_memory::v2::Actor::User {
+            invocation: UserInvocationId::mint(format!(
+                "tools-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )),
+        }
+    }
+
+    /// One explicit user fact, written through the same facade production uses.
+    fn seed_user(
+        service: &MemoryService,
+        title: &str,
+        body: &str,
+        kind: &str,
+        subject: Option<&str>,
+    ) -> String {
+        let mut request = RememberRequest::new(
+            leveler_memory::v2::OpId::derived("seed", title),
+            ServiceScope::Project,
+            title,
+            body,
+            kind,
+        );
+        request.subject = subject.map(str::to_string);
+        service
+            .remember(&user(), request)
+            .unwrap()
+            .applied_id()
+            .expect("user seed must apply")
+            .to_string()
+    }
+
+    /// One runtime-observed lesson, with the evidence the store requires.
+    fn seed_experience(
+        service: &MemoryService,
+        verified: bool,
+        invalid_if: Option<&str>,
+    ) -> String {
+        use leveler_memory::{
+            CandidateKind, CandidateSource, ExperienceCategory, ExperienceEvidence,
+            ExperienceRecord, ExperienceVerification, MemoryCandidate,
+        };
+        let mut candidate = MemoryCandidate::new(
+            "Deploy lesson",
+            "The blue deployment failed because the token had expired.",
+            CandidateKind::Free,
+            None,
+            CandidateSource::RuntimeObserved,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut evidence = vec![ExperienceEvidence {
+            kind: "failure".to_string(),
+            reference: "step 2: deploy (exit 1)".to_string(),
+        }];
+        if verified {
+            evidence.push(ExperienceEvidence {
+                kind: "resolution".to_string(),
+                reference: "step 4: rotate the token (exit 0)".to_string(),
+            });
+        }
+        candidate.experience = Some(ExperienceRecord {
+            category: ExperienceCategory::RootCause,
+            verification: if verified {
+                ExperienceVerification::Verified
+            } else {
+                ExperienceVerification::Unverified
+            },
+            applies_when: "deploying to blue".to_string(),
+            invalid_if: invalid_if.map(str::to_string),
+            evidence,
+        });
+        let actor = leveler_memory::v2::Actor::Runtime {
+            task: leveler_core::TaskId::new("fixture-task"),
+        };
+        service
+            .admit_candidate(&actor, ServiceScope::Project, &candidate, "seed-experience")
+            .unwrap()
+            .applied_id()
+            .expect("experience seed must apply")
+            .to_string()
+    }
 
     fn ctx_in(root: &std::path::Path) -> ToolContext {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -820,14 +885,22 @@ mod tests {
             .with_tool_call_scope(format!("test-call-{call}"))
     }
 
-    /// The root a memory tool writes to is the one it was CONSTRUCTED with —
+    fn active_ids(service: &MemoryService) -> Vec<String> {
+        service
+            .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+            .unwrap()
+            .into_iter()
+            .map(|view| view.id)
+            .collect()
+    }
+
+    /// The store a memory tool writes to is the one it was CONSTRUCTED with —
     /// never an ambient environment variable, and never a location invented at
     /// call time.
     #[tokio::test]
     async fn writes_to_the_root_it_was_constructed_with() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
         let out = RememberTool::new(root.clone())
             .execute(
@@ -838,7 +911,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        assert!(mem.join("active").exists());
+        let records: Vec<_> = std::fs::read_dir(dir.path().join("current"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(records.len(), 1, "one Markdown record: {records:?}");
         let listed = MemoryTool::new(root)
             .execute(
                 serde_json::json!({"action": "list"}),
@@ -848,6 +926,7 @@ mod tests {
             .await
             .unwrap();
         assert!(listed.content.contains("Prefer workspace-write"));
+        assert_eq!(active_ids(&service).len(), 1);
     }
 
     /// Provider tool-call ids are opaque; the remembered operation id must
@@ -857,23 +936,13 @@ mod tests {
     #[tokio::test]
     async fn an_opaque_tool_call_id_still_writes_and_replays() {
         let dir = tempdir().unwrap();
-        let current = dir.path().join("memory");
-        let state = dir.path().join("state");
-        let service = Arc::new(leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::markdown().with_project(
-                leveler_memory::v2::ScopeRoots::new(
-                    leveler_memory::v2::MemoryScope::Project,
-                    current.clone(),
-                    state,
-                ),
-            ),
-        ));
+        let (service, root) = fixture(dir.path());
         let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
             .with_session_scope("test-session")
             .with_turn_scope("test-turn")
             .with_tool_call_scope("call|opaque/with spaces");
-        let tool = RememberTool::new(MemoryRoot::from_service(Some(service)));
+        let tool = RememberTool::new(root);
         let arguments = serde_json::json!({
             "title": "用 pnpm",
             "body": "本仓库统一用 pnpm，不要用 npm。",
@@ -896,22 +965,23 @@ mod tests {
             "a retried call is the same operation: {}",
             replayed.content
         );
-        let active: Vec<_> = std::fs::read_dir(&current)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-            .collect();
-        assert_eq!(active.len(), 1, "the retry must not write twice");
+        assert_eq!(
+            active_ids(&service).len(),
+            1,
+            "the retry must not write twice"
+        );
     }
 
     #[tokio::test]
     async fn two_different_facts_with_the_same_title_do_not_clobber_each_other() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
+        let dir_for_call = dir.path().to_path_buf();
         let remember = |body: &'static str, subject: &'static str| {
-            let ctx = ctx.clone();
+            // A distinct tool call per write: one call identity is one
+            // operation, and two different facts are two operations.
+            let ctx = ctx_in(&dir_for_call);
             let root = root.clone();
             async move {
                 RememberTool::new(root)
@@ -939,7 +1009,7 @@ mod tests {
 
         // Both facts must be retrievable — the second must not have overwritten
         // the first just because their titles slug to the same id.
-        let listed = MemoryTool::new(MemoryRoot::new(Some(mem.clone())))
+        let listed = MemoryTool::new(root.clone())
             .execute(
                 serde_json::json!({"action": "search", "query": "deploy", "limit": 10}),
                 ctx.clone(),
@@ -964,8 +1034,7 @@ mod tests {
             "identical fact must be recognized as current: {}",
             again.content
         );
-        let store = MemoryStore::open(&mem).unwrap();
-        assert_eq!(store.effective_active().unwrap().len(), 2);
+        assert_eq!(active_ids(&service).len(), 2);
     }
 
     /// A run with memory unconfigured says so. Nothing invents a store
@@ -974,7 +1043,7 @@ mod tests {
     async fn an_unconfigured_memory_root_errors_clearly() {
         let dir = tempdir().unwrap();
         let ctx = ctx_in(dir.path());
-        let err = MemoryTool::new(MemoryRoot::new(None))
+        let err = MemoryTool::new(MemoryRoot::from_service(None))
             .execute(
                 serde_json::json!({"action": "list"}),
                 ctx,
@@ -986,15 +1055,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vector_search_returns_ranked_hits() {
+    async fn search_returns_ranked_hits() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (_service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
         RememberTool::new(root.clone())
             .execute(
                 serde_json::json!({"title": "Workspace write", "body": "Prefer PermissionProfile::Assisted for file edits.", "kind": "note", "subject": "editing.permission_profile"}),
-                ctx.clone(),
+                ctx_in(dir.path()),
                 CancellationToken::new(),
             )
             .await
@@ -1002,7 +1070,7 @@ mod tests {
         RememberTool::new(root.clone())
             .execute(
                 serde_json::json!({"title": "Unrelated", "body": "The sky is blue on clear days.", "kind": "note", "subject": "weather.sky"}),
-                ctx.clone(),
+                ctx_in(dir.path()),
                 CancellationToken::new(),
             )
             .await
@@ -1010,7 +1078,7 @@ mod tests {
         let out = MemoryTool::new(root)
             .execute(
                 serde_json::json!({
-                    "action": "vector_search",
+                    "action": "search",
                     "query": "workspace write edits",
                     "limit": 3
                 }),
@@ -1034,20 +1102,17 @@ mod tests {
     #[tokio::test]
     async fn agent_remember_is_model_authority_and_never_replaces_a_user_fact() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
-        let store = MemoryStore::open(&mem).unwrap();
-        let user = store
-            .activate(
-                "Deploy notes",
-                "User chose the release branch.",
-                leveler_memory::MemoryKind::Note,
-                vec![],
-            )
-            .unwrap();
+        let user_id = seed_user(
+            &service,
+            "Deploy notes",
+            "User chose the release branch.",
+            "note",
+            Some("deploy.release"),
+        );
 
-        let out = RememberTool::new(root.clone())
+        let out = RememberTool::new(root)
             .execute(
                 serde_json::json!({
                     "title": "Deploy notes",
@@ -1055,83 +1120,96 @@ mod tests {
                     "kind": "note",
                     "subject": "deploy.production"
                 }),
-                ctx.clone(),
+                ctx,
                 CancellationToken::new(),
             )
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
 
-        let active = store.list_active().unwrap();
+        let active = service
+            .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+            .unwrap();
         assert_eq!(active.len(), 2, "the model adds a second entry: {active:?}");
-        let user_entry = active.iter().find(|entry| entry.id == user.id).unwrap();
-        assert_eq!(
-            user_entry.body, "User chose the release branch.",
-            "the user's entry must be untouched"
-        );
-        assert_eq!(
-            user_entry.provenance.as_ref().unwrap().authority,
-            leveler_memory::MemoryAuthority::ExplicitUser
-        );
-        let agent_entry = active
+        let user_view = active.iter().find(|view| view.id == user_id).unwrap();
+        assert_eq!(user_view.authority, "user_explicit");
+        let model_view = active
             .iter()
-            .find(|entry| entry.id != user.id)
-            .expect("agent entry");
+            .find(|view| view.id != user_id)
+            .expect("model entry");
         assert_eq!(
-            agent_entry.provenance.as_ref().unwrap().authority,
-            leveler_memory::MemoryAuthority::ModelInference,
+            model_view.authority, "model_inferred",
             "approval to execute is not a claim that the user asserted the fact"
         );
-        assert_eq!(
-            agent_entry.provenance.as_ref().unwrap().source,
-            "agent_remember_tool"
-        );
+        // The user's record keeps its own body and revision.
+        let read = service
+            .read(
+                &leveler_memory::v2::Actor::External,
+                ServiceScope::Project,
+                &user_id,
+            )
+            .unwrap();
+        assert_eq!(read.body, "User chose the release branch.");
+        assert_eq!(read.revision, Some(1));
     }
 
-    /// The same semantic subject is one fact: a later value updates the
-    /// current entry instead of accumulating a second active copy.
+    /// The same semantic subject is one identity, so a second model value does
+    /// not accumulate beside the first: with no evidence of its own, a model
+    /// tool call cannot silently replace a current value and is queued for a
+    /// person instead.
     #[tokio::test]
-    async fn agent_remember_with_the_same_subject_updates_instead_of_duplicating() {
+    async fn agent_remember_with_the_same_subject_waits_instead_of_duplicating() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
-        let ctx = ctx_in(dir.path());
-        let remember = |body: &'static str, evidence: Option<&'static str>| {
-            let ctx = ctx.clone();
+        let (service, root) = fixture(dir.path());
+        let dir_for_call = dir.path().to_path_buf();
+        let remember = |body: &'static str| {
+            let ctx = ctx_in(&dir_for_call);
             let root = root.clone();
             async move {
-                let mut args = serde_json::json!({
-                    "title": "项目默认模型",
-                    "body": body,
-                    "kind": "note",
-                    "subject": "project.default_model"
-                });
-                if let Some(evidence) = evidence {
-                    args["evidence"] = serde_json::Value::String(evidence.to_string());
-                }
                 RememberTool::new(root)
-                    .execute(args, ctx, CancellationToken::new())
+                    .execute(
+                        serde_json::json!({
+                            "title": "项目默认模型",
+                            "body": body,
+                            "kind": "note",
+                            "subject": "project.default_model"
+                        }),
+                        ctx,
+                        CancellationToken::new(),
+                    )
                     .await
                     .unwrap()
             }
         };
 
-        let first = remember("项目默认模型是 Pro", None).await;
+        let first = remember("项目默认模型是 Pro").await;
         assert!(!first.is_error, "{}", first.content);
-        let second = remember(
-            "项目默认模型是 Flash",
-            Some("the user restated the model in this turn"),
-        )
-        .await;
+        let second = remember("项目默认模型是 Flash").await;
         assert!(!second.is_error, "{}", second.content);
+        assert!(
+            second.content.contains("approval") || second.content.contains("等待"),
+            "a replacement without new evidence waits for a person: {}",
+            second.content
+        );
 
-        let store = MemoryStore::open(&mem).unwrap();
-        let active = store.effective_active().unwrap();
+        let active = service
+            .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+            .unwrap();
         assert_eq!(active.len(), 1, "one current truth: {active:?}");
-        assert!(active[0].body.contains("Flash"));
-        let history = store.list_archived().unwrap();
-        assert_eq!(history.len(), 1, "the old value is history");
-        assert!(history[0].body.contains("Pro"));
+        let current = service
+            .read(
+                &leveler_memory::v2::Actor::External,
+                ServiceScope::Project,
+                &active[0].id,
+            )
+            .unwrap();
+        assert!(current.body.contains("Pro"));
+        let pending = service.pending(&user(), ServiceScope::Project).unwrap();
+        assert_eq!(pending.len(), 1, "the new value is a proposal");
+        assert!(
+            pending[0].body.contains("Flash"),
+            "the proposal keeps the new value: {pending:?}"
+        );
     }
 
     /// Approval to execute a tool is not a claim that the model's fact
@@ -1139,23 +1217,15 @@ mod tests {
     #[tokio::test]
     async fn agent_remember_conflicting_with_a_user_fact_waits_for_approval() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
-        let store = MemoryStore::open(&mem).unwrap();
-        let key = leveler_memory::semantic_key_of("default_model");
-        let mut user = leveler_memory::MemoryCandidate::new(
+        let user_id = seed_user(
+            &service,
             "项目默认模型",
             "以后本项目默认模型固定为 Pro",
-            leveler_memory::CandidateKind::Free,
-            Some(key.clone()),
-            leveler_memory::CandidateSource::UserExplicit,
-            vec![],
-        )
-        .unwrap();
-        user.semantic_key = Some(key);
-        user.authority = leveler_memory::MemoryAuthority::ExplicitUser;
-        store.commit_candidate(&user).unwrap();
+            "note",
+            Some("project.default_model"),
+        );
 
         let out = RememberTool::new(root)
             .execute(
@@ -1177,38 +1247,65 @@ mod tests {
             "the model must be told a person decides: {}",
             out.content
         );
-        let active = store.effective_active().unwrap();
+        let active = service
+            .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+            .unwrap();
         assert_eq!(active.len(), 1);
-        assert!(active[0].body.contains("Pro"), "{active:?}");
-        assert_eq!(store.list_archived().unwrap().len(), 0);
-        assert_eq!(store.list_pending().unwrap().len(), 1, "conflict is kept");
+        assert_eq!(active[0].id, user_id);
+        let current = service
+            .read(
+                &leveler_memory::v2::Actor::External,
+                ServiceScope::Project,
+                &user_id,
+            )
+            .unwrap();
+        assert!(current.body.contains("Pro"), "{current:?}");
+        assert_eq!(
+            service
+                .archived(
+                    &leveler_memory::v2::Actor::External,
+                    ServiceScope::Project,
+                    leveler_memory::MemoryLanes::ALL,
+                    None,
+                )
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            service
+                .pending(&user(), ServiceScope::Project)
+                .unwrap()
+                .len(),
+            1,
+            "conflict is kept"
+        );
     }
 
-    /// Every model-facing read presents current truth. Crash residue can leave
-    /// the replacement and the old copy active together; neither `list` nor
-    /// `read` may present the loser as a memory.
+    /// Every model-facing read presents current truth. A rejected proposal or a
+    /// superseded record is history: `list` and `read` must not present it.
     #[tokio::test]
-    async fn reads_never_present_crash_residue_as_current_truth() {
+    async fn reads_never_present_history_as_current_truth() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
-        let store = MemoryStore::open(&mem).unwrap();
 
-        let mut old = leveler_memory::new_entry("Old value", "默认模型：Pro", vec![]);
-        old.id = "old-pro".into();
-        old.key = Some("k-defaultmodel".into());
-        old.updated_at = "2026-01-01T00:00:00Z".into();
-        old.created_at = old.updated_at.clone();
-        store.remember(old).unwrap();
-
-        let mut new = leveler_memory::new_entry("New value", "默认模型：Flash", vec![]);
-        new.id = "new-flash".into();
-        new.key = Some("k-defaultmodel".into());
-        new.updated_at = "2026-01-01T00:00:00Z".into();
-        new.created_at = new.updated_at.clone();
-        new.supersedes = Some("old-pro".into());
-        store.remember(new).unwrap();
+        // The correction is the user's, so it replaces the earlier value and
+        // the old record becomes history.
+        let old_id = seed_user(
+            &service,
+            "Old value",
+            "默认模型：Pro",
+            "note",
+            Some("project.default_model"),
+        );
+        seed_user(
+            &service,
+            "New value",
+            "默认模型：Flash",
+            "note",
+            Some("project.default_model"),
+        );
 
         let listed = MemoryTool::new(root.clone())
             .execute(
@@ -1223,20 +1320,19 @@ mod tests {
 
         let read = MemoryTool::new(root)
             .execute(
-                serde_json::json!({"action": "read", "id": "old-pro"}),
+                serde_json::json!({"action": "read", "id": old_id}),
                 ctx,
                 CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert!(read.is_error, "stale residue is not current truth");
+        assert!(read.is_error, "a superseded record is not current truth");
     }
 
     #[tokio::test]
     async fn remember_requires_a_subject_and_preserves_the_declared_kind() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
 
         let missing = RememberTool::new(root.clone())
@@ -1266,84 +1362,62 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        let store = MemoryStore::open(&mem).unwrap();
-        let active = store.effective_active().unwrap();
-        assert_eq!(active[0].kind.as_deref(), Some("decision"));
+        let active = service
+            .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+            .unwrap();
+        assert!(
+            active[0].kind == "user_fact",
+            "kind is the record kind: {active:?}"
+        );
+        assert!(
+            active[0].tags.iter().any(|tag| tag == "decision"),
+            "the declared label stays visible as a tag: {active:?}"
+        );
     }
 
-    /// Stores created before credential validation may already contain a key.
-    /// The model-facing tool must not expose it through any read action, even
-    /// though the file remains available for the user's own cleanup/audit.
+    /// A credential-shaped write never reaches the store, so no read action
+    /// can leak it. The refusal is the contract; an empty store is the proof.
     #[tokio::test]
-    async fn historical_sensitive_memory_is_hidden_from_every_read_action() {
+    async fn a_credential_shaped_remember_is_refused_and_never_appears() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
-        let store = MemoryStore::open(&mem).unwrap();
-        let safe = leveler_memory::new_entry(
+        seed_user(
+            &service,
             "Deploy preference",
             "Use foreground service startup.",
-            vec![],
+            "note",
+            Some("deploy.startup"),
         );
-        store.remember(safe).unwrap();
 
-        let secret = leveler_memory::new_entry(
-            "Legacy API key",
-            "API_KEY=demo-provider-value-1234567890",
-            vec![],
-        );
-        let secret_id = secret.id.clone();
-        std::fs::write(
-            mem.join("active").join(format!("{secret_id}.json")),
-            serde_json::to_vec_pretty(&secret).unwrap(),
-        )
-        .unwrap();
+        let refused = RememberTool::new(root.clone())
+            .execute(
+                serde_json::json!({
+                    "title": "Provider credential",
+                    "body": "API_KEY=demo-provider-value-1234567890",
+                    "kind": "note",
+                    "subject": "provider.api_key"
+                }),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await;
+        match refused {
+            Err(error) => assert!(error.to_string().contains("credential"), "{error}"),
+            Ok(output) => assert!(output.is_error, "{}", output.content),
+        }
+        assert_eq!(active_ids(&service).len(), 1, "only the safe fact exists");
 
         for input in [
             serde_json::json!({"action": "list"}),
             serde_json::json!({"action": "search", "query": "API key provider", "limit": 10}),
-            serde_json::json!({"action": "vector_search", "query": "API key provider", "limit": 10}),
         ] {
             let out = MemoryTool::new(root.clone())
                 .execute(input, ctx.clone(), CancellationToken::new())
                 .await
                 .unwrap();
-            assert!(!out.content.contains(&secret_id), "{}", out.content);
             assert!(!out.content.contains("demo-provider"), "{}", out.content);
         }
-
-        let read = MemoryTool::new(root)
-            .execute(
-                serde_json::json!({"action": "read", "id": secret_id}),
-                ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(read.is_error, "sensitive direct read must be refused");
-        assert!(!read.content.contains("demo-provider"), "{}", read.content);
-    }
-
-    fn experience_entry() -> leveler_memory::MemoryEntry {
-        let mut entry = leveler_memory::new_entry(
-            "Deploy lesson",
-            "The blue deployment failed because the token had expired.",
-            Vec::new(),
-        );
-        entry.id = "deploy-lesson".to_string();
-        entry.kind = Some(leveler_memory::EXPERIENCE_KIND.to_string());
-        entry.experience = Some(leveler_memory::ExperienceRecord {
-            category: leveler_memory::ExperienceCategory::RootCause,
-            verification: leveler_memory::ExperienceVerification::Verified,
-            applies_when: "deploying to blue".to_string(),
-            invalid_if: None,
-            evidence: vec![leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 2: deploy (exit 1)".to_string(),
-            }],
-        });
-        entry
     }
 
     /// A recall candidate carries only the row, so the read that expands it
@@ -1352,18 +1426,13 @@ mod tests {
     #[tokio::test]
     async fn reading_an_experience_returns_its_standing_and_conditions() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
-        let store = MemoryStore::open(&mem).unwrap();
-        let mut entry = experience_entry();
-        entry.experience.as_mut().unwrap().invalid_if =
-            Some("the deployment target changes".to_string());
-        store.remember(entry).unwrap();
+        let id = seed_experience(&service, false, Some("the deployment target changes"));
 
         let read = MemoryTool::new(root)
             .execute(
-                serde_json::json!({"action": "read", "id": "deploy-lesson"}),
+                serde_json::json!({"action": "read", "id": id}),
                 ctx,
                 CancellationToken::new(),
             )
@@ -1376,12 +1445,12 @@ mod tests {
             read.content
         );
         assert!(
-            read.content.contains("experience·observed"),
+            read.content.contains("experience\u{b7}observed"),
             "the fixture has failure evidence but no resolution: {}",
             read.content
         );
         assert!(
-            !read.content.contains("experience·verified"),
+            !read.content.contains("experience\u{b7}verified"),
             "an observation-only lesson must not read as a resolution: {}",
             read.content
         );
@@ -1401,20 +1470,20 @@ mod tests {
     #[tokio::test]
     async fn memory_reads_never_cross_a_closed_lane() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
+        let (service, root) = fixture(dir.path());
         let ctx = ctx_in(dir.path());
-        let store = MemoryStore::open(&mem).unwrap();
-        let mut user = leveler_memory::new_entry(
+        seed_user(
+            &service,
             "Release rule",
             "Tag only after the full suite passes.",
-            Vec::new(),
+            "decision",
+            Some("release.tagging"),
         );
-        user.kind = Some("decision".to_string());
-        store.remember(user).unwrap();
-        store.remember(experience_entry()).unwrap();
+        let experience_id = seed_experience(&service, true, None);
 
-        let user_only =
-            MemoryRoot::new(Some(mem.clone())).with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+        let user_only = root
+            .clone()
+            .with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
         let listed = MemoryTool::new(user_only.clone())
             .execute(
                 serde_json::json!({"action": "list"}),
@@ -1442,13 +1511,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !searched.content.contains("deploy-lesson"),
+            !searched.content.contains(&experience_id),
             "{}",
             searched.content
         );
         let read = MemoryTool::new(user_only)
             .execute(
-                serde_json::json!({"action": "read", "id": "deploy-lesson"}),
+                serde_json::json!({"action": "read", "id": experience_id}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -1456,8 +1525,7 @@ mod tests {
             .unwrap();
         assert!(read.is_error, "a disabled lane is not readable");
 
-        let experience_only =
-            MemoryRoot::new(Some(mem)).with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
+        let experience_only = root.with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
         let listed = MemoryTool::new(experience_only)
             .execute(
                 serde_json::json!({"action": "list"}),
@@ -1481,9 +1549,8 @@ mod tests {
     #[tokio::test]
     async fn remember_is_refused_when_the_user_lane_is_closed() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()))
-            .with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
+        let (service, root) = fixture(dir.path());
+        let root = root.with_lanes(leveler_memory::MemoryLanes::EXPERIENCE_ONLY);
         let out = RememberTool::new(root)
             .execute(
                 serde_json::json!({
@@ -1498,33 +1565,25 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error, "{}", out.content);
-        assert!(
-            MemoryStore::open(&mem)
-                .unwrap()
-                .effective_active()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(active_ids(&service).is_empty());
     }
 
     #[tokio::test]
     async fn forget_is_refused_for_an_entry_in_a_closed_lane() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let store = MemoryStore::open(&mem).unwrap();
-        store.remember(experience_entry()).unwrap();
-        let root =
-            MemoryRoot::new(Some(mem.clone())).with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
+        let (service, root) = fixture(dir.path());
+        let experience_id = seed_experience(&service, true, None);
+        let root = root.with_lanes(leveler_memory::MemoryLanes::USER_ONLY);
         let out = ForgetTool::new(root)
             .execute(
-                serde_json::json!({"id": "deploy-lesson"}),
+                serde_json::json!({"id": experience_id}),
                 ctx_in(dir.path()),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
         assert!(out.is_error, "{}", out.content);
-        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert_eq!(active_ids(&service).len(), 1);
     }
 
     /// The body slice inside a rendered read, between the id header and the
@@ -1552,13 +1611,9 @@ mod tests {
     #[tokio::test]
     async fn a_long_read_is_bounded_and_continued_by_offset() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
-        let store = MemoryStore::open(&mem).unwrap();
+        let (service, root) = fixture(dir.path());
         let body = format!("开头{}结尾", "中".repeat(1_500));
-        let entry = leveler_memory::new_entry("长记录", &body, vec![]);
-        let id = entry.id.clone();
-        store.remember(entry).unwrap();
+        let id = seed_user(&service, "长记录", &body, "note", None);
         let tool = MemoryTool::new(root);
         let ctx = ctx_in(dir.path());
 
@@ -1606,12 +1661,8 @@ mod tests {
     #[tokio::test]
     async fn read_budget_is_per_turn_and_exhaustion_is_explicit() {
         let dir = tempdir().unwrap();
-        let mem = dir.path().join("memory");
-        let root = MemoryRoot::new(Some(mem.clone()));
-        let store = MemoryStore::open(&mem).unwrap();
-        let entry = leveler_memory::new_entry("小记录", "很短的内容", vec![]);
-        let id = entry.id.clone();
-        store.remember(entry).unwrap();
+        let (service, root) = fixture(dir.path());
+        let id = seed_user(&service, "小记录", "很短的内容", "note", None);
         let tool = MemoryTool::new(root);
 
         for _ in 0..READ_CALLS_PER_TURN {

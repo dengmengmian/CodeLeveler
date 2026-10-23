@@ -40,12 +40,7 @@ fn runtime() -> Actor {
     }
 }
 
-fn fact(
-    scope: MemoryScope,
-    subject_key: Option<&str>,
-    value: &str,
-    body: &str,
-) -> WriteIntent {
+fn fact(scope: MemoryScope, subject_key: Option<&str>, value: &str, body: &str) -> WriteIntent {
     WriteIntent {
         op_id: op(),
         kind: MemoryKind::UserFact,
@@ -68,8 +63,9 @@ fn fact(
 
 fn apply(admission: Admission) -> (MemoryId, u64) {
     match admission {
-        Admission::Applied { id, revision, .. }
-        | Admission::Replayed { id, revision, .. } => (id, revision),
+        Admission::Applied { id, revision, .. } | Admission::Replayed { id, revision, .. } => {
+            (id, revision)
+        }
         other => panic!("expected an applied admission, got {other:?}"),
     }
 }
@@ -94,7 +90,12 @@ fn a_user_command_writes_user_explicit_authority() {
         service
             .admit(
                 &user(),
-                fact(MemoryScope::Project, Some("billing_model"), "subscription", "Billing is subscription."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "subscription",
+                    "Billing is subscription.",
+                ),
             )
             .unwrap(),
     );
@@ -131,7 +132,12 @@ fn a_model_write_cannot_promote_itself_by_claiming_authority() {
 fn a_model_cannot_forge_user_provenance() {
     let fixture = Fixture::new(MemoryScope::Project);
     let service = service(&fixture);
-    let mut intent = fact(MemoryScope::Project, Some("billing_model"), "usage", "Billing.");
+    let mut intent = fact(
+        MemoryScope::Project,
+        Some("billing_model"),
+        "usage",
+        "Billing.",
+    );
     let mut forged = source_ref();
     forged.kind = SourceRefKind::UserCommand;
     intent.evidence = vec![forged];
@@ -144,7 +150,12 @@ fn a_model_cannot_forge_user_provenance() {
 fn a_model_cannot_claim_a_user_turn_span() {
     let fixture = Fixture::new(MemoryScope::Project);
     let service = service(&fixture);
-    let mut intent = fact(MemoryScope::Project, Some("billing_model"), "usage", "Billing.");
+    let mut intent = fact(
+        MemoryScope::Project,
+        Some("billing_model"),
+        "usage",
+        "Billing.",
+    );
     intent.evidence = vec![source_ref()];
     let error = service.admit(&model(), intent).unwrap_err();
     assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
@@ -158,7 +169,12 @@ fn a_model_fact_outside_project_scope_waits_for_a_person() {
         service
             .admit(
                 &model(),
-                fact(MemoryScope::Global, Some("editor"), "vim", "The editor is vim."),
+                fact(
+                    MemoryScope::Global,
+                    Some("editor"),
+                    "vim",
+                    "The editor is vim.",
+                ),
             )
             .unwrap(),
     );
@@ -175,7 +191,12 @@ fn a_model_cannot_replace_a_protected_user_fact() {
         service
             .admit(
                 &user(),
-                fact(MemoryScope::Project, Some("billing_model"), "subscription", "Billing is subscription."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "subscription",
+                    "Billing is subscription.",
+                ),
             )
             .unwrap(),
     );
@@ -183,14 +204,22 @@ fn a_model_cannot_replace_a_protected_user_fact() {
         service
             .admit(
                 &model(),
-                fact(MemoryScope::Project, Some("billing_model"), "usage", "Billing is usage based."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "usage",
+                    "Billing is usage based.",
+                ),
             )
             .unwrap(),
     );
     assert_ne!(id, id2);
     let active = service.effective_active().unwrap();
     assert_eq!(active.len(), 1);
-    assert_eq!(active[0].record.frontmatter.value.as_deref(), Some("subscription"));
+    assert_eq!(
+        active[0].record.frontmatter.value.as_deref(),
+        Some("subscription")
+    );
 }
 
 #[test]
@@ -200,7 +229,12 @@ fn a_runtime_user_fact_requires_an_exact_user_span() {
     let error = service
         .admit(
             &runtime(),
-            fact(MemoryScope::Project, Some("billing_model"), "usage", "Billing is usage."),
+            fact(
+                MemoryScope::Project,
+                Some("billing_model"),
+                "usage",
+                "Billing is usage.",
+            ),
         )
         .unwrap_err();
     assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
@@ -256,13 +290,23 @@ fn two_facts_in_one_turn_are_two_writes() {
     let first = service
         .admit(
             &actor,
-            fact(MemoryScope::Project, Some("billing_model"), "usage", "Billing is usage."),
+            fact(
+                MemoryScope::Project,
+                Some("billing_model"),
+                "usage",
+                "Billing is usage.",
+            ),
         )
         .unwrap();
     let second = service
         .admit(
             &actor,
-            fact(MemoryScope::Project, Some("deploy_target"), "fly", "Deploys go to fly."),
+            fact(
+                MemoryScope::Project,
+                Some("deploy_target"),
+                "fly",
+                "Deploys go to fly.",
+            ),
         )
         .unwrap();
     assert!(first.is_applied());
@@ -278,7 +322,12 @@ fn a_user_review_activates_pending_with_user_approved_authority() {
         service
             .admit(
                 &user(),
-                fact(MemoryScope::Project, Some("editor"), "emacs", "The editor is emacs."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "emacs",
+                    "The editor is emacs.",
+                ),
             )
             .unwrap(),
     );
@@ -286,7 +335,12 @@ fn a_user_review_activates_pending_with_user_approved_authority() {
         service
             .admit(
                 &model(),
-                fact(MemoryScope::Project, Some("editor"), "vim", "The editor is vim."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "vim",
+                    "The editor is vim.",
+                ),
             )
             .unwrap(),
     );
@@ -298,10 +352,7 @@ fn a_user_review_activates_pending_with_user_approved_authority() {
     let active = service.effective_active().unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].record.frontmatter.id, queued);
-    assert_eq!(
-        active[0].effective_authority,
-        MemoryAuthority::UserApproved
-    );
+    assert_eq!(active[0].effective_authority, MemoryAuthority::UserApproved);
 }
 
 #[test]
@@ -312,7 +363,12 @@ fn a_user_rejection_deletes_the_pending_record_and_suppresses_the_signal() {
         service
             .admit(
                 &user(),
-                fact(MemoryScope::Project, Some("editor"), "emacs", "The editor is emacs."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "emacs",
+                    "The editor is emacs.",
+                ),
             )
             .unwrap(),
     );
@@ -320,7 +376,12 @@ fn a_user_rejection_deletes_the_pending_record_and_suppresses_the_signal() {
         service
             .admit(
                 &model(),
-                fact(MemoryScope::Project, Some("editor"), "vim", "The editor is vim."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "vim",
+                    "The editor is vim.",
+                ),
             )
             .unwrap(),
     );
@@ -349,7 +410,12 @@ fn only_a_user_can_review() {
         service
             .admit(
                 &user(),
-                fact(MemoryScope::Project, Some("editor"), "emacs", "The editor is emacs."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "emacs",
+                    "The editor is emacs.",
+                ),
             )
             .unwrap(),
     );
@@ -357,7 +423,12 @@ fn only_a_user_can_review() {
         service
             .admit(
                 &model(),
-                fact(MemoryScope::Project, Some("editor"), "vim", "The editor is vim."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "vim",
+                    "The editor is vim.",
+                ),
             )
             .unwrap(),
     );
@@ -378,7 +449,12 @@ fn a_user_pin_is_user_owned_and_a_model_cannot_pin_a_user_fact() {
         service
             .admit(
                 &actor,
-                fact(MemoryScope::Project, Some("billing_model"), "subscription", "Billing is subscription."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "subscription",
+                    "Billing is subscription.",
+                ),
             )
             .unwrap(),
     );
@@ -391,11 +467,13 @@ fn a_user_pin_is_user_owned_and_a_model_cannot_pin_a_user_fact() {
 
     let cas = read(&service, &id).cas;
     let queued = pending(service.pin(&model(), op(), &id, cas).unwrap());
-    assert!(service
-        .pending(&user())
-        .unwrap()
-        .iter()
-        .any(|record| record.frontmatter.id == queued));
+    assert!(
+        service
+            .pending(&user())
+            .unwrap()
+            .iter()
+            .any(|record| record.frontmatter.id == queued)
+    );
 }
 
 #[test]
@@ -407,7 +485,12 @@ fn a_model_forget_of_a_user_fact_waits_and_a_user_forget_tombstones() {
         service
             .admit(
                 &actor,
-                fact(MemoryScope::Project, Some("billing_model"), "subscription", "Billing is subscription."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "subscription",
+                    "Billing is subscription.",
+                ),
             )
             .unwrap(),
     );
@@ -441,7 +524,12 @@ fn a_stale_cas_conflicts_instead_of_overwriting() {
         service
             .admit(
                 &actor,
-                fact(MemoryScope::Project, Some("billing_model"), "subscription", "Billing is subscription."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "subscription",
+                    "Billing is subscription.",
+                ),
             )
             .unwrap(),
     );
@@ -466,15 +554,18 @@ fn a_stale_cas_conflicts_instead_of_overwriting() {
 fn external_edits_never_become_current_truth() {
     let fixture = Fixture::new(MemoryScope::Project);
     let service = service(&fixture);
-    let key = service
-        .effective_active()
-        .unwrap();
+    let key = service.effective_active().unwrap();
     assert!(key.is_empty());
     let (id, _) = apply(
         service
             .admit(
                 &user(),
-                fact(MemoryScope::Project, Some("billing_model"), "subscription", "Billing is subscription."),
+                fact(
+                    MemoryScope::Project,
+                    Some("billing_model"),
+                    "subscription",
+                    "Billing is subscription.",
+                ),
             )
             .unwrap(),
     );
@@ -500,10 +591,7 @@ fn identity_context_is_bounded_and_user_decisions_come_first() {
         let key = format!("subject_{index}");
         let (id, _) = apply(
             service
-                .admit(
-                    &actor,
-                    fact(MemoryScope::Project, Some(&key), "v", "body"),
-                )
+                .admit(&actor, fact(MemoryScope::Project, Some(&key), "v", "body"))
                 .unwrap(),
         );
         ids.push(id);
@@ -515,9 +603,11 @@ fn identity_context_is_bounded_and_user_decisions_come_first() {
     let context: Vec<IdentityRef> = service.identity_context(100).unwrap();
     assert_eq!(context.len(), 24);
     assert_eq!(context[0].id, pinned.to_string());
-    assert!(context
-        .iter()
-        .all(|entry| entry.kind == MemoryKind::UserFact));
+    assert!(
+        context
+            .iter()
+            .all(|entry| entry.kind == MemoryKind::UserFact)
+    );
 }
 
 #[test]
@@ -533,10 +623,7 @@ fn a_replaces_target_must_be_a_real_current_record() {
     );
     intent.relation = Relation::Replaces { target: missing };
     let admission = service.admit(&user(), intent).unwrap();
-    assert!(matches!(
-        admission,
-        Admission::Rejected { .. }
-    ));
+    assert!(matches!(admission, Admission::Rejected { .. }));
 }
 
 #[test]
@@ -546,7 +633,12 @@ fn a_scope_mismatch_is_rejected() {
     let admission = service
         .admit(
             &user(),
-            fact(MemoryScope::Global, Some("editor"), "vim", "The editor is vim."),
+            fact(
+                MemoryScope::Global,
+                Some("editor"),
+                "vim",
+                "The editor is vim.",
+            ),
         )
         .unwrap();
     assert!(matches!(admission, Admission::Rejected { .. }));
@@ -629,7 +721,12 @@ fn review_accept_of_a_stale_pending_conflicts_without_overwriting() {
         service
             .admit(
                 &actor,
-                fact(MemoryScope::Project, Some("editor"), "emacs", "The editor is emacs."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "emacs",
+                    "The editor is emacs.",
+                ),
             )
             .unwrap(),
     );
@@ -637,7 +734,12 @@ fn review_accept_of_a_stale_pending_conflicts_without_overwriting() {
         service
             .admit(
                 &model(),
-                fact(MemoryScope::Project, Some("editor"), "vim", "The editor is vim."),
+                fact(
+                    MemoryScope::Project,
+                    Some("editor"),
+                    "vim",
+                    "The editor is vim.",
+                ),
             )
             .unwrap(),
     );

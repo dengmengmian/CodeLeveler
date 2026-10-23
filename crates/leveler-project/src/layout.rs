@@ -201,11 +201,6 @@ impl Layout {
         }
     }
 
-    /// Durable project memory root (`active/` + `archive/` JSON entries).
-    pub fn memory_dir(&self) -> PathBuf {
-        self.state_dir.join("memory")
-    }
-
     /// Markdown current records for project scope (`<repo>/.leveler/memory`).
     /// `None` when the layout has no workspace.
     pub fn markdown_memory_dir(&self) -> Option<PathBuf> {
@@ -493,9 +488,13 @@ mod tests {
             None,
             &env_home("/h/.leveler"),
         );
+        assert_eq!(
+            layout.markdown_memory_dir().unwrap(),
+            PathBuf::from("/repo/.leveler/memory")
+        );
         assert!(
             layout
-                .memory_dir()
+                .memory_v2_state_dir("project")
                 .starts_with("/h/.leveler/state/projects")
         );
         assert!(

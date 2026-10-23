@@ -230,22 +230,31 @@ async fn a_named_skill_is_a_procedure_not_a_contract() {
 #[tokio::test]
 async fn memory_is_advisory_and_absent_when_disabled() {
     let dir = tempfile::tempdir().unwrap();
-    let memory_root = dir.path().join("memory");
-    std::fs::create_dir_all(&memory_root).unwrap();
-    leveler_memory::MemoryStore::open(&memory_root)
-        .unwrap()
-        .activate(
-            "Style",
-            "MEMORY_ADVISORY_SENTINEL prefer short answers",
-            leveler_memory::MemoryKind::Preference,
-            Vec::new(),
+    let service = Arc::new(leveler_memory::MemoryService::new(
+        leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+            leveler_memory::v2::MemoryScope::Project,
+            dir.path().join("memory"),
+            dir.path().join("state"),
+        )),
+    ));
+    service
+        .remember(
+            &leveler_memory::v2::Actor::User {
+                invocation: leveler_memory::v2::UserInvocationId::mint("prompt-fixture"),
+            },
+            leveler_memory::RememberRequest::new(
+                leveler_memory::v2::OpId::derived("fixture", "style"),
+                leveler_memory::ServiceScope::Project,
+                "Style",
+                "MEMORY_ADVISORY_SENTINEL prefer short answers",
+                "preference",
+            ),
         )
         .unwrap();
     let enabled = Script::new(vec![answer("done")]);
     executor(dir.path(), enabled.clone())
         .with_memory_expose(true)
-        .with_memory_root(Some(memory_root.clone()))
-        .with_memory_catalog("CATALOG_SENTINEL")
+        .with_memory_service(Some(service.clone()))
         .run(
             "inspect",
             &mut |_| {},
@@ -265,6 +274,11 @@ async fn memory_is_advisory_and_absent_when_disabled() {
     let catalog = block(&request, "memory_catalog");
     assert_eq!(catalog.authority, PromptAuthority::AdvisoryContext);
     assert_eq!(catalog.source, PromptSource::MemoryCatalog);
+    assert!(
+        catalog.text.contains("Style"),
+        "the catalog lists the current title: {}",
+        catalog.text
+    );
     assert_eq!(
         block(&request, "memory_guidance").authority,
         PromptAuthority::CoreContract
@@ -273,8 +287,7 @@ async fn memory_is_advisory_and_absent_when_disabled() {
     let disabled = Script::new(vec![answer("done")]);
     executor(dir.path(), disabled.clone())
         .with_memory_expose(false)
-        .with_memory_root(Some(memory_root))
-        .with_memory_catalog("CATALOG_SENTINEL")
+        .with_memory_service(Some(service))
         .run(
             "inspect",
             &mut |_| {},

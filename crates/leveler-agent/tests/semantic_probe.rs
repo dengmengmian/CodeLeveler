@@ -26,7 +26,9 @@ use leveler_agent::{
     validate_batch_candidates,
 };
 use leveler_memory::{
-    MemoryCandidate, MemoryStore, parse_semantic_candidates, validate_semantic_candidates,
+    MemoryCandidate, MemoryRoots, MemoryService, ServiceScope, parse_semantic_candidates,
+    v2::{Actor, MemoryScope, ScopeRoots},
+    validate_semantic_candidates,
 };
 use leveler_model::{
     ModelCapabilities, ModelError, ModelEventStream, ModelLimits, ModelPricing, ModelProfile,
@@ -126,7 +128,7 @@ async fn real_model_semantic_extraction_probe() {
         ModelSemanticExtractor::new(runtime.clone(), model).with_timeout(Duration::from_secs(60));
 
     let dir = tempfile::tempdir().unwrap();
-    let store = MemoryStore::open(dir.path()).unwrap();
+    let service = probe_service(dir.path());
 
     let mut total_in = 0u64;
     let mut total_out = 0u64;
@@ -204,7 +206,7 @@ async fn real_model_semantic_extraction_probe() {
             hits += 1;
         }
         for memory in &validated.accepted {
-            let applied = commit(&store, memory);
+            let applied = commit(&service, memory);
             println!(
                 "  COMMITTED fact={:?} key={:?} -> {applied:?}",
                 memory.body, memory.semantic_key
@@ -213,17 +215,26 @@ async fn real_model_semantic_extraction_probe() {
     }
 
     println!("\n===== STORE (effective active) =====");
-    for entry in store.effective_active().unwrap() {
+    for view in service
+        .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+        .unwrap()
+    {
         println!(
             "  active key={:?} body={:?} authority={:?}",
-            entry.key,
-            entry.body,
-            entry.authority()
+            view.subject_key, view.body, view.authority
         );
     }
     println!("===== HISTORY =====");
-    for entry in store.list_archived().unwrap() {
-        println!("  archived {:?} status={:?}", entry.body, entry.status);
+    for view in service
+        .archived(
+            &Actor::External,
+            ServiceScope::Project,
+            leveler_memory::MemoryLanes::ALL,
+            None,
+        )
+        .unwrap()
+    {
+        println!("  archived {:?} status={:?}", view.body, view.status);
     }
 
     let turns = PROBE.len();
@@ -247,9 +258,24 @@ async fn real_model_semantic_extraction_probe() {
     );
 }
 
-fn commit(store: &MemoryStore, memory: &MemoryCandidate) -> String {
-    match store.commit_candidate(memory) {
-        Ok(outcome) => format!("{:?}", outcome.operation),
+fn probe_service(dir: &std::path::Path) -> MemoryService {
+    MemoryService::new(MemoryRoots::new().with_project(ScopeRoots::new(
+        MemoryScope::Project,
+        dir.join("memory"),
+        dir.join("state"),
+    )))
+}
+
+fn probe_actor() -> Actor {
+    Actor::Runtime {
+        task: leveler_core::TaskId::new("semantic-probe"),
+    }
+}
+
+fn commit(service: &MemoryService, memory: &MemoryCandidate) -> String {
+    let seed = format!("probe:{}", memory.fingerprint);
+    match service.admit_candidate(&probe_actor(), ServiceScope::Project, memory, &seed) {
+        Ok(outcome) => format!("{outcome:?}"),
         Err(error) => format!("error: {error}"),
     }
 }
@@ -331,7 +357,7 @@ async fn real_model_batch_consolidation_probe() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let store = MemoryStore::open(dir.path().join("memory")).unwrap();
+    let service = probe_service(dir.path());
     let extractor =
         ModelSemanticExtractor::new(runtime.clone(), model).with_timeout(Duration::from_secs(60));
     let turns = PROBE
@@ -357,7 +383,14 @@ async fn real_model_batch_consolidation_probe() {
             match validated.result {
                 Ok(memory) => {
                     accepted += 1;
-                    store.commit_candidate(&memory).expect("candidate commits");
+                    service
+                        .admit_candidate(
+                            &probe_actor(),
+                            ServiceScope::Project,
+                            &memory,
+                            &format!("probe-batch:{:?}", memory.semantic_key),
+                        )
+                        .expect("candidate commits");
                 }
                 Err(error) => {
                     rejected += 1;
@@ -370,8 +403,17 @@ async fn real_model_batch_consolidation_probe() {
         }
     }
 
-    let active = store.effective_active().unwrap();
-    let archived = store.list_archived().unwrap();
+    let active = service
+        .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+        .unwrap();
+    let archived = service
+        .archived(
+            &Actor::External,
+            ServiceScope::Project,
+            leveler_memory::MemoryLanes::ALL,
+            None,
+        )
+        .unwrap();
     let usages = runtime.usages.lock().unwrap().clone();
     let input_tokens: u64 = usages.iter().map(|usage| usage.input_tokens).sum();
     let output_tokens: u64 = usages.iter().map(|usage| usage.output_tokens).sum();
@@ -385,7 +427,7 @@ async fn real_model_batch_consolidation_probe() {
         cost_usd / turns.len() as f64 * 100.0,
         active
             .iter()
-            .map(|entry| (&entry.key, &entry.body))
+            .map(|view| (&view.subject_key, &view.body))
             .collect::<Vec<_>>()
     );
     assert_eq!(calls, 1);

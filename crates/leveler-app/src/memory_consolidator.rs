@@ -160,7 +160,7 @@ impl MemoryConsolidator {
         db: Database,
         boot: BootId,
         state_dir: PathBuf,
-        memory_dir: PathBuf,
+        memory: MemoryService,
         runtime: Arc<dyn ModelRuntime>,
         event_sink: MemoryEventSink,
     ) -> Arc<Self> {
@@ -168,7 +168,7 @@ impl MemoryConsolidator {
             db,
             boot,
             state_dir,
-            memory: MemoryService::legacy(memory_dir),
+            memory,
             lanes: leveler_memory::MemoryLanes::ALL,
             runtime,
             extraction_timeout: DEFAULT_EXTRACTION_TIMEOUT,
@@ -1633,8 +1633,8 @@ mod tests {
     use async_trait::async_trait;
     use leveler_agent::{BatchSemanticCandidate, ExtractionError};
     use leveler_memory::{
-        AdmitOutcome, AgentAdmitOutcome, CandidateDurability, CandidateScope, MemoryAuthority,
-        MemoryStore, OperationHint, SemanticCandidate,
+        CandidateDurability, CandidateScope, MemoryAuthority, MemoryRoots, OperationHint,
+        SemanticCandidate, ServiceError,
     };
     use leveler_model::{
         FinishReason, Message, ModelError, ModelErrorKind, ModelEventStream, ModelProfile,
@@ -1643,6 +1643,125 @@ mod tests {
     use leveler_storage::{SessionRecord, SessionRepository, TurnRepository};
 
     use super::*;
+
+    /// A test handle over the production service.
+    ///
+    /// These worker tests assert what the store ends up holding, so the handle
+    /// exposes the same read questions in the facade's terms. Nothing here
+    /// reimplements storage: every call goes through `MemoryService` over a
+    /// project-scope Markdown store.
+    struct TestMemory {
+        service: MemoryService,
+    }
+
+    impl TestMemory {
+        /// `root/memory` is the current Markdown root, `root/memory-v2` the
+        /// private state root.
+        fn open(root: &std::path::Path) -> Self {
+            Self {
+                service: MemoryService::new(MemoryRoots::new().with_project(
+                    leveler_memory::v2::ScopeRoots::new(
+                        leveler_memory::v2::MemoryScope::Project,
+                        root.join("memory"),
+                        root.join("memory-v2"),
+                    ),
+                )),
+            }
+        }
+
+        /// A store whose current root IS `current`. The private state root is
+        /// its sibling, because it may never live inside the current root.
+        fn open_at(current: &std::path::Path) -> Self {
+            let state = current
+                .parent()
+                .map(|parent| parent.join("memory-v2-state"))
+                .unwrap_or_else(|| current.join("memory-v2-state"));
+            Self {
+                service: MemoryService::new(MemoryRoots::new().with_project(
+                    leveler_memory::v2::ScopeRoots::new(
+                        leveler_memory::v2::MemoryScope::Project,
+                        current,
+                        state,
+                    ),
+                )),
+            }
+        }
+
+        fn service(&self) -> &MemoryService {
+            &self.service
+        }
+
+        fn effective_active(&self) -> Result<Vec<leveler_memory::MemoryView>, ServiceError> {
+            self.service
+                .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
+        }
+
+        fn list_pending(&self) -> Result<Vec<leveler_memory::MemoryView>, ServiceError> {
+            self.service.pending(&reviewer(), ServiceScope::Project)
+        }
+
+        fn list_archived(&self) -> Result<Vec<leveler_memory::MemoryView>, ServiceError> {
+            self.service.archived(
+                &leveler_memory::v2::Actor::External,
+                ServiceScope::Project,
+                leveler_memory::MemoryLanes::ALL,
+                None,
+            )
+        }
+
+        fn read_active(&self, id: &str) -> Result<leveler_memory::MemoryView, ServiceError> {
+            self.service.read(
+                &leveler_memory::v2::Actor::External,
+                ServiceScope::Project,
+                id,
+            )
+        }
+
+        fn counts(&self) -> Result<(usize, usize), ServiceError> {
+            Ok((self.effective_active()?.len(), self.list_archived()?.len()))
+        }
+    }
+
+    fn reviewer() -> leveler_memory::v2::Actor {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        leveler_memory::v2::Actor::User {
+            invocation: leveler_memory::v2::UserInvocationId::mint(format!(
+                "consolidator-test-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
+        }
+    }
+
+    /// The service a worker under test is constructed with, sharing the roots
+    /// `TestMemory::open(root)` reads.
+    fn worker_memory(root: &std::path::Path) -> MemoryService {
+        TestMemory::open(root).service
+    }
+
+    /// The service for a worker whose current root IS `current`.
+    fn worker_memory_at(current: &std::path::Path) -> MemoryService {
+        TestMemory::open_at(current).service
+    }
+
+    /// One explicit user fact, written through the production facade.
+    fn seed_user_fact(store: &TestMemory, title: &str, body: &str, kind: &str) -> String {
+        let mut request = leveler_memory::RememberRequest::new(
+            leveler_memory::v2::OpId::derived("seed", &format!("{title}|{body}")),
+            ServiceScope::Project,
+            title,
+            body,
+            kind,
+        );
+        request.subject = Some(title.to_string());
+        store
+            .service
+            .remember(&reviewer(), request)
+            .unwrap()
+            .applied_id()
+            .expect("the fixture fact is current")
+            .to_string()
+    }
 
     struct UnusedRuntime;
 
@@ -2064,7 +2183,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         )
@@ -2093,7 +2212,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         )
@@ -2134,7 +2253,7 @@ mod tests {
             db,
             boot,
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -2145,8 +2264,7 @@ mod tests {
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.rejected, 0);
         assert!(
-            MemoryStore::open(temp.path().join("memory"))
-                .unwrap()
+            TestMemory::open(temp.path())
                 .list_pending()
                 .unwrap()
                 .is_empty()
@@ -2176,7 +2294,7 @@ mod tests {
             db,
             boot,
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(move |event| captured.lock().unwrap().push(event)),
         );
@@ -2187,7 +2305,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.accepted, 2);
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].body, "项目默认模型是 Flash");
@@ -2219,21 +2337,30 @@ mod tests {
             .claim_batch(&boot, leveler_core::now(), 1)
             .await
             .unwrap();
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
+        // An older direct save carries no structured identity: its id is the
+        // only handle a reader has.
         let old_id = store
-            .activate(
-                "以后后台启动服务",
-                "以后后台启动服务",
-                leveler_memory::MemoryKind::Preference,
-                Vec::new(),
+            .service
+            .remember(
+                &reviewer(),
+                leveler_memory::RememberRequest::new(
+                    leveler_memory::v2::OpId::derived("seed", "keyless"),
+                    ServiceScope::Project,
+                    "以后后台启动服务",
+                    "以后后台启动服务",
+                    "preference",
+                ),
             )
             .unwrap()
-            .id;
+            .applied_id()
+            .expect("the direct save is current")
+            .to_string();
         let worker = MemoryConsolidator::new(
             db,
             boot,
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -2243,13 +2370,23 @@ mod tests {
             .await
             .unwrap();
 
-        // The direct save has no structured identity. The model's update names
-        // no active subject, so the runtime parks it instead of guessing that
-        // the prose describes the same decision.
-        assert_eq!(store.list_pending().unwrap().len(), 1);
+        // The direct save has no structured identity. The extractor's subject
+        // is a different fact, so the store keeps both: it never guesses that
+        // the prose describes the same decision, and never rewrites the
+        // keyless save.
+        assert!(store.list_pending().unwrap().is_empty());
         let active = store.effective_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].id, old_id);
+        assert_eq!(active.len(), 2, "one keyless save plus one keyed fact");
+        assert!(
+            active.iter().any(|view| view.id == old_id),
+            "the direct save is untouched: {active:?}"
+        );
+        assert!(
+            active
+                .iter()
+                .any(|view| view.subject_key.as_deref() == Some("k-service-background-start")),
+            "the extractor's own identity is stored: {active:?}"
+        );
         assert!(store.list_archived().unwrap().is_empty());
     }
 
@@ -2263,7 +2400,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         )
@@ -2293,7 +2430,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         )
@@ -2305,7 +2442,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         )
@@ -2328,7 +2465,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         )
@@ -2361,7 +2498,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime,
             Arc::new(|_| {}),
         )
@@ -2389,7 +2526,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         )
@@ -2417,7 +2554,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         )
@@ -2486,7 +2623,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2506,7 +2643,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2539,7 +2676,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2588,7 +2725,7 @@ mod tests {
             db_a,
             BootId::generate(),
             temp_a.path().to_path_buf(),
-            temp_a.path().join("memory"),
+            worker_memory(temp_a.path()),
             runtime,
             Arc::new(|_| {}),
         );
@@ -2613,7 +2750,7 @@ mod tests {
         let db = Database::connect_in_memory().await.unwrap();
         let statement = "以后本项目默认模型固定为 Pro";
         let turn_ids = admitted_messages(&db, [statement.to_string()]).await;
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         let raw = serde_json::json!({"candidates": [{
             "source_turn_id": turn_ids[0].0.clone(),
             "candidate": {
@@ -2638,7 +2775,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(move |event| captured.lock().unwrap().push(event)),
         );
@@ -2677,7 +2814,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2687,7 +2824,7 @@ mod tests {
         let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
         assert_eq!(counts.processed, 0);
         assert_eq!(counts.failed_retryable, 1);
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         assert!(store.effective_active().unwrap().is_empty());
         assert!(store.list_pending().unwrap().is_empty());
         tokio::time::sleep(Duration::from_millis(1_050)).await;
@@ -2706,7 +2843,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime,
             Arc::new(|_| {}),
         );
@@ -2746,7 +2883,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(HangingRuntime),
             Arc::new(|_| {}),
         )
@@ -2778,7 +2915,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime,
             Arc::new(|_| {}),
         );
@@ -2801,7 +2938,7 @@ mod tests {
             reopened.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2845,7 +2982,7 @@ mod tests {
             db,
             boot,
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime,
             Arc::new(|_| {}),
         );
@@ -2867,7 +3004,7 @@ mod tests {
             db.clone(),
             dead,
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -2899,7 +3036,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2907,7 +3044,7 @@ mod tests {
         second.run_once().await.unwrap();
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
 
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1, "the replay must not duplicate the fact");
         assert_eq!(active[0].body, "turn 0");
@@ -2946,7 +3083,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -2958,7 +3095,7 @@ mod tests {
             1,
             "an answer that never became durable must be asked again"
         );
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         assert_eq!(store.effective_active().unwrap().len(), 1);
         assert!(store.list_pending().unwrap().is_empty());
         let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
@@ -2984,7 +3121,7 @@ mod tests {
             db.clone(),
             dead,
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -2998,7 +3135,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -3010,7 +3147,7 @@ mod tests {
             0,
             "the staged answer is replayed, not re-asked"
         );
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].body, "turn 0");
@@ -3050,13 +3187,13 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
         worker.run_once().await.unwrap();
 
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].body, "turn 0");
@@ -3105,7 +3242,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -3121,7 +3258,7 @@ mod tests {
         let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
         assert_eq!(counts.processed, 0, "cancellation is not success");
         assert_eq!(counts.failed_retryable, 1);
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         assert!(store.effective_active().unwrap().is_empty());
         assert!(store.list_pending().unwrap().is_empty());
     }
@@ -3147,6 +3284,7 @@ mod tests {
         )
         .unwrap();
         pro.semantic_key = Some(key.clone());
+        pro.evidence = Some("默认模型：Pro".to_string());
         pro.authority = leveler_memory::MemoryAuthority::ExplicitUser;
         let mut flash = leveler_memory::MemoryCandidate::new(
             "默认模型：Flash",
@@ -3158,17 +3296,26 @@ mod tests {
         )
         .unwrap();
         flash.semantic_key = Some(key);
+        flash.evidence = Some("默认模型：Flash".to_string());
         flash.authority = leveler_memory::MemoryAuthority::ExplicitUser;
-        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let store = TestMemory::open(temp.path());
         // The cursor says candidate 0 was already applied before the crash, so
-        // the fixture commits it. Proposing instead would be a sequence the
-        // worker can never produce: a committed fact never leaves its own
-        // proposal behind.
-        store.propose(pro.clone()).unwrap();
-        assert!(matches!(
-            store.admit_candidate(pro.clone()).unwrap(),
-            AdmitOutcome::Applied(_)
-        ));
+        // the fixture applies it exactly as the worker would have.
+        let applied = store
+            .service
+            .admit_candidate(
+                &leveler_memory::v2::Actor::Runtime {
+                    task: leveler_core::TaskId::new("cursor-fixture"),
+                },
+                ServiceScope::Project,
+                &pro,
+                "cursor-fixture:0",
+            )
+            .unwrap();
+        assert!(
+            matches!(applied, leveler_memory::WriteOutcome::Applied { .. }),
+            "the pre-crash fact must be current: {applied:?}"
+        );
         let staged = StagedTurnResult {
             accepted: vec![pro, flash],
             rejected: 0,
@@ -3196,7 +3343,7 @@ mod tests {
             db,
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             runtime.clone(),
             Arc::new(|_| {}),
         );
@@ -3308,7 +3455,7 @@ mod tests {
             db.clone(),
             BootId::generate(),
             temp.path().to_path_buf(),
-            temp.path().join("memory"),
+            worker_memory(temp.path()),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -3333,7 +3480,7 @@ mod tests {
     #[test]
     fn duplicate_evidence_is_recognised_only_while_its_lesson_is_active() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::open(dir.path()).unwrap();
+        let store = TestMemory::open(dir.path());
         let tag = "evidence:0123456789abcdef";
         let mut candidate = MemoryCandidate::new(
             "engine profile lesson",
@@ -3361,13 +3508,23 @@ mod tests {
                 },
             ],
         });
-        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        let outcome = store
+            .service
+            .admit_candidate(
+                &leveler_memory::v2::Actor::Runtime {
+                    task: leveler_core::TaskId::new("experience-fixture"),
+                },
+                ServiceScope::Project,
+                &candidate,
+                "experience-fixture",
+            )
+            .unwrap();
         assert!(
-            matches!(outcome, AgentAdmitOutcome::Applied(_)),
+            matches!(outcome, leveler_memory::WriteOutcome::Applied { .. }),
             "fixture lesson was not activated: {outcome:?}"
         );
 
-        let service = MemoryService::legacy(dir.path());
+        let service = TestMemory::open(dir.path()).service;
         assert!(experience_evidence_learned(&service, tag).unwrap());
         assert!(!experience_evidence_learned(&service, "evidence:ffffffffffffffff").unwrap());
     }
@@ -3376,8 +3533,8 @@ mod tests {
     ///
     /// Returns the active entry id: a keyed candidate is stored under the
     /// slug of its key, not under the pending candidate id.
-    fn seed_active_identity(store: &MemoryStore, key: &str) -> String {
-        let candidate = MemoryCandidate::new(
+    fn seed_active_identity(store: &TestMemory, key: &str) -> String {
+        let mut candidate = MemoryCandidate::new(
             format!("{key} is Pro"),
             format!("{key} must stay Pro"),
             leveler_memory::CandidateKind::Free,
@@ -3386,22 +3543,36 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let pending_id = candidate.id.clone();
-        store.propose(candidate).unwrap();
-        store.accept(&pending_id).unwrap().id
+        candidate.semantic_key = Some(key.to_string());
+        candidate.evidence = Some(format!("{key} must stay Pro"));
+        store
+            .service
+            .admit_candidate(
+                &leveler_memory::v2::Actor::Runtime {
+                    task: leveler_core::TaskId::new("seed-identity"),
+                },
+                ServiceScope::Project,
+                &candidate,
+                &format!("seed:{key}"),
+            )
+            .unwrap()
+            .applied_id()
+            .expect("the seeded identity is current")
+            .to_string()
     }
 
     #[tokio::test]
     async fn a_replacement_outside_the_identity_window_is_verified_against_the_store() {
         let temp = tempfile::tempdir().unwrap();
         let memory_dir = temp.path().join("memory");
-        let store = MemoryStore::open(&memory_dir).unwrap();
+        let store = TestMemory::open_at(&memory_dir);
         let seeded = (0..30)
             .map(|index| seed_active_identity(&store, &format!("project.setting.{index}")))
             .collect::<Vec<_>>();
         // The extractor context is bounded at 24, so at least one real identity
         // in this store is deliberately not offered to the model.
-        let offered = MemoryService::legacy(memory_dir.as_path())
+        let offered = TestMemory::open_at(&memory_dir)
+            .service
             .identity_context(
                 ServiceScope::Project,
                 leveler_memory::v2::IDENTITY_CONTEXT_LIMIT,
@@ -3415,7 +3586,7 @@ mod tests {
             .find(|id| !offered.contains(*id))
             .expect("30 identities exceed the 24-entry context")
             .clone();
-        let probe = MemoryService::legacy(memory_dir.as_path()).read(
+        let probe = TestMemory::open_at(&memory_dir).service.read(
             &leveler_memory::v2::Actor::External,
             ServiceScope::Project,
             &target,
@@ -3438,7 +3609,7 @@ mod tests {
             db,
             boot,
             temp.path().to_path_buf(),
-            memory_dir,
+            worker_memory_at(&memory_dir),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -3468,7 +3639,7 @@ mod tests {
     async fn a_guessed_replacement_target_is_rejected_before_the_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         let memory_dir = temp.path().join("memory");
-        let store = MemoryStore::open(&memory_dir).unwrap();
+        let store = TestMemory::open_at(&memory_dir);
         seed_active_identity(&store, "project.setting.0");
 
         let db = Database::connect_in_memory().await.unwrap();
@@ -3482,7 +3653,7 @@ mod tests {
             db,
             boot,
             temp.path().to_path_buf(),
-            memory_dir,
+            worker_memory_at(&memory_dir),
             Arc::new(UnusedRuntime),
             Arc::new(|_| {}),
         );
@@ -3500,7 +3671,7 @@ mod tests {
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.rejected, 1);
         assert_eq!(
-            store.list_active().unwrap().len(),
+            store.effective_active().unwrap().len(),
             1,
             "a guessed target must not change the store"
         );

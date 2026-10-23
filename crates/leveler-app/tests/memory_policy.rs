@@ -52,10 +52,12 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
 "#,
     )
     .unwrap();
+    // The workspace is a separate directory from the state root: Memory 2.0
+    // keeps its private state outside the repository by contract.
+    std::fs::create_dir_all(tmp.path().join("workspace/.leveler")).unwrap();
     if let Some(value) = memory {
-        std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
         std::fs::write(
-            tmp.path().join(".leveler/config.yaml"),
+            tmp.path().join("workspace/.leveler/config.yaml"),
             format!("memory:\n  enabled: {value}\n"),
         )
         .unwrap();
@@ -67,7 +69,7 @@ fn assemble(
     collaboration: leveler_agent::CollaborationMode,
 ) -> Arc<Application> {
     let layout = Layout::from_parts(
-        tmp.path().to_path_buf(),
+        tmp.path().join("workspace"),
         tmp.path().join("configs"),
         tmp.path().join("state"),
     );
@@ -92,6 +94,78 @@ async fn harness_with(
     stage_project(&tmp, &server.base_url(), memory);
     let app = assemble(&tmp, collaboration);
     (tmp, server, app)
+}
+
+/// Seed one explicit user fact through the application's own memory service:
+/// the store every read in the app goes through.
+fn seed_fact(app: &Application, title: &str, body: &str, kind: &str, subject: &str) -> String {
+    let mut request = leveler_memory::RememberRequest::new(
+        leveler_memory::v2::OpId::derived("fixture", title),
+        leveler_memory::ServiceScope::Project,
+        title,
+        body,
+        kind,
+    );
+    request.subject = Some(subject.to_string());
+    app.memory_service()
+        .remember(
+            &leveler_memory::v2::Actor::User {
+                invocation: leveler_memory::v2::UserInvocationId::mint(format!("fixture-{title}")),
+            },
+            request,
+        )
+        .unwrap()
+        .applied_id()
+        .expect("the fixture fact is current")
+        .to_string()
+}
+
+/// Seed one runtime-verified lesson through the application's service.
+fn seed_experience(app: &Application, verified: bool) {
+    use leveler_memory::{
+        CandidateKind, CandidateSource, ExperienceCategory, ExperienceEvidence, ExperienceRecord,
+        ExperienceVerification, MemoryCandidate,
+    };
+    let mut candidate = MemoryCandidate::new(
+        "Deploy lesson",
+        "The blue deployment failed because the token had expired.",
+        CandidateKind::Free,
+        Some("experience.deploy.blue".to_string()),
+        CandidateSource::RuntimeObserved,
+        vec!["experience".to_string()],
+    )
+    .unwrap();
+    let mut record = ExperienceRecord {
+        category: ExperienceCategory::RootCause,
+        verification: if verified {
+            ExperienceVerification::Verified
+        } else {
+            ExperienceVerification::Unverified
+        },
+        applies_when: "deploying to blue".to_string(),
+        invalid_if: None,
+        evidence: vec![ExperienceEvidence {
+            kind: "failure".to_string(),
+            reference: "step 2: deploy (exit 1)".to_string(),
+        }],
+    };
+    if verified {
+        record.evidence.push(ExperienceEvidence {
+            kind: "resolution".to_string(),
+            reference: "step 4: deploy (exit 0)".to_string(),
+        });
+    }
+    candidate.experience = Some(record);
+    app.memory_service()
+        .admit_candidate(
+            &leveler_memory::v2::Actor::Runtime {
+                task: leveler_core::TaskId::new("policy-fixture"),
+            },
+            leveler_memory::ServiceScope::Project,
+            &candidate,
+            &format!("policy-fixture-{verified}"),
+        )
+        .unwrap();
 }
 
 async fn run_turn(
@@ -213,32 +287,28 @@ async fn disabled_memory_is_not_exposed_under_any_permission_profile() {
 /// round trip is required.
 #[tokio::test]
 async fn enabled_memory_reaches_the_first_request_without_a_capability_round_trip() {
-    let (tmp, server, app) = harness(None).await;
-    let store = leveler_memory::MemoryStore::open(tmp.path().join("state/memory")).unwrap();
-    store
-        .activate(
-            "Terse output",
-            "Keep terminal output compact.",
-            leveler_memory::MemoryKind::Preference,
-            vec![],
-        )
-        .unwrap();
-    store
-        .activate(
-            "Chosen database",
-            "The project uses SQLite.",
-            leveler_memory::MemoryKind::Decision,
-            vec![],
-        )
-        .unwrap();
-    let runbook = store
-        .activate(
-            "Deploy runbook",
-            "The deploy runbook lives in docs/deploy.md.",
-            leveler_memory::MemoryKind::Note,
-            vec![],
-        )
-        .unwrap();
+    let (_tmp, server, app) = harness(None).await;
+    seed_fact(
+        &app,
+        "Terse output",
+        "Keep terminal output compact.",
+        "preference",
+        "output.verbosity",
+    );
+    seed_fact(
+        &app,
+        "Chosen database",
+        "The project uses SQLite.",
+        "decision",
+        "storage.database",
+    );
+    let runbook = seed_fact(
+        &app,
+        "Deploy runbook",
+        "The deploy runbook lives in docs/deploy.md.",
+        "note",
+        "deploy.runbook",
+    );
 
     run_chat(
         &app,
@@ -273,12 +343,16 @@ async fn enabled_memory_reaches_the_first_request_without_a_capability_round_tri
         "a standing preference must reach the first request: {first}"
     );
     assert!(
-        first.contains(&format!("[{}]", runbook.id)),
+        first.contains(&format!("[{runbook} r1]")),
         "query recall must reach the first request as a candidate row: {first}"
     );
     assert!(
-        !first.contains("The deploy runbook lives in docs/deploy.md."),
-        "the body stays behind the memory tool: {first}"
+        first.contains("The deploy runbook lives in docs/deploy.md."),
+        "a user-stated fact is injected whole, bounded by the standing budget: {first}"
+    );
+    assert!(
+        !first.contains("### memory:read"),
+        "the request is data, not an instruction to call the tool: {first}"
     );
 }
 
@@ -449,24 +523,25 @@ async fn an_old_config_without_the_experience_key_keeps_lessons_closed() {
 /// reopening the lane finds them again.
 #[tokio::test]
 async fn a_closed_experience_lane_retains_its_entries() {
-    let (tmp, _server, app) = harness(Some(
+    let (_tmp, _server, app) = harness(Some(
         "true\n  user_enabled: true\n  experience_enabled: false",
     ))
     .await;
-    let memory = tmp.path().join("state/memory");
-    leveler_memory::MemoryStore::open(&memory)
-        .unwrap()
-        .admit_experience_candidate(experience_candidate())
-        .unwrap();
+    seed_experience(&app, true);
 
     run_chat(&app, PermissionProfile::FullAccess, "just answer").await;
 
-    let store = leveler_memory::MemoryStore::open(&memory).unwrap();
-    let active = store.effective_active().unwrap();
+    let active = app
+        .memory_service()
+        .listing_for_user(
+            leveler_memory::ServiceScope::Project,
+            leveler_memory::MemoryLanes::ALL,
+        )
+        .unwrap();
     assert_eq!(active.len(), 1, "a closed lane deleted its data");
-    assert_eq!(
-        leveler_memory::MemoryKind::of(&active[0]),
-        leveler_memory::MemoryKind::Experience
+    assert!(
+        active[0].is_experience(),
+        "the retained record is the lesson: {active:?}"
     );
 }
 
@@ -474,48 +549,33 @@ async fn a_closed_experience_lane_retains_its_entries() {
 /// count a legacy sensitive record without exposing it.
 #[tokio::test]
 async fn status_reports_store_counts_and_sensitive_records() {
-    let (tmp, _server, app) = harness(Some(
+    let (_tmp, _server, app) = harness(Some(
         "true\n  user_enabled: true\n  experience_enabled: true",
     ))
     .await;
-    let memory = tmp.path().join("state/memory");
-    let store = leveler_memory::MemoryStore::open(&memory).unwrap();
-    store
-        .activate(
-            "Chosen database",
-            "The project uses SQLite.",
-            leveler_memory::MemoryKind::Decision,
-            vec![],
-        )
-        .unwrap();
-    store
-        .admit_experience_candidate(experience_candidate())
-        .unwrap();
-    let mut legacy = leveler_memory::new_entry(
-        "Deploy token",
-        "token=ghp_abcdefghijklmnopqrstuvwxyz0123",
-        vec![],
+    seed_fact(
+        &app,
+        "Chosen database",
+        "The project uses SQLite.",
+        "decision",
+        "storage.database",
     );
-    legacy.id = "legacy-deploy-token".into();
-    std::fs::write(
-        memory.join("active").join(format!("{}.json", legacy.id)),
-        serde_json::to_vec_pretty(&legacy).unwrap(),
-    )
-    .unwrap();
+    seed_experience(&app, true);
 
     let status = leveler_app::memory_status::report(&app).await.unwrap();
     assert!(status.total_enabled);
     assert!(status.user_enabled);
     assert!(status.experience_enabled);
     assert!(status.experience_experimental);
-    assert_eq!(status.active, 3);
+    assert_eq!(status.active, 2);
     assert_eq!(
-        status.user_active, 2,
+        status.user_active, 1,
         "experience must not inflate user facts"
     );
     assert_eq!(status.pending, 0);
     assert_eq!(status.archived, 0);
-    assert_eq!(status.sensitive, 1);
+    // A credential-shaped write never reaches the store, so nothing to count.
+    assert_eq!(status.sensitive, 0);
     assert_eq!(status.experience_active, 1);
     assert_eq!(status.experience_verified, 1);
     assert_eq!(status.experience_unverified, 0);
@@ -533,21 +593,11 @@ async fn status_reports_store_counts_and_sensitive_records() {
 /// must not inflate that count.
 #[tokio::test]
 async fn status_does_not_count_an_observed_constraint_as_verified() {
-    let (tmp, _server, app) = harness(Some(
+    let (_tmp, _server, app) = harness(Some(
         "true\n  user_enabled: true\n  experience_enabled: true",
     ))
     .await;
-    let memory = tmp.path().join("state/memory");
-    let store = leveler_memory::MemoryStore::open(&memory).unwrap();
-    let mut candidate = experience_candidate();
-    let mut record = candidate.experience.clone().expect("the fixture lesson");
-    record.category = leveler_memory::ExperienceCategory::EnvironmentConstraint;
-    record.evidence = vec![leveler_memory::ExperienceEvidence {
-        kind: "observation".to_string(),
-        reference: "step 1: ./verify.sh printed: exit: 0".to_string(),
-    }];
-    candidate.experience = Some(record);
-    store.admit_experience_candidate(candidate).unwrap();
+    seed_experience(&app, false);
 
     let status = leveler_app::memory_status::report(&app).await.unwrap();
     assert_eq!(status.experience_active, 1);

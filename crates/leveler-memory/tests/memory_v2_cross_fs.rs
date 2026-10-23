@@ -81,11 +81,11 @@ fn exercise(store: &MarkdownStore) {
     assert!(!store.paths().current_file(&other).exists());
 
     let outcome = store.forget(op(), user(), &id, second).unwrap();
-    assert!(matches!(outcome, ForgetOutcome::Forgotten(_)), "{outcome:?}");
-    assert!(matches!(
-        store.read(&id),
-        Err(StoreError::Forgotten(_))
-    ));
+    assert!(
+        matches!(outcome, ForgetOutcome::Forgotten(_)),
+        "{outcome:?}"
+    );
+    assert!(matches!(store.read(&id), Err(StoreError::Forgotten(_))));
 }
 
 #[cfg(target_os = "macos")]
@@ -98,7 +98,8 @@ fn current_on_a_different_device_from_state_supports_the_lifecycle() {
     let state_dir = tempfile::tempdir().unwrap();
     let current = volume.path().join("memory");
     let state = state_dir.path().join("state");
-    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
+    let store =
+        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
     assert_ne!(
         device(&store.paths().current_root),
         device(&store.paths().state_root),
@@ -107,7 +108,8 @@ fn current_on_a_different_device_from_state_supports_the_lifecycle() {
     exercise(&store);
     drop(store);
 
-    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
+    let store =
+        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
     assert_eq!(store.effective_active().unwrap().len(), 1);
     let report = store.recover().unwrap();
     assert!(!report.is_blocked(), "{report:?}");
@@ -123,7 +125,8 @@ fn state_on_a_different_device_from_current_supports_the_lifecycle() {
     let current_dir = tempfile::tempdir().unwrap();
     let current = current_dir.path().join("memory");
     let state = volume.path().join("state");
-    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
+    let store =
+        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
     assert_ne!(
         device(&store.paths().current_root),
         device(&store.paths().state_root),
@@ -132,7 +135,8 @@ fn state_on_a_different_device_from_current_supports_the_lifecycle() {
     exercise(&store);
     drop(store);
 
-    let store = MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
+    let store =
+        MarkdownStore::open(ScopeRoots::new(MemoryScope::Project, &current, &state)).unwrap();
     let active = store.effective_active().unwrap();
     assert_eq!(active.len(), 1);
     assert!(store.read(&active[0].record.frontmatter.id).is_ok());

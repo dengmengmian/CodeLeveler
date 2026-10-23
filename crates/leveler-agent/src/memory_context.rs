@@ -376,7 +376,6 @@ impl MemoryContextBuilder {
                         MemoryLanes::USER_ONLY,
                         query,
                         USER_RECALL_PER_SCOPE,
-                        false,
                     ) {
                         Ok(hits) => user_hits.extend(
                             hits.into_iter()
@@ -392,7 +391,6 @@ impl MemoryContextBuilder {
                         MemoryLanes::EXPERIENCE_ONLY,
                         query,
                         EXPERIENCE_RECALL_PER_SCOPE,
-                        false,
                     ) {
                         Ok(hits) => experience_hits.extend(
                             hits.into_iter()

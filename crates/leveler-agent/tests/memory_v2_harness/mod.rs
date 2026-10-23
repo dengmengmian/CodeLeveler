@@ -88,7 +88,7 @@ impl Fixture {
     }
 
     pub fn roots(&self) -> MemoryRoots {
-        MemoryRoots::markdown()
+        MemoryRoots::new()
             .with_project(self.project_roots())
             .with_global(self.global_roots())
             .with_local(self.local_roots())

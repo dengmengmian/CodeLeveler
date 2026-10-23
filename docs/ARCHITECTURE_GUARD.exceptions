@@ -66,22 +66,6 @@ reason = bounded selection of a failure line from tool output; standing comes fr
 owner = experience-evidence
 test = the_same_failure_signature_is_one_identity_even_with_different_subjects
 ---
-file = crates/leveler-memory/src/audit.rs
-symbol = is_canonical_key
-construct = text-predicate
-hits = 1
-reason = normalized key protocol: durable keys are `k-` plus slug or hash; this is spelling, not meaning
-owner = memory-lifecycle
-test = stale_residue_is_reported_without_being_repaired
----
-file = crates/leveler-memory/src/candidates.rs
-symbol = is_high_risk_memory
-construct = table
-hits = 1
-reason = security policy: destructive-scope wording forces person confirmation; it is conservative and never grants authority
-owner = memory-security
-test = a_destructive_permission_claim_waits_for_confirmation
----
 file = crates/leveler-memory/src/candidates.rs
 symbol = looks_like_secret
 construct = table
@@ -105,22 +89,6 @@ hits = 4
 reason = secret protection: well-known token prefixes with a minimum payload length
 owner = memory-security
 test = common_credential_forms_are_sensitive
----
-file = crates/leveler-memory/src/lifecycle.rs
-symbol = agent_candidate
-construct = text-predicate
-hits = 2
-reason = tag protocol: the runtime owns the `kind:` and `subject:` tags and strips a model-supplied copy
-owner = memory-lifecycle
-test = agent_candidate_owns_its_structured_tags
----
-file = crates/leveler-memory/src/lifecycle.rs
-symbol = decide
-construct = text-set
-hits = 2
-reason = exact line-set containment under one declared identity; no fuzzy similarity and no identity is inferred from it
-owner = memory-lifecycle
-test = a_strict_superset_merges_instead_of_duplicating
 ---
 file = crates/leveler-memory/src/v2/path.rs
 symbol = list_markdown
@@ -146,10 +114,10 @@ reason = atomic-write protocol: `.tmp-` names are this store's own partial write
 owner = memory-lifecycle
 test = stray_atomic_write_temporaries_are_cleaned
 ---
-file = crates/leveler-memory/src/lifecycle.rs
+file = crates/leveler-memory/src/candidates.rs
 symbol = is_canonical_key
 construct = text-predicate
 hits = 1
 reason = normalized key protocol: a stored identity is `k-` plus slug or hash; recognizing the namespace is byte structure, not meaning, and keeps the extractor's second pass idempotent
 owner = memory-lifecycle
-test = semantic_keys_are_idempotent
+test = a_canonical_key_is_its_own_identity

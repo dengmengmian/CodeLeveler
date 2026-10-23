@@ -1,21 +1,23 @@
 # CodeLeveler Memory 2.0 实施计划
 
-状态：Stage 3.1（Store 生命周期性能修复、`/memory` 管理页、召回引用可见性）已于 2026-10-23 实现，见 §3.1；真实 Catalog / Prefix / Lane 关闭 Dogfood 见 §3.1.7。Stage 1 已实现并完成 Phase C 验证；Stage 2（统一 Memory Service、运行时接线、多 scope Pending review）已于 2026-10-23 落地，Stage 2.1 正确性收口随本轮实现。Stage 3（FTS5 derived index、Memory Context Builder、Logged Injection）已于 2026-10-23 实现，验证结果见该轮交付报告。Stage 4 未开始。本文给出 Stage 1–4 的代码范围、依赖、测试/Dogfood、停止条件、完成标准、回滚，以及决策表和 10 个问题的结论。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11（设计结论见 §7）。
+状态：**Stage 4 已完成（2026-10-23）**。Markdown Memory 2.0 是 CodeLeveler 唯一的 Memory 实现：唯一事实来源是 Markdown + YAML frontmatter，唯一业务入口是 `MemoryService`，SQLite FTS5 只是可重建的派生索引，`MemoryContextBuilder` 是唯一召回与注入 owner，注入有 receipt。Legacy JSON backend、双 backend 配置、迁移工具与 Shadow Compare 均已删除，旧 JSON 数据按用户决策精确清理（见 §4 与 `docs/MEMORY_2_MIGRATION.md`）。
+
+本文保留 Stage 1–3 的实施记录（它们是当前代码的来源），Stage 2 段落中出现的 `memory.backend`、legacy 只读等临时过渡说法已按最终状态改写；不再有可选 backend。Stage 1 的实际测试与验证结果见 §1.5，Stage 2.1 的改动与未验证项见 §2.11，Stage 4 的删除范围、purge 工具与回归见 §4。
 
 前置文档：
 
 - `docs/MEMORY_2_DESIGN.md`：架构、schema、service、tool、context、index、安全。
-- `docs/MEMORY_2_MIGRATION.md`：盘点、备份、映射、校验、cutover、回滚。
+- `docs/MEMORY_2_MIGRATION.md`：旧数据处置的最终决策、删除边界、执行结果与回归证据（迁移已取消）。
 
 ---
 
 ## 0. 实施总原则
 
 1. **先测试后实现**：每个行为变化先写可失败的测试；失败原因必须是目标行为缺失，不是编译/fixture/环境错误。
-2. **v2 与 legacy 隔离**：Stage 1 只在 `leveler-memory::v2` 增加新模块，不改旧 store 行为；Stage 2 起通过配置选择 backend，默认仍是 legacy，直到 Stage 4 cutover 由用户批准。
-3. **不一次性改完所有 memory 模块**：Stage 1 只做 store/schema/journal/lifecycle；Stage 2 才接 service/tool/auto；Stage 3 才接 index/context/event；Stage 4 才迁移。
+2. **分阶段接线，最终只有一个实现**：Stage 1 只在 `leveler-memory::v2` 增加 store；Stage 2 接 service/tool/auto；Stage 3 接 index/context/event；Stage 4 删除 legacy，Markdown 成为唯一实现。过渡期的 backend 选择已随 Stage 4 删除。
+3. **每个阶段独立停止**：某一阶段验收不通过就停在该阶段，不靠下一阶段“顺便修”。
 4. **不新增语义判断**：不加同义词/停用词/主题词表/文本相似度/LLM Judge；FTS5 只做词法召回；身份只由结构化 `subject_key` 决定。
-5. **不双写**：legacy 与 v2 不同时接受写；迁移期 legacy 只读。
+5. **不双写**：任何阶段都不存在两套 Memory 同时接受写入的路径。
 6. **每个阶段可停止**：阶段验收不通过就停，不靠下一阶段“顺便修”。
 7. **不复用未跟踪 WIP 的所有权**：`crates/leveler-memory/tests/e3_lifecycle.rs` 是并行 WIP，不修改；Stage 1/2 在自己的测试文件里移植等价契约。
 
@@ -253,7 +255,7 @@ E3 11 个契约的分层标注：
 - `MemoryService`：actor、intent、authority 推导、admission、CAS、pending review、read/list/recall。
 - 模型工具 `remember`/`forget`/`memory` 全部走 service；TUI/CLI/Web 写命令也走 service。
 - 自动用户事实/experience 通过 service 写入；修复 `known_identities` 生产接线。
-- 配置 `memory.backend=legacy|markdown`，默认 legacy；Markdown 只用于测试/dogfood，不切换真实用户。
+- （过渡实现，已在 Stage 4 删除）当时用 `memory.backend` 在测试/dogfood 中选择 Markdown；真实用户默认仍是 legacy。
 - 保留 `experience_enabled=false` 默认值。
 
 ### 2.2 代码范围
@@ -271,15 +273,15 @@ E3 11 个契约的分层标注：
 | `crates/leveler-agent/src/memory_extract.rs` | 支持传入 `known_identities`；生产调用走 context |
 | `crates/leveler-app/src/memory_consolidator.rs` | `admit_*` 改为 `MemoryService::admit`；构造 identity context；experience 走 service |
 | `crates/leveler-app/src/interactive.rs` | 直接命令、accept/reject、remember/forget 走 service；不直接 open store |
-| `crates/leveler-app/src/lib.rs` | 按 `memory.backend` 构造 legacy 或 v2 service；默认 legacy |
-| `crates/leveler-agent/src/executor.rs` | `maintain_memory`/direct command 走 service；Stage 2 不改召回（legacy backend 保持现状，markdown backend 的 search 明确不可用） |
-| `crates/leveler-cli/src/memory_cmds.rs` | 写命令走 service；读命令兼容两种 backend |
-| `crates/leveler-project/src/config.rs` | `MemoryConfig` 增加 `backend`（默认 `Legacy`）；不改 `enabled/user_enabled/experience_enabled` 默认 |
+| `crates/leveler-app/src/lib.rs` | 构造 v2 service（Stage 2 过渡期按 `memory.backend`；Stage 4 后只有 Markdown） |
+| `crates/leveler-agent/src/executor.rs` | `maintain_memory`/direct command 走 service；召回在 Stage 3 交给 Context Builder |
+| `crates/leveler-cli/src/memory_cmds.rs` | 写命令走 service；读命令走同一 service |
+| `crates/leveler-project/src/config.rs` | 不改 `enabled/user_enabled/experience_enabled` 默认（Stage 2 曾加 `backend`，Stage 4 删除） |
 | `crates/leveler-client-protocol` | 若 pending/tool 结果需要新字段，做向后兼容的可选字段；不改写协议语义 |
 
 不做：
 
-- 不实现 FTS5/召回。markdown backend 下 `memory.search`/`vector_search` 在 Stage 2 明确返回 `not_available_until_stage_3`（不静默返回空结果，不假装成功）；list/read 正常。legacy backend 保持现状。Stage 3 用唯一 `MemoryService::recall` 替换，不保留临时 BM25。
+- 不实现 FTS5/召回。Stage 2 的 Markdown 路径当时对 search 明确返回 `not_available_until_stage_3`（不静默返回空结果）；Stage 3 用唯一 `MemoryService::search` + Context Builder 替换，未保留临时 BM25。
 - 不改 event `MemoryRecalled` 持久化（Stage 3）。
 - 不改 UI 布局，只改数据来源。
 - 不迁移真实数据。
@@ -320,7 +322,7 @@ pub enum Actor {
   - accept：重新校验 pending digest 与 proposal 的 `expected_revision`/`expected_digest`，按 operation 走完整提交协议；`user_approved`；CAS 失败 → conflict，不覆盖。
   - reject：删除 pending，写完整 intent digest 到 `<state_root>/suppressed.jsonl`；不写正文。
 - TUI/CLI/Web 的 accept/reject 由可信用户路径 mint `Actor::User`，全部走 service；不再直接操作 `pending/` 目录。
-- 旧 pending 不自动 active；legacy backend 下保持旧行为，v2 backend 下按新契约。
+- 旧 pending 不自动 active；Stage 4 后不存在第二套 backend，pending 语义只有一套。
 - 外部放入 current 的 `status=pending` 文件不是合法 pending，按 `ExternalUnverified` 处理。
 
 ### 2.6 自动提取
@@ -338,14 +340,13 @@ pub enum Actor {
 | 测试文件 | 覆盖 |
 | --- | --- |
 | `tests/memory_v2_service.rs` | actor 矩阵、authority 推导、CAS、显式 OpId 幂等/重放/复用冲突、pending accept/reject、pin、forget、scope、receipt 更新、外部记录不进入可信路径 |
-| `tests/memory_v2_tool.rs` | 三个工具的动作、模型不能自升 authority、不能 review、Full 不绕过、错误语义、Stage 2 markdown backend 的 search 明确 `not_available_until_stage_3` |
+| `tests/memory_v2_tool.rs` | 三个工具的动作、模型不能自升 authority、不能 review、Full 不绕过、错误语义 |
 | `tests/memory_v2_extraction.rs` | known_identities 接线、evidence span、proposal/hypothetical、value secret、同 subject 直接命令优先但不同 subject 不被 turn 级去重、continuation gap 记录 |
-| `tests/memory_v2_parity.rs` | E3 11 场景在 legacy 与 v2 上参数化运行；结果一致或差异有明确原因（同 body 不同 subject 的差异必须记录为刻意变更） |
 | `tests/memory_v2_direct.rs` | 可信用户命令 + extractor + 模型工具；模型伪造 User actor 不可能；交互式无 attachments 与有 attachments 的差异记录 |
 
 Dogfood（小规模，真实 CodeLeveler + DeepSeek Flash）：
 
-1. 临时项目 + `memory.backend=markdown`（测试配置，不提交）。
+1. 临时项目（测试配置，不提交）。
 2. 用户 `/remember` 写一条 project fact；模型 `remember` 写一条 model_inferred；检查 Markdown/frontmatter/authority。
 3. 模型尝试 update 用户 fact → 返回 pending；TUI accept → 记录 revision/history。
 4. 自动提取（fresh turn）写一条 user_stated；检查 known_identities 传给 extractor（测试日志/ledger，不含用户原文）。
@@ -360,29 +361,29 @@ Dogfood（小规模，真实 CodeLeveler + DeepSeek Flash）：
 - known_identities 在生产调用路径仍为空 → 停。
 - 模型工具能在 Full 下直接改受保护用户记录/自升 authority → 停。
 - 同 body 不同 subject 被服务合并，或同 turn 多条独立事实被 OpId 去重吞掉 → 停。
-- legacy 与 v2 的 E3 契约差异无法解释，或 v2 需要语义相似度才能通过 → 停。
-- 默认配置被改变（experience 开启、backend 默认 markdown）→ 停。
+- E3 契约无法解释，或实现需要语义相似度才能通过 → 停。
+- 默认配置被改变（experience 开启）→ 停。
 - 真实用户数据被写入/迁移 → 停。
 
 ### 2.9 完成标准
 
-- 所有生产写路径经 `MemoryService`；代码搜索不再有直接 `MemoryStore::activate/commit_candidate/accept` 的生产调用（legacy backend 适配层除外）。
+- 所有生产写路径经 `MemoryService`；代码搜索不再有直接 store 写调用的生产路径。
 - 模型工具/自动提取/TUI/CLI 的 actor 与 authority 测试全绿；`Actor::User` 无法从模型 payload/CLI argv 构造。
 - 受保护用户记录的更新只能 pending 或经可信 review；Full 模式不改变。
 - 外部编辑/无 receipt 记录不进入可信路径；receipt 与 CAS 测试通过。
 - OpId 幂等、同 OpId 冲突、同 turn 多事实测试通过；不存在 turn 级去重。
 - known_identities 在真实 consolidator 路径非空，`replaces_memory_id` 可命中。
 - pending 永不注入；accept 是唯一激活路径；模型不能 review；pending 只在 state root。
-- legacy backend 默认不变；v2 backend 只在测试/dogfood 使用。
+- （当时）legacy 仍是默认；Markdown 只在测试/dogfood 使用。Stage 4 已删除 legacy。
 - `cargo test -p leveler-memory -p leveler-tools -p leveler-agent -p leveler-app` 相关目标通过；`./dev arch` 通过。
 - 没有改动 `e3_lifecycle.rs` 并行 WIP。
 
-### 2.10 回滚
+### 2.10 回滚（Stage 2 当时）
 
-- `memory.backend` 切回 `legacy`；v2 files 不删除，作为测试/迁移输入。
+- 当时 `memory.backend` 切回 `legacy`；v2 files 不删除。
 - 如果 v2 写入过测试项目，删除测试项目即可；真实用户 store 未被触碰。
-- 代码回滚：撤掉 service 接线，保留 legacy 路径；不删除 legacy 代码。
-- 不承诺 v2 测试数据可反向迁移；Stage 2 不用于真实数据。
+- 代码回滚：撤掉 service 接线，保留 legacy 路径。
+- 这个回滚窗口随 Stage 4 关闭：legacy 代码与旧数据都已删除，回滚只能是恢复到升级前的提交。
 
 ### 2.11 Stage 2.1 正确性收口（2026-10-23）
 
@@ -524,7 +525,7 @@ Stage 2.1 只修正确性与证据链，不进入 Stage 3：没有 FTS5、Contex
 | `tests/memory_v2_injection.rs` | MemoryRecalled 形状、请求实际内容与 receipt 一致（含 catalog version/digest、block digest 与请求行一致）、supersede 后只召回替代者、词法相关性、experience 模式、关闭 experience lane；0 条由 executor 单元测试覆盖；resume/compact 与历史 vs 当前只有 dogfood 覆盖。 |
 | `tests/memory_v2_tail.rs` | recall 在 tail、guidance/catalog 在 prefix；run 内 delta 不改 prefix、removed delta 无 title/body、run start 重建；catalog version/digest 另见 `tests/memory_v2_injection.rs` |
 | `tests/memory_v2_subagent.rs` | 子代理继承父 scope/lane 并在 tail 召回、不携带顶层 catalog；尚无子代理写入 model_inferred/pending 的用例。 |
-| `tests/memory_v2_legacy.rs` | Legacy backend 的 recall 仍到达请求、位于 tail、两轮 prefix 稳定、receipt 不声称 catalog/budget。 |
+| `tests/memory_v2_tail.rs` / `tests/memory_v2_injection.rs` | recall 位于 tail、两轮 prefix 稳定、receipt 与实际请求一致。 |
 
 catalog 失效由 `<state>/catalog/<scope>.json` 的版本/digest 与 Builder 的结构化对比实现，没有独立的 `CatalogInvalidated` 事件；run start 的完整重建由 `memory_v2_tail.rs` 覆盖，resume/compaction 重建只有 dogfood 覆盖；超阈值 `catalog_stale` 与 TTL 变化尚无独立用例。
 
@@ -558,7 +559,7 @@ Dogfood（真实 CodeLeveler + DeepSeek Flash）：
 
 ### 3.9 回滚
 
-- 配置关闭 index：`memory.index=enabled|disabled`（新增，默认 enabled；legacy backend 不读）。关闭后只注入 standing，事件 `degraded=index_unavailable`。
+- 派生索引不可用（损坏/被关闭）时只注入 standing，事件 `degraded=index_unavailable`。
 - recall 位置/格式回滚：保留旧 `relevant_memory_injection` 的 feature flag（短期），确认新路径稳定后删除；不长期双路径。
 - 事件扩展是可选字段，旧客户端忽略；如果 UI 不兼容，回滚 UI 读取，不删事件。
 - index 文件可删除；Markdown 不受影响。
@@ -643,7 +644,7 @@ Gate 判定：
 
 ### 3.1.7 真实 Dogfood 结果
 
-脚本：`dogfood/eval/memory/stage3_1_recall.py`（真实 `leveler tui` + PTY + 记录代理 + 真实 DeepSeek Flash；项目显式配置 `memory.backend=markdown`）与 `stage3_1_page.py`（真实终端的 `/memory` 页面）。断言只读 provider 实际收到的请求字节、磁盘上的 Markdown 记录与 pyte 当前屏幕。
+脚本：`dogfood/eval/memory/stage3_1_recall.py`（真实 `leveler tui` + PTY + 记录代理 + 真实 DeepSeek Flash；当时项目显式配置 `memory.backend=markdown`，该字段已在 Stage 4 删除）与 `stage3_1_page.py`（真实终端的 `/memory` 页面）。断言只读 provider 实际收到的请求字节、磁盘上的 Markdown 记录与 pyte 当前屏幕。
 
 | Case | 结果 | 证据 |
 | --- | --- | --- |
@@ -659,108 +660,78 @@ Gate 判定：
 
 ---
 
-## Stage 4：Migration + Full Dogfood + Cutover
+## Stage 4：Legacy Removal、Markdown Cutover 与最终收口（已完成）
 
-### 4.1 目标
+### 4.1 最终决策
 
-- 实现迁移工具的 inventory/backup/convert/validate/shadow/cutover/rollback。
-- 在隔离副本上完整演练；真实数据迁移需单独批准。
-- 真实 CodeLeveler + DeepSeek Flash 完整 Dogfood：用户 Memory、Experience、检索、存储、迁移。
-- 文档同步；legacy 进入只读/退休流程。
+用户已明确决定：**不做迁移，不保留旧 JSON 作为备用 Backend，不做 Shadow Compare，不维护双 Backend。**
 
-### 4.2 代码范围
+Stage 4 因此不是迁移工程，而是删除工程：
+
+- Legacy JSON backend 的代码全部删除（store、lifecycle 决策层、pipeline、audit、双 backend 分流、旧工具适配）。
+- `memory.backend` 配置字段删除；旧配置里的该字段仍可解析（避免整份配置失效），但只作为弃用提示，不能激活任何 backend。
+- 旧 JSON 数据按用户决策精确删除，不复制、不迁移、不建影子副本。
+- Markdown Memory 2.0 成为唯一实现；全部生产入口统一到 `MemoryService`。
+
+### 4.2 代码范围（实际）
 
 | 位置 | 变更 |
 | --- | --- |
-| `crates/leveler-cli/src/memory_migrate.rs`（或同级模块） | `leveler memory migrate` 子命令：`--inventory`、`--backup`、`--convert`、`--validate`、`--shadow`、`--cutover`、`--rollback`；`--dry-run` 默认 |
-| `crates/leveler-memory/src/v2/migrate.rs` | 只读 legacy JSON → v2 records 的转换、映射、冲突组、secret quarantine、manifest |
-| `crates/leveler-memory/src/v2/validate.rs` | 条数守恒、链接、schema、索引、secret、shadow compare |
-| `crates/leveler-project/src/config.rs` | `memory.backend` 最终默认切换只在用户批准后；迁移配置只读 |
-| `crates/leveler-app/src/lib.rs` | backend 选择、cutover 启动检查、legacy read-only |
-| `docs/ARCHITECTURE*.md`、`SECURITY.md`、`CHANGELOG*`、`README*` | 语义/路径/安全/迁移说明 |
-| `docs/ARCHITECTURE_GUARD.exceptions` | 只有 guard 误判且测试证明时才加 |
+| `crates/leveler-memory/src/lib.rs` | 从旧 store 实现收缩为纯领域模块 + service/v2 导出；`MemoryStore`、`MemoryEntry`、`MemoryKind`、`new_entry`、向量/审计/scrub 全部删除 |
+| `crates/leveler-memory/src/service.rs` | 只保留 Markdown 路径；删除 `MemoryRoots::legacy`、`backend()`、`legacy_root()` 与每处 legacy 分支 |
+| `crates/leveler-memory/src/v2/store.rs` | 经验记录按 `(kind, subject_key)` 参与身份匹配，同身份不再堆叠第二条 current |
+| `crates/leveler-memory/src/{audit,pipeline,lifecycle}.rs` | 删除；`MemoryAuthority`/`CandidateOperation`/`semantic_key_of` 迁到 `candidates.rs` |
+| `crates/leveler-core/src/memory.rs` | 删除 `MemoryBackend` |
+| `crates/leveler-project/src/config.rs` | 删除 `backend` 选择，保留弃用字段解析 + `deprecated_backend()` 提示 |
+| `crates/leveler-project/src/legacy_memory_purge.rs` | 新增：精确删除旧 JSON store（默认 dry run、canonicalize、符号链接/未知内容拒绝） |
+| `crates/leveler-app/src/lib.rs` | `memory_service(layout)` 只有一个实现；删除 catalog 双路径 |
+| `crates/leveler-app/src/memory_consolidator.rs` | 构造时必须传入 service；测试适配层仍只通过 facade 读写 |
+| `crates/leveler-cli/src/memory_cmds.rs` | 删除 `audit`/`audit-identity`/`scrub`/`restore` 与 backend 分流；新增 `memory purge-legacy` |
+| `crates/leveler-agent/src/executor.rs` | 删除 legacy 召回/渲染路径、`with_memory_root`、legacy catalog 注入 |
+| `crates/leveler-agent/src/coding/factory.rs` | 删除 `memory_root`/`memory_catalog` 字段，只接受 service |
+| `crates/leveler-tools/src/tools/memory.rs` | `MemoryRoot::new` 删除，只接受 service；`vector_search` 别名删除 |
+| `xtask/src/arch.rs` | 结构性守卫：退役标识符不得回归，UI/运行时 crate 不得直接打开 `MarkdownStore` |
+| `docs/MEMORY_2_*.md` | 迁移方案改为“已取消并执行删除”，删除 Shadow Compare/双 backend/迁移工具要求 |
 
 不做：
 
-- 不在本轮迁移真实数据。
-- 不自动 commit/push。
-- 不删除 legacy store；不自动清理备份。
-- 不改变 `experience_enabled=false` 默认。
-- 不把迁移报告/备份放进 repo。
+- 不迁移旧数据；不建备份副本；不实现 `leveler memory migrate`。
+- 不保留 legacy 只读模式。
+- 不改变 `experience_enabled=false` 默认值。
+- 不删除 Markdown、Session、配置或其他 `.leveler` 状态。
 
-### 4.3 迁移工具接口
+### 4.3 删除顺序（实际执行）
 
-```text
-leveler memory migrate inventory --project <root> [--legacy-root <path>] --report <dir>
-leveler memory migrate backup    --project <root> [--legacy-root <path>] --backup-dir <dir>
-leveler memory migrate convert   --project <root> --run <id> --isolated-dir <dir>
-leveler memory migrate validate  --run <id> --isolated-dir <dir>
-leveler memory migrate shadow    --run <id> --queries <file> --report <dir>
-leveler memory migrate cutover   --run <id> --confirm-cutover
-leveler memory migrate rollback  --run <id> --confirm-rollback
-```
+1. 代码侧先完成单一实现（Phase A），全部 crate 编译与测试通过。
+2. `leveler memory purge-legacy` 默认 dry run：列出每个候选 store 的路径、文件数、字节数、被拒绝原因。
+3. 确认没有阻塞项、没有正在写入旧 store 的进程后 `--apply`。
+4. 删除后重跑同一条命令必须输出 `no legacy store found`（幂等）。
+5. 验证 Markdown、`memory-v2`、`sessions.db`、配置与仓库文件未被触碰。
 
-- 默认 `dry-run`；破坏性/写 live 需要显式 `--confirm-cutover`。
-- 不接受模型调用；只作为用户 CLI。
-- 每个子命令输出 JSON/markdown 报告到指定目录；不打印 body/value/secret。
-- `--legacy-root` 用于大小写/多 store 歧义；不接受自动扫描后合并。
+实际删除：116 个旧 store、133 个文件、21,716 字节；0 个阻塞项；所有 `~/.leveler/state/projects/*/memory` 与 `no-workspace/memory` 消失，其余状态目录保持完整。旧数据可能含凭据，因此不记录任何正文。
 
-### 4.4 测试 / Dogfood
+### 4.4 回归测试
 
-测试：
-
-| 测试文件 | 覆盖 |
+| 测试 | 覆盖 |
 | --- | --- |
-| `tests/memory_v2_migrate.rs` | 9 条真实形态 fixture、字段映射、status/kind/scope/authority、keyless、derived/ephemeral、pending、archive、links |
-| `tests/memory_v2_migrate_conflict.rs` | 同 subject 不同 value → conflict group + pending；同 body 不同 subject → 保留；精确重复折叠 |
-| `tests/memory_v2_migrate_secret.rs` | value/evidence 中的凭据 → local deprecated 脱敏；project 零命中；报告零原文 |
-| `tests/memory_v2_migrate_idempotent.rs` | 重跑不重复；输入变化 → 新 run；输出已存在 → 拒绝覆盖 |
-| `tests/memory_v2_migrate_crash.rs` | 备份/转换/cutover 阶段崩溃恢复；不出现半 live store |
-| `tests/memory_v2_migrate_git.rs` | current 只出 active；history/pending/attic/tombstone/journal/receipt 只进 state；`git status` 不含内部状态；local ignore 生效 |
-| `tests/memory_v2_migrate_rollback.rs` | 冻结写回滚、首次写前回滚；写后回滚的明确失败/需反向迁移 |
+| `leveler-project/src/legacy_memory_purge.rs`（7 个） | 精确删除、dry run、幂等、未知内容阻塞、`.md` 阻塞、符号链接不越界、大小写命名空间、不可读目录上报 |
+| `leveler-memory`（V2 全量） | 生命周期、旧 Pending/Forget、索引、跨进程、崩溃注入、诊断、显式记忆、外部编辑 |
+| `leveler-app` | 策略/scope/direct command/experience/consolidator；经验重学成为 pending，接受后替换 |
+| `leveler-cli` | 命令面契约、status 与 lane、支持命令拒绝已删除动词 |
+| `xtask`（arch 测试） | 退役标识符回归即 FAIL；UI crate 直接打开 store 即 FAIL |
 
-Dogfood（真实 CodeLeveler + DeepSeek Flash）：
+### 4.5 完成标准
 
-1. 复制当前仓库 legacy store 到隔离目录（不碰真实 store），执行 inventory/backup/convert/validate；确认 9 条 active 的 disposition。
-2. 确认两条疑似凭据记录被 quarantine/local/deprecated；project 零 secret。
-3. 在临时项目启动 v2，跑用户记忆/experience/检索/存储场景：
-   - 用户 `/remember` → Markdown；重启 → recall；
-   - 模型 remember → model_inferred；用户 fact 冲突 → pending；
-   - failure→resolution experience → verified_resolution；environment constraint → 最多 observed；
-   - 中文 2 字 query + 代码标识符；context builder 预算；注入事件；
-   - `memory.read` 按需读；pending accept；forget 后 tombstone、不可 recall。
-4. Shadow compare：固定 query corpus 的 legacy vs v2 top-k；差异解释。
-5. Rollback drill：冻结写阶段切回 legacy；首次 v2 写前回滚；记录写后回滚的限制。
-6. 真实迁移（如用户另行批准）：按迁移文档执行 cutover，保留 legacy 只读，观察稳定窗口。
+- 全仓没有可运行的 Legacy 写入路径；`MemoryService` 是唯一业务入口。
+- 旧 JSON 数据已按清单删除，Markdown/V2/Session/Config 未受影响。
+- `cargo fmt --all -- --check`、受影响 crate 测试、`./dev arch` 通过。
+- 真实 DeepSeek 关键 Dogfood 与性能结论按实际证据记录；未验证项明确标注。
 
-### 4.5 停止条件
+### 4.6 回滚
 
-- 盘点出现未解释的 parse_error/ambiguous store，且用户未决定 → 停。
-- 备份未完成/哈希失败 → 停。
-- project 输出命中 secret → 停，清理隔离输出，重新处理；不进入 live。
-- 冲突组被自动选赢家，或 pending 被自动 active → 停。
-- 条数不守恒、链接断裂未报告、experience 伪造 verified → 停。
-- shadow compare 关键 query 旧值优先且无法解释 → 停。
-- 真实数据迁移未获单独授权 → 停。
-- Windows/网络 FS 的 rename/锁/fsync 未验证且目标平台是 Windows → 标记 blocked，不假装通过。
-
-### 4.6 完成标准
-
-- 迁移报告完整、可审计、无 secret；每个 legacy 文件有 disposition。
-- 隔离转换/验证/shadow 全部通过；冲突组/pending 需要用户决定的事项清楚。
-- 真实 CodeLeveler + DeepSeek Flash 的 Dogfood 场景通过；未通过项明确 NOT_VERIFIED/blocked。
-- v2 成为唯一写路径（在测试项目/批准的项目）；legacy 只读。
-- 回滚 gate 与写后回滚限制写入文档并演练。
-- 文档同步：ARCHITECTURE 双版、SECURITY、CHANGELOG、README（按实际变更）。
-- gate：`./dev fmt`（本任务文件）、相关 `cargo test`、`./dev arch`、项目现有 gate；需要 release 时再按 release 流程。
-- 没有删除真实数据；备份可读；没有 AI 署名。
-
-### 4.7 回滚
-
-- Cutover 前：删除隔离输出；live 未变。
-- Cutover 冻结写、首次 v2 写前：配置切回 legacy；Markdown 保留只读。
-- 首次 v2 写后：不做配置级“无损回滚”；执行反向迁移/导出，保留 v2 归档；需用户批准。
-- Legacy retirement 后：从备份恢复是唯一路径；不自动删除备份。
+- Legacy 代码与旧数据均已删除，不存在配置级回滚。
+- 唯一回滚是恢复到本阶段之前的提交与二进制；旧 JSON 记忆无法恢复（用户已明确接受）。
+- Markdown 数据不参与任何删除路径，升级/回滚都不需要迁移它。
 
 ---
 
@@ -773,9 +744,9 @@ Stage 1 (store/schema/journal/lifecycle)
    │        │
    │        └── Stage 3 (index/context/event) ── 需要 service 的 recall 接口 + 标记
    │                 │
-   │                 └── Stage 4 (migration/cutover) ── 需要 index + context + 事件
+   │                 └── Stage 4 (legacy removal + cutover) ── 需要 index + context + 事件
    │
-   └── 迁移工具可在 Stage 2 后并行开发，但 cutover 必须等 Stage 3 完成
+   └── 没有迁移分支：旧 JSON 数据按用户决策删除
 ```
 
 | 依赖 | 版本/来源 | 阶段 | 说明 |
@@ -813,14 +784,14 @@ Stage 1 (store/schema/journal/lifecycle)
 | Markdown 权威存储 | 一条逻辑 Memory 一个 `.md`；frontmatter + body；history 目录；SQLite 只做索引 | 人可读/可编辑/可 diff/可提交；当前字段集合不需要关系事务；唯一权威易审计 | 文件数多、写入是 rename 而非 SQL、跨文件需要 journal | 外部编辑/合并冲突；目录 IO 在超大 store 下变慢；Windows fsync 语义待验证 |
 | Frontmatter Schema | 最小字段 + `legacy` 保留未知字段；schema=2；严格校验；proposal/experience 块 | 可读、可演进、迁移可追溯；不靠 serde default 猜 | YAML 解析/序列化成本；重复键/alias 需要额外拒绝 | 用户手写 YAML 出错；恶意项目文件伪造 authority 元数据（不授予权限） |
 | 三层 Scope | global `~/.leveler/memory`、project `<repo>/.leveler/memory`、local `<repo>/.leveler/local/memory` | 用户/团队/机器三种生命周期；project 可版本化；local 可 ignore | 多 store、跨 scope 去重、路径/权限检查 | project 误提交敏感事实；local 未 ignore；repo 只读 |
-| Memory Service | 唯一写/lifecycle 入口；actor 推导 authority；CAS；pending review | 消除多写入路径；模型不能自升 authority；所有 UI/工具一致 | 需要改所有调用点；actor 上下文要贯通 | legacy 适配层仍可能绕过；调用点遗漏；Full 模式误以为无约束 |
+| Memory Service | 唯一写/lifecycle 入口；actor 推导 authority；CAS；pending review | 消除多写入路径；模型不能自升 authority；所有 UI/工具一致 | 需要改所有调用点；actor 上下文要贯通 | 新的调用点绕过 facade（已由 arch 守卫拦截）；Full 模式误以为无约束 |
 | Memory Tool | 保留 `memory`/`remember`/`forget` 名字，扩展 update/deprecate/pin/unpin；全部走 service | 不破坏模型 surface；工具只是薄适配器；便于逐步迁移 | 工具 schema 变大；模型可能误用动作 | 模型把建议写成事实；模型 pin 影响排序；工具结果泄露 body |
 | 自动提取 | fresh-turn 用户事实 + evidence span + known_identities；experience 由 runtime receipt；不新增 Judge | 保持现有成本模型；身份收敛靠结构化上下文；证据可验证 | 提取延迟/成本；known_identities 需要查询；continuation 不覆盖 | 模型误标 statement；paraphrase 重复；provider 输出 malformed；用户修正延迟 |
 | 生命周期 | 同身份结构化更新；受保护用户事实只能 User 命令/review 直接更新；不同 subject 的相同 body 只提示不合并；history/tombstone；TTL 转 expired | 一个事实一个当前版本；保留证据；用户拥有最终控制 | pending 增多；用户 review 负担；旧数据冲突需要解决 | 过度保守导致旧值滞留；keyless 旧值；模型误标 correction |
 | FTS5 | 独立 SQLite FTS5；现有 tokenize 预切分 + unicode61；可重建；active-only | 满足中英文/代码召回；不引入向量/Judge；索引可删 | 新增 rusqlite 依赖；索引维护/重建；中文 2 字需预切分 | 版本冲突（libsqlite3-sys）；损坏；并发；词法召回不懂同义 |
 | Context Builder | standing + candidates + experience；预算；sensitive 排除；catalog 独立 + version/delta；recall 放 tail | 有界、可解释、不改变 prefix cache；按需 read 降低 token | 新格式/预算逻辑；tail 注入需要 encoder 支持；catalog 失效管理 | 选错候选；catalog stale；scope 泄露；预算挤压 user constraints |
 | Logged Injection | 扩展现有 `MemoryRecalled` 并持久化；id/revision/scope/kind/mode/token/digest/omission | 不新建 Session Log；可回答“注入了哪个版本”；历史与当前分离 | 事件体积/保留策略；payload 兼容；UI 需要读新字段 | 事件含敏感 title；历史事件被误当当前；旧客户端忽略字段 |
-| 历史迁移 | 盘点/备份/隔离转换/校验/shadow/cutover/rollback；精确重复折叠；冲突组 pending；secret 隔离 | 可预演、可回滚、不触碰真实数据；不强制语义合并 | 人工 review 成本；迁移窗口；报告/备份管理 | secret 泄露；条数丢失；冲突组积压；写后回滚困难；大小写 store 歧义 |
+| 旧数据处置 | 用户决定不迁移：精确识别旧 JSON store，整目录删除，默认 dry run，未知内容阻塞 | 没有双实现、没有半迁移状态、没有影子副本 | 旧记忆不可恢复（用户已接受）；删除边界必须严格 | 误删非 Memory 数据（已由内容白名单 + canonicalize 拦截）|
 
 ---
 
@@ -911,13 +882,13 @@ Stage 1 (store/schema/journal/lifecycle)
 - 测试：每个阶段 abort 的子进程、两进程并发、外部编辑冲突、读一致性、index 删除重建。
 - 未验证：Windows 目录 fsync、网络 FS 锁语义、真实跨文件系统组合；不能声称已保证。
 
-### 7.8 如何安全迁移？
+### 7.8 旧数据怎么处置？
 
-- 只读盘点 → 全量备份（manifest/哈希/`BACKUP_COMPLETE`）→ 隔离转换 → schema/链接/secret/index/shadow 校验 → 人工 review → 冻结写 cutover → v2 live → legacy 只读。
-- 不做语义合并；精确重复折叠；同 subject 不同 value 进 conflict group + pending；pending 不自动 active；旧 suppress 不导入。
-- secret 默认 quarantine/local/deprecated；project 零命中；报告零原文；不自动 commit。
-- 回滚窗口到首次 v2 写之前；写后回滚不是配置开关，需要反向迁移，必须提前说明。
-- 真实数据迁移需单独授权；本轮只设计，不执行。
+- 迁移已取消。用户明确决定不迁移旧 JSON 记忆，也不保留备用 Backend。
+- 处置方式是精确删除：`leveler memory purge-legacy` 默认 dry run 列出旧 store 路径、文件数与字节数；只有内容全部属于旧 store 已知产物时才 `--apply` 删除；未知目录、符号链接、`.md` 记录、大小写变体一律阻塞并报告。
+- 删除范围只包含 `<state>/projects/*/memory` 与 `<state>/no-workspace/memory`；Markdown current、`memory-v2`、`sessions.db`、配置与仓库文件不在删除路径上。
+- 旧数据可能含凭据：不复制、不记录正文；删除不等于凭据失效，需要时单独轮换。
+- 回滚不存在：代码与数据都已删除，恢复到升级前提交是唯一路径。
 
 ### 7.9 剩余架构风险
 

@@ -14,7 +14,7 @@ use leveler_memory::{MemoryLanes, MemoryRoots, MemoryService, ServiceError, Serv
 use memory_v2_common::{Fixture, op};
 
 fn facade(fixture: &Fixture) -> MemoryService {
-    MemoryService::new(MemoryRoots::markdown().with_project(fixture.roots()))
+    MemoryService::new(MemoryRoots::new().with_project(fixture.roots()))
 }
 
 fn user() -> Actor {
@@ -52,7 +52,7 @@ fn fact(fixture: &Fixture, subject: &str, title: &str, body: &str) -> MemoryId {
 
 fn search(fixture: &Fixture, scope: ServiceScope, query: &str) -> Vec<String> {
     facade(fixture)
-        .search(&user(), scope, MemoryLanes::ALL, query, 10, false)
+        .search(&user(), scope, MemoryLanes::ALL, query, 10)
         .unwrap()
         .into_iter()
         .map(|(view, _)| view.id)
@@ -127,33 +127,19 @@ fn scope_isolation_holds() {
     let global_id = fact(&global, "rate", "费率", "全球费率是每千 token 二元。");
 
     let service = MemoryService::new(
-        MemoryRoots::markdown()
+        MemoryRoots::new()
             .with_project(project.roots())
             .with_global(global.roots()),
     );
     let hits = service
-        .search(
-            &user(),
-            ServiceScope::Project,
-            MemoryLanes::ALL,
-            "费率",
-            10,
-            false,
-        )
+        .search(&user(), ServiceScope::Project, MemoryLanes::ALL, "费率", 10)
         .unwrap();
     let ids: Vec<String> = hits.into_iter().map(|(view, _)| view.id).collect();
     assert!(ids.contains(&project_id.to_string()));
     assert!(!ids.contains(&global_id.to_string()));
 
     let hits = service
-        .search(
-            &user(),
-            ServiceScope::Global,
-            MemoryLanes::ALL,
-            "费率",
-            10,
-            false,
-        )
+        .search(&user(), ServiceScope::Global, MemoryLanes::ALL, "费率", 10)
         .unwrap();
     let ids: Vec<String> = hits.into_iter().map(|(view, _)| view.id).collect();
     assert!(ids.contains(&global_id.to_string()));
@@ -283,14 +269,8 @@ fn corrupt_index_reports_degraded_instead_of_empty_success() {
     let index = fixture.state.join("index").join("fts.sqlite");
     std::fs::write(&index, b"not a sqlite database").unwrap();
 
-    let result = facade(&fixture).search(
-        &user(),
-        ServiceScope::Project,
-        MemoryLanes::ALL,
-        "索引",
-        10,
-        false,
-    );
+    let result =
+        facade(&fixture).search(&user(), ServiceScope::Project, MemoryLanes::ALL, "索引", 10);
     match result {
         Err(ServiceError::Unavailable(reason)) => {
             assert!(
@@ -317,7 +297,6 @@ fn status_and_lane_filters_apply_to_search_results() {
             MemoryLanes::EXPERIENCE_ONLY,
             "用户记忆",
             10,
-            false,
         )
         .unwrap();
     assert!(!hits.iter().any(|(view, _)| view.id == id.to_string()));
@@ -329,7 +308,6 @@ fn status_and_lane_filters_apply_to_search_results() {
             MemoryLanes::USER_ONLY,
             "用户记忆",
             10,
-            false,
         )
         .unwrap();
     assert!(hits.iter().any(|(view, _)| view.id == id.to_string()));
@@ -384,7 +362,6 @@ fn facade_write_updates_the_derived_index_without_a_reconcile() {
             MemoryLanes::ALL,
             "蓝色通道",
             10,
-            false,
         )
         .unwrap();
     assert!(hits.iter().any(|(view, _)| view.id == id), "{hits:?}");
@@ -410,14 +387,7 @@ fn supersede_removes_the_old_record_from_retrieval() {
     );
 
     let hits = service
-        .search(
-            &user(),
-            ServiceScope::Project,
-            MemoryLanes::ALL,
-            "计费",
-            10,
-            false,
-        )
+        .search(&user(), ServiceScope::Project, MemoryLanes::ALL, "计费", 10)
         .unwrap();
     let ids: Vec<String> = hits.into_iter().map(|(view, _)| view.id).collect();
     assert!(ids.contains(&new), "new record missing: {ids:?}");

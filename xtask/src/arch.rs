@@ -29,6 +29,78 @@ const EXTRA_SCOPE: &[&str] = &[
     "crates/leveler-tools/src/tools/memory.rs",
 ];
 
+/// Identifiers whose return would recreate the retired JSON backend, a second
+/// memory write path, or a second place that decides how memory reaches a
+/// model request. They are checked across every crate, not only the memory
+/// crate, because each of them lived outside it too.
+const FORBIDDEN_IDENTIFIERS: &[&str] = &[
+    "struct MemoryStore",
+    "enum MemoryBackend",
+    "MemoryBackend::",
+    "MemoryService::legacy",
+    "with_memory_root",
+    "MemoryLifecycleOp",
+    "AgentAdmitOutcome",
+    "ProposeOutcome",
+    "leveler_memory::MemoryStore",
+    "leveler_memory::new_entry",
+];
+
+/// Crates that must reach memory through `MemoryService` only. A direct
+/// `MarkdownStore` here would be a second authority over the same files.
+const FACADE_ONLY_CRATES: &[&str] = &[
+    "crates/leveler-tui/",
+    "crates/leveler-app/",
+    "crates/leveler-agent/",
+    "crates/leveler-tools/",
+];
+
+/// Structural guard: the deleted backend cannot come back, and no UI or
+/// runtime crate may open the Markdown store directly.
+fn structural_problems(repo: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    walk_rust(&repo.join("crates"), &mut files)?;
+    let apps = repo.join("apps");
+    if apps.is_dir() {
+        walk_rust(&apps, &mut files)?;
+    }
+    files.sort();
+    let mut problems = Vec::new();
+    for path in files {
+        let relative = relative(repo, &path);
+        let source = std::fs::read_to_string(&path)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        // Test modules and comments are documentation of past incidents; the
+        // guard is about production code paths.
+        let code: String = source
+            .lines()
+            .take_while(|line| line.trim() != "#[cfg(test)]")
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in FORBIDDEN_IDENTIFIERS {
+            if code.contains(needle) {
+                problems.push(format!(
+                    "{relative}: `{needle}` is retired; memory has one Markdown implementation behind MemoryService"
+                ));
+            }
+        }
+        if FACADE_ONLY_CRATES
+            .iter()
+            .any(|prefix| relative.starts_with(prefix))
+            && code.contains("MarkdownStore")
+        {
+            problems.push(format!(
+                "{relative}: opens MarkdownStore directly; use MemoryService so one facade owns reads, writes and authority"
+            ));
+        }
+    }
+    Ok(problems)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Construct {
     /// A literal table of words or characters drives a decision.
@@ -112,6 +184,18 @@ pub fn run(repo: &Path) -> Result<Report, Fail> {
         let relative = relative(repo, path);
         hits.extend(scan_source(&relative, &source));
         scanned += 1;
+    }
+
+    let structural = structural_problems(repo).map_err(|detail| Fail::new("ARCH_STRUCTURE", detail))?;
+    if !structural.is_empty() {
+        return Ok(Report::with_code(
+            1,
+            format!(
+                "arch: FAIL\nstructural: {}\n{}",
+                structural.len(),
+                structural.join("\n")
+            ),
+        ));
     }
 
     let exceptions_path = repo.join(EXCEPTIONS_PATH);
@@ -793,6 +877,44 @@ mod tests {
             Ok(report) => report.text,
             Err(fail) => fail.detail,
         }
+    }
+
+    #[test]
+    fn a_reintroduced_memory_backend_fails_even_outside_the_memory_crate() {
+        let dir = repo_with("fn production() {}\n", "");
+        write(
+            &dir.path().join("crates/leveler-agent/src/executor.rs"),
+            "fn connect() { let _ = MemoryService::legacy(root); }\n",
+        );
+        let text = report(dir.path());
+        assert!(text.contains("arch: FAIL"), "{text}");
+        assert!(text.contains("MemoryService::legacy"), "{text}");
+        assert!(text.contains("retired"), "{text}");
+    }
+
+    #[test]
+    fn a_test_module_may_still_describe_the_old_path() {
+        // The guard is about production paths; a test that pins the refusal of
+        // a retired command is documentation, not a second implementation.
+        let dir = repo_with("fn production() {}\n", "");
+        write(
+            &dir.path().join("crates/leveler-cli/src/memory_cmds.rs"),
+            "fn production() {}\n#[cfg(test)]\nmod tests {\n    fn note() { let _ = MemoryService::legacy; }\n}\n",
+        );
+        let text = report(dir.path());
+        assert!(text.contains("arch: PASS"), "{text}");
+    }
+
+    #[test]
+    fn a_ui_crate_may_not_open_the_markdown_store_directly() {
+        let dir = repo_with("fn production() {}\n", "");
+        write(
+            &dir.path().join("crates/leveler-tui/src/memory.rs"),
+            "fn open() { let _ = MarkdownStore::open(roots); }\n",
+        );
+        let text = report(dir.path());
+        assert!(text.contains("arch: FAIL"), "{text}");
+        assert!(text.contains("opens MarkdownStore directly"), "{text}");
     }
 
     #[test]

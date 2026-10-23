@@ -5733,7 +5733,7 @@ async fn auto_approve_blocks_a_durable_memory_write() {
         std::process::id() as u64 * 31 + 50
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let mem = dir.join("memory");
+    let memory_current = dir.join("memory");
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5742,11 +5742,19 @@ async fn auto_approve_blocks_a_durable_memory_write() {
             "remember",
             serde_json::json!({
                 "title": "Prefer workspace-write",
-                "body": "Always use WorkspaceWrite for edits."
+                "body": "Always use WorkspaceWrite for edits.",
+                "subject": "editing.permission_profile"
             }),
         ),
         assistant_text("done"),
     ]));
+    let service = Arc::new(leveler_memory::MemoryService::new(
+        leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+            leveler_memory::v2::MemoryScope::Project,
+            memory_current.clone(),
+            dir.join("state"),
+        )),
+    ));
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
@@ -5754,7 +5762,7 @@ async fn auto_approve_blocks_a_durable_memory_write() {
         ModelRef::new("mock", "m"),
         6,
     )
-    .with_memory_root(Some(mem.clone()))
+    .with_memory_service(Some(service))
     .with_approver(Arc::new(leveler_execution::AutoApprove));
     let mut events = Vec::new();
     let _ = executor
@@ -5785,13 +5793,18 @@ async fn auto_approve_blocks_a_durable_memory_write() {
     );
     // No durable write under AutoApprove. The proposal may be PARKED as a
     // pending candidate — that is consent deferred, and `accept` is a separate
-    // user-authoritative step.
-    if mem.join("active").exists() {
-        let count = std::fs::read_dir(mem.join("active"))
-            .map(|d| d.filter_map(|e| e.ok()).count())
-            .unwrap_or(0);
-        assert_eq!(count, 0, "active memory must stay empty under AutoApprove");
-    }
+    // user-authoritative step. Nothing becomes current Markdown.
+    let active = std::fs::read_dir(&memory_current)
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        active, 0,
+        "current memory must stay empty under AutoApprove"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

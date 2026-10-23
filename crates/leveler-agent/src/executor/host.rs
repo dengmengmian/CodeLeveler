@@ -2265,6 +2265,9 @@ mod authorize_tests {
             arguments: serde_json::json!({
                 "title": "用 pnpm",
                 "body": "本仓库统一用 pnpm，不要用 npm。",
+                // A model proposal names the identity it is about; without a
+                // subject the store has nothing to park.
+                "subject": "package_manager",
             }),
         }
     }
@@ -2283,7 +2286,13 @@ mod authorize_tests {
             ModelRef::new("mock", "m"),
             10,
         )
-        .with_memory_root(Some(dir.path().join("memory")))
+        .with_memory_service(Some(Arc::new(leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+                leveler_memory::v2::MemoryScope::Project,
+                dir.path().join("memory"),
+                dir.path().join("state"),
+            )),
+        ))))
         .with_approver(Arc::new(HeadlessDeny));
         let mut session = HashSet::new();
 
@@ -2302,7 +2311,6 @@ mod authorize_tests {
     #[tokio::test]
     async fn a_headless_run_parks_the_memory_instead_of_dropping_it() {
         let dir = tempfile::tempdir().unwrap();
-        let memory_root = dir.path().join("memory");
         let workspace = Workspace::new(dir.path()).unwrap();
         let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
         // Parking is a model proposal; the runtime's own execution identity is
@@ -2310,6 +2318,13 @@ mod authorize_tests {
         tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
         tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
         tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
+        let service = Arc::new(leveler_memory::MemoryService::new(
+            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
+                leveler_memory::v2::MemoryScope::Project,
+                dir.path().join("memory"),
+                dir.path().join("state"),
+            )),
+        ));
         let executor = Executor::new(
             Arc::new(StubRuntime),
             Arc::new(default_registry()),
@@ -2317,7 +2332,7 @@ mod authorize_tests {
             ModelRef::new("mock", "m"),
             10,
         )
-        .with_memory_root(Some(memory_root.clone()))
+        .with_memory_service(Some(service.clone()))
         .with_approver(Arc::new(HeadlessDeny));
         let mut session = HashSet::new();
 
@@ -2329,8 +2344,14 @@ mod authorize_tests {
         // hence the candidate id — without handing it a command to adopt the
         // memory itself. The previous wording spelled out
         // `leveler memory accept <id>`, and a real run executed it.
-        let store_peek = leveler_memory::MemoryStore::open(&memory_root).unwrap();
-        let candidate_id = store_peek.list_pending().unwrap()[0].id.clone();
+        let reviewer = leveler_memory::v2::Actor::User {
+            invocation: leveler_memory::v2::UserInvocationId::mint("host-test-reviewer"),
+        };
+        let candidate_id = service
+            .pending(&reviewer, leveler_memory::ServiceScope::Project)
+            .unwrap()[0]
+            .id
+            .clone();
         assert!(
             err.contains(&candidate_id),
             "the message must name the waiting candidate: {err}"
@@ -2340,17 +2361,23 @@ mod authorize_tests {
             "the message must not hand the model a way to adopt it: {err}"
         );
 
-        let store = leveler_memory::MemoryStore::open(&memory_root).unwrap();
-        let pending = store.list_pending().unwrap();
+        let pending = service
+            .pending(&reviewer, leveler_memory::ServiceScope::Project)
+            .unwrap();
         assert_eq!(pending.len(), 1, "the proposal must survive as a candidate");
         assert!(pending[0].title.contains("pnpm"));
         assert_eq!(
-            pending[0].source,
-            leveler_memory::CandidateSource::AgentProposed,
+            pending[0].authority, "model_inferred",
             "the parked fact came from the model, not from the user or a system guess"
         );
         assert!(
-            store.list_active().unwrap().is_empty(),
+            service
+                .listing_for_user(
+                    leveler_memory::ServiceScope::Project,
+                    leveler_memory::MemoryLanes::ALL
+                )
+                .unwrap()
+                .is_empty(),
             "parking must never activate without consent (K36)"
         );
     }
@@ -2367,7 +2394,7 @@ mod authorize_tests {
         let global_current = dir.path().join("global-memory");
         let global_state = dir.path().join("global-state");
         let service = leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::markdown()
+            leveler_memory::MemoryRoots::new()
                 .with_project(leveler_memory::v2::ScopeRoots::new(
                     leveler_memory::v2::MemoryScope::Project,
                     project_current,
@@ -2448,7 +2475,7 @@ mod authorize_tests {
         let global_current = dir.path().join("global-memory");
         let global_state = dir.path().join("global-state");
         let service = leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::markdown()
+            leveler_memory::MemoryRoots::new()
                 .with_project(leveler_memory::v2::ScopeRoots::new(
                     leveler_memory::v2::MemoryScope::Project,
                     project_current,

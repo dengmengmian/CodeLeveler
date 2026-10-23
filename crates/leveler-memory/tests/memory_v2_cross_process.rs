@@ -26,11 +26,7 @@ fn user() -> Caller {
     }
 }
 
-fn spawn(
-    fixture: &Fixture,
-    helper: &str,
-    env: &[(&str, String)],
-) -> Child {
+fn spawn(fixture: &Fixture, helper: &str, env: &[(&str, String)]) -> Child {
     let executable = std::env::current_exe().unwrap();
     let mut command = Command::new(executable);
     command
@@ -365,10 +361,7 @@ fn a_sigkilled_writer_leaves_a_store_a_new_process_can_recover() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let store = fixture.store();
     loop {
-        let revision = retry_busy(|| store.read(&id))
-            .record
-            .frontmatter
-            .revision;
+        let revision = retry_busy(|| store.read(&id)).record.frontmatter.revision;
         if revision > 1 || Instant::now() > deadline {
             break;
         }
