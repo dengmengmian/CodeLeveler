@@ -302,7 +302,11 @@ pub fn pin_decision(caller: &Caller, target: &TargetView<'_>, unpin: bool) -> Ta
     if unpin && target.record.frontmatter.pinned_by == Some(super::record::PinOwner::User) {
         return TargetDecision::Pending(PendingReason::UserPinned);
     }
-    if !unpin && target.protected {
+    // §7.3: an automatic pin of a user-owned fact waits for a person. This is
+    // wider than proposal protection: an extracted `user_stated` fact may be
+    // corrected by the extractor's own new evidence, but it is still the
+    // user's memory and must not be pinned automatically.
+    if !unpin && target.effective_authority >= MemoryAuthority::UserStated {
         return TargetDecision::Pending(PendingReason::ProtectedUserFact);
     }
     if target.record.frontmatter.kind == MemoryKind::Experience
@@ -358,8 +362,11 @@ fn is_channel_source(source: &super::record::SourceRef) -> bool {
 
 /// A current record must not be replaced through an automatic path when the
 /// stored authority came from a user decision.
+///
+/// `user_stated` is an extracted statement with evidence, not a decision: a
+/// later statement under the same identity with a new span may supersede it.
 pub fn is_protected(authority: MemoryAuthority) -> bool {
-    authority >= MemoryAuthority::UserStated
+    authority.is_user_decision()
 }
 
 #[cfg(test)]
@@ -400,6 +407,16 @@ mod tests {
             },
             body: "subscription".into(),
         }
+    }
+
+    #[test]
+    fn only_user_decisions_are_protected() {
+        assert!(is_protected(MemoryAuthority::UserExplicit));
+        assert!(is_protected(MemoryAuthority::UserApproved));
+        assert!(!is_protected(MemoryAuthority::UserStated));
+        assert!(!is_protected(MemoryAuthority::ProjectSource));
+        assert!(!is_protected(MemoryAuthority::RuntimeObserved));
+        assert!(!is_protected(MemoryAuthority::ModelInferred));
     }
 
     #[test]
