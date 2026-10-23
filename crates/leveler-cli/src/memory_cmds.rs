@@ -5,8 +5,8 @@
 //! writes — the human is managing memory directly (including pending accept).
 
 use leveler_memory::{
-    MemoryEntry, MemoryKind, MemoryStore, ProposeOutcome, collect_turn_candidates, is_sensitive,
-    is_sensitive_candidate, redact_candidate,
+    CandidateKind, CandidateSource, MemoryCandidate, MemoryEntry, MemoryKind, MemoryStore,
+    ProposeOutcome, is_sensitive, is_sensitive_candidate, redact_candidate, title_from_body,
 };
 use leveler_project::Layout;
 
@@ -441,10 +441,18 @@ pub(crate) fn cmd_memory(
             Ok(std::process::ExitCode::SUCCESS)
         }
         MemoryCommand::Propose { text } => {
-            // Repository signals are no longer scanned into candidates: a
-            // lockfile is read from the working tree when needed, never
-            // remembered, so `--scan-pm` had nothing left to do.
-            let outcomes = collect_turn_candidates(&store, &text, None)?;
+            // The CLI has no model call and no structured subject here. Store
+            // the text as a pending proposal verbatim; a person still accepts
+            // it, so nothing becomes current truth on the strength of a rule.
+            let candidate = MemoryCandidate::new(
+                title_from_body(&text),
+                &text,
+                CandidateKind::Free,
+                None,
+                CandidateSource::SystemPropose,
+                vec!["manual".to_string()],
+            )?;
+            let outcomes = vec![store.propose(candidate)?];
             if outcomes.is_empty() {
                 println!("{}", Line::warn("No candidates extracted."));
                 return Ok(std::process::ExitCode::SUCCESS);
@@ -527,7 +535,7 @@ fn remember_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_memory::{ProposeOutcome, parse_inferred_preference};
+    use leveler_memory::ProposeOutcome;
     use std::path::PathBuf;
 
     #[test]
@@ -619,7 +627,15 @@ mod tests {
             std::env::temp_dir().join(format!("leveler-memory-cli-accept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = MemoryStore::open(&root).unwrap();
-        let c = parse_inferred_preference("我通常希望 prefer gated memory writes").unwrap();
+        let c = leveler_memory::MemoryCandidate::new(
+            "gated memory writes",
+            "prefer gated memory writes",
+            leveler_memory::CandidateKind::Preference,
+            None,
+            leveler_memory::CandidateSource::SystemInferred,
+            vec![],
+        )
+        .unwrap();
         let pending = match store.propose(c).unwrap() {
             ProposeOutcome::Pending(c) => c,
             other => panic!("{other:?}"),

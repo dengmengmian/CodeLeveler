@@ -7,7 +7,7 @@
 //! The split is deliberate:
 //!
 //! ```text
-//! parse_durable_fact / candidate
+//! direct command / extractor / tool candidate
 //!         ↓
 //! decide(store, candidate)   → MemoryOperation   (pure-ish: reads the store)
 //!         ↓
@@ -15,16 +15,16 @@
 //! ```
 //!
 //! A model never writes the store directly. `remember`/`forget` tools keep
-//! their K36 human-approval gate, and ordinary durable-looking user statements
-//! remain pending candidates. Only an explicit direct memory command, or an
-//! accepted candidate, authorizes an active-memory write.
+//! their K36 human-approval gate, and a statement without a structured
+//! identity is only proposed. An explicit direct memory command, a validated
+//! explicit-user fact, or an accepted candidate authorizes an active write.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 
 use serde::{Deserialize, Serialize};
 
-use crate::candidates::{CandidateKind, CandidateSource, MemoryCandidate, looks_like_secret};
+use crate::candidates::{CandidateSource, MemoryCandidate};
 use crate::{
     MemoryEntry, MemoryError, MemoryKind, MemoryStatus, MemoryStore, entry_from_candidate,
     now_rfc3339, slugify,
@@ -84,16 +84,20 @@ pub struct Provenance {
     pub evidence: Option<String>,
 }
 
-/// Whether a candidate states a fresh fact or corrects an existing one.
+/// Whether a candidate states a fresh fact, corrects an existing one, or
+/// reverses it.
 ///
 /// Only a hint: the commit decision re-derives the operation from the store, so
-/// a mislabeled candidate cannot overwrite the wrong memory.
+/// a mislabeled candidate cannot overwrite the wrong memory. Negation is
+/// separate from Update because a reversal is a change even when the extracted
+/// value string happens to match the current one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateOperation {
     #[default]
     Create,
     Update,
+    Negate,
 }
 
 /// The operation the decision layer chose. Separated from mutation so it can be
@@ -169,31 +173,24 @@ impl MemoryLifecycleOp {
 
 // ── semantic identity ──────────────────────────────────────────────────────
 
-/// Normalize a subject into a stable identity. Deterministic, not semantic: it
-/// is a function of the characters alone, so the same subject always maps to
-/// the same key and two different subjects do not collide by construction.
+/// Normalize a subject into a stable identity. Deterministic, not semantic:
+/// it folds spelling only — case, whitespace and separator characters. It
+/// NEVER strips a trailing word: `billing_model` and `billing_setting` are two
+/// different facts, and an identity that collapses them makes one silently
+/// overwrite the other. Meaning belongs to the model that supplied the
+/// subject; the runtime only decides whether two spellings are the same
+/// string.
 pub fn semantic_key_of(subject: &str) -> String {
-    let mut normalized: String = subject
+    let normalized: String = subject
+        .trim()
         .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            '.' | '-' | '/' | '\\' => '_',
+            other => other,
+        })
+        .flat_map(char::to_lowercase)
         .collect();
-    // Strip a small set of trailing nouns so "默认模型", "默认模型设置" and
-    // "默认" are one fact. Repeat until stable: stripping "设置" can expose
-    // "模型", and a single ordered pass would leave the two spellings with
-    // different identities.
-    loop {
-        let mut stripped = false;
-        for suffix in ["模型", "设置", "选项", "名称", "model", "value", "setting"] {
-            if normalized.len() > suffix.len() && normalized.ends_with(suffix) {
-                normalized.truncate(normalized.len() - suffix.len());
-                stripped = true;
-            }
-        }
-        if !stripped {
-            break;
-        }
-    }
     if normalized.is_empty() {
         "fact".to_string()
     } else if normalized.is_ascii() && normalized.len() <= 48 {
@@ -206,191 +203,11 @@ pub fn semantic_key_of(subject: &str) -> String {
     }
 }
 
-/// Semantic identity for both current entries and legacy direct writes that
-/// predate the `key` field. The latter can be upgraded from their own durable
-/// assignment text without guessing from unrelated prose.
+/// Identity for a stored entry. Entries written before identities were
+/// recorded have none: their old prose is not re-parsed into a guessed
+/// subject, because a wrong identity silently overwrites a different fact.
 pub(crate) fn durable_entry_key(entry: &MemoryEntry) -> Option<String> {
-    entry.key.clone().or_else(|| {
-        parse_durable_fact(&entry.body)
-            .and_then(|candidate| candidate.semantic_key.or(candidate.key))
-    })
-}
-
-// ── explicit durable-fact parsing ──────────────────────────────────────────
-
-const DURABLE_PREFIXES: [&str; 7] = [
-    "以后",
-    "今后",
-    "从现在起",
-    "这个项目",
-    "本项目",
-    "本仓库",
-    "这个仓库",
-];
-
-const STRONG_MARKERS: [&str; 5] = ["固定为", "固定是", "不再", "禁止", "必须"];
-
-/// Separators that state an assignment: `subject <sep> value`. Ordered by scan
-/// position, not preference, so the earliest one wins.
-const SEPARATORS: [&str; 12] = [
-    "固定为",
-    "固定是",
-    "变更为",
-    "设置为",
-    "设为",
-    "改成",
-    "改为",
-    "默认使用",
-    "默认用",
-    "统一使用",
-    "统一用",
-    "=",
-];
-
-const CORRECTION_MARKERS: [&str; 7] =
-    ["改成", "改为", "变更", "不再", "之前那个", "原来的", "修正"];
-
-/// Parse a statement that the user explicitly framed as a lasting project rule.
-///
-/// Deliberately narrow. It fires only on an explicit durability marker plus an
-/// assignment shape, and refuses secrets, code, quotes and any body long enough
-/// to be a task rather than a fact. A miss is recoverable (the soft-preference
-/// path still proposes a candidate); a false positive rewrites long-term state.
-pub fn parse_durable_fact(text: &str) -> Option<MemoryCandidate> {
-    let t = text.trim();
-    if t.is_empty() || t.chars().count() > 300 {
-        return None;
-    }
-    if looks_like_secret(t) || t.contains('`') {
-        return None;
-    }
-    if t.contains('“') || t.contains('”') || t.contains('"') {
-        return None;
-    }
-    if !has_durability_marker(t) {
-        return None;
-    }
-    let (subject_raw, sep, value_raw) = split_fact(t)?;
-    let value = value_raw
-        .trim()
-        .trim_end_matches(['。', '.', '！', '!', '；', ';'])
-        .trim();
-    if value.is_empty() || value.chars().count() > 160 {
-        return None;
-    }
-    let subject = match clean_subject(subject_raw) {
-        Some(s) => s,
-        None if sep.starts_with("默认") => "默认".to_string(),
-        None if sep.starts_with("统一") => "统一".to_string(),
-        None => return None,
-    };
-    // The same canonical identity every other write path uses. Without this,
-    // "以后默认使用 Flash" stores the subject "默认" while its key aliases to
-    // "默认模型": the key updates the right entry, but the stored text loses
-    // the object the user asked about, so a later question about the default
-    // model cannot match it.
-    let subject = crate::canonical_subject(&subject);
-    if subject.chars().count() > 60 {
-        return None;
-    }
-    let key = semantic_key_of(&subject);
-    let title = format!("{}：{}", subject, first_line(value));
-    let body = format!("{subject}：{value}");
-    let mut candidate = MemoryCandidate::new(
-        title,
-        body,
-        CandidateKind::Free,
-        Some(key.clone()),
-        CandidateSource::UserExplicit,
-        vec![
-            "explicit".to_string(),
-            "decision".to_string(),
-            format!("subject:{subject}"),
-        ],
-    )
-    .ok()?;
-    candidate.semantic_key = Some(key);
-    candidate.authority = MemoryAuthority::ExplicitUser;
-    candidate.operation = if is_correction(t) {
-        CandidateOperation::Update
-    } else {
-        CandidateOperation::Create
-    };
-    Some(candidate)
-}
-
-fn has_durability_marker(text: &str) -> bool {
-    if DURABLE_PREFIXES.iter().any(|p| text.starts_with(p)) {
-        return true;
-    }
-    STRONG_MARKERS.iter().any(|m| text.contains(m))
-}
-
-fn split_fact(text: &str) -> Option<(&str, &'static str, &str)> {
-    let mut best: Option<(usize, &'static str)> = None;
-    for sep in SEPARATORS {
-        if let Some(index) = text.find(sep)
-            && best.map(|(b, _)| index < b).unwrap_or(true)
-        {
-            best = Some((index, sep));
-        }
-    }
-    let (index, sep) = best?;
-    Some((&text[..index], sep, &text[index + sep.len()..]))
-}
-
-fn clean_subject(raw: &str) -> Option<String> {
-    let mut s = raw.trim();
-    const STRIP: [&str; 20] = [
-        "从现在起",
-        "这个项目的",
-        "本项目的",
-        "这个仓库的",
-        "本仓库的",
-        "这个项目",
-        "本项目",
-        "这个仓库",
-        "本仓库",
-        "以后",
-        "今后",
-        "项目里",
-        "仓库里",
-        "里",
-        "中",
-        "的",
-        "：",
-        ":",
-        "，",
-        ",",
-    ];
-    loop {
-        let before = s;
-        for prefix in STRIP {
-            if let Some(rest) = s.strip_prefix(prefix) {
-                s = rest.trim_start();
-            }
-        }
-        if s == before {
-            break;
-        }
-    }
-    let s = s
-        .trim_end_matches(['的', '：', ':', '，', ',', '。'])
-        .trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
-    }
-}
-
-fn is_correction(text: &str) -> bool {
-    CORRECTION_MARKERS.iter().any(|m| text.contains(m))
-}
-
-fn first_line(value: &str) -> String {
-    let line = value.lines().next().unwrap_or(value).trim();
-    line.chars().take(48).collect()
+    entry.key.clone()
 }
 
 /// Build the candidate behind the model's `remember` tool.
@@ -408,7 +225,7 @@ pub fn agent_candidate(
     subject: &str,
     evidence: Option<String>,
 ) -> Result<MemoryCandidate, MemoryError> {
-    let subject = crate::canonical_subject(subject);
+    let subject = crate::normalize_subject(subject);
     let subject = subject.trim();
     if subject.is_empty() {
         return Err(MemoryError::Invalid(
@@ -465,234 +282,20 @@ pub fn agent_candidate(
     Ok(candidate)
 }
 
-pub(crate) fn candidate_subject(candidate: &MemoryCandidate) -> Option<&str> {
+/// The identity this candidate speaks about. A model may declare which active
+/// subject it means to restate or replace; that declared relation wins over
+/// its own subject string. No wording is compared.
+pub(crate) fn candidate_identity(candidate: &MemoryCandidate) -> Option<&str> {
     candidate
-        .tags
-        .iter()
-        .find_map(|tag| tag.strip_prefix("subject:"))
-        .filter(|subject| !subject.is_empty())
+        .related_key
+        .as_deref()
+        .or(candidate.semantic_key.as_deref())
+        .or(candidate.key.as_deref())
 }
 
 pub(crate) fn entry_matches_candidate(entry: &MemoryEntry, candidate: &MemoryCandidate) -> bool {
-    let identity = candidate
-        .semantic_key
-        .as_deref()
-        .or(candidate.key.as_deref());
-    if identity.is_some() && durable_entry_key(entry).as_deref() == identity {
-        return true;
-    }
-    if entry.key.is_some() {
-        return false;
-    }
-    if MemoryKind::of(entry) != MemoryKind::Preference
-        || entry.provenance.as_ref().map(|value| value.source.as_str()) != Some("user_direct")
-    {
-        return false;
-    }
-    let Some(subject) = candidate_subject(candidate) else {
-        return false;
-    };
-    let normalized_subject: String = subject
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(|character| character.to_lowercase())
-        .collect();
-    if normalized_subject.chars().count() < 4 {
-        return false;
-    }
-    let mut body = entry.body.trim();
-    for prefix in ["从现在起", "以后", "今后"] {
-        if let Some(rest) = body.strip_prefix(prefix) {
-            body = rest.trim_start();
-            break;
-        }
-    }
-    for prefix in ["不要", "不再", "别"] {
-        if let Some(rest) = body.strip_prefix(prefix) {
-            body = rest.trim_start();
-            break;
-        }
-    }
-    let body = body
-        .trim_end_matches(['。', '.', '！', '!', '；', ';'])
-        .trim_end_matches('了')
-        .trim();
-    let normalized_body: String = body
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(|character| character.to_lowercase())
-        .collect();
-    normalized_body == normalized_subject
-}
-
-// ── assertion identity ─────────────────────────────────────────────────────
-//
-// A semantic key is derived from a model-generated subject. One constraint can
-// therefore arrive under two identities when the model words its object
-// differently (`api_response_field_naming` vs `json_response_field_naming`).
-// The comparison below reads the assertion itself for autonomous user
-// statements: topic (the clause before the assignment) and value (what is
-// assigned). It uses the same lexical view as recall — CJK bigrams and ASCII
-// words — so it adds no index and no model call.
-
-/// Below this share of shared topic terms, two statements describe different
-/// subjects. The floor separates reworded objects from different predicates
-/// measured on the same phrase; it is deliberately conservative because a
-/// wrong duplicate skip loses a real fact.
-const FACT_TOPIC_SIMILARITY: f64 = 0.60;
-
-/// Structural connectives that split a fact into topic and value. This is
-/// grammar, not a synonym table for any particular fixture.
-const ASSERTION_MARKERS: &[&str] = &[
-    "always use",
-    "always be",
-    "must not use",
-    "must not",
-    "must use",
-    "must be",
-    "never use",
-    "should not use",
-    "should use",
-    "should be",
-    "set to",
-    "default to",
-    "change to",
-    "统一使用",
-    "统一采用",
-    "统一设为",
-    "统一为",
-    "统一用",
-    "固定使用",
-    "固定为",
-    "固定成",
-    "默认使用",
-    "默认为",
-    "默认用",
-    "设置为",
-    "设为",
-    "修改为",
-    "改为",
-    "改成",
-    "更换为",
-    "换成",
-    "采用",
-    "使用",
-    "=",
-    "：",
-    ":",
-];
-
-const NEGATION_MARKERS: &[&str] = &[
-    "不要", "不得", "禁止", "不能", "不可", "不再", "无需", "never", "must not", "should not",
-    "do not", "don't", "avoid",
-];
-
-struct FactAssertion<'a> {
-    topic: &'a str,
-    value: String,
-    negative: bool,
-}
-
-/// Split a remembered fact into "what it constrains" and "what it assigns".
-/// `None` when the sentence has no assignment connective: without a value
-/// there is nothing to compare, and guessing would be worse than the current
-/// subject identity.
-fn fact_assertion(body: &str) -> Option<FactAssertion<'_>> {
-    let lower = body.to_ascii_lowercase();
-    let mut split: Option<(usize, usize)> = None;
-    for marker in ASSERTION_MARKERS {
-        let found = if marker.is_ascii() {
-            lower
-                .rfind(marker)
-                .map(|start| (start, start + marker.len()))
-        } else {
-            body.rfind(marker)
-                .map(|start| (start, start + marker.len()))
-        };
-        let Some((start, end)) = found else {
-            continue;
-        };
-        let replace = match split {
-            None => true,
-            Some((best, best_end)) => {
-                start > best || (start == best && end - start > best_end - best)
-            }
-        };
-        if replace {
-            split = Some((start, end));
-        }
-    }
-    let (start, end) = split?;
-    let value = normalize_asserted_value(&body[end..]);
-    if value.is_empty() {
-        return None;
-    }
-    let topic = &body[..start];
-    if crate::tokenize(topic).is_empty() {
-        return None;
-    }
-    let lower_topic = topic.to_ascii_lowercase();
-    let negative = NEGATION_MARKERS
-        .iter()
-        .any(|marker| lower_topic.contains(marker));
-    Some(FactAssertion {
-        topic,
-        value,
-        negative,
-    })
-}
-
-fn normalize_asserted_value(raw: &str) -> String {
-    raw.trim()
-        .trim_matches(|character: char| {
-            character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '“' | '”')
-        })
-        .trim_end_matches(['。', '.', '！', '!', '；', ';', ',', '，'])
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn topic_similarity(left: &str, right: &str) -> f64 {
-    let left: HashSet<String> = crate::tokenize(left).into_iter().collect();
-    let right: HashSet<String> = crate::tokenize(right).into_iter().collect();
-    if left.is_empty() || right.is_empty() {
-        return 0.0;
-    }
-    let shared = left.intersection(&right).count() as f64;
-    let union = left.union(&right).count() as f64;
-    shared / union
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FactRelation {
-    /// Different topics: the lifecycle's identity rules decide.
-    Unrelated,
-    /// Same constraint, same value: one memory is enough.
-    Duplicate,
-    /// Same constraint, different value or polarity: a person must choose.
-    Conflict,
-}
-
-fn user_fact_relation(existing: &MemoryEntry, candidate: &MemoryCandidate) -> FactRelation {
-    let Some(existing_assertion) = fact_assertion(&existing.body) else {
-        return FactRelation::Unrelated;
-    };
-    let Some(candidate_assertion) = fact_assertion(&candidate.body) else {
-        return FactRelation::Unrelated;
-    };
-    if topic_similarity(existing_assertion.topic, candidate_assertion.topic) < FACT_TOPIC_SIMILARITY
-    {
-        return FactRelation::Unrelated;
-    }
-    if existing_assertion.value == candidate_assertion.value
-        && existing_assertion.negative == candidate_assertion.negative
-    {
-        FactRelation::Duplicate
-    } else {
-        FactRelation::Conflict
-    }
+    candidate_identity(candidate)
+        .is_some_and(|identity| durable_entry_key(entry).as_deref() == Some(identity))
 }
 
 // ── decision ───────────────────────────────────────────────────────────────
@@ -751,78 +354,49 @@ pub fn decide(
         });
     }
 
-    // A subject is a model hint, not a stable identity. Compare the assertion
-    // itself for autonomous user statements so two wordings of one constraint
-    // cannot both become current truth. Entries that already match the
-    // candidate's identity are left to the rules below, which know how to
-    // merge, supersede and preserve history for one identity. `UserRestore`
-    // is excluded: a restore has its own identity path and must not be turned
-    // into a duplicate skip or a consent prompt here.
-    let user_statement = matches!(
-        candidate.source,
-        CandidateSource::UserExplicit | CandidateSource::UserAccepted
-    );
-    if user_statement
-        && candidate.authority == MemoryAuthority::ExplicitUser
-        && candidate.experience.is_none()
+    // The model may name the active subject this statement restates or
+    // replaces. The runtime only checks that the named subject is active; it
+    // never infers a relation from wording. An unresolvable relation is parked,
+    // not guessed: using the candidate's own subject would silently rewrite a
+    // different fact, and creating it would accumulate a competing Active entry.
+    if let Some(related) = candidate.related_key.as_deref()
+        && !active
+            .iter()
+            .any(|entry| durable_entry_key(entry).as_deref() == Some(related))
     {
-        let mut peers = Vec::new();
-        let mut conflict = None;
-        for entry in active.iter().filter(|entry| {
-            entry.scope == crate::MemoryScope::Project
-                && entry.authority() == MemoryAuthority::ExplicitUser
-                && entry.experience.is_none()
-                && MemoryKind::of(entry) != MemoryKind::Derived
-                && !entry_matches_candidate(entry, candidate)
-        }) {
-            match user_fact_relation(entry, candidate) {
-                FactRelation::Unrelated => {}
-                FactRelation::Duplicate => peers.push(entry.clone()),
-                FactRelation::Conflict => {
-                    peers.push(entry.clone());
-                    conflict = Some(entry.clone());
-                }
-            }
-        }
-        if let Some(existing) = conflict {
-            // An acceptance is the person choosing the new value. It replaces
-            // the conflicting truth while preserving it as history. An
-            // autonomous statement instead waits for that choice.
-            if candidate.source == CandidateSource::UserAccepted {
-                return Ok(MemoryDecision {
-                    operation: MemoryOperation::Supersede {
-                        existing_id: existing.id,
-                    },
-                    related: peers,
-                });
-            }
-            return Ok(MemoryDecision {
-                operation: MemoryOperation::NeedsApproval {
-                    reason: format!(
-                        "this states a different value for the same constraint as active memory {}",
-                        existing.id
-                    ),
-                },
-                related: peers,
-            });
-        }
-        if let Some(existing) = peers.first() {
-            return Ok(MemoryDecision {
-                operation: MemoryOperation::Skip {
-                    reason: format!(
-                        "active memory {} already states this constraint in other words",
-                        existing.id
-                    ),
-                },
-                related: peers,
-            });
-        }
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::NeedsApproval {
+                reason: format!(
+                    "the related subject `{related}` is not an active memory; \
+                     a person must confirm what this statement replaces"
+                ),
+            },
+            related: Vec::new(),
+        });
     }
 
-    let identity = candidate
-        .semantic_key
-        .as_deref()
-        .or(candidate.key.as_deref());
+    // An update or negation claims that a decision already exists. If no
+    // active memory carries its identity or declared relation, the runtime
+    // cannot know which fact it changes; creating it would turn a correction
+    // into a second competing truth.
+    if matches!(
+        candidate.operation,
+        CandidateOperation::Update | CandidateOperation::Negate
+    ) && !active
+        .iter()
+        .any(|entry| entry_matches_candidate(entry, candidate))
+    {
+        return Ok(MemoryDecision {
+            operation: MemoryOperation::NeedsApproval {
+                reason: "this updates a decision that is not active; \
+                         a person must say which memory it replaces"
+                    .to_string(),
+            },
+            related: Vec::new(),
+        });
+    }
+
+    let identity = candidate_identity(candidate);
     if identity.is_some() {
         let mut related: Vec<MemoryEntry> = active
             .into_iter()
@@ -831,8 +405,16 @@ pub fn decide(
         related.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         if let Some(existing) = related.first() {
             // Same identity and same stated value: nothing new, whatever the
-            // title says.
-            if existing.body.trim() == candidate.body.trim() {
+            // title says. The value is a structured field the model supplied;
+            // the runtime compares fields, never prose.
+            let same_stated_value = candidate.operation != CandidateOperation::Negate
+                && candidate
+                    .value
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(|value| existing.value.as_deref().map(str::trim) == Some(value));
+            if existing.body.trim() == candidate.body.trim() || same_stated_value {
                 return Ok(MemoryDecision {
                     operation: MemoryOperation::Skip {
                         reason: format!("existing memory {} already states this", existing.id),
@@ -955,23 +537,14 @@ pub fn decide(
                         related,
                     });
                 }
-                // An explicit accept is the person choosing between the two
-                // accounts; it resolves the dispute without a second review.
-                if user_decision
-                    || crate::experience::claims_are_related(&existing.body, &candidate.body)
-                {
-                    return Ok(MemoryDecision {
-                        operation: MemoryOperation::Supersede {
-                            existing_id: existing.id.clone(),
-                        },
-                        related,
-                    });
-                }
+                // The model declared the same subject and both accounts carry
+                // mechanically verified evidence, so this is a newer reading of
+                // the same failure, not a wording coincidence. The runtime does
+                // not compare the prose; identity is the model's structured
+                // claim, and evidence decides whether it may become current.
                 return Ok(MemoryDecision {
-                    operation: MemoryOperation::NeedsApproval {
-                        reason: "the same failure signature carries a different explanation; \
-                                 a person must choose which one is current"
-                            .to_string(),
+                    operation: MemoryOperation::Supersede {
+                        existing_id: existing.id.clone(),
                     },
                     related,
                 });
@@ -1549,10 +1122,29 @@ mod tests {
         (dir, store)
     }
 
+    /// A structured explicit-user fact. The model owns the subject; the test
+    /// supplies it directly, so no prose is parsed into identity anywhere.
+    fn user_fact(subject: &str, body: &str) -> MemoryCandidate {
+        let key = semantic_key_of(&crate::normalize_subject(subject));
+        let mut candidate = MemoryCandidate::new(
+            body,
+            body,
+            crate::CandidateKind::Free,
+            Some(key.clone()),
+            CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        candidate.semantic_key = Some(key);
+        candidate.authority = MemoryAuthority::ExplicitUser;
+        candidate
+    }
+
     fn semantic_fact(fact: &str, subject: &str, evidence: &str) -> crate::SemanticCandidate {
         crate::SemanticCandidate {
             fact: fact.to_string(),
             subject: subject.to_string(),
+            related_subject: None,
             value: None,
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,
@@ -1573,15 +1165,9 @@ mod tests {
         }
     }
 
-    fn admit_fact(
-        store: &MemoryStore,
-        fact: &str,
-        subject: &str,
-    ) -> crate::AdmitOutcome {
-        let validated = crate::validate_semantic_candidates(
-            &[semantic_fact(fact, subject, fact)],
-            fact,
-        );
+    fn admit_fact(store: &MemoryStore, fact: &str, subject: &str) -> crate::AdmitOutcome {
+        let validated =
+            crate::validate_semantic_candidates(&[semantic_fact(fact, subject, fact)], fact);
         assert_eq!(
             validated.accepted.len(),
             1,
@@ -1606,69 +1192,28 @@ mod tests {
         );
     }
 
+    /// A suffix is part of the subject's name, not decoration. Stripping it
+    /// would make two different facts update each other.
     #[test]
-    fn semantic_identity_strips_trailing_nouns_until_stable() {
-        let base = semantic_key_of("默认");
-        for subject in ["默认模型", "默认模型设置", "默认模型设置选项", "默认设置"]
-        {
-            assert_eq!(semantic_key_of(subject), base, "{subject}");
-        }
-        assert_eq!(
-            semantic_key_of("default model setting"),
-            semantic_key_of("default")
+    fn suffix_words_are_part_of_the_subject() {
+        assert_ne!(
+            semantic_key_of(&crate::normalize_subject("billing_model")),
+            semantic_key_of(&crate::normalize_subject("billing_setting"))
         );
-    }
-
-    #[test]
-    fn a_probe_code_name_assignment_is_a_durable_fact() {
-        let c = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").expect("fact");
-        assert_eq!(c.authority, MemoryAuthority::ExplicitUser);
-        assert_eq!(c.source, CandidateSource::UserExplicit);
-        assert_eq!(
-            c.semantic_key.as_deref(),
-            Some(semantic_key_of("发布探针代号").as_str())
+        assert_ne!(
+            semantic_key_of(&crate::normalize_subject("default_model")),
+            semantic_key_of(&crate::normalize_subject("default_model_setting"))
         );
-        assert!(c.body.contains("ORANGE-7319"));
-    }
-
-    /// The stored text carries the canonical subject, not the fragment left by
-    /// splitting the sentence. "以后默认使用 Flash" parses the subject as
-    /// "默认"; storing that fragment loses the object the user asked about, so
-    /// a later "默认模型是什么？" cannot match the updated entry.
-    #[test]
-    fn a_durable_fact_stores_the_canonical_subject() {
-        let c = parse_durable_fact("以后默认使用 Flash，不再使用 Pro。").expect("fact");
-        assert_eq!(
-            c.semantic_key.as_deref(),
-            Some(semantic_key_of("默认模型").as_str())
-        );
-        assert!(c.body.starts_with("默认模型："), "{:?}", c.body);
-        assert!(
-            c.tags.iter().any(|tag| tag == "subject:默认模型"),
-            "{:?}",
-            c.tags
-        );
-    }
-
-    #[test]
-    fn a_durable_fact_needs_a_marker_and_an_assignment() {
-        for text in [
-            "帮我看一下这个组件",
-            "ORANGE-7319",
-            "以后都用 pnpm",
-            "我通常希望输出短一点",
-        ] {
-            assert!(
-                parse_durable_fact(text).is_none(),
-                "must not be durable: {text}"
-            );
-        }
     }
 
     #[test]
     fn a_correction_and_its_original_share_one_key() {
-        let a = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
-        let b = parse_durable_fact("以后发布探针代号改成 BLUE-4821").unwrap();
+        let a = user_fact(
+            "release_probe_codename",
+            "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        );
+        let mut b = user_fact("release_probe_codename", "以后发布探针代号改成 BLUE-4821");
+        b.operation = CandidateOperation::Update;
         assert_eq!(a.semantic_key, b.semantic_key);
         assert_eq!(b.operation, CandidateOperation::Update);
     }
@@ -1676,13 +1221,16 @@ mod tests {
     #[test]
     fn explicit_create_then_supersede_leaves_one_current_truth() {
         let (_dir, store) = store();
-        let first = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+        let first = user_fact(
+            "release_probe_codename",
+            "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        );
         let created = store.commit_candidate(&first).unwrap();
         assert_eq!(created.operation, AppliedOperation::Created);
         let first_id = created.entry.unwrap().id;
         assert_eq!(store.effective_active().unwrap().len(), 1);
 
-        let second = parse_durable_fact("以后发布探针代号改成 BLUE-4821").unwrap();
+        let second = user_fact("release_probe_codename", "以后发布探针代号改成 BLUE-4821");
         let updated = store.commit_candidate(&second).unwrap();
         assert_eq!(updated.operation, AppliedOperation::Superseded);
         let current = store.effective_active().unwrap();
@@ -1704,7 +1252,10 @@ mod tests {
     #[test]
     fn repeating_the_same_fact_creates_no_duplicate() {
         let (_dir, store) = store();
-        let fact = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+        let fact = user_fact(
+            "release_probe_codename",
+            "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        );
         store.commit_candidate(&fact).unwrap();
         let again = store.commit_candidate(&fact).unwrap();
         assert_eq!(again.operation, AppliedOperation::Skipped);
@@ -1715,32 +1266,33 @@ mod tests {
     /// different model-generated subject because the model described the
     /// object as an API response once and a JSON response the next time.
     ///
-    /// The subject is only a hint from the model. Two statements of the same
-    /// constraint must not become two Active memories; otherwise recall can
-    /// return either wording and the user sees a rule they only stated once
-    /// duplicated.
+    /// The second candidate declares which subject it restates. The runtime
+    /// resolves that declared relation; it never guesses one from the wording.
+    /// The two statements therefore leave one Active memory and no pending
+    /// question.
     #[test]
-    fn one_constraint_under_two_subjects_creates_one_active_memory() {
+    fn a_declared_relation_unites_two_spellings_of_one_constraint() {
         let (_dir, store) = store();
         let message =
             "以后 API 响应字段命名统一使用 snake_case，JSON 响应字段命名统一使用 snake_case";
-        let candidates = vec![
-            semantic_fact(
-                "API 响应字段命名统一使用 snake_case",
-                "project.api_response_field_naming",
-                "API 响应字段命名统一使用 snake_case",
-            ),
-            semantic_fact(
-                "JSON 响应字段命名统一使用 snake_case",
-                "project.json_response_field_naming",
-                "JSON 响应字段命名统一使用 snake_case",
-            ),
-        ];
-        let validated = crate::validate_semantic_candidates(&candidates, message);
+        let mut first = semantic_fact(
+            "API 响应字段命名统一使用 snake_case",
+            "project.api_response_field_naming",
+            "API 响应字段命名统一使用 snake_case",
+        );
+        first.value = Some("snake_case".to_string());
+        let mut second = semantic_fact(
+            "JSON 响应字段命名统一使用 snake_case",
+            "project.json_response_field_naming",
+            "JSON 响应字段命名统一使用 snake_case",
+        );
+        second.value = Some("snake_case".to_string());
+        second.related_subject = Some("project.api_response_field_naming".to_string());
+        let validated = crate::validate_semantic_candidates(&[first, second], message);
         assert_eq!(
             validated.accepted.len(),
             2,
-            "the extraction keeps both wordings; identity is the store's job"
+            "the extraction keeps both wordings; the model declares the relation"
         );
 
         let first = store
@@ -1771,10 +1323,78 @@ mod tests {
         );
     }
 
-    /// Wording drift is not limited to one pair of nouns: the same constraint
-    /// with a reworded object is still one constraint.
+    /// The runtime's own tags are a structured protocol: the model may not
+    /// smuggle a second `kind:` or `subject:` into the candidate.
     #[test]
-    fn the_same_constraint_with_a_reworded_object_is_skipped() {
+    fn agent_candidate_owns_its_structured_tags() {
+        let candidate = agent_candidate(
+            "响应字段命名",
+            "响应字段命名使用 snake_case",
+            MemoryKind::Note,
+            vec![
+                "kind:preference".to_string(),
+                "subject:other".to_string(),
+                "kept".to_string(),
+            ],
+            "response_field_naming",
+            None,
+        )
+        .unwrap();
+        assert!(!candidate.tags.iter().any(|tag| tag == "kind:preference"));
+        assert!(!candidate.tags.iter().any(|tag| tag == "subject:other"));
+        assert!(candidate.tags.iter().any(|tag| tag == "kept"));
+        assert!(
+            candidate.tags.iter().any(|tag| tag == "kind:note"),
+            "{:?}",
+            candidate.tags
+        );
+        assert!(
+            candidate
+                .tags
+                .iter()
+                .any(|tag| tag == "subject:response_field_naming"),
+            "{:?}",
+            candidate.tags
+        );
+    }
+
+    /// A shared prefix is not one fact. `billing_model` and `billing_setting`
+    /// stay two identities through the whole lifecycle: committing both
+    /// leaves two current entries and no implicit update.
+    #[test]
+    fn a_shared_prefix_never_merges_two_facts() {
+        let (_dir, store) = store();
+        let model = admit_fact(&store, "计费模型使用按量计费", "billing_model");
+        assert_eq!(applied(model), AppliedOperation::Created);
+        let setting = admit_fact(&store, "计费设置允许月结", "billing_setting");
+        assert_eq!(applied(setting), AppliedOperation::Created);
+        assert_eq!(store.effective_active().unwrap().len(), 2);
+        assert!(store.list_pending().unwrap().is_empty());
+    }
+
+    /// Two languages are two spellings of a person's statement, not evidence
+    /// that two declared subjects are one. Without a structured relation an
+    /// English fact never updates a Chinese fact.
+    #[test]
+    fn different_languages_do_not_create_an_implicit_update() {
+        let (_dir, store) = store();
+        let chinese = admit_fact(&store, "默认模型使用 Pro", "default_model");
+        assert_eq!(applied(chinese), AppliedOperation::Created);
+        let english = admit_fact(
+            &store,
+            "The release probe codename is ORANGE-7319",
+            "release_probe",
+        );
+        assert_eq!(applied(english), AppliedOperation::Created);
+        assert_eq!(store.effective_active().unwrap().len(), 2);
+        assert!(store.list_archived().unwrap().is_empty());
+    }
+
+    /// Wording is not identity. Without a declared relation the runtime must
+    /// not merge two subjects, however similar the prose looks: the model owns
+    /// meaning, and a surface match is not evidence that two facts are one.
+    #[test]
+    fn wording_alone_never_unites_two_subjects() {
         let (_dir, store) = store();
         let first = admit_fact(
             &store,
@@ -1785,11 +1405,16 @@ mod tests {
 
         let second = admit_fact(
             &store,
-            "接口响应字段命名统一使用 snake_case",
-            "project.interface_response_field_naming",
+            "JSON 响应字段命名统一使用 snake_case",
+            "project.json_response_field_naming",
         );
-        assert_eq!(applied(second), AppliedOperation::Skipped);
-        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert_eq!(
+            applied(second),
+            AppliedOperation::Created,
+            "distinct declared subjects stay distinct; merging needs a relation"
+        );
+        assert_eq!(store.effective_active().unwrap().len(), 2);
+        assert!(store.list_pending().unwrap().is_empty());
     }
 
     /// A different predicate on the same subject is a different constraint
@@ -1812,77 +1437,75 @@ mod tests {
         assert_eq!(active.len(), 2, "both constraints stay current");
     }
 
-    /// A changed value for the same constraint is not a duplicate and must
-    /// not silently replace the current truth. The new wording waits for a
-    /// person while the old value stays current and historical evidence is
-    /// untouched.
+    /// A changed value for the same identity is not a duplicate: the user's
+    /// new statement is current, the old value becomes history, and nothing is
+    /// left asking for consent. The relation is the shared declared subject,
+    /// not a similarity between the two sentences.
     #[test]
-    fn a_new_value_for_the_same_constraint_is_parked_not_overwritten() {
+    fn a_changed_value_for_the_same_identity_supersedes() {
         let (_dir, store) = store();
-        admit_fact(
-            &store,
-            "API 响应字段命名统一使用 snake_case",
-            "project.api_response_field_naming",
-        );
-        let outcome = admit_fact(
-            &store,
-            "JSON 响应字段命名统一使用 camelCase",
-            "project.json_response_field_naming",
-        );
-        match outcome {
-            crate::AdmitOutcome::Proposed(crate::ProposeOutcome::Pending(candidate)) => {
-                assert!(candidate.body.contains("camelCase"));
-            }
-            other => panic!("a conflicting value must wait for a person: {other:?}"),
-        }
+        let first = user_fact("response_field_naming", "响应字段命名使用 snake_case");
+        store.commit_candidate(&first).unwrap();
+        let mut second = user_fact("response_field_naming", "响应字段命名使用 camelCase");
+        second.value = Some("camelCase".to_string());
+        let outcome = store.commit_candidate(&second).unwrap();
+        assert_eq!(outcome.operation, AppliedOperation::Superseded);
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
-        assert!(active[0].body.contains("snake_case"));
-        assert!(store.list_archived().unwrap().is_empty());
-        assert_eq!(store.list_pending().unwrap().len(), 1);
+        assert!(active[0].body.contains("camelCase"));
+        let archived = store.list_archived().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].body.contains("snake_case"));
+        assert!(store.list_pending().unwrap().is_empty());
     }
 
-    /// The same value with the opposite polarity is a contradiction, not a
-    /// duplicate.
+    /// The same value with the opposite polarity from a weaker authority is a
+    /// contradiction, not a duplicate: only the person may replace their own
+    /// decision.
     #[test]
     fn opposite_polarity_is_a_conflict_not_a_duplicate() {
         let (_dir, store) = store();
-        admit_fact(
-            &store,
-            "响应字段命名不要使用 camelCase",
-            "project.response_field_naming",
-        );
-        let outcome = admit_fact(
-            &store,
+        let mut decision = user_fact("response_field_naming", "响应字段命名不要使用 camelCase");
+        decision.value = Some("camelCase".to_string());
+        store.commit_candidate(&decision).unwrap();
+
+        let mut agent = agent_candidate(
+            "响应字段命名",
             "响应字段命名使用 camelCase",
-            "project.response_field_naming_positive",
-        );
-        assert!(matches!(
-            outcome,
-            crate::AdmitOutcome::Proposed(crate::ProposeOutcome::Pending(_))
-        ));
+            MemoryKind::Note,
+            vec![],
+            "response_field_naming",
+            None,
+        )
+        .unwrap();
+        agent.value = Some("camelCase".to_string());
+        agent.operation = CandidateOperation::Negate;
+        let outcome = store.admit_agent_candidate(agent).unwrap();
+        assert!(matches!(outcome, crate::AgentAdmitOutcome::Queued { .. }));
         assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert_eq!(store.list_pending().unwrap().len(), 1);
     }
 
     /// Identity is durable: a reopened store reaches the same conclusion,
-    /// which is what a resumed session or another process sees.
+    /// which is what a resumed session or another process sees. The second
+    /// statement is recognised as the same fact by its declared subject and
+    /// structured value, not by a repeated sentence.
     #[test]
     fn a_duplicate_is_still_recognised_after_reopening_the_store() {
         let (dir, store) = store();
-        admit_fact(
-            &store,
+        let mut first = user_fact(
+            "response_field_naming",
             "API 响应字段命名统一使用 snake_case",
-            "project.api_response_field_naming",
         );
+        first.value = Some("snake_case".to_string());
+        store.commit_candidate(&first).unwrap();
         drop(store);
 
         let reopened = MemoryStore::open(dir.path()).unwrap();
-        let second = admit_fact(
-            &reopened,
-            "JSON 响应字段命名统一使用 snake_case",
-            "project.json_response_field_naming",
-        );
-        assert_eq!(applied(second), AppliedOperation::Skipped);
+        let mut second = user_fact("response_field_naming", "字段命名约定：snake_case");
+        second.value = Some("snake_case".to_string());
+        let outcome = reopened.commit_candidate(&second).unwrap();
+        assert_eq!(outcome.operation, AppliedOperation::Skipped);
         assert_eq!(reopened.effective_active().unwrap().len(), 1);
     }
 
@@ -1904,18 +1527,17 @@ mod tests {
                 let (fact, subject) = if index % 2 == 0 {
                     (
                         "API 响应字段命名统一使用 snake_case",
-                        "project.api_response_field_naming",
+                        "response_field_naming",
                     )
                 } else {
                     (
                         "JSON 响应字段命名统一使用 snake_case",
-                        "project.json_response_field_naming",
+                        "response_field_naming",
                     )
                 };
-                let validated = crate::validate_semantic_candidates(
-                    &[semantic_fact(fact, subject, fact)],
-                    fact,
-                );
+                let mut semantic = semantic_fact(fact, subject, fact);
+                semantic.value = Some("snake_case".to_string());
+                let validated = crate::validate_semantic_candidates(&[semantic], fact);
                 let candidate = validated.accepted[0].clone();
                 barrier.wait();
                 store.commit_candidate(&candidate).unwrap()
@@ -1943,22 +1565,30 @@ mod tests {
         let (_second_dir, second) = store();
         let fact = "API 响应字段命名统一使用 snake_case";
         assert_eq!(
-            applied(admit_fact(&first, fact, "project.api_response_field_naming")),
+            applied(admit_fact(
+                &first,
+                fact,
+                "project.api_response_field_naming"
+            )),
             AppliedOperation::Created
         );
         assert_eq!(
-            applied(admit_fact(&second, fact, "project.api_response_field_naming")),
+            applied(admit_fact(
+                &second,
+                fact,
+                "project.api_response_field_naming"
+            )),
             AppliedOperation::Created
         );
         assert_eq!(first.effective_active().unwrap().len(), 1);
         assert_eq!(second.effective_active().unwrap().len(), 1);
     }
 
-    /// A direct user write runs the same content comparison. Returning the
-    /// existing memory makes the write idempotent instead of failing on a key
-    /// that no longer matches.
+    /// A direct write is a plain create: the runtime does not parse its prose
+    /// into an identity, so a differently worded write is a second memory
+    /// rather than a silent replacement.
     #[test]
-    fn a_direct_write_in_other_words_returns_the_existing_memory() {
+    fn a_direct_write_never_replaces_another_by_wording() {
         let (_dir, store) = store();
         let first = store
             .activate(
@@ -1968,6 +1598,7 @@ mod tests {
                 vec![],
             )
             .unwrap();
+        assert!(first.key.is_none(), "no identity is parsed from prose");
         let second = store
             .activate(
                 "JSON 响应字段命名",
@@ -1976,8 +1607,10 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        assert_eq!(second.id, first.id);
-        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert_ne!(second.id, first.id);
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(store.list_archived().unwrap().is_empty());
     }
 
     /// A person accepting the parked conflicting value is the choice the
@@ -1986,17 +1619,24 @@ mod tests {
     #[test]
     fn accepting_a_conflicting_value_replaces_the_old_truth_and_keeps_history() {
         let (_dir, store) = store();
-        admit_fact(
-            &store,
-            "API 响应字段命名统一使用 snake_case",
-            "project.api_response_field_naming",
-        );
-        let pending = match admit_fact(
-            &store,
-            "JSON 响应字段命名统一使用 camelCase",
-            "project.json_response_field_naming",
-        ) {
-            crate::AdmitOutcome::Proposed(crate::ProposeOutcome::Pending(candidate)) => candidate,
+        let mut decision = user_fact("response_field_naming", "响应字段命名使用 snake_case");
+        decision.value = Some("snake_case".to_string());
+        store.commit_candidate(&decision).unwrap();
+
+        // The model proposes the same identity with a different value. It has
+        // lower authority, so the lifecycle parks it instead of overwriting.
+        let mut agent = agent_candidate(
+            "响应字段命名",
+            "响应字段命名使用 camelCase",
+            MemoryKind::Note,
+            vec![],
+            "response_field_naming",
+            None,
+        )
+        .unwrap();
+        agent.value = Some("camelCase".to_string());
+        let pending = match store.admit_agent_candidate(agent).unwrap() {
+            crate::AgentAdmitOutcome::Queued { candidate, .. } => candidate,
             other => panic!("expected a parked conflict: {other:?}"),
         };
 
@@ -2014,50 +1654,47 @@ mod tests {
         );
     }
 
-    /// Accepting a pending wording that has since become equivalent to an
-    /// active memory is an idempotent accept, not a second entry and not an
-    /// error.
+    /// An explicit write establishes the current truth for an identity, so an
+    /// older unapproved proposal for the same identity is stale. It is
+    /// cleared as part of the write, and no second accept is needed.
     #[test]
-    fn accepting_an_equivalent_pending_candidate_returns_the_current_truth() {
+    fn an_explicit_write_clears_a_stale_equivalent_proposal() {
         let (_dir, store) = store();
-        let fact = "JSON 响应字段命名统一使用 snake_case";
-        let validated = crate::validate_semantic_candidates(
-            &[semantic_fact(
-                fact,
-                "project.json_response_field_naming",
-                fact,
-            )],
-            fact,
-        );
-        let pending = store
-            .propose(validated.accepted[0].clone())
-            .unwrap();
+        let fact = "响应字段命名统一使用 snake_case";
+        let mut semantic = semantic_fact(fact, "response_field_naming", fact);
+        semantic.value = Some("snake_case".to_string());
+        let validated = crate::validate_semantic_candidates(&[semantic], fact);
+        let pending = store.propose(validated.accepted[0].clone()).unwrap();
         let pending = match pending {
             crate::ProposeOutcome::Pending(candidate) => candidate,
             other => panic!("expected pending: {other:?}"),
         };
-        admit_fact(
-            &store,
-            "API 响应字段命名统一使用 snake_case",
-            "project.api_response_field_naming",
-        );
+        let mut active = user_fact("response_field_naming", "字段命名约定：snake_case");
+        active.value = Some("snake_case".to_string());
+        store.commit_candidate(&active).unwrap();
 
-        let accepted = store.accept(&pending.id).unwrap();
-        assert!(accepted.body.contains("snake_case"));
         assert_eq!(store.effective_active().unwrap().len(), 1);
         assert!(store.list_archived().unwrap().is_empty());
+        assert!(
+            store.read_pending(&pending.id).is_err(),
+            "the superseded proposal must not remain acceptable"
+        );
+        assert!(store.list_pending().unwrap().is_empty());
     }
 
     #[test]
     fn retry_reconciles_crash_after_new_truth_became_durable() {
         let (_dir, store) = store();
-        let first = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+        let first = user_fact(
+            "release_probe_codename",
+            "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        );
         let old = store
             .commit_candidate(&first)
             .unwrap()
             .entry
             .expect("created entry");
-        let second = parse_durable_fact("以后发布探针代号改成 BLUE-4821").unwrap();
+        let second = user_fact("release_probe_codename", "以后发布探针代号改成 BLUE-4821");
 
         // Fault injection: this is the exact durable state left by a process
         // dying after the replacement write and before the old entry is moved
@@ -2088,7 +1725,7 @@ mod tests {
         let mut initial = MemoryCandidate::new(
             "初始模型",
             "并发写入模型：initial",
-            CandidateKind::Free,
+            crate::CandidateKind::Free,
             Some(key.clone()),
             CandidateSource::UserExplicit,
             vec![],
@@ -2108,7 +1745,7 @@ mod tests {
                 let mut candidate = MemoryCandidate::new(
                     format!("并发模型 {index}"),
                     format!("并发写入模型：value-{index}"),
-                    CandidateKind::Free,
+                    crate::CandidateKind::Free,
                     Some(key),
                     CandidateSource::UserExplicit,
                     vec![],
@@ -2136,10 +1773,12 @@ mod tests {
     #[test]
     fn a_strict_superset_merges_instead_of_duplicating() {
         let (_dir, store) = store();
-        let first = parse_durable_fact("以后本项目平台支持固定为 Windows").unwrap();
+        let first = user_fact("platform_support", "以后本项目平台支持固定为 Windows");
         store.commit_candidate(&first).unwrap();
-        let second =
-            parse_durable_fact("以后本项目平台支持固定为 Windows\n同时支持 Linux").unwrap();
+        let second = user_fact(
+            "platform_support",
+            "以后本项目平台支持固定为 Windows\n同时支持 Linux",
+        );
         let outcome = store.commit_candidate(&second).unwrap();
         assert_eq!(outcome.operation, AppliedOperation::Merged);
         let active = store.effective_active().unwrap();
@@ -2151,9 +1790,9 @@ mod tests {
     #[test]
     fn conflicting_values_never_merge() {
         let (_dir, store) = store();
-        let first = parse_durable_fact("以后本项目默认模型固定为 flash").unwrap();
+        let first = user_fact("default_model", "以后本项目默认模型固定为 flash");
         store.commit_candidate(&first).unwrap();
-        let second = parse_durable_fact("以后发布探针代号固定为 pro").unwrap();
+        let second = user_fact("release_probe_codename", "以后发布探针代号固定为 pro");
         // Different subject → different key → create, not merge.
         let outcome = store.commit_candidate(&second).unwrap();
         assert_eq!(outcome.operation, AppliedOperation::Created);
@@ -2163,7 +1802,7 @@ mod tests {
     #[test]
     fn model_inference_cannot_supersede_explicit_user() {
         let (_dir, store) = store();
-        let mut explicit = parse_durable_fact("以后本项目平台支持固定为 Windows").unwrap();
+        let mut explicit = user_fact("platform_support", "以后本项目平台支持固定为 Windows");
         explicit.semantic_key = Some(semantic_key_of("平台支持"));
         explicit.key = Some(semantic_key_of("平台支持"));
         store.commit_candidate(&explicit).unwrap();
@@ -2205,7 +1844,10 @@ mod tests {
     #[test]
     fn provenance_survives_commit() {
         let (_dir, store) = store();
-        let fact = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+        let fact = user_fact(
+            "release_probe_codename",
+            "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        );
         let entry = store.commit_candidate(&fact).unwrap().entry.unwrap();
         assert_eq!(entry.authority(), MemoryAuthority::ExplicitUser);
         let provenance = entry.provenance.clone().expect("provenance");
@@ -2234,7 +1876,7 @@ mod tests {
         let mut candidate = MemoryCandidate::new(
             "部署令牌轮换",
             "部署令牌：rotate",
-            CandidateKind::Free,
+            crate::CandidateKind::Free,
             Some(key),
             CandidateSource::UserExplicit,
             vec![],
@@ -2258,9 +1900,9 @@ mod tests {
     #[test]
     fn a_delayed_retry_of_an_old_candidate_cannot_revert_current_truth() {
         let (_dir, store) = store();
-        let old_candidate = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old_candidate = user_fact("default_model", "以后本项目默认模型固定为 Pro");
         store.commit_candidate(&old_candidate).unwrap();
-        let current = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let current = user_fact("default_model", "以后本项目默认模型改为 Flash");
         store.commit_candidate(&current).unwrap();
 
         let mut retried = old_candidate.clone();
@@ -2279,10 +1921,11 @@ mod tests {
 
     // ---- unified write paths ----
 
-    /// A user write that states a durable assignment uses the same identity as
-    /// every other path: the later value replaces the earlier one.
+    /// A direct write is a plain create. The runtime does not parse an
+    /// identity out of its prose, so a later direct write is a second memory
+    /// with its own history rather than a silent replacement.
     #[test]
-    fn activating_a_durable_assignment_updates_the_same_identity() {
+    fn a_direct_write_does_not_parse_an_identity_from_prose() {
         let (_dir, store) = store();
         let first = store
             .activate(
@@ -2292,7 +1935,7 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        assert!(first.key.is_some(), "identity is established on write");
+        assert!(first.key.is_none(), "no identity is parsed from prose");
 
         let second = store
             .activate(
@@ -2302,16 +1945,20 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        assert_eq!(second.key, first.key, "same semantic identity");
+        assert!(second.key.is_none());
+        assert_ne!(second.id, first.id);
 
         let current = store.effective_active().unwrap();
-        assert_eq!(current.len(), 1);
-        assert!(current[0].body.contains("Flash"));
-        assert_eq!(store.list_archived().unwrap()[0].id, first.id);
-        assert_eq!(
-            current[0].kind.as_deref(),
-            Some("preference"),
-            "the caller's kind survives the lifecycle"
+        assert_eq!(current.len(), 2);
+        assert!(
+            store.list_archived().unwrap().is_empty(),
+            "nothing was silently replaced"
+        );
+        assert!(
+            current
+                .iter()
+                .all(|entry| entry.kind.as_deref() == Some("preference")),
+            "the caller's kind survives"
         );
     }
 
@@ -2320,7 +1967,7 @@ mod tests {
     #[test]
     fn agent_conflict_with_user_truth_is_queued_not_applied() {
         let (_dir, store) = store();
-        let user = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let user = user_fact("default_model", "以后本项目默认模型固定为 Pro");
         store.commit_candidate(&user).unwrap();
 
         let agent = agent_candidate(
@@ -2409,9 +2056,9 @@ mod tests {
     #[test]
     fn restoring_history_supersedes_current_truth() {
         let (_dir, store) = store();
-        let first = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let first = user_fact("default_model", "以后本项目默认模型固定为 Pro");
         let old_id = store.commit_candidate(&first).unwrap().entry.unwrap().id;
-        let second = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let second = user_fact("default_model", "以后本项目默认模型改为 Flash");
         store.commit_candidate(&second).unwrap();
 
         let restored = store.restore(&old_id).unwrap();
@@ -2455,22 +2102,12 @@ mod tests {
     #[test]
     fn standing_preferences_never_hold_two_values_for_one_identity() {
         let (_dir, store) = store();
-        store
-            .activate(
-                "默认模型",
-                "以后本项目默认模型固定为 Pro",
-                MemoryKind::Preference,
-                vec![],
-            )
-            .unwrap();
-        store
-            .activate(
-                "默认模型",
-                "以后本项目默认模型改为 Flash",
-                MemoryKind::Preference,
-                vec![],
-            )
-            .unwrap();
+        let mut pro = user_fact("default_model", "以后本项目默认模型固定为 Pro");
+        pro.kind = crate::CandidateKind::Preference;
+        store.commit_candidate(&pro).unwrap();
+        let mut flash = user_fact("default_model", "以后本项目默认模型改为 Flash");
+        flash.kind = crate::CandidateKind::Preference;
+        store.commit_candidate(&flash).unwrap();
         let preferences = store.standing_preferences(16).unwrap();
         assert_eq!(preferences.len(), 1);
         assert!(preferences[0].body.contains("Flash"));
@@ -2482,12 +2119,12 @@ mod tests {
     #[test]
     fn a_fresh_restatement_of_an_older_value_is_not_treated_as_a_retry() {
         let (_dir, store) = store();
-        let pro = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let pro = user_fact("default_model", "以后本项目默认模型固定为 Pro");
         store.commit_candidate(&pro).unwrap();
-        let flash = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let flash = user_fact("default_model", "以后本项目默认模型改为 Flash");
         store.commit_candidate(&flash).unwrap();
 
-        let pro_again = parse_durable_fact("以后本项目默认模型改为 Pro").unwrap();
+        let pro_again = user_fact("default_model", "以后本项目默认模型改为 Pro");
         let outcome = store.commit_candidate(&pro_again).unwrap();
         assert_eq!(outcome.operation, AppliedOperation::Superseded);
         let active = store.effective_active().unwrap();
@@ -2501,9 +2138,9 @@ mod tests {
     #[test]
     fn every_injection_surface_drops_the_superseded_value() {
         let (_dir, store) = store();
-        let first = parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let first = user_fact("default_model", "以后本项目默认模型固定为 Pro");
         store.commit_candidate(&first).unwrap();
-        let second = parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        let second = user_fact("default_model", "以后本项目默认模型改为 Flash");
         store.commit_candidate(&second).unwrap();
 
         let catalog = store.catalog_lines(16).unwrap();
@@ -2547,9 +2184,12 @@ mod tests {
     #[test]
     fn recall_returns_the_current_truth_only() {
         let (_dir, store) = store();
-        let a = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+        let a = user_fact(
+            "release_probe_codename",
+            "以后这个项目的发布探针代号固定为 ORANGE-7319",
+        );
         store.commit_candidate(&a).unwrap();
-        let b = parse_durable_fact("以后发布探针代号改成 BLUE-4821").unwrap();
+        let b = user_fact("release_probe_codename", "以后发布探针代号改成 BLUE-4821");
         store.commit_candidate(&b).unwrap();
         let hits = store.recall("发布探针代号", 5).unwrap();
         assert_eq!(hits.len(), 1);

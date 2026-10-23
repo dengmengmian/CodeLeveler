@@ -41,7 +41,7 @@ pub use executor::{
 pub use experience::{
     ExperienceCandidate, ExperienceEvent, ExperienceEvidencePack, ExperienceExtraction,
     ExperienceExtractor, ExperienceRejection, ExperienceRun, ModelExperienceExtractor,
-    ValidatedExperiences, build_evidence_pack, experience_system_prompt,
+    ValidatedExperiences, build_evidence_pack, evidence_fingerprint, experience_system_prompt,
     parse_experience_candidates, validate_experience_candidate, validate_experience_candidates,
 };
 pub use leveler_agent_core::{

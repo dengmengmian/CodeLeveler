@@ -20,7 +20,7 @@ pub use audit::{IdentityAudit, IdentityLocation, IdentityRecord, IdentityState, 
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, candidate_sensitive_fields, fingerprint_of,
     is_high_risk_memory, is_sensitive_candidate, looks_like_secret, package_manager_from_root,
-    parse_direct_memory_command, parse_inferred_preference, redact_candidate, title_from_body,
+    parse_direct_memory_command, redact_candidate, title_from_body,
 };
 pub use experience::{
     EXPERIENCE_KIND, ExperienceCategory, ExperienceEvidence, ExperienceRecord, ExperienceStanding,
@@ -29,20 +29,19 @@ pub use experience::{
 pub use lanes::MemoryLanes;
 pub use lifecycle::{
     AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
-    MemoryLifecycleOp, MemoryOperation, Provenance, agent_candidate, decide, parse_durable_fact,
-    semantic_key_of,
+    MemoryLifecycleOp, MemoryOperation, Provenance, agent_candidate, decide, semantic_key_of,
 };
 pub use pipeline::{
     AdmitOutcome, AgentAdmitOutcome, ProposeOutcome, SuppressRecord,
-    candidate_eligible_for_activation, collect_turn_candidates,
+    candidate_eligible_for_activation,
 };
 pub use semantic::{
     CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
-    SemanticError, SemanticMemoryType, ValidatedCandidates, canonical_subject, evidence_matches,
+    SemanticError, SemanticMemoryType, ValidatedCandidates, evidence_matches, normalize_subject,
     parse_semantic_candidates, validate_semantic_candidate, validate_semantic_candidates,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -95,6 +94,11 @@ pub struct MemoryEntry {
     /// Doubles as the semantic identity for lifecycle conflict resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// The value the fact assigns, when the statement is an assignment. Stored
+    /// structurally so "same subject, same value" is an exact field compare,
+    /// never a comparison of two sentences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
     /// Free-form kind label (`preference`, `package_manager`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -408,21 +412,13 @@ impl MemoryStore {
     /// THE way a new active memory comes into being.
     ///
     /// Every caller that creates active memory goes through here — `/remember`,
-    /// the Web panel, the CLI, an approved agent proposal, and accepting a
-    /// candidate. Before this existed each one picked between `remember`
-    /// (upsert by id) and `remember_deduplicated` and decided overwrite,
-    /// dedup and pending cleanup for itself; the CLI picked the upsert and
-    /// silently destroyed same-titled notes.
+    /// Store a memory the person wrote directly.
     ///
-    /// Guarantees: a non-assignment body never overwrites — identical
-    /// title+body returns the entry that already exists (so a retry is
-    /// idempotent) and the same title with different content gets its own id.
-    /// A body that states a durable assignment ("以后…固定为 X") instead runs
-    /// the shared lifecycle: it updates the current value for that semantic
-    /// identity and preserves the old value as superseded history. Secrets are
-    /// refused here rather than in each UI, and an equivalent pending
-    /// candidate is cleaned up once the active copy is durable — a failure to
-    /// clean up leaves the active entry in place rather than rolling it back.
+    /// The person's own command is the authority, but no meaning is parsed
+    /// out of the prose: identity, scope and relations are model-supplied
+    /// structured fields on the proposal paths. A direct write is therefore a
+    /// plain create (deduplicated by title+body) and never silently replaces
+    /// another entry. Secrets are refused here rather than in each UI.
     pub fn activate(
         &self,
         title: &str,
@@ -439,72 +435,6 @@ impl MemoryStore {
             ));
         }
         let _lifecycle_lock = self.acquire_lifecycle_lock()?;
-        // A user write that states an assignment ("以后默认模型固定为 Pro")
-        // carries the same semantic identity as every other path. It therefore
-        // runs the same lifecycle decision: a later value replaces the earlier
-        // one and the old value becomes history, instead of accumulating a
-        // second current truth. A non-assignment body stays a plain create.
-        if let Some(mut candidate) = crate::parse_durable_fact(body) {
-            candidate.title = title.trim().to_string();
-            candidate.body = body.trim().to_string();
-            candidate.kind = kind.candidate_kind();
-            candidate
-                .tags
-                .retain(|tag| !tag.trim_start().starts_with("kind:"));
-            candidate.tags.push(format!("kind:{}", kind.as_str()));
-            candidate.authority = MemoryAuthority::ExplicitUser;
-            candidate.source = CandidateSource::UserExplicit;
-            if candidate.evidence.is_none() {
-                candidate.evidence = Some(body.trim().to_string());
-            }
-            let outcome = self.apply_candidate_locked(&candidate, &now_rfc3339())?;
-            return match outcome.operation {
-                AppliedOperation::Created
-                | AppliedOperation::Superseded
-                | AppliedOperation::Merged => {
-                    let saved = outcome.entry.ok_or_else(|| {
-                        MemoryError::Invalid("memory write produced no current entry".to_string())
-                    })?;
-                    // Best effort, after the active copy is durable, exactly
-                    // like the non-assignment path below.
-                    let _ = self.clear_equivalent_pending(&saved);
-                    Ok(saved)
-                }
-                AppliedOperation::Skipped => {
-                    let key = candidate
-                        .semantic_key
-                        .as_deref()
-                        .or(candidate.key.as_deref());
-                    let current = self.effective_active()?.into_iter().find(|entry| {
-                        key.is_some_and(|key| {
-                            crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)
-                        })
-                    });
-                    match current {
-                        Some(entry) => Ok(entry),
-                        // The same constraint stated in other words has no
-                        // matching key. The decision already found the entry
-                        // that covers this write; return it instead of failing.
-                        None => crate::lifecycle::decide(self, &candidate, &now_rfc3339())?
-                            .related
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                MemoryError::Invalid(
-                                    outcome
-                                        .skipped_reason
-                                        .unwrap_or_else(|| "memory was not stored".to_string()),
-                                )
-                            }),
-                    }
-                }
-                AppliedOperation::NeedsApproval => Err(MemoryError::Invalid(
-                    outcome
-                        .skipped_reason
-                        .unwrap_or_else(|| "memory needs a person".to_string()),
-                )),
-            };
-        }
         let mut entry = new_entry(title, body, tags);
         entry.kind = Some(kind.as_str().to_string());
         // Every caller of `activate` is a person's own command or a proposal
@@ -709,7 +639,6 @@ impl MemoryStore {
             })
             .collect();
         let docs: Vec<Vec<String>> = doc_texts.iter().map(|text| tokenize(text)).collect();
-        let subjects: Vec<Option<&str>> = entries.iter().map(declared_subject).collect();
         let n = docs.len() as f64;
         if n == 0.0 {
             return Ok(Vec::new());
@@ -720,15 +649,12 @@ impl MemoryStore {
             df.insert(term.as_str(), count);
         }
         let avgdl = docs.iter().map(|d| d.len() as f64).sum::<f64>() / n;
-        let query_terms: HashSet<&str> = q.iter().map(String::as_str).collect();
-        let query_trigrams = cjk_trigrams(query);
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
         let mut scored: Vec<(usize, f64)> = Vec::new();
         for (i, doc) in docs.iter().enumerate() {
             let dl = doc.len() as f64;
             let mut score = 0.0;
-            let mut matched: HashSet<&str> = HashSet::new();
             for term in &q {
                 let tf = doc.iter().filter(|t| *t == term).count() as f64;
                 if tf == 0.0 {
@@ -738,19 +664,15 @@ impl MemoryStore {
                 if dfi == 0.0 {
                     continue;
                 }
-                matched.insert(term.as_str());
                 let idf = ((n - dfi + 0.5) / (dfi + 0.5) + 1.0).ln();
                 let denom = tf + K1 * (1.0 - B + B * dl / avgdl.max(1.0));
                 score += idf * (tf * (K1 + 1.0)) / denom;
             }
-            if score > 0.0
-                && (relevant_match(
-                    &query_terms,
-                    &matched,
-                    &query_trigrams,
-                    &cjk_trigrams(&doc_texts[i]),
-                ) || subjects[i].is_some_and(|subject| query_names_subject(query, subject)))
-            {
+            // Lexical overlap is retrieval, not applicability. The caller
+            // bounds this candidate set and the main model judges which
+            // candidates this task actually needs; the store must not encode
+            // "relevant" as a word list or phrase rule.
+            if score > 0.0 {
                 scored.push((i, score * relevance_weight(&entries[i])));
             }
         }
@@ -789,106 +711,6 @@ fn relevance_weight(entry: &MemoryEntry) -> f64 {
         None => 1.0,
     };
     authority * scope * evidence
-}
-
-/// Three-character CJK windows. A shared trigram is a phrase, while two
-/// isolated shared bigrams are often just common words appearing nearby.
-fn cjk_trigrams(text: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let mut run: Vec<char> = Vec::new();
-    let flush = |run: &mut Vec<char>, out: &mut HashSet<String>| {
-        if run.len() >= 3 {
-            for window in run.windows(3) {
-                out.insert(window.iter().collect());
-            }
-        }
-        run.clear();
-    };
-    for c in text.chars() {
-        if is_cjk(c) {
-            run.push(c);
-        } else {
-            flush(&mut run, &mut out);
-        }
-    }
-    flush(&mut run, &mut out);
-    out
-}
-
-/// A lexical hit is only recall-worthy when the overlap is specific.
-///
-/// BM25 answers "how often do these words occur", not "is this memory about
-/// the request". A long request can share two generic words with an unrelated
-/// entry and outscore a short, precise technical match. Accept a hit when at
-/// least one of these holds:
-///
-/// - the query is mostly about the entry (half its distinct terms matched);
-/// - a technical identifier (an ASCII word such as `MCP` or `SQLite`) matched;
-/// - a three-character CJK phrase is shared.
-fn relevant_match(
-    query_terms: &HashSet<&str>,
-    matched: &HashSet<&str>,
-    query_trigrams: &HashSet<String>,
-    doc_trigrams: &HashSet<String>,
-) -> bool {
-    if matched.is_empty() || query_terms.is_empty() {
-        return false;
-    }
-    if matched.len() * 2 >= query_terms.len() {
-        return true;
-    }
-    if matched
-        .iter()
-        .any(|term| term.chars().count() >= 2 && term.chars().all(|c| c.is_ascii_alphanumeric()))
-    {
-        return true;
-    }
-    !query_trigrams.is_disjoint(doc_trigrams)
-}
-
-/// The identity every write path records for a fact. Entries written before
-/// subjects were tagged have none, so the rule simply does not apply to them.
-fn declared_subject(entry: &MemoryEntry) -> Option<&str> {
-    entry
-        .tags
-        .iter()
-        .find_map(|tag| tag.strip_prefix("subject:"))
-        .map(str::trim)
-        .filter(|subject| !subject.is_empty())
-}
-
-/// A query can refer to a declared identity by naming part of it.
-///
-/// The overlap ratio cannot see this: `模型按之前定的来` is mostly function
-/// words, so only one of its bigrams matches. Measure the longest contiguous
-/// CJK span the query shares with the subject instead. A span covering at
-/// least half of the subject names it (`模型` for `默认模型`); a single generic
-/// word does not (`字段` for `API 响应字段命名`). ASCII identifiers are already
-/// handled by [`relevant_match`].
-fn query_names_subject(query: &str, subject: &str) -> bool {
-    let subject: Vec<char> = subject.chars().filter(|c| is_cjk(*c)).collect();
-    if subject.len() < 2 {
-        return false;
-    }
-    let query: Vec<char> = query.chars().collect();
-    let mut longest = 0;
-    for start in 0..subject.len() {
-        if !query.contains(&subject[start]) {
-            continue;
-        }
-        for end in (start + 2)..=subject.len() {
-            let window = &subject[start..end];
-            if !window.iter().all(|c| is_cjk(*c)) {
-                break;
-            }
-            if query.windows(window.len()).any(|candidate| candidate == window) {
-                longest = longest.max(window.len());
-            } else {
-                break;
-            }
-        }
-    }
-    longest >= 2 && longest * 2 >= subject.len()
 }
 
 fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
@@ -939,6 +761,7 @@ pub fn new_entry(title: &str, body: &str, tags: Vec<String>) -> MemoryEntry {
         updated_at: ts,
         archived_at: None,
         key: None,
+        value: None,
         kind: None,
         status: MemoryStatus::Active,
         scope: MemoryScope::Project,
@@ -999,6 +822,7 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
     });
     entry.expires_at = candidate.expires_at.clone();
     entry.experience = candidate.experience.clone();
+    entry.value = candidate.value.clone();
     entry
 }
 
@@ -1350,6 +1174,37 @@ pub(crate) fn write_atomically_pub(path: &Path, bytes: &[u8]) -> Result<(), Memo
 
 #[cfg(test)]
 mod tests {
+    /// A structured durable fact. The model owns the subject; the test
+    /// supplies it directly, so no prose is parsed into identity anywhere.
+    pub(crate) fn fact(subject: &str, body: &str) -> MemoryCandidate {
+        let key = semantic_key_of(&normalize_subject(subject));
+        let mut candidate = MemoryCandidate::new(
+            body,
+            body,
+            CandidateKind::Free,
+            Some(key.clone()),
+            CandidateSource::UserExplicit,
+            vec![format!("subject:{subject}")],
+        )
+        .unwrap();
+        candidate.semantic_key = Some(key);
+        candidate.authority = MemoryAuthority::ExplicitUser;
+        candidate
+    }
+
+    /// A pending proposal with no parsed meaning.
+    fn inferred(body: &str) -> MemoryCandidate {
+        MemoryCandidate::new(
+            body,
+            body,
+            CandidateKind::Free,
+            None,
+            CandidateSource::SystemInferred,
+            vec![],
+        )
+        .unwrap()
+    }
+
     /// One fact must not end up as a direct write AND a candidate awaiting
     /// consent: the user would be asked to approve what is already saved.
     #[test]
@@ -1358,12 +1213,7 @@ mod tests {
         let store = MemoryStore::open(dir.path()).unwrap();
         let body = "提交前先运行 pnpm lint";
 
-        // A soft signal proposed it first.
-        let candidate = match store
-            .propose_from_user_text(&format!("我通常希望{body}"))
-            .unwrap()
-            .unwrap()
-        {
+        let candidate = match store.propose(inferred(body)).unwrap() {
             ProposeOutcome::Pending(c) => c,
             other => panic!("{other:?}"),
         };
@@ -1395,11 +1245,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         let body = "提交前先运行 pnpm lint";
-        let candidate = match store
-            .propose_from_user_text(&format!("我通常希望{body}"))
-            .unwrap()
-            .unwrap()
-        {
+        let candidate = match store.propose(inferred(body)).unwrap() {
             ProposeOutcome::Pending(c) => c,
             other => panic!("{other:?}"),
         };
@@ -1505,8 +1351,8 @@ mod tests {
     fn activation_clears_an_equivalent_pending_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let text = "我通常希望提交前先跑 lint";
-        let candidate = match store.propose_from_user_text(text).unwrap().unwrap() {
+        let text = "提交前先跑 lint";
+        let candidate = match store.propose(inferred(text)).unwrap() {
             ProposeOutcome::Pending(c) => c,
             other => panic!("{other:?}"),
         };
@@ -2597,12 +2443,12 @@ mod safety_tests {
         assert_eq!(archived[0].status, crate::MemoryStatus::Superseded);
     }
 
-    /// A generic error line ("assertion left == right failed") can describe
-    /// unrelated causes. A later verified lesson that shares the identity but
-    /// says something else is not an update; overwriting the current account
-    /// would make one wrong explanation the only remembered truth.
+    /// The model declares the subject, and the runtime does not second-guess
+    /// that declaration with a prose-similarity gate. A reading that names the
+    /// same identity and carries verified evidence is the newer account; the
+    /// old one is archived, never deleted.
     #[test]
-    fn a_different_explanation_under_one_failure_signature_waits_for_a_person() {
+    fn a_verified_reading_under_the_same_identity_becomes_current() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         store
@@ -2620,23 +2466,19 @@ mod safety_tests {
         conflicting.experience.as_mut().unwrap().applies_when =
             "a Rust test asserts on a value produced by the changed API".to_string();
         let outcome = store.admit_experience_candidate(conflicting).unwrap();
-        let crate::AgentAdmitOutcome::Queued { candidate, .. } = outcome else {
-            panic!("a different claim must wait for a person: {outcome:?}");
-        };
-        let active = store.effective_active().unwrap();
-        assert_eq!(active.len(), 1);
         assert!(
-            active[0].body.contains("linker"),
-            "the current lesson must not be overwritten: {active:?}"
+            matches!(
+                outcome,
+                crate::AgentAdmitOutcome::Applied(CommitOutcome {
+                    operation: crate::AppliedOperation::Superseded,
+                    ..
+                })
+            ),
+            "a verified reading of the same identity is an update: {outcome:?}"
         );
-
-        // The person chooses the parked explanation: consent resolves the
-        // dispute without parking it a second time.
-        let accepted = store.accept(&candidate.id).unwrap();
-        assert!(accepted.body.contains("assertion"), "{accepted:?}");
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].id, accepted.id);
+        assert!(active[0].body.contains("assertion"), "{active:?}");
         assert!(
             store
                 .list_archived()
@@ -2644,7 +2486,7 @@ mod safety_tests {
                 .iter()
                 .any(|entry| entry.body.contains("linker")
                     && entry.status == crate::MemoryStatus::Superseded),
-            "the rejected account stays as history"
+            "the replaced account stays as history"
         );
     }
 
@@ -2687,11 +2529,11 @@ mod safety_tests {
         assert_eq!(store.effective_active().unwrap()[0].id, accepted.id);
     }
 
-    /// A sentence asserting that a lesson is inapplicable is a claim, not
-    /// runtime evidence. Under the same identity it must wait for a person
-    /// instead of retiring the current lesson.
+    /// An unverified claim that a lesson is inapplicable is a hypothesis, not
+    /// runtime evidence. The structured verification field decides this, not
+    /// the wording of the sentence: only a person may retire the lesson.
     #[test]
-    fn a_bare_claim_that_a_lesson_is_inapplicable_waits_for_a_person() {
+    fn an_unverified_claim_that_a_lesson_is_inapplicable_waits_for_a_person() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
         store
@@ -2702,17 +2544,17 @@ mod safety_tests {
             ))
             .unwrap();
 
-        let outcome = store
-            .admit_experience_candidate(verified_experience(
-                "cargo.test.dev_profile",
-                "旧经验已经不适用：缓存目录权限才是真正原因，请先清理缓存重建索引。",
-                "cargo test -p demo (exit 0)",
-            ))
-            .unwrap();
+        let mut claim = verified_experience(
+            "cargo.test.dev_profile",
+            "旧经验已经不适用：缓存目录权限才是真正原因，请先清理缓存重建索引。",
+            "cargo test -p demo (exit 0)",
+        );
+        claim.experience.as_mut().unwrap().verification = crate::ExperienceVerification::Unverified;
+        let outcome = store.admit_experience_candidate(claim).unwrap();
 
         assert!(
             matches!(outcome, crate::AgentAdmitOutcome::Queued { .. }),
-            "a model sentence must not mechanically invalidate an experience: {outcome:?}"
+            "an unverified claim must not mechanically invalidate an experience: {outcome:?}"
         );
         let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
@@ -2824,7 +2666,11 @@ mod safety_tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].0.body.contains("A 项目"));
         assert_eq!(store_b.effective_active().unwrap().len(), 1);
-        assert!(store_b.effective_active().unwrap()[0].body.contains("B 项目"));
+        assert!(
+            store_b.effective_active().unwrap()[0]
+                .body
+                .contains("B 项目")
+        );
     }
 
     #[test]
@@ -3220,25 +3066,22 @@ mod safety_tests {
         (dir, store)
     }
 
-    /// A long request shares "生成" and "代码" with an unrelated code-commit
-    /// rule. Two isolated generic words are not relevance: unrelated memories
-    /// must not be injected just because their words also appear in the task.
+    /// BM25 retrieval is not a verdict. A long request that shares generic
+    /// words with a rule still offers that rule as a candidate; whether it
+    /// applies is the main model's judgment, not a curated word list's.
     #[test]
-    fn recall_drops_incidental_shared_words_in_a_long_request() {
+    fn a_generic_word_overlap_is_offered_as_a_candidate() {
         let (_dir, store) = store_with_code_and_mcp();
         let query = "用 Python 写一个生成斐波那契数列前十项的函数，只给代码，不要修改任何文件，也不要读取项目文件。";
         let hits = store.recall(query, 4).unwrap();
         assert!(
-            hits.iter().all(|(entry, _)| entry.id != "code"),
-            "an unrelated commit rule was recalled: {:?}",
+            hits.iter().any(|(entry, _)| entry.id == "code"),
+            "lexical retrieval must offer the candidate: {:?}",
             hits.iter()
                 .map(|(entry, score)| (&entry.id, score))
                 .collect::<Vec<_>>()
         );
-        assert!(
-            hits.is_empty(),
-            "nothing in this store is relevant: {hits:?}"
-        );
+        assert!(hits.len() <= 4, "the candidate set stays bounded");
     }
 
     /// The same long request that names the subject still recalls the entry:
@@ -3280,22 +3123,296 @@ mod safety_tests {
     fn recall_recognises_a_shorthand_for_the_declared_subject() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let fact = parse_durable_fact("以后本项目默认模型固定为 flash").unwrap();
+        let fact = crate::tests::fact("默认模型", "以后本项目默认模型固定为 flash");
         store.commit_candidate(&fact).unwrap();
         let hits = store.recall("模型按之前定的来", 4).unwrap();
         assert_eq!(hits.len(), 1, "the decision was not recalled: {hits:?}");
         assert!(hits[0].0.body.contains("flash"), "{:?}", hits[0].0.body);
     }
 
-    /// Naming a single generic word is not naming the identity: a field
-    /// question must not recall an unrelated naming convention.
+    /// A single shared word produces a candidate row. Whether it names the
+    /// same decision is the model's call; the store does not turn that into a
+    /// hidden identity rule.
     #[test]
-    fn a_generic_word_below_half_the_subject_is_not_an_identity_match() {
+    fn a_single_shared_word_is_a_candidate_not_an_identity_match() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path()).unwrap();
-        let fact = parse_durable_fact("以后 API 响应字段命名统一使用 snake_case").unwrap();
+        let fact = crate::tests::fact(
+            "API 响应字段命名",
+            "以后 API 响应字段命名统一使用 snake_case",
+        );
         store.commit_candidate(&fact).unwrap();
         let hits = store.recall("这个字段怎么序列化", 4).unwrap();
-        assert!(hits.is_empty(), "a generic word was treated as identity: {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a lexical candidate must be offered for judgment: {hits:?}"
+        );
+    }
+
+    // The task texts below are the real prompts from the DF-M3 acceptance
+    // arms (2026-10-22) whose recall decisions were wrong. They stay verbatim
+    // so this regression keeps testing the observed failure, not a simplified
+    // paraphrase of it.
+    const ENGINE_TASK: &str = r#"Execute `./verify.sh` as one standalone command: no `;`, pipe, redirection, or appended exit-status echo. It exits non-zero with the message `error: engine profile rejected`. Diagnose the real cause in this environment, then fix the project configuration so `./verify.sh` exits 0 and prints an `engine: build ok` receipt. Do not edit `./verify.sh` and do not modify the engine program or anything outside this repository; fix the project's own `engine.config`."#;
+    const PYTHON_REPORT_TASK: &str = r#"Run `python3 -m unittest tests.test_report`. It fails with `AssertionError: 30.0 != 15.0` and a `ZeroDivisionError` on the one-value case. Diagnose the real cause in `scripts/report.py` and fix it so both tests pass. Do not change the tests or anything outside this repository."#;
+    const CARGO_SCALE_TASK: &str = r#"Run `cargo test --test scale`. It fails because `scale(3, 4)` returns 7 instead of 12. Fix `src/lib.rs` so `cargo test --test scale` passes. Only the scale failure is in scope; do not change the tests or unrelated functions, and do not fix unrelated failing tests."#;
+    const PYBUILD_TASK: &str = r#"What layout value does the installed pybuild in this environment accept, and what must `pybuild.config` contain for `./verify.sh` to succeed? Answer from the current environment. Do not modify any files."#;
+
+    fn learn_experience(
+        store: &MemoryStore,
+        subject: &str,
+        title: &str,
+        body: &str,
+        applies_when: &str,
+    ) {
+        let mut candidate = verified_experience(subject, body, "cargo test --test scale (exit 0)");
+        candidate.title = title.to_string();
+        let record = candidate.experience.as_mut().unwrap();
+        record.applies_when = applies_when.to_string();
+        record.invalid_if = None;
+        let outcome = store.admit_experience_candidate(candidate).unwrap();
+        assert!(
+            matches!(outcome, crate::AgentAdmitOutcome::Applied(_)),
+            "fixture lesson was not activated: {outcome:?}"
+        );
+    }
+
+    fn engine_lesson(store: &MemoryStore) {
+        learn_experience(
+            store,
+            "experience_engine_config_profile_rejected",
+            "Align engine.config profile with accepted profile",
+            "When `./verify.sh` exits non-zero with `error: engine profile rejected`, inspect and correct the profile selected in the project's `engine.config` rather than editing `./verify.sh` or the engine program. Editing `engine.config` to a supported profile was followed by `./verify.sh` exiting 0 and printing `engine: build ok (profile=legacy)`, so use the accepted profile named in the receipt as the configuration target. If no receipt appears, identify the profile values the engine accepts and match the config to one of them.",
+            "`./verify.sh` fails with `error: engine profile rejected` and the project controls its profile through `engine.config`.",
+        );
+    }
+
+    fn preview_lesson(store: &MemoryStore) {
+        learn_experience(
+            store,
+            "experience_rust_utf8_byte_index_truncation_panic",
+            "Byte-index truncation panics on multibyte UTF-8 previews",
+            "Preview/truncation code that slices a string at a fixed byte offset (`&s[..n]`) panics on non-ASCII input: the run failed with \"end byte index 4 is not a char boundary; it is inside '文' (bytes 3..6) of `中文预览`\". The handling executed was an edit in src/lib.rs, after which `cargo test --test preview` reported \"test result: ok. 1 passed; 0 failed\". Truncate by characters or by a boundary-safe helper (chars().take(n), char_indices, floor_char_boundary) rather than raw byte indices; that mechanism is inferred, since the diff itself is not in evidence.",
+            "truncating, previewing, or slicing user-visible strings that may contain multibyte UTF-8 (CJK, emoji) by a length limit",
+        );
+    }
+
+    fn pybuild_lesson(store: &MemoryStore) {
+        learn_experience(
+            store,
+            "experience_pybuild_config_layout_mismatch",
+            "Match pybuild layout to repository shape",
+            "When `./verify.sh` exits 1 with `error: build layout rejected`, check the repository's `pybuild.config` layout/configuration against the actual tree shape rather than editing the verify script or pybuild itself. In the observed repository the accepted configuration produced exit 0 and the receipt `pybuild: build ok (layout=flat)`, and `pybuild.config` was the only modified project file, so the actionable fix is to set or correct the layout value in that config to the layout the project actually uses.",
+            "A pybuild-based verification command fails with `error: build layout rejected` and the project owns a `pybuild.config`.",
+        );
+    }
+
+    /// Real failure from DF-M3: the engine lesson shares `error`, `test`,
+    /// `fix` and `project` with a Python report task. BM25 cannot tell a
+    /// toolchain word from subject matter, so the lesson is offered as a
+    /// candidate; the injected block says candidates are unconfirmed and the
+    /// main model decides. The store's job is only to bound the set.
+    #[test]
+    fn retrieval_offers_an_ecosystem_overlap_as_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        engine_lesson(&store);
+
+        let hits = store
+            .recall_for_lanes(PYTHON_REPORT_TASK, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|(entry, _)| entry.title.contains("Align engine.config profile")),
+            "retrieval must offer the candidate, not apply a word-list verdict: {:?}",
+            hits.iter().map(|(entry, _)| &entry.id).collect::<Vec<_>>()
+        );
+        assert!(hits.len() <= 2, "the candidate set stays bounded");
+    }
+
+    /// Real failure from DF-M3: the UTF-8 preview lesson shares `cargo`,
+    /// `test`, `src` and `lib` with a cargo scale task. It is a retrieval
+    /// candidate, not a runtime verdict about relevance.
+    #[test]
+    fn retrieval_offers_a_toolchain_overlap_as_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        preview_lesson(&store);
+
+        let hits = store
+            .recall_for_lanes(CARGO_SCALE_TASK, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|(entry, _)| entry.title.contains("Byte-index truncation")),
+            "retrieval must offer the candidate, not apply a word-list verdict: {:?}",
+            hits.iter().map(|(entry, _)| &entry.id).collect::<Vec<_>>()
+        );
+        assert!(hits.len() <= 2, "the candidate set stays bounded");
+    }
+
+    /// The same failure described in other words is still the same failure.
+    /// Retrieval must follow the defect, not one exact task phrase.
+    #[test]
+    fn an_experience_matches_the_same_failure_in_different_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        engine_lesson(&store);
+
+        let paraphrase =
+            "verify.sh is rejected by the engine because of the profile in engine.config";
+        let hits = store
+            .recall_for_lanes(paraphrase, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the same failure was not recognised: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].0.title, "Align engine.config profile with accepted profile",
+            "a different lesson matched: {hits:?}"
+        );
+
+        let fresh_task = r#"The preview helper panics on a multibyte boundary while truncating Chinese text with `cargo test --test preview`."#;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        preview_lesson(&store);
+        let hits = store
+            .recall_for_lanes(fresh_task, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a new task naming the same defect was missed: {hits:?}"
+        );
+    }
+
+    /// The ordinary positive: the task that produced the lesson recalls it.
+    #[test]
+    fn an_experience_matches_the_task_that_established_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        engine_lesson(&store);
+        let hits = store
+            .recall_for_lanes(ENGINE_TASK, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the task that produced the lesson missed it: {hits:?}"
+        );
+    }
+
+    /// Same failure family, different root cause: a pybuild layout task ranks
+    /// the pybuild lesson first. Ranking is retrieval; the model still judges
+    /// whether the lesson applies.
+    #[test]
+    fn a_verify_failure_ranks_the_lesson_for_its_own_root_cause_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        engine_lesson(&store);
+        pybuild_lesson(&store);
+
+        let hits = store
+            .recall_for_lanes(PYBUILD_TASK, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert!(hits.len() <= 2, "the candidate set stays bounded");
+        assert_eq!(
+            hits[0].0.title, "Match pybuild layout to repository shape",
+            "a different failure family ranked first: {hits:?}"
+        );
+    }
+
+    /// Anti-overfit: a task type outside the DF-M3 fixtures. Retrieval must
+    /// rank the lesson for the same defect first, and rank a different
+    /// problem's lesson first for that problem — without a curated word list.
+    #[test]
+    fn a_bundler_lesson_ranks_by_defect_not_by_ecosystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        learn_experience(
+            &store,
+            "experience_vite_missing_public_asset_alias",
+            "Vite bundle fails on a missing public asset after an alias change",
+            "When the frontend bundle aborts with `ENOENT` for `public/logo.svg` after an alias change, check that the alias still resolves the public asset; restoring the alias path made `vite build` exit 0.",
+            "A Vite build fails with ENOENT on a public asset after an alias or import-path change.",
+        );
+        learn_experience(
+            &store,
+            "experience_vite_proxy_ignored",
+            "Vite dev server ignores the proxy setting",
+            "When the Vite dev server returns 404 for `/api` during local testing, check that the proxy entry sits under `server.proxy` and that the request path still matches its prefix; moving the entry made the dev server serve the API again.",
+            "A Vite dev server returns 404 for API routes during local testing.",
+        );
+
+        let positive = "The frontend bundle aborts: vite reports ENOENT for public/logo.svg after the alias change.";
+        let hits = store
+            .recall_for_lanes(positive, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert_eq!(
+            hits[0].0.title, "Vite bundle fails on a missing public asset after an alias change",
+            "the same bundle defect did not rank first: {hits:?}"
+        );
+
+        let negative =
+            "The vite dev server ignores the proxy setting for /api during local testing.";
+        let hits = store
+            .recall_for_lanes(negative, 2, MemoryLanes::EXPERIENCE_ONLY)
+            .unwrap();
+        assert_eq!(
+            hits[0].0.title, "Vite dev server ignores the proxy setting",
+            "a different vite problem ranked first: {hits:?}"
+        );
+    }
+
+    /// A data-format name can be the only term connecting a task to the lesson
+    /// that explains it. Retrieval must keep `yaml`, `toml` and `json` as
+    /// material; a later precision pass must not "fix" recall precision by
+    /// adding them to a stopword list.
+    #[test]
+    fn technical_format_names_stay_retrieval_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        learn_experience(
+            &store,
+            "experience_yaml_tab_indentation",
+            "YAML rejects tab indentation",
+            "A `config.yaml` parse failure names the tab position; replacing the tab with spaces made the parse succeed.",
+            "A YAML document fails to parse because of tab indentation.",
+        );
+        learn_experience(
+            &store,
+            "experience_toml_duplicate_key",
+            "TOML rejects a duplicate key",
+            "A `Cargo.toml` duplicate-key error names the second definition; removing the duplicate made the manifest load.",
+            "A TOML manifest fails to load because of a duplicate key.",
+        );
+        learn_experience(
+            &store,
+            "experience_json_trailing_comma",
+            "JSON rejects a trailing comma",
+            "A JSON payload with a trailing comma is rejected by the parser; removing the comma made the payload valid.",
+            "A JSON payload is rejected because of a trailing comma.",
+        );
+
+        for (query, expected) in [
+            (
+                "这个 yaml 配置解析不了，报的是缩进问题",
+                "YAML rejects tab indentation",
+            ),
+            ("toml 清单重复 key 载入失败", "TOML rejects a duplicate key"),
+            ("json 载荷多了一个逗号", "JSON rejects a trailing comma"),
+        ] {
+            let hits = store
+                .recall_for_lanes(query, 3, MemoryLanes::EXPERIENCE_ONLY)
+                .unwrap();
+            assert_eq!(
+                hits.first().map(|(entry, _)| entry.title.as_str()),
+                Some(expected),
+                "`{query}` lost its format lesson: {hits:?}"
+            );
+        }
     }
 }

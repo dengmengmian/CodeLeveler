@@ -209,14 +209,15 @@ fn is_canonical_key(key: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Flag active records that share a distinctive value under DIFFERENT keys.
-/// This is deliberately a report, not a merge: similar wording is not identity.
+/// Flag active records that state the same exact structured value under
+/// DIFFERENT keys. Only a field compare is evidence: repeated prose is not.
+/// This is deliberately a report, not a merge.
 fn mark_shared_values(records: &mut [IdentityRecord], entries: &[MemoryEntry]) {
     let by_id: HashMap<&str, &MemoryEntry> = entries
         .iter()
         .map(|entry| (entry.id.as_str(), entry))
         .collect();
-    let mut by_token: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    let mut by_value: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         if record.sensitive || record.location != IdentityLocation::Active {
             continue;
@@ -224,18 +225,24 @@ fn mark_shared_values(records: &mut [IdentityRecord], entries: &[MemoryEntry]) {
         let Some(entry) = by_id.get(record.id.as_str()) else {
             continue;
         };
-        for token in distinctive_tokens(&format!("{} {}", entry.title, entry.body)) {
-            by_token.entry(token).or_default().insert(index);
-        }
+        let Some(value) = entry
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        by_value.entry(value).or_default().insert(index);
     }
 
     let mut related: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
-    for indexes in by_token.values() {
+    for indexes in by_value.values() {
         if indexes.len() < 2 {
             continue;
         }
         // Only a cross-key match is evidence of duplication; the same key is
-        // already an identity conflict, not a wording coincidence.
+        // already an identity conflict.
         for &left in indexes {
             for &right in indexes {
                 if left == right {
@@ -259,7 +266,7 @@ fn mark_shared_values(records: &mut [IdentityRecord], entries: &[MemoryEntry]) {
         }
         record.state = IdentityState::PossibleDuplicate;
         record.related = ids.into_iter().collect();
-        record.reason = "shares a distinctive value with another identity".to_string();
+        record.reason = "states the same structured value under another identity".to_string();
     }
 }
 
@@ -284,69 +291,6 @@ fn mark_stale_active_copies(
         record.related = vec![current.clone()];
         record.reason = format!("a stale active copy; current truth is {current}");
     }
-}
-
-/// Tokens that look like a value rather than ordinary prose. Values are what a
-/// duplicate detector can compare without resorting to fuzzy text similarity.
-fn distinctive_tokens(text: &str) -> BTreeSet<String> {
-    const STOPWORDS: &[&str] = &[
-        "about",
-        "after",
-        "allowed",
-        "and",
-        "api",
-        "base",
-        "before",
-        "branch",
-        "coding",
-        "compact",
-        "config",
-        "configuration",
-        "default",
-        "deploy",
-        "enabled",
-        "false",
-        "file",
-        "files",
-        "for",
-        "from",
-        "leveler",
-        "memory",
-        "model",
-        "models",
-        "output",
-        "path",
-        "plan",
-        "production",
-        "project",
-        "provider",
-        "release",
-        "service",
-        "setting",
-        "should",
-        "staging",
-        "terminal",
-        "the",
-        "token",
-        "true",
-        "url",
-        "using",
-        "value",
-        "with",
-        "workspace",
-    ];
-    let mut out = BTreeSet::new();
-    for raw in text.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let token = raw.to_ascii_lowercase();
-        if token.len() < 4 || STOPWORDS.contains(&token.as_str()) {
-            continue;
-        }
-        let has_digit = token.chars().any(|c| c.is_ascii_digit());
-        if has_digit || token.len() >= 6 {
-            out.insert(token);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -432,7 +376,9 @@ mod tests {
         assert!(!rendered.contains("A note without an explicit assignment."));
         assert_eq!(audit.summary.total, 4);
         assert_eq!(audit.summary.sensitive, 1);
-        assert_eq!(audit.summary.possible_duplicate, 2, "{:?}", audit.records);
+        // The two endpoint records repeat one URL in prose, but neither stores
+        // a structured value: repeated wording is not identity evidence.
+        assert_eq!(audit.summary.possible_duplicate, 0, "{:?}", audit.records);
         assert_eq!(audit.summary.needs_confirmation, 1);
         let sensitive = audit
             .records
@@ -562,8 +508,10 @@ mod tests {
         assert_eq!(before, after, "audit must be read-only");
         assert_eq!(audit.summary.total, 9);
         assert_eq!(audit.summary.sensitive, 2, "{rendered}");
-        assert_eq!(audit.summary.ready, 2, "{rendered}");
-        assert_eq!(audit.summary.possible_duplicate, 5, "{rendered}");
+        assert_eq!(audit.summary.ready, 7, "{rendered}");
+        // Historical copies repeat prose values but store no structured value;
+        // the audit does not infer equivalence from wording.
+        assert_eq!(audit.summary.possible_duplicate, 0, "{rendered}");
         assert_eq!(audit.summary.needs_confirmation, 0, "{rendered}");
         assert!(!rendered.contains(secret), "audit leaked a credential");
         assert!(!rendered.contains(url), "audit leaked a body value");
@@ -584,8 +532,11 @@ mod tests {
         assert!(audit.records[0].key.is_none());
     }
 
+    /// A historical record without a stored key has no trustworthy identity.
+    /// The audit refuses to derive one from its prose: a guessed identity can
+    /// make two different facts update each other.
     #[test]
-    fn an_explicit_assignment_without_a_stored_key_yields_a_derived_identity() {
+    fn a_record_without_a_stored_key_needs_confirmation() {
         let (_dir, store) = store_with(vec![legacy(
             "historical",
             None,
@@ -594,10 +545,92 @@ mod tests {
         )]);
         let audit = store.audit_identity().unwrap();
         let record = &audit.records[0];
-        assert_eq!(record.state, IdentityState::Ready, "{record:?}");
-        assert_eq!(
-            record.key.as_deref(),
-            Some(crate::semantic_key_of("默认模型").as_str())
+        assert_eq!(record.state, IdentityState::NeedsConfirmation, "{record:?}");
+        assert_eq!(record.key, None);
+    }
+
+    /// Repeated prose is not identity evidence. Two records under different
+    /// keys that happen to mention the same URL stay Ready until an exact
+    /// structured value says they assign the same thing.
+    #[test]
+    fn repeated_prose_alone_is_not_a_possible_duplicate() {
+        let (_dir, store) = store_with(vec![
+            legacy(
+                "k-primary-endpoint",
+                Some("k-primary-endpoint"),
+                "primary endpoint",
+                "the primary endpoint is https://example.test/api/v3",
+            ),
+            legacy(
+                "k-backup-endpoint",
+                Some("k-backup-endpoint"),
+                "backup endpoint",
+                "the backup endpoint is https://example.test/api/v3",
+            ),
+        ]);
+        let audit = store.audit_identity().unwrap();
+        assert_eq!(audit.summary.possible_duplicate, 0, "{:?}", audit.records);
+        assert!(
+            audit
+                .records
+                .iter()
+                .all(|record| record.state == IdentityState::Ready),
+            "{:?}",
+            audit.records
         );
+    }
+
+    /// The same exact structured value under two different keys is a duplicate
+    /// the audit can prove from fields alone.
+    #[test]
+    fn an_exact_structured_value_under_two_keys_is_a_possible_duplicate() {
+        let value = "https://example.test/api/v3";
+        let mut first = legacy(
+            "k-primary-endpoint",
+            Some("k-primary-endpoint"),
+            "primary endpoint",
+            "primary endpoint",
+        );
+        first.value = Some(value.to_string());
+        let mut second = legacy(
+            "k-backup-endpoint",
+            Some("k-backup-endpoint"),
+            "backup endpoint",
+            "backup endpoint",
+        );
+        second.value = Some(value.to_string());
+        let (_dir, store) = store_with(vec![first, second]);
+
+        let audit = store.audit_identity().unwrap();
+        assert_eq!(audit.summary.possible_duplicate, 2, "{:?}", audit.records);
+        let primary = audit
+            .records
+            .iter()
+            .find(|record| record.id == "k-primary-endpoint")
+            .unwrap();
+        assert_eq!(
+            primary.state,
+            IdentityState::PossibleDuplicate,
+            "{primary:?}"
+        );
+        assert_eq!(primary.related, vec!["k-backup-endpoint".to_string()]);
+    }
+
+    /// Sharing one value is only a cross-key finding. Records under the same
+    /// key are already one identity, and the state for residue there is
+    /// PossiblyStale, not PossibleDuplicate.
+    #[test]
+    fn the_same_value_under_one_key_is_not_a_duplicate_finding() {
+        let value = "snake_case";
+        let mut first = legacy("current", Some("k-style"), "style", "style");
+        first.value = Some(value.to_string());
+        first.updated_at = "2026-01-02T00:00:00Z".into();
+        let mut second = legacy("stale", Some("k-style"), "style", "style");
+        second.value = Some(value.to_string());
+        second.updated_at = "2026-01-01T00:00:00Z".into();
+        let (_dir, store) = store_with(vec![first, second]);
+
+        let audit = store.audit_identity().unwrap();
+        assert_eq!(audit.summary.possible_duplicate, 0, "{:?}", audit.records);
     }
 }

@@ -635,9 +635,16 @@ async fn a_changed_environment_supersedes_the_stale_experience_and_recalls_only_
         !chat.contains(&format!("[{old_id}]")),
         "the superseded lesson must not be recalled: {chat}"
     );
+    // Recall delivers a candidate row, not the body: the replacement is
+    // identified by its title and id, and the model expands it through the
+    // memory tool when the task needs the value.
     assert!(
-        chat.contains("profile=current"),
-        "the current value must reach the model: {chat}"
+        chat.contains("engine profile 拒绝时改用 current"),
+        "the replacement's candidate row must reach the model: {chat}"
+    );
+    assert!(
+        !chat.contains("profile=legacy"),
+        "the stale body must not reach the model: {chat}"
     );
 }
 

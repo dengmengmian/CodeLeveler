@@ -231,7 +231,7 @@ async fn enabled_memory_reaches_the_first_request_without_a_capability_round_tri
             vec![],
         )
         .unwrap();
-    store
+    let runbook = store
         .activate(
             "Deploy runbook",
             "The deploy runbook lives in docs/deploy.md.",
@@ -273,8 +273,12 @@ async fn enabled_memory_reaches_the_first_request_without_a_capability_round_tri
         "a standing preference must reach the first request: {first}"
     );
     assert!(
-        first.contains("The deploy runbook lives in docs/deploy.md."),
-        "query recall must reach the first request: {first}"
+        first.contains(&format!("[{}]", runbook.id)),
+        "query recall must reach the first request as a candidate row: {first}"
+    );
+    assert!(
+        !first.contains("The deploy runbook lives in docs/deploy.md."),
+        "the body stays behind the memory tool: {first}"
     );
 }
 

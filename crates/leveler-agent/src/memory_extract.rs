@@ -611,7 +611,9 @@ Each candidate envelope is exactly:
   "source_turn_id": the exact id of the ONE source turn,
   "candidate": {{
     "fact": one short clause, in the conversation's language,
-    "subject": a stable lowercase dotted identity,
+    "subject": a stable lowercase dotted identity chosen by meaning,
+    "related_subject": optional; the existing decision's subject when this
+                       statement restates, changes, or reverses it,
     "value": the assigned value when present (optional),
     "scope": "project" | "session" | "task" | "user",
     "durability": "durable" | "temporary" | "unknown",
@@ -648,7 +650,17 @@ Rules:
   blocker" produce no candidates. When uncertain, return an empty list.
 - Use derived or task_state only when explaining a rejected classification;
   the runtime will deterministically refuse both.
-- Prefer a stable dotted subject across turns for the same subject.
+- `subject` is an identity you choose from MEANING, not from surface wording.
+  If two turns state the same constraint while naming the object differently
+  ("API response fields" / "JSON response fields"), reuse ONE subject. Never
+  make two subjects merely because two sentences use different nouns.
+- `related_subject` is only for a statement that restates, changes, or
+  reverses a decision already recorded under another subject. Name that
+  subject exactly as it was first recorded. Do not guess: if you cannot name
+  the original subject, omit it. The runtime resolves it against active
+  memory; an unknown target is parked for a person instead of being merged.
+- `create` states a new subject. `update` changes the value of an existing
+  decision. `negate` reverses it. `reaffirm` restates the same value.
 "#
     )
 }
@@ -668,7 +680,10 @@ Return {"candidates": []} when the message states no durable project fact.
 Each candidate is exactly:
 {
   "fact":       one short clause, the fact in the conversation's language,
-  "subject":    a stable identity, lowercase dotted, e.g. "project.default_model",
+  "subject":    a stable identity chosen by meaning, lowercase dotted,
+                e.g. "project.default_model",
+  "related_subject": optional; the existing decision's subject when this
+                statement restates, changes, or reverses it,
   "value":      the assigned value when the fact is an assignment (optional),
   "scope":      "project" | "session" | "task" | "user",
   "durability": "durable" | "temporary" | "unknown",
@@ -721,9 +736,15 @@ Rules:
 - Use "reaffirm" when the user restates an existing decision with the SAME
   value (still no new value, so no candidate is owed); "update" or "negate"
   when they change or reverse an existing decision by naming a different value.
-- Prefer a canonical dotted "subject" and reuse the same subject string for the
-  same subject across messages, so a later statement updates rather than
-  duplicates.
+- `subject` is an identity you choose from MEANING, not surface wording. Reuse
+  the same subject for the same constraint across messages even when the
+  object is worded differently. Never split one constraint into two subjects
+  just because two sentences use different nouns, and never merge two
+  constraints that merely share a word.
+- Set `related_subject` only when this statement restates, changes, or
+  reverses a decision recorded under another subject; name that subject
+  exactly. Omit it when unsure. The runtime resolves it against active memory
+  and parks an unknown target for a person rather than guessing.
 "#
     .to_string()
 }

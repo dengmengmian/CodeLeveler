@@ -1625,64 +1625,14 @@ pub(crate) fn load_memory_catalog(memory_dir: &std::path::Path) -> String {
     }
 }
 
-impl Application {
-    /// Enqueue pending memory candidates from this turn's user text and RETURN
-    /// the ones that are newly waiting. Never writes `active/` (K36: accept is
-    /// separate).
-    ///
-    /// Returning them is the point. This used to log `tracing::info!` and stop,
-    /// so a user who said "记住 X" got a stored candidate and no signal
-    /// whatsoever — the adopt path existed (`/memory accept <id>`) but nothing
-    /// ever told them to use it. The caller that owns a client connection
-    /// turns these into a visible notice; a headless caller ignores them,
-    /// which is also why this layer does not send the notice itself.
-    pub(crate) fn enqueue_memory_candidates(&self, user_text: &str) -> Vec<(String, String)> {
-        // Automatic candidate extraction is user-lane admission. A project
-        // with that lane closed does not admit user facts, and this
-        // interactive shortcut must not become a second policy owner that
-        // bypasses the switch.
-        if !self.memory.user_enabled() {
-            return Vec::new();
-        }
-        let memory_dir = self.layout.memory_dir();
-        let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) else {
-            return Vec::new();
-        };
-        // The executor admits an eligible explicit project decision during
-        // this turn. Proposing it here would tell the user it is waiting for
-        // confirmation immediately before it is applied. An eligible fact
-        // that a later lifecycle conflict parks is still written to
-        // `pending/` and remains discoverable there.
-        if let Some(candidate) = leveler_memory::parse_durable_fact(user_text)
-            && leveler_memory::candidate_eligible_for_activation(&candidate)
-        {
-            return Vec::new();
-        }
-        match leveler_memory::collect_turn_candidates(
-            &store,
-            user_text,
-            self.layout.primary_workspace(),
-        ) {
-            Ok(outcomes) => outcomes
-                .into_iter()
-                .filter_map(|o| match o {
-                    leveler_memory::ProposeOutcome::Pending(c) => Some((c.id, c.title)),
-                    _ => None,
-                })
-                .collect(),
-            Err(err) => {
-                tracing::debug!(error = %err, "memory candidate enqueue skipped");
-                Vec::new()
-            }
-        }
-    }
-}
+// Turn-time candidate extraction lives in the durable consolidator: the SQL
+// inbox trigger records the turn, and the background worker calls the model
+// extractor. A synchronous, rule-based second extractor here would be a
+// competing policy owner and a second source of truth.
 
 #[cfg(test)]
 mod memory_catalog_tests {
     use super::*;
-    use leveler_memory::{ProposeOutcome, collect_turn_candidates};
-    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -1702,110 +1652,12 @@ mod memory_catalog_tests {
         assert!(!index.contains("SECRET_BODY"), "{index}");
     }
 
-    /// The enqueue result must name what is waiting, or no caller can tell the
-    /// user anything. A silent `tracing::info!` was the whole bug.
-    #[test]
-    fn enqueue_returns_the_candidates_that_are_waiting() {
-        let mem = tempdir().unwrap();
-        let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
-        // A soft signal is what produces a candidate now. A commanding
-        // "记住：…" is a direct write handled before the turn is staged.
-        let outcomes = collect_turn_candidates(&store, "我通常希望提交前先跑 lint", None).unwrap();
-        let waiting: Vec<(String, String)> = outcomes
-            .into_iter()
-            .filter_map(|o| match o {
-                ProposeOutcome::Pending(c) => Some((c.id, c.title)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(waiting.len(), 1, "{waiting:?}");
-        assert!(!waiting[0].0.is_empty(), "an id the user can accept");
-        assert!(waiting[0].1.contains("lint"), "{waiting:?}");
-    }
-
-    /// Host path used by `Application::enqueue_memory_candidates` — propose only.
-    #[test]
-    fn turn_candidate_collect_never_writes_active() {
-        let mem = tempdir().unwrap();
-        let repo = tempdir().unwrap();
-        // The lockfile deliberately proposes nothing now; the user's own words
-        // are what still does.
-        fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
-        let store = leveler_memory::MemoryStore::open(mem.path()).unwrap();
-        let outcomes =
-            collect_turn_candidates(&store, "我通常希望用 pnpm", Some(repo.path())).unwrap();
-        assert!(
-            outcomes
-                .iter()
-                .any(|o| matches!(o, ProposeOutcome::Pending(_))),
-            "{outcomes:?}"
-        );
-        assert_eq!(store.list_active().unwrap().len(), 0);
-        assert!(!store.list_pending().unwrap().is_empty());
-    }
-
     #[test]
     fn a_missing_store_yields_an_empty_catalog() {
         let dir = tempdir().unwrap();
         // path does not exist yet — open creates it empty
         let index = load_memory_catalog(&dir.path().join("nope-yet"));
         assert!(index.is_empty() || !index.contains("SECRET"));
-    }
-
-    /// The interactive shortcut proposes candidates before a turn is staged.
-    /// It must obey the same project switch as the durable inbox trigger.
-    /// The pre-turn notice must name only facts that will actually wait. An
-    /// explicit project decision is admitted during the turn, so announcing
-    /// it as pending would be a false signal; a destructive grant is parked
-    /// and must be announced.
-    #[test]
-    fn the_pre_turn_notice_names_only_facts_that_will_wait() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".leveler")).unwrap();
-        std::fs::write(
-            dir.path().join(".leveler/config.yaml"),
-            "memory:\n  enabled: true\n  user_enabled: true\n",
-        )
-        .unwrap();
-        let app = Application::assemble(Layout::from_parts(
-            dir.path().to_path_buf(),
-            dir.path().join("configs"),
-            dir.path().join("state"),
-        ))
-        .unwrap();
-
-        assert!(
-            app.enqueue_memory_candidates("以后本项目默认模型固定为 Pro")
-                .is_empty(),
-            "a fact the turn will admit is not waiting for confirmation"
-        );
-
-        let waiting = app.enqueue_memory_candidates("以后数据库清空方式固定为允许清空数据库");
-        assert_eq!(waiting.len(), 1, "{waiting:?}");
-        assert!(waiting[0].1.contains("数据库"), "{waiting:?}");
-    }
-
-    #[tokio::test]
-    async fn a_disabled_project_admits_no_automatic_candidates() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".leveler")).unwrap();
-        std::fs::write(
-            dir.path().join(".leveler/config.yaml"),
-            "memory:\n  enabled: false\n",
-        )
-        .unwrap();
-        let app = Application::assemble(Layout::from_parts(
-            dir.path().to_path_buf(),
-            dir.path().join("configs"),
-            dir.path().join("state"),
-        ))
-        .unwrap();
-        assert!(
-            app.enqueue_memory_candidates("记住：提交前先跑 lint")
-                .is_empty(),
-            "a disabled project must not create pending candidates"
-        );
-        assert!(!dir.path().join("state/memory/pending").exists());
     }
 }
 

@@ -160,12 +160,37 @@ impl Tool for MemoryTool {
                         "memory is historical or superseded; it is not current truth",
                     ));
                 }
-                Ok(ToolOutput::ok(format!(
-                    "# {}\n\n{}\n\n(tags: {})",
-                    e.title,
-                    e.body,
-                    e.tags.join(", ")
-                )))
+                // A recall row carries the conditions so the model can decide
+                // whether to expand; this is the expansion, so it carries the
+                // body and the same conditions. A lesson read without them
+                // would look unconditional.
+                let experience = e.experience.as_ref().map(|record| {
+                    let mut line = format!(
+                        "experience·{}; recorded {}; applies when: {}",
+                        record.standing().as_str(),
+                        e.created_at.trim(),
+                        record.applies_when.trim()
+                    );
+                    if let Some(invalid_if) = record.invalid_if.as_deref() {
+                        line.push_str(&format!("; invalid if: {}", invalid_if.trim()));
+                    }
+                    line
+                });
+                let body = match experience {
+                    Some(line) => format!(
+                        "# {}\n\n{}\n\n({line})\n\n(tags: {})",
+                        e.title,
+                        e.body,
+                        e.tags.join(", ")
+                    ),
+                    None => format!(
+                        "# {}\n\n{}\n\n(tags: {})",
+                        e.title,
+                        e.body,
+                        e.tags.join(", ")
+                    ),
+                };
+                Ok(ToolOutput::ok(body))
             }
             "search" | "vector_search" => {
                 let q = args.query.unwrap_or_default();
@@ -712,7 +737,18 @@ mod tests {
         let root = MemoryRoot::new(Some(mem.clone()));
         let ctx = ctx_in(dir.path());
         let store = MemoryStore::open(&mem).unwrap();
-        let user = leveler_memory::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let key = leveler_memory::semantic_key_of("default_model");
+        let mut user = leveler_memory::MemoryCandidate::new(
+            "项目默认模型",
+            "以后本项目默认模型固定为 Pro",
+            leveler_memory::CandidateKind::Free,
+            Some(key.clone()),
+            leveler_memory::CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        user.semantic_key = Some(key);
+        user.authority = leveler_memory::MemoryAuthority::ExplicitUser;
         store.commit_candidate(&user).unwrap();
 
         let out = RememberTool::new(root)
@@ -902,6 +938,58 @@ mod tests {
             }],
         });
         entry
+    }
+
+    /// A recall candidate carries only the row, so the read that expands it
+    /// must carry everything a reader needs to judge the lesson: the body, the
+    /// standing, and both applicability clauses.
+    #[tokio::test]
+    async fn reading_an_experience_returns_its_standing_and_conditions() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let store = MemoryStore::open(&mem).unwrap();
+        let mut entry = experience_entry();
+        entry.experience.as_mut().unwrap().invalid_if =
+            Some("the deployment target changes".to_string());
+        store.remember(entry).unwrap();
+
+        let read = MemoryTool::new(root)
+            .execute(
+                serde_json::json!({"action": "read", "id": "deploy-lesson"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!read.is_error, "{}", read.content);
+        assert!(
+            read.content.contains("token had expired"),
+            "{}",
+            read.content
+        );
+        assert!(
+            read.content.contains("experience·observed"),
+            "the fixture has failure evidence but no resolution: {}",
+            read.content
+        );
+        assert!(
+            !read.content.contains("experience·verified"),
+            "an observation-only lesson must not read as a resolution: {}",
+            read.content
+        );
+        assert!(
+            read.content.contains("applies when: deploying to blue"),
+            "{}",
+            read.content
+        );
+        assert!(
+            read.content
+                .contains("invalid if: the deployment target changes"),
+            "{}",
+            read.content
+        );
     }
 
     #[tokio::test]
