@@ -643,13 +643,14 @@ Gate 判定：
 
 ### 3.1.7 真实 Dogfood 结果
 
-脚本：`dogfood/eval/memory/stage3_1_recall.py`（真实 `leveler tui` + PTY + 记录代理 + 真实 DeepSeek Flash；项目显式配置 `memory.backend=markdown`）。断言只读 provider 实际收到的请求字节与磁盘上的 Markdown 记录。
+脚本：`dogfood/eval/memory/stage3_1_recall.py`（真实 `leveler tui` + PTY + 记录代理 + 真实 DeepSeek Flash；项目显式配置 `memory.backend=markdown`）与 `stage3_1_page.py`（真实终端的 `/memory` 页面）。断言只读 provider 实际收到的请求字节、磁盘上的 Markdown 记录与 pyte 当前屏幕。
 
 | Case | 结果 | 证据 |
 | --- | --- | --- |
 | WITHIN-TURN-PREFIX | 4 PASS | 同一回合 2 个模型步骤的首个 system 消息字节完全相同（含 catalog），只有末个 system 消息（tail）变化；召回只在 tail |
 | CATALOG-REBUILD | 4 PASS | 两条 `/remember` 落在磁盘；下一回合（新 run）重建完整 catalog 同时包含两条记录；召回仍在 tail |
 | LANE-OFF | 5 PASS | `memory.user_enabled: false` 时请求中无 recall block、无 catalog、无 `memory`/`remember` 工具（18 个工具）；磁盘记录保留 |
+| `/memory` 页面（真实终端） | 11 PASS | 列表显示两条记录及「scope · kind · status · authority · revision」行；`/` 关键词筛选保留命中、隐藏其余并常显筛选条；详情显示 `project:mem_…`、版本、来源与完整正文；`p` 经运行时固定后列表出现固定标记 |
 | MID-TURN-DELTA | NOT_VERIFIED | 模型确实调用了 `remember`，但该写入被挂为 pending 候选（非交互运行没有审批人），active catalog 未变化，因此没有 tail delta。要验证该路径需要交互式审批，本轮未执行 |
 
 含义：**catalog 只在 run 起始重建**，同一 run 内 prefix 稳定；跨回合写入不产生 tail delta，而是下一 run 重建 catalog。这正是 §3.4 的设计，不是缺陷；tail delta 只在同一 run 内 active 集合真正变化时出现。
