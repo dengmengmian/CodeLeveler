@@ -68,8 +68,8 @@ fn structural_problems(repo: &Path) -> Result<Vec<String>, String> {
     let mut problems = Vec::new();
     for path in files {
         let relative = relative(repo, &path);
-        let source = std::fs::read_to_string(&path)
-            .map_err(|err| format!("{}: {err}", path.display()))?;
+        let source =
+            std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         // Test modules and comments are documentation of past incidents; the
         // guard is about production code paths.
         let code: String = source
@@ -186,7 +186,8 @@ pub fn run(repo: &Path) -> Result<Report, Fail> {
         scanned += 1;
     }
 
-    let structural = structural_problems(repo).map_err(|detail| Fail::new("ARCH_STRUCTURE", detail))?;
+    let structural =
+        structural_problems(repo).map_err(|detail| Fail::new("ARCH_STRUCTURE", detail))?;
     if !structural.is_empty() {
         return Ok(Report::with_code(
             1,
