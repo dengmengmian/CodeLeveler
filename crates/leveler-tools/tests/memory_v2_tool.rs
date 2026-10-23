@@ -190,10 +190,11 @@ async fn markdown_search_returns_lexical_hits_and_never_a_fake_empty_result() {
         .await
         .unwrap();
 
-    // On the Markdown backend both actions run over the same derived lexical
-    // index. The important contract is that a hit is a hit and a miss is a
-    // real miss, never a claim of unavailability or an invented empty result.
-    for action in ["search", "vector_search"] {
+    // `search` runs over the derived lexical index. The important contract is
+    // that a hit is a hit and a miss is a real miss, never a claim of
+    // unavailability or an invented empty result. (`vector_search` was the
+    // retired JSON backend's alias and is gone.)
+    for action in ["search"] {
         let output = fixture
             .memory(serde_json::json!({"action": action, "query": "Flash"}))
             .await

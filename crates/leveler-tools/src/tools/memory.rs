@@ -432,7 +432,7 @@ impl Tool for MemoryTool {
                 Ok(ToolOutput::ok(outcome_message(&outcome)))
             }
             other => Ok(ToolOutput::error(format!(
-                "unknown action `{other}`; use list|read|search|vector_search|update|deprecate|pin|unpin"
+                "unknown action `{other}`; use list|read|search|update|deprecate|pin|unpin"
             ))),
         }
     }
