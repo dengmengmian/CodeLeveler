@@ -659,9 +659,15 @@ fn find_account<'a>(
     if need.chars().count() < 2 {
         return None;
     }
-    accounts
-        .iter()
-        .find(|account| covers(&normalize(&account.requirement), &need))
+    // The requirement and the model's account may spell the same artifact at
+    // different lengths: the user names `internal/report/aggregate.go` once
+    // and `aggregate.go` later, and the model accounts for the shorter form
+    // while its evidence names the full path. Naming it in either field is
+    // still accounting for it; the artifact check below remains mechanical.
+    accounts.iter().find(|account| {
+        covers(&normalize(&account.requirement), &need)
+            || covers(&normalize(&account.evidence), &need)
+    })
 }
 
 /// Whether an acceptance check names the requirement. The requirement must
@@ -772,8 +778,27 @@ fn collect_backticks(
             out.push((span.to_string(), RequirementKind::Command, source.clone()));
             continue;
         }
-        out.push((span.to_string(), RequirementKind::Named, source.clone()));
+        if named_span(span) {
+            out.push((span.to_string(), RequirementKind::Named, source.clone()));
+        }
     }
+}
+
+/// Whether a backticked span names a deliverable rather than quoting code.
+///
+/// Users quote expressions and conditions to explain the problem (`Valid =
+/// false`), and those are facts about the code, not items they asked for. A
+/// deliverable name is one token without operators; anything else stays out
+/// of the requirement set, consistent with under-extraction.
+fn named_span(span: &str) -> bool {
+    let mut words = span.split_whitespace();
+    let Some(word) = words.next() else {
+        return false;
+    };
+    if words.next().is_some() {
+        return false;
+    }
+    !word.contains(['=', '<', '>', '+', '(', ')'])
 }
 
 fn collect_paths(
@@ -1092,7 +1117,12 @@ fn command_text(text: &str) -> bool {
 
 fn path_like(token: &str) -> bool {
     let token = clean_token(token);
-    if token.is_empty() || looks_like_url(&token) || token.contains("//") {
+    if token.is_empty() || looks_like_url(&token) || token.contains("//") || glob_pattern(&token) {
+        return false;
+    }
+    // A separator between two tokens (`count=`/`total=`) is punctuation, not
+    // a path. Every real artifact names something with a letter or digit.
+    if !token.chars().any(|c| c.is_alphanumeric()) {
         return false;
     }
     // Explicit path syntax.
@@ -1116,6 +1146,14 @@ fn path_like(token: &str) -> bool {
         return false;
     };
     !stem.is_empty() && PATH_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+/// A package pattern or shell wildcard names a set of files, not one artifact.
+/// Demanding that the literal pattern exist produces a refusal no completion
+/// can satisfy.
+fn glob_pattern(token: &str) -> bool {
+    let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    name == "..." || name.contains(['*', '?', '['])
 }
 
 fn executable_path(token: &str) -> bool {
@@ -1420,6 +1458,19 @@ mod tests {
         assert!(found.contains(&"README"), "{found:?}");
     }
 
+    /// A backtick can quote a fact about the code ("a decoder marks a record
+    /// `Valid = false`"), not a deliverable. Demanding an account for the
+    /// expression creates a requirement the user never made.
+    #[test]
+    fn a_backticked_expression_is_a_fact_not_a_deliverable() {
+        let requirements = extract(
+            "A decoder marks a record `Valid = false` when it could read the record's \
+             shape but not its contents.",
+            &[],
+        );
+        assert!(requirements.is_empty(), "{requirements:?}");
+    }
+
     #[test]
     fn a_backticked_command_is_mechanical_not_a_named_deliverable() {
         let requirements = extract("实现接口，最后运行 `cargo fmt --check`。", &[]);
@@ -1443,6 +1494,53 @@ mod tests {
                 requirement.text.contains("unittest") && requirement.kind == RequirementKind::Named
             }),
             "the test command must not also become a named deliverable: {tests:?}"
+        );
+    }
+
+    /// The exact T3/T4 shape: a Go package pattern is not a filesystem path.
+    /// Demanding that `./...` exist refuses every correct completion, because
+    /// no file can ever satisfy the literal pattern.
+    #[test]
+    fn a_go_package_wildcard_is_not_an_artifact() {
+        let requirements = extract(
+            "Do not change existing tests. `go build ./...` and `go test ./...` must pass.",
+            &[],
+        );
+        assert!(
+            !requirements
+                .iter()
+                .any(|requirement| requirement.text == "./..."),
+            "a package wildcard is not a path: {requirements:?}"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.text == "go build ./..." && requirement.kind == RequirementKind::Command
+            }),
+            "the build command remains a mechanical requirement: {requirements:?}"
+        );
+    }
+
+    #[test]
+    fn a_glob_pattern_is_not_an_artifact() {
+        let requirements = extract("Update `src/*.rs` and `docs/**/*.md`.", &[]);
+        assert!(
+            !requirements.iter().any(|requirement| {
+                matches!(requirement.kind, RequirementKind::Artifact { .. })
+                    && requirement.text.contains('*')
+            }),
+            "a glob names a set, not one path: {requirements:?}"
+        );
+    }
+
+    #[test]
+    fn a_separator_between_two_tokens_is_not_an_artifact() {
+        let requirements = extract("The `count=`/`total=` format is unchanged.", &[]);
+        assert!(
+            !requirements.iter().any(|requirement| {
+                matches!(requirement.kind, RequirementKind::Artifact { .. })
+                    && !requirement.text.chars().any(|c| c.is_alphanumeric())
+            }),
+            "punctuation between two tokens is not a path: {requirements:?}"
         );
     }
 
@@ -1668,6 +1766,35 @@ mod tests {
             }
             other => panic!("expected refusal, got {other:?}"),
         }
+    }
+
+    /// The user names a full path once and its bare filename later; the model
+    /// accounts for the filename and puts the full path in the evidence. The
+    /// artifact is mechanically present, and the account demonstrably saw it:
+    /// exact-quote matching alone would refuse a completion the runtime can
+    /// verify.
+    #[test]
+    fn an_account_whose_evidence_names_the_requirement_covers_it() {
+        let requirements = vec![req(
+            "internal/report/aggregate.go",
+            RequirementKind::Artifact { removed: false },
+        )];
+        let present = |_: &str| ArtifactState::Present;
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&[account(
+                "aggregate.go contains only Aggregate",
+                AccountStatus::Done,
+                "internal/report/aggregate.go read after the edit; only Aggregate remains",
+            )]),
+            runs: &[],
+            mutation_ops: 1,
+            artifact: &present,
+        });
+        assert!(
+            matches!(decision, ScopeDecision::Accept { .. }),
+            "{decision:?}"
+        );
     }
 
     #[test]
