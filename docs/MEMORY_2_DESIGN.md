@@ -1519,7 +1519,9 @@ LIMIT ?2;
 `experience.standing = verified` 表达的是“运行时观察到 failure → resolution，且这条记录的文字就是当时观察对象”。因此它需要**同时**满足：
 
 1. `experience.evidence` 具备 failure→resolution 链（`has_resolution()`）；
-2. 当前 revision 的 `authority` 仍是 `runtime_observed`（即记录文字仍由 Runtime 写入）。
+2. 当前 revision 的 `authority` 仍是 `runtime_observed`（Runtime 写入）或 `user_approved`（用户采纳了 Runtime 的提案，文字未被改动）。
+
+`user_explicit` 意味着用户自己重写了这段文字，因此不再满足第 2 条。
 
 用户改写正文或标题后，第 2 条不再成立，`standing` 降级为 `observed`；`evidence` 引用与历史 revision 保留（审计可得），但当前文字不再宣称已被运行时验证。重新验证的路径是新的 runtime 观察产生新 revision，而不是编辑旧文字。这是 presentation truth 的收紧：修复前，用户改写正文后仍显示 `verified`，等于让未被观察的文字继承运行时的证明。
 

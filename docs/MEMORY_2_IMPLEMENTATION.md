@@ -1014,7 +1014,9 @@ Stage 4 之后，按以下顺序（不改变本轮范围）：
 
 问题：用户改写已验证 Experience 的正文后，`standing` 仍显示 `verified`——新的文字继承了运行时对旧文字的证明。
 
-修复：`crates/leveler-memory/src/service.rs` 的 `markdown_view` 要求 `authority == runtime_observed && has_resolution()` 才给出 `verified`。用户命令写入后 authority 为 `user_explicit`，因此显示 `observed`，`evidence` 与历史保留。
+修复：`crates/leveler-memory/src/service.rs` 的 `markdown_view` 只允许 `runtime_observed`（Runtime 写入）或 `user_approved`（用户采纳 Runtime 提案、文字未改）在 `has_resolution()` 成立时给出 `verified`。用户命令改写后 authority 为 `user_explicit`，显示 `observed`，`evidence` 与历史保留。
+
+第一版只接受 `runtime_observed`，被既有回归测试 `leveler-app/tests/memory_experience.rs::a_changed_environment_supersedes_the_stale_experience_and_recalls_only_the_replacement` 抓到：用户 adopt 一条 Runtime 提案后文字未被改动，运行时的证明仍然成立，不应降级。该失败真实存在，修正是收紧条件而不是放宽断言。
 
 测试：`memory_v2_explicit.rs::a_user_edit_of_a_verified_experience_drops_the_verification_claim`（Red：修复前 left=`verified`/right=`observed`；Green：修复后通过，并断言证据条数仍为 2）。
 
