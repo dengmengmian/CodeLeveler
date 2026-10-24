@@ -179,6 +179,39 @@ fn two_independent_direct_commands_are_both_stored() {
     assert_eq!(active(&service).len(), 2);
 }
 
+/// An identity longer than a tag is still a writable identity. The store's tag
+/// budget turned such a fact into a permanently retryable extraction once: the
+/// candidate carried `subject:<key>` as a tag, the record was refused, and the
+/// same turn was replayed forever.
+#[test]
+fn a_candidate_with_a_long_subject_is_written_instead_of_retried_forever() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = open_service(&fixture);
+    let sentence = "部署只允许在 Linux 上通过 scripts/release.sh --channel blue 执行。";
+    let mut candidate = MemoryCandidate::new(
+        "部署只允许在 Linux 上通过 scripts/release.sh --channel blue 执行",
+        "部署只允许在 Linux 上通过 scripts/release.sh --channel blue 执行",
+        CandidateKind::Free,
+        Some("k-deploy-linux-release-script".to_string()),
+        CandidateSource::UserExplicit,
+        vec!["explicit".to_string()],
+    )
+    .unwrap();
+    candidate.evidence = Some(sentence.to_string());
+    candidate.evidence_turn = Some("turn-1".to_string());
+    let outcome = service.admit_candidate(&runtime(), ServiceScope::Project, &candidate, "inbox-1");
+    assert!(
+        matches!(outcome, Ok(WriteOutcome::Applied { .. })),
+        "{outcome:?}"
+    );
+    let active = service
+        .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+        .unwrap();
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0].kind, "user_fact");
+    assert_eq!(active[0].authority, "user_stated");
+}
+
 /// An automatic writer without a structured subject is still refused. The
 /// explicit path must not widen the extractor's admission contract.
 #[test]

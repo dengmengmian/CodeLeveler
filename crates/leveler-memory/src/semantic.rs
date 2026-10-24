@@ -545,19 +545,28 @@ pub fn validate_semantic_candidate(
         SemanticMemoryType::Project | SemanticMemoryType::Reference => CandidateKind::Free,
         SemanticMemoryType::Derived | SemanticMemoryType::TaskState => unreachable!(),
     };
+    let mut tags = vec![
+        "explicit".to_string(),
+        "decision".to_string(),
+        "semantic".to_string(),
+        format!("memory_type:{:?}", candidate.memory_type).to_ascii_lowercase(),
+    ];
+    // The subject tag only repeats `subject_key`, which already carries the
+    // identity with its own, larger budget. A subject longer than a tag is not
+    // a reason to refuse the fact — and it must not become one, because the
+    // store's tag budget would otherwise fail every write for that identity and
+    // retry forever.
+    let subject_tag = format!("subject:{subject}");
+    if subject_tag.chars().count() <= crate::v2::record::MAX_TAG_CHARS {
+        tags.push(subject_tag);
+    }
     let mut memory = MemoryCandidate::new(
         fact,
         fact,
         kind,
         Some(key.clone()),
         CandidateSource::UserExplicit,
-        vec![
-            "explicit".to_string(),
-            "decision".to_string(),
-            "semantic".to_string(),
-            format!("memory_type:{:?}", candidate.memory_type).to_ascii_lowercase(),
-            format!("subject:{subject}"),
-        ],
+        tags,
     )
     .map_err(|_| CandidateRejection::Sensitive)?;
     memory.semantic_key = Some(key);
@@ -1118,6 +1127,35 @@ mod tests {
             "部署脚本在 scripts/deploy.sh。生产环境禁止手工迁移",
             message
         ));
+    }
+
+    /// A long subject is a valid identity (its own budget is separate), and it
+    /// must not make the candidate unwritable: the store rejects an oversized
+    /// tag, which would otherwise fail every automatic write for that identity.
+    #[test]
+    fn a_long_subject_does_not_make_the_candidate_unwritable() {
+        let message = "部署只允许在 Linux 上通过 scripts/release.sh --channel blue 执行。";
+        let c = candidate(
+            "部署只允许在 Linux 上通过 scripts/release.sh --channel blue 执行",
+            "project.deploy_linux_release_script_channel",
+            message,
+        );
+        let memory = validate_semantic_candidate(&c, message).unwrap();
+        assert!(
+            memory
+                .tags
+                .iter()
+                .all(|tag| tag.chars().count() <= crate::v2::record::MAX_TAG_CHARS),
+            "{:?}",
+            memory.tags
+        );
+        assert!(
+            memory
+                .semantic_key
+                .as_deref()
+                .is_some_and(|key| !key.is_empty()),
+            "the identity itself is still carried"
+        );
     }
 
     #[test]
