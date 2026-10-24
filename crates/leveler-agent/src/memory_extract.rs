@@ -362,18 +362,32 @@ impl ModelSemanticExtractor {
         self
     }
 
-    /// The effort this extractor will put on the wire: the requested low
-    /// effort, remapped onto what the model actually supports. The adapter
-    /// deliberately does not remap, so resolution happens here; a model whose
-    /// profile cannot be read keeps the requested value rather than silently
-    /// dropping the knob.
-    async fn resolved_effort(&self, requested: ReasoningEffort) -> Option<ReasoningEffort> {
+    /// The reasoning settings this extractor will put on the wire.
+    ///
+    /// Extraction is a bounded, mechanical JSON task, so it asks for the
+    /// lowest effort. On a thinking-flag route the lowest effort is not
+    /// `low`: a profile that supports only `max` resolves `low` upward, and
+    /// the reasoning then consumes the whole output ceiling before any JSON
+    /// exists. The flag route has an explicit `off` spelling, so it is used
+    /// and no effort is sent. Routes without that spelling cannot express
+    /// `off`; they keep the capability-derived effort rather than dropping
+    /// the knob and silently accepting the provider default.
+    ///
+    /// A model whose profile cannot be read keeps the requested low effort.
+    async fn extraction_reasoning(&self) -> (Option<ReasoningEffort>, bool) {
         match self.runtime.profile(&self.model).await {
-            Ok(profile) => {
-                leveler_model::resolve_reasoning_effort(Some(requested), &profile.reasoning)
-                    .effective
-            }
-            Err(_) => Some(requested),
+            Ok(profile) => match profile.reasoning.style {
+                leveler_model::ReasoningStyle::ThinkingFlag => (None, true),
+                _ => (
+                    leveler_model::resolve_reasoning_effort(
+                        Some(ReasoningEffort::Low),
+                        &profile.reasoning,
+                    )
+                    .effective,
+                    false,
+                ),
+            },
+            Err(_) => (Some(ReasoningEffort::Low), false),
         }
     }
 
@@ -496,7 +510,9 @@ impl SemanticExtractor for ModelSemanticExtractor {
         let Some(mut request) = self.build_request(user_message) else {
             return Ok(Vec::new());
         };
-        request.reasoning_effort = self.resolved_effort(ReasoningEffort::Low).await;
+        let (effort, thinking_disabled) = self.extraction_reasoning().await;
+        request.reasoning_effort = effort;
+        request.thinking_disabled = thinking_disabled;
         // The child token means a cancelled turn stops the extraction too, but
         // the timeout is this call's own bound and never the turn's.
         let call_token = cancellation.child_token();
@@ -567,8 +583,9 @@ impl SemanticExtractor for ModelSemanticExtractor {
             Ok(None) => return (Ok(Vec::new()), None),
             Err(error) => return (Err(error), None),
         };
-        let effort = self.resolved_effort(ReasoningEffort::Low).await;
+        let (effort, thinking_disabled) = self.extraction_reasoning().await;
         request.reasoning_effort = effort;
+        request.thinking_disabled = thinking_disabled;
         let record = |usage: Option<TokenUsage>,
                       latency_ms: u64,
                       provider_request_id: Option<String>,
@@ -934,7 +951,7 @@ mod tests {
 
     use leveler_model::{
         FinishReason, ModelError, ModelErrorKind, ModelEventStream, ModelProfile, ModelResponse,
-        TokenUsage,
+        ReasoningStyle, TokenUsage,
     };
 
     #[test]
@@ -968,6 +985,7 @@ mod tests {
         response: Mutex<Option<Result<String, ModelError>>>,
         requests: Mutex<Vec<ModelRequest>>,
         delay: Duration,
+        profile: Option<ModelProfile>,
     }
 
     impl FakeRuntime {
@@ -976,6 +994,7 @@ mod tests {
                 response: Mutex::new(Some(Ok(text.to_string()))),
                 requests: Mutex::new(Vec::new()),
                 delay: Duration::ZERO,
+                profile: None,
             }
         }
 
@@ -984,6 +1003,7 @@ mod tests {
                 response: Mutex::new(Some(Err(ModelError::new(kind, "boom")))),
                 requests: Mutex::new(Vec::new()),
                 delay: Duration::ZERO,
+                profile: None,
             }
         }
 
@@ -992,7 +1012,48 @@ mod tests {
                 response: Mutex::new(Some(Ok(text.to_string()))),
                 requests: Mutex::new(Vec::new()),
                 delay,
+                profile: None,
             }
+        }
+
+        /// A runtime whose model profile declares the given reasoning route.
+        fn with_reasoning(
+            mut self,
+            style: ReasoningStyle,
+            supported: Vec<ReasoningEffort>,
+        ) -> Self {
+            self.profile = Some(ModelProfile {
+                id: "fake/m".to_string(),
+                provider: "fake".to_string(),
+                model_id: "m".to_string(),
+                protocol: leveler_model::ProtocolKind::OpenAiChat,
+                capabilities: leveler_model::ModelCapabilities {
+                    streaming: true,
+                    tool_calling: true,
+                    parallel_tool_calls: false,
+                    structured_output: true,
+                    reasoning: true,
+                    vision: false,
+                },
+                limits: leveler_model::ModelLimits {
+                    context_window: 131_072,
+                    reliable_context: 65_536,
+                    max_output_tokens: 8_192,
+                    max_tool_schema_bytes: 32_768,
+                    max_parallel_tool_calls: 1,
+                    max_tool_output_bytes: None,
+                },
+                context_quality: None,
+                thinking: None,
+                reasoning: leveler_model::ReasoningConfig {
+                    style,
+                    supported_efforts: supported,
+                    default_effort: None,
+                },
+                compatibility: leveler_model::CompatibilityConfig::default(),
+                pricing: None,
+            });
+            self
         }
 
         fn requests(&self) -> Vec<ModelRequest> {
@@ -1030,12 +1091,11 @@ mod tests {
         }
 
         async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-            // A fake runtime has no registry profile; the extractor keeps the
-            // requested effort rather than remapping it.
-            Err(ModelError::new(
-                ModelErrorKind::ProviderUnavailable,
-                "no profile in tests",
-            ))
+            // Without a scripted profile the extractor keeps the requested
+            // effort rather than remapping it.
+            self.profile.clone().ok_or_else(|| {
+                ModelError::new(ModelErrorKind::ProviderUnavailable, "no profile in tests")
+            })
         }
     }
 
@@ -1078,6 +1138,47 @@ mod tests {
                 }}
             }}]}}"#
         )
+    }
+
+    #[tokio::test]
+    async fn a_thinking_flag_route_extracts_without_spending_its_budget_on_thinking() {
+        // The benchmark profile declares only `max`. Resolving the extractor's
+        // `low` request upward to `max` spends the whole 4096-token batch budget
+        // on reasoning and returns no JSON. A route that has an explicit `off`
+        // spelling must use it: extraction is mechanical, not a thinking task.
+        let runtime = Arc::new(
+            FakeRuntime::answering(VALID_JSON)
+                .with_reasoning(ReasoningStyle::ThinkingFlag, vec![ReasoningEffort::Max]),
+        );
+        extractor(runtime.clone())
+            .extract("这个项目后面模型就 Pro 吧", &CancellationToken::new())
+            .await
+            .expect("extraction succeeds");
+        let request = &runtime.requests()[0];
+        assert!(request.thinking_disabled, "thinking must be off");
+        assert_eq!(
+            request.reasoning_effort, None,
+            "the disabled spelling carries no effort"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_without_a_thinking_switch_keeps_the_supported_effort() {
+        // An effort-only route cannot say `off`. The request must carry the
+        // capability-derived effort instead of pretending thinking is disabled
+        // (the adapter would drop the knob entirely and the provider default
+        // would silently apply).
+        let runtime = Arc::new(
+            FakeRuntime::answering(VALID_JSON)
+                .with_reasoning(ReasoningStyle::OpenAiEffort, vec![ReasoningEffort::Max]),
+        );
+        extractor(runtime.clone())
+            .extract("这个项目后面模型就 Pro 吧", &CancellationToken::new())
+            .await
+            .expect("extraction succeeds");
+        let request = &runtime.requests()[0];
+        assert!(!request.thinking_disabled);
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Max));
     }
 
     #[tokio::test]
