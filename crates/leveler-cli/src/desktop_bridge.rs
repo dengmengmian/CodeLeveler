@@ -628,6 +628,7 @@ mod tests {
                 &session,
                 &ClientCommand::ForgetMemory {
                     session_id: session.clone(),
+                    scope: leveler_client_protocol::UiMemoryScope::Project,
                     id: "memory".into()
                 }
             )
