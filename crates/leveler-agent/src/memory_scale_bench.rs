@@ -353,7 +353,7 @@ fn build_store(directory: &Path, count: usize) -> v2::ScopeRoots {
                 revision: 2,
                 digest,
             },
-            effective_authority: effective_authority.clone(),
+            effective_authority,
         });
     }
 

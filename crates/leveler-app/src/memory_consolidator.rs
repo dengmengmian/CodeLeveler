@@ -1693,10 +1693,6 @@ mod tests {
             }
         }
 
-        fn service(&self) -> &MemoryService {
-            &self.service
-        }
-
         fn effective_active(&self) -> Result<Vec<leveler_memory::MemoryView>, ServiceError> {
             self.service
                 .listing_for_user(ServiceScope::Project, leveler_memory::MemoryLanes::ALL)
@@ -1722,10 +1718,6 @@ mod tests {
                 id,
             )
         }
-
-        fn counts(&self) -> Result<(usize, usize), ServiceError> {
-            Ok((self.effective_active()?.len(), self.list_archived()?.len()))
-        }
     }
 
     fn reviewer() -> leveler_memory::v2::Actor {
@@ -1748,25 +1740,6 @@ mod tests {
     /// The service for a worker whose current root IS `current`.
     fn worker_memory_at(current: &std::path::Path) -> MemoryService {
         TestMemory::open_at(current).service
-    }
-
-    /// One explicit user fact, written through the production facade.
-    fn seed_user_fact(store: &TestMemory, title: &str, body: &str, kind: &str) -> String {
-        let mut request = leveler_memory::RememberRequest::new(
-            leveler_memory::v2::OpId::derived("seed", &format!("{title}|{body}")),
-            ServiceScope::Project,
-            title,
-            body,
-            kind,
-        );
-        request.subject = Some(title.to_string());
-        store
-            .service
-            .remember(&reviewer(), request)
-            .unwrap()
-            .applied_id()
-            .expect("the fixture fact is current")
-            .to_string()
     }
 
     struct UnusedRuntime;

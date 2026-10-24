@@ -46,7 +46,7 @@ async fn recall_is_a_tail_block_and_the_prefix_is_stable_across_turns() {
         "catalog row missing from the prefix: {prefix}"
     );
     assert!(
-        prefix.contains("## Memory context") == false,
+        !prefix.contains("## Memory context"),
         "recall leaked into the cache-stable prefix: {prefix}"
     );
     assert!(

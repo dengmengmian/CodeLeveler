@@ -204,39 +204,6 @@ async fn experience_rows(app: &Application) -> u64 {
     counts.pending + counts.processing + counts.failed_retryable + counts.processed
 }
 
-fn experience_candidate() -> leveler_memory::MemoryCandidate {
-    let key = leveler_memory::semantic_key_of("cargo.test.dev_profile");
-    let mut experience = leveler_memory::MemoryCandidate::new(
-        "dev profile 缺少 test feature",
-        "运行 cargo test 前先确认 dev profile 启用了 test feature。",
-        leveler_memory::CandidateKind::Free,
-        Some(key.clone()),
-        leveler_memory::CandidateSource::RuntimeObserved,
-        vec!["experience".to_string()],
-    )
-    .unwrap();
-    experience.semantic_key = Some(key);
-    experience.authority = leveler_memory::MemoryAuthority::ToolObservation;
-    experience.evidence = Some("task turn-1".to_string());
-    experience.experience = Some(leveler_memory::ExperienceRecord {
-        category: leveler_memory::ExperienceCategory::RootCause,
-        verification: leveler_memory::ExperienceVerification::Verified,
-        applies_when: "运行 cargo test 且使用 dev profile".to_string(),
-        invalid_if: Some("profile 配置改变".to_string()),
-        evidence: vec![
-            leveler_memory::ExperienceEvidence {
-                kind: "failure".to_string(),
-                reference: "step 1: cargo test (exit 101)".to_string(),
-            },
-            leveler_memory::ExperienceEvidence {
-                kind: "resolution".to_string(),
-                reference: "step 3: cargo test (exit 0)".to_string(),
-            },
-        ],
-    });
-    experience
-}
-
 fn memory_tool_names_in(body: &str) -> Vec<&'static str> {
     ["memory", "remember", "forget"]
         .into_iter()

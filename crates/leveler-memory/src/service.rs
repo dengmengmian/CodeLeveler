@@ -1177,19 +1177,16 @@ impl UpdateRequest {
             tags: self.tags,
             subject_key: subject.as_deref().map(canonical_subject_key),
             subject,
-            expires_at: match self.expires_at {
-                Some(value) => Some(
-                    value
-                        .as_deref()
-                        .map(|text| {
-                            chrono::DateTime::parse_from_rfc3339(text)
-                                .ok()
-                                .map(|value| value.with_timezone(&chrono::Utc))
-                        })
-                        .unwrap_or_default(),
-                ),
-                None => None,
-            },
+            expires_at: self.expires_at.map(|value| {
+                value
+                    .as_deref()
+                    .map(|text| {
+                        chrono::DateTime::parse_from_rfc3339(text)
+                            .ok()
+                            .map(|value| value.with_timezone(&chrono::Utc))
+                    })
+                    .unwrap_or_default()
+            }),
             evidence: None,
         }
     }
@@ -1476,14 +1473,14 @@ fn candidate_intent(
         None => v2::Relation::None,
     };
     let mut evidence = Vec::new();
-    if let Some(span) = candidate.evidence.as_deref() {
-        if !span.trim().is_empty() {
-            evidence.push(user_turn_source(
-                span,
-                candidate.evidence_session.as_deref(),
-                candidate.evidence_turn.as_deref(),
-            ));
-        }
+    if let Some(span) = candidate.evidence.as_deref()
+        && !span.trim().is_empty()
+    {
+        evidence.push(user_turn_source(
+            span,
+            candidate.evidence_session.as_deref(),
+            candidate.evidence_turn.as_deref(),
+        ));
     }
     let expires_at = match candidate.expires_at.as_deref() {
         Some(value) => Some(
@@ -1496,7 +1493,7 @@ fn candidate_intent(
     let op_id = format!(
         "{}:{}",
         op_seed,
-        crate::v2::sha256_hex_text(&candidate.fingerprint)[..16].to_string()
+        &crate::v2::sha256_hex_text(&candidate.fingerprint)[..16]
     );
     Ok(v2::WriteIntent {
         op_id: v2::OpId::parse(op_id).map_err(|error| ServiceError::Invalid(error.to_string()))?,

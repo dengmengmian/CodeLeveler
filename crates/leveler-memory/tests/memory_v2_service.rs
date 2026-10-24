@@ -286,7 +286,7 @@ fn the_same_op_id_replays_and_a_changed_request_is_rejected() {
     let fixture = Fixture::new(MemoryScope::Project);
     let service = service(&fixture);
     let actor = user();
-    let mut intent = fact(
+    let intent = fact(
         MemoryScope::Project,
         Some("billing_model"),
         "subscription",

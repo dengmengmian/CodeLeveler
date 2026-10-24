@@ -558,8 +558,8 @@ fn bracket_char_literals(line: &str) -> usize {
     while index < bytes.len() {
         if bytes[index] == b'\'' && index + 1 < bytes.len() {
             let rest = &span[index + 1..];
-            let width = if rest.starts_with('\\') {
-                rest[1..].find('\'').map(|offset| offset + 2)
+            let width = if let Some(escaped) = rest.strip_prefix('\\') {
+                escaped.find('\'').map(|offset| offset + 2)
             } else {
                 rest.find('\'').map(|offset| offset + 1)
             };
@@ -945,9 +945,7 @@ fn is_protocol_marker(text: &str) -> bool {
     text.starts_with("exit: ")
 }
 "#;
-        let exceptions = format!(
-            "file = crates/leveler-memory/src/lib.rs\nsymbol = is_protocol_marker\nconstruct = text-predicate\nhits = 1\nreason = tool receipt protocol, not a memory fact\nowner = runtime\ntest = a_named_test\n"
-        );
+        let exceptions = "file = crates/leveler-memory/src/lib.rs\nsymbol = is_protocol_marker\nconstruct = text-predicate\nhits = 1\nreason = tool receipt protocol, not a memory fact\nowner = runtime\ntest = a_named_test\n".to_string();
         let dir = repo_with(source, &exceptions);
         let text = report(dir.path());
         assert!(text.contains("arch: PASS"), "{text}");

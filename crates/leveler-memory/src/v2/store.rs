@@ -1128,14 +1128,14 @@ impl MarkdownStore {
                 Trust::Trusted => {}
             }
             report.active_records += 1;
-            if record.frontmatter.kind == MemoryKind::UserFact {
-                if let Some(subject_key) = record.frontmatter.subject_key.clone() {
-                    subjects.push((
-                        record.frontmatter.kind,
-                        subject_key,
-                        record.frontmatter.id.clone(),
-                    ));
-                }
+            if record.frontmatter.kind == MemoryKind::UserFact
+                && let Some(subject_key) = record.frontmatter.subject_key.clone()
+            {
+                subjects.push((
+                    record.frontmatter.kind,
+                    subject_key,
+                    record.frontmatter.id.clone(),
+                ));
             }
         }
 
@@ -1921,16 +1921,16 @@ impl MarkdownStore {
                 self.finish_noop(&op_id, &digest, admission.clone())?;
                 return Ok(admission);
             };
-            if let Some(expected) = &expected {
-                if target.cas() != *expected {
-                    let admission = Admission::Conflict {
-                        target: target_id.clone(),
-                        current: target.cas(),
-                        expected: expected.clone(),
-                    };
-                    self.finish_noop(&op_id, &digest, admission.clone())?;
-                    return Ok(admission);
-                }
+            if let Some(expected) = &expected
+                && target.cas() != *expected
+            {
+                let admission = Admission::Conflict {
+                    target: target_id.clone(),
+                    current: target.cas(),
+                    expected: expected.clone(),
+                };
+                self.finish_noop(&op_id, &digest, admission.clone())?;
+                return Ok(admission);
             }
             if target.trust.trust != Trust::Trusted {
                 return Err(StoreError::ExternalConflict {
@@ -2436,21 +2436,19 @@ impl MarkdownStore {
                             reason: "pending target is not trusted".into(),
                         });
                     }
-                    if let Some(expected_revision) = proposal.expected_revision {
-                        if let Some(expected_digest) = &proposal.expected_digest {
-                            if target.record.frontmatter.revision != expected_revision
-                                || &target.digest != expected_digest
-                            {
-                                return Err(StoreError::Conflict {
-                                    target: target_id.clone(),
-                                    current: target.cas(),
-                                    expected: Cas {
-                                        revision: expected_revision,
-                                        digest: expected_digest.clone(),
-                                    },
-                                });
-                            }
-                        }
+                    if let Some(expected_revision) = proposal.expected_revision
+                        && let Some(expected_digest) = &proposal.expected_digest
+                        && (target.record.frontmatter.revision != expected_revision
+                            || &target.digest != expected_digest)
+                    {
+                        return Err(StoreError::Conflict {
+                            target: target_id.clone(),
+                            current: target.cas(),
+                            expected: Cas {
+                                revision: expected_revision,
+                                digest: expected_digest.clone(),
+                            },
+                        });
                     }
                     loaded.push(target);
                 }
@@ -2966,10 +2964,7 @@ impl MarkdownStore {
     }
 
     fn execute_tx(&self, tx: Tx) -> Result<(), StoreError> {
-        let prepared = match self.prepare_files(&tx) {
-            Ok(prepared) => prepared,
-            Err(error) => return Err(error),
-        };
+        let prepared = self.prepare_files(&tx)?;
         let mut journal =
             JournalPlan::new(tx.intent.op_id.clone(), tx.operation, tx.caller.clone());
         journal.new_files = prepared
@@ -3548,10 +3543,9 @@ impl MarkdownStore {
                     .file_type()
                     .map(|kind| kind.is_file())
                     .unwrap_or(false)
+                    && path::remove_if_exists(&path).unwrap_or(false)
                 {
-                    if path::remove_if_exists(&path).unwrap_or(false) {
-                        cleaned.push(path);
-                    }
+                    cleaned.push(path);
                 }
             }
         }
@@ -3593,10 +3587,9 @@ impl MarkdownStore {
                     .file_type()
                     .map(|kind| kind.is_file())
                     .unwrap_or(false)
+                    && path::remove_if_exists(&path).unwrap_or(false)
                 {
-                    if path::remove_if_exists(&path).unwrap_or(false) {
-                        cleaned.push(path);
-                    }
+                    cleaned.push(path);
                 }
             }
         }

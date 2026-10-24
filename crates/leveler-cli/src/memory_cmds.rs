@@ -452,7 +452,7 @@ pub(crate) fn cmd_memory(
                 .listing_for_user(scope, lanes)?
                 .into_iter()
                 .find(|view| view.id == id);
-            return match found {
+            match found {
                 Some(view) => {
                     print_view(&view);
                     Ok(std::process::ExitCode::SUCCESS)
@@ -475,7 +475,7 @@ pub(crate) fn cmd_memory(
                     }
                     Err(error) => Err(error.into()),
                 },
-            };
+            }
         }
         MemoryCommand::Forget { id } => {
             // A credential-shaped title must stay withheld even as the record

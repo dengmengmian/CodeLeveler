@@ -1454,8 +1454,8 @@ fn render_memory_home(frame: &mut Frame, body: Rect, state: &mut AppState) {
             Style::default().fg(theme.text.secondary),
         )));
         for (_, entry) in recalled.iter().take(5) {
-            let scope = crate::memory::scope_label(entry.scope, &t);
-            let kind = memory_entry_kind_label(entry, &t);
+            let scope = crate::memory::scope_label(entry.scope, t);
+            let kind = memory_entry_kind_label(entry, t);
             lines.push(Line::from(Span::styled(
                 format!("  · {}（{scope} · {kind}）", entry.title.trim()),
                 Style::default().fg(theme.text.muted),
@@ -1539,7 +1539,7 @@ fn render_memory_review(frame: &mut Frame, body: Rect, state: &mut AppState) {
     }
     if let Some(report) = &state.memory.batch {
         lines.push(Line::from(Span::styled(
-            memory_batch_line(report, &state.t()),
+            memory_batch_line(report, state.t()),
             Style::default().fg(if report.failed.is_empty() {
                 theme.status.success
             } else {
@@ -1580,7 +1580,7 @@ fn render_memory_review(frame: &mut Frame, body: Rect, state: &mut AppState) {
         } else {
             "[ ] "
         };
-        let scope = crate::memory::scope_label(candidate.scope, &t);
+        let scope = crate::memory::scope_label(candidate.scope, t);
         let heading = format!("[{scope}] {}", candidate.title);
         let title_room = width.saturating_sub(6).max(1);
         lines.push(Line::from(vec![
@@ -1640,7 +1640,7 @@ fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, ac
             }),
         )));
         let scope = match state.memory.filter.scope {
-            Some(scope) => crate::memory::scope_label(scope, &t),
+            Some(scope) => crate::memory::scope_label(scope, t),
             None => t.memory_filter_scope_all,
         };
         let kind = match state.memory.filter.kind {
@@ -1704,14 +1704,14 @@ fn render_memory_entries(frame: &mut Frame, body: Rect, state: &mut AppState, ac
         lines.push(Line::from(spans));
         // The second line answers "what is this and how does it reach the
         // model?" without opening the record.
-        let scope = crate::memory::scope_label(entry.scope, &t);
-        let kind = memory_entry_kind_label(entry, &t);
+        let scope = crate::memory::scope_label(entry.scope, t);
+        let kind = memory_entry_kind_label(entry, t);
         let mut detail: Vec<std::borrow::Cow<'static, str>> = vec![scope.into(), kind.into()];
         if let Some(status) = entry.status.as_deref() {
-            detail.push(memory_status_label(status, &t));
+            detail.push(memory_status_label(status, t));
         }
         if let Some(authority) = entry.authority.as_deref() {
-            detail.push(memory_authority_label(authority, &t));
+            detail.push(memory_authority_label(authority, t));
         }
         if let Some(revision) = entry.revision {
             detail.push(format!("r{revision}").into());
@@ -1777,7 +1777,7 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
         let title = candidate.title.trim();
         let heading = format!(
             "[{}] {title}",
-            crate::memory::scope_label(candidate.scope, &t)
+            crate::memory::scope_label(candidate.scope, t)
         );
         let body_text = candidate.body.trim();
         // The title appears once. A body that merely repeats it is not shown
@@ -1827,7 +1827,7 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
         }
     } else if let Some(entry) = state.memory.focused_entry() {
         let title = entry.title.trim();
-        let heading = format!("[{}] {title}", crate::memory::scope_label(entry.scope, &t));
+        let heading = format!("[{}] {title}", crate::memory::scope_label(entry.scope, t));
         let body_text = entry.body.trim();
         if normalize_memory_text(title) == normalize_memory_text(body_text) || body_text.is_empty()
         {
@@ -1855,7 +1855,7 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
             );
         }
         lines.push(Line::from(""));
-        for (label, value) in memory_detail_metadata(entry, &t) {
+        for (label, value) in memory_detail_metadata(entry, t) {
             push_memory_wrapped(
                 &mut lines,
                 &format!("{label}: {value}"),
@@ -1927,7 +1927,7 @@ fn render_memory_edit(frame: &mut Frame, body: Rect, state: &mut AppState) {
     let heading = format!(
         "{} · {}:{} · r{}",
         t.memory_edit_title,
-        crate::memory::scope_label(editor.scope, &t),
+        crate::memory::scope_label(editor.scope, t),
         editor.id,
         editor.revision
     );
@@ -2005,7 +2005,7 @@ fn render_memory_edit(frame: &mut Frame, body: Rect, state: &mut AppState) {
         lines.push(Line::from(""));
     }
 
-    for footer in edit_status_lines(state, &t) {
+    for footer in edit_status_lines(state, t) {
         push_memory_wrapped(&mut lines, &footer.0, width, Style::default().fg(footer.1));
     }
     render_scrolled(frame, body, state, lines);

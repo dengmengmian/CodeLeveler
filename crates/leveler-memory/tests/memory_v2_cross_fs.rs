@@ -74,7 +74,7 @@ fn exercise(store: &MarkdownStore) {
                 "value-replaced",
                 "The value is value-replaced.",
             )),
-            &[other.clone()],
+            std::slice::from_ref(&other),
         )
         .unwrap();
     assert!(admission.is_applied(), "{admission:?}");
