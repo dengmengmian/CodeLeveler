@@ -378,16 +378,20 @@ every record (the worst case for ranking):
 
 | Configuration | p50 | p95 |
 | --- | --- | --- |
-| 10k, user lane only (shipped default) | 7.3ms | 9.3ms |
-| 10k, both lanes, experience lane empty | 11.3ms | 15.6ms |
-| 10k, both lanes, 2000 experience records | 12.0ms | 24.5ms |
+| 10k, user lane only (shipped default) | 6.8–6.9ms | 7.4–10.1ms |
+| 10k, both lanes, experience lane empty | 9.4–9.8ms | 10.3–12.4ms |
+| 10k, both lanes, 2000 experience records | 10.8–10.9ms | 11.9–13.9ms |
 
-Index rebuild at 10k: 0.8s. Cold store open: ~150–350ms (journal recovery plus
-orphan scan), warm catalog: sub-microsecond.
+Three consecutive runs per row. A single lexical pass over the 10k fixture costs
+6.5–6.7ms at limit 12 and 6.0–6.2ms at limit 1, so nearly all of the user-lane
+time is the ranked FTS5 scan, not candidate validation (48 batch reads: 2.4ms).
+Index rebuild at 10k: 0.7–0.8s. Cold store open: ~150–350ms (journal recovery
+plus orphan scan), warm catalog: sub-microsecond.
 
-The user lane meets the 10ms p95 target. The dual-lane worst case does not. The
-cost is two lexical rankings of disjoint row sets: the lane filter already keeps
-each query from scoring the other lane's rows, and FTS5 cannot apply `bm25()` in a
+The user lane sits on the 10ms p95 target: two of three runs are under it and the
+third is 10.1ms, so the margin is thin. The dual-lane rows are over it. The cost
+is two lexical rankings of disjoint row sets: the lane filter already keeps each
+query from scoring the other lane's rows, and FTS5 cannot apply `bm25()` in a
 subquery, so a per-lane top-K is still two scans. Reducing it would mean merging
 the two rankings (which cannot guarantee a per-lane K), shrinking K, or skipping
 the Markdown revalidation — all of which trade recall or correctness for latency,

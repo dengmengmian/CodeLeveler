@@ -296,13 +296,13 @@ python3 eval/memory/live_acceptance.py --phase all \
 
 | 配置 | p50 | p95 |
 | --- | --- | --- |
-| 10k，仅 user lane（出厂默认） | 7.3ms | 9.3ms |
-| 10k，双 Lane，经验 lane 为空 | 11.3ms | 15.6ms |
-| 10k，双 Lane，2000 条经验 | 12.0ms | 24.5ms |
+| 10k，仅 user lane（出厂默认） | 6.8–6.9ms | 7.4–10.1ms |
+| 10k，双 Lane，经验 lane 为空 | 9.4–9.8ms | 10.3–12.4ms |
+| 10k，双 Lane，2000 条经验 | 10.8–10.9ms | 11.9–13.9ms |
 
-10k 索引重建 0.8s；冷开 store 约 150–350ms（journal 恢复 + 孤儿扫描），warm catalog 亚微秒级。
+每行连续三次运行。单次词法扫描（10k fixture，limit 12）6.5–6.7ms，limit 1 也要 6.0–6.2ms，可见 user lane 的时间几乎全在 FTS5 排序扫描上，不在候选复核（48 条批量读 2.4ms）。10k 索引重建 0.7–0.8s；冷开 store 约 150–350ms（journal 恢复 + 孤儿扫描），warm catalog 亚微秒级。
 
-user lane 达到 p95 < 10ms 的目标，双 Lane 最坏情况未达标。代价是两次互不相交的行集上的词法排序：lane 过滤已经保证每次查询不为另一个 lane 的行打分，而 FTS5 不能在子查询里用 `bm25()`，所以「每个 lane 各取 top-K」必然是两次扫描。要降下来只能把两次排序合并（无法保证每个 lane 的 K）、减小 K、或跳过 Markdown 复核——三者都在拿召回或正确性换延迟，因此都没有实现。
+user lane 刚好压在 p95 < 10ms 的线上：三次运行有两次达标，第三次 10.1ms，余量很小；双 Lane 两行都超出。代价是两次互不相交行集上的词法排序：lane 过滤已经保证每次查询不为另一个 lane 的行打分，而 FTS5 不能在子查询里用 `bm25()`，所以「每个 lane 各取 top-K」必然是两次扫描。要降下来只能把两次排序合并（无法保证每个 lane 的 K）、减小 K、或跳过 Markdown 复核——三者都在拿召回或正确性换延迟，因此都没有实现。
 
 ## 17. 已知限制
 
