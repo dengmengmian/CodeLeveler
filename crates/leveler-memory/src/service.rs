@@ -1244,13 +1244,16 @@ fn markdown_view(record: &v2::MemoryRecord, authority: v2::MemoryAuthority) -> M
             .experience
             .as_ref()
             .map(|experience| ExperienceView {
-                // Verification is a claim about the text the runtime observed,
-                // so it needs both the evidence chain AND the runtime as the
-                // record's author. A record a person rewrote is still the same
-                // record (same id, same history, same evidence references),
-                // but its current text is not what the runtime proved.
-                standing: if authority == v2::MemoryAuthority::RuntimeObserved
-                    && experience.has_resolution()
+                // Verification is a claim about the text the runtime observed.
+                // It survives the two ways that text reaches a person unchanged
+                // — the runtime writing it, or a person accepting the runtime's
+                // own proposal — and ends the moment someone rewrites it
+                // (`user_explicit`), which is a different text with a different
+                // author.
+                standing: if matches!(
+                    authority,
+                    v2::MemoryAuthority::RuntimeObserved | v2::MemoryAuthority::UserApproved
+                ) && experience.has_resolution()
                 {
                     "verified".into()
                 } else {
