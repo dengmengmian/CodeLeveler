@@ -2006,6 +2006,13 @@
             "type": "string"
           }
         },
+        "injected": {
+          "description": "The same records with the identity a person needs to find them again: scope, bounded title and the mode they were injected in. Titles only — a body never travels on this event. Additive: an older runtime sends none, and the client then shows counts alone.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiMemoryReference"
+          }
+        },
         "type": {
           "type": "string",
           "enum": [
@@ -5381,6 +5388,13 @@
                 "type": "string"
               }
             },
+            "injected": {
+              "description": "The same records with the identity a person needs to find them again: scope, bounded title and the mode they were injected in. Titles only — a body never travels on this event. Additive: an older runtime sends none, and the client then shows counts alone.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/UiMemoryReference"
+              }
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -7091,6 +7105,15 @@
           "description": "Free-form label as stored (`preference`, `package_manager`, …).",
           "type": "string"
         },
+        "scope": {
+          "description": "Which store is holding this pending record. Accept/reject must carry it back so a decision can never land in another scope.",
+          "default": "project",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiMemoryScope"
+            }
+          ]
+        },
         "source": {
           "description": "Who proposed it (`user_explicit`, `system_propose`, …).",
           "type": "string"
@@ -7108,6 +7131,18 @@
         "title"
       ],
       "properties": {
+        "authority": {
+          "description": "Who established this memory (`user_explicit`, `runtime_observed`, ...). This is the store's own vocabulary, not a client guess.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body": {
+          "description": "The stored content. A title alone cannot answer \"what do I actually remember?\", and the detail page must not guess it. Additive: absent on older runtimes (empty string).",
+          "default": "",
+          "type": "string"
+        },
         "id": {
           "type": "string"
         },
@@ -7122,12 +7157,48 @@
             }
           ]
         },
+        "pinned": {
+          "description": "Pinned by the person, not by a model hint.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The revision this row was read at, so a detail page can name exactly what it is showing instead of \"the current one\".",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "scope": {
+          "description": "Which store this row came from; part of the row's identity.",
+          "default": "project",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiMemoryScope"
+            }
+          ]
+        },
         "sensitive": {
           "description": "Held back from every automatic path because it looks like a credential. Kept in the listing so the user can find and archive it.",
           "type": "boolean"
         },
+        "status": {
+          "description": "The lifecycle state the store reports for this row (`active`, `pending`, `superseded`, `deprecated`). Additive: absent on older runtimes, and the page then says nothing it cannot prove.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "title": {
           "type": "string"
+        },
+        "updated_at": {
+          "description": "When the store last changed this record (RFC 3339).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -7282,6 +7353,50 @@
         }
       ]
     },
+    "UiMemoryReference": {
+      "description": "One record a turn's request actually carried.",
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "description": "`standing`, `candidate` or `experience`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "Which store the record came from; `(scope, id)` is its identity.",
+          "default": "project",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiMemoryScope"
+            }
+          ]
+        },
+        "title": {
+          "description": "A bounded summary. Redacted when the record looks like a credential.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiMemoryScope": {
+      "description": "The scope a memory row or decision belongs to.\n\n`(scope, id)` is the record's identity: the same id in two scopes is two independent memories. An older runtime that sends no scope predates multi-scope listings and only ever served the project store.",
+      "type": "string",
+      "enum": [
+        "global",
+        "project",
+        "local"
+      ]
+    },
     "UiMemoryStatus": {
       "description": "Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error.",
       "type": "object",
@@ -7320,6 +7435,15 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        },
+        "experience_enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "experience_experimental": {
+          "description": "Agent experience is still experimental.",
+          "default": true,
+          "type": "boolean"
         },
         "experience_inbox_failed_retryable": {
           "default": 0,
@@ -7450,6 +7574,34 @@
           "minimum": 0.0
         },
         "sensitive": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "total_enabled": {
+          "description": "The project's effective switches. `*_enabled` is already the conjunction with `total_enabled`; an old daemon that sends no switches is read as the historical all-on state.",
+          "default": true,
+          "type": "boolean"
+        },
+        "user_active": {
+          "description": "User-lane entries only, so a client can show the two lanes separately and still account for every active/pending/archived row.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "user_archived": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "user_enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "user_pending": {
+          "default": 0,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
