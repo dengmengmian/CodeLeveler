@@ -58,7 +58,7 @@ Project scope 是工作区内容：写进仓库，人可以直接看、改、提
 
 ```markdown
 ---
-schema: 1
+schema: 2
 id: mem_<32 hex>
 kind: user_fact | experience
 scope: global | project | local
