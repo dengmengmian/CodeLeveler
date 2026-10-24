@@ -170,7 +170,9 @@ fn outcome_message(outcome: &WriteOutcome) -> String {
         ),
         WriteOutcome::Rejected { reason } => format!("Rejected: {reason}"),
         WriteOutcome::NotStored { reason } => format!("Not stored: {reason}"),
-        WriteOutcome::Forgotten { id, title } => format!("Archived memory [{id}]: {title}"),
+        WriteOutcome::Forgotten { id, title } => {
+            format!("Forgotten [{id}]: {title} (the text is deleted; only a tombstone remains)")
+        }
     }
 }
 
@@ -642,8 +644,8 @@ impl Tool for RememberTool {
          section of the system prompt; a change to a user-owned fact is queued \
          for the user. \
          `preference` is injected into later turns; `decision` and `note` are \
-         retrieved by relevance or title. `forget` archives an id. Secrets are \
-         not a valid body."
+         retrieved by relevance or title. `forget` deletes an id's text for \
+         good. Secrets are not a valid body."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -727,10 +729,11 @@ impl Tool for ForgetTool {
     }
 
     fn description(&self) -> &'static str {
-        "Archive a memory by id. The entry is retained for audit and is no \
-         longer active. Requires user approval. Archiving does not write a \
-         replacement; a replacement is a separate `remember` proposal. A \
-         user-owned memory is queued for the user instead of being removed."
+        "Forget a memory by id for good: its text, its revisions and its index \
+         rows are deleted, and only a minimal tombstone remains. This is not \
+         reversible and not the same as retiring an entry while keeping its \
+         history. Requires user approval. A user-owned memory is queued for the \
+         user instead of being deleted."
     }
 
     fn input_schema(&self) -> serde_json::Value {
