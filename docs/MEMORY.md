@@ -70,7 +70,7 @@ One file per record, YAML frontmatter plus a Markdown body:
 
 ```markdown
 ---
-schema: 1
+schema: 2
 id: mem_<32 hex>
 kind: user_fact | experience
 scope: global | project | local
