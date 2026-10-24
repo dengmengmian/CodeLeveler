@@ -104,6 +104,13 @@ pub struct ProcessRequest {
     /// Never derived from tool or model input.
     #[serde(default)]
     pub sandbox_write_roots: Vec<PathBuf>,
+    /// This command is a verification check: its verdict is read as "does the
+    /// current source build", so it runs under the build-state contract of
+    /// [`verify_source`] — output in build state this workspace owns, and bound
+    /// to the content the check is about to judge. Host authority, never model
+    /// input; only [`process_request_for_verify_check`] sets it.
+    #[serde(default)]
+    pub verify_check: bool,
 }
 
 /// Default per-stream output cap (1 MiB).
@@ -352,6 +359,7 @@ impl ProcessRequest {
             allow_env: Vec::new(),
             authority_env: Vec::new(),
             sandbox_write_roots: Vec::new(),
+            verify_check: false,
         }
     }
 }
@@ -379,6 +387,33 @@ impl ProcessRequest {
 /// still needs caches to build against).
 pub(crate) fn sandbox_anchor(request: &ProcessRequest) -> &Path {
     request.write_scope.root().unwrap_or(&request.cwd)
+}
+
+/// The `CARGO_TARGET_DIR` a verification check would inherit, resolved against
+/// the directory the check runs in.
+///
+/// Relative values are what Cargo itself resolves against the working
+/// directory, so the answer is where the build would really land, not how the
+/// setting happens to be spelled.
+fn verification_target_override(
+    environment: &leveler_core::EnvSnapshot,
+    request: &ProcessRequest,
+) -> Option<PathBuf> {
+    for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+        let Some(value) = environment.var_os(name) else {
+            continue;
+        };
+        let value = PathBuf::from(value);
+        if value.as_os_str().is_empty() {
+            continue;
+        }
+        return Some(if value.is_absolute() {
+            value
+        } else {
+            request.cwd.join(value)
+        });
+    }
+    None
 }
 
 /// Whether a confined command should expose the host's existing dependency
@@ -428,6 +463,7 @@ pub fn process_request_for_verify_check(
         root: workspace_root,
     };
     req.deny_network = matches!(network, VerifyNetworkPolicy::ForceDeny);
+    req.verify_check = true;
     req
 }
 
@@ -876,6 +912,7 @@ fn writable_roots_for_scope(
 }
 
 mod host_cache;
+mod verify_source;
 pub(crate) use host_cache::{
     SandboxPaths, SandboxScratch, apply_sandbox_environment, prepare_sandbox_paths,
 };
@@ -1461,6 +1498,7 @@ impl CommandRunner {
                     &self.environment,
                     sandbox_anchor(request),
                     should_read_host_caches(request),
+                    request.verify_check,
                 )
             })
             .transpose()
@@ -1527,6 +1565,42 @@ impl CommandRunner {
         apply_common_command_env(&mut cmd, request, &program, &args, &self.environment);
         if let Some(paths) = sandbox_paths.as_ref() {
             apply_sandbox_environment(&mut cmd, paths);
+            if request.verify_check {
+                // A verification verdict may only describe the source it was
+                // asked about: see `verify_source`.
+                let workspace = sandbox_anchor(request).to_path_buf();
+                let inherited = verification_target_override(&self.environment, request);
+                let (target, overrides_inherited) = verify_source::build_state_dir(
+                    inherited.as_deref(),
+                    &workspace,
+                    paths.tool_cache_path().join(verify_source::VERIFY_TARGET),
+                );
+                if overrides_inherited {
+                    verify_source::apply_build_state(&mut cmd, &target);
+                }
+                let state_dir = paths.tool_cache_path().join(verify_source::VERIFY_STATE);
+                let bound = tokio::task::spawn_blocking(move || {
+                    verify_source::bind_to_current_source(&workspace, &state_dir)
+                })
+                .await
+                .map_err(|error| {
+                    ProcessError::SandboxPolicy(format!(
+                        "verification source binding was interrupted: {error}"
+                    ))
+                })?;
+                match bound {
+                    Ok(moved) => tracing::debug!(
+                        target_dir = %target.display(),
+                        inputs_marked_changed = moved,
+                        "verification check bound to the current source"
+                    ),
+                    Err(error) => {
+                        return Err(ProcessError::SandboxPolicy(format!(
+                            "verification cannot be bound to the current source: {error}"
+                        )));
+                    }
+                }
+            }
         }
 
         #[cfg(not(unix))]
@@ -3413,7 +3487,8 @@ mod tests {
             PathBuf::new(),
             base.path().to_path_buf(),
         );
-        let paths = prepare_sandbox_paths(&environment, &workspace, false).expect("private paths");
+        let paths =
+            prepare_sandbox_paths(&environment, &workspace, false, false).expect("private paths");
         assert!(paths.scratch_path().join("tmp").is_dir());
         for relative in [
             "cargo",
@@ -3449,7 +3524,8 @@ mod tests {
                 .starts_with(leveler_home.canonicalize().unwrap().join("cache/tools"))
         );
 
-        let second = prepare_sandbox_paths(&environment, &workspace, false).expect("second paths");
+        let second =
+            prepare_sandbox_paths(&environment, &workspace, false, false).expect("second paths");
         assert_ne!(paths.scratch_path(), second.scratch_path());
         assert_eq!(paths.tool_cache_path(), second.tool_cache_path());
     }
@@ -3468,7 +3544,7 @@ mod tests {
             base.path().to_path_buf(),
         );
 
-        let paths = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let paths = prepare_sandbox_paths(&environment, &workspace, false, false).unwrap();
         // With no HOME, LevelerHome falls back to a process-local temp home —
         // `<temp>/leveler-<pid>` — never a second `codeleveler-private`
         // namespace. scratch = <home>/run/sandboxes/<name>.
@@ -3521,7 +3597,7 @@ mod tests {
             poisoned_temp,
         );
 
-        let error = prepare_sandbox_paths(&environment, &workspace, false)
+        let error = prepare_sandbox_paths(&environment, &workspace, false, false)
             .err()
             .expect("poisoned temp must fail closed");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
@@ -3547,7 +3623,7 @@ mod tests {
             base.path().to_path_buf(),
             home.join("tmp"),
         ));
-        let initialized = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let initialized = prepare_sandbox_paths(&environment, &workspace, false, false).unwrap();
         let registry = initialized.tool_cache_path().join("cargo/registry");
         drop(initialized);
         std::fs::remove_dir(&registry).unwrap();
@@ -3561,7 +3637,7 @@ mod tests {
             let workspace = workspace.clone();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                prepare_sandbox_paths(&environment, &workspace, false).map(drop)
+                prepare_sandbox_paths(&environment, &workspace, false, false).map(drop)
             }));
         }
         for thread in threads {
@@ -3714,7 +3790,7 @@ mod tests {
             poisoned_tmp.clone(),
         );
         assert!(
-            prepare_sandbox_paths(&poisoned_env, &workspace, false).is_err(),
+            prepare_sandbox_paths(&poisoned_env, &workspace, false, false).is_err(),
             "a workspace-linked LEVELER_HOME must fail closed"
         );
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
@@ -3732,7 +3808,7 @@ mod tests {
             poisoned_tmp,
         ));
 
-        let paths = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let paths = prepare_sandbox_paths(&environment, &workspace, false, false).unwrap();
         let safe_home = safe_home.canonicalize().unwrap();
         assert!(paths.tool_cache_path().starts_with(&safe_home));
         assert!(paths.scratch_path().starts_with(&safe_home));
@@ -3744,7 +3820,7 @@ mod tests {
         // recreate a real leaf, and leave the target untouched.
         std::fs::remove_dir(&registry_root).unwrap();
         std::os::unix::fs::symlink(&outside, &registry_root).unwrap();
-        let repaired = prepare_sandbox_paths(&environment, &workspace, false).unwrap();
+        let repaired = prepare_sandbox_paths(&environment, &workspace, false, false).unwrap();
         assert!(registry_root.is_dir());
         assert!(
             !std::fs::symlink_metadata(&registry_root)
@@ -3789,7 +3865,8 @@ mod tests {
         );
 
         // The next trusted initialization is safe even after the attack.
-        let _next = prepare_sandbox_paths(runner.environment.as_ref(), &workspace, false).unwrap();
+        let _next =
+            prepare_sandbox_paths(runner.environment.as_ref(), &workspace, false, false).unwrap();
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
     }
 
@@ -6445,6 +6522,230 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("process-tree") || msg.contains("Job"), "{msg}");
         assert!(matches!(err, ProcessError::ProcessTreeSetup(_)));
+    }
+
+    // ---- verification build state -----------------------------------------
+    //
+    // A verification check answers one question: does THIS source build? Its
+    // verdict may only come from the sources it was asked about, so the check
+    // must (a) not depend on build state another project owns, and (b) not let
+    // a cache called "fresh" stand in for a tree that changed.
+
+    /// One Rust project plus a runner whose inherited `CARGO_TARGET_DIR` the
+    /// caller chooses. The workspace lives outside the shared temp grant, so a
+    /// writable-roots denial can only come from the path under test.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn verify_build_fixture(
+        inherited_target: Option<&Path>,
+        base: &Path,
+    ) -> (PathBuf, CommandRunner) {
+        let workspace = base.join("project");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"verify-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let host_cargo = base.join("host-cargo");
+        std::fs::create_dir_all(&host_cargo).unwrap();
+        let mut variables: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| {
+                name != "CARGO_HOME"
+                    && name != "RUSTC_WRAPPER"
+                    && name != "RUSTC_WORKSPACE_WRAPPER"
+                    && name != "CARGO_TARGET_DIR"
+                    && name != "CARGO_BUILD_TARGET_DIR"
+            })
+            .collect();
+        variables.push(("CARGO_HOME".into(), host_cargo.into_os_string()));
+        if let Some(target) = inherited_target {
+            variables.push(("CARGO_TARGET_DIR".into(), target.as_os_str().to_owned()));
+        }
+        variables.push(("LEVELER_HOME".into(), base.join("home").into_os_string()));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            variables,
+            std::env::current_dir().unwrap(),
+            std::env::temp_dir(),
+        ));
+        (workspace, CommandRunner::with_environment(environment))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn broken_main(workspace: &Path) {
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() { this is not rust }\n",
+        )
+        .unwrap();
+    }
+
+    /// A shared `CARGO_TARGET_DIR` outside the workspace is the user's own
+    /// build preference, not a verification input. It must never decide the
+    /// verdict — and it must never make a clean tree fail for lack of write
+    /// permission to somebody else's cache directory.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_inherited_target_dir_outside_the_workspace_cannot_fail_a_clean_build() {
+        let base = private_home_fixture();
+        let shared = base.path().join("shared-target");
+        std::fs::create_dir_all(&shared).unwrap();
+        let (workspace, runner) = verify_build_fixture(Some(&shared), base.path());
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            output.success(),
+            "a clean tree must build regardless of an inherited target dir: {output:?}"
+        );
+    }
+
+    /// The same inherited directory must not lend its state to a broken tree
+    /// either: two projects sharing one cache keep their own verdicts.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn two_projects_sharing_one_inherited_target_dir_keep_their_own_verdicts() {
+        let base = private_home_fixture();
+        let shared = base.path().join("shared-target");
+        std::fs::create_dir_all(&shared).unwrap();
+        let clean_base = base.path().join("clean");
+        let broken_base = base.path().join("broken");
+        std::fs::create_dir_all(&clean_base).unwrap();
+        std::fs::create_dir_all(&broken_base).unwrap();
+        let (clean, clean_runner) = verify_build_fixture(Some(&shared), &clean_base);
+        let (broken, broken_runner) = verify_build_fixture(Some(&shared), &broken_base);
+        broken_main(&broken);
+
+        let clean_output = verify_build(&clean, &clean_runner).await;
+        let broken_output = verify_build(&broken, &broken_runner).await;
+        assert!(
+            clean_output.success(),
+            "the clean project must build: {clean_output:?}"
+        );
+        assert!(
+            !broken_output.success(),
+            "the broken project must not borrow the clean project's success: {broken_output:?}"
+        );
+    }
+
+    /// A build cache decides "fresh" from file mtimes, not file contents. A
+    /// file whose content changed but whose mtime did not move forward — a
+    /// checkout, a restored backup, an editor's atomic save, a filesystem with
+    /// a coarse clock — would let the cache answer for a tree it never
+    /// compiled. A verification must never report that as a success.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_broken_source_with_an_older_mtime_still_fails_the_gate() {
+        let base = private_home_fixture();
+        let (workspace, runner) = verify_build_fixture(None, base.path());
+        let source = workspace.join("src/main.rs");
+        let clean = verify_build(&workspace, &runner).await;
+        assert!(clean.success(), "the fixture must build first: {clean:?}");
+        let original = std::fs::metadata(&source).unwrap();
+
+        broken_main(&workspace);
+        let handle = std::fs::File::open(&source).unwrap();
+        handle
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(original.modified().unwrap())
+                    .set_accessed(original.accessed().unwrap()),
+            )
+            .unwrap();
+        drop(handle);
+
+        let output = verify_build(&workspace, &runner).await;
+        assert!(
+            !output.success(),
+            "a broken source must fail the gate even when its mtime predates the artifacts: {output:?}"
+        );
+        assert!(
+            output.stderr.contains("not rust") && output.stderr.contains("main.rs"),
+            "the verdict must come from recompiling the current source, not from a denial: {output:?}"
+        );
+    }
+
+    /// The negative case is only evidence when the compiler actually judged
+    /// the file: an environment that stops `cargo` from running must not be
+    /// mistaken for "the build failed" either.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_compile_failure_names_the_current_source() {
+        let base = private_home_fixture();
+        let shared = base.path().join("shared-target");
+        std::fs::create_dir_all(&shared).unwrap();
+        let (workspace, runner) = verify_build_fixture(Some(&shared), base.path());
+        broken_main(&workspace);
+        let output = verify_build(&workspace, &runner).await;
+        assert!(!output.success(), "{output:?}");
+        assert!(
+            output.stderr.contains("not rust") && output.stderr.contains("main.rs"),
+            "the failure must come from compiling the current source: {output:?}"
+        );
+    }
+
+    /// Editing the source and verifying again must judge the edit.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_source_edited_between_checks_is_recompiled() {
+        let base = private_home_fixture();
+        let (workspace, runner) = verify_build_fixture(None, base.path());
+        assert!(verify_build(&workspace, &runner).await.success());
+        broken_main(&workspace);
+        let broken = verify_build(&workspace, &runner).await;
+        assert!(!broken.success(), "{broken:?}");
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let fixed = verify_build(&workspace, &runner).await;
+        assert!(fixed.success(), "{fixed:?}");
+    }
+
+    /// A verification check reports the exit code it observed, and a timeout
+    /// or cancellation is never a pass.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_verification_check_reports_the_exit_code_it_saw() {
+        let base = private_home_fixture();
+        let (workspace, runner) = verify_build_fixture(None, base.path());
+        let mut request = process_request_for_verify_check(
+            "sh",
+            vec!["-c".into(), "exit 3".into()],
+            workspace.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        request.timeout = Duration::from_secs(30);
+        let output = runner.run(request, CancellationToken::new()).await.unwrap();
+        assert_eq!(output.exit_code, Some(3), "{output:?}");
+        assert!(!output.success() && !output.timed_out);
+
+        let mut slow = process_request_for_verify_check(
+            "sh",
+            vec!["-c".into(), "sleep 30".into()],
+            workspace.clone(),
+            VerifyNetworkPolicy::InheritSession,
+        );
+        slow.timeout = Duration::from_millis(300);
+        let timed_out = runner.run(slow, CancellationToken::new()).await.unwrap();
+        assert!(timed_out.timed_out && !timed_out.success(), "{timed_out:?}");
+
+        let cancel = CancellationToken::new();
+        let cancel_child = cancel.clone();
+        let workspace_for_task = workspace.clone();
+        let runner_for_task = CommandRunner::with_environment(runner.environment.clone());
+        let task = tokio::spawn(async move {
+            let mut request = process_request_for_verify_check(
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                workspace_for_task,
+                VerifyNetworkPolicy::InheritSession,
+            );
+            request.timeout = Duration::from_secs(60);
+            runner_for_task.run(request, cancel_child).await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        let cancelled = task.await.unwrap();
+        assert!(
+            !matches!(cancelled, Ok(ref output) if output.success()),
+            "a cancelled check must not look like a pass: {cancelled:?}"
+        );
     }
 }
 

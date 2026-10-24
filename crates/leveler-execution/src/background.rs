@@ -4105,7 +4105,7 @@ mod tests {
 
         // Cache contents are writable, but the trusted leaf itself must not be
         // unlinked and replaced by a background child.
-        let prepared = prepare_sandbox_paths(reg.runner.environment(), &ws, false).unwrap();
+        let prepared = prepare_sandbox_paths(reg.runner.environment(), &ws, false, false).unwrap();
         let registry_root = prepared.tool_cache_path().join("cargo/registry");
         drop(prepared);
         let sentinel_dir = base.join("cache-escape");
