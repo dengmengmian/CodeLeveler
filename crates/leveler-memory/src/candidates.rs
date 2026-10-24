@@ -130,6 +130,14 @@ pub struct MemoryCandidate {
     /// authorized it. Never a secret (checked at construction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// The trusted session the evidence span was read from. Set by the runtime
+    /// that read the turn — the extractor never sees a session id — so a stored
+    /// fact points at a real message a person can still open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_session: Option<String>,
+    /// The trusted turn the evidence span was read from, for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_turn: Option<String>,
     /// The structured evidence contract for an agent experience. Present only
     /// for [`CandidateSource::RuntimeObserved`] (or a user-accepted/restored
     /// experience); absent everywhere else.
@@ -196,6 +204,8 @@ impl MemoryCandidate {
             operation: CandidateOperation::Create,
             expires_at: None,
             evidence: None,
+            evidence_session: None,
+            evidence_turn: None,
             experience: None,
         })
     }

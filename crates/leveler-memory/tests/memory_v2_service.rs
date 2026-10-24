@@ -9,11 +9,11 @@ mod memory_v2_common;
 use leveler_core::{SessionId, TaskId, ToolCallId, TurnId};
 use leveler_memory::v2::{
     Actor, Admission, IdentityRef, MemoryAuthority, MemoryId, MemoryKind, MemoryScope,
-    MemoryService, MemoryStatus, MigrationId, PinOwner, ReadRecord, RecordPatch, Relation,
-    ReviewDecision, SourceRef, SourceRefKind, StatementKind, StoreError, UserInvocationId,
-    WriteIntent,
+    MemoryService, MemoryStatus, MigrationId, PendingReason, PinOwner, ReadRecord, RecordPatch,
+    Relation, ReviewDecision, SourceRef, SourceRefKind, StatementKind, StoreError,
+    UserInvocationId, WriteIntent,
 };
-use memory_v2_common::{Fixture, op, source_ref};
+use memory_v2_common::{Fixture, op, source_ref, verbatim_source};
 use uuid::Uuid;
 
 fn service(fixture: &Fixture) -> MemoryService {
@@ -245,12 +245,40 @@ fn a_runtime_user_fact_requires_an_exact_user_span() {
         "usage",
         "Billing is usage.",
     );
-    intent.evidence = vec![source_ref()];
+    intent.evidence = vec![verbatim_source("Billing is usage.")];
     let (id, _) = apply(service.admit(&runtime(), intent).unwrap());
     assert_eq!(
         read(&service, &id).record.frontmatter.authority,
         MemoryAuthority::UserStated
     );
+}
+
+/// A span that exists but does not contain the body proves the opposite of
+/// what the writer claims: the runtime is storing its own wording. It waits
+/// for a person instead of speaking as one.
+#[test]
+fn a_runtime_user_fact_is_parked_when_its_span_does_not_contain_it() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = service(&fixture);
+    let mut intent = fact(
+        MemoryScope::Project,
+        Some("billing_model"),
+        "usage",
+        "Billing is usage.",
+    );
+    intent.evidence = vec![source_ref()];
+    let parked = service.admit(&runtime(), intent).unwrap();
+    assert!(
+        matches!(
+            parked,
+            Admission::Pending {
+                reason: PendingReason::UnverifiedUserStatement,
+                ..
+            }
+        ),
+        "{parked:?}"
+    );
+    assert!(service.effective_active().unwrap().is_empty());
 }
 
 #[test]
@@ -708,7 +736,17 @@ fn a_migration_record_keeps_its_legacy_provenance_but_caps_authority() {
     let record = read(&service, &id);
     assert_eq!(
         record.record.frontmatter.authority,
-        MemoryAuthority::UserStated
+        MemoryAuthority::ModelInferred,
+        "an imported sentence is not evidence of what the user said"
+    );
+    assert!(
+        record
+            .record
+            .frontmatter
+            .source_refs
+            .iter()
+            .any(|source| source.legacy_id.as_deref() == Some("old-id")),
+        "the legacy provenance is still recorded: {record:?}"
     );
 }
 

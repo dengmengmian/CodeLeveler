@@ -1399,7 +1399,7 @@ impl RememberRequest {
         let evidence = self
             .evidence
             .filter(|span| !span.trim().is_empty())
-            .map(|span| user_turn_source(&span))
+            .map(|span| user_turn_source(&span, None, None))
             .into_iter()
             .collect();
         let expires_at = match self.expires_at.as_deref() {
@@ -1478,7 +1478,11 @@ fn candidate_intent(
     let mut evidence = Vec::new();
     if let Some(span) = candidate.evidence.as_deref() {
         if !span.trim().is_empty() {
-            evidence.push(user_turn_source(span));
+            evidence.push(user_turn_source(
+                span,
+                candidate.evidence_session.as_deref(),
+                candidate.evidence_turn.as_deref(),
+            ));
         }
     }
     let expires_at = match candidate.expires_at.as_deref() {
@@ -1531,11 +1535,17 @@ fn v2_experience(record: &ExperienceRecord) -> v2::Experience {
     }
 }
 
-fn user_turn_source(span: &str) -> v2::SourceRef {
+/// The provenance of a fact extracted from a user turn.
+///
+/// The span is what the user said; the session and turn are which message it
+/// was said in. The runtime supplies the identities because it read the turn —
+/// an extractor's output never carries them — so a stored `user_stated` fact
+/// can always be traced back to a real message instead of only to a string.
+fn user_turn_source(span: &str, session: Option<&str>, turn: Option<&str>) -> v2::SourceRef {
     v2::SourceRef {
         kind: v2::SourceRefKind::UserTurn,
-        session_id: None,
-        turn_id: None,
+        session_id: session.map(str::to_string),
+        turn_id: turn.map(str::to_string),
         tool_call_id: None,
         task_id: None,
         pending_id: None,

@@ -226,6 +226,10 @@ pub enum CandidateRejection {
     DirectCommandOwned,
     /// `replaces_memory_id` was not a usable memory id.
     InvalidTarget,
+    /// The fact is not a verbatim clause of the user's own sentence. A model
+    /// may summarize, but a summary is the model's wording, so it cannot be
+    /// stored under the user's authority.
+    FactNotVerbatim,
 }
 
 impl CandidateRejection {
@@ -246,6 +250,7 @@ impl CandidateRejection {
             Self::NotAConfirmedStatement { .. } => "not_confirmed",
             Self::DirectCommandOwned => "direct_command_owned",
             Self::InvalidTarget => "invalid_target",
+            Self::FactNotVerbatim => "fact_not_verbatim",
         }
     }
 
@@ -281,6 +286,9 @@ impl CandidateRejection {
                 "the direct memory writer already stored this span".to_string()
             }
             Self::InvalidTarget => "candidate named an unusable memory id".to_string(),
+            Self::FactNotVerbatim => {
+                "the fact is not a verbatim clause of the user's sentence".to_string()
+            }
         }
     }
 }
@@ -485,6 +493,17 @@ pub fn validate_semantic_candidate(
         return Err(CandidateRejection::Sensitive);
     }
 
+    // The evidence checks above prove the model quoted the user. This one
+    // proves it is not storing something else: the body has to be a whole
+    // clause of the sentence it just quoted. A model may summarize, title and
+    // classify — the schema exists for exactly that — but a summary is the
+    // model's wording, so it carries the model's authority, not the user's.
+    // Checked last so the more specific refusals (a credential, a quotation)
+    // are the reason that gets recorded.
+    if !is_verbatim_excerpt(fact, candidate.evidence_span.trim()) {
+        return Err(CandidateRejection::FactNotVerbatim);
+    }
+
     let subject = normalize_subject(&candidate.subject);
     if subject.is_empty() || subject.chars().count() > MAX_SUBJECT_CHARS {
         return Err(CandidateRejection::InvalidSubject);
@@ -593,6 +612,77 @@ pub fn validate_semantic_candidates(
                 }
             }
             Err(rejection) => out.rejected.push((index, rejection)),
+        }
+    }
+    out
+}
+
+/// Whether `excerpt` is a whole clause of `source`, quoted verbatim.
+///
+/// Presentation may differ and nothing else: letter case and horizontal
+/// whitespace are folded. Every letter, digit and separator of the excerpt
+/// then has to appear in the source, in order and without a gap, and the match
+/// has to begin and end at a clause boundary — which is a character that is
+/// not a letter or a digit, or the edge of the source.
+///
+/// Each part of that rule rejects a real defect, with no similarity score, no
+/// word table and no reading of meaning:
+///
+/// - **Contiguity** rejects omission. Dropping `src/config.rs` from the middle
+///   leaves a remainder that is not in the sentence.
+/// - **Boundaries** reject truncation. `使用 npm` occurs inside `不要使用 npm`,
+///   but starting mid-clause is exactly how a stored fact loses the negation,
+///   the condition or the obligation that preceded it.
+/// - **Per-character comparison** rejects substitution: `10ms` cannot cover
+///   `100ms`, and no alias can make `禁止` out of `允许`.
+///
+/// Two separate quotes cannot be stitched together either: whatever joins what
+/// an ellipsis separated is not contiguous in the source.
+pub fn is_verbatim_excerpt(excerpt: &str, source: &str) -> bool {
+    let source = fold_for_containment(source);
+    let excerpt = fold_for_containment(excerpt);
+    if excerpt.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(found) = source[from..].find(&excerpt) {
+        let start = from + found;
+        let end = start + excerpt.len();
+        let starts_clause = source[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric());
+        let ends_clause = source[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_alphanumeric());
+        if starts_clause && ends_clause {
+            return true;
+        }
+        from = start + excerpt.chars().next().map(char::len_utf8).unwrap_or(1);
+        if from >= source.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Fold case and drop horizontal whitespace, keeping every other character.
+///
+/// A space separates words in some scripts and is a formatting choice in others
+/// (`配置解析入口是src/config.rs里`), so it is not part of what the user said.
+/// Every character that can carry meaning — letters, digits, symbols, interior
+/// punctuation — survives, which is what keeps `10ms` and `100ms` apart. Line
+/// breaks survive too: they end a statement, so an excerpt that joins two lines
+/// is two statements stitched together, not one.
+fn fold_for_containment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_whitespace() && character != '\n' {
+            continue;
+        }
+        for lowered in character.to_lowercase() {
+            out.push(lowered);
         }
     }
     out
@@ -809,7 +899,11 @@ mod tests {
     #[test]
     fn a_valid_candidate_becomes_an_explicit_user_memory() {
         let msg = "这个项目后面模型就 Pro 吧";
-        let c = candidate("项目默认模型为 Pro", "project.default_model", "模型就 Pro");
+        let c = candidate(
+            "这个项目后面模型就 Pro 吧",
+            "project.default_model",
+            "这个项目后面模型就 Pro 吧",
+        );
         let memory = validate_semantic_candidate(&c, msg).unwrap();
         assert_eq!(memory.authority, MemoryAuthority::ExplicitUser);
         assert_eq!(memory.source, CandidateSource::UserExplicit);
@@ -817,7 +911,10 @@ mod tests {
             memory.semantic_key.as_deref(),
             Some(semantic_key_of("default_model").as_str())
         );
-        assert_eq!(memory.evidence.as_deref(), Some("模型就 Pro"));
+        assert_eq!(
+            memory.evidence.as_deref(),
+            Some("这个项目后面模型就 Pro 吧")
+        );
     }
 
     #[test]
@@ -869,11 +966,158 @@ mod tests {
         }
         // The same words spoken normally are still the user's own statement.
         let c = candidate(
-            "默认模型是 Flash",
+            "以后默认使用 Flash",
             "project.default_model",
             "以后默认使用 Flash",
         );
         assert!(validate_semantic_candidate(&c, "以后默认使用 Flash，不再用 Pro。").is_ok());
+    }
+
+    /// The user's sentence names a file. A candidate that keeps the function
+    /// name and drops the file is not the same fact, and the model may not put
+    /// its summary under the user's authority by quoting the full sentence as
+    /// "evidence" while storing less than it.
+    #[test]
+    fn a_fact_that_drops_the_path_in_the_evidence_is_refused() {
+        let message = "配置解析入口是 src/config.rs 里的 parseConfigFile 函数。";
+        let summary = candidate(
+            "配置解析入口是 parseConfigFile 函数",
+            "project.config_parse_entry",
+            message,
+        );
+        assert!(!is_verbatim_excerpt(
+            summary.fact.trim(),
+            summary.evidence_span.trim()
+        ));
+        assert_eq!(
+            validate_semantic_candidate(&summary, message).unwrap_err(),
+            CandidateRejection::FactNotVerbatim
+        );
+
+        // The user's own sentence is still admitted: the gate refuses the
+        // rewrite, not the memory.
+        let verbatim = candidate(
+            "配置解析入口是 src/config.rs 里的 parseConfigFile 函数",
+            "project.config_parse_entry",
+            message,
+        );
+        let memory = validate_semantic_candidate(&verbatim, message).unwrap();
+        assert_eq!(
+            memory.body,
+            "配置解析入口是 src/config.rs 里的 parseConfigFile 函数"
+        );
+        assert_eq!(
+            memory.evidence.as_deref(),
+            Some("配置解析入口是 src/config.rs 里的 parseConfigFile 函数。")
+        );
+    }
+
+    /// Omission, inversion, narrowed scope and a changed number are all the
+    /// same defect: the stored body is not a slice of what the user wrote.
+    #[test]
+    fn an_altered_stmt_cannot_borrow_the_users_words() {
+        for (message, stored) in [
+            ("不要使用 npm 安装依赖。", "使用 npm 安装依赖"),
+            ("仅在 Linux 下执行这步。", "始终执行这步"),
+            ("先验证再提交。", "直接提交"),
+            ("只在测试环境启用这个开关。", "启用这个开关"),
+            ("超时设为 10ms。", "超时设为 100ms"),
+            (
+                "发布前必须运行 scripts/release.sh 里的预检。",
+                "发布前必须运行预检",
+            ),
+        ] {
+            let paraphrased = candidate(stored, "project.rule", message);
+            assert_eq!(
+                validate_semantic_candidate(&paraphrased, message).unwrap_err(),
+                CandidateRejection::FactNotVerbatim,
+                "{stored:?} is not the user's wording in {message:?}"
+            );
+        }
+    }
+
+    /// Verbatim means verbatim: the excerpt may differ from the source in
+    /// spacing, letter case and the sentence punctuation at its edges, and
+    /// nothing else. Chinese, English, code identifiers and paths all keep
+    /// every letter, digit and interior separator.
+    #[test]
+    fn verbatim_allows_only_presentation_to_differ() {
+        let message = "配置解析入口是 src/config.rs 里的 parseConfigFile 函数。";
+        for (fact, expected) in [
+            (
+                "配置解析入口是 src/config.rs 里的 parseConfigFile 函数",
+                true,
+            ),
+            (
+                "  配置解析入口是 src/config.rs 里的 parseConfigFile 函数。  ",
+                true,
+            ),
+            // A substituted terminal punctuation mark is not the user's text.
+            (
+                "配置解析入口是 src/config.rs 里的 parseConfigFile 函数！",
+                false,
+            ),
+            ("配置解析入口是src/config.rs里的parseConfigFile函数", true),
+            (
+                "配置解析入口是 src/config.rs 里的 parse_config_file 函数",
+                false,
+            ),
+            (
+                "配置解析入口是 src/config.rs 里的 ParseConfigFile 函数",
+                true,
+            ),
+            ("配置解析入口是 config.rs 里的 parseConfigFile 函数", false),
+            ("配置解析入口是 parseConfigFile 函数", false),
+        ] {
+            assert_eq!(
+                is_verbatim_excerpt(fact, message),
+                expected,
+                "{fact:?} against {message:?}"
+            );
+        }
+
+        let english = "Parse config in src/config.rs with parseConfigFile only.";
+        assert!(is_verbatim_excerpt(
+            "parse config in src/config.rs with parseConfigFile only",
+            english
+        ));
+        assert!(!is_verbatim_excerpt(
+            "parse config with parseConfigFile only",
+            english
+        ));
+    }
+
+    /// The comparison is character-class based, not language based: there is
+    /// no particle table, so an excerpt that drops the user's last character
+    /// is not the user's clause. Learning to quote is the extractor's job; the
+    /// runtime only decides whether the quote is real.
+    #[test]
+    fn a_clause_ends_where_the_user_stopped() {
+        let message = "以后不要后台启动服务了";
+        assert!(is_verbatim_excerpt("以后不要后台启动服务了", message));
+        assert!(!is_verbatim_excerpt("以后不要后台启动服务", message));
+        // And no excerpt may start inside the clause it quotes.
+        assert!(!is_verbatim_excerpt("后台启动服务", message));
+        assert!(!is_verbatim_excerpt(
+            "不要后台启动服务了，直接部署",
+            message
+        ));
+    }
+
+    /// A multi-line message keeps its newlines: an excerpt that joins two
+    /// clauses across a line break is a different sentence than either one.
+    #[test]
+    fn a_multiline_source_is_matched_line_by_line() {
+        let message = "部署脚本在 scripts/deploy.sh。\n生产环境禁止手工迁移。";
+        assert!(is_verbatim_excerpt(
+            "部署脚本在 scripts/deploy.sh。",
+            message
+        ));
+        assert!(is_verbatim_excerpt("生产环境禁止手工迁移。", message));
+        assert!(!is_verbatim_excerpt(
+            "部署脚本在 scripts/deploy.sh。生产环境禁止手工迁移",
+            message
+        ));
     }
 
     #[test]
@@ -950,17 +1194,37 @@ mod tests {
         );
     }
 
-    /// Punctuation is not a semantic test. The model's structured candidate is
-    /// the unit of a fact; the runtime validates provenance, not how many
-    /// clauses a sentence contains.
+    /// Punctuation is not a semantic test, and a sentence with several clauses
+    /// is not rejected for having them: each clause can be stored on its own,
+    /// verbatim. What punctuation cannot do is let one clause be rewritten into
+    /// another.
     #[test]
     fn punctuation_does_not_decide_atomicity() {
         let msg = "以后统一用 Rust；Windows 也必须支持，而且 protected branch 不要直接 push。";
-        let mut c = candidate("用 Rust；支持 Windows，禁止 push", "language", msg);
-        c.fact = "用 Rust；支持 Windows，禁止 push".to_string();
+        let mut whole = candidate(
+            "以后统一用 Rust；Windows 也必须支持，而且 protected branch 不要直接 push",
+            "language",
+            msg,
+        );
+        whole.fact =
+            "以后统一用 Rust；Windows 也必须支持，而且 protected branch 不要直接 push".to_string();
         let converted =
-            validate_semantic_candidate(&c, msg).expect("punctuation must not reject a fact");
-        assert_eq!(converted.body, "用 Rust；支持 Windows，禁止 push");
+            validate_semantic_candidate(&whole, msg).expect("punctuation must not reject a fact");
+        assert_eq!(
+            converted.body,
+            "以后统一用 Rust；Windows 也必须支持，而且 protected branch 不要直接 push"
+        );
+
+        let clause = candidate("Windows 也必须支持", "language", msg);
+        let clause =
+            validate_semantic_candidate(&clause, msg).expect("a whole clause stands alone");
+        assert_eq!(clause.body, "Windows 也必须支持");
+
+        let rewritten = candidate("用 Rust；支持 Windows，禁止 push", "language", msg);
+        assert_eq!(
+            validate_semantic_candidate(&rewritten, msg).unwrap_err(),
+            CandidateRejection::FactNotVerbatim
+        );
     }
 
     #[test]
@@ -1021,7 +1285,7 @@ mod tests {
     fn a_related_subject_is_a_structured_identity() {
         let msg = "JSON 响应字段命名也用 snake_case";
         let mut c = candidate(
-            "JSON 响应字段命名使用 snake_case",
+            "JSON 响应字段命名也用 snake_case",
             "project.json_response_field_naming",
             "JSON 响应字段命名也用 snake_case",
         );
@@ -1039,13 +1303,13 @@ mod tests {
         let msg = "Windows 以后还是得支持，只是这阶段先把 macOS 做完。";
         let batch = vec![
             candidate(
-                "Windows support remains required",
+                "Windows 以后还是得支持",
                 "project.windows.support",
                 "Windows 以后还是得支持",
             ),
             {
                 let mut t = candidate(
-                    "macOS is the current implementation priority",
+                    "这阶段先把 macOS 做完",
                     "project.current_priority",
                     "这阶段先把 macOS 做完",
                 );
@@ -1067,8 +1331,8 @@ mod tests {
     fn duplicate_facts_for_the_same_subject_spelling_collapse() {
         let msg = "默认模型用 Pro";
         let batch = vec![
-            candidate("默认模型是 Pro", "project.default_model", "默认模型用 Pro"),
-            candidate("默认模型是 Pro", "Project.Default-Model", "默认模型用 Pro"),
+            candidate("默认模型用 Pro", "project.default_model", msg),
+            candidate("默认模型用 Pro", "Project.Default-Model", msg),
         ];
         let validated = validate_semantic_candidates(&batch, msg);
         assert_eq!(validated.accepted.len(), 1);

@@ -1508,7 +1508,7 @@ impl MarkdownStore {
             ));
         }
         let now = Utc::now();
-        let new_authority = authority_for_caller(&caller, intent.kind, intent.experience.as_ref());
+        let new_authority = creation_authority(&caller, intent.kind, &intent);
         match intent.relation.clone() {
             Relation::None => self.admit_create(
                 op_id,
@@ -1571,6 +1571,7 @@ impl MarkdownStore {
                 intent.kind,
                 intent.scope,
                 intent.experience.as_ref(),
+                lifecycle::user_statement_is_proven(&intent),
             ),
         };
         match creation {
@@ -4143,12 +4144,50 @@ fn relation_targets(relation: &Relation) -> Vec<String> {
     }
 }
 
+/// The authority a NEW value carries for this caller and this intent.
+///
+/// Derivation stays on the caller path — a claimed `proposed_authority` never
+/// mints user authority — and a runtime user fact additionally has to prove
+/// that its body is the user's own sentence. When it cannot, the value is the
+/// runtime's proposal, and a proposal is what it is recorded as.
+fn creation_authority(caller: &Caller, kind: MemoryKind, intent: &MemoryIntent) -> MemoryAuthority {
+    let proven = lifecycle::user_statement_is_proven(intent);
+    match lifecycle::creation_decision(
+        caller,
+        kind,
+        intent.scope,
+        intent.experience.as_ref(),
+        proven,
+    ) {
+        CreationDecision::Active(authority) => authority,
+        CreationDecision::Pending(_) | CreationDecision::Rejected(_) => match (caller, kind) {
+            (Caller::Runtime { .. }, MemoryKind::UserFact) => MemoryAuthority::ModelInferred,
+            _ => caller.authority_for(
+                kind,
+                intent
+                    .experience
+                    .as_ref()
+                    .is_some_and(Experience::has_resolution),
+            ),
+        },
+    }
+}
+
+/// The authority an existing target grants its caller for a destructive action.
 fn authority_for_caller(
     caller: &Caller,
     kind: MemoryKind,
     experience: Option<&Experience>,
 ) -> MemoryAuthority {
-    match lifecycle::creation_decision(caller, kind, MemoryScope::Project, experience) {
+    match lifecycle::creation_decision(
+        caller,
+        kind,
+        MemoryScope::Project,
+        experience,
+        // A destructive action says nothing about a new user statement; this
+        // path only needs the caller's own ceiling.
+        false,
+    ) {
         CreationDecision::Active(authority) => authority,
         CreationDecision::Pending(_) | CreationDecision::Rejected(_) => {
             caller.authority_for(kind, experience.is_some_and(Experience::has_resolution))

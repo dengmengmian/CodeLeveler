@@ -85,7 +85,7 @@ fn a_user_stated_fact_is_corrected_by_a_new_user_statement() {
         "tuesday",
         "The release runs in the Tuesday window.",
     );
-    first.evidence = vec![source_ref()];
+    first.evidence = vec![verbatim_source("The release runs in the Tuesday window.")];
     let original_id = applied_id(&admit(&store, runtime(), first));
 
     let mut correction = fact_intent(
@@ -94,10 +94,7 @@ fn a_user_stated_fact_is_corrected_by_a_new_user_statement() {
         "friday",
         "The release runs in the Friday window.",
     );
-    let mut later = source_ref();
-    later.turn_id = Some("turn-2".into());
-    later.evidence_span = Some("move the release to Friday".into());
-    correction.evidence = vec![later];
+    correction.evidence = vec![verbatim_source("The release runs in the Friday window.")];
     let admission = admit(&store, runtime(), correction);
     assert!(
         matches!(
@@ -148,7 +145,7 @@ fn a_model_still_cannot_replace_a_user_stated_fact() {
         "tuesday",
         "The release runs in the Tuesday window.",
     );
-    first.evidence = vec![source_ref()];
+    first.evidence = vec![verbatim_source("The release runs in the Tuesday window.")];
     let original_id = applied_id(&admit(&store, runtime(), first));
 
     let proposal = admit(
@@ -187,7 +184,7 @@ fn a_model_pin_of_a_user_stated_fact_waits_for_a_person() {
         "direct",
         "Prefer direct answers.",
     );
-    intent.evidence = vec![source_ref()];
+    intent.evidence = vec![verbatim_source("Prefer direct answers.")];
     let id = applied_id(&admit(&store, runtime(), intent));
     let cas = store.read(&id).unwrap().cas;
 
@@ -370,6 +367,22 @@ fn migration_cannot_mint_an_explicit_user_decision() {
     let id = applied_id(&admission);
     assert_eq!(
         store.read(&id).unwrap().record.frontmatter.authority,
+        MemoryAuthority::ModelInferred,
+        "imported prose is not a user statement"
+    );
+
+    // A migration that does carry the user's own sentence is a different
+    // matter: the body is proven, so the record is the user's.
+    let mut proven = fact_intent(
+        MemoryScope::Project,
+        Some("billing_period"),
+        "monthly",
+        "The provider bills monthly.",
+    );
+    proven.evidence = vec![verbatim_source("The provider bills monthly.")];
+    let proven_id = applied_id(&admit(&store, migration(), proven));
+    assert_eq!(
+        store.read(&proven_id).unwrap().record.frontmatter.authority,
         MemoryAuthority::UserStated
     );
 }
@@ -397,5 +410,152 @@ fn an_unresolved_runtime_experience_is_tool_observed() {
     assert_eq!(
         store.read(&id).unwrap().record.frontmatter.kind,
         MemoryKind::Experience
+    );
+}
+
+/// A model rewrite may not enter the store under the user's authority. The
+/// runtime path is the one that mints `user_stated`, so it must prove the body
+/// came from the user's own sentence — an evidence span that does not contain
+/// the body proves the opposite.
+#[test]
+fn a_runtime_user_fact_whose_body_outgrows_its_evidence_is_parked() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let mut intent = fact_intent(
+        MemoryScope::Project,
+        Some("project.config_parse_entry"),
+        "parseConfigFile",
+        "配置解析入口是 parseConfigFile 函数",
+    );
+    let mut source = source_ref();
+    source.evidence_span = Some("配置解析入口是 src/config.rs 里的 parseConfigFile 函数。".into());
+    intent.evidence = vec![source];
+
+    let admission = admit(&store, runtime(), intent);
+    assert!(
+        matches!(
+            admission,
+            Admission::Pending {
+                reason: PendingReason::UnverifiedUserStatement,
+                ..
+            }
+        ),
+        "{admission:?}"
+    );
+    assert!(
+        effective(&store).is_empty(),
+        "an unproven rewrite is not current truth"
+    );
+    let pending = store.list_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].frontmatter.authority,
+        MemoryAuthority::ModelInferred,
+        "the proposal is the model's, and its authority must say so"
+    );
+}
+
+/// The same runtime path still records what the user actually said, with the
+/// user's authority: the guard is about fidelity, not about disabling
+/// automatic learning.
+#[test]
+fn a_runtime_user_fact_that_is_the_users_own_sentence_is_user_stated() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let mut intent = fact_intent(
+        MemoryScope::Project,
+        Some("project.config_parse_entry"),
+        "parseConfigFile",
+        "配置解析入口是 src/config.rs 里的 parseConfigFile 函数",
+    );
+    let mut source = source_ref();
+    source.evidence_span = Some("配置解析入口是 src/config.rs 里的 parseConfigFile 函数。".into());
+    intent.evidence = vec![source];
+
+    let admission = admit(&store, runtime(), intent);
+    assert!(admission.is_applied(), "{admission:?}");
+    let stored = effective(&store);
+    assert_eq!(
+        stored[0].record.frontmatter.authority,
+        MemoryAuthority::UserStated
+    );
+    assert_eq!(
+        stored[0].record.body,
+        "配置解析入口是 src/config.rs 里的 parseConfigFile 函数"
+    );
+}
+
+/// No evidence at all is not a user statement either: a runtime caller cannot
+/// mint `user_stated` from its own text.
+#[test]
+fn a_runtime_user_fact_without_a_user_turn_span_is_parked() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let intent = fact_intent(
+        MemoryScope::Project,
+        Some("project.config_parse_entry"),
+        "parseConfigFile",
+        "配置解析入口是 src/config.rs 里的 parseConfigFile 函数",
+    );
+    let admission = admit(&store, runtime(), intent);
+    assert!(
+        matches!(
+            admission,
+            Admission::Pending {
+                reason: PendingReason::UnverifiedUserStatement,
+                ..
+            }
+        ),
+        "{admission:?}"
+    );
+    assert!(effective(&store).is_empty());
+}
+
+/// An unproven rewrite cannot displace a confirmed fact either: the protected
+/// target keeps its value and the proposal waits for a person.
+#[test]
+fn an_unproven_rewrite_cannot_supersede_a_confirmed_fact() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let store = fixture.store();
+    let mut confirmed = fact_intent(
+        MemoryScope::Project,
+        Some("project.config_parse_entry"),
+        "parseConfigFile@src/config.rs",
+        "配置解析入口是 src/config.rs 里的 parseConfigFile 函数",
+    );
+    let mut source = source_ref();
+    source.evidence_span = Some("配置解析入口是 src/config.rs 里的 parseConfigFile 函数。".into());
+    confirmed.evidence = vec![source];
+    let original = applied_id(&admit(&store, runtime(), confirmed));
+
+    let mut rewrite = fact_intent(
+        MemoryScope::Project,
+        Some("project.config_parse_entry"),
+        "parseConfigFile",
+        "配置解析入口是 parseConfigFile 函数",
+    );
+    let mut later = source_ref();
+    later.turn_id = Some("turn-2".into());
+    later.evidence_span = Some("配置解析入口是 src/config.rs 里的 parseConfigFile 函数。".into());
+    rewrite.evidence = vec![later];
+    let admission = admit(&store, runtime(), rewrite);
+    assert!(
+        matches!(
+            admission,
+            Admission::Pending {
+                reason: PendingReason::UnverifiedUserStatement,
+                ..
+            }
+        ),
+        "{admission:?}"
+    );
+    let current = store.read(&original).unwrap();
+    assert_eq!(
+        current.record.body,
+        "配置解析入口是 src/config.rs 里的 parseConfigFile 函数"
+    );
+    assert_eq!(
+        current.record.frontmatter.authority,
+        MemoryAuthority::UserStated
     );
 }

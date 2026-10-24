@@ -326,6 +326,15 @@ pub fn new_record_for(intent: &MemoryIntent) -> NewRecord {
     }
 }
 
+/// A user-turn source whose span is exactly `body` — the provenance shape a
+/// verified automatic user fact carries. A fixture that wants the user's
+/// authority has to provide the user's words.
+pub fn verbatim_source(body: &str) -> SourceRef {
+    let mut source = source_ref();
+    source.evidence_span = Some(body.to_string());
+    source
+}
+
 pub fn source_ref() -> SourceRef {
     SourceRef {
         kind: leveler_memory::v2::SourceRefKind::UserTurn,
