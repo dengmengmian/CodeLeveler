@@ -124,13 +124,22 @@ claims.
 | --- | --- |
 | Explicit user command (`/remember`, CLI, TUI edit) | `user_explicit` |
 | User accepted a pending candidate | `user_approved` |
-| User statement captured verbatim by automatic extraction | `user_stated` |
+| User statement captured verbatim by automatic extraction | `user_stated` (only when proven, below) |
 | Runtime observed a failure → resolution | `runtime_observed` |
 | Model tool call or model inference | `model_inferred` |
 | Imported or externally edited file | `ExternalUnverified`, capped at `model_inferred` |
 
 Rules that follow from this table:
 
+- **`user_stated` is proven, never claimed.** Automatic extraction reaches it
+  only when the intent carries a trusted user-turn evidence span and the body is
+  a verbatim, clause-bounded slice of that span: same letters and digits in the
+  same order, with case and horizontal whitespace folded. Dropping a file path,
+  a version, a number, a negation or a condition (`只在测试环境`) breaks
+  contiguity or the clause boundary, so the candidate cannot be stored as the
+  user's fact. It is parked instead, with authority `model_inferred`, and waits
+  for a person. The rule is structural: no similarity score, no word table and
+  no judge model participates.
 - A model actor can never replace a user decision. It can only produce a
   pending candidate for a target the user already decided.
 - `Full` permission mode does not create memory authority. Approving a tool call
@@ -173,13 +182,17 @@ failure → resolution ─────────► experience candidate ─�
 ```
 
 Automatic extraction runs after a user turn, out of band. It proposes candidates
-with evidence spans; it does not write standing facts. A candidate that would
-replace a protected user decision is always parked as pending, and a rejected
-signal is recorded in `suppressed.jsonl` so it is not re-offered.
+with evidence spans; it does not write standing facts. The stored provenance
+keeps both the span and the session/turn the runtime read, so a fact can always
+be traced to a real message. A candidate that would replace a protected user
+decision is always parked as pending, and a rejected signal is recorded in
+`suppressed.jsonl` so it is not re-offered.
 
 Admission decides `Applied`, `Pending` or `Skipped` from structured facts:
-caller, target authority, statement kind, revision, subject identity. No
-synonym table, similarity threshold or judge model participates.
+caller, target authority, statement kind, revision, subject identity, and — for
+a `user_stated` fact — whether the body is a verbatim clause of the user-turn
+span (`unverified_user_statement` when it is not). No synonym table, similarity
+threshold or judge model participates.
 
 ## 7. Experience
 
@@ -405,7 +418,9 @@ so none of them is implemented.
    reported as `possible_duplicate`, never merged.
 2. **Contradictions under different subjects coexist.** Both are injected as
    candidates and the model decides; the runtime does not pick a winner.
-3. **Extraction is not proof.** `user_stated` needs an exact user span; verified
+3. **Extraction is not proof.** `user_stated` needs a verbatim user clause, not
+   a model summary of one: an extractor that rewrites loses the candidate to
+   `unverified_user_statement` instead of gaining the user's authority. Verified
    experience needs a runtime receipt. A model that mislabels a proposal still
    only produces a pending candidate.
 4. **Continuation turns are not extracted.** Automatic extraction is triggered by

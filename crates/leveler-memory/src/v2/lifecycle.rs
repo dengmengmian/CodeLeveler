@@ -27,6 +27,11 @@ pub enum PendingReason {
     TargetNotActive,
     PendingTarget,
     ForgetRequiresUserReview,
+    /// An automatic writer asked for user authority without proving the body
+    /// came from the user's own sentence: the evidence span is missing, or the
+    /// text it would store is not a verbatim clause of that span. The candidate
+    /// waits for a person instead of speaking as one.
+    UnverifiedUserStatement,
     Other(String),
 }
 
@@ -45,6 +50,7 @@ impl PendingReason {
             Self::TargetNotActive => "target_not_active",
             Self::PendingTarget => "pending_target",
             Self::ForgetRequiresUserReview => "forget_requires_user_review",
+            Self::UnverifiedUserStatement => "unverified_user_statement",
             Self::Other(value) => value,
         }
     }
@@ -176,14 +182,36 @@ pub enum CreationDecision {
     Rejected(RejectReason),
 }
 
+/// Whether an intent proves that its body is the user's own statement.
+///
+/// `user_stated` is not a claim a writer may make about itself: it says the
+/// stored words are the user's. The proof is structural — a trusted user-turn
+/// evidence span exists, and the body is a verbatim clause of that span — so a
+/// model summary, an omitted qualifier or an inverted negation cannot borrow
+/// the user's authority, however confident the writer is.
+pub fn user_statement_is_proven(intent: &MemoryIntent) -> bool {
+    intent.evidence.iter().any(|source| {
+        source.kind == crate::v2::record::SourceRefKind::UserTurn
+            && source
+                .evidence_span
+                .as_deref()
+                .is_some_and(|span| crate::semantic::is_verbatim_excerpt(&intent.body, span))
+    })
+}
+
 /// Derive the authority of a newly created record from the caller path. A
 /// caller-supplied `proposed_authority` is only consulted for migration, where
 /// it is capped below an explicit user decision.
+///
+/// `proven_user_statement` is [`user_statement_is_proven`] for the intent being
+/// admitted: the runtime may record what the user said, and only what the user
+/// said.
 pub fn creation_decision(
     caller: &Caller,
     kind: MemoryKind,
     scope: MemoryScope,
     experience: Option<&Experience>,
+    proven_user_statement: bool,
 ) -> CreationDecision {
     match caller {
         Caller::UserCommand { .. } => CreationDecision::Active(MemoryAuthority::UserExplicit),
@@ -197,8 +225,13 @@ pub fn creation_decision(
                     MemoryAuthority::ToolObserved
                 })
             }
-            MemoryKind::UserFact if scope == MemoryScope::Project => {
+            MemoryKind::UserFact if scope == MemoryScope::Project && proven_user_statement => {
                 CreationDecision::Active(MemoryAuthority::UserStated)
+            }
+            // The user's authority needs the user's words. Without them this is
+            // a proposal for a person to read, not current truth.
+            MemoryKind::UserFact if scope == MemoryScope::Project => {
+                CreationDecision::Pending(PendingReason::UnverifiedUserStatement)
             }
             MemoryKind::UserFact => {
                 CreationDecision::Pending(PendingReason::ScopeRequiresUserCommand)
@@ -216,9 +249,14 @@ pub fn creation_decision(
             }
         },
         Caller::Migration { .. } => {
-            // Migration is a trusted operator path but cannot mint an explicit
-            // user decision from legacy prose.
-            CreationDecision::Active(MemoryAuthority::UserStated)
+            // Migration is a trusted operator path, so it may write; but an
+            // imported sentence is not evidence of what the user said, so it
+            // cannot mint user authority either. Only a proven user clause can.
+            CreationDecision::Active(if proven_user_statement {
+                MemoryAuthority::UserStated
+            } else {
+                MemoryAuthority::ModelInferred
+            })
         }
         Caller::External => CreationDecision::Rejected(RejectReason::ExternalCaller),
     }

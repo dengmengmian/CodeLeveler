@@ -741,7 +741,7 @@ Each candidate envelope is exactly:
 {{
   "source_turn_id": the exact id of the ONE source turn,
   "candidate": {{
-    "fact": one short clause, in the conversation's language,
+    "fact": the user's own clause, copied character for character,
     "subject": a stable lowercase dotted identity chosen by meaning,
     "related_subject": optional; the existing decision's subject when this
                        statement restates, changes, or reverses it,
@@ -764,6 +764,13 @@ Rules:
 - Every envelope MUST name exactly one supplied source_turn_id.
 - evidence_span MUST occur verbatim in that same source turn. Never borrow
   evidence from another turn, combine turns, translate, infer, or paraphrase.
+- fact MUST be a whole clause copied from that same turn: the user's own
+  characters, in the user's own order. You choose WHICH clause states the
+  fact; you do not reword, shorten, reorder, or tidy it. Anything a rewrite
+  would drop — a file path, a version, a number, a negation, a condition such
+  as "only in tests" — is part of the fact and must stay. A candidate whose
+  fact is not a clause of the user's own text is discarded, so quote rather
+  than summarise.
 - The ONLY authority is explicit_user. One atomic fact per candidate.
 - Emit candidates only for a new or changed concrete value. Questions,
   references to an earlier decision, guesses, and confirmations without a new
@@ -831,7 +838,7 @@ Return {"candidates": []} when the message states no durable project fact.
 
 Each candidate is exactly:
 {
-  "fact":       one short clause, the fact in the conversation's language,
+  "fact":       the user's own clause, copied character for character,
   "subject":    a stable identity chosen by meaning, lowercase dotted,
                 e.g. "project.default_model",
   "related_subject": optional; the existing decision's subject when this
@@ -855,6 +862,11 @@ Rules:
   to the user that the user did not say.
 - "evidence_span" MUST be copied verbatim from the user message. Never invent,
   translate or paraphrase it. A fact without a verbatim span is not a fact.
+- "fact" MUST be a whole clause of that same message, in the user's own
+  characters and order. You choose which clause states the fact; you do not
+  reword, shorten, reorder or tidy it. Everything a rewrite could drop — a
+  path, a version, a number, a negation, a condition — is part of the fact. A
+  fact that is not a clause of the user's own text is discarded.
 - Be atomic: one fact per candidate. If the message states three separate
   durable facts, return three candidates. Never return one multi-fact blob.
 - Classify what the user is DOING. assertion: a settled fact or decision.

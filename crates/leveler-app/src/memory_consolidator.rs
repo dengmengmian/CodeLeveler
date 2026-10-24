@@ -1274,6 +1274,12 @@ impl MemoryConsolidator {
                 .position(|item| item.turn_id == candidate.source_turn_id);
             match (index, candidate.result) {
                 (Some(index), Ok(memory)) => {
+                    // The turn identity comes from the durable inbox row the
+                    // runtime read, never from the model: it is what lets a
+                    // stored fact be traced back to the real message.
+                    let mut memory = memory;
+                    memory.evidence_session = Some(items[index].session_id.clone());
+                    memory.evidence_turn = Some(items[index].turn_id.clone());
                     let replacement_verified = match memory.replaces_id.as_deref() {
                         None => true,
                         Some(target) if known_ids.contains(target) => true,
@@ -2023,7 +2029,7 @@ mod tests {
             Ok(vec![BatchSemanticCandidate {
                 source_turn_id: turns[0].source_turn_id.clone(),
                 candidate: SemanticCandidate {
-                    fact: "以后不要后台启动服务".to_string(),
+                    fact: "以后不要后台启动服务了".to_string(),
                     subject: "service.background_start".to_string(),
                     related_subject: None,
                     replaces_memory_id: None,
@@ -3154,6 +3160,89 @@ mod tests {
         let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
         assert_eq!(counts.processed, 1);
         assert_eq!(counts.failed_retryable, 0);
+    }
+
+    /// The dogfood defect, end to end: the extractor quotes the user's whole
+    /// sentence as evidence and offers a summary that drops the file path. A
+    /// summary is the model's wording, so it can never be stored under the
+    /// user's authority — not as current truth, and not as a pending proposal
+    /// that claims to be the user's decision.
+    #[tokio::test]
+    async fn a_summarised_fact_never_reaches_the_store_as_the_users_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        let sentence = "配置解析入口是 src/config.rs 里的 parseConfigFile 函数。";
+        let turns = admitted_messages(&db, [sentence.to_string()]).await;
+        let raw = serde_json::json!({"candidates": [batch_candidate(
+            &turns[0].0,
+            "配置解析入口是 parseConfigFile 函数",
+            "project.config_parse_entry",
+            "parseConfigFile",
+            sentence,
+        )]})
+        .to_string();
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            worker_memory(temp.path()),
+            ScriptedRuntime::new(vec![Ok(raw.as_str())]),
+            Arc::new(|_| {}),
+        );
+        worker.run_once().await.unwrap();
+
+        let store = TestMemory::open(temp.path());
+        assert!(
+            store.effective_active().unwrap().is_empty(),
+            "a summary must not become the user's current fact: {:?}",
+            store.effective_active().unwrap()
+        );
+        assert!(store.list_pending().unwrap().is_empty());
+
+        // The same extraction, quoting the user instead of summarising, is
+        // stored — with the path, and as the user's own statement.
+        let second_turns = admitted_messages(&db, [sentence.to_string()]).await;
+        let verbatim_raw = serde_json::json!({"candidates": [batch_candidate(
+            &second_turns[0].0,
+            "配置解析入口是 src/config.rs 里的 parseConfigFile 函数",
+            "project.config_parse_entry",
+            "parseConfigFile@src/config.rs",
+            sentence,
+        )]})
+        .to_string();
+        let second = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            worker_memory(temp.path()),
+            ScriptedRuntime::new(vec![Ok(verbatim_raw.as_str())]),
+            Arc::new(|_| {}),
+        );
+        second.run_once().await.unwrap();
+
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert_eq!(
+            active[0].body,
+            "配置解析入口是 src/config.rs 里的 parseConfigFile 函数"
+        );
+        assert_eq!(active[0].authority, "user_stated");
+        // The store keeps the user's own sentence as the record's source, so
+        // the qualifier a summary would drop stays recoverable.
+        let stored = std::fs::read_dir(temp.path().join("memory"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            stored.contains("user_turn")
+                && stored.contains(sentence)
+                && stored.contains(&second_turns[0].0),
+            "the user's own sentence and its turn must survive as provenance:\n{stored}"
+        );
     }
 
     /// One invalid candidate does not discard the valid one, and it is

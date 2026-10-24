@@ -106,13 +106,14 @@ updated_at: 2026-10-24T00:00:00Z
 | --- | --- |
 | 显式用户命令（`/remember`、CLI、TUI 编辑） | `user_explicit` |
 | 用户接受 pending 候选 | `user_approved` |
-| 自动抽取原样捕获的用户表述 | `user_stated` |
+| 自动抽取原样捕获的用户表述 | `user_stated`（必须被证明，见下） |
 | 运行时观察到 failure → resolution | `runtime_observed` |
 | 模型工具调用或模型推断 | `model_inferred` |
 | 导入或外部编辑的文件 | `ExternalUnverified`，有效权威封顶 `model_inferred` |
 
 由此得到的规则：
 
+- **`user_stated` 必须被证明，不能被声明。** 自动抽取只有在 intent 携带可信用户轮次的 evidence span、且正文是该 span 的逐字子句（同样的字符与顺序，仅折叠大小写与行内空白）时才获得它。丢掉文件路径、版本号、数字、否定词或限定条件（`只在测试环境`）会破坏连续性或子句边界，候选因此不能作为用户事实保存：它被挂起为 pending，authority 记为 `model_inferred`，等待人确认。规则是结构性的：不使用相似度、不使用词表、不使用 judge 模型。
 - 模型永远不能覆盖用户已决定的事实，只能为目标产生 pending 候选。
 - `Full` 权限模式不创造记忆权威。批准一次工具调用是批准这次动作，不是批准一条关于用户的持久事实。
 - `sensitive` 记录永不进入注入，也永不进入 catalog。
@@ -148,9 +149,9 @@ memory:
 失败 → 修复 ───────────────► 经验候选 ────────────────► pending 或提交
 ```
 
-自动抽取在用户回合之后离线运行，产出带证据 span 的候选；它不写 standing 事实。会替换受保护用户决定的候选一律停在 pending；被拒绝的信号写进 `suppressed.jsonl`，不再重复打扰。
+自动抽取在用户回合之后离线运行，产出带证据 span 的候选；它不写 standing 事实。存储的 provenance 同时保留 span 和运行时读到的 session/turn，因此一条事实总能追回真实消息。会替换受保护用户决定的候选一律停在 pending；被拒绝的信号写进 `suppressed.jsonl`，不再重复打扰。
 
-Admission 只依据结构化事实判断 `Applied`、`Pending` 或 `Skipped`：调用者、目标权威、statement 类型、revision、subject 身份。没有同义词表、相似度阈值或裁判模型参与。
+Admission 只依据结构化事实判断 `Applied`、`Pending` 或 `Skipped`：调用者、目标权威、statement 类型、revision、subject 身份；对 `user_stated` 事实还要判断正文是否为用户轮次 span 的逐字子句（否则 `unverified_user_statement`）。没有同义词表、相似度阈值或裁判模型参与。
 
 ## 7. Experience
 
@@ -308,7 +309,7 @@ user lane 刚好压在 p95 < 10ms 的线上：三次运行有两次达标，第�
 
 1. **跨 subject 的近义改写仍可能重复。** 没有 embedding 或裁判模型就无法证明等价；只有精确 `subject_key` 或显式 `supersedes` 会收敛。不同 subject 下正文完全相同时只报 `possible_duplicate`，不合并。
 2. **不同 subject 下的矛盾可以并存。** 两条都作为候选注入，由主模型判断，运行时不替用户选一个。
-3. **抽取不是证明。** `user_stated` 需要精确用户 span，verified 经验需要运行时凭证。模型把 proposal 误标成 assertion，仍然只能产生 pending 候选。
+3. **抽取不是证明。** `user_stated` 需要用户的逐字子句，而不是对它的模型摘要：改写的抽取器得到的是 `unverified_user_statement`，不是用户的权威。verified 经验需要运行时凭证。模型把 proposal 误标成 assertion，仍然只能产生 pending 候选。
 4. **续跑回合不自动抽取。** 自动抽取由 fresh 用户回合触发；续跑过程中用户的修正只能通过直接命令或模型工具进入记忆。
 5. **外部编辑无法自我提权。** 凭证不匹配的文件权威封顶 `model_inferred`。凭证不能防住能写状态根的同权限进程。
 6. **FTS5 是词法的。** 中文同义、跨语言改写召回有限，这是明确取舍，本设计不引入向量。
