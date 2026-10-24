@@ -414,6 +414,34 @@ impl MemoryContextBuilder {
             *omitted.entry("dedup").or_default() += (before - candidates.len()) as u32;
         }
 
+        // A recalled lesson may describe the very subject the person has
+        // already decided: the same canonical identity, two different kinds.
+        // Storing both is correct — the lesson is history, the decision is
+        // current — but injecting both as parallel advice would present an old
+        // observation with the authority of today's instruction. The structural
+        // match (exact subject identity) is what makes this decidable without
+        // guessing at meaning.
+        if !experience.is_empty() {
+            let mut decided: Vec<&str> = standing
+                .iter()
+                .chain(candidates.iter())
+                .filter_map(|entry| entry.view.subject_key.as_deref())
+                .collect();
+            decided.sort_unstable();
+            decided.dedup();
+            let before = experience.len();
+            experience.retain(|entry| {
+                let Some(key) = entry.view.subject_key.as_deref() else {
+                    return true;
+                };
+                !decided.binary_search(&key).is_ok()
+            });
+            let shadowed = before - experience.len();
+            if shadowed > 0 {
+                *omitted.entry("conflict").or_default() += shadowed as u32;
+            }
+        }
+
         let mut block = String::from(BLOCK_HEADER);
         let mut injections = Vec::new();
         let mut section_tokens = SectionTokens::default();

@@ -537,7 +537,9 @@ fn ten_thousand_memories_index_scale() {
             format!("PermissionProfile {sequence}")
         };
         let started = Instant::now();
-        let hits = index.search(&query, 10).unwrap();
+        let hits = index
+            .search(&query, 10, leveler_memory::MemoryLanes::ALL)
+            .unwrap();
         timings.push(started.elapsed());
         assert!(!hits.is_empty());
     }
@@ -566,4 +568,152 @@ fn ten_thousand_memories_index_scale() {
         "scale: cold_build={cold_build:?} query_p50={p50:?} query_p95={p95:?} incremental={incremental:?} reopen={reopen_time:?} documents={} dirty={} bytes={size}",
         diagnostics.documents, diagnostics.dirty
     );
+}
+
+/// A forget is content destruction, not a filter. Rebuilding the derived index
+/// from Markdown must not bring the text back, and a stale index row must not
+/// outlive the file it described.
+#[test]
+fn a_rebuilt_index_does_not_resurrect_a_forgotten_record() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = V2Service::open(fixture.roots()).unwrap();
+    let id = fact(
+        &fixture,
+        "forget-index",
+        "遗忘后重建",
+        "这条记忆会在遗忘之后重建索引。",
+    );
+    assert!(search(&fixture, ServiceScope::Project, "重建索引").contains(&id.to_string()));
+
+    let record = service.read(&user(), &id).unwrap();
+    service.forget(&user(), op(), &id, record.cas).unwrap();
+
+    // Remove only the derived database; the Markdown authority stays.
+    let index = fixture.state.join("index");
+    for entry in std::fs::read_dir(&index).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_file() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let hits = search(&fixture, ServiceScope::Project, "重建索引");
+    assert!(
+        !hits.contains(&id.to_string()),
+        "a rebuilt index recalled a forgotten record: {hits:?}"
+    );
+    assert!(
+        service.read(&user(), &id).is_err(),
+        "the forgotten record must not be readable"
+    );
+    // The body is gone from the store, not merely hidden from retrieval.
+    let mut copies = Vec::new();
+    collect_bodies(fixture.dir(), &mut copies);
+    assert!(
+        copies
+            .iter()
+            .all(|text| !text.contains("这条记忆会在遗忘之后重建索引")),
+        "a forget left a body copy: {copies:?}"
+    );
+}
+
+fn collect_bodies(dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_bodies(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "md") {
+            out.push(std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+}
+
+/// A lane is not starved by the other lane's hits.
+///
+/// The candidate window is bounded, so a lane whose rows all rank lower than
+/// the other lane's rows could return nothing at all. Filtering by kind in the
+/// query is what keeps the experience lane reachable in a store dominated by
+/// user facts.
+#[test]
+fn a_lane_is_not_starved_by_the_other_lanes_hits() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = facade(&fixture);
+    for sequence in 0..60 {
+        fact(
+            &fixture,
+            &format!("subject_{sequence}"),
+            &format!("发布流程 {sequence}"),
+            "发布流程 PermissionProfile 校验步骤。",
+        );
+    }
+    let mut candidate = leveler_memory::MemoryCandidate::new(
+        "发布流程失败",
+        "发布流程 PermissionProfile 校验失败时先重跑权限测试。",
+        leveler_memory::CandidateKind::Free,
+        Some("experience.publish".to_string()),
+        leveler_memory::CandidateSource::RuntimeObserved,
+        Vec::new(),
+    )
+    .unwrap();
+    candidate.experience = Some(leveler_memory::ExperienceRecord {
+        category: leveler_memory::ExperienceCategory::RootCause,
+        verification: leveler_memory::ExperienceVerification::Verified,
+        applies_when: "发布流程 PermissionProfile 校验失败时".to_string(),
+        invalid_if: None,
+        evidence: vec![
+            leveler_memory::ExperienceEvidence {
+                kind: "failure".into(),
+                reference: "failure-1".into(),
+            },
+            leveler_memory::ExperienceEvidence {
+                kind: "resolution".into(),
+                reference: "resolution-1".into(),
+            },
+        ],
+    });
+    let experience_id = service
+        .admit_candidate(
+            &leveler_memory::v2::Actor::Runtime {
+                task: leveler_core::TaskId::new("task-1"),
+            },
+            ServiceScope::Project,
+            &candidate,
+            "inbox-lane",
+        )
+        .unwrap()
+        .applied_id()
+        .expect("experience applies")
+        .to_string();
+
+    let hits = service
+        .search(
+            &user(),
+            ServiceScope::Project,
+            MemoryLanes::EXPERIENCE_ONLY,
+            "发布流程 PermissionProfile",
+            5,
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "the experience lane must be reachable: {hits:?}"
+    );
+    assert_eq!(hits[0].0.id, experience_id);
+
+    // The user lane still answers with user facts, and never with the lesson.
+    let user_hits = service
+        .search(
+            &user(),
+            ServiceScope::Project,
+            MemoryLanes::USER_ONLY,
+            "发布流程 PermissionProfile",
+            5,
+        )
+        .unwrap();
+    assert_eq!(user_hits.len(), 5);
+    assert!(user_hits.iter().all(|(view, _)| view.id != experience_id));
 }

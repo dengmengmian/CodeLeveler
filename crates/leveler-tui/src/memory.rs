@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leveler_client_protocol::{
     ClientCommand, CommandId, NotificationLevel, SessionId, UiMemoryCandidate, UiMemoryEntry,
     UiMemoryKind, UiMemoryReference, UiMemoryScope,
@@ -51,6 +51,7 @@ pub fn scope_label(scope: UiMemoryScope, text: &crate::i18n::UiText) -> &'static
 }
 
 use crate::action::{CopyWhat, Effect};
+use crate::composer::Composer;
 use crate::screen::Screen;
 use crate::state::{AppState, Notification};
 
@@ -63,6 +64,147 @@ pub enum MemoryView {
     Detail,
     Active,
     Archived,
+    /// Editing one record's title and body. A view, not a second page: the
+    /// record, its scope and its revision come from the detail it opened.
+    Edit,
+}
+
+/// The two fields the editor exposes.
+///
+/// Everything else about a record (kind, scope, authority, revision, pins,
+/// experience evidence) is owned by the runtime and is never typed over from
+/// this page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditField {
+    #[default]
+    Title,
+    Body,
+}
+
+/// What the last submit attempt established.
+///
+/// `Conflict` is entered only when the runtime answered *and* the refreshed
+/// listing proves the record is at another revision: the client never guesses
+/// that a failure was a version race.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EditStatus {
+    #[default]
+    Editing,
+    Submitting,
+    Conflict {
+        current: Option<u64>,
+    },
+    Failed,
+}
+
+/// One record being edited, with the text the user typed.
+///
+/// Nothing here writes a store file. The buffers are the user's unsent text:
+/// they survive a rejected submit and a version conflict, and only an explicit
+/// discard or a successful write clears them.
+#[derive(Debug, Clone)]
+pub struct MemoryEditor {
+    pub scope: UiMemoryScope,
+    pub id: String,
+    /// The revision the record was opened at; this is the CAS the submit
+    /// carries, so a record another process changed is never overwritten
+    /// silently.
+    pub revision: u64,
+    title: Composer,
+    body: Composer,
+    original_title: String,
+    original_body: String,
+    pub field: EditField,
+    pub status: EditStatus,
+    /// The user asked to leave with unsent text. A second Esc discards it.
+    pub confirm_discard: bool,
+    /// The user asked to reload the record's current text, abandoning theirs.
+    pub confirm_reload: bool,
+}
+
+impl MemoryEditor {
+    /// Open one record's text. `false` when the runtime sent no revision: an
+    /// edit without the version it started from could only overwrite.
+    fn open(entry: &UiMemoryEntry) -> Option<Self> {
+        let revision = entry.revision?;
+        let mut title = Composer::new();
+        title.replace(entry.title.clone());
+        let mut body = Composer::new();
+        body.replace(entry.body.clone());
+        Some(Self {
+            scope: entry.scope,
+            id: entry.id.clone(),
+            revision,
+            title,
+            body,
+            original_title: entry.title.clone(),
+            original_body: entry.body.clone(),
+            field: EditField::Title,
+            status: EditStatus::Editing,
+            confirm_discard: false,
+            confirm_reload: false,
+        })
+    }
+
+    /// The buffer the keyboard is typing into.
+    pub fn buffer(&self) -> &Composer {
+        match self.field {
+            EditField::Title => &self.title,
+            EditField::Body => &self.body,
+        }
+    }
+
+    fn buffer_mut(&mut self) -> &mut Composer {
+        match self.field {
+            EditField::Title => &mut self.title,
+            EditField::Body => &mut self.body,
+        }
+    }
+
+    pub fn title_text(&self) -> &str {
+        self.title.text()
+    }
+
+    pub fn body_text(&self) -> &str {
+        self.body.text()
+    }
+
+    /// True when the buffers differ from what the store returned.
+    pub fn is_dirty(&self) -> bool {
+        self.title.text() != self.original_title || self.body.text() != self.original_body
+    }
+
+    /// A blank title is refused here because a listing paints titles as the
+    /// row's identity; writing one would make the record unfindable by the
+    /// person who wrote it.
+    pub fn blank_title(&self) -> bool {
+        self.title.text().trim().is_empty()
+    }
+
+    /// Replace the buffers with the record's current authoritative text.
+    fn reload(&mut self, entry: &UiMemoryEntry) {
+        let Some(revision) = entry.revision else {
+            return;
+        };
+        self.title.replace(entry.title.clone());
+        self.body.replace(entry.body.clone());
+        self.original_title = entry.title.clone();
+        self.original_body = entry.body.clone();
+        self.revision = revision;
+        self.status = EditStatus::Editing;
+        self.confirm_discard = false;
+        self.confirm_reload = false;
+        self.field = EditField::Title;
+    }
+
+    fn switch_field(&mut self) {
+        self.field = match self.field {
+            EditField::Title => EditField::Body,
+            EditField::Body => EditField::Title,
+        };
+        self.confirm_discard = false;
+        self.confirm_reload = false;
+    }
 }
 
 /// Which records a listing shows, by lane.
@@ -221,6 +363,8 @@ pub struct MemoryPage {
     /// reported them. Titles here are only a fallback; the listing is the
     /// authority for what a record is *now*.
     pub last_recalled: Vec<UiMemoryReference>,
+    /// The record currently open in the editor, with the user's unsent text.
+    pub editor: Option<MemoryEditor>,
 }
 
 impl MemoryPage {
@@ -300,6 +444,7 @@ impl MemoryPage {
         if self.op_kind.is_some() && self.ops.is_empty() {
             self.finish_batch();
         }
+        self.detect_conflict();
         self.sync_focus();
     }
 
@@ -325,6 +470,9 @@ impl MemoryPage {
     /// Returns true when the batch has fully settled and a proving refresh
     /// must be requested.
     pub fn resolve_receipt(&mut self, message: &str, success: bool) -> bool {
+        if self.resolve_edit_receipt(message, success) {
+            return true;
+        }
         if self.op_kind.is_none() || !self.busy() {
             return false;
         }
@@ -608,8 +756,103 @@ impl MemoryPage {
                     .collect();
                 self.focus = step_id(self.focus.as_deref(), &ids, delta);
             }
-            MemoryView::Detail => {}
+            MemoryView::Detail | MemoryView::Edit => {}
         }
+    }
+
+    /// Open the focused record in the editor. A record the runtime reported no
+    /// revision for cannot be edited: without the version it started from,
+    /// saving could only overwrite whatever is there now.
+    pub fn begin_edit(&mut self) -> bool {
+        let Some(entry) = self.focused_entry() else {
+            return false;
+        };
+        match MemoryEditor::open(entry) {
+            Some(editor) => {
+                self.editor = Some(editor);
+                self.view = MemoryView::Edit;
+                self.confirm = None;
+                self.action_error = None;
+                true
+            }
+            None => {
+                self.action_error = Some("revision");
+                false
+            }
+        }
+    }
+
+    pub fn editor_mut(&mut self) -> Option<&mut MemoryEditor> {
+        self.editor.as_mut()
+    }
+
+    /// One record as the last authoritative listing reported it.
+    pub fn current_entry(&self, scope: UiMemoryScope, id: &str) -> Option<&UiMemoryEntry> {
+        self.active
+            .iter()
+            .chain(self.archived.iter())
+            .find(|entry| entry.scope == scope && entry.id == id)
+    }
+
+    /// Settle an in-flight submit from the runtime's own receipt.
+    ///
+    /// Success closes the editor: the write is the runtime's statement, and the
+    /// refresh that follows repaints the record. A refusal keeps every typed
+    /// character and leaves the reason to be read from the runtime's message.
+    /// Returns true when a proving refresh must be requested.
+    pub fn resolve_edit_receipt(&mut self, message: &str, success: bool) -> bool {
+        let Some(editor) = self.editor.as_mut() else {
+            return false;
+        };
+        if editor.status != EditStatus::Submitting || !message.contains(&format!("[{}]", editor.id))
+        {
+            return false;
+        }
+        if success {
+            self.editor = None;
+            self.view = MemoryView::Detail;
+        } else {
+            editor.status = EditStatus::Failed;
+        }
+        true
+    }
+
+    /// True when the open editor's record is no longer the revision it was
+    /// opened at — as proven by the authoritative listing, never assumed.
+    fn detect_conflict(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if editor.status != EditStatus::Failed {
+            return;
+        }
+        let scope = editor.scope;
+        let id = editor.id.clone();
+        let opened = editor.revision;
+        let current = self
+            .active
+            .iter()
+            .chain(self.archived.iter())
+            .find(|entry| entry.scope == scope && entry.id == id)
+            .and_then(|entry| entry.revision);
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if let Some(current) = current
+            && current != opened
+        {
+            editor.status = EditStatus::Conflict {
+                current: Some(current),
+            };
+            editor.confirm_reload = false;
+        }
+    }
+
+    /// Leave the editor. The buffers go with it, so the caller must have
+    /// proven the user meant to discard them.
+    pub fn close_editor(&mut self) {
+        self.editor = None;
+        self.view = MemoryView::Detail;
     }
 
     /// Point the focus at an id the page painted. A row key that is no longer
@@ -626,7 +869,7 @@ impl MemoryPage {
             MemoryView::Review => self.pending.iter().any(|c| candidate_key(c) == key),
             MemoryView::Active => self.visible_active().iter().any(|e| entry_key(e) == key),
             MemoryView::Archived => self.visible_archived().iter().any(|e| entry_key(e) == key),
-            MemoryView::Home | MemoryView::Detail => false,
+            MemoryView::Home | MemoryView::Detail | MemoryView::Edit => false,
         };
         if exists {
             self.focus = Some(key.to_string());
@@ -660,7 +903,7 @@ impl MemoryPage {
                 .iter()
                 .map(|e| entry_key(e))
                 .collect(),
-            MemoryView::Home | MemoryView::Detail => return,
+            MemoryView::Home | MemoryView::Detail | MemoryView::Edit => return,
         };
         if self
             .focus
@@ -675,6 +918,9 @@ impl MemoryPage {
 /// Keystrokes for the memory page. Esc walks one level back and never
 /// confirms anything; only `a`/`r` do.
 pub fn screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if state.memory.view == MemoryView::Edit {
+        return edit_key(state, key);
+    }
     if state.memory.filter_edit {
         // While the query line owns the keyboard, list keys are text. Enter
         // and Esc leave it; the typed query stays in force so the list does
@@ -755,6 +1001,12 @@ pub fn screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.memory.action_error = None;
             arm_or_run(state, MemoryAction::Deprecate)
         }
+        // Editing is reversible up to the submit, so one key opens it. Nothing
+        // is written until the user saves the buffer.
+        KeyCode::Char('e') if state.memory.view == MemoryView::Detail => {
+            state.memory.begin_edit();
+            Vec::new()
+        }
         KeyCode::Char('f') if state.memory.view == MemoryView::Detail => {
             state.memory.action_error = None;
             arm_or_run(state, MemoryAction::Forget)
@@ -767,6 +1019,169 @@ pub fn screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             Vec::new()
         }
     }
+}
+
+/// Keystrokes for the open editor.
+///
+/// Editing keys belong to the focused buffer, so the page's list shortcuts
+/// (`d`, `f`, `p`, `y`) are plain text here and cannot trigger a lifecycle
+/// action on a record the user is typing into. Only Esc, Tab, Enter, Page and
+/// the two save/reload shortcuts are the page's.
+fn edit_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if state.memory.editor.is_none() {
+        return Vec::new();
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => leave_edit(state),
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(editor) = state.memory.editor_mut() {
+                editor.switch_field();
+            }
+            Vec::new()
+        }
+        KeyCode::PageUp => {
+            state.screen_scroll = state.screen_scroll.saturating_sub(10);
+            Vec::new()
+        }
+        KeyCode::PageDown => {
+            state.screen_scroll = state.screen_scroll.saturating_add(10);
+            Vec::new()
+        }
+        // Saving is a deliberate chord: Enter is a newline in the body.
+        KeyCode::Char('s' | 'S') if ctrl => submit_edit(state),
+        KeyCode::Char('r' | 'R') if ctrl => reload_edit(state),
+        KeyCode::Enter => {
+            let Some(editor) = state.memory.editor_mut() else {
+                return Vec::new();
+            };
+            match editor.field {
+                // A title is one line; Enter there moves to the body rather
+                // than writing a newline the listing could not paint.
+                EditField::Title => editor.switch_field(),
+                EditField::Body => editor.buffer_mut().newline(),
+            }
+            Vec::new()
+        }
+        KeyCode::Up => {
+            if let Some(editor) = state.memory.editor_mut() {
+                editor.buffer_mut().up();
+            }
+            Vec::new()
+        }
+        KeyCode::Down => {
+            if let Some(editor) = state.memory.editor_mut() {
+                editor.buffer_mut().down();
+            }
+            Vec::new()
+        }
+        _ => {
+            let Some(editor) = state.memory.editor_mut() else {
+                return Vec::new();
+            };
+            if editor.buffer_mut().apply_editing_key(key) {
+                editor.confirm_discard = false;
+                editor.confirm_reload = false;
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Text that arrived as a burst (typing coalesced by the terminal, or a
+/// bracketed paste) belongs to the same buffer the single-key path fills.
+/// Multi-line pastes stay multi-line: `insert_paste` keeps the whole text.
+pub fn editor_insert_text(state: &mut AppState, text: &str) -> bool {
+    if state.memory.view != MemoryView::Edit {
+        return false;
+    }
+    let Some(editor) = state.memory.editor_mut() else {
+        return false;
+    };
+    editor.buffer_mut().insert_paste(text);
+    editor.confirm_discard = false;
+    editor.confirm_reload = false;
+    true
+}
+
+/// Esc in the editor: the first press asks, the second discards. Unsent text
+/// is never dropped by a single keystroke.
+fn leave_edit(state: &mut AppState) -> Vec<Effect> {
+    let Some(editor) = state.memory.editor_mut() else {
+        return Vec::new();
+    };
+    if editor.is_dirty() && !editor.confirm_discard {
+        editor.confirm_discard = true;
+        editor.confirm_reload = false;
+        return Vec::new();
+    }
+    state.memory.close_editor();
+    state.screen_scroll = 0;
+    Vec::new()
+}
+
+/// Submit the buffers against the revision the record was opened at.
+fn submit_edit(state: &mut AppState) -> Vec<Effect> {
+    let session_id = state.session_id.clone();
+    let Some(editor) = state.memory.editor_mut() else {
+        return Vec::new();
+    };
+    if editor.status == EditStatus::Submitting {
+        return Vec::new();
+    }
+    if !editor.is_dirty() {
+        // Nothing was typed; there is nothing the runtime could apply.
+        return Vec::new();
+    }
+    if editor.blank_title() {
+        editor.status = EditStatus::Failed;
+        return Vec::new();
+    }
+    let command = ClientCommand::UpdateMemory {
+        session_id,
+        scope: editor.scope,
+        id: editor.id.clone(),
+        revision: editor.revision,
+        title: editor.title_text().to_string(),
+        body: editor.body_text().to_string(),
+    };
+    editor.status = EditStatus::Submitting;
+    editor.confirm_discard = false;
+    editor.confirm_reload = false;
+    // The listing refresh follows the runtime's receipt, not this press: the
+    // page may only repaint what the store proved.
+    vec![Effect::Send(command)]
+}
+
+/// Reload the record's authoritative text into the buffers, abandoning the
+/// user's. Two presses: the state itself is the warning, not the confirmation.
+fn reload_edit(state: &mut AppState) -> Vec<Effect> {
+    let Some(editor) = state.memory.editor.as_ref() else {
+        return Vec::new();
+    };
+    if !matches!(editor.status, EditStatus::Conflict { .. }) {
+        return Vec::new();
+    }
+    if !editor.confirm_reload {
+        if let Some(editor) = state.memory.editor.as_mut() {
+            editor.confirm_reload = true;
+            editor.confirm_discard = false;
+        }
+        return Vec::new();
+    }
+    let scope = editor.scope;
+    let id = editor.id.clone();
+    let fresh = state.memory.current_entry(scope, &id).cloned();
+    let Some(editor) = state.memory.editor.as_mut() else {
+        return Vec::new();
+    };
+    match fresh {
+        Some(entry) => editor.reload(&entry),
+        // A record that left the listing cannot be reloaded from a memory of
+        // what it was: say so and keep the user's text.
+        None => editor.status = EditStatus::Failed,
+    }
+    Vec::new()
 }
 
 /// Arm a destructive action on the focused record, or perform it when it is
@@ -861,6 +1276,11 @@ pub fn memory_reference(entry: &UiMemoryEntry) -> String {
 /// One level back: detail → its list, list → home, home → conversation.
 pub fn back_one(state: &mut AppState) {
     match state.memory.view {
+        // Esc in the editor never discards unsent text on the first press: the
+        // editor owns its own confirmation rule.
+        MemoryView::Edit => {
+            let _ = leave_edit(state);
+        }
         MemoryView::Detail => {
             // Leaving the record leaves the question it was asking.
             state.memory.confirm = None;
@@ -888,8 +1308,14 @@ pub fn owns_back(state: &AppState) -> bool {
     state.active_screen == Screen::Memory && state.memory.view != MemoryView::Home
 }
 
+/// True when the editor owns typing, so printable keys are text and not the
+/// page's lifecycle shortcuts.
+pub fn editing(state: &AppState) -> bool {
+    state.active_screen == Screen::Memory && state.memory.view == MemoryView::Edit
+}
+
 pub fn wheel(state: &mut AppState, notches: isize) {
-    if state.memory.view == MemoryView::Detail {
+    if matches!(state.memory.view, MemoryView::Detail | MemoryView::Edit) {
         let lines = (notches * 3).unsigned_abs();
         state.screen_scroll = if notches < 0 {
             state.screen_scroll.saturating_sub(lines)
@@ -937,6 +1363,7 @@ fn open_focused(state: &mut AppState) -> Vec<Effect> {
             Vec::new()
         }
         MemoryView::Detail => Vec::new(),
+        MemoryView::Edit => Vec::new(),
     }
 }
 

@@ -282,6 +282,22 @@ pub enum ClientCommand {
         /// a silent overwrite of a newer record.
         revision: u64,
     },
+    /// Rewrite the title and body of one active memory the user is looking at.
+    ///
+    /// `revision` is the revision the page opened: a mismatch is a conflict the
+    /// user has to resolve, never a silent overwrite of a newer record. The
+    /// user's own edit IS the authority, so this command is minted by a client
+    /// surface; the model edits through `memory.update` and its own admission
+    /// path instead.
+    UpdateMemory {
+        session_id: SessionId,
+        #[serde(default)]
+        scope: UiMemoryScope,
+        id: String,
+        revision: u64,
+        title: String,
+        body: String,
+    },
     /// Archive (forget) one active memory id — user-authoritative (no model).
     ForgetMemory {
         session_id: SessionId,
@@ -599,6 +615,7 @@ impl ClientCommand {
             | ClientCommand::RememberMemory { session_id, .. }
             | ClientCommand::ForgetMemory { session_id, .. }
             | ClientCommand::SetMemoryPin { session_id, .. }
+            | ClientCommand::UpdateMemory { session_id, .. }
             | ClientCommand::DeprecateMemory { session_id, .. }
             | ClientCommand::RequestDiff { session_id, .. }
             | ClientCommand::CompactContext { session_id }

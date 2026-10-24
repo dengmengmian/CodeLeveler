@@ -452,6 +452,10 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     path: image.path,
                     name: image.name,
                 })]
+            } else if crate::memory::editor_insert_text(state, &text) {
+                // A paste while the /memory editor is open is text for the
+                // buffer, not for the composer underneath.
+                Vec::new()
             } else if state
                 .overlay
                 .as_mut()
@@ -472,6 +476,9 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         Action::TextInput(text) => {
             state.disarm_ctrlc();
             clear_quit_confirm_notification(state);
+            if !text.is_empty() && crate::memory::editor_insert_text(state, &text) {
+                return Vec::new();
+            }
             if !text.is_empty()
                 && state
                     .overlay
@@ -1806,6 +1813,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     if should_disarm_ctrlc(&key) && !(matches!(key.code, KeyCode::Esc) && state.is_busy()) {
         state.disarm_ctrlc();
         clear_quit_confirm_notification(state);
+    }
+
+    // The `/memory` editor is a text surface: its keys must reach the buffers
+    // before the global screen toggles, the permission cycle, the completion
+    // menu and the popup bindings. Inside it, `d`/`f`/`p` are letters, not
+    // lifecycle actions on the record being typed into.
+    if state.surface == SurfaceFocus::Main && crate::memory::editing(state) {
+        return handle_screen_key(state, key);
     }
 
     // `Ctrl+X Ctrl+E` opens $EDITOR on the draft (readline's binding, which

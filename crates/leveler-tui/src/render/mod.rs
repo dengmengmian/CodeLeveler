@@ -1378,6 +1378,7 @@ fn render_memory_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         MemoryView::Home => t.memory_home_hint,
         MemoryView::Review => t.memory_review_hint,
         MemoryView::Detail => t.memory_detail_hint,
+        MemoryView::Edit => t.memory_edit_hint,
         MemoryView::Active | MemoryView::Archived => t.memory_list_hint,
     };
     // A consent page is only usable if its keys stay readable. Wrap whole
@@ -1405,6 +1406,7 @@ fn render_memory_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         MemoryView::Home => render_memory_home(frame, body, state),
         MemoryView::Review => render_memory_review(frame, body, state),
         MemoryView::Detail => render_memory_detail(frame, body, state),
+        MemoryView::Edit => render_memory_edit(frame, body, state),
         MemoryView::Active => render_memory_entries(frame, body, state, true),
         MemoryView::Archived => render_memory_entries(frame, body, state, false),
     }
@@ -1908,6 +1910,161 @@ fn render_memory_detail(frame: &mut Frame, body: Rect, state: &mut AppState) {
         }
     }
     render_scrolled(frame, body, state, lines);
+}
+
+/// The editor. The record's text is shown exactly as it will be written — no
+/// ellipsis, no row cap — because a body is only editable if the person can
+/// read all of it. The cursor is a real glyph inside the buffer, so a wrapped
+/// row never hides where typing goes.
+fn render_memory_edit(frame: &mut Frame, body: Rect, state: &mut AppState) {
+    let t = state.t();
+    let theme = state.theme.clone();
+    let width = body.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let Some(editor) = state.memory.editor.as_ref() else {
+        return;
+    };
+    let heading = format!(
+        "{} · {}:{} · r{}",
+        t.memory_edit_title,
+        crate::memory::scope_label(editor.scope, &t),
+        editor.id,
+        editor.revision
+    );
+    push_memory_wrapped(
+        &mut lines,
+        &heading,
+        width,
+        Style::default()
+            .fg(theme.text.primary)
+            .add_modifier(Modifier::BOLD),
+    );
+    push_memory_wrapped(
+        &mut lines,
+        t.memory_edit_scope_note,
+        width,
+        Style::default().fg(theme.text.muted),
+    );
+    // An experience's verification is a claim about the text the runtime
+    // observed. Saying so before the edit is what keeps the label honest after
+    // it.
+    if state
+        .memory
+        .current_entry(editor.scope, &editor.id)
+        .and_then(|entry| entry.kind)
+        == Some(leveler_client_protocol::UiMemoryKind::Experience)
+    {
+        push_memory_wrapped(
+            &mut lines,
+            t.memory_edit_experience_note,
+            width,
+            Style::default().fg(theme.status.warning),
+        );
+    }
+    lines.push(Line::from(""));
+
+    for field in [
+        crate::memory::EditField::Title,
+        crate::memory::EditField::Body,
+    ] {
+        let focused = editor.field == field;
+        let label = match field {
+            crate::memory::EditField::Title => t.memory_edit_field_title,
+            crate::memory::EditField::Body => t.memory_edit_field_body,
+        };
+        let marker = if focused { "▸" } else { " " };
+        push_memory_wrapped(
+            &mut lines,
+            &format!("{marker} {label}"),
+            width,
+            Style::default()
+                .fg(if focused {
+                    theme.accent.primary
+                } else {
+                    theme.text.secondary
+                })
+                .add_modifier(Modifier::BOLD),
+        );
+        let text = match field {
+            crate::memory::EditField::Title => editor.title_text(),
+            crate::memory::EditField::Body => editor.body_text(),
+        };
+        let shown = if focused {
+            // Two columns are reserved for the caret itself, so an insertion
+            // at the very end of the line stays visible.
+            edit_text_with_caret(text, editor.buffer().cursor_byte())
+        } else {
+            text.to_string()
+        };
+        push_memory_wrapped(
+            &mut lines,
+            &shown,
+            width.saturating_sub(2),
+            Style::default().fg(theme.text.primary),
+        );
+        lines.push(Line::from(""));
+    }
+
+    for footer in edit_status_lines(state, &t) {
+        push_memory_wrapped(&mut lines, &footer.0, width, Style::default().fg(footer.1));
+    }
+    render_scrolled(frame, body, state, lines);
+}
+
+/// The state lines under the buffers: why a save did not apply, why the record
+/// moved, and which confirmation the next key performs.
+fn edit_status_lines(
+    state: &AppState,
+    t: &crate::i18n::UiText,
+) -> Vec<(String, ratatui::style::Color)> {
+    let theme = &state.theme;
+    let Some(editor) = state.memory.editor.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match &editor.status {
+        crate::memory::EditStatus::Editing => {}
+        crate::memory::EditStatus::Submitting => {
+            out.push((t.memory_edit_submitting.to_string(), theme.text.secondary));
+        }
+        crate::memory::EditStatus::Failed => {
+            let message = if editor.blank_title() {
+                t.memory_edit_blank_title.to_string()
+            } else {
+                t.memory_edit_failed.to_string()
+            };
+            out.push((message, theme.status.warning));
+        }
+        crate::memory::EditStatus::Conflict { current } => {
+            let revision = current.map(|value| value.to_string()).unwrap_or_default();
+            out.push((
+                t.memory_edit_conflict.replace("{revision}", &revision),
+                theme.status.warning,
+            ));
+        }
+    }
+    if editor.confirm_discard {
+        out.push((
+            t.memory_edit_discard_confirm.to_string(),
+            theme.status.warning,
+        ));
+    }
+    if editor.confirm_reload {
+        out.push((
+            t.memory_edit_reload_confirm.to_string(),
+            theme.status.warning,
+        ));
+    }
+    out
+}
+
+/// Insert the caret glyph at the cursor byte so a wrapped row shows exactly
+/// where typing lands. Appending after the last grapheme keeps the caret
+/// visible at the end of a full row.
+fn edit_text_with_caret(text: &str, cursor_byte: usize) -> String {
+    let cursor_byte = cursor_byte.min(text.len());
+    let (before, after) = text.split_at(cursor_byte);
+    format!("{before}▏{after}")
 }
 
 /// Everything the page can prove about a record, in a stable order.
@@ -5722,7 +5879,7 @@ mod tests {
         assert!(!text.contains("已归档 1 条"), "{text}");
         let remembered = text.find("查看已记住").expect("remembered entry");
         let pending = text.find("查看待确认").expect("pending entry");
-        let archived = text.find("查看已归档").expect("archived entry");
+        let archived = text.find("查看历史").expect("history entry");
         assert!(remembered < pending && pending < archived, "{text}");
         for internal in [
             "cand-",

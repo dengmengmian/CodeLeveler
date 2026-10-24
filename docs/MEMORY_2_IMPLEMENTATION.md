@@ -981,3 +981,90 @@ Stage 4 之后，按以下顺序（不改变本轮范围）：
 8. **工具面清理**：评估 `vector_search`（FNV hashed bag-of-tokens）是否下线或映射到 FTS5；不与 Memory 2.0 核心混做。
 
 明确不做：embedding/向量库、LLM Judge、同义词/停用词表、第二套 store、第二套 session log、长期双写。
+
+---
+
+## Stage 5：编辑闭环、跨 Kind 优先级与双 Lane 调优（本轮）
+
+基线：`8050db8` / tree `f640cf08a0869fa1b841438083425fffe6799178`。本节只记录本轮实际改动、验证与未验证项。
+
+### S5.1 TUI Memory Update
+
+问题：Stage 4 的 `/memory` 只有列表、筛选、详情、复制、Pin、Deprecate、Forget，没有标题/正文编辑；服务层已有 `MemoryService::update`，但协议与 App 层没有用户入口，因此 TUI 管理仍是 CONDITIONAL。
+
+改动（新增文件内的位置）：
+
+- `crates/leveler-client-protocol/src/command.rs`：新增 `ClientCommand::UpdateMemory { session_id, scope, id, revision, title, body }`，并纳入 `session_id()` 取值；`leveler-remote-protocol` 对其 `Deny`（memory 不可远程编辑），`leveler-remote-agent` 增加命令名映射。
+- `crates/leveler-app/src/interactive.rs`：`update_memory` 处理器用 `memory_invocation("ui:update", …)` 铸造 `Actor::User`，调用 `MemoryService::update`；成功发 Info 通知，`ServiceError::Conflict` 发独立的 `update conflict [id]` 警告，绝不写盘。
+- `crates/leveler-tui/src/memory.rs`：`MemoryView::Edit` + `MemoryEditor`（两个 `Composer` 缓冲、字段焦点、脏标记、状态机 `Editing/Submitting/Conflict/Failed`）。
+- `crates/leveler-tui/src/reducer/mod.rs`：编辑态独占键盘（`crate::memory::editing`），`Action::TextInput`/`Action::Paste` 进入聚焦缓冲，不再落到对话输入框。
+- `crates/leveler-tui/src/render/mod.rs`：`render_memory_edit` 原样渲染完整正文（不截断），光标以真实字形插入，状态行显示冲突/失败/待确认丢弃。
+
+行为契约：
+
+- `Enter` 在标题栏切到正文，在正文插入换行；`Tab`/`Shift+Tab` 切字段；`Ctrl+S` 提交；`Esc` 两次丢弃；`Ctrl+R` 两次重新载入当前版本。
+- 未修改时不提交（不产生空 revision）；空标题在客户端拒绝，service 也拒绝。
+- 提交携带打开时的 `revision`。运行时拒绝 + 刷新后的 revision 变化，才判定为 `Conflict`（用权威 listing 证明，不猜）。
+- 冲突时用户输入保留在缓冲，提示当前 revision，可显式重新载入（两次按键）或以新 revision 保存。
+- 列表/搜索/详情全部由提交成功后的 `ListMemory` 刷新重绘；TUI 不直接写 store。
+
+测试（`crates/leveler-tui/src/reducer/memory_tests.rs`，11 个）：打开不改即不脏、标题编辑携带 revision 与两字段、正文多行 Markdown 与代码块逐字提交、粘贴/合并输入进入缓冲、Esc 两次丢弃、未改一次 Esc 退出、空标题拦截、receipt 成功后关闭并刷新、拒绝后保留文本并按 listing 判定冲突、冲突下两次 Ctrl+R 重载、保存后重新打开读到新 revision、编辑态下 `d/f/p` 只是字符。
+
+### S5.2 Experience 编辑后的验证立场
+
+问题：用户改写已验证 Experience 的正文后，`standing` 仍显示 `verified`——新的文字继承了运行时对旧文字的证明。
+
+修复：`crates/leveler-memory/src/service.rs` 的 `markdown_view` 要求 `authority == runtime_observed && has_resolution()` 才给出 `verified`。用户命令写入后 authority 为 `user_explicit`，因此显示 `observed`，`evidence` 与历史保留。
+
+测试：`memory_v2_explicit.rs::a_user_edit_of_a_verified_experience_drops_the_verification_claim`（Red：修复前 left=`verified`/right=`observed`；Green：修复后通过，并断言证据条数仍为 2）。
+
+### S5.3 跨 Kind 冲突（同 subject_key）
+
+问题：同一 `subject_key` 的当前用户决定与历史 Experience 会同时注入——用户决定在 Standing 段、经验在 Experience 段，且 Experience 段没有任何“该主题已被用户决定”的抑制。
+
+修复：`crates/leveler-agent/src/memory_context.rs` 在渲染前按精确 `subject_key` 抑制：standing/candidate 已占用的 key，其 Experience 不进入注入，计入 omission `conflict`。
+
+验证针对**最终 Provider Request**（`runtime.requests()[0].control_context.trailing_text()`），不是候选排序：
+
+- `memory_v2_injection.rs::a_lesson_on_a_decided_subject_is_not_injected_beside_the_decision`（Red：修复前该经验以 `mode=experience` 出现在 `injections` 与请求文本中；Green：`experience_count == 0`、omission `conflict=1`、请求不含 `npm install`，且记录仍可读）。
+- `memory_v2_injection.rs::a_lesson_about_another_subject_is_still_recalled`：不同 subject 不受影响。
+
+### S5.4 双 Lane 召回的性能根因与修复
+
+Stage 4 记录的 10k 双 Lane p95 为 17.04–18.46ms。本轮同机 release 复现：**20.5ms**。分解（10k，release）：
+
+```
+search12=6.82ms  search1=6.24ms  batch_read48=2.21ms  single_read=75µs
+user_only_recall_p50=6.93ms  dual_recall_p50=14.15ms
+```
+
+`search1` 与 `search12` 几乎相同，说明成本在 FTS5 bm25 排序本身，而非每候选 Markdown 复核。
+
+根因：`MemoryIndex::search` 的 SQL 没有 lane 条件，`Service::search` 先取 `limit*4` 行再在 Markdown 复核时丢弃另一 lane，于是双 Lane 对同一批候选排名两次；更严重的是**单 lane 被另一 lane 的命中挤出候选窗口**——60 条用户事实 + 1 条经验时，经验 lane 返回空集（真实召回缺陷，不是理论问题）。
+
+修复：`crates/leveler-memory/src/v2/index.rs` 的 `search(query, limit, lanes)` 把 kind 条件下推到 SQL（`?2 IS NULL OR documents.kind = ?2`），`Service::search` 传入 lanes。单 lane 只排自己的行；`MemoryLanes::ALL` 仍一次排名两 lane。
+
+验证：新增 `memory_v2_index.rs::a_lane_is_not_starved_by_the_other_lanes_hits`（Red：修复前经验 lane 返回 `[]`；Green：返回该经验，且 user lane 不含它）。
+
+同机 release 复测（10k，未固定机器负载）：
+
+| 配置 | p50 | p95 |
+| --- | ---: | ---: |
+| 单 Lane（USER_ONLY） | 6.9–7.2ms | 7.8–8.9ms |
+| 双 Lane，经验 lane 为空（默认关闭 Experience） | 9.2–9.4ms | 9.9 / 14.0 / 12.2ms（3 次） |
+| 双 Lane，2000 条经验记录（显式开启） | 10.3ms | 16.8ms |
+
+结论：10k 单 Lane 达标；默认配置的双 Lane 在 p50 达标、p95 在机器有并行负载时抖动越线；经验 lane 真实填充后 p95 仍 16.8ms。**保留 PERFORMANCE CONDITIONAL**，未调低门槛、未减小 K、未关闭 Experience、未跳过 FTS5/Revision 校验。下一步优化方向：把 kind 变为 FTS 表的一部分（按 lane 分表或增加 kind 列参与 MATCH），使单 lane 查询不再扫描另一 lane 的 rowid；或对超高频 query 引入带失效的结构化候选缓存（需先证明显式键，不得缓存旧事实）。
+
+### S5.5 遗忘语义的文案纠正
+
+问题：`Forget` 实际删除正文、修订历史与索引行，只保留 tombstone（`store.destructive_locked` 的 `TargetDisposition::Delete` + `history_dir` 删除），但 TUI 中文写作“归档”、CLI 写作 “Archive (soft-delete)” 并打印 `archived [id]`。用户会以为正文仍可找回。
+
+修复：`crates/leveler-tui/src/i18n.rs`（`f` 确认文案、`/memory forget` 用法、历史列表标题）、`crates/leveler-cli/src/cli.rs`（`Forget`/`List --archived`/`Show --archived` 文档）、`crates/leveler-cli/src/memory_cmds.rs`（成功行 “forgotten for good”）。语义未改，只修文案。测试：删除索引重建后 `a_rebuilt_index_does_not_resurrect_a_forgotten_record`（断言召回为空、读取失败、Markdown 无正文副本）。
+
+### S5.6 本轮未验证项
+
+- 真实 DeepSeek Flash dogfood（DF-FINAL-01…10）：本会话未执行，NOT_VERIFIED。
+- 真实 PTY 下 `/memory` 编辑交互（120×40 / 80×24 / 48×20）：NOT_VERIFIED；已有 reducer 级行为测试与渲染快照测试覆盖显示契约。
+- Windows / Linux：NOT_VERIFIED（本轮只在 macOS arm64 验证）。
+- Dogfood 长期脚本收口：BLOCKED（`dogfood` 仓库存在他人未提交改动，未提交）。
