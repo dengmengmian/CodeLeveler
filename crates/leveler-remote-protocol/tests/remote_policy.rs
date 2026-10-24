@@ -275,6 +275,40 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             },
             false,
         ),
+        // Editing, pinning and retiring a record are the user's own memory
+        // decisions; the same verdict the policy assigns them applies here.
+        (
+            "update_memory",
+            ClientCommand::UpdateMemory {
+                session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
+                id: "m1".to_string(),
+                revision: 1,
+                title: "subject".to_string(),
+                body: "keep it compact".to_string(),
+            },
+            false,
+        ),
+        (
+            "set_memory_pin",
+            ClientCommand::SetMemoryPin {
+                session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
+                id: "m1".to_string(),
+                pinned: true,
+            },
+            false,
+        ),
+        (
+            "deprecate_memory",
+            ClientCommand::DeprecateMemory {
+                session_id: session(),
+                scope: leveler_client_protocol::UiMemoryScope::Project,
+                id: "m1".to_string(),
+                revision: 1,
+            },
+            false,
+        ),
         (
             "steer_current_turn",
             ClientCommand::SteerCurrentTurn {
