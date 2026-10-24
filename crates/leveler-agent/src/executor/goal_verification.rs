@@ -78,7 +78,7 @@ pub(crate) fn decide(
                 if cited.is_empty() {
                     continue;
                 }
-                let Some(last) = runs.iter().rev().find(|run| run.label.contains(cited)) else {
+                let Some(last) = runs.iter().rev().find(|run| cites(&run.label, cited)) else {
                     return VerificationDecision::Refuse(format!(
                         "`{cited}` was cited as verification but never ran in this task. Run \
                          the command that proves the objective, or cite one you actually ran."
@@ -90,7 +90,11 @@ pub(crate) fn decide(
                         last.model_step
                     ));
                 }
-                if last.mutation_ops < mutation_ops {
+                // Freshness is a property of verification: a test or build
+                // must judge the current tree. A command the user ordered as
+                // an action can legitimately precede the change it produces;
+                // demanding it run again would reverse the user's sequence.
+                if is_verification_command(&last.label) && last.mutation_ops < mutation_ops {
                     return VerificationDecision::Refuse(format!(
                         "`{cited}` passed before the most recent file change. Re-run it against \
                          the current workspace before marking the goal complete."
@@ -207,6 +211,80 @@ pub(crate) fn parse_claim(arguments: &serde_json::Value) -> Result<VerificationC
 ///
 /// Only the two command tools have one. Every other tool is not executable
 /// verification, so a call returns `None`.
+/// Whether a citation names a command the runtime actually ran.
+///
+/// The model writes the citation as prose: it may quote one argument for
+/// readability (`-run 'A|B'`) and may append an observation in parentheses.
+/// The execution record stores the command as the tool received it. Compare
+/// token sequences after removing only that presentation, never words:
+/// `grep 'a b' file` and `grep a b file` are different commands.
+fn cites(label: &str, cited: &str) -> bool {
+    let cited = command_tokens(strip_trailing_note(cited));
+    if cited.is_empty() {
+        return false;
+    }
+    let label = command_tokens(label);
+    label
+        .windows(cited.len())
+        .any(|window| window == cited.as_slice())
+}
+
+/// Split a command into argument-shaped tokens. Quotes group and are dropped;
+/// whitespace outside quotes separates. No word is discarded, so a quoted
+/// argument cannot stand in for several unquoted ones.
+fn command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Drop a trailing parenthetical observation such as
+/// `gofmt -l . (only pre-existing files flagged)`. Only a note that closes
+/// the citation and starts outside a quoted argument is removed; a
+/// parenthesis that belongs to the command itself stays.
+fn strip_trailing_note(command: &str) -> &str {
+    let command = command.trim_end();
+    let Some(open) = command.rfind(" (") else {
+        return command;
+    };
+    let note = &command[open..];
+    if !note.ends_with(')') || note.contains('\n') {
+        return command;
+    }
+    let mut quote: Option<char> = None;
+    for (index, c) in command.char_indices() {
+        if index == open {
+            if quote.is_some() {
+                return command;
+            }
+            break;
+        }
+        match quote {
+            Some(q) if c == q => quote = None,
+            None if c == '\'' || c == '"' => quote = Some(c),
+            _ => {}
+        }
+    }
+    command[..open].trim_end()
+}
+
 pub(crate) fn command_label(name: &str, arguments: &serde_json::Value) -> Option<String> {
     match name {
         "run_command" => {
@@ -503,6 +581,59 @@ mod tests {
     }
 
     #[test]
+    fn a_cited_command_may_quote_its_argument() {
+        let runs = vec![run(
+            "go test -v -run TestNamesOnly|TestRenderNamesIncludesInvalid ./cmd/... ./internal/report/...",
+            true,
+            4,
+            2,
+        )];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec![
+                    "go test -v -run 'TestNamesOnly|TestRenderNamesIncludesInvalid' ./cmd/... ./internal/report/..."
+                        .into()
+                ]),
+                &runs,
+                2,
+                true
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
+    }
+
+    #[test]
+    fn a_cited_command_may_carry_a_trailing_annotation() {
+        let runs = vec![run("gofmt -l .", true, 4, 2)];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec![
+                    "gofmt -l . (only pre-existing internal/config/config.go flagged; touched files clean)"
+                        .into()
+                ]),
+                &runs,
+                2,
+                true
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
+    }
+
+    #[test]
+    fn a_quoted_argument_does_not_match_a_different_unquoted_command() {
+        let runs = vec![run("grep a b file", true, 4, 2)];
+        assert!(matches!(
+            decide(
+                &VerificationClaim::Passed(vec!["grep 'a b' file".into()]),
+                &runs,
+                2,
+                true
+            ),
+            VerificationDecision::Refuse(message) if message.contains("never ran")
+        ));
+    }
+
+    #[test]
     fn a_citation_whose_last_run_failed_is_refused() {
         let runs = vec![run("go test ./...", false, 4, 2)];
         assert!(matches!(
@@ -518,6 +649,28 @@ mod tests {
             decide(&VerificationClaim::Passed(vec!["go test".into()]), &runs, 3, true),
             VerificationDecision::Refuse(message) if message.contains("before the most recent")
         ));
+    }
+
+    /// The T9 shape: a task orders a side-effect-free command BEFORE the file
+    /// it creates ("run sleep 60, only then create done.txt"). A cited
+    /// command that is not verification-class must have run and passed, but
+    /// it cannot be made "stale" by the later change it was ordered to
+    /// precede; demanding a re-run reverses the user's own sequence.
+    #[test]
+    fn a_cited_non_verification_command_need_not_follow_the_last_change() {
+        let runs = vec![
+            run("sleep 60", true, 3, 0),
+            run("od -c done.txt", true, 5, 1),
+        ];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec!["sleep 60".into()]),
+                &runs,
+                1,
+                true
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
     }
 
     #[test]

@@ -2751,7 +2751,9 @@ impl AgentHarness for Drive<'_> {
                             };
                             let workspace =
                                 self.executor.tool_context.execution.workspace.as_deref();
-                            let artifact = |path: &str| artifact_state(workspace, path);
+                            let recorded =
+                                epoch_modified_paths(&self.progress, &self.modified_files);
+                            let artifact = |path: &str| artifact_state(workspace, path, &recorded);
                             match goal_scope::decide(&goal_scope::ScopeFacts {
                                 requirements: &requirements,
                                 accounting: accounting.as_deref(),
@@ -5258,13 +5260,16 @@ fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<St
 
 /// Whether a user-named artifact exists in this agent's workspace.
 ///
-/// Only workspace-relative paths are inspected. An absolute path, a `..`
-/// escape, a missing workspace, or an unresolvable path is `Unknown`; the
-/// completion gate then records an honest unverified boundary rather than
-/// guessing.
+/// Only workspace-relative paths are inspected. A bare name also resolves
+/// through recorded changes: the user often names a file without its
+/// directory, and the runtime already observed which paths the task changed.
+/// An absolute path, a `..` escape, a missing workspace, or an unresolvable
+/// path is `Unknown`; the completion gate then records an honest unverified
+/// boundary rather than guessing.
 fn artifact_state(
     workspace: Option<&leveler_execution::Workspace>,
     path: &str,
+    recorded_paths: &[String],
 ) -> goal_scope::ArtifactState {
     use goal_scope::ArtifactState;
     let path = path.trim().trim_start_matches("./");
@@ -5280,9 +5285,71 @@ fn artifact_state(
         return ArtifactState::Unknown;
     };
     match workspace.resolve_for_read(path) {
-        Ok(resolved) if resolved.exists() => ArtifactState::Present,
-        Ok(_) => ArtifactState::Absent,
-        Err(_) => ArtifactState::Unknown,
+        Ok(resolved) if resolved.exists() => return ArtifactState::Present,
+        Ok(_) => {}
+        Err(_) => return ArtifactState::Unknown,
+    }
+    // A bare file name in the user's prose is shorthand for the file in its
+    // real directory (`aggregate.go` for `internal/report/aggregate.go`). A
+    // recorded change with that basename is evidence the named deliverable
+    // exists; demanding the shorthand exist at the workspace root refuses
+    // correct work.
+    if !path.contains(['/', '\\']) {
+        let suffix = format!("/{path}");
+        if recorded_paths.iter().any(|recorded| {
+            let recorded = recorded.trim().trim_start_matches("./");
+            recorded == path || recorded.ends_with(&suffix)
+        }) {
+            return ArtifactState::Present;
+        }
+    }
+    ArtifactState::Absent
+}
+
+#[cfg(test)]
+mod artifact_scope_tests {
+    use super::{artifact_state, goal_scope};
+
+    /// A bare file name in the user's prose is shorthand for the file in its
+    /// real directory (`aggregate.go` for `internal/report/aggregate.go`).
+    /// A recorded change with that basename is evidence the named deliverable
+    /// exists; demanding it at the workspace root rejects correct work.
+    #[test]
+    fn a_bare_name_is_present_when_a_recorded_change_has_that_basename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("internal/report");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(nested.join("aggregate.go"), "package report\n").expect("file");
+        let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
+        let recorded = vec!["internal/report/aggregate.go".to_string()];
+
+        assert_eq!(
+            artifact_state(Some(&workspace), "aggregate.go", &recorded),
+            goal_scope::ArtifactState::Present
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_bare_name_absent_from_the_root_stays_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
+
+        assert_eq!(
+            artifact_state(Some(&workspace), "done.txt", &[]),
+            goal_scope::ArtifactState::Absent
+        );
+    }
+
+    #[test]
+    fn a_root_artifact_does_not_need_a_recorded_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("done.txt"), "RESUME_OK\n").expect("file");
+        let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
+
+        assert_eq!(
+            artifact_state(Some(&workspace), "done.txt", &[]),
+            goal_scope::ArtifactState::Present
+        );
     }
 }
 
