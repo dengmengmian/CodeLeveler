@@ -710,3 +710,172 @@ fn accepting_an_identical_identity_conversion_retires_the_collision() {
         "the identical structured record retires with history: {archived:?}"
     );
 }
+
+/// A credential typed into an update is refused exactly like one typed into a
+/// direct write: the page must not be a second, weaker way to store a secret.
+#[test]
+fn a_secret_in_an_update_is_refused() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = open_service(&fixture);
+    let (id, revision, _) = applied(direct(
+        &service,
+        &user("cmd-1"),
+        "direct:cmd-1",
+        "这个项目使用 pnpm",
+    ));
+    let refused = service.update(
+        &user("cmd-2"),
+        ServiceScope::Project,
+        &id,
+        revision,
+        UpdateRequest {
+            title: Some("API key".into()),
+            body: Some("api_key=sk-abcdef1234567890abcdef".into()),
+            value: None,
+            tags: None,
+            expires_at: None,
+            subject: None,
+        },
+    );
+    assert!(
+        matches!(refused, Err(leveler_memory::ServiceError::Invalid(_))),
+        "a secret-shaped update must be refused: {refused:?}"
+    );
+    let entries = active(&service);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].body, "这个项目使用 pnpm",
+        "a refused update leaves the stored text alone"
+    );
+    assert_eq!(entries[0].revision, Some(revision));
+    let mut leaked = Vec::new();
+    collect_files(fixture.dir(), &mut leaked);
+    for path in leaked {
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("sk-abcdef1234567890abcdef"),
+            "the refused secret must not survive on disk: {}",
+            path.display()
+        );
+    }
+}
+
+/// A record whose title is blank cannot be found again by the person who wrote
+/// it, so the service refuses it instead of writing one.
+#[test]
+fn an_update_cannot_blank_the_title() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = open_service(&fixture);
+    let (id, revision, _) = applied(direct(
+        &service,
+        &user("cmd-1"),
+        "direct:cmd-1",
+        "这个项目使用 pnpm",
+    ));
+    let refused = service.update(
+        &user("cmd-2"),
+        ServiceScope::Project,
+        &id,
+        revision,
+        UpdateRequest {
+            title: Some("   ".into()),
+            body: None,
+            value: None,
+            tags: None,
+            expires_at: None,
+            subject: None,
+        },
+    );
+    assert!(
+        matches!(refused, Err(leveler_memory::ServiceError::Invalid(_))),
+        "a blank title must be refused: {refused:?}"
+    );
+    assert_eq!(active(&service)[0].revision, Some(revision));
+}
+
+/// A verified experience is verified *about the text the runtime observed*.
+/// When a person rewrites that text, the runtime's proof no longer describes
+/// it: the record keeps its history and its evidence references, but the
+/// current revision may not keep claiming "verified".
+#[test]
+fn a_user_edit_of_a_verified_experience_drops_the_verification_claim() {
+    let fixture = Fixture::new(MemoryScope::Project);
+    let service = open_service(&fixture);
+    let mut candidate = MemoryCandidate::new(
+        "cargo build target",
+        "cargo 构建失败时先清理 target 目录再重试",
+        CandidateKind::Free,
+        Some("build.cargo.target".to_string()),
+        CandidateSource::RuntimeObserved,
+        Vec::new(),
+    )
+    .unwrap();
+    candidate.experience = Some(leveler_memory::ExperienceRecord {
+        category: leveler_memory::ExperienceCategory::RootCause,
+        verification: leveler_memory::ExperienceVerification::Verified,
+        applies_when: "cargo build 在一个改了依赖的仓库里失败".to_string(),
+        invalid_if: None,
+        evidence: vec![
+            leveler_memory::ExperienceEvidence {
+                kind: "failure".into(),
+                reference: "call-1 cargo build".into(),
+            },
+            leveler_memory::ExperienceEvidence {
+                kind: "resolution".into(),
+                reference: "call-2 cargo clean && cargo build".into(),
+            },
+        ],
+    });
+    let (id, revision, _) = applied(
+        service
+            .admit_candidate(&runtime(), ServiceScope::Project, &candidate, "inbox-1")
+            .unwrap(),
+    );
+    let before = active(&service);
+    let before = before.iter().find(|view| view.id == id).unwrap();
+    assert_eq!(
+        before.experience.as_ref().map(|e| e.standing.as_str()),
+        Some("verified"),
+        "the runtime's failure/resolution pair is what makes it verified"
+    );
+
+    let (updated, next, _) = applied(
+        service
+            .update(
+                &user("cmd-edit"),
+                ServiceScope::Project,
+                &id,
+                revision,
+                UpdateRequest {
+                    // The person rewrites the lesson to something the runtime
+                    // never observed.
+                    body: Some("依赖安装失败时改用 npm install".into()),
+                    title: None,
+                    value: None,
+                    tags: None,
+                    expires_at: None,
+                    subject: None,
+                },
+            )
+            .unwrap(),
+    );
+    assert_eq!(updated, id);
+    assert_eq!(next, revision + 1);
+    let after = active(&service);
+    let after = after.iter().find(|view| view.id == id).unwrap();
+    assert_eq!(
+        after.body, "依赖安装失败时改用 npm install",
+        "the user's text is what the record now says"
+    );
+    assert_eq!(
+        after.experience.as_ref().map(|e| e.standing.as_str()),
+        Some("observed"),
+        "new text cannot inherit the runtime's verification of the old text"
+    );
+    assert_eq!(
+        after.experience.as_ref().map(|e| e.evidence.len()),
+        Some(2),
+        "the runtime's evidence stays readable as audit of what was observed"
+    );
+}

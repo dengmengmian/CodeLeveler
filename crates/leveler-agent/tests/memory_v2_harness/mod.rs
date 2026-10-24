@@ -389,3 +389,52 @@ pub fn receipt(events: &[AgentEvent]) -> &AgentEvent {
     assert_eq!(hits.len(), 1, "expected exactly one MemoryRecalled");
     hits[0]
 }
+
+/// Write one runtime-verified experience under an explicit structured subject,
+/// so it shares a canonical identity with a user fact about the same topic.
+pub fn experience_about(
+    service: &MemoryService,
+    scope: ServiceScope,
+    subject_key: &str,
+    category: &str,
+    applies_when: &str,
+    body: &str,
+) -> String {
+    let mut candidate = candidate(
+        category,
+        body,
+        None,
+        leveler_memory::CandidateSource::RuntimeObserved,
+    );
+    candidate.semantic_key = Some(subject_key.to_string());
+    candidate.experience = Some(leveler_memory::ExperienceRecord {
+        category: leveler_memory::ExperienceCategory::RootCause,
+        verification: leveler_memory::ExperienceVerification::Verified,
+        applies_when: applies_when.into(),
+        invalid_if: None,
+        evidence: vec![
+            leveler_memory::ExperienceEvidence {
+                kind: "failure".into(),
+                reference: "failure-1".into(),
+            },
+            leveler_memory::ExperienceEvidence {
+                kind: "resolution".into(),
+                reference: "resolution-1".into(),
+            },
+        ],
+    });
+    let actor = leveler_memory::v2::Actor::Runtime {
+        task: leveler_core::TaskId::new("fixture-task"),
+    };
+    service
+        .admit_candidate(&actor, scope, &candidate, &unique("fixture-exp"))
+        .unwrap()
+        .applied_id()
+        .expect("experience must apply")
+        .to_string()
+}
+
+/// The canonical identity of a subject label, as the service computes it.
+pub fn subject_key(label: &str) -> String {
+    leveler_memory::semantic_key_of(&leveler_memory::normalize_subject(label))
+}

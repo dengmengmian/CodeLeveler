@@ -529,7 +529,7 @@ impl MemoryService {
         let service = self.markdown_service(scope)?;
         let index = self.fresh_index(scope)?;
         let hits = index
-            .search(query, limit.max(1).saturating_mul(4))
+            .search(query, limit.max(1).saturating_mul(4), lanes)
             .map_err(index_error)?;
         self.validated_hits(actor, scope, &service, &index, &hits, lanes, limit.max(1))
     }
@@ -942,6 +942,28 @@ impl MemoryService {
         expected_revision: u64,
         patch: UpdateRequest,
     ) -> Result<WriteOutcome, ServiceError> {
+        // Refuse the two payloads that cannot become a usable record, at the
+        // one business entrance every writer shares: a blank title makes the
+        // row unfindable for the person who wrote it, and a credential-shaped
+        // value must never reach Markdown (the store would reject it later as
+        // an opaque backend error; here it is the caller's mistake).
+        if let Some(title) = patch.title.as_deref() {
+            if title.trim().is_empty() {
+                return Err(ServiceError::Invalid("a memory needs a title".to_string()));
+            }
+            if crate::looks_like_secret(title) {
+                return Err(ServiceError::Invalid(
+                    "credential-like value in field: title".to_string(),
+                ));
+            }
+        }
+        if let Some(body) = patch.body.as_deref()
+            && crate::looks_like_secret(body)
+        {
+            return Err(ServiceError::Invalid(
+                "credential-like value in field: body".to_string(),
+            ));
+        }
         let service = self.markdown_service(scope)?;
         let id =
             v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
@@ -1222,7 +1244,14 @@ fn markdown_view(record: &v2::MemoryRecord, authority: v2::MemoryAuthority) -> M
             .experience
             .as_ref()
             .map(|experience| ExperienceView {
-                standing: if experience.has_resolution() {
+                // Verification is a claim about the text the runtime observed,
+                // so it needs both the evidence chain AND the runtime as the
+                // record's author. A record a person rewrote is still the same
+                // record (same id, same history, same evidence references),
+                // but its current text is not what the runtime proved.
+                standing: if authority == v2::MemoryAuthority::RuntimeObserved
+                    && experience.has_resolution()
+                {
                     "verified".into()
                 } else {
                     "observed".into()

@@ -1496,3 +1496,49 @@ LIMIT ?2;
 10. **Windows/网络文件系统**：rename/锁/fsync 语义需要在 Windows CI 和真实磁盘验证；网络 FS 不保证。跨文件系统提交没有全局原子性，只保证 journal 恢复与读者不观察半提交。
 11. **真实迁移未执行**：所有迁移结论在 Stage 4 的隔离副本上验证后才可用于真实数据。
 12. **瞬态重复 active**：多文件 supersede 在 crash/外部观察窗口内可能出现新旧同时 active；服务读者持锁不可见，恢复后解决。外部工具直接读目录时必须检查 journal 或接受该瞬态。
+
+---
+
+## 15. Stage 5 语义确认（编辑、跨 Kind 优先级、遗忘）
+
+本节只固化本轮确认的语义，不引入新机制。所有判定都基于结构化事实（`authority`、`kind`、`subject_key`、`revision`、`status`、FTS5 词法命中），不含同义词表、停用词表、相似度阈值或 LLM Judge。
+
+### 15.1 用户编辑的字段边界
+
+`/memory` 编辑页只提交 `title` 与 `body`，通过 `ClientCommand::UpdateMemory` → `MemoryService::update` 写入：
+
+- 用户可改：`title`、`body`。
+- Runtime 拥有、页面不可改：`id`、`kind`、`scope`、`authority`、`status`、`revision`、`pinned`、`source_refs`、`experience`（`applies_when`/`invalid_if`/`environment`/`evidence`）、`expires_at`、`subject_key`。
+- 空标题与凭据形态文本在 service 入口拒绝（`ServiceError::Invalid`），不产生 revision，不落盘。
+- 提交必须携带打开时的 `revision`；不匹配是冲突，不是覆盖。
+
+**编辑后的 authority**：写入者是可信用户命令，因此新 revision 的 authority 由 `Caller::UserCommand` 决定（UserFact → `user_explicit`）。这不是“提权”，而是事实：这段文字现在是用户自己写的。
+
+### 15.2 Experience 的验证立场不随正文继承
+
+`experience.standing = verified` 表达的是“运行时观察到 failure → resolution，且这条记录的文字就是当时观察对象”。因此它需要**同时**满足：
+
+1. `experience.evidence` 具备 failure→resolution 链（`has_resolution()`）；
+2. 当前 revision 的 `authority` 仍是 `runtime_observed`（即记录文字仍由 Runtime 写入）。
+
+用户改写正文或标题后，第 2 条不再成立，`standing` 降级为 `observed`；`evidence` 引用与历史 revision 保留（审计可得），但当前文字不再宣称已被运行时验证。重新验证的路径是新的 runtime 观察产生新 revision，而不是编辑旧文字。这是 presentation truth 的收紧：修复前，用户改写正文后仍显示 `verified`，等于让未被观察的文字继承运行时的证明。
+
+### 15.3 跨 Kind 的执行适用性
+
+User Fact 与 Experience 可以共存于同一个 `subject_key`——数据模型正确，历史应当保留。但**注入**时不能平权：
+
+- 身份匹配只允许精确 `subject_key` 相等（结构化身份），不比较文本相似度。
+- 当某个 `subject_key` 已被 standing（用户确认/固定的事实）或候选 UserFact 占用时，同 key 的 Experience 不进入 `### Recalled experience` 段落；它被计入 omission `conflict`，记录仍在库里、仍可 `memory.read`、仍可审计。
+- 不同 `subject_key` 的 Experience 不受影响：保留不确定性，让主模型按 `applies when` 自行判断。
+- 结构上，Experience 永远不会进入 `### Standing user constraints`：`standing_rows` 的 SQL 已限定 `kind = 'user_fact'`，`authority` 层级也不足以让 Experience 变成用户约束。
+
+优先级次序（由结构决定，不由时间或模型声明决定）：当前用户消息 > standing 用户约束（`user_explicit`/`user_approved`/`user_stated`/用户 pin）> 适用的候选用户事实 > 适用且未被用户决定遮蔽的 Experience。
+
+### 15.4 遗忘与退休是两个操作
+
+| 操作 | 语义 | 正文 | 历史 revision | 索引 | 可恢复 |
+| --- | --- | --- | --- | --- | --- |
+| Deprecate（退休） | 退出当前有效集合 | 保留 | 保留 | 移除召回 | 保留历史，可读 |
+| Forget（遗忘） | 删除受管正文副本 | 删除 | 删除 | 删除 | 否，仅 tombstone |
+
+因此 TUI 与 CLI 的文案必须区分：`d` 是“标记为过期（保留历史）”，`f` 是“彻底遗忘（删除正文，保留最小墓碑）”。把 Forget 描述成“归档/archive”会让用户以为正文还在。重建索引、重启、Resume、Compaction 都不得让 Tombstone 覆盖的正文复活。

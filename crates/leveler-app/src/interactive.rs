@@ -4895,6 +4895,17 @@ impl InProcessRuntimeClient {
                 self.deprecate_memory(session_id, scope, id, revision, Some(origin))
                     .await
             }
+            ClientCommand::UpdateMemory {
+                session_id,
+                scope,
+                id,
+                revision,
+                title,
+                body,
+            } => {
+                self.update_memory(session_id, scope, id, revision, title, body, Some(origin))
+                    .await
+            }
             command => self.send(command).await,
         }
     }
@@ -5010,6 +5021,69 @@ impl InProcessRuntimeClient {
                 let _ = events.send(RuntimeEvent::Notification {
                     level: leveler_client_protocol::NotificationLevel::Warning,
                     message: format!("deprecate failed [{id}]: {error}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite one record from the user's own /memory page.
+    ///
+    /// The command carries the revision the page opened, so a record another
+    /// process changed in the meantime is a conflict the user must resolve —
+    /// never a silent overwrite. The invocation is minted from the user's
+    /// command id: the model has no path to this handler.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_memory(
+        &self,
+        session_id: SessionId,
+        scope: leveler_client_protocol::UiMemoryScope,
+        id: String,
+        revision: u64,
+        title: String,
+        body: String,
+        origin: Option<&CommandId>,
+    ) -> Result<(), ClientError> {
+        let events = self.events_for(&session_id);
+        let invocation = Self::memory_invocation("ui:update", &session_id, origin);
+        let actor = leveler_memory::v2::Actor::User { invocation };
+        let request = leveler_memory::UpdateRequest {
+            title: Some(title),
+            body: Some(body),
+            value: None,
+            tags: None,
+            expires_at: None,
+            subject: None,
+        };
+        match self.app.memory_service().update(
+            &actor,
+            service_memory_scope(scope),
+            &id,
+            revision,
+            request,
+        ) {
+            Ok(outcome) => {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: format!("已更新记忆 [{id}]: {}", outcome_title(&outcome)),
+                });
+            }
+            Err(error) => {
+                // A conflict is a specific, actionable answer: the record is
+                // at a newer revision and the caller's text was NOT written.
+                // The message says which, so the page can keep the edit.
+                let message = match &error {
+                    leveler_memory::ServiceError::Conflict(_) => {
+                        format!("update conflict [{id}]: {error}")
+                    }
+                    leveler_memory::ServiceError::NotCurrent(_) => {
+                        format!("update rejected [{id}]: {error}")
+                    }
+                    _ => format!("update failed [{id}]: {error}"),
+                };
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    message,
                 });
             }
         }
@@ -5579,6 +5653,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 revision,
             } => {
                 self.deprecate_memory(session_id, scope, id, revision, None)
+                    .await
+            }
+            ClientCommand::UpdateMemory {
+                session_id,
+                scope,
+                id,
+                revision,
+                title,
+                body,
+            } => {
+                self.update_memory(session_id, scope, id, revision, title, body, None)
                     .await
             }
             ClientCommand::RequestDiff {

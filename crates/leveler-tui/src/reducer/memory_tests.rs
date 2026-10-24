@@ -1014,3 +1014,350 @@ fn a_recall_names_the_records_the_turn_used_and_drops_forgotten_ones() {
     let text = format!("{:?}", s.transcript.items());
     assert!(!text.contains("已被遗忘的旧约定"), "{text}");
 }
+
+// ----- the editor ---------------------------------------------------------
+
+fn open_editor(s: &mut AppState) {
+    open_active(s);
+    key(s, KeyCode::Enter);
+    assert_eq!(s.memory.view, MemoryView::Detail);
+    key(s, KeyCode::Char('e'));
+    assert_eq!(
+        s.memory.view,
+        MemoryView::Edit,
+        "the detail page must offer the editor"
+    );
+}
+
+fn ctrl(s: &mut AppState, character: char) -> Vec<Effect> {
+    reduce(
+        s,
+        Action::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::CONTROL,
+        )),
+    )
+}
+
+fn typed(s: &mut AppState, text: &str) {
+    for character in text.chars() {
+        key(s, KeyCode::Char(character));
+    }
+}
+
+#[test]
+fn the_editor_opens_with_the_record_text_and_writes_only_on_save() {
+    let mut s = state();
+    open_editor(&mut s);
+    let editor = s.memory.editor.as_ref().expect("an open editor");
+    assert_eq!(editor.title_text(), "构建使用 cargo");
+    assert_eq!(editor.body_text(), "构建使用 cargo 的正文");
+    assert!(
+        !editor.is_dirty(),
+        "opening the editor is not an edit: nothing is dirty until typing"
+    );
+
+    // A no-op save must not write a pointless revision.
+    assert!(ctrl(&mut s, 's').is_empty());
+}
+
+#[test]
+fn a_title_edit_sends_the_opened_revision_and_the_whole_text() {
+    let mut s = state();
+    open_editor(&mut s);
+    // The title buffer starts with the cursor at the end of the stored title.
+    typed(&mut s, " 优先");
+
+    let effects = ctrl(&mut s, 's');
+    let commands = sent_commands(&effects);
+    assert!(
+        matches!(
+            commands.first(),
+            Some(ClientCommand::UpdateMemory { id, revision, title, body, .. })
+                if id == "mem-build"
+                    && *revision == 2
+                    && title == "构建使用 cargo 优先"
+                    && body == "构建使用 cargo 的正文"
+        ),
+        "the submit must carry the revision it opened and both fields: {commands:?}"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, ClientCommand::ListMemory { .. })),
+        "the refresh follows the runtime's receipt, not the keypress: {commands:?}"
+    );
+}
+
+#[test]
+fn the_body_keeps_markdown_newlines_and_wide_text() {
+    let mut s = state();
+    open_editor(&mut s);
+    key(&mut s, KeyCode::Tab);
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().field,
+        crate::memory::EditField::Body
+    );
+    // Clear the body, then type a multi-line document with a code block.
+    for _ in 0.."构建使用 cargo 的正文".chars().count() {
+        key(&mut s, KeyCode::Backspace);
+    }
+    typed(&mut s, "第一行");
+    key(&mut s, KeyCode::Enter);
+    typed(&mut s, "```sh");
+    key(&mut s, KeyCode::Enter);
+    typed(&mut s, "cargo test");
+    key(&mut s, KeyCode::Enter);
+    typed(&mut s, "```");
+
+    let effects = ctrl(&mut s, 's');
+    let commands = sent_commands(&effects);
+    let expected = "第一行\n```sh\ncargo test\n```";
+    assert!(
+        matches!(
+            commands.first(),
+            Some(ClientCommand::UpdateMemory { body, .. }) if body == expected
+        ),
+        "a Markdown body must be sent verbatim: {commands:?}"
+    );
+}
+
+#[test]
+fn a_burst_paste_lands_in_the_focused_buffer_not_the_composer() {
+    let mut s = state();
+    open_editor(&mut s);
+    let paste = "粘贴的第一段\n粘贴的第二段";
+    reduce(&mut s, Action::Paste(paste.into()));
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().title_text(),
+        format!("构建使用 cargo{paste}")
+    );
+    assert!(
+        s.composer.is_empty(),
+        "the conversation composer must not receive an edit meant for memory"
+    );
+
+    // Coalesced typing (no bracketed paste) takes the same path.
+    reduce(&mut s, Action::TextInput(" 打字".into()));
+    assert!(
+        s.memory
+            .editor
+            .as_ref()
+            .unwrap()
+            .title_text()
+            .ends_with(" 打字")
+    );
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn esc_keeps_unsent_text_until_the_second_press() {
+    let mut s = state();
+    open_editor(&mut s);
+    typed(&mut s, "改");
+
+    assert!(key(&mut s, KeyCode::Esc).is_empty());
+    assert_eq!(s.memory.view, MemoryView::Edit, "one Esc must not discard");
+    assert!(s.memory.editor.as_ref().unwrap().confirm_discard);
+
+    key(&mut s, KeyCode::Esc);
+    assert_eq!(s.memory.view, MemoryView::Detail);
+    assert!(s.memory.editor.is_none(), "the second Esc discards");
+}
+
+#[test]
+fn an_unchanged_editor_leaves_on_one_esc() {
+    let mut s = state();
+    open_editor(&mut s);
+    key(&mut s, KeyCode::Esc);
+    assert_eq!(s.memory.view, MemoryView::Detail);
+}
+
+#[test]
+fn a_blank_title_is_refused_before_it_reaches_the_runtime() {
+    let mut s = state();
+    open_editor(&mut s);
+    for _ in 0.."构建使用 cargo".chars().count() {
+        key(&mut s, KeyCode::Backspace);
+    }
+    let effects = ctrl(&mut s, 's');
+    assert!(effects.is_empty(), "a nameless memory must not be written");
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().status,
+        crate::memory::EditStatus::Failed
+    );
+}
+
+#[test]
+fn a_receipt_settles_the_editor_and_only_then_is_the_listing_asked() {
+    let mut s = state();
+    open_editor(&mut s);
+    typed(&mut s, " 优先");
+    ctrl(&mut s, 's');
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().status,
+        crate::memory::EditStatus::Submitting
+    );
+
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "已更新记忆 [mem-build]: update".into(),
+        }),
+    );
+    assert!(
+        s.memory.editor.is_none(),
+        "a successful write closes the editor"
+    );
+    assert_eq!(s.memory.view, MemoryView::Detail);
+    assert!(
+        list_query(&effects).is_some(),
+        "the page must repaint from the store: {effects:?}"
+    );
+}
+
+#[test]
+fn a_refused_save_keeps_the_user_text_and_names_the_new_revision() {
+    let mut s = state();
+    open_editor(&mut s);
+    typed(&mut s, " 优先");
+    ctrl(&mut s, 's');
+
+    // Another process wrote revision 3 in the meantime: the runtime refuses.
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Warning,
+            message: "update conflict [mem-build]: memory conflict: current revision 3, expected 2"
+                .into(),
+        }),
+    );
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().status,
+        crate::memory::EditStatus::Failed
+    );
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().title_text(),
+        "构建使用 cargo 优先",
+        "a refused save must not lose what was typed"
+    );
+
+    // The proving listing says the record really moved.
+    let query = list_query(&effects).expect("a refusal still refreshes");
+    let mut moved = entry_in(
+        leveler_client_protocol::UiMemoryScope::Project,
+        "mem-build",
+        "构建使用 cargo",
+        leveler_client_protocol::UiMemoryKind::Preference,
+    );
+    moved.revision = Some(3);
+    reduce(
+        &mut s,
+        Action::Runtime(list(Some(query), vec![moved], vec![], vec![])),
+    );
+
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().status,
+        crate::memory::EditStatus::Conflict { current: Some(3) },
+        "a conflict is concluded from the store's revision, never assumed"
+    );
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().title_text(),
+        "构建使用 cargo 优先"
+    );
+}
+
+#[test]
+fn reloading_the_current_version_needs_two_presses() {
+    let mut s = state();
+    open_editor(&mut s);
+    typed(&mut s, " 优先");
+    ctrl(&mut s, 's');
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Warning,
+            message: "update conflict [mem-build]".into(),
+        }),
+    );
+    let query = list_query(&effects).expect("a refusal still refreshes");
+    let mut moved = entry_in(
+        leveler_client_protocol::UiMemoryScope::Project,
+        "mem-build",
+        "构建改用 cargo",
+        leveler_client_protocol::UiMemoryKind::Preference,
+    );
+    moved.revision = Some(3);
+    reduce(
+        &mut s,
+        Action::Runtime(list(Some(query), vec![moved], vec![], vec![])),
+    );
+    assert!(matches!(
+        s.memory.editor.as_ref().unwrap().status,
+        crate::memory::EditStatus::Conflict { .. }
+    ));
+
+    ctrl(&mut s, 'r');
+    assert!(
+        s.memory.editor.as_ref().unwrap().confirm_reload,
+        "the first press only asks"
+    );
+    ctrl(&mut s, 'r');
+    let editor = s.memory.editor.as_ref().unwrap();
+    assert_eq!(editor.title_text(), "构建改用 cargo");
+    assert_eq!(editor.revision, 3);
+    assert_eq!(editor.status, crate::memory::EditStatus::Editing);
+}
+
+#[test]
+fn a_saved_edit_is_what_the_next_open_shows() {
+    let mut s = state();
+    open_editor(&mut s);
+    typed(&mut s, " 优先");
+    ctrl(&mut s, 's');
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "已更新记忆 [mem-build]".into(),
+        }),
+    );
+    let query = list_query(&effects).expect("a success refreshes");
+    // The store's answer, with the new revision and the new title.
+    let mut updated = entry_in(
+        leveler_client_protocol::UiMemoryScope::Project,
+        "mem-build",
+        "构建使用 cargo 优先",
+        leveler_client_protocol::UiMemoryKind::Preference,
+    );
+    updated.revision = Some(3);
+    reduce(
+        &mut s,
+        Action::Runtime(list(Some(query), vec![updated], vec![], vec![])),
+    );
+
+    key(&mut s, KeyCode::Esc);
+    key(&mut s, KeyCode::Enter);
+    key(&mut s, KeyCode::Char('e'));
+    let editor = s.memory.editor.as_ref().unwrap();
+    assert_eq!(editor.title_text(), "构建使用 cargo 优先");
+    assert_eq!(
+        editor.revision, 3,
+        "a reopened record edits the revision the store returned"
+    );
+}
+
+#[test]
+fn editing_is_not_a_list_shortcut() {
+    let mut s = state();
+    open_editor(&mut s);
+    // `d`, `f`, `p` are letters in a buffer, not lifecycle actions.
+    typed(&mut s, "dfp");
+    assert!(s.memory.confirm.is_none());
+    assert!(s.memory.editor.is_some());
+    assert_eq!(
+        s.memory.editor.as_ref().unwrap().title_text(),
+        "构建使用 cargodfp"
+    );
+}

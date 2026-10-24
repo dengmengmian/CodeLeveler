@@ -239,6 +239,7 @@ impl RemotePolicy {
             // Pin is a standing constraint and Deprecate changes what the model
             // may rely on: both are user decisions, made where the user is.
             | ClientCommand::SetMemoryPin { .. }
+            | ClientCommand::UpdateMemory { .. }
             | ClientCommand::DeprecateMemory { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
                 reason: "memory is not reachable remotely",

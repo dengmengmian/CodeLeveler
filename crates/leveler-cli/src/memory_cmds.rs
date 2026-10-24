@@ -151,7 +151,14 @@ fn report_outcome(outcome: WriteOutcome) -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
         WriteOutcome::Forgotten { id, title } => {
-            println!("{}", Line::ok(&format!("archived [{id}]: {title}")));
+            // A forget is content destruction: the body, its history and its
+            // index rows are gone and only a tombstone remains. Saying
+            // "archived" here would tell the user the opposite of what
+            // happened.
+            println!(
+                "{}",
+                Line::ok(&format!("forgotten for good [{id}]: {title}"))
+            );
             std::process::ExitCode::SUCCESS
         }
     }
@@ -486,7 +493,10 @@ pub(crate) fn cmd_memory(
                     } else {
                         title.as_str()
                     };
-                    println!("{}", Line::ok(&format!("archived [{id}]: {title}")));
+                    println!(
+                        "{}",
+                        Line::ok(&format!("forgotten for good [{id}]: {title}"))
+                    );
                     Ok(std::process::ExitCode::SUCCESS)
                 }
                 Ok(outcome) => Ok(report_outcome(outcome)),

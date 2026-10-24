@@ -477,12 +477,17 @@ pub enum TrustCommand {
 /// Project memory commands (`~/.leveler/projects/<repo>/memory/`).
 ///
 /// Agent `remember`/`forget` still require interactive approval (K36). These
-/// CLI commands are user-authoritative: the human is writing/archiving.
+/// CLI commands are user-authoritative: the human is writing the record.
+///
+/// `forget` is content destruction, not retirement: it deletes the record, its
+/// revisions and its index rows and keeps a minimal tombstone. `deprecate`
+/// (the retirement that keeps history) has no CLI verb yet — the TUI offers it
+/// on the `/memory` page.
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
     /// List active memories.
     List {
-        /// Also list archived (forgotten) entries.
+        /// Also list historical (deprecated or superseded) entries.
         #[arg(long)]
         archived: bool,
     },
@@ -500,12 +505,14 @@ pub enum MemoryCommand {
     Show {
         /// Memory id.
         id: String,
-        /// Read the archived (historical) record instead of the active one.
-        /// Sensitive content stays withheld; use `restore` to make it current.
+        /// Read the historical record instead of the active one.
+        /// Sensitive content stays withheld.
         #[arg(long)]
         archived: bool,
     },
-    /// Archive (soft-delete) an active memory by id.
+    /// Forget one active memory for good: the text, its revisions and its
+    /// index rows are deleted, only a tombstone remains. Not the same as
+    /// retiring a record and keeping its history.
     Forget {
         /// Memory id.
         id: String,

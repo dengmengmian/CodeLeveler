@@ -352,27 +352,48 @@ impl MemoryIndex {
         result
     }
 
-    /// Lexical candidates ordered by bm25.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<IndexHit>, IndexError> {
+    /// Lexical candidates ordered by bm25, restricted to the lanes that asked.
+    ///
+    /// The lane filter belongs in the query: ranking every current record and
+    /// discarding the other lane's rows afterwards pays bm25 for candidates the
+    /// caller can never use. `MemoryLanes::ALL` ranks both lanes together, so a
+    /// dual-lane turn still resolves one shared ranking; a single-lane turn only
+    /// pays for its own rows.
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        lanes: crate::MemoryLanes,
+    ) -> Result<Vec<IndexHit>, IndexError> {
         let terms = query_terms(query);
-        if terms.is_empty() || limit == 0 {
+        if terms.is_empty() || limit == 0 || !lanes.any() {
             return Ok(Vec::new());
         }
+        let kind = match (lanes.user, lanes.experience) {
+            (true, true) => None,
+            (true, false) => Some("user_fact"),
+            (false, true) => Some("experience"),
+            (false, false) => None,
+        };
         let expression = terms
             .iter()
             .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
         let conn = self.lock();
+        // `?2` is the lane's kind, or NULL for both lanes. The predicate is
+        // evaluated before the sort, so a single-lane query never computes bm25
+        // for the other lane's rows.
         let mut statement = conn.prepare(
             "SELECT documents.id, bm25(documents_fts, 3.0, 2.0, 1.0, 1.5) AS rank
              FROM documents_fts
              JOIN documents ON documents.rowid = documents_fts.rowid
              WHERE documents_fts MATCH ?1
+               AND (?2 IS NULL OR documents.kind = ?2)
              ORDER BY rank
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![expression, limit as i64], |row| {
+        let rows = statement.query_map(params![expression, kind, limit as i64], |row| {
             let id: String = row.get(0)?;
             let rank: f64 = row.get(1)?;
             Ok(IndexHit { id, score: -rank })
