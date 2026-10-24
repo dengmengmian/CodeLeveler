@@ -105,7 +105,7 @@ fn retrying_the_same_operation_is_idempotent_and_reuse_is_rejected() {
     );
     let error = store
         .admit(AdmitRequest {
-            op_id: op_id,
+            op_id,
             caller,
             intent: different,
             expected: None,
@@ -138,7 +138,7 @@ fn explicit_supersede_retires_the_target_and_keeps_it_in_history() {
                 op(),
                 user(),
                 new_record_for(&replacement),
-                &[old_id.clone()],
+                std::slice::from_ref(&old_id),
             )
             .unwrap(),
     );
@@ -180,7 +180,7 @@ fn superseded_attic_points_at_the_replacement_that_became_current() {
                 op(),
                 user(),
                 new_record_for(&replacement),
-                &[old_id.clone()],
+                std::slice::from_ref(&old_id),
             )
             .unwrap(),
     );

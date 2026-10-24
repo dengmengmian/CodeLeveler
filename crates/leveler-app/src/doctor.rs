@@ -220,7 +220,7 @@ fn memory_check(service: &leveler_memory::MemoryService) -> CheckResult {
     if !errors.is_empty() {
         return CheckResult::warn("memory", errors.join("; "));
     }
-    let detail = format!("{}", parts.join("; "));
+    let detail = parts.join("; ").to_string();
     if blocking > 0 {
         CheckResult::warn("memory", format!("{detail}; {blocking} blocking issue(s)"))
     } else {

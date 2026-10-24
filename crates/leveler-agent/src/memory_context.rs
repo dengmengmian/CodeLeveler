@@ -248,11 +248,11 @@ impl MemoryContextBuilder {
                         for row in rows {
                             // A catalog title is a fact. Validate the derived
                             // row against Markdown trust before caching it.
-                            match self
-                                .service
-                                .read_injectable(&v2::Actor::External, scope, &row.id)
+                            if let Ok(view) =
+                                self.service
+                                    .read_injectable(&v2::Actor::External, scope, &row.id)
                             {
-                                Ok(view) => all.push(SnapshotEntry {
+                                all.push(SnapshotEntry {
                                     scope,
                                     id: view.id,
                                     revision: view.revision.unwrap_or(row.revision),
@@ -261,8 +261,7 @@ impl MemoryContextBuilder {
                                     pinned_by_user: view.pinned_by_user,
                                     authority: view.authority,
                                     updated_at: view.updated_at.unwrap_or(row.updated_at),
-                                }),
-                                Err(_) => {}
+                                })
                             }
                         }
                     }
@@ -434,7 +433,7 @@ impl MemoryContextBuilder {
                 let Some(key) = entry.view.subject_key.as_deref() else {
                     return true;
                 };
-                !decided.binary_search(&key).is_ok()
+                decided.binary_search(&key).is_err()
             });
             let shadowed = before - experience.len();
             if shadowed > 0 {

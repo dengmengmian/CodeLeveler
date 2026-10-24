@@ -783,7 +783,7 @@ fn verification_output_lines(preview: &str) -> Option<String> {
         let cleaned = strip_ansi(raw);
         let line = cleaned.trim();
         let chars = line.chars().count();
-        if chars < 4 || chars > 200 {
+        if !(4..=200).contains(&chars) {
             continue;
         }
         if looks_like_secret(line) || looks_like_instruction(line) {

@@ -125,32 +125,6 @@ fn body_of(service: &MemoryService, id: &str) -> String {
         .body
 }
 
-/// The same service the executor will use, opened up front so a test can seed
-/// a fact before the run.
-fn executor_with_service(runtime: Arc<CaptureRuntime>, service: Arc<MemoryService>) -> Executor {
-    let workspace_dir = std::env::temp_dir();
-    let workspace = Workspace::new(&workspace_dir).unwrap();
-    let tool_context = ToolContext::with_environment(
-        workspace,
-        PermissionProfile::Assisted,
-        Arc::new(leveler_core::EnvSnapshot::new(
-            std::env::vars_os(),
-            std::env::current_dir().unwrap_or_default(),
-            std::env::temp_dir(),
-        )),
-    );
-    Executor::new(
-        runtime,
-        Arc::new(leveler_tools::default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_memory_expose(true)
-    .with_memory_service(Some(service))
-    .with_approver(Arc::new(AutoApprove))
-}
-
 /// An executor with memory exposed and pointed at `mem`; everything else is the
 /// production default surface.
 fn executor(

@@ -329,7 +329,7 @@ async fn wait_for_experience_inbox_settled(app: &Application) {
 
 #[tokio::test]
 async fn a_completed_task_with_a_verified_resolution_stores_a_verified_experience() {
-    let (tmp, server, app) = harness(vec![
+    let (_tmp, server, app) = harness(vec![
         tool_call("c-fail", "run_command", check_marker()),
         tool_call("c-fix", "write_file", write_marker()),
         tool_call("c-pass", "run_command", check_marker()),
@@ -385,7 +385,7 @@ async fn a_completed_task_with_a_verified_resolution_stores_a_verified_experienc
 /// `update_goal(complete)` and its mechanical verification gate.
 #[tokio::test]
 async fn a_goal_turn_also_extracts_an_experience() {
-    let (tmp, _server, app) = harness(vec![
+    let (_tmp, _server, app) = harness(vec![
         tool_call("c-fail", "run_command", check_marker()),
         tool_call("c-fix", "write_file", write_marker()),
         tool_call("c-pass", "run_command", check_marker()),
@@ -418,7 +418,7 @@ async fn a_goal_turn_also_extracts_an_experience() {
 
 #[tokio::test]
 async fn an_ordinary_task_does_not_pay_for_an_experience_extraction_call() {
-    let (tmp, _server, app) = harness(vec![
+    let (_tmp, _server, app) = harness(vec![
         tool_call(
             "c-ok",
             "run_command",
@@ -465,7 +465,7 @@ async fn an_ordinary_task_does_not_pay_for_an_experience_extraction_call() {
 /// read; the identity is the exact invocation.
 #[tokio::test]
 async fn a_silent_verification_command_can_produce_a_verified_constraint() {
-    let (tmp, _server, app) = harness(vec![
+    let (_tmp, _server, app) = harness(vec![
         tool_call(
             "c-fail",
             "run_command",
@@ -510,7 +510,7 @@ async fn a_silent_verification_command_can_produce_a_verified_constraint() {
 /// still never read as a verified fix.
 #[tokio::test]
 async fn an_observation_only_lesson_is_current_as_observed_not_verified() {
-    let (tmp, _server, app) = harness(vec![
+    let (_tmp, _server, app) = harness(vec![
         tool_call("c-fail", "run_command", failing_cargo_test()),
         text("the workspace has no Cargo.toml"),
         unverified_lesson(),
@@ -542,7 +542,7 @@ async fn an_observation_only_lesson_is_current_as_observed_not_verified() {
 
 #[tokio::test]
 async fn new_evidence_updates_the_previous_experience_instead_of_duplicating_it() {
-    let (tmp, _server, app) = harness(vec![
+    let (_tmp, _server, app) = harness(vec![
         tool_call("c-fail", "run_command", check_marker()),
         tool_call("c-fix", "write_file", write_marker()),
         tool_call("c-pass", "run_command", check_marker()),
@@ -734,7 +734,7 @@ async fn a_changed_environment_supersedes_the_stale_experience_and_recalls_only_
 
 #[tokio::test]
 async fn a_lesson_never_replaces_a_user_decision_on_the_same_subject() {
-    let (tmp, _server, app) = harness(vec![
+    let (_tmp, _server, app) = harness(vec![
         tool_call("c-fail", "run_command", check_marker()),
         tool_call("c-fix", "write_file", write_marker()),
         tool_call("c-pass", "run_command", check_marker()),

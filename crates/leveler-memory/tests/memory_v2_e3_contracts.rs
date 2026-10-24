@@ -160,7 +160,7 @@ fn u3_a_correction_naming_a_keyless_memory_removes_it_from_current_truth() {
                 op(),
                 user(),
                 new_record_for(&replacement),
-                &[old_id.clone()],
+                std::slice::from_ref(&old_id),
             )
             .unwrap(),
     );

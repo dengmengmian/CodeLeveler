@@ -139,9 +139,10 @@ async fn list(
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
             Ok(Ok(event @ RuntimeEvent::MemoryList { .. })) => return event,
-            Ok(Ok(RuntimeEvent::Notification { level, message }))
-                if level == NotificationLevel::Warning =>
-            {
+            Ok(Ok(RuntimeEvent::Notification {
+                level: NotificationLevel::Warning,
+                message,
+            })) => {
                 panic!("listing failed: {message}")
             }
             Ok(Ok(_)) => continue,

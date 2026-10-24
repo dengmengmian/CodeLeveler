@@ -560,18 +560,17 @@ impl MemoryRecord {
                 return Some("source_refs");
             }
         }
-        if let Some(proposal) = &fm.proposal {
-            if crate::looks_like_secret(&proposal.reason)
+        if let Some(proposal) = &fm.proposal
+            && (crate::looks_like_secret(&proposal.reason)
                 || proposal
                     .target_ids
                     .iter()
-                    .any(|target| crate::looks_like_secret(target))
-            {
-                return Some("proposal");
-            }
+                    .any(|target| crate::looks_like_secret(target)))
+        {
+            return Some("proposal");
         }
-        if let Some(experience) = &fm.experience {
-            if crate::looks_like_secret(&experience.category)
+        if let Some(experience) = &fm.experience
+            && (crate::looks_like_secret(&experience.category)
                 || crate::looks_like_secret(&experience.applies_when)
                 || experience
                     .invalid_if
@@ -581,10 +580,9 @@ impl MemoryRecord {
                     .evidence
                     .iter()
                     .any(|e| crate::looks_like_secret(&e.reference))
-                || mapping_has_secret(&experience.environment)
-            {
-                return Some("experience");
-            }
+                || mapping_has_secret(&experience.environment))
+        {
+            return Some("experience");
         }
         if mapping_has_secret(&fm.extra) {
             return Some("extra");
@@ -663,10 +661,10 @@ impl Frontmatter {
             return Err(DocumentError::UnexpectedPinOwner);
         }
         for source in &self.source_refs {
-            if let Some(span) = &source.evidence_span {
-                if span.chars().count() > MAX_EVIDENCE_SPAN_CHARS {
-                    return Err(DocumentError::EvidenceTooLong);
-                }
+            if let Some(span) = &source.evidence_span
+                && span.chars().count() > MAX_EVIDENCE_SPAN_CHARS
+            {
+                return Err(DocumentError::EvidenceTooLong);
             }
         }
         Ok(())
