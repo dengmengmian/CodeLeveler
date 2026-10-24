@@ -401,6 +401,7 @@ pub(crate) fn prepare_sandbox_paths(
     environment: &leveler_core::EnvSnapshot,
     workspace: &Path,
     read_host_caches: bool,
+    verification: bool,
 ) -> std::io::Result<SandboxPaths> {
     let workspace_raw = workspace;
     let workspace = workspace
@@ -488,6 +489,21 @@ pub(crate) fn prepare_sandbox_paths(
             &tool_cache,
             Path::new(relative),
         )?);
+    }
+    // A verification check writes its build output and its input receipt
+    // here. Granted to verification checks only: another confined command must
+    // not be able to plant artifacts a later check would read as its own.
+    if verification {
+        for name in [
+            crate::command::verify_source::VERIFY_TARGET,
+            crate::command::verify_source::VERIFY_STATE,
+        ] {
+            cache_write_roots.push(ensure_real_private_chain(
+                &tool_cache_dir,
+                &tool_cache,
+                Path::new(name),
+            )?);
+        }
     }
     let cargo_home = prepare_cargo_home(
         environment,
@@ -1332,7 +1348,7 @@ mod tests {
             std::path::PathBuf::new(),
             std::env::temp_dir(),
         );
-        let paths = prepare_sandbox_paths(&env, &ws, false).expect("prepare paths");
+        let paths = prepare_sandbox_paths(&env, &ws, false, false).expect("prepare paths");
         (home, workspace, paths)
     }
 
@@ -1398,7 +1414,7 @@ mod tests {
             std::env::temp_dir(),
         );
         let ws = workspace.path().join("ws");
-        let second = prepare_sandbox_paths(&env, &ws, false).expect("prepare paths");
+        let second = prepare_sandbox_paths(&env, &ws, false, false).expect("prepare paths");
         assert_ne!(first.scratch_path(), second.scratch_path());
         assert_eq!(first.cargo_home, second.cargo_home);
         assert!(!first.cargo_home.starts_with(first.scratch_path()));
@@ -1410,8 +1426,8 @@ mod tests {
         );
         drop(first);
         let (third, fourth) = (
-            prepare_sandbox_paths(&env, &ws, true).expect("prepare paths"),
-            prepare_sandbox_paths(&env, &ws, true).expect("prepare paths"),
+            prepare_sandbox_paths(&env, &ws, true, false).expect("prepare paths"),
+            prepare_sandbox_paths(&env, &ws, true, false).expect("prepare paths"),
         );
         assert_eq!(third.cargo_home, fourth.cargo_home);
         assert_eq!(
@@ -1452,7 +1468,7 @@ mod tests {
             std::path::PathBuf::new(),
             std::env::temp_dir(),
         );
-        let paths = prepare_sandbox_paths(&env, &ws, false).expect("prepare paths");
+        let paths = prepare_sandbox_paths(&env, &ws, false, false).expect("prepare paths");
 
         assert_eq!(
             before,
