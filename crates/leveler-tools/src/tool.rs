@@ -568,6 +568,19 @@ impl ToolContext {
         self.policy.max_files_per_step = max_files_per_step;
         self
     }
+
+    /// Bound the model-facing size of each result in THIS batch.
+    ///
+    /// The static per-model ceiling says how large one result may be. When
+    /// the remaining room to the hard context capacity is smaller than that,
+    /// the caller passes the smaller figure here so a single result cannot
+    /// crowd the task anchor and the evidence out of the window. This is a
+    /// mechanical budget, not a permission: it never widens what a tool may
+    /// do, only how much of its output is shown inline.
+    pub fn with_tool_output_budget(mut self, budget: usize) -> Self {
+        self.policy.tool_output_budget = budget;
+        self
+    }
 }
 
 /// The result of a tool invocation. `is_error` tells the agent loop to present

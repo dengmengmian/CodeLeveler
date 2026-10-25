@@ -81,11 +81,36 @@ pub fn is_observe_class_tool(name: &str) -> bool {
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Where a result larger than the per-call budget is saved before its
+    /// preview is bounded. `None` keeps the old truncation-with-marker
+    /// behavior: the content is gone, and the marker says so.
+    ///
+    /// The store belongs to the registry, not to `ToolContext`: it is a
+    /// capability the host composes ONCE for the whole surface (like the
+    /// language server and the browser), not per-call authority. Tools that
+    /// already own a store (`run_command`) keep spilling on their own.
+    artifact_store: Option<Arc<leveler_execution::ArtifactStore>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Save oversized results to `store` instead of dropping their middle.
+    /// Subsets inherit the store: narrowing the tool surface must not silently
+    /// change what happens to a result that is still too large.
+    pub fn with_artifact_store(mut self, store: Arc<leveler_execution::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    /// An empty registry that keeps this one's host capabilities.
+    fn empty_like(&self) -> ToolRegistry {
+        ToolRegistry {
+            tools: BTreeMap::new(),
+            artifact_store: self.artifact_store.clone(),
+        }
     }
 
     /// Register a tool. A later registration with the same name replaces it.
@@ -140,7 +165,7 @@ impl ToolRegistry {
     /// allowlist is far more often a config typo than a deliberate lockout.
     /// Names that match nothing are ignored here; the caller validates them.
     pub fn named_subset(&self, allowed: &[String]) -> ToolRegistry {
-        let mut subset = ToolRegistry::new();
+        let mut subset = self.empty_like();
         if allowed.is_empty() {
             for tool in self.tools.values() {
                 subset.register(tool.clone());
@@ -157,7 +182,7 @@ impl ToolRegistry {
 
     /// Only implementations independent of a user-selected directory.
     pub fn workspace_independent_subset(&self) -> ToolRegistry {
-        let mut subset = ToolRegistry::new();
+        let mut subset = self.empty_like();
         for tool in self
             .tools
             .values()
@@ -175,7 +200,7 @@ impl ToolRegistry {
     /// refuses it too, but offering a tool that can only ever be refused just
     /// burns the child's rounds.
     pub fn without_mcp_tools(&self) -> ToolRegistry {
-        let mut subset = ToolRegistry::new();
+        let mut subset = self.empty_like();
         for tool in self.tools.values() {
             if !tool.name().starts_with("mcp__") {
                 subset.register(tool.clone());
@@ -186,7 +211,7 @@ impl ToolRegistry {
 
     /// Every tool except those named.
     pub fn without_named(&self, names: &[&str]) -> ToolRegistry {
-        let mut subset = ToolRegistry::new();
+        let mut subset = self.empty_like();
         for tool in self.tools.values() {
             if !names.contains(&tool.name()) {
                 subset.register(tool.clone());
@@ -197,7 +222,7 @@ impl ToolRegistry {
 
     pub fn read_only_subset(&self) -> ToolRegistry {
         const READ_ONLY_TOOLS: &[&str] = OBSERVE_CLASS_TOOLS;
-        let mut subset = ToolRegistry::new();
+        let mut subset = self.empty_like();
         for tool in self.tools.values() {
             // Belt and braces: allowlisted AND still Safe-risk, so a future
             // risk bump on a listed tool drops it out automatically.
@@ -269,7 +294,7 @@ impl ToolRegistry {
         // This is a mechanical runtime guarantee about what the MODEL sees,
         // not a policy: it is applied to every dispatch, it cannot be granted
         // away, and a tool cannot opt out of it.
-        output.content = cap_output_with(&output.content, budget);
+        output.content = cap_result(&output.content, budget, self.artifact_store.as_deref());
         Ok(output)
     }
 }
@@ -289,6 +314,54 @@ pub const MIN_TOOL_OUTPUT: usize = 1024;
 /// the registry (sub-agent results).
 pub fn cap_output(s: &str) -> String {
     cap_output_with(s, MAX_TOOL_OUTPUT)
+}
+
+/// The model-facing bound for one result: [`cap_output_with`], but when a
+/// store exists, the FULL content is saved first and the bounded output starts
+/// with a reference to it.
+///
+/// The reference is the first line on purpose. Every later cap keeps a head
+/// and a tail; a reference placed inside the preview could land in the elided
+/// middle, and then the model would hold a partial result with no way to know
+/// what it lost. The saved content is the only copy that is not subject to
+/// this budget.
+fn cap_result(
+    s: &str,
+    budget: usize,
+    store: Option<&leveler_execution::ArtifactStore>,
+) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    let Some(store) = store else {
+        // No store: the content is gone. `cap_output_with`'s marker states the
+        // elision, and `reference_only` recognizes that shape if hard-capacity
+        // recovery later has to give up the preview too.
+        return cap_output_with(s, budget);
+    };
+    let artifact = match store.write_text(s) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                bytes = s.len(),
+                "tool result could not be saved; truncating with an explicit marker"
+            );
+            return cap_output_with(s, budget);
+        }
+    };
+    let reference = leveler_model::tool_output::saved_reference(
+        &artifact.path.display().to_string(),
+        &artifact.sha256,
+        artifact.size_bytes,
+    );
+    let payload_budget = budget.saturating_sub(reference.len() + 1);
+    if payload_budget < MIN_TOOL_OUTPUT / 2 {
+        // Too small even for the reference plus a useful preview. The budget
+        // invariant wins, and the fallback still says the middle was elided.
+        return cap_output_with(s, budget);
+    }
+    format!("{reference}\n{}", cap_output_with(s, payload_budget))
 }
 
 /// Truncate `s` to `budget` bytes, keeping the head (½ budget) and tail
@@ -489,6 +562,9 @@ pub fn core_surface(capabilities: &Capabilities) -> ToolRegistry {
 pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> ToolRegistry {
     use crate::tools;
     let mut registry = core_surface(capabilities);
+    // One host capability, one owner: the store is composed here and every
+    // tool result that has to be bounded can point at what it saved.
+    registry.artifact_store = capabilities.artifact_store.clone();
     if packs.code_intelligence {
         let lsp = &capabilities.lsp;
         registry.register(Arc::new(tools::FindSymbolTool::new(lsp.clone())));
@@ -1342,5 +1418,177 @@ mod schema_budget {
             core_bytes < full_bytes,
             "core must stay a subset of full: {core_bytes} vs {full_bytes}"
         );
+    }
+}
+
+#[cfg(test)]
+mod result_offload {
+    //! A result larger than the per-call budget must remain retrievable.
+    //!
+    //! T8 showed the cost of the old contract: `grep` returned 48 KiB, the
+    //! central cap kept a head and a tail, and the model never learned where
+    //! the rest went. The registry now saves the full content first and keeps
+    //! its reference as the result's first line, so every subsequent head/tail
+    //! cap is a preview of something the model can still read.
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use leveler_execution::{ArtifactStore, PermissionProfile, RiskLevel, Workspace};
+    use leveler_model::tool_output::TOOL_OUTPUT_SAVED_PREFIX;
+
+    use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+
+    struct Firehose {
+        payload: String,
+    }
+
+    #[async_trait]
+    impl Tool for Firehose {
+        fn name(&self) -> &str {
+            "firehose"
+        }
+
+        fn description(&self) -> &str {
+            "test-only result firehose"
+        }
+
+        fn requires_workspace(&self) -> bool {
+            false
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn risk(&self) -> RiskLevel {
+            RiskLevel::Safe
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok(self.payload.clone()))
+        }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-offload-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn registry(payload: &str, store: Option<Arc<ArtifactStore>>) -> super::ToolRegistry {
+        let mut capabilities = crate::tools::test_capabilities();
+        if let Some(store) = store {
+            capabilities = capabilities.with_artifact_store(store);
+        }
+        let mut registry =
+            super::model_surface(super::CapabilityPacks::NONE, &capabilities);
+        registry.register(Arc::new(Firehose {
+            payload: payload.to_string(),
+        }));
+        registry
+    }
+
+    fn context(dir: &std::path::Path, budget: usize) -> ToolContext {
+        let mut context = ToolContext::new(
+            Workspace::new(dir).unwrap(),
+            PermissionProfile::Assisted,
+        );
+        context.policy.tool_output_budget = budget;
+        context
+    }
+
+    fn payload() -> String {
+        format!(
+            "HEAD-LINE\n{}\nMIDDLE_NEEDLE\n{}\nTAIL-LINE",
+            "x".repeat(100_000),
+            "y".repeat(100_000)
+        )
+    }
+
+    #[tokio::test]
+    async fn an_oversized_result_is_saved_and_its_reference_survives_the_cap() {
+        let dir = temp_dir("saved");
+        let store = Arc::new(ArtifactStore::new(dir.join("artifacts")));
+        let full = payload();
+        let registry = registry(&full, Some(store));
+
+        let out = registry
+            .execute(
+                "firehose",
+                serde_json::json!({}),
+                context(&dir, 8 * 1024),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the tool runs");
+
+        assert!(
+            out.content.len() <= 8 * 1024,
+            "the central cap still bounds the result: {} bytes",
+            out.content.len()
+        );
+        assert!(
+            out.content.starts_with(TOOL_OUTPUT_SAVED_PREFIX),
+            "the saved reference must be the first line, ahead of every preview: {}",
+            &out.content[..out.content.len().min(300)]
+        );
+        let reference = out.content.lines().next().unwrap();
+        let path = reference
+            .strip_prefix(TOOL_OUTPUT_SAVED_PREFIX)
+            .unwrap()
+            .trim()
+            .split(" | sha256:")
+            .next()
+            .expect("the reference names a path");
+        let stored = std::fs::read_to_string(path).expect("the full result is on disk");
+        assert!(
+            stored.contains("MIDDLE_NEEDLE"),
+            "the saved content is the WHOLE result, not the preview"
+        );
+        assert_eq!(stored.len(), full.len());
+        assert!(
+            out.content.contains("HEAD-LINE") && out.content.contains("TAIL-LINE"),
+            "both ends of the preview survive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_truncation_is_explicit() {
+        let dir = temp_dir("no-store");
+        let registry = registry(&payload(), None);
+
+        let out = registry
+            .execute(
+                "firehose",
+                serde_json::json!({}),
+                context(&dir, 4 * 1024),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the tool runs");
+
+        assert!(out.content.len() <= 4 * 1024);
+        assert!(
+            out.content.contains(leveler_model::tool_output::TOOL_OUTPUT_ELIDED_MARKER),
+            "without a store the loss must be stated: {}",
+            &out.content[..out.content.len().min(300)]
+        );
+        assert!(
+            !dir.join("artifacts").exists(),
+            "no store means nothing was saved"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

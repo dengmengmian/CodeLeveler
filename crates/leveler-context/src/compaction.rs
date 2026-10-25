@@ -257,8 +257,9 @@ pub fn compact_messages(
         .collect();
     let elided = middle.len() - carried.len();
 
-    // Files the elided steps touched, gathered from tool-call args. Cheap, exact,
-    // and useful even when the summary is present.
+    // Files the elided steps referenced, gathered from tool-call args. These
+    // are mostly READS: the note must not call them changes, or a model that
+    // compares it with `git status` concludes the summary is wrong.
     let mut files: Vec<String> = Vec::new();
     for m in middle {
         for part in &m.content {
@@ -274,7 +275,7 @@ pub fn compact_messages(
     let files_note = if files.is_empty() {
         String::new()
     } else {
-        format!(" Files touched: {}.", files.join(", "))
+        format!(" Files referenced: {}.", files.join(", "))
     };
     let body = match summary {
         Some(summary) => format!(
@@ -306,6 +307,68 @@ pub fn compact_messages(
     out.push(breadcrumb);
     out.extend_from_slice(&messages[tail_start..]);
     out
+}
+
+/// Replace already-externalized tool results, oldest first, with their
+/// reference line until the measured transcript fits `target_tokens`.
+///
+/// This is the deterministic half of hard-capacity recovery. A transcript can
+/// be over the model's capacity while nothing is foldable — a short task whose
+/// only large message is a tool result has no middle between the task anchor
+/// and the retained tail, so [`compact_messages`] is a no-op. An offloaded
+/// result carries a path to its full content, so giving up its preview is a
+/// reduction, not a loss.
+///
+/// Only the content of [`leveler_model::ContentPart::ToolResult`] parts is
+/// rewritten. Message count, roles, call ids and every other message stay
+/// byte-identical, so the provider's tool-call/result pairing cannot be broken
+/// by this path. A result with no externalization marker is never touched:
+/// unless the runtime recorded where the rest is, that content is the only
+/// copy.
+///
+/// Returns the rewritten transcript and how many results were reduced.
+pub fn shrink_externalized_results(
+    messages: &[Message],
+    target_tokens: u64,
+    measure: impl Fn(&[Message]) -> u64,
+) -> (Vec<Message>, usize) {
+    let candidates: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .flat_map(|(message_index, message)| {
+            message
+                .content
+                .iter()
+                .enumerate()
+                .filter_map(move |(part_index, part)| match part {
+                    ContentPart::ToolResult { result }
+                        if leveler_model::tool_output::reference_only(&result.content).is_some() =>
+                    {
+                        Some((message_index, part_index))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return (messages.to_vec(), 0);
+    }
+    let mut out = messages.to_vec();
+    let mut reduced = 0;
+    for (message_index, part_index) in candidates {
+        let ContentPart::ToolResult { result } = &mut out[message_index].content[part_index] else {
+            continue;
+        };
+        let Some(reference) = leveler_model::tool_output::reference_only(&result.content) else {
+            continue;
+        };
+        result.content = reference;
+        reduced += 1;
+        if measure(&out) <= target_tokens {
+            break;
+        }
+    }
+    (out, reduced)
 }
 
 /// Which briefing instruction applies to the range about to be summarized: if it
@@ -762,6 +825,34 @@ mod span_tests {
             msg(Role::Assistant, "more work"),
         ];
         assert_eq!(summary_prompt_for(&with_prior), COMPACT_UPDATE_PROMPT);
+    }
+
+    #[test]
+    fn the_breadcrumb_does_not_claim_read_only_files_were_touched() {
+        // The note is built from tool-call `path` arguments, which include
+        // reads. Calling that list "touched" made a live T8 run doubt its own
+        // summary ("files touched ... but git status shows no changes") and
+        // re-verify the repository instead of acting on what it had learned.
+        let mut call = assistant_call("c1", "read_file");
+        if let ContentPart::ToolCall { call: ref mut inner } = call.content[0] {
+            inner.arguments = serde_json::json!({"path": "internal/window/window.go"});
+        }
+        let mut msgs = vec![msg(Role::User, "task"), call, tool_result("c1")];
+        for i in 0..8 {
+            msgs.push(msg(Role::Assistant, &format!("step {i}")));
+        }
+        let out = compact_messages(&msgs, 2, 0, Some("brief"), None);
+        let breadcrumb = out
+            .iter()
+            .find(|m| m.text_content().contains(COMPACTION_BREADCRUMB_MARKER))
+            .expect("the fold leaves a breadcrumb")
+            .text_content();
+        assert!(breadcrumb.contains("internal/window/window.go"));
+        assert!(
+            !breadcrumb.contains("Files touched:"),
+            "a read is not a modification: {breadcrumb}"
+        );
+        assert!(breadcrumb.contains("Files referenced:"));
     }
 
     #[test]

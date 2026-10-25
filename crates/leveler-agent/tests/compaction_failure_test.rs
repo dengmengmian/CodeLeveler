@@ -363,6 +363,43 @@ async fn a_soft_summary_error_keeps_the_original_history() {
     );
 }
 
+/// Test D (retry) — a soft briefing that keeps failing is not retried every
+/// round. The uncompacted history is legal to send, so a retry at the same
+/// size is an extra model call that changes nothing and, in a bounded turn,
+/// spends the task's own rounds.
+#[tokio::test]
+async fn a_failing_soft_briefing_is_not_retried_every_round() {
+    let dir = workspace();
+    let mut script = rounds(9);
+    script.push(answer("done"));
+    let runtime = CompactionRuntime::new(script, Summary::Failed);
+
+    let outcome = executor(
+        dir.path(),
+        runtime.clone(),
+        soft_policy(),
+        StepLimits::default(),
+    )
+    .run(
+        "investigate the source",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+
+    let main_rounds = runtime.main_requests().len();
+    let attempts = runtime.summary_requests();
+    assert!(main_rounds >= 9, "the main rounds really ran: {main_rounds}");
+    assert!(
+        attempts <= 2,
+        "a failing briefing must not be retried every round: {attempts} attempts across \
+         {main_rounds} rounds"
+    );
+}
+
 /// Test D — after a soft failure the next round is a normal round: a real tool
 /// exchange, a real follow-up request, and no breadcrumb smuggled in.
 #[tokio::test]

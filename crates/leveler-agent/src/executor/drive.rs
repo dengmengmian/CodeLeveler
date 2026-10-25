@@ -109,6 +109,14 @@ const MAX_DECODE_RETRIES: u32 = 2;
 /// to execute and fail immediately.
 const MAX_LENGTH_CONTINUATIONS: u32 = 2;
 
+/// Tokens held back from each call's share of the remaining context capacity.
+/// The estimator deliberately prices message content only, not the per-message
+/// role framing or the JSON envelope a provider also counts (see
+/// `leveler_model::estimate`). This is a lower-bound allowance for that known
+/// omission, not a measured calibration; the provider's reported count is the
+/// authority once a request has been made.
+const TOOL_RESULT_FRAMING_ALLOWANCE: u64 = 256;
+
 /// The wall-clock point (on the same task-level axis as `max_duration`) at
 /// which a bounded run is asked to stop expanding and return what it has.
 ///
@@ -202,10 +210,23 @@ pub(crate) struct Drive<'a> {
     /// Stamped onto the round's ledger row so the estimate sits beside the
     /// provider's own prompt count instead of being recomputed offline.
     last_projected_input_tokens: Option<u64>,
+    /// The provider's own prompt count for that same request, when it reported
+    /// one. The estimator is a documented LOWER bound (role framing and JSON
+    /// envelopes are not priced); this is the only measurement of the gap, so
+    /// the next request's pressure is judged with it instead of pretending the
+    /// estimate is the whole truth.
+    last_actual_input_tokens: Option<u64>,
     /// Of that projection, how much was the historical-reasoning channel —
     /// priced over the SAME projection, so it can never claim reasoning the
     /// provider did not receive.
     last_projected_reasoning_tokens: Option<u64>,
+    /// The projected size at which a soft fold's briefing last failed. A soft
+    /// fold is optional — the uncompacted history is still legal to send — so
+    /// retrying at the same size costs an extra model call that cannot succeed
+    /// any differently. The next attempt is due once the transcript has grown
+    /// by what the failed fold would have reclaimed; the hard bound always
+    /// retries, because there the fold is mandatory.
+    soft_fold_retry_at: Option<u64>,
 }
 
 struct CompactionObserver<'a, 'b> {
@@ -585,7 +606,9 @@ impl Executor {
             continued_text: String::new(),
             budget_exceeded: None,
             last_projected_input_tokens: None,
+            last_actual_input_tokens: None,
             last_projected_reasoning_tokens: None,
+            soft_fold_retry_at: None,
             compaction: compaction_record.clone(),
             progress,
             objective,
@@ -723,16 +746,22 @@ impl<'a> Drive<'a> {
             Kernel::ReasoningCompleted { elapsed_ms } => {
                 AgentEvent::ReasoningCompleted { elapsed_ms }
             }
-            Kernel::Usage(usage) => AgentEvent::Usage {
-                input_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
-                output_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
-                cached_input_tokens: usage.cached_input_tokens.min(u32::MAX as u64) as u32,
-                // `None` stays `None`: an unreported breakdown must not become
-                // a measured zero on its way to a client.
-                reasoning_tokens: usage
-                    .reasoning_tokens
-                    .map(|value| value.min(u32::MAX as u64) as u32),
-            },
+            Kernel::Usage(usage) => {
+                // The provider's count for the request whose estimate
+                // `ContextUsage` just recorded. Kept together, they are the
+                // measured gap the estimator cannot derive on its own.
+                self.last_actual_input_tokens = Some(usage.input_tokens);
+                AgentEvent::Usage {
+                    input_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
+                    output_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
+                    cached_input_tokens: usage.cached_input_tokens.min(u32::MAX as u64) as u32,
+                    // `None` stays `None`: an unreported breakdown must not become
+                    // a measured zero on its way to a client.
+                    reasoning_tokens: usage
+                        .reasoning_tokens
+                        .map(|value| value.min(u32::MAX as u64) as u32),
+                }
+            }
             Kernel::ContextUsage(accounting) => {
                 // The one place the estimate is captured: it describes the
                 // request this round is about to send, so the ledger row for
@@ -1322,6 +1351,73 @@ impl Drive<'_> {
             ));
         }
         tracing::info!(event="tool_surface_changed",reason,active_capabilities=?state.active(),tool_count=self.tools.len(),schema_tokens=leveler_model::estimate_tool_definitions(&self.tools),loaded_schema_tokens=leveler_model::estimate_tool_definitions(&self.tools).saturating_sub(previous_schema_tokens),tool_names=?self.tools.iter().map(|tool|&tool.name).collect::<Vec<_>>());
+    }
+
+    /// How much the provider counted above the estimator on the request that
+    /// just completed. Zero until both figures exist, and never negative: a
+    /// provider that reports fewer prompt tokens than estimated is not
+    /// evidence the estimator is too high (cache accounting differs by
+    /// route), so this only ever widens the safety margin.
+    fn measured_estimate_gap(&self) -> u64 {
+        match (self.last_projected_input_tokens, self.last_actual_input_tokens) {
+            (Some(estimated), Some(actual)) => actual.saturating_sub(estimated),
+            _ => 0,
+        }
+    }
+
+    /// The projected request size with the measured gap applied. The gap was
+    /// measured against the previous request, and the next request carries the
+    /// same fixed prefix plus messages the same estimator priced, so applying
+    /// it here judges pressure against what the provider will actually count.
+    fn projected_with_measured_gap(&self, estimate: u64) -> u64 {
+        estimate.saturating_add(self.measured_estimate_gap())
+    }
+
+    /// Bytes one result in this batch may occupy so the NEXT request stays
+    /// inside the model's hard capacity.
+    ///
+    /// The static per-model ceiling answers "how large may one result be?";
+    /// this answers "how much room is actually left?" — the question T8 showed
+    /// was missing. The room is split evenly across the batch's calls because
+    /// their results arrive together in one request: one call must not consume
+    /// another's share.
+    ///
+    /// Bytes convert at the estimator's tool density (2/5), less a fixed
+    /// allowance for the per-message role framing and JSON envelope the
+    /// estimator deliberately does not price. With no hard capacity (a route
+    /// that declares no window) the static ceiling is the only honest bound.
+    fn tool_result_budget_bytes(
+        &self,
+        rt: &LoopContext,
+        messages: &[Message],
+        calls: usize,
+    ) -> usize {
+        let static_budget = self.executor.tool_context.policy.tool_output_budget;
+        let policy = self.executor.policy.context_policy;
+        if calls == 0 || !policy.folding_enabled() {
+            return static_budget;
+        }
+        let Some(capacity) = policy.hard_capacity() else {
+            return static_budget;
+        };
+        let base = self.projected_with_measured_gap(
+            leveler_model::RequestProjection::project_with_control_context(
+                messages,
+                &self.tools,
+                self.executor.policy.reasoning_replay,
+                self.executor.policy.reasoning_retention,
+                &self.request_context(rt),
+            )
+            .estimated_tokens(),
+        );
+        let share = capacity.saturating_sub(base) / calls as u64;
+        let bytes = share
+            .saturating_sub(TOOL_RESULT_FRAMING_ALLOWANCE)
+            .saturating_mul(5)
+            / 2;
+        usize::try_from(bytes)
+            .unwrap_or(usize::MAX)
+            .clamp(leveler_tools::registry::MIN_TOOL_OUTPUT, static_budget)
     }
 }
 
@@ -2105,6 +2201,12 @@ impl AgentHarness for Drive<'_> {
         let has_next_model_step = rt.has_next_model_step();
         let model_tokens_spent = rt.model_tokens_spent();
         let cost_spent_micros = rt.cost_spent_micros();
+        // Measured BEFORE any result is appended: the request these results
+        // will join already carries the assistant message and its tool calls,
+        // so what is left is exactly the room they may use. Every call in the
+        // batch shares it; a static ceiling that ignores the window is what
+        // let one `grep` result crowd out the task (G7/T8).
+        let tool_result_budget = self.tool_result_budget_bytes(rt, messages.as_slice(), calls.len());
         // Tool results, filled by call index. Parallel-safe read-only tools
         // may finish out of order, but the model must receive their results
         // in the original call order — providers reject reordered results.
@@ -3473,6 +3575,11 @@ impl AgentHarness for Drive<'_> {
             let ctx = ctx.with_foreign_owned_paths(
                 self.executor.ownership.paths_owned_by_others(&owner_key),
             );
+            // The model-facing size of THIS call's result, from the room the
+            // next request actually has rather than the static model ceiling.
+            // Admission freezes the policy, and dispatch executes under it, so
+            // the budget must be set here — before admission, not after.
+            let ctx = ctx.with_tool_output_budget(tool_result_budget);
 
             // Admission: the ToolHost pipeline (side-effect barrier →
             // hooks → rules → policy → approval → barrier). Execution
@@ -4349,10 +4456,12 @@ impl AgentHarness for Drive<'_> {
                             result: ToolResultContent {
                                 call_id,
                                 // Sub-agent results bypass the registry, so apply
-                                // the central cap here.
+                                // the central cap here — at this round's
+                                // remaining-capacity budget, the same bound the
+                                // registry applied to every other result.
                                 content: leveler_tools::registry::cap_output_with(
                                     &content,
-                                    self.executor.tool_context.policy.tool_output_budget,
+                                    tool_result_budget,
                                 ),
                                 is_error: !ok,
                             },
@@ -4536,28 +4645,40 @@ impl AgentHarness for Drive<'_> {
         // gateways don't report streaming usage, and without a fallback
         // compaction would silently never fire. The persisted transcript
         // (sink) is untouched — only what we resend shrinks.
-        let context_tokens = leveler_model::RequestProjection::project_with_control_context(
-            messages,
-            &self.tools,
-            self.executor.policy.reasoning_replay,
-            self.executor.policy.reasoning_retention,
-            &self.request_context(rt),
-        )
-        .estimated_tokens();
+        let context_tokens = self.projected_with_measured_gap(
+            leveler_model::RequestProjection::project_with_control_context(
+                messages,
+                &self.tools,
+                self.executor.policy.reasoning_replay,
+                self.executor.policy.reasoning_retention,
+                &self.request_context(rt),
+            )
+            .estimated_tokens(),
+        );
         // Fold when the last request's estimate crossed the budget. One
         // threshold, one action: the runtime does not read the model's
         // re-reads as evidence that it "deserves" a bigger window.
         let context_policy = self.executor.policy.context_policy;
         let over_budget = context_policy.folding_enabled()
             && context_tokens > u64::from(context_policy.pressure_threshold);
-        if has_next_model_step && over_budget {
+        let requirement = fold_requirement(&context_policy, context_tokens);
+        // A soft fold whose briefing just failed is not retried at the same
+        // size: the uncompacted history is still legal to send, so the retry
+        // would spend a model call to get the same answer. The next attempt is
+        // due once the transcript has grown by what that fold would have
+        // reclaimed. The hard bound ignores the schedule — there the fold is
+        // mandatory.
+        let soft_retry_due = requirement == FoldRequirement::HardRequired
+            || self
+                .soft_fold_retry_at
+                .is_none_or(|retry_at| context_tokens >= retry_at);
+        if has_next_model_step && over_budget && soft_retry_due {
             let before = messages.len();
             // TWO bounds, two meanings. `pressure_threshold` says recall is
             // expected to degrade; `hard_capacity` says the request can no
             // longer be sent. A fold below the hard bound is a quality choice
             // and may be abandoned; above it, a fold is required to send
             // anything at all, so its failure must be explicit.
-            let requirement = fold_requirement(&context_policy, context_tokens);
             // Cap the retained working set at half the live budget so a
             // huge recent tool output can't keep the fold over the window;
             // the other half leaves room for the head, summary, and next
@@ -4722,8 +4843,54 @@ impl AgentHarness for Drive<'_> {
                     requirement == FoldRequirement::Soft,
                 );
                 if requirement == FoldRequirement::Soft {
+                    // A briefing was never requested: the transcript had no
+                    // foldable middle yet (or the route cannot fit a summary),
+                    // so no model call was spent. Re-check next round — the
+                    // middle appears as the transcript grows — and only put a
+                    // briefing that actually failed on the retry schedule.
+                    if failure == "no_request" {
+                        return Ok(Flow::Continue);
+                    }
                     // The uncompacted history is still legal to send. A
-                    // briefing nobody could produce must not cost the task.
+                    // briefing nobody could produce must not cost the task —
+                    // nor may it cost one model call per round for the rest of
+                    // the turn. The next attempt is due once the transcript
+                    // has grown by what this fold would have reclaimed without
+                    // a briefing, so a retry only happens when there is a
+                    // fold's worth of new history to justify it.
+                    let retry_at = match tail_budget {
+                        Some(_) => {
+                            let reclaim = context_tokens.saturating_sub(
+                                self.projected_with_measured_gap(
+                                    leveler_model::RequestProjection::project_with_control_context(
+                                        &compact_messages(
+                                            messages,
+                                            keep_recent_messages,
+                                            keep_recent_tokens,
+                                            None,
+                                            Some(self.objective.text()),
+                                        ),
+                                        &self.tools,
+                                        self.executor.policy.reasoning_replay,
+                                        self.executor.policy.reasoning_retention,
+                                        &self.request_context(rt),
+                                    )
+                                    .estimated_tokens(),
+                                ),
+                            );
+                            context_tokens.saturating_add(reclaim.max(1))
+                        }
+                        // The fold cannot reach the quality boundary even after
+                        // eliding everything it can: a soft retry at this size
+                        // has nothing new to act on. Wait for the hard bound,
+                        // where the fold is mandatory and retries regardless;
+                        // with no declared capacity nothing can make it
+                        // mandatory, so the briefing is not retried this turn.
+                        None => context_policy
+                            .hard_capacity()
+                            .map_or(u64::MAX, |capacity| capacity.saturating_add(1)),
+                    };
+                    self.soft_fold_retry_at = Some(retry_at);
                     return Ok(Flow::Continue);
                 }
                 // Hard-required: fall through and fold MECHANICALLY (no model
@@ -4756,7 +4923,7 @@ impl AgentHarness for Drive<'_> {
             // that cannot fit must leave no state behind, so the failure path
             // is validate-before-commit, never mutate-then-fail. (This is the
             // same ordering `assemble_measured` uses for the engine entry.)
-            let candidate = fold_permitted.then(|| {
+            let mut candidate = fold_permitted.then(|| {
                 compact_messages(
                     messages,
                     keep_recent_messages,
@@ -4770,14 +4937,58 @@ impl AgentHarness for Drive<'_> {
             // second transcript. With no candidate this measures the unchanged
             // history, which is what the gate must judge when the checkpoint
             // port refused the fold.
-            let after_tokens = leveler_model::RequestProjection::project_with_control_context(
-                candidate.as_deref().unwrap_or(&messages[..]),
-                &self.tools,
-                self.executor.policy.reasoning_replay,
-                self.executor.policy.reasoning_retention,
-                &self.request_context(rt),
-            )
-            .estimated_tokens();
+            let mut after_tokens = self.projected_with_measured_gap(
+                leveler_model::RequestProjection::project_with_control_context(
+                    candidate.as_deref().unwrap_or(&messages[..]),
+                    &self.tools,
+                    self.executor.policy.reasoning_replay,
+                    self.executor.policy.reasoning_retention,
+                    &self.request_context(rt),
+                )
+                .estimated_tokens(),
+            );
+            // Deterministic recovery. A short transcript can be over the hard
+            // capacity while NOTHING is foldable: T8 had five messages, one of
+            // them a single huge tool result, so `compaction_span` found no
+            // middle and the mechanical fold was a no-op. An offloaded result
+            // names the path to its full content, so the oldest previews can be
+            // reduced to their references without losing anything recoverable.
+            // Message count, roles and call ids stay untouched, so the tool
+            // exchange stays paired. The gate below still decides whether the
+            // reduced transcript is sendable.
+            if requirement == FoldRequirement::HardRequired
+                && let Some(capacity) = context_policy.hard_capacity()
+                && after_tokens > capacity
+                && let Some(base) = candidate.take()
+            {
+                let measured = |msgs: &[leveler_model::Message]| {
+                    self.projected_with_measured_gap(
+                        leveler_model::RequestProjection::project_with_control_context(
+                            msgs,
+                            &self.tools,
+                            self.executor.policy.reasoning_replay,
+                            self.executor.policy.reasoning_retention,
+                            &self.request_context(rt),
+                        )
+                        .estimated_tokens(),
+                    )
+                };
+                let (shrunk, reduced) =
+                    leveler_context::shrink_externalized_results(&base, capacity, measured);
+                if reduced > 0 {
+                    after_tokens = measured(&shrunk);
+                    tracing::info!(
+                        operation = "compaction",
+                        reduced_results = reduced,
+                        projected_after = after_tokens,
+                        capacity,
+                        "externalized tool results reduced to their references"
+                    );
+                    candidate = Some(shrunk);
+                } else {
+                    candidate = Some(base);
+                }
+            }
             // Hard-required: a legal context is mandatory. If neither the model
             // briefing nor the mechanical fold brought the request under the
             // model's hard capacity, fail explicitly BEFORE the fold is
@@ -4797,6 +5008,8 @@ impl AgentHarness for Drive<'_> {
             if let Some(folded) = candidate {
                 *messages = folded;
                 self.context_diverged = true;
+                // The fold cycle restarts from the folded size.
+                self.soft_fold_retry_at = None;
                 if let Ok(mut slot) = self.compaction.lock() {
                     *slot = Some(CompactionRecord {
                         before_tokens: context_tokens,

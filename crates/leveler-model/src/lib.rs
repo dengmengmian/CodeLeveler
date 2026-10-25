@@ -29,6 +29,7 @@ pub mod retention;
 pub mod runtime;
 pub mod thinking;
 pub mod tool_exchange;
+pub mod tool_output;
 
 pub use authority::{
     InstructionPrecedence, OriginClass, PromptAuthority, PromptSource, ProtocolRepairKind,

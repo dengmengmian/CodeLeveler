@@ -16,7 +16,8 @@ pub mod symbols;
 pub use compaction::{
     ACTIVE_OBJECTIVE_MARKER, COMPACT_KEEP_RECENT, COMPACTION_SUMMARY_BUDGET_TOKENS,
     FoldRequirement, accepted_summary, compact_messages, compaction_span, estimate_tokens,
-    objective_pin_message, retention_tail_budget, round_boundary, summary_request,
+    objective_pin_message, retention_tail_budget, round_boundary, shrink_externalized_results,
+    summary_request,
 };
 pub use guard::{ContentFingerprint, FileStateTracker};
 pub use repo_map::RepositoryMap;
