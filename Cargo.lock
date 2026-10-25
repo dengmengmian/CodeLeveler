@@ -1974,6 +1974,7 @@ dependencies = [
  "leveler-project",
  "leveler-skills",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

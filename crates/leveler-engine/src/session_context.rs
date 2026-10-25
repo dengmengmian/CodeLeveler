@@ -289,14 +289,33 @@ impl RawTranscript {
                         // no budget). The request cannot legally be sent
                         // unfolded, so fold MECHANICALLY, then prove the result
                         // is sendable BEFORE it is committed.
-                        let folded = leveler_context::compact_messages(
+                        let mut folded = leveler_context::compact_messages(
                             &base,
                             keep_recent,
                             keep_recent_tokens,
                             summary.as_deref(),
                             active_objective,
                         );
-                        let projected = measure(&folded);
+                        let mut projected = measure(&folded);
+                        // A retained tool result can keep the fold over
+                        // capacity with nothing left to elide. When that
+                        // result names where its full output was saved, its
+                        // preview is replaceable: reduce the oldest previews
+                        // to their references, exactly as the drive does.
+                        if let Some(capacity) = hard_capacity
+                            && projected > capacity
+                        {
+                            let (shrunk, reduced) =
+                                leveler_context::shrink_externalized_results(
+                                    &folded,
+                                    capacity,
+                                    |messages| measure(messages),
+                                );
+                            if reduced > 0 {
+                                projected = measure(&shrunk);
+                                folded = shrunk;
+                            }
+                        }
                         if let Some(capacity) = hard_capacity
                             && projected > capacity
                         {
@@ -710,6 +729,91 @@ mod fold_semantics_tests {
         assert!(
             log.latest_context_snapshot(None).await.unwrap().is_none(),
             "a refused fold must not leave a partial ContextSnapshot"
+        );
+    }
+
+    /// Hard pressure where the only oversized message is an EXTERNALIZED tool
+    /// result inside the retained tail. The fold keeps that message, so folding
+    /// alone cannot reach capacity; the saved reference makes the preview
+    /// replaceable, and that replacement is what must happen before refusing —
+    /// the same recovery the drive applies.
+    #[tokio::test]
+    async fn hard_pressure_reduces_saved_results_before_refusing_the_fold() {
+        use leveler_core::ToolCallId;
+        use leveler_model::{
+            ContentPart, ReasoningReplayContract, ReasoningRetention, RequestProjection, ToolCall,
+            ToolResultContent,
+        };
+
+        let store = leveler_storage::MemoryEventStore::default();
+        let log = EventLog::new(&store, SessionId::generate());
+        let saved = leveler_model::tool_output::saved_reference(
+            "/tmp/artifacts/abc.txt",
+            "abc",
+            400_000,
+        );
+        let mut messages = transcript();
+        messages.push(Message::from_parts(
+            Role::Assistant,
+            vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new("call-1"),
+                    name: "grep".into(),
+                    arguments: Default::default(),
+                },
+            }],
+            None,
+        ));
+        messages.push(Message::from_parts(
+            Role::Tool,
+            vec![ContentPart::ToolResult {
+                result: ToolResultContent {
+                    call_id: ToolCallId::new("call-1"),
+                    content: format!("{saved}\n{}", "x".repeat(40_000)),
+                    is_error: false,
+                },
+            }],
+            None,
+        ));
+        let measure = |messages: &[Message]| {
+            RequestProjection::project(
+                messages,
+                &[],
+                ReasoningReplayContract::NONE,
+                ReasoningRetention::All,
+            )
+            .estimated_tokens()
+        };
+        // keep_recent = 4 retains the tool exchange, so the folded transcript
+        // still carries the 40 KB preview and is over this capacity.
+        let folded = leveler_context::compact_messages(&messages, 4, 0, None, None);
+        let capacity = measure(&folded) / 2;
+        let raw = RawTranscript {
+            messages,
+            offset: 0,
+        };
+        let context = raw
+            .assemble_measured(&log, None, None, 1, Some(capacity), 4, 0, &measure)
+            .await
+            .expect("a result with a saved path must be reduced, not end the turn");
+        assert!(context.compacted, "the fold is committed");
+        let result = context
+            .prior
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .expect("the retained tail keeps the tool exchange");
+        assert!(
+            result.starts_with(leveler_model::tool_output::TOOL_OUTPUT_SAVED_PREFIX),
+            "the preview is reduced to its saved reference: {result}"
+        );
+        assert!(result.contains("/tmp/artifacts/abc.txt"));
+        assert!(
+            measure(&context.prior) <= capacity,
+            "the committed transcript is sendable"
         );
     }
 

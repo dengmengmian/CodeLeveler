@@ -26,8 +26,14 @@ pub const GOAL_CHECKPOINT_SCHEMA_VERSION: i64 = 1;
 
 /// Caps that keep a checkpoint compact (spec: bounded summaries plus
 /// canonical references, never embedded transcripts or diffs).
+///
+/// The text cap matches the fold's own summary budget
+/// (`COMPACTION_SUMMARY_BUDGET_TOKENS`, ~2 K tokens at 4 bytes/token). A
+/// storage bound tighter than the context bound truncates the handoff the
+/// model is about to receive: the old 2 KB cap cut a live briefing before its
+/// final section, which is where "what remains to be done" lives.
 const MAX_LIST_ITEMS: usize = 20;
-const MAX_TEXT_LEN: usize = 2_000;
+const MAX_TEXT_LEN: usize = 8_192;
 
 /// Why this checkpoint was cut. Deterministic and explicit — there is no
 /// "the model felt this was a milestone" trigger.
@@ -356,11 +362,25 @@ fn bounded_text(s: &str) -> String {
     if s.len() <= MAX_TEXT_LEN {
         return s.to_string();
     }
-    let mut end = MAX_TEXT_LEN;
-    while !s.is_char_boundary(end) {
-        end -= 1;
+    // Keep BOTH ends. A handoff ends with its next steps, so a head-only cut
+    // removes the part the resuming model acts on. The marker is explicit:
+    // the reader must know content was elided and roughly how much.
+    const MARKER_RESERVE: usize = 64;
+    let tail_budget = MAX_TEXT_LEN / 3;
+    let mut head = MAX_TEXT_LEN - tail_budget - MARKER_RESERVE;
+    while !s.is_char_boundary(head) {
+        head -= 1;
     }
-    format!("{}…", &s[..end])
+    let mut tail = s.len() - tail_budget;
+    while !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n[… {} bytes elided to bound the checkpoint …]\n{}",
+        &s[..head],
+        tail - head,
+        &s[tail..]
+    )
 }
 
 fn bounded_list(items: impl Iterator<Item = String>) -> Vec<String> {
@@ -529,6 +549,45 @@ mod tests {
         let block = cp.context_block();
         assert!(block.contains("completed, no findings"), "got: {block}");
         assert!(block.contains("INCOMPLETE"), "got: {block}");
+    }
+
+    #[test]
+    fn a_handoff_briefing_keeps_its_actionable_tail() {
+        // The compaction prompt puts "what remains to be done" LAST. A 2 KB
+        // head-only cap cut a live T8 briefing mid-sentence and dropped
+        // exactly that section, so every fold handed the model a briefing
+        // with no next step and it re-explored from scratch.
+        let mut briefing = String::from("# Handoff Briefing\n\n## Progress\n");
+        while briefing.len() < 6_000 {
+            briefing.push_str("- read internal/window/window.go; Start rounds by Size/2\n");
+        }
+        briefing.push_str("\n## Next steps\n1. Change Start to floor division\n");
+        let cp = GoalCheckpoint {
+            goal_summary: Some(briefing),
+            ..Default::default()
+        }
+        .bounded();
+        let block = cp.context_block();
+        assert!(
+            block.contains("## Next steps") && block.contains("Change Start to floor division"),
+            "the actionable tail must survive the checkpoint bound: {block}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_briefing_states_that_content_was_elided() {
+        let briefing = "x".repeat(MAX_TEXT_LEN + 500);
+        let cp = GoalCheckpoint {
+            goal_summary: Some(briefing),
+            ..Default::default()
+        }
+        .bounded();
+        let summary = cp.goal_summary.unwrap();
+        assert!(summary.len() <= MAX_TEXT_LEN);
+        assert!(
+            summary.contains("elided"),
+            "bounded content must say it was cut, not end in a bare ellipsis"
+        );
     }
 
     #[test]

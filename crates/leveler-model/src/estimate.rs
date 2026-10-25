@@ -10,11 +10,19 @@
 //!
 //! # What is counted
 //!
-//! * text and reasoning at prose density (~4 ASCII bytes, ~3 bytes for
-//!   non-ASCII, per token);
-//! * tool calls, tool results and tool schemas at tool density (~2.5 bytes per
-//!   token), measured against DeepSeek-reported usage (C5-S2);
+//! * text, reasoning and tool DEFINITIONS at prose density (~4 ASCII bytes,
+//!   ~3 bytes for non-ASCII, per token);
+//! * tool calls and tool results at tool density (~2.5 bytes per token),
+//!   measured against DeepSeek-reported usage (C5-S2);
 //! * one flat cost per image, so a vision turn is not free.
+//!
+//! The two densities are a measured split, not a preference. Tool schemas are
+//! sentences describing parameters and tokenize like prose (~4.1 bytes/token
+//! measured on the wire in G7); tool RESULTS carry code, diffs and logs and
+//! tokenize denser (~2.5 bytes/token). Charging definitions at the result
+//! density made the fixed prefix of a 32K-window request look ~7K tokens
+//! larger than the provider counted, so folds fired early and left almost no
+//! retained tail.
 //!
 //! # What is deliberately NOT counted
 //!
@@ -111,10 +119,22 @@ impl TokenEstimate {
 
     /// Fold one tool definition the way the wire spells it: name, description
     /// and input schema.
+    ///
+    /// A definition is prose-shaped even though it is a tool artefact: the
+    /// description and the schema's own field descriptions are natural
+    /// language, and the JSON punctuation between them is cheaper than code.
+    /// Measured on the wire (G7): 37 definitions, 44,733 bytes → 10,916
+    /// prompt tokens, i.e. ~4.1 bytes per token. Pricing definitions at the
+    /// tool-result density (2.5 bytes/token) overstated a 32K-window request
+    /// by ~7K tokens; the harness then folded while the real request still
+    /// had 3K tokens of room. Tool RESULTS stay dense — code, diffs and logs
+    /// tokenize like tool payloads, and that is what the C5-S2 calibration
+    /// measured.
     pub fn add_tool_definition(&mut self, tool: &ToolDefinition) {
+        self.add_text(&tool.name);
         self.add_text(&tool.description);
-        self.add_tool(&tool.name);
-        self.add_tool(&tool.input_schema.to_string());
+        let schema = tool.input_schema.to_string();
+        self.add_text(&schema);
     }
 
     /// The token estimate for everything accumulated so far.
@@ -246,6 +266,32 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         };
         assert!(estimate_tool_definitions(std::slice::from_ref(&tool)) > 0);
+    }
+
+    #[test]
+    fn tool_definitions_price_at_prose_density() {
+        // Measured on the wire (G7, DeepSeek route): 37 definitions, 44,733
+        // bytes of name+description+schema → 10,916 prompt tokens
+        // (4.1 bytes/token). A schema describes an interface in words, so it
+        // prices like prose. Charging it at tool-result density (2.5
+        // bytes/token) overstated a 32K-window request by ~7K tokens, which
+        // made the harness fold while the real request still had room.
+        let tool = ToolDefinition {
+            name: "run_command".into(),
+            description: "Run one command and return its output.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"program": {"type": "string", "description": "word ".repeat(800)}}
+            }),
+        };
+        let bytes = tool.name.len() + tool.description.len() + tool.input_schema.to_string().len();
+        let prose = bytes as u64 / 4;
+        let estimate = estimate_tool_definitions(std::slice::from_ref(&tool));
+        assert!(
+            estimate <= prose + prose / 10,
+            "tool definition priced at {estimate} tokens for {bytes} bytes; \
+             prose density is {prose}"
+        );
     }
 
     #[test]
