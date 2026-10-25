@@ -195,7 +195,7 @@ pub(crate) fn parse_claim(arguments: &serde_json::Value) -> Result<VerificationC
             let commands = detail
                 .lines()
                 .map(str::trim)
-                .filter(|command| !command.is_empty())
+                .filter(|command| !command.is_empty() && !is_observation(command))
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             Ok(VerificationClaim::Passed(commands))
@@ -205,6 +205,17 @@ pub(crate) fn parse_claim(arguments: &serde_json::Value) -> Result<VerificationC
             "`verification.status` must be \"passed\" or \"not_applicable\" (got \"{other}\")"
         )),
     }
+}
+
+/// Whether a line is an observation rather than a command.
+///
+/// The model may put a result note on its own line under the command it
+/// annotates (`go test ./...` then `(exit 0; every package ok)`). A line that
+/// is nothing but a parenthetical records what the command produced; no tool
+/// run is recorded under it, so reading it as a citation refuses a completion
+/// that did cite the command.
+fn is_observation(line: &str) -> bool {
+    line.starts_with('(') && line.ends_with(')')
 }
 
 /// The command a tool call actually asked to run, in one display string.
@@ -598,6 +609,25 @@ mod tests {
                 2,
                 true
             ),
+            VerificationDecision::Accept { warning: None }
+        );
+    }
+
+    /// The T8 shape: the model writes the command on one line and its
+    /// observation on the next. The observation is presentation, not a second
+    /// command — an `(exit 0; …)` line cannot be executed as one.
+    #[test]
+    fn an_observation_line_is_not_a_cited_command() {
+        let runs = vec![run("go test -count=1 ./...", true, 4, 2)];
+        let claim = parse_claim(&serde_json::json!({
+            "verification": {
+                "status": "passed",
+                "detail": "go test -count=1 ./...\n(exit 0; every package ok, no FAIL)"
+            }
+        }))
+        .expect("valid claim");
+        assert_eq!(
+            decide(&claim, &runs, 2, true),
             VerificationDecision::Accept { warning: None }
         );
     }
