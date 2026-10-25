@@ -1777,13 +1777,14 @@ impl Executor {
         self
     }
 
+    /// Whether a capability reaches the model on this request.
+    ///
+    /// FullAccess removes permission checks; it does not broadcast every
+    /// schema. The capability catalog stays available and `capability(enable)`
+    /// activates an available pack without an approval, so disclosure remains
+    /// on-demand in every mode. Without a capability state the legacy surface
+    /// is unchanged.
     fn capability_exposed(&self, id: crate::capability::CapabilityId, legacy: bool) -> bool {
-        if self.tool_context.policy.unrestricted_execution() {
-            return self
-                .capabilities
-                .as_ref()
-                .is_none_or(|state| state.available(id));
-        }
         self.capabilities
             .as_ref()
             .map_or(legacy, |state| state.exposed(id))
@@ -2981,7 +2982,20 @@ impl Executor {
 
     /// Resolve `$name` mentions in the user request into a system injection block.
     fn skill_turn_injection(&self, request: &str) -> Option<SelectedSkills> {
-        if !self.capability_exposed(crate::capability::CapabilityId::Skills, true) {
+        // A named skill is the user's explicit instruction, not model
+        // discovery, so its procedure is injected whenever the host has the
+        // pack. FullAccess removes the permission check but still discloses
+        // packs on demand, so it gates on availability; every other mode
+        // gates on exposure, because a `$mention` is user intent and must
+        // not widen the capability surface by itself.
+        let skills_available = match self.capabilities.as_ref() {
+            None => true,
+            Some(state) if self.tool_context.policy.unrestricted_execution() => {
+                state.available(crate::capability::CapabilityId::Skills)
+            }
+            Some(state) => state.exposed(crate::capability::CapabilityId::Skills),
+        };
+        if !skills_available {
             return None;
         }
         // Built from this execution's own environment, so `$mention` and
@@ -3302,24 +3316,20 @@ mod ownership_authority_tests {
         )
     }
 
-    #[test]
-    fn full_tool_surface_bypasses_capability_and_product_permission_flags() {
+    #[tokio::test]
+    async fn full_tool_surface_discloses_optional_packs_on_demand_instead_of_broadcasting() {
         use crate::capability::{CapabilityDisclosure, CapabilityId};
         let mut exec = executor().with_delegation(false).with_host_input(false);
         let mut registry = leveler_tools::default_registry();
         registry.register(Arc::new(leveler_tools::tools::WebFetchTool));
         exec.registry = Arc::new(registry);
+        let available = vec![
+            CapabilityId::Web,
+            CapabilityId::MultiAgent,
+            CapabilityId::HostInteraction,
+        ];
         exec.capabilities = Some(Arc::new(
-            CapabilityDisclosure::new(
-                vec![
-                    CapabilityId::Web,
-                    CapabilityId::MultiAgent,
-                    CapabilityId::HostInteraction,
-                ],
-                vec![],
-                vec![],
-            )
-            .unwrap(),
+            CapabilityDisclosure::new(available.clone(), available, vec![]).unwrap(),
         ));
         let scoped = exec.request_tool_definitions();
         for name in ["web_fetch", "spawn_agent", "request_user_input"] {
@@ -3330,10 +3340,35 @@ mod ownership_authority_tests {
             .permission_profile()
             .set(leveler_execution::PermissionProfile::FullAccess);
         let full = exec.request_tool_definitions();
+        assert!(
+            full.iter().any(|t| t.name == "capability"),
+            "Full keeps the catalog so an optional pack stays reachable"
+        );
         for name in ["web_fetch", "spawn_agent", "request_user_input"] {
             assert!(
-                full.iter().any(|t| t.name == name),
-                "{name} still restricted in Full"
+                !full.iter().any(|t| t.name == name),
+                "Full must not broadcast {name} before its capability is enabled"
+            );
+        }
+        for id in [
+            CapabilityId::Web,
+            CapabilityId::MultiAgent,
+            CapabilityId::HostInteraction,
+        ] {
+            assert!(
+                exec.capabilities
+                    .as_ref()
+                    .unwrap()
+                    .enable_with_authority(id, true)
+                    .await
+                    .unwrap()
+            );
+        }
+        let enabled = exec.request_tool_definitions();
+        for name in ["web_fetch", "spawn_agent", "request_user_input"] {
+            assert!(
+                enabled.iter().any(|t| t.name == name),
+                "an enabled capability must reach the next Full request: {name}"
             );
         }
         assert!(exec.capability_exposed(CapabilityId::Web, false));
@@ -3365,38 +3400,67 @@ mod ownership_authority_tests {
         );
     }
 
-    #[test]
-    fn existing_explorer_auto_to_full_recovers_actual_write_and_optional_handles() {
+    #[tokio::test]
+    async fn existing_explorer_auto_to_full_recovers_write_and_keeps_optional_handles_enableable() {
         use crate::capability::{CapabilityDisclosure, CapabilityId};
         let mut parent = executor();
         let mut registry = leveler_tools::default_registry();
         registry.register(Arc::new(leveler_tools::tools::WebFetchTool));
         parent.registry = Arc::new(registry);
         parent.capabilities = Some(Arc::new(
-            CapabilityDisclosure::new(vec![CapabilityId::Web], vec![], vec![]).unwrap(),
+            CapabilityDisclosure::new(vec![CapabilityId::Web], vec![CapabilityId::Web], vec![])
+                .unwrap(),
         ));
         let child = parent.child_for_role_on(AgentRole::Explorer, vec![], None);
-        assert!(
-            !child
-                .request_tool_definitions()
-                .iter()
-                .any(|t| t.name == "apply_patch")
-        );
+        for name in ["apply_patch", "web_fetch"] {
+            assert!(
+                !child
+                    .request_tool_definitions()
+                    .iter()
+                    .any(|t| t.name == name),
+                "assisted explorer must not start with {name}"
+            );
+        }
         parent
             .tool_context
             .policy
             .permission_profile()
             .set(leveler_execution::PermissionProfile::FullAccess);
-        for name in ["apply_patch", "web_fetch"] {
-            assert!(
-                child
-                    .request_tool_definitions()
-                    .iter()
-                    .any(|t| t.name == name),
-                "existing child lost actual {name} handle"
-            );
-        }
+        assert!(
+            child
+                .request_tool_definitions()
+                .iter()
+                .any(|t| t.name == "apply_patch"),
+            "existing child lost the actual apply_patch handle in Full"
+        );
+        assert!(
+            child.registry.get("web_fetch").is_some(),
+            "the optional handle stays in the registry before disclosure"
+        );
+        assert!(
+            !child
+                .request_tool_definitions()
+                .iter()
+                .any(|t| t.name == "web_fetch"),
+            "Full discloses an optional pack on demand, not by switching modes"
+        );
+        assert!(
+            parent
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .enable_with_authority(CapabilityId::Web, true)
+                .await
+                .unwrap()
+        );
         assert!(child.capability_exposed(CapabilityId::Web, false));
+        assert!(
+            child
+                .request_tool_definitions()
+                .iter()
+                .any(|t| t.name == "web_fetch"),
+            "the enabled pack must reach the existing child's next request"
+        );
     }
 
     struct WriteDriveRuntime(std::sync::atomic::AtomicUsize);

@@ -177,15 +177,29 @@ fn executor(
     minimal_baseline: bool,
     goal: bool,
 ) -> leveler_agent::Executor {
+    executor_with_mode(
+        root,
+        home,
+        script,
+        minimal_baseline,
+        goal,
+        PermissionProfile::Assisted,
+    )
+}
+
+fn executor_with_mode(
+    root: &Path,
+    home: &Path,
+    script: Arc<Script>,
+    minimal_baseline: bool,
+    goal: bool,
+    mode: PermissionProfile,
+) -> leveler_agent::Executor {
     let env = isolated_env(root, home);
     leveler_agent::Executor::new(
         script,
         Arc::new(registry(minimal_baseline, env.clone())),
-        ToolContext::with_environment(
-            Workspace::new(root).unwrap(),
-            PermissionProfile::Assisted,
-            env,
-        ),
+        ToolContext::with_environment(Workspace::new(root).unwrap(), mode, env),
         ModelRef::new("mock", "m"),
         4,
     )
@@ -816,4 +830,126 @@ async fn progressive_initial_surface_inventory() {
         schema_tokens + estimate_text(&initial.control_context.text())
     );
     eprintln!("{}", report("progressive_initial", &initial));
+}
+
+/// FullAccess is authority, not a broadcast of every schema. It must not ask
+/// or deny anything, but a capability the model has not enabled is still not
+/// disclosed. Enabling is immediate and needs no approval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_access_uses_the_progressive_initial_surface() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+
+    let root = repo_root();
+    let home = tempfile::tempdir().unwrap();
+    let available = vec![
+        CapabilityId::Memory,
+        CapabilityId::MultiAgent,
+        CapabilityId::Skills,
+        CapabilityId::CodeIntelligence,
+        CapabilityId::Web,
+        CapabilityId::Authoring,
+        CapabilityId::HostInteraction,
+    ];
+    let disclosure =
+        Arc::new(CapabilityDisclosure::new(available.clone(), available, vec![]).unwrap());
+    let script = Script::new(vec![
+        tool_call(
+            "enable",
+            "capability",
+            serde_json::json!({"action":"enable","id":"code_intelligence"}),
+        ),
+        tool_call(
+            "done",
+            "update_goal",
+            serde_json::json!({"status":"complete","summary":"done"}),
+        ),
+    ]);
+    executor_with_mode(
+        &root,
+        home.path(),
+        script.clone(),
+        false,
+        true,
+        PermissionProfile::FullAccess,
+    )
+    .with_capabilities(Some(disclosure))
+    .run(
+        "Inspect a local source file.",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let requests = script.requests.lock().unwrap().clone();
+    let names = |index: usize| {
+        requests[index]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    for hidden in [
+        "find_symbol",
+        "read_symbol",
+        "find_references",
+        "diagnostics",
+        "blast_radius",
+        "web_fetch",
+        "memory",
+        "remember",
+        "forget",
+        "load_skill",
+        "spawn_agent",
+        "list_agents",
+        "save_agent",
+        "delete_agent",
+        "save_skill",
+        "delete_skill",
+        "request_user_input",
+    ] {
+        assert!(
+            !names(0).contains(&hidden),
+            "FullAccess disclosed {hidden} before the model enabled its capability"
+        );
+    }
+    for present in [
+        "read_file",
+        "apply_patch",
+        "run_command",
+        "shell_command",
+        "update_goal",
+        "capability",
+    ] {
+        assert!(
+            names(0).contains(&present),
+            "FullAccess lost the core tool {present}"
+        );
+    }
+    assert!(
+        names(1).contains(&"find_symbol"),
+        "an enabled capability must reach the next request"
+    );
+    let segments = |index: usize| {
+        requests[index]
+            .control_context
+            .blocks
+            .iter()
+            .map(|block| block.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    for absent in [
+        "agent_catalog",
+        "skill_index",
+        "multi_agent_hint",
+        "skills_guidance",
+        "multi_agent_guidance",
+        "host_interaction_guidance",
+    ] {
+        assert!(
+            !segments(0).contains(&absent),
+            "FullAccess disclosed the {absent} block before its capability was enabled"
+        );
+    }
 }

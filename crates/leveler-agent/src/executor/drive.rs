@@ -406,9 +406,10 @@ impl Executor {
         }
 
         if let Some(state) = &self.capabilities {
-            if !self.tool_context.policy.unrestricted_execution() {
-                tools.retain(|tool| state.permits_tool(&tool.name));
-            }
+            // Exposure is the same in every permission mode: FullAccess
+            // removes the ASK/DENY boundary, not the model's ability to
+            // discover an optional pack through the catalog.
+            tools.retain(|tool| state.permits_tool(&tool.name));
             tools.push(crate::capability::control_definition());
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));

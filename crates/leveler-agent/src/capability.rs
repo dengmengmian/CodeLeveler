@@ -162,9 +162,15 @@ impl CapabilityDisclosure {
             if !self.available(id) {
                 return Err(format!("capability unavailable: {}", id.as_str()));
             }
-            // Full already exposes every mechanically available capability;
-            // bypassing permission must not manufacture a persisted grant.
-            return Ok(false);
+            if !self.permitted.contains(&id) {
+                return Err(format!("capability not permitted: {}", id.as_str()));
+            }
+            // Full removes the permission check, not disclosure. Activate the
+            // pack for this session so its tools reach the next request, but
+            // never write a grant: exposure is not authority, and a resumed
+            // Full session asks again through the same catalog.
+            let mut active = self.active.write().expect("capability lock");
+            return Ok(active.insert(id));
         }
         self.enable(id).await
     }
@@ -224,20 +230,11 @@ impl CapabilityDisclosure {
         .with_default_active(self.default_active.iter().copied().collect())
         .expect("defaults were valid on the parent")
     }
-    pub fn catalog_with_authority(&self, unrestricted: bool) -> serde_json::Value {
-        if !unrestricted {
-            return self.catalog();
-        }
-        serde_json::json!(
-            CapabilityId::ALL
-                .into_iter()
-                .map(|id| serde_json::json!({
-                    "id": id.as_str(), "description": id.description(),
-                    "available": self.available(id), "permitted": self.available(id),
-                    "exposed": self.available(id),
-                }))
-                .collect::<Vec<_>>()
-        )
+    /// The catalog the model reads. `exposed` is the truth for this request;
+    /// `permitted` is the authority fact. FullAccess makes every available
+    /// capability permitted, but an unenabled pack is still not exposed.
+    pub fn catalog_with_authority(&self, _unrestricted: bool) -> serde_json::Value {
+        self.catalog()
     }
 
     pub fn catalog(&self) -> serde_json::Value {
@@ -336,19 +333,37 @@ mod tests {
         assert!(state.fresh().active().is_empty());
     }
     #[tokio::test]
-    async fn full_capability_authority_bypasses_permission_but_not_availability() {
-        let state = CapabilityDisclosure::new(vec![CapabilityId::Memory], vec![], vec![]).unwrap();
+    async fn full_capability_authority_activates_exposure_without_persisting_a_grant() {
+        // Production resolves `permitted` from `available` in FullAccess; Web
+        // stays available-but-unpermitted here to prove disclosure still obeys
+        // the host's authority fact.
+        let state = CapabilityDisclosure::new(
+            vec![CapabilityId::Memory, CapabilityId::Web],
+            vec![CapabilityId::Memory],
+            vec![],
+        )
+        .unwrap();
         assert!(
             state
-                .enable_with_authority(CapabilityId::Memory, false)
+                .enable_with_authority(CapabilityId::Web, false)
                 .await
-                .is_err()
+                .unwrap_err()
+                .contains("not permitted")
         );
+        assert!(
+            state
+                .enable_with_authority(CapabilityId::Memory, true)
+                .await
+                .unwrap(),
+            "Full activates an available capability without approval"
+        );
+        assert!(state.exposed(CapabilityId::Memory));
         assert!(
             !state
                 .enable_with_authority(CapabilityId::Memory, true)
                 .await
-                .unwrap()
+                .unwrap(),
+            "a second enable is idempotent"
         );
         assert!(
             state
@@ -358,8 +373,8 @@ mod tests {
                 .contains("unavailable")
         );
         assert!(
-            state.active().is_empty(),
-            "Full permission bypass must not persist a grant"
+            state.fresh().active().is_empty(),
+            "the activation is session exposure, not a persisted grant"
         );
     }
 
