@@ -1262,7 +1262,10 @@ fn is_cjk(c: char) -> bool {
 
 fn normalize(text: &str) -> String {
     let text = clean_token(text).trim_start_matches("./").to_lowercase();
-    text.trim_end_matches('/').to_string()
+    // A sentence period is presentation: the user's bullet ends with one and
+    // the model quotes the same requirement without it. A path never ends in
+    // a dot, so trimming a trailing one cannot merge two artifacts.
+    text.trim_end_matches(['.', '/']).to_string()
 }
 
 #[cfg(test)]
@@ -1337,6 +1340,40 @@ mod tests {
                 .iter()
                 .any(|requirement| requirement.kind == RequirementKind::Tests),
             "an explicit demand for tests is a requirement: {requirements:?}"
+        );
+    }
+
+    /// The T8 shape: the user enumerates an acceptance criterion ending with a
+    /// sentence period, and the model quotes the criterion back without the
+    /// period. That is the same requirement accounted for, not a missing one.
+    #[test]
+    fn an_account_that_drops_a_trailing_period_still_covers_the_requirement() {
+        let requirements = extract(
+            "Acceptance criteria:\n\
+             - `go test ./...` passes.\n\
+             - The boundary rule is covered by a test.\n\
+             - The command-line report reflects the rule end to end.\n",
+            &[],
+        );
+        let cli = requirements
+            .iter()
+            .find(|requirement| requirement.text.contains("command-line report"))
+            .expect("the enumerated acceptance criterion is a requirement");
+        let accounting = vec![account(
+            "The command-line report reflects the rule end to end",
+            AccountStatus::Done,
+            "cmd/telemetryd/main_test.go drives run() through the pipeline",
+        )];
+        let facts = ScopeFacts {
+            requirements: std::slice::from_ref(cli),
+            accounting: Some(&accounting),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        };
+        assert!(
+            matches!(decide(&facts), ScopeDecision::Accept { .. }),
+            "the period is presentation, not a different requirement: {cli:?}"
         );
     }
 
