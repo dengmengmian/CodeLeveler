@@ -20,11 +20,14 @@ pub(crate) const COMPACT_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT
      Write a handoff briefing for the model that resumes this task.\n\
      Include:\n\
      - Progress so far and the key decisions made, with the reasoning behind them\n\
+     - Verification already run: each exact command and its observed outcome, so the \
+     resumed model neither repeats it nor claims a result nobody observed\n\
      - What you learned about the codebase: the real paths, symbols, and their roles\n\
      - Approaches already tried that FAILED, so they are not attempted again\n\
      - Constraints, requirements, and user preferences stated so far\n\
      - What remains to be done, as concrete next steps\n\
-     Be specific and cite real paths. Reply with ONLY the briefing.";
+     Keep it under 600 words. If an earlier briefing above already carries the task or \
+     goal, do not restate it. Be specific and cite real paths. Reply with ONLY the briefing.";
 
 /// Stable prefix of the fold breadcrumb (see `compact_messages`). Used both to
 /// build the breadcrumb and to detect, on a later fold, that an earlier briefing
@@ -42,12 +45,16 @@ pub(crate) const COMPACT_UPDATE_PROMPT: &str = "You are performing a CONTEXT CHE
      \"[Earlier context was compacted\"). Produce an UPDATED briefing that MERGES that earlier \
      briefing with the newer work about to be dropped.\n\
      Rules:\n\
-     - Preserve every still-relevant fact, decision, failed approach, real path, and constraint \
-     from the earlier briefing — do not drop them just because they are older.\n\
+     - Carry forward every fact still needed for the remaining work: decisions, real paths, \
+     constraints, failed approaches, and verification commands with their outcomes.\n\
      - Fold in what happened since: new progress, decisions, findings, and failed approaches.\n\
-     - Drop only what later work has made obsolete or superseded, and say what replaced it.\n\
+     - Drop what later work has made obsolete or superseded, and say what replaced it. \
+     An update may be SHORTER than the earlier briefing.\n\
+     - Do not restate the task or goal when an earlier briefing or [GOAL CHECKPOINT] already \
+     carries it.\n\
      Keep the same sections (progress, learnings, failed approaches, constraints, next steps). \
-     Be specific and cite real paths. Reply with ONLY the updated briefing.";
+     Keep it under 600 words. Be specific and cite real paths. \
+     Reply with ONLY the updated briefing.";
 
 /// The first index at or before `start` where a transcript tail may legally
 /// begin.
@@ -805,6 +812,34 @@ mod span_tests {
         // Nothing meaningful to fold (middle < 2) → None, and we never panic
         // trying to walk past the last message.
         assert!(span.is_none() || span.unwrap().1 == msgs.len() - 1);
+    }
+
+    /// A briefing REPLACES the history it summarizes, so it is a fixed cost on
+    /// every later request. A live 32K-window run showed the update prompt
+    /// driving monotonically growing dossiers (2,679 then 2,740 output tokens
+    /// against a 2,048-token reservation) and restating the goal the checkpoint
+    /// already carried. Both prompts must bound the briefing, allow an update
+    /// to shrink, and keep the one fact a resumed model cannot re-derive:
+    /// which verification already ran and what it returned.
+    #[test]
+    fn fold_prompts_bound_the_briefing_and_keep_verification() {
+        for prompt in [COMPACT_PROMPT, COMPACT_UPDATE_PROMPT] {
+            let lower = prompt.to_lowercase();
+            assert!(lower.contains("600 words"), "no length bound: {prompt}");
+            assert!(
+                lower.contains("verification"),
+                "verification evidence is not required: {prompt}"
+            );
+            assert!(
+                lower.contains("do not restate"),
+                "the carried goal may be restated: {prompt}"
+            );
+        }
+        assert!(
+            COMPACT_UPDATE_PROMPT.contains("SHORTER")
+                && COMPACT_UPDATE_PROMPT.contains("superseded"),
+            "an update must be allowed to drop superseded detail: {COMPACT_UPDATE_PROMPT}"
+        );
     }
 
     #[test]
