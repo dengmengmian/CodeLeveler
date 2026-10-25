@@ -79,9 +79,25 @@ pub(crate) fn decide(
                     continue;
                 }
                 let Some(last) = runs.iter().rev().find(|run| cites(&run.label, cited)) else {
+                    // The check stays exact; only the feedback improves. A
+                    // model that ran a semantically equivalent command can
+                    // copy a recorded label instead of replaying its whole
+                    // verification sequence to rediscover the exact string.
+                    let recorded: Vec<String> = runs
+                        .iter()
+                        .rev()
+                        .filter(|run| run.ok && is_verification_command(&run.label))
+                        .take(2)
+                        .map(|run| format!("`{}` (step {})", run.label, run.model_step))
+                        .collect();
+                    let hint = if recorded.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Recorded: {}.", recorded.join("; "))
+                    };
                     return VerificationDecision::Refuse(format!(
                         "`{cited}` was cited as verification but never ran in this task. Run \
-                         the command that proves the objective, or cite one you actually ran."
+                         the command that proves the objective, or cite one you actually ran.{hint}"
                     ));
                 };
                 if !last.ok {
@@ -586,6 +602,34 @@ mod tests {
         match decision {
             VerificationDecision::Refuse(message) => {
                 assert!(message.contains("never ran"), "{message}")
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    /// A refusal that names no recorded command sends the model back through
+    /// the whole verification sequence to discover an exact string. Name the
+    /// commands the runtime actually recorded, so the model can cite one and
+    /// keep the evidence check exact.
+    #[test]
+    fn a_missed_citation_refusal_names_a_command_the_runtime_actually_ran() {
+        let runs = vec![
+            run("go build ./...", true, 4, 2),
+            run("go test -count=1 ./...", true, 6, 2),
+        ];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["go test ./...".into()]),
+            &runs,
+            2,
+            true,
+        );
+        match decision {
+            VerificationDecision::Refuse(message) => {
+                assert!(message.contains("never ran"), "{message}");
+                assert!(
+                    message.contains("go test -count=1 ./..."),
+                    "the refusal must name a recorded command: {message}"
+                );
             }
             other => panic!("expected refusal, got {other:?}"),
         }
