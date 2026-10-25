@@ -227,6 +227,111 @@ async fn a_named_skill_is_a_procedure_not_a_contract() {
     assert_ne!(index.authority, skill.authority);
 }
 
+/// Full removes approval, not the user's explicit instruction. A `$name` in
+/// the request is authority, so its procedure is injected even while the
+/// optional Skills pack is still undisclosed; the index and `load_skill`
+/// stay on demand.
+#[tokio::test]
+async fn full_access_still_injects_a_named_skill_before_its_pack_is_enabled() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let available = vec![CapabilityId::Skills];
+    let disclosure =
+        Arc::new(CapabilityDisclosure::new(available.clone(), available, vec![]).unwrap());
+    Executor::new(
+        script.clone(),
+        Arc::new(leveler_tools::default_registry()),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::FullAccess,
+        ),
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_delegation(false)
+    .with_capabilities(Some(disclosure))
+    .run(
+        "use $demo to inspect",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert!(
+        skill.text.contains("SKILL_BODY_SENTINEL"),
+        "a user-named procedure must reach the model: {}",
+        skill.text
+    );
+    assert!(
+        !request.tools.iter().any(|tool| tool.name == "load_skill"),
+        "the Skills catalog stays on demand; only the named procedure is injected"
+    );
+    assert!(
+        !request
+            .control_context
+            .blocks
+            .iter()
+            .any(|block| block.name == "skill_index"),
+        "the full index stays on demand"
+    );
+}
+
+#[tokio::test]
+async fn a_named_skill_cannot_widen_authority_outside_full_access() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let disclosure =
+        Arc::new(CapabilityDisclosure::new(vec![CapabilityId::Skills], vec![], vec![]).unwrap());
+    Executor::new(
+        script.clone(),
+        Arc::new(leveler_tools::default_registry()),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_delegation(false)
+    .with_capabilities(Some(disclosure))
+    .run(
+        "use $demo to inspect",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    assert!(
+        !request
+            .control_context
+            .blocks
+            .iter()
+            .any(|block| block.name == "selected_skills"),
+        "a mention is user intent, not Skills permission; outside Full the pack stays closed"
+    );
+}
+
 #[tokio::test]
 async fn memory_is_advisory_and_absent_when_disabled() {
     let dir = tempfile::tempdir().unwrap();
