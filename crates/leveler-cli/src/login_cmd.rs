@@ -864,11 +864,17 @@ context_window = 131072
     fn login_output_resolves_the_family_replay_contract() {
         use leveler_provider::presets::preset;
 
+        // GLM's bundled facts declare preserved thinking, and login writes
+        // model facts — including that mode — so the generated route asks the
+        // endpoint to keep prior turns' thinking and therefore owes it back on
+        // every request, tool-bearing or not. A GLM deployment that clears
+        // instead sets `preserved_thinking = false` and drops to the family's
+        // tool-loop default (`when_tools`).
         for (provider, model, arm) in [
             ("deepseek", "deepseek-flash", "when_tools+empty"),
             ("deepseek", "deepseek-v4-pro", "when_tools+empty"),
-            ("bigmodel", "glm-5.3", "when_tools"),
-            ("bigmodel", "glm-5.3-flash", "when_tools"),
+            ("bigmodel", "glm-5.3", "always"),
+            ("bigmodel", "glm-5.3-flash", "always"),
         ] {
             let text = starter_config(preset(provider).unwrap(), model).unwrap();
             let bundle = leveler_app::global_config::GlobalConfig::from_toml_str(&text)
