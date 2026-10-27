@@ -888,7 +888,21 @@ async fn run_prepared_sub_agent(
             let stop_reason = if completed {
                 String::new()
             } else {
-                stop_reason_wording(outcome.stop_reason, outcome.budget_exhaustion.as_ref())
+                // The mechanical class goes first; the runtime's own reason
+                // follows it. Dropping the detail left the parent with "it
+                // stopped without finishing" and no way to tell a refusal
+                // bound from an unanswered question.
+                let class =
+                    stop_reason_wording(outcome.stop_reason, outcome.budget_exhaustion.as_ref());
+                match outcome
+                    .stop_detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|detail| !detail.is_empty())
+                {
+                    Some(detail) => format!("{class}: {detail}"),
+                    None => class,
+                }
             };
             SubAgentRunResult {
                 result: ChildResult::new(completed, &findings, stop_reason),

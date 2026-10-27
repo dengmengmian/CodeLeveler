@@ -6653,6 +6653,159 @@ async fn goal_gate_recovery_stops_after_repeated_citation_refusals() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A round that mixes a citation refusal with a call the runtime refuses
+/// before execution is still not progress. If the mixed round looked like
+/// progress, both counts would reset and a model that puts the two in one
+/// batch could re-issue them until the script ran dry.
+#[tokio::test]
+async fn a_mixed_citation_and_denial_round_is_not_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-mixed-refusal-{}",
+        std::process::id() as u64 * 43 + 9
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(dir.join("docs/out.md"), "keep me\n").unwrap();
+
+    // Every round: one write the allowlist refuses before it runs and one
+    // completion whose citation never matched a recorded command.
+    let mixed = || {
+        assistant_tool_calls(vec![
+            (
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "docs/out.md", "content": "changed\n"}),
+            ),
+            (
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "done",
+                    "verification": {"status": "passed", "detail": "echo nope"}
+                }),
+            ),
+        ])
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        mixed(),
+        mixed(),
+        mixed(),
+        mixed(),
+        mixed(),
+        assistant_text("should not be requested"),
+    ]));
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let outcome = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_write_allowlist(Some(vec!["src".to_string()]))
+    .with_approver(Arc::new(AutoDeny))
+    .with_goal_mode(true)
+    .run(
+        "do the task",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("the no-progress bound stops the turn; it does not exhaust the script");
+
+    assert_eq!(outcome.stop_reason, StopReason::Incomplete);
+    assert_ne!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "a mixed refusal round counts toward the citation bound: \
+         three of them stop the turn instead of draining the script"
+    );
+    let detail = outcome.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("verification refused"),
+        "the incomplete reason must name the exhausted bound: {detail}"
+    );
+    assert_eq!(
+        outcome.progress.no_progress_streak, 0,
+        "a correctable citation is not a denial streak: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("docs/out.md")).unwrap(),
+        "keep me\n"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A round that executes a tool is progress and resets the recovery count,
+/// so three citation refusals spread across a working turn are not a bound
+/// trip — the count measures consecutive stalled rounds, not lifetime
+/// mistakes.
+#[tokio::test]
+async fn executed_work_resets_the_verification_recovery_count() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-mixed-recovery-{}",
+        std::process::id() as u64 * 43 + 11
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let recorded = format!("{} --version", env!("CARGO"));
+
+    let citation = || passed_goal("g", "echo nope");
+    let check = || {
+        assistant_tool_call(
+            "r",
+            "run_command",
+            serde_json::json!({"program": env!("CARGO"), "args": ["--version"]}),
+        )
+    };
+    // refusal, real work, refusal, real work, refusal, then the corrected
+    // citation. Without the reset the third refusal would stop the turn.
+    let runtime = Arc::new(MockRuntime::new(vec![
+        citation(),
+        check(),
+        citation(),
+        check(),
+        citation(),
+        passed_goal("g6", &recorded),
+    ]));
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let outcome = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_goal_mode(true)
+    .run(
+        "do the task",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("executed work between refusals keeps the turn alive");
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a refusal round between working rounds is recoverable: {outcome:?}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        6,
+        "every scripted round ran; the bound did not fire"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Two refusals are not the end. Citing the command the runtime actually
 /// recorded completes the goal.
 #[tokio::test]
@@ -6866,6 +7019,313 @@ async fn goal_gate_recovery_accepts_the_full_shell_command_after_a_subcommand_ci
     assert!(
         !detail.contains("never ran"),
         "the script did run: {detail}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn bad_citation(id: &str) -> ModelResponse {
+    passed_goal(id, "go test ./...")
+}
+
+fn denied_goal_status(id: &str) -> ModelResponse {
+    assistant_tool_call(
+        id,
+        "update_goal",
+        serde_json::json!({"status": "later", "summary": "not a resolution"}),
+    )
+}
+
+/// One verification refusal and one pre-execution refusal, nothing executed.
+fn mixed_goal_refusal(verify_id: &str, denied_id: &str) -> ModelResponse {
+    assistant_tool_calls(vec![
+        (
+            verify_id,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "done",
+                "verification": {"status": "passed", "detail": "go test ./..."}
+            }),
+        ),
+        (
+            denied_id,
+            "update_goal",
+            serde_json::json!({"status": "later", "summary": "not a resolution"}),
+        ),
+    ])
+}
+
+/// A citation refusal followed by a mixed round must keep the recovery count.
+/// Treating the mixed round as progress would zero it, and the turn would
+/// never reach the bound.
+#[tokio::test]
+async fn mixed_refusal_keeps_the_verification_recovery_count() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-mixed-keep-{}",
+        std::process::id() as u64 * 43 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        bad_citation("g1"),
+        mixed_goal_refusal("g2", "d2"),
+        bad_citation("g3"),
+        bad_citation("g4"),
+        bad_citation("g5"),
+        assistant_text("should not be requested"),
+    ]));
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the recovery bound stops the turn");
+
+    assert_eq!(outcome.stop_reason, StopReason::Incomplete);
+    let detail = outcome.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("verification refused"),
+        "a mixed round must not replace the recovery stop: {detail}"
+    );
+    assert!(
+        !detail.contains("no-progress"),
+        "the verification bound is not the no-progress streak: {detail}"
+    );
+    assert_eq!(
+        outcome.progress.no_progress_streak, 0,
+        "verification recovery must not tick the denial streak: {outcome:?}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "citation, mixed, citation is the bound; a fourth must not run"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two mixed rounds are still inside the verification bound. The no-progress
+/// streak (two rounds) must not end a correctable citation early.
+#[tokio::test]
+async fn mixed_refusal_does_not_stop_on_the_no_progress_bound() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-mixed-early-{}",
+        std::process::id() as u64 * 43 + 15
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        mixed_goal_refusal("g1", "d1"),
+        mixed_goal_refusal("g2", "d2"),
+        assistant_tool_call(
+            "b",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "need a decision"}),
+        ),
+        assistant_text("should not be requested"),
+    ]));
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("two mixed rounds stay recoverable");
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Blocked,
+        "a correctable mixed refusal must not become Incomplete at the denial bound: {outcome:?}"
+    );
+    assert_eq!(runtime.recorded_requests().len(), 3);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A mixed round is not progress, so it must not clear a pre-execution streak.
+/// Two pure denials still stop on that streak, with the mixed round between them.
+#[tokio::test]
+async fn mixed_refusal_does_not_clear_a_pre_execution_streak() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-mixed-streak-{}",
+        std::process::id() as u64 * 43 + 17
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        denied_goal_status("d1"),
+        mixed_goal_refusal("g2", "d2"),
+        denied_goal_status("d3"),
+        denied_goal_status("d4"),
+        assistant_text("should not be requested"),
+    ]));
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the denial streak still stops the turn");
+
+    assert_eq!(outcome.stop_reason, StopReason::Incomplete);
+    let detail = outcome.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("no-progress"),
+        "pure pre-execution refusals keep their own stop: {detail}"
+    );
+    assert!(
+        !detail.contains("verification refused"),
+        "a denial stop must not be reported as a citation failure: {detail}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "denial, mixed, denial is the no-progress bound"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A pre-execution goal refusal, with no verification refusal in the round,
+/// still stops on the no-progress streak after two rounds.
+#[tokio::test]
+async fn a_pre_execution_goal_refusal_still_stops_on_the_no_progress_streak() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-pre-exec-{}",
+        std::process::id() as u64 * 43 + 19
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        denied_goal_status("d1"),
+        denied_goal_status("d2"),
+        denied_goal_status("d3"),
+        assistant_text("should not be requested"),
+    ]));
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("two pre-execution refusals stop the turn");
+
+    assert_eq!(outcome.stop_reason, StopReason::Incomplete);
+    assert!(
+        outcome
+            .stop_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no-progress")),
+        "expected the no-progress stop detail, got {:?}",
+        outcome.stop_detail
+    );
+    assert_eq!(runtime.recorded_requests().len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A nested goal drive has the same recovery bound as the top-level drive.
+/// Its stop stays on that drive: the streak is not a parent ledger tick, and
+/// the refusal stays a tool error.
+#[tokio::test]
+async fn goal_gate_recovery_stops_a_nested_drive() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-nested-bound-{}",
+        std::process::id() as u64 * 43 + 21
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        bad_citation("g1"),
+        bad_citation("g2"),
+        bad_citation("g3"),
+        bad_citation("g4"),
+        bad_citation("g5"),
+        assistant_text("should not be requested"),
+    ]));
+    let mut events = Vec::new();
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .with_depth(1)
+        .run(
+            "do the delegated task",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a nested drive stops on the recovery bound");
+
+    assert_eq!(outcome.stop_reason, StopReason::Incomplete);
+    let detail = outcome.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("verification refused"),
+        "the nested stop must keep the recovery reason: {detail}"
+    );
+    assert_eq!(
+        outcome.progress.no_progress_streak, 0,
+        "a nested recovery stop must not look like a denial streak"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "a nested drive must not spend its step window on the same citation"
+    );
+    let requests = runtime.recorded_requests();
+    assert!(
+        requests[2].messages.iter().all(|message| {
+            message.role != Role::User
+                || message.content.iter().all(|part| match part {
+                    ContentPart::Text { text } => !text.contains("verification refused"),
+                    _ => true,
+                })
+        }),
+        "the recovery stop must not be written back as a user message"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "verification_refused"
+            )
+        }),
+        "the nested drive still reports the refusal as a gate event"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The nested bound still leaves room to cite the recorded command.
+#[tokio::test]
+async fn goal_gate_recovery_still_accepts_a_correction_from_a_nested_drive() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-nested-correct-{}",
+        std::process::id() as u64 * 43 + 23
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let recorded = format!("{} --version", env!("CARGO"));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": env!("CARGO"), "args": ["--version"]}),
+        ),
+        passed_goal("g1", "echo nope"),
+        passed_goal("g2", "echo nope"),
+        passed_goal("g3", &recorded),
+    ]));
+    let outcome = goal_full_access(&dir, runtime, 20)
+        .with_depth(1)
+        .run(
+            "do the delegated task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a nested drive can still correct a citation");
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "two refusals must not exhaust a nested drive: {outcome:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

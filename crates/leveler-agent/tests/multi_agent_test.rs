@@ -531,6 +531,105 @@ async fn worker_ownership_rejects_out_of_scope_edit() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A child that only repeats calls refused before they ran must stop on the
+/// same mechanical no-progress bound as the top level. Without it a delegated
+/// worker spends its whole step ceiling re-issuing one refusal, the parent
+/// waits for all of it, and the reason it stopped never reaches the parent.
+#[tokio::test]
+async fn a_worker_that_only_repeats_refused_calls_stops_on_the_no_progress_bound() {
+    let dir = tmp("worker-no-progress", 118);
+    std::fs::write(dir.join("a.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "pub fn b() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // The worker owns only a.rs and every round re-issues the same b.rs edit,
+    // which the ownership fence refuses before it runs.
+    let denied = || {
+        assistant_with(
+            vec![tool_call_part(
+                "c1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Update File: b.rs\n pub fn b() {}\n+pub fn hacked() {}\n*** End Patch"
+                }),
+            )],
+            FinishReason::ToolCalls,
+        )
+    };
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![spawn_call(
+                    "s1",
+                    serde_json::json!({
+                        "task": "edit files",
+                        "role": "worker",
+                        "files": ["a.rs"]
+                    }),
+                )],
+                FinishReason::ToolCalls,
+            ),
+            denied(),
+            denied(),
+            assistant_text("worker stopped early"),
+        ],
+        Duration::from_millis(0),
+    ));
+
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
+    let mut events = Vec::new();
+    executor
+        .run(
+            "delegate to a worker",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the child's bound stops it; the script is not exhausted by refusals");
+
+    let (_, stop) = first_terminal(&events);
+    assert_eq!(
+        stop,
+        Some(leveler_agent::ChildStop::Incomplete),
+        "a worker with only refused rounds stops Incomplete, not Completed"
+    );
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SubAgentFinished { summary, .. } => Some(summary.clone()),
+            _ => None,
+        })
+        .expect("the child settles");
+    assert!(
+        summary.contains("no-progress"),
+        "the parent must be told why the child stopped: {summary}"
+    );
+    assert!(
+        runtime
+            .stream_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 4,
+        "two refused child rounds reach the bound: one spawn round, two refused \
+         child rounds, and the parent's answer — the child must not keep going"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.rs")).unwrap(),
+        "pub fn b() {}\n"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Human-review P2: a Worker must not keep a shell mutation outside its
 /// exclusive files. The existing command_write_allowlist + snapshot restore
 /// is the close — this test proves it is wired through spawn_agent, not

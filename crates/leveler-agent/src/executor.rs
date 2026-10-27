@@ -1985,6 +1985,16 @@ impl Executor {
         self
     }
 
+    /// Nesting depth of this drive. `0` is the top-level agent.
+    ///
+    /// `spawn_agent` sets `depth + 1` on the child it builds. A host that
+    /// constructs a nested goal drive itself uses this so the goal-recovery
+    /// bound still applies. The count stays on that drive.
+    pub fn with_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
     /// Give this turn the host's durable goal binder.
     ///
     /// Only a turn that did NOT start in Goal mode needs it: a mid-turn

@@ -199,10 +199,13 @@ pub(crate) struct Drive<'a> {
     /// of these facts, and a failed test/build is hard evidence against
     /// `update_goal(complete)`.
     verification_runs: Vec<super::goal_verification::VerificationRun>,
-    /// Consecutive rounds whose every call was a recoverable goal-verification
-    /// refusal. Not the generic no-progress streak: the model must be able to
-    /// read the refusal and cite the recorded command or run the check again.
-    /// A round that executes a tool resets it. A new drive starts it over.
+    /// Consecutive rounds with no executed tool call in which a
+    /// goal-verification refusal arrived, including a round that also refused
+    /// another call before it ran. Not the generic no-progress streak: the
+    /// model must be able to read the refusal and cite the recorded command
+    /// or run the check again. A denial in that round does not clear this
+    /// count and does not tick the denial streak. A round that executes a
+    /// tool resets it. A new drive starts it over.
     goal_gate_recovery_rounds: u32,
     /// Facts the terminal must carry even though the Goal resolved: accepted
     /// completions with no executable verification. Read by the engine and
@@ -1273,6 +1276,10 @@ impl<'a> Drive<'a> {
     /// A progress watchdog giving up: mark the ledger terminal, publish it,
     /// report the model's own last words (or `fallback` when it went quiet),
     /// and flush the epoch before returning.
+    ///
+    /// `detail` is the machine-readable reason carried on the outcome. It is
+    /// never substituted for the model's own final text: the runtime's reason
+    /// belongs in the terminal report, not in a fabricated assistant message.
     async fn stop_now(
         &mut self,
         rt: &mut LoopContext,
@@ -1280,15 +1287,12 @@ impl<'a> Drive<'a> {
         stop: StopReason,
         detail: &str,
         fallback: &str,
-        announce: Option<String>,
     ) -> Result<AgentOutcome, AgentError> {
         self.progress.enter_closed();
         (self.observer)(AgentEvent::ProgressUpdated {
             ledger: self.progress.clone(),
         });
-        let final_text = if let Some(announce) = announce {
-            announce
-        } else if self.last_text.trim().is_empty() {
+        let final_text = if self.last_text.trim().is_empty() {
             fallback.to_string()
         } else {
             self.last_text.clone()
@@ -4570,60 +4574,58 @@ impl AgentHarness for Drive<'_> {
         // Unconditional: a run in which every attempted action is refused is
         // making no progress, and stopping is lifecycle correctness rather
         // than advice to the model. Nothing here reads a policy flag, because
-        // a safety boundary is not an experiment.
+        // a safety boundary is not an experiment. It applies at every depth:
+        // a delegated child re-issuing one refusal spends its whole step
+        // ceiling and makes its parent wait for it.
         //
-        // A round that is only a goal-verification refusal is not that case.
-        // The tool result tells the model which citation failed and which
-        // command was recorded. Stopping on the second such round ends the
-        // turn before the model can read the latest refusal. Those rounds
-        // have their own bound and do not tick the guard streak.
-        let pure_verification_recovery =
-            !call_snapshot.is_empty() && verification_refusals_this_round == call_snapshot.len();
-        let all_refused =
-            !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len();
-        if pure_verification_recovery {
-            self.goal_gate_recovery_rounds = self.goal_gate_recovery_rounds.saturating_add(1);
-            if self.executor.depth == 0
-                && self.goal_gate_recovery_rounds >= MAX_VERIFICATION_RECOVERY_ROUNDS
-            {
-                let detail = format!(
-                    "goal verification refused {} times in a row without a corrected citation \
-                     or a new command",
-                    self.goal_gate_recovery_rounds
-                );
-                return Ok(Flow::Stop(
-                    self.stop_now(
-                        rt,
-                        messages,
-                        StopReason::Incomplete,
-                        &detail,
-                        &detail,
-                        Some(detail.clone()),
-                    )
-                    .await?,
-                ));
-            }
-        } else if all_refused {
-            self.progress.note_no_progress_round(model_steps);
-            (self.observer)(AgentEvent::ProgressUpdated {
-                ledger: self.progress.clone(),
-            });
-            if self.executor.depth == 0
-                && self
+        // The classification is "did any call run", not "which refusal owns
+        // the round". Counting a mixed round as progress reset both streaks,
+        // so a model that put a citation refusal beside a denied call could
+        // re-issue them until its budget ran out. A citation refusal is
+        // feedback the model can act on, and it has its own bound, so a round
+        // that carried one neither advances nor clears the denial streak; the
+        // recovery count is what bounds it. A round whose refusals were all
+        // pre-execution denials keeps the denial streak's stop.
+        let all_refused = !call_snapshot.is_empty()
+            && denied_calls_this_round.saturating_add(verification_refusals_this_round)
+                == call_snapshot.len();
+        let citation_refused = verification_refusals_this_round > 0;
+        if all_refused {
+            if citation_refused {
+                self.goal_gate_recovery_rounds = self.goal_gate_recovery_rounds.saturating_add(1);
+                // A nested goal drive (a host-built sub-goal) has the same
+                // bound; the counter and the stop stay on that drive.
+                if self.goal_gate_recovery_rounds >= MAX_VERIFICATION_RECOVERY_ROUNDS {
+                    let detail = format!(
+                        "goal verification refused {} times in a row without a corrected \
+                         citation or a new command",
+                        self.goal_gate_recovery_rounds
+                    );
+                    return Ok(Flow::Stop(
+                        self.stop_now(rt, messages, StopReason::Incomplete, &detail, &detail)
+                            .await?,
+                    ));
+                }
+            } else {
+                self.progress.note_no_progress_round(model_steps);
+                (self.observer)(AgentEvent::ProgressUpdated {
+                    ledger: self.progress.clone(),
+                });
+                if self
                     .progress
                     .should_hard_stop_no_progress(self.progress_caps)
-            {
-                return Ok(Flow::Stop(
-                    self.stop_now(
-                        rt,
-                        messages,
-                        StopReason::Incomplete,
-                        "no-progress streak; model steps that only repeated refused calls short-circuited",
-                        "Stopped: no progress (every attempted action was refused).",
-                        None,
-                    )
-                    .await?,
-                ));
+                {
+                    return Ok(Flow::Stop(
+                        self.stop_now(
+                            rt,
+                            messages,
+                            StopReason::Incomplete,
+                            "no-progress streak; model steps that only repeated refused calls short-circuited",
+                            "Stopped: no progress (every attempted action was refused).",
+                        )
+                        .await?,
+                    ));
+                }
             }
         } else if !call_snapshot.is_empty() {
             self.progress.note_progress(model_steps);
