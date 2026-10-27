@@ -300,8 +300,13 @@ impl ReasoningReplayContract {
     /// Resolve the contract from the protocol a route speaks and its declared
     /// compatibility facts.
     ///
-    /// This is the ONLY place that maps a compatibility switch onto replay
-    /// behaviour. It reads facts, never model or provider names.
+    /// This answers only "what did the configuration declare?". A configured
+    /// route must use [`Self::for_route`], which also consults the wire model
+    /// family's protocol requirement; calling this directly on a profile whose
+    /// compatibility block is absent reports `never` even for a family that
+    /// requires replay.
+    ///
+    /// It reads facts, never model or provider names.
     ///
     /// Protocols without a historical-reasoning channel resolve to
     /// [`Self::NONE`] regardless of their compatibility switches; the switches
@@ -310,7 +315,9 @@ impl ReasoningReplayContract {
     pub fn resolve(protocol: ProtocolKind, compatibility: &CompatibilityConfig) -> Self {
         match protocol {
             ProtocolKind::OpenAiChat => {
-                let scope = compatibility.reasoning_replay_scope;
+                let scope = compatibility
+                    .reasoning_replay_scope
+                    .unwrap_or(ReasoningReplayScope::Never);
                 let mut contract = if scope == ReasoningReplayScope::Never {
                     Self::NONE
                 } else {
@@ -319,7 +326,7 @@ impl ReasoningReplayContract {
                 // The empty-key requirement is a separate structural fact and
                 // is recorded even when the scope never replays, so a later
                 // widened scope does not silently lose it.
-                contract.missing = if compatibility.reasoning_content_key_required {
+                contract.missing = if compatibility.reasoning_content_key_required == Some(true) {
                     MissingReasoningReplay::EmptyString
                 } else {
                     MissingReasoningReplay::Omit
@@ -937,8 +944,8 @@ mod tests {
         ReasoningReplayContract::resolve(
             ProtocolKind::OpenAiChat,
             &CompatibilityConfig {
-                reasoning_replay_scope: when_tools(passback),
-                reasoning_content_key_required: key_required,
+                reasoning_replay_scope: Some(when_tools(passback)),
+                reasoning_content_key_required: Some(key_required),
                 ..empty_compat()
             },
         )
@@ -1045,8 +1052,8 @@ mod tests {
             ReasoningReplayContract::resolve(
                 ProtocolKind::OpenAiChat,
                 &CompatibilityConfig {
-                    reasoning_replay_scope: scope,
-                    reasoning_content_key_required: key_required,
+                    reasoning_replay_scope: Some(scope),
+                    reasoning_content_key_required: Some(key_required),
                     ..CompatibilityConfig::default()
                 },
             )
@@ -1091,8 +1098,8 @@ mod tests {
     #[test]
     fn protocols_without_a_channel_resolve_to_none() {
         let compat = CompatibilityConfig {
-            reasoning_replay_scope: ReasoningReplayScope::Always,
-            reasoning_content_key_required: true,
+            reasoning_replay_scope: Some(ReasoningReplayScope::Always),
+            reasoning_content_key_required: Some(true),
             ..CompatibilityConfig::default()
         };
         for protocol in [

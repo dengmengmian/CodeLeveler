@@ -63,8 +63,8 @@ use serde::Deserialize;
 use toml_edit::{DocumentMut, value};
 
 use leveler_model::{
-    CompatibilityConfig, ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind,
-    ReasoningConfig, ReasoningEffort, ReasoningStyle, ThinkingLevel,
+    CompatibilityConfig, MissingReasoningReplay, ModelCapabilities, ModelLimits, ModelProfile,
+    ProtocolKind, ReasoningConfig, ReasoningEffort, ReasoningStyle, ThinkingLevel,
 };
 use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
@@ -467,21 +467,23 @@ struct GlobalModel {
     #[serde(default = "default_true")]
     thinking_supports_forced_tool_choice: bool,
     /// Whether, and in which request shapes, historical assistant reasoning
-    /// is replayed to this provider. `never` (the default), `when_tools_present`
-    /// or `always`. The pre-existing boolean spelling
-    /// `passback_reasoning_content` is accepted and maps `true` to
-    /// `when_tools_present`.
+    /// is replayed to this provider. Absent leaves the decision to the route's
+    /// model family and then to the conservative `never` default; `never`,
+    /// `when_tools_present` or `always` declares it explicitly. The pre-existing
+    /// boolean spelling `passback_reasoning_content` is accepted and maps
+    /// `true` to `when_tools_present`.
     #[serde(
         default,
         alias = "passback_reasoning_content",
         deserialize_with = "leveler_model::profile::deserialize_reasoning_replay_scope"
     )]
-    reasoning_replay_scope: leveler_model::ReasoningReplayScope,
+    reasoning_replay_scope: Option<leveler_model::ReasoningReplayScope>,
     /// Whether a replayed assistant turn must carry the `reasoning_content`
     /// key even when it captured no reasoning (DeepSeek validates the key's
-    /// presence on such a turn). Defaults to false.
+    /// presence on such a turn). Absent leaves the decision to the route's
+    /// model family; otherwise this is an explicit declaration.
     #[serde(default)]
-    reasoning_content_key_required: bool,
+    reasoning_content_key_required: Option<bool>,
 }
 
 impl GlobalModel {
@@ -937,9 +939,25 @@ pub fn render_init_config_with_profile(
     model["supports_temperature"] = value(profile.compatibility.supports_temperature);
     model["thinking_supports_forced_tool_choice"] =
         value(profile.compatibility.thinking_supports_forced_tool_choice);
-    model["reasoning_replay_scope"] = value(profile.compatibility.reasoning_replay_scope.as_str());
-    model["reasoning_content_key_required"] =
-        value(profile.compatibility.reasoning_content_key_required);
+    // Write what the route actually resolves to: an explicit declaration, or
+    // the requirement the model family's wire protocol imposes. A model with
+    // no historical-reasoning channel writes neither field, so a generated
+    // config never claims a channel the provider does not have.
+    let required = leveler_model::required_reasoning_replay(profile.protocol, &profile.model_id);
+    if let Some(scope) = profile
+        .compatibility
+        .reasoning_replay_scope
+        .or(required.map(|required| required.scope))
+    {
+        model["reasoning_replay_scope"] = value(scope.as_str());
+    }
+    if let Some(required_key) = profile
+        .compatibility
+        .reasoning_content_key_required
+        .or(required.map(|required| required.missing == MissingReasoningReplay::EmptyString))
+    {
+        model["reasoning_content_key_required"] = value(required_key);
+    }
     annotate_generated_config(&mut doc);
     format!(
         "# CodeLeveler global config — created by `leveler login`.\n\
@@ -1777,6 +1795,152 @@ mod tests {
         }
     }
 
+    /// The lab/dogfood config and the `leveler login` output must resolve to
+    /// the SAME replay contract even though only login writes the two
+    /// compatibility fields. The route's model family is the capability source.
+    #[test]
+    fn a_hand_written_route_resolves_the_same_contract_as_login() {
+        // Shape of the Release-lab config: a DeepSeek wire model with a
+        // thinking style but no compatibility block at all.
+        let lab = r#"
+default_model = "deepseek/deepseek-v4-flash"
+
+[providers.deepseek]
+base_url = "https://gateway.invalid/api/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek-v4-flash"]
+provider = "deepseek"
+model_id = "deepseek-v4-flash"
+context_window = 1048576
+reliable_context = 786432
+max_output_tokens = 393216
+streaming = true
+tool_calling = true
+structured_output = true
+reasoning = true
+reasoning_style = "thinking_flag"
+reasoning_effort = "max"
+"#;
+        let bundle = GlobalConfig::from_toml_str(lab).unwrap().into_bundle();
+        let lab_profile = &bundle.models[0].profile;
+        assert_eq!(lab_profile.compatibility.reasoning_replay_scope, None);
+        assert_eq!(
+            lab_profile.compatibility.reasoning_content_key_required,
+            None
+        );
+        let lab_contract = leveler_model::ReasoningReplayContract::for_route(lab_profile);
+        assert_eq!(lab_contract.arm_name(), "when_tools+empty");
+        leveler_model::ReasoningReplayContract::check_route(lab_profile).unwrap();
+
+        // The login path renders the requirement it resolved, so a generated
+        // config declares the same fact instead of depending on the reader's
+        // family table.
+        let builtin = leveler_provider::builtin_model_profile("deepseek", "deepseek-flash")
+            .unwrap()
+            .unwrap();
+        let rendered = render_init_config_with_profile(
+            "deepseek",
+            "https://api.deepseek.com",
+            "DEEPSEEK_API_KEY",
+            &builtin,
+        );
+        let login_bundle = GlobalConfig::from_toml_str(&rendered)
+            .unwrap()
+            .into_bundle();
+        let login_profile = &login_bundle.models[0].profile;
+        let login_contract = leveler_model::ReasoningReplayContract::for_route(login_profile);
+        assert_eq!(login_contract, lab_contract);
+        assert_eq!(
+            login_profile.compatibility.reasoning_replay_scope,
+            Some(leveler_model::ReasoningReplayScope::WhenToolsPresent)
+        );
+        assert_eq!(
+            login_profile.compatibility.reasoning_content_key_required,
+            Some(true)
+        );
+    }
+
+    /// A route that weakens its provider's required protocol must fail at
+    /// startup with the model and field named — not on the first tool request.
+    #[test]
+    fn a_weakening_declaration_is_refused_when_the_registry_is_built() {
+        let text = r#"
+[providers.deepseek]
+base_url = "https://gateway.invalid/api/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek-flash"]
+provider = "deepseek"
+model_id = "deepseek-flash"
+context_window = 131072
+reliable_context = 65536
+max_output_tokens = 8192
+streaming = true
+tool_calling = true
+reasoning = true
+reasoning_style = "thinking_flag"
+reasoning_effort = "high"
+reasoning_replay_scope = "never"
+"#;
+        let bundle = GlobalConfig::from_toml_str(text).unwrap().into_bundle();
+        let error = leveler_provider::ProviderRegistry::build(leveler_provider::RegistryInputs {
+            providers: Vec::new(),
+            models: bundle.models,
+        })
+        .err()
+        .expect("the illegal declaration is refused");
+        let message = error.to_string();
+        assert!(message.contains("deepseek-flash"), "{message}");
+        assert!(message.contains("reasoning_replay_scope"), "{message}");
+        assert!(message.contains("HTTP 400"), "{message}");
+    }
+
+    /// A provider with no historical-reasoning channel must not receive fields
+    /// it never asked for, whatever the route is called.
+    #[test]
+    fn a_non_replay_route_keeps_writing_no_replay_fields() {
+        let profile = leveler_provider::builtin_model_profile("bigmodel", "glm-5.3")
+            .unwrap()
+            .unwrap();
+        assert!(profile.compatibility.reasoning_replay_scope.is_some());
+        let text = render_init_config_with_profile(
+            "bigmodel",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+            "BIGMODEL_API_KEY",
+            &profile,
+        );
+        let doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(
+            doc["models"]["glm-5.3"]["reasoning_replay_scope"].as_str(),
+            Some("when_tools_present")
+        );
+
+        let mut plain = profile.clone();
+        plain.model_id = "gpt-4o".into();
+        plain.provider = "openai".into();
+        plain.compatibility = CompatibilityConfig::default();
+        let text = render_init_config_with_profile(
+            "openai",
+            "https://api.openai.com/v1",
+            "OPENAI_API_KEY",
+            &plain,
+        );
+        let doc: DocumentMut = text.parse().unwrap();
+        assert!(
+            doc["models"]["glm-5.3"]
+                .get("reasoning_replay_scope")
+                .is_none(),
+            "{text}"
+        );
+        assert!(
+            doc["models"]["glm-5.3"]
+                .get("reasoning_content_key_required")
+                .is_none(),
+            "{text}"
+        );
+    }
+
     #[test]
     fn profile_rendering_preserves_explicit_anthropic_thinking_modes() {
         let mut profile = leveler_provider::builtin_model_profile("deepseek", "deepseek-flash")
@@ -2327,7 +2491,7 @@ provider = "deepseek"
     }
 
     #[test]
-    fn reasoning_replay_scope_defaults_to_never_and_accepts_both_spellings() {
+    fn reasoning_replay_scope_is_undeclared_by_default_and_accepts_both_spellings() {
         let toml = r#"
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
@@ -2356,23 +2520,23 @@ provider = "deepseek"
         };
         assert_eq!(
             find("legacy-bool"),
-            leveler_model::ReasoningReplayScope::WhenToolsPresent,
+            Some(leveler_model::ReasoningReplayScope::WhenToolsPresent),
             "the pre-existing boolean keeps its exact meaning"
         );
         assert_eq!(
             find("explicit-scope"),
-            leveler_model::ReasoningReplayScope::Always,
+            Some(leveler_model::ReasoningReplayScope::Always),
             "a route may declare the unconditional channel"
         );
         assert_eq!(
             find("legacy"),
-            leveler_model::ReasoningReplayScope::Never,
-            "routes never send the channel unless they declare it"
+            None,
+            "an undeclared route makes no claim; the model family decides"
         );
     }
 
     #[test]
-    fn passback_reasoning_content_defaults_false_and_can_be_enabled() {
+    fn passback_reasoning_content_is_undeclared_by_default_and_can_be_enabled() {
         let toml = r#"
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
@@ -2394,7 +2558,7 @@ provider = "deepseek"
                 .profile
                 .compatibility
                 .reasoning_replay_scope
-                == leveler_model::ReasoningReplayScope::WhenToolsPresent
+                == Some(leveler_model::ReasoningReplayScope::WhenToolsPresent)
         };
         assert!(
             find("needs-passback"),

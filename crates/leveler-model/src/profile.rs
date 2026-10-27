@@ -364,11 +364,14 @@ pub struct CompatibilityConfig {
     ///
     /// This is the REPLAY SCOPE — a route fact resolved into a
     /// [`crate::ReasoningReplayContract`], never a harness preference and
-    /// never a model-name branch. [`ReasoningReplayScope::Never`] (the
-    /// default) means the route has no historical-reasoning channel;
-    /// [`ReasoningReplayScope::WhenToolsPresent`] replays only on requests
-    /// that expose tools; [`ReasoningReplayScope::Always`] replays on every
-    /// request that spans the history.
+    /// never a scattered model-name branch. `None` means the configuration
+    /// makes no claim: [`crate::ReasoningReplayContract::for_route`] then
+    /// consults the wire model family's protocol requirement and falls back
+    /// to the conservative default (`never`). `Some(Never)` means the route
+    /// has no historical-reasoning channel; `Some(WhenToolsPresent)` replays
+    /// only on requests that expose tools; `Some(Always)` replays on every
+    /// request that spans the history. An explicit value may strengthen a
+    /// documented default; it may not weaken a hard provider requirement.
     ///
     /// Backward compatibility: configuration written before the scope became
     /// explicit spells this as the boolean `passback_reasoning_content`
@@ -378,9 +381,10 @@ pub struct CompatibilityConfig {
     #[serde(
         default,
         alias = "passback_reasoning_content",
-        deserialize_with = "deserialize_reasoning_replay_scope"
+        deserialize_with = "deserialize_reasoning_replay_scope",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub reasoning_replay_scope: crate::ReasoningReplayScope,
+    pub reasoning_replay_scope: Option<crate::ReasoningReplayScope>,
     /// Whether an assistant turn being replayed must carry the
     /// `reasoning_content` key even when it captured no reasoning (the empty
     /// string agrees with this provider's validator).
@@ -392,11 +396,11 @@ pub struct CompatibilityConfig {
     /// reasoning was captured). Other endpoints treat a fabricated field as
     /// content and ask clients not to send it.
     ///
-    /// Only meaningful together with a replaying
-    /// [`Self::reasoning_replay_scope`].
-    /// Default false: a turn without captured reasoning sends no field.
-    #[serde(default)]
-    pub reasoning_content_key_required: bool,
+    /// Only meaningful together with a replaying replay scope. `None` leaves
+    /// the decision to the wire model family; `Some(false)` is an explicit
+    /// declaration that a turn without captured reasoning sends no field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content_key_required: Option<bool>,
 }
 
 /// Accept either the explicit replay-scope spelling or the legacy boolean
@@ -404,7 +408,7 @@ pub struct CompatibilityConfig {
 /// three does not change the meaning of any configuration already written.
 pub fn deserialize_reasoning_replay_scope<'de, D>(
     deserializer: D,
-) -> Result<crate::ReasoningReplayScope, D::Error>
+) -> Result<Option<crate::ReasoningReplayScope>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -414,11 +418,11 @@ where
         Scope(crate::ReasoningReplayScope),
         Legacy(bool),
     }
-    Ok(match ScopeOrLegacy::deserialize(deserializer)? {
+    Ok(Some(match ScopeOrLegacy::deserialize(deserializer)? {
         ScopeOrLegacy::Scope(scope) => scope,
         ScopeOrLegacy::Legacy(true) => crate::ReasoningReplayScope::WhenToolsPresent,
         ScopeOrLegacy::Legacy(false) => crate::ReasoningReplayScope::Never,
-    })
+    }))
 }
 
 fn default_true() -> bool {
@@ -433,8 +437,8 @@ impl Default for CompatibilityConfig {
         Self {
             supports_temperature: true,
             thinking_supports_forced_tool_choice: true,
-            reasoning_replay_scope: crate::ReasoningReplayScope::Never,
-            reasoning_content_key_required: false,
+            reasoning_replay_scope: None,
+            reasoning_content_key_required: None,
         }
     }
 }
@@ -538,6 +542,7 @@ impl ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningReplayContract;
 
     /// USD/Mtok is micro-USD/token: deepseek-style $0.27/$1.10 per Mtok over
     /// 1M in + 100k out = 270_000 + 110_000 micro-USD.
@@ -740,8 +745,8 @@ mod tests {
                 // default value can't catch a field dropped from (de)serialization.
                 supports_temperature: false,
                 thinking_supports_forced_tool_choice: false,
-                reasoning_replay_scope: crate::ReasoningReplayScope::Always,
-                reasoning_content_key_required: true,
+                reasoning_replay_scope: Some(crate::ReasoningReplayScope::Always),
+                reasoning_content_key_required: Some(true),
             },
             pricing: None,
             thinking: None,
@@ -792,15 +797,23 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_config_defaults_are_empty() {
+    fn compatibility_config_defaults_are_undeclared() {
         let config: CompatibilityConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        // A route carries no historical reasoning until it declares that it
-        // does; nothing inherits another route's requirement by default.
+        // Nothing is declared. The route's model family may still impose a
+        // requirement; `ReasoningReplayContract::for_route` resolves that.
+        // `resolve` here only answers "what did the configuration say?", and
+        // the answer is nothing.
+        assert_eq!(config.reasoning_replay_scope, None);
+        assert_eq!(config.reasoning_content_key_required, None);
         assert_eq!(
-            config.reasoning_replay_scope,
-            crate::ReasoningReplayScope::Never
+            ReasoningReplayContract::resolve(ProtocolKind::OpenAiChat, &config),
+            ReasoningReplayContract::NONE
         );
-        assert!(!config.reasoning_content_key_required);
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("reasoning")
+        );
     }
 
     /// The three replay scopes are expressible as declared route facts, so a
@@ -820,7 +833,7 @@ mod tests {
                 "reasoning_replay_scope": spelling
             }))
             .unwrap();
-            assert_eq!(compat.reasoning_replay_scope, expected, "{spelling}");
+            assert_eq!(compat.reasoning_replay_scope, Some(expected), "{spelling}");
         }
     }
 
@@ -836,21 +849,21 @@ mod tests {
                 .unwrap();
         assert_eq!(
             enabled.reasoning_replay_scope,
-            crate::ReasoningReplayScope::WhenToolsPresent
+            Some(crate::ReasoningReplayScope::WhenToolsPresent)
         );
         let disabled: CompatibilityConfig =
             serde_json::from_value(serde_json::json!({"passback_reasoning_content": false}))
                 .unwrap();
         assert_eq!(
             disabled.reasoning_replay_scope,
-            crate::ReasoningReplayScope::Never
+            Some(crate::ReasoningReplayScope::Never)
         );
     }
 
     #[test]
     fn replay_scope_writes_back_as_the_explicit_spelling() {
         let compat = CompatibilityConfig {
-            reasoning_replay_scope: crate::ReasoningReplayScope::Always,
+            reasoning_replay_scope: Some(crate::ReasoningReplayScope::Always),
             ..CompatibilityConfig::default()
         };
         let json = serde_json::to_string(&compat).unwrap();

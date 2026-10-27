@@ -50,6 +50,7 @@ display and archive boundaries.
 - Sensitive-material validation covers title, body, tags and provenance evidence on every write path
 - Forget, supersede and expiry redact credential-shaped content before writing an archive; a non-sensitive record is unchanged
 - CLI, TUI, Web projections, notifications and logs no longer print a historical sensitive title or body; clients receive a redacted marker and the `sensitive` flag
+- History reasoning replay is resolved from the route's wire model family, not from whether an entry point happened to write two compatibility fields. The Release-lab/dogfood config (a reasoning route with no `compatibility` block) silently sent no `reasoning_content` on tool-bearing requests, while `leveler login` did; both now resolve through one function. DeepSeek thinking mode replays the full reasoning of every historical assistant turn on tool-bearing requests, including turns that called no tool, and a turn that captured none carries the empty key. GLM and Kimi thinking models got the same tool-loop replay their documentation requires. A model family with no historical-reasoning channel still receives no field. An explicit declaration that would weaken a provider's hard protocol requirement is a startup error naming the model and field, not a provider 400 on the first tool request
 
 ## [1.0.20] - 2026-10-19
 

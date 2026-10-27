@@ -339,24 +339,24 @@ pub fn shrink_externalized_results(
     target_tokens: u64,
     measure: impl Fn(&[Message]) -> u64,
 ) -> (Vec<Message>, usize) {
-    let candidates: Vec<(usize, usize)> = messages
-        .iter()
-        .enumerate()
-        .flat_map(|(message_index, message)| {
-            message
-                .content
-                .iter()
-                .enumerate()
-                .filter_map(move |(part_index, part)| match part {
-                    ContentPart::ToolResult { result }
-                        if leveler_model::tool_output::reference_only(&result.content).is_some() =>
-                    {
-                        Some((message_index, part_index))
-                    }
-                    _ => None,
-                })
-        })
-        .collect();
+    let candidates: Vec<(usize, usize)> =
+        messages
+            .iter()
+            .enumerate()
+            .flat_map(|(message_index, message)| {
+                message.content.iter().enumerate().filter_map(
+                    move |(part_index, part)| match part {
+                        ContentPart::ToolResult { result }
+                            if leveler_model::tool_output::reference_only(&result.content)
+                                .is_some() =>
+                        {
+                            Some((message_index, part_index))
+                        }
+                        _ => None,
+                    },
+                )
+            })
+            .collect();
     if candidates.is_empty() {
         return (messages.to_vec(), 0);
     }
@@ -444,7 +444,7 @@ pub async fn summary_request(
     request.projection = Some(leveler_model::RequestProjection::project(
         &request.messages,
         &request.tools,
-        leveler_model::ReasoningReplayContract::resolve(profile.protocol, &profile.compatibility),
+        leveler_model::ReasoningReplayContract::for_route(&profile),
         leveler_model::ReasoningRetention::All,
     ));
 
@@ -869,7 +869,10 @@ mod span_tests {
         // summary ("files touched ... but git status shows no changes") and
         // re-verify the repository instead of acting on what it had learned.
         let mut call = assistant_call("c1", "read_file");
-        if let ContentPart::ToolCall { call: ref mut inner } = call.content[0] {
+        if let ContentPart::ToolCall {
+            call: ref mut inner,
+        } = call.content[0]
+        {
             inner.arguments = serde_json::json!({"path": "internal/window/window.go"});
         }
         let mut msgs = vec![msg(Role::User, "task"), call, tool_result("c1")];
