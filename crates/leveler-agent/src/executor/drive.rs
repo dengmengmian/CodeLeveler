@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_context::{FoldRequirement, load_scoped_rules, render_instructions};
+use leveler_context::{
+    FoldRequirement, ProjectInstruction, render_instructions, scoped_rule_sources,
+};
 use leveler_lifecycle::{
     EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
 };
@@ -117,6 +119,17 @@ const MAX_LENGTH_CONTINUATIONS: u32 = 2;
 /// A round that executes a tool resets the count.
 const MAX_VERIFICATION_RECOVERY_ROUNDS: u32 = 3;
 
+/// How often the goal gate may return the SAME refusal before the run stops.
+///
+/// The recovery bound above only fires when a round does nothing else. A gate
+/// that refuses for a reason the model cannot remove — a requirement set the
+/// runtime itself made contradictory, or an artifact check reading a state the
+/// task legitimately changed — can be re-issued forever while the model keeps
+/// doing work in between (`DF-06`: 30 rounds, 661k tokens, then Blocked). Three
+/// identical verdicts on the same facts means retrying is not the fix, so the
+/// run ends as incomplete and reports the gate's own words.
+const MAX_IDENTICAL_GATE_REFUSALS: u32 = 3;
+
 /// Tokens held back from each call's share of the remaining context capacity.
 /// The estimator deliberately prices message content only, not the per-message
 /// role framing or the JSON envelope a provider also counts (see
@@ -167,6 +180,11 @@ pub(crate) struct Drive<'a> {
     /// count of the agent's request cadence, never a task-progress measure.
     model_steps: u32,
     scoped_paths: Vec<String>,
+    /// Scoped rule sources injected during the CURRENT round. Another call in
+    /// the same round cannot have read them (the request already left), so a
+    /// mutating call that needs one is refused as well — but the source is
+    /// loaded once, not once per call.
+    staged_scoped_rules: std::collections::HashSet<String>,
     progress_caps: ProgressCaps,
     progress: ProgressLedger,
     epoch_model_steps_at_start: u32,
@@ -207,6 +225,10 @@ pub(crate) struct Drive<'a> {
     /// count and does not tick the denial streak. A round that executes a
     /// tool resets it. A new drive starts it over.
     goal_gate_recovery_rounds: u32,
+    /// The last goal-gate refusal text and how many times in a row it has been
+    /// returned unchanged. Set to the gate's own message when the bound is
+    /// reached, so the round can stop after its results are durable.
+    repeated_gate_refusal: Option<(String, u32)>,
     /// Facts the terminal must carry even though the Goal resolved: accepted
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
@@ -588,6 +610,7 @@ impl Executor {
             modified_files: Vec::new(),
             model_steps: 0,
             scoped_paths,
+            staged_scoped_rules: std::collections::HashSet::new(),
             progress_caps: ProgressCaps::default(),
             epoch_model_steps_at_start: progress.cumulative_model_steps,
             epoch_tokens_at_start: progress.cumulative_model_tokens,
@@ -618,6 +641,7 @@ impl Executor {
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
             verification_runs: self.seeded_verification_runs.clone(),
             goal_gate_recovery_rounds: 0,
+            repeated_gate_refusal: None,
             completion_warnings: Vec::new(),
             decode_retries: 0,
             length_continuations: 0,
@@ -1444,6 +1468,97 @@ impl Drive<'_> {
             .unwrap_or(usize::MAX)
             .clamp(leveler_tools::registry::MIN_TOOL_OUTPUT, static_budget)
     }
+    /// Reconcile the scoped rule blocks with what is on disk right now.
+    ///
+    /// Only the CURRENT set is valid state: a new file is added, a changed
+    /// file replaces its old block, a deleted file's block disappears, and an
+    /// unchanged file is left untouched. Identity is the exact prompt text the
+    /// block would carry, so there is no version counter or digest table that
+    /// can disagree with the file. Blocks live in the control context (not the
+    /// transcript), so a fold cannot restore a stale copy.
+    ///
+    /// Returns the sources that were injected.
+    fn reconcile_scoped_rules(&mut self) -> Vec<String> {
+        let Some(root) = self.scoped_rule_root() else {
+            return Vec::new();
+        };
+        let candidates = scoped_rule_sources(&root, &self.scoped_paths);
+        let mut dropped = false;
+        let mut retained: Vec<leveler_model::PromptSegment> =
+            Vec::with_capacity(self.control_context.blocks.len());
+        for block in self.control_context.blocks.drain(..) {
+            if let Some(source) = block.name.strip_prefix("scoped_rules:") {
+                let still_valid = candidates
+                    .iter()
+                    .any(|rule| rule.source == source && scoped_rule_body(rule) == block.text);
+                if !still_valid {
+                    dropped = true;
+                    continue;
+                }
+            }
+            retained.push(block);
+        }
+        self.control_context.blocks = retained;
+        let injected = self.inject_scoped_rules(&candidates);
+        if dropped {
+            // The rules that no longer apply are gone from the request; say so
+            // without quoting them.
+            (self.observer)(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ScopedRules,
+                self.model_steps,
+            ));
+        }
+        injected
+    }
+
+    /// The nested rule documents that scope over `paths` (whether or not they
+    /// are already in the context).
+    fn applicable_scoped_rules(&self, paths: &[String]) -> Vec<ProjectInstruction> {
+        let Some(root) = self.scoped_rule_root() else {
+            return Vec::new();
+        };
+        scoped_rule_sources(&root, paths)
+    }
+
+    fn scoped_rule_root(&self) -> Option<std::path::PathBuf> {
+        self.executor
+            .tool_context
+            .execution
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+    }
+
+    fn has_scoped_rule(&self, source: &str) -> bool {
+        let name = format!("scoped_rules:{source}");
+        self.control_context
+            .blocks
+            .iter()
+            .any(|block| block.name == name)
+    }
+
+    /// Push the scoped rules that are not in the context yet. Returns the
+    /// sources that were added.
+    fn inject_scoped_rules(&mut self, rules: &[ProjectInstruction]) -> Vec<String> {
+        let mut added = Vec::new();
+        for rule in rules {
+            if self.has_scoped_rule(&rule.source) {
+                continue;
+            }
+            self.control_context.blocks.push(PromptSegment::control(
+                format!("scoped_rules:{}", rule.source),
+                PromptSource::ScopedRule {
+                    path: rule.source.clone(),
+                },
+                PromptAuthority::ProjectInstruction,
+                SegmentLifecycle::Scoped,
+                false,
+                scoped_rule_body(rule),
+            ));
+            added.push(rule.source.clone());
+        }
+        added
+    }
 }
 
 #[async_trait]
@@ -1700,54 +1815,19 @@ impl AgentHarness for Drive<'_> {
         let model_steps = rt.model_steps();
         self.model_steps = model_steps;
         let _ = rt;
-        // Discover scoped rules before this request, keeping them outside the
-        // transcript so folding history cannot remove current constraints.
-        let fresh = self
-            .executor
-            .tool_context
-            .execution
-            .workspace
-            .as_ref()
-            .map(|workspace| {
-                load_scoped_rules(
-                    workspace.root(),
-                    &self.scoped_paths,
-                    &self
-                        .control_context
-                        .blocks
-                        .iter()
-                        .filter_map(|segment| {
-                            segment
-                                .name
-                                .strip_prefix("scoped_rules:")
-                                .map(str::to_string)
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
-        if !fresh.is_empty() {
-            for rule in &fresh {
-                push_unique_path(&mut self.progress.scoped_rule_sources, &rule.source);
+        // Reconcile scoped rules before this request, keeping them outside the
+        // transcript so folding history cannot remove current constraints. A
+        // source that changed is replaced and one that disappeared is dropped:
+        // the request never carries a rule the repository no longer states.
+        self.staged_scoped_rules.clear();
+        let injected = self.reconcile_scoped_rules();
+        if !injected.is_empty() {
+            for source in &injected {
+                push_unique_path(&mut self.progress.scoped_rule_sources, source);
             }
             (self.observer)(AgentEvent::ProgressUpdated {
                 ledger: self.progress.clone(),
             });
-            for rule in &fresh {
-                self.control_context.blocks.push(PromptSegment::control(
-                    format!("scoped_rules:{}", rule.source),
-                    PromptSource::ScopedRule {
-                        path: rule.source.clone(),
-                    },
-                    PromptAuthority::ProjectInstruction,
-                    SegmentLifecycle::Scoped,
-                    false,
-                    format!(
-                        "Project rules:\n{}",
-                        render_instructions(std::slice::from_ref(rule))
-                    ),
-                ));
-            }
             (self.observer)(AgentEvent::runtime_injection(
                 crate::executor::RuntimeInjectionKind::ScopedRules,
                 model_steps,
@@ -2811,9 +2891,11 @@ impl AgentHarness for Drive<'_> {
                             if let Some(warning) = warning {
                                 self.completion_warnings.push(warning);
                             }
+                            self.repeated_gate_refusal = None;
                         }
                         super::goal_verification::VerificationDecision::Refuse(message) => {
                             verification_refusals_this_round += 1;
+                            note_gate_refusal(&mut self.repeated_gate_refusal, &message);
                             (self.observer)(AgentEvent::GoalIntercepted {
                                 kind: "verification_refused".to_string(),
                                 detail: message.clone(),
@@ -2894,9 +2976,11 @@ impl AgentHarness for Drive<'_> {
                             }) {
                                 goal_scope::ScopeDecision::Accept { warnings } => {
                                     self.completion_warnings.extend(warnings);
+                                    self.repeated_gate_refusal = None;
                                 }
                                 goal_scope::ScopeDecision::Refuse(message) => {
                                     denied_calls_this_round += 1;
+                                    note_gate_refusal(&mut self.repeated_gate_refusal, &message);
                                     (self.observer)(AgentEvent::GoalIntercepted {
                                         kind: "requirements_refused".to_string(),
                                         detail: message.clone(),
@@ -3352,46 +3436,39 @@ impl AgentHarness for Drive<'_> {
             }
 
             // A nested AGENTS.md may apply to a file the model tries to edit
-            // directly. Refuse that first edit and inject the scoped rules
-            // on the next round; otherwise the edit lands before the model
-            // ever sees the rules governing it.
+            // directly. Load it NOW (so this round's control context carries
+            // it) and refuse only the calls whose own target paths need it;
+            // an unrelated path in the same batch is not the punished one.
             if self.executor.registry.mutates_files(&call.name) {
-                let mut target_paths = self.scoped_paths.clone();
-                collect_scoped_paths_from_call(&call, &mut target_paths);
-                let fresh = self
-                    .executor
-                    .tool_context
-                    .execution
-                    .workspace
-                    .as_ref()
-                    .map(|workspace| {
-                        load_scoped_rules(
-                            workspace.root(),
-                            &target_paths,
-                            &self
-                                .control_context
-                                .blocks
-                                .iter()
-                                .filter_map(|segment| {
-                                    segment
-                                        .name
-                                        .strip_prefix("scoped_rules:")
-                                        .map(str::to_string)
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .unwrap_or_default();
-                if !fresh.is_empty() {
-                    self.scoped_paths = target_paths;
-                    let sources = fresh
+                let mut call_paths = Vec::new();
+                collect_scoped_paths_from_call(&call, &mut call_paths);
+                let applicable = self.applicable_scoped_rules(&call_paths);
+                let unread = applicable
+                    .iter()
+                    .filter(|rule| !self.has_scoped_rule(&rule.source))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // Already injected earlier in this same round: the request
+                // the model is answering left before that injection, so this
+                // call has not read it either.
+                let staged_here = applicable
+                    .iter()
+                    .any(|rule| self.staged_scoped_rules.contains(&rule.source));
+                if !unread.is_empty() || staged_here {
+                    for path in &call_paths {
+                        push_unique_path(&mut self.scoped_paths, path);
+                    }
+                    for source in self.inject_scoped_rules(&unread) {
+                        self.staged_scoped_rules.insert(source);
+                    }
+                    let sources = applicable
                         .iter()
                         .map(|rule| rule.source.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
                     let msg = format!(
                         "Edit paused before execution: project rules were discovered for \
-                             this path ({sources}). They will be injected as system rules on \
+                             this path ({sources}). They are part of the system rules from \
                              the next model step; review them, then retry the edit."
                     );
                     denied_calls_this_round += 1;
@@ -4632,6 +4709,20 @@ impl AgentHarness for Drive<'_> {
             self.goal_gate_recovery_rounds = 0;
         }
 
+        // A gate that returns the SAME verdict while the model keeps doing
+        // other work is stuck, not slow. The all-refused bounds above own the
+        // case where nothing else ran (they can name the correction); this one
+        // owns the case that wasted thirty rounds in DF-06: real tool calls
+        // between identical refusals, so no no-progress streak ever tripped.
+        if all_refused {
+            // Already classified by the bounded recovery above.
+        } else if let Some(detail) = stuck_gate_detail(&self.repeated_gate_refusal) {
+            return Ok(Flow::Stop(
+                self.stop_now(rt, messages, StopReason::Incomplete, &detail, &detail)
+                    .await?,
+            ));
+        }
+
         // Goal mode: an explicit update_goal this round ends the run now that
         // its result is committed.
         if let Some((reason, summary)) = goal_resolution {
@@ -5538,6 +5629,41 @@ fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<St
 /// An absolute path, a `..` escape, a missing workspace, or an unresolvable
 /// path is `Unknown`; the completion gate then records an honest unverified
 /// boundary rather than guessing.
+/// Record one goal-gate refusal against the previous one.
+fn note_gate_refusal(slot: &mut Option<(String, u32)>, message: &str) {
+    let count = match &*slot {
+        Some((previous, count)) if previous == message => count.saturating_add(1),
+        _ => 1,
+    };
+    *slot = Some((message.to_string(), count));
+}
+
+/// The stuck-gate detail once the same verdict has repeated past
+/// [`MAX_IDENTICAL_GATE_REFUSALS`], else `None`.
+fn stuck_gate_detail(slot: &Option<(String, u32)>) -> Option<String> {
+    let (message, count) = slot.as_ref()?;
+    (*count >= MAX_IDENTICAL_GATE_REFUSALS).then(|| {
+        let reason = message.lines().nth(1).unwrap_or(message).trim();
+        format!(
+            "the goal gate returned the same refusal {count} times; the facts it reads did \
+             not change, so retrying cannot satisfy it ({reason})"
+        )
+    })
+}
+
+/// The exact prompt text one scoped rule contributes.
+///
+/// This string IS the identity used to reconcile a block with the file: equal
+/// bytes means the same rule is already delivered, different bytes means the
+/// file changed and its block must be replaced. No separate digest table can
+/// disagree with what the model was given.
+fn scoped_rule_body(rule: &ProjectInstruction) -> String {
+    format!(
+        "Project rules:\n{}",
+        render_instructions(std::slice::from_ref(rule))
+    )
+}
+
 fn artifact_state(
     workspace: Option<&leveler_execution::Workspace>,
     path: &str,
@@ -6035,5 +6161,45 @@ mod fold_requirement_tests {
             compaction_failure_class(&AgentError::Persistence("db down".into())),
             "other"
         );
+    }
+}
+
+#[cfg(test)]
+mod gate_refusal_bound_tests {
+    use super::{MAX_IDENTICAL_GATE_REFUSALS, note_gate_refusal, stuck_gate_detail};
+
+    /// A gate that returns the same verdict again and again is not making
+    /// progress; the bound ends the run with the gate's own words instead of
+    /// spending thirty more rounds on it (DF-06: 30 rounds, 661k tokens).
+    #[test]
+    fn identical_gate_refusals_stop_the_run_at_the_bound() {
+        let mut slot = None;
+        let message = "update_goal(complete) was refused: the user's stated scope is not fully accounted for.\n\
+             - `src/AGENTS.md` is accounted done, but it does not exist in the workspace";
+        for attempt in 1..MAX_IDENTICAL_GATE_REFUSALS {
+            note_gate_refusal(&mut slot, message);
+            assert_eq!(
+                stuck_gate_detail(&slot),
+                None,
+                "attempt {attempt} must still be recoverable"
+            );
+        }
+        note_gate_refusal(&mut slot, message);
+        let detail = stuck_gate_detail(&slot).expect("the bound stopped the run");
+        assert!(detail.contains("src/AGENTS.md"), "{detail}");
+        assert!(detail.contains("same refusal"), "{detail}");
+    }
+
+    /// Different verdicts are not the same stuck gate: a model fixing one
+    /// requirement at a time must not be cut off.
+    #[test]
+    fn a_changing_verdict_restarts_the_count() {
+        let mut slot = None;
+        for _ in 0..(MAX_IDENTICAL_GATE_REFUSALS * 2) {
+            note_gate_refusal(&mut slot, "first requirement is missing");
+            note_gate_refusal(&mut slot, "second requirement is missing");
+            note_gate_refusal(&mut slot, "third requirement is missing");
+            assert_eq!(stuck_gate_detail(&slot), None);
+        }
     }
 }

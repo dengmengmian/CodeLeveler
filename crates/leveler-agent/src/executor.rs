@@ -2421,16 +2421,53 @@ impl Executor {
         // `.leveler/config.yaml` the rest of the runtime reads. Composing it
         // here keeps the selection next to the rules it selects, and keeps a
         // model from ever being the thing that decides which rules matter.
-        let policy = root
-            .and_then(leveler_project::ProjectConfig::load)
-            .map(|config| leveler_context::RuleDeliveryPolicy {
-                always: config.rules.always_delivered,
-                budget_bytes: config.rules.budget_bytes,
+        let loaded = root.map(leveler_project::ProjectConfig::load_rules_policy);
+        let policy = loaded
+            .as_ref()
+            .map(|loaded| leveler_context::RuleDeliveryPolicy {
+                always: loaded.policy.always_delivered.clone(),
+                budget_bytes: loaded.policy.budget_bytes,
             })
             .unwrap_or_default();
-        let project_rules = root
-            .map(|root| leveler_context::load_rules_for_delivery(root, &policy))
-            .unwrap_or_default();
+        let mut rule_diagnostics = Vec::new();
+        let project_rules = match root {
+            Some(root) => {
+                if let Some(diagnostic) =
+                    loaded.as_ref().and_then(|loaded| loaded.diagnostic.clone())
+                {
+                    // A `.leveler/config.yaml` that cannot be parsed used to
+                    // fall back to "no mandatory rules, default budget" in
+                    // silence, which turns pinned authority into prose that
+                    // may be omitted. The model is told; the operator sees a
+                    // warning.
+                    tracing::warn!(event = "rule_policy_unreadable", %diagnostic);
+                    rule_diagnostics.push(format!(
+                        "The project's rule delivery policy could not be read ({diagnostic}); \
+                         no section is treated as mandatory this turn."
+                    ));
+                }
+                let plan = leveler_context::plan_rule_delivery(root, &policy);
+                let report = &plan.report;
+                tracing::info!(
+                    event = "rule_delivery",
+                    budget_bytes = report.budget_bytes,
+                    mandatory_bytes = report.mandatory_bytes,
+                    optional_bytes = report.optional_bytes,
+                    index_bytes = report.index_bytes,
+                    sections_delivered = report.sections_delivered,
+                    sections_omitted = report.sections_omitted,
+                    mandatory_undelivered = report.undelivered_mandatory.len(),
+                    mandatory_unmatched = report.unmatched_mandatory.len(),
+                    sources = ?plan.documents.iter().map(|rule| rule.source.as_str()).collect::<Vec<_>>(),
+                    "project rule delivery"
+                );
+                for entry in &report.unmatched_mandatory {
+                    tracing::warn!(event = "mandatory_rule_unmatched", entry = %entry);
+                }
+                plan.documents
+            }
+            None => Vec::new(),
+        };
         let mut segments =
             PromptBuilder::new()
                 .optional_guidance(
@@ -2451,6 +2488,7 @@ impl Executor {
                     network_scope: self.tool_context.policy.network_scope(),
                     cwd: root.map(std::path::Path::to_path_buf),
                     project_rules,
+                    rule_diagnostics,
                     user_language: crate::prompt::user_language(request),
                     repo_map: root.map(workspace_listing).unwrap_or_default(),
                 })

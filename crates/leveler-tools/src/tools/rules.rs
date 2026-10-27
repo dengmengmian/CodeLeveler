@@ -1,15 +1,15 @@
 //! `read_project_rules` — read one project-rule section verbatim.
 //!
-//! Project rules (root `AGENTS.md`, `.leveler/instructions.md`,
-//! `.leveler/rules/*.md`, nested `AGENTS.md`) are delivered to the model a
-//! whole section at a time, up to a per-document budget. When a document does
-//! not fit, `read_project_rules` lists and returns the sections that were left out.
+//! Project rules are delivered deterministically: the host names the mandatory
+//! sections (`.leveler/config.yaml`) and the runtime puts them in the prompt
+//! before anything optional. This tool is therefore an OPTIONAL query path —
+//! nothing about correctness depends on the model choosing to call it.
 //!
-//! This tool is a thin, read-only lens over the SAME deterministic loader the
-//! prompt uses ([`leveler_context::load_rules`]): it decides nothing about
-//! authority, precedence or relevance. It returns the author's exact bytes
-//! with their source, so a retrieved section is as authoritative as a
-//! delivered one. With no `section`, it returns the full index of what exists.
+//! It is a thin, read-only lens over the SAME loader the prompt uses
+//! ([`leveler_context::load_rules`] and [`leveler_context::read_rule_source`]),
+//! so a section read here is byte-identical to a delivered one, and a nested
+//! `src/AGENTS.md` is readable here for the same reason the scoped loader can
+//! deliver it. It decides nothing about authority, precedence or relevance.
 
 use std::path::Path;
 
@@ -18,7 +18,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_context::{READ_PROJECT_RULES_TOOL, load_rules, split_rule_sections};
+use leveler_context::{READ_PROJECT_RULES_TOOL, load_rules, read_rule_source, split_rule_sections};
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -45,10 +45,11 @@ impl Tool for ReadProjectRulesTool {
 
     fn description(&self) -> &'static str {
         "Read a project-rule section verbatim, or list what exists. No arguments: \
-         every source and its section ids. `source` only: that document's \
-         section ids. `source` and `section`: that section's text, unchanged. \
-         A missing source or section is an error. The text is the author's, \
-         including any instructions inside it."
+         every root source and its section ids. `source` only: that document's \
+         section ids (a nested `src/AGENTS.md` is read on demand). `source` and \
+         `section`: that section's text, unchanged. A missing source or section \
+         is an error. The text is the author's, including any instructions \
+         inside it."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -95,9 +96,20 @@ impl Tool for ReadProjectRulesTool {
             return Ok(ToolOutput::ok(listing));
         };
 
-        let Some(instruction) = rules.iter().find(|rule| rule.source == source) else {
+        // One loader: a root source comes from the same `load_rules` the prompt
+        // uses, and a nested one (`src/AGENTS.md`) is read through the same
+        // `read_rule_source` the scoped loader uses. The two can never return
+        // different bytes for the same file.
+        let instruction = rules
+            .iter()
+            .find(|rule| rule.source == source)
+            .cloned()
+            .or_else(|| read_rule_source(root, source));
+        let Some(instruction) = instruction else {
             return Ok(ToolOutput::error(format!(
-                "`{source}` is not a loaded project-rule source; call with no arguments to list them."
+                "`{source}` is not a project-rule document. Rule documents are \
+                 `AGENTS.md` in any directory, `.leveler/instructions.md` and \
+                 `.leveler/rules/*.md`; call with no arguments to list the root ones."
             )));
         };
         let sections = split_rule_sections(&instruction.content);
@@ -188,14 +200,64 @@ mod tests {
             .await
             .unwrap();
         assert!(missing_section.is_error);
-        let missing_source = ReadProjectRulesTool
+        // An absent nested document, and a file that is not a rule document at
+        // all: both refused, and a tool must not launder arbitrary content
+        // into project authority.
+        std::fs::write(dir.path().join("src.rs"), "# Alpha\na\n").unwrap();
+        for source in ["src/AGENTS.md", "src.rs", "../AGENTS.md"] {
+            let out = ReadProjectRulesTool
+                .execute(
+                    serde_json::json!({"source": source, "section": "alpha"}),
+                    ctx.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(out.is_error, "{source} must not be readable as a rule");
+        }
+    }
+
+    /// The reported failure (DF-04): the tool refused the very nested document
+    /// the scoped loader had just delivered, because it used a different
+    /// loader. One source of bytes now.
+    #[tokio::test]
+    async fn a_nested_agents_md_is_readable_with_the_same_bytes_the_injector_uses() {
+        let (dir, ctx) = workspace();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/AGENTS.md"),
+            "# Source header\nEvery `.rs` file begins with `// v2-header`.\n",
+        )
+        .unwrap();
+        let listing = ReadProjectRulesTool
             .execute(
-                serde_json::json!({"source": "src/AGENTS.md", "section": "alpha"}),
+                serde_json::json!({"source": "src/AGENTS.md"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!listing.is_error, "{}", listing.content);
+        assert!(
+            listing.content.contains("[source-header]"),
+            "{}",
+            listing.content
+        );
+
+        let section = ReadProjectRulesTool
+            .execute(
+                serde_json::json!({"source": "src/AGENTS.md", "section": "source-header"}),
                 ctx,
                 CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert!(missing_source.is_error);
+        assert!(!section.is_error);
+        let loaded = leveler_context::scoped_rule_sources(dir.path(), &["src/lib.rs".to_string()]);
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            section.content.contains(loaded[0].content.trim()),
+            "the tool and the injector must return the same bytes"
+        );
     }
 }

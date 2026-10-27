@@ -394,6 +394,19 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
         if duplicate {
             continue;
         }
+        // One artifact cannot be both required and required-absent. When the
+        // same path appears under opposite verbs, the LATER statement is the
+        // user's final word (`create a.txt. delete a.txt.` asks for absence),
+        // so the earlier claim is replaced instead of kept beside it. Keeping
+        // both made the gate unsatisfiable and the run loop (DF-06).
+        if let Some(existing) = requirements.iter_mut().find(|requirement| {
+            normalize(&requirement.text) == normalize(&text)
+                && matches!(requirement.kind, RequirementKind::Artifact { .. })
+                && matches!(kind, RequirementKind::Artifact { .. })
+        }) {
+            existing.kind = kind;
+            continue;
+        }
         requirements.push(Requirement {
             id: format!("R{}", requirements.len() + 1),
             text,
@@ -756,14 +769,7 @@ fn collect_backticks(
                 continue;
             }
             added_path = true;
-            let kind = if executable_path(&token)
-                && (has_any(span, RUN_VERBS) || has_any(segment, RUN_VERBS))
-            {
-                RequirementKind::Command
-            } else {
-                RequirementKind::Artifact { removed: false }
-            };
-            out.push((token, kind, source.clone()));
+            out.push((token.clone(), path_kind(segment, &token), source.clone()));
         }
         if added_path || is_test_phrase(span) {
             continue;
@@ -816,13 +822,10 @@ fn collect_paths(
             continue;
         }
         let clause = clause_around(segment, &token);
-        let removed = has_any(clause, REMOVAL_VERBS) && !has_any(clause, NEGATIONS);
-        let kind = if removed {
-            RequirementKind::Artifact { removed: true }
-        } else if executable_path(&token) && has_any(clause, RUN_VERBS) {
+        let kind = if executable_path(&token) && has_any(clause, RUN_VERBS) {
             RequirementKind::Command
         } else {
-            RequirementKind::Artifact { removed: false }
+            path_kind(segment, &token)
         };
         out.push((token, kind, source.clone()));
     }
@@ -897,6 +900,63 @@ fn kind_key(kind: RequirementKind) -> u8 {
         RequirementKind::Named => 3,
         RequirementKind::Tests => 4,
     }
+}
+
+/// Classify one path token by the verb that governs it.
+///
+/// The nearest governing verb before the token decides, not the sentence: a
+/// single clause can delete one path and create another (`delete `old.txt`,
+/// create `new.txt``), and a whole-sentence scan would apply the deletion verb
+/// to both. Both the backticked and the bare-path scan use this one function,
+/// so one path yields one requirement.
+fn path_kind(segment: &str, token: &str) -> RequirementKind {
+    if removal_expected(segment, token) {
+        return RequirementKind::Artifact { removed: true };
+    }
+    // A command is judged over its clause, not its nearest verb: `go build
+    // ./...` names the run first and the executable afterwards.
+    if executable_path(token) && has_any(clause_around(segment, token), RUN_VERBS) {
+        return RequirementKind::Command;
+    }
+    RequirementKind::Artifact { removed: false }
+}
+
+/// Whether the user asked for `token` to be absent.
+///
+/// The nearest verb wins among removal, delivery and negation words, so
+/// `delete `a` and create `b`` classifies each path by its own verb and
+/// `do not delete `a`` is not a removal requirement.
+fn removal_expected(segment: &str, token: &str) -> bool {
+    let Some(at) = last_match_end(segment, token) else {
+        return false;
+    };
+    let prefix = &segment[..at];
+    let nearest = REMOVAL_VERBS
+        .iter()
+        .map(|needle| (needle, true))
+        .chain(DELIVERY_VERBS.iter().map(|needle| (needle, false)))
+        .chain(NEGATIONS.iter().map(|needle| (needle, false)))
+        .filter_map(|(needle, removal)| last_match_end(prefix, needle).map(|end| (end, removal)))
+        .max_by_key(|(end, _)| *end);
+    matches!(nearest, Some((_, true)))
+}
+
+/// Byte offset of the end of the last case-insensitive occurrence of `needle`
+/// in `haystack`. ASCII case folding only: the verb lists are ASCII or CJK, and
+/// folding per char keeps offsets valid for both.
+fn last_match_end(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut best = None;
+    for (start, _) in haystack.char_indices() {
+        if let Some(candidate) = haystack[start..].get(..needle.len())
+            && candidate.eq_ignore_ascii_case(needle)
+        {
+            best = Some(start + candidate.len());
+        }
+    }
+    best
 }
 
 fn has_any(text: &str, needles: &[&str]) -> bool {
@@ -1713,6 +1773,73 @@ mod tests {
             }),
             "{requirements:?}"
         );
+    }
+
+    /// The DF-06 shape: a backticked path in a deletion clause. Reading the
+    /// backticked span as an artifact without its clause made the runtime
+    /// demand that the file the user asked to delete keep existing, while the
+    /// bare-path scan produced the opposite requirement. The pair was
+    /// unsatisfiable, so completion could only loop (30 rounds, 661k tokens).
+    #[test]
+    fn a_backticked_path_in_a_deletion_clause_expects_absence() {
+        let requirements = extract(
+            "First delete `src/AGENTS.md`. Then add `pub fn add(a: i32, b: i32) -> i32` to \
+             `src/lib.rs`. No file header is required any more.",
+            &[],
+        );
+        let deleted: Vec<&Requirement> = requirements
+            .iter()
+            .filter(|requirement| requirement.text == "src/AGENTS.md")
+            .collect();
+        assert_eq!(
+            deleted.len(),
+            1,
+            "one fact per path, never a presence and an absence claim: {requirements:?}"
+        );
+        assert_eq!(
+            deleted[0].kind,
+            RequirementKind::Artifact { removed: true },
+            "the clause says delete: {requirements:?}"
+        );
+    }
+
+    /// A deletion and a creation in one clause keep their own verbs. The
+    /// deletion verb must not travel to the path named after it.
+    #[test]
+    fn a_removal_verb_does_not_apply_to_a_later_path_in_the_same_clause() {
+        let requirements = extract("Delete `old.txt` and create `new.txt`.", &[]);
+        let old = requirements
+            .iter()
+            .find(|requirement| requirement.text == "old.txt")
+            .expect("old.txt");
+        let new = requirements
+            .iter()
+            .find(|requirement| requirement.text == "new.txt")
+            .expect("new.txt");
+        assert_eq!(old.kind, RequirementKind::Artifact { removed: true });
+        assert_eq!(new.kind, RequirementKind::Artifact { removed: false });
+    }
+
+    /// Two statements about one path must not become two contradictory
+    /// requirements. The later one is the user's final word.
+    #[test]
+    fn opposite_statements_about_one_path_keep_only_the_last() {
+        for (text, removed) in [
+            ("Create `a.txt`. Delete `a.txt`.", true),
+            ("Delete `a.txt`. Create `a.txt`.", false),
+        ] {
+            let requirements = extract(text, &[]);
+            let found: Vec<&Requirement> = requirements
+                .iter()
+                .filter(|requirement| requirement.text == "a.txt")
+                .collect();
+            assert_eq!(found.len(), 1, "one fact per path: {requirements:?}");
+            assert_eq!(
+                found[0].kind,
+                RequirementKind::Artifact { removed },
+                "{text}: {requirements:?}"
+            );
+        }
     }
 
     #[test]

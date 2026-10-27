@@ -767,3 +767,215 @@ fn a_legacy_user_row_is_not_promoted() {
     assert_ne!(class.authority, PromptAuthority::UserIntent);
     assert!(!class.authority.is_instruction());
 }
+
+fn tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: calls
+                .into_iter()
+                .map(|(id, name, arguments)| ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new(id),
+                        name: name.into(),
+                        arguments,
+                    },
+                })
+                .collect(),
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
+fn scoped_blocks<'a>(
+    request: &'a ModelRequest,
+    source: &str,
+) -> Vec<&'a leveler_model::PromptSegment> {
+    let name = format!("scoped_rules:{source}");
+    request
+        .control_context
+        .blocks
+        .iter()
+        .filter(|segment| segment.name == name)
+        .collect()
+}
+
+fn pause_messages(request: &ModelRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|part| match part {
+            ContentPart::ToolResult { result } => {
+                result.content.contains("Edit paused before execution")
+            }
+            _ => false,
+        })
+        .count()
+}
+
+/// DF-05: the rules that are in force are the ones on disk now. A changed
+/// nested document must replace its delivered block, not sit beside the old
+/// copy. Everything here is state the runtime can check; the model re-reading
+/// the file is not what makes it correct.
+#[tokio::test]
+async fn a_changed_scoped_rule_replaces_its_block() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/AGENTS.md"),
+        "# Source header\nbegin every file with `// v1-header`\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+    let script = Script::new(vec![
+        read("src/lib.rs"),
+        tool_calls(vec![(
+            "w1",
+            "write_file",
+            serde_json::json!({
+                "path": "src/AGENTS.md",
+                "content": "# Source header\nbegin every file with `// v2-header`\n",
+            }),
+        )]),
+        read("src/lib.rs"),
+        answer("done"),
+    ]);
+    executor(dir.path(), script.clone())
+        .run(
+            "change the header rule, then edit the source",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = script.requests.lock().unwrap();
+    let after = requests.last().expect("a request after the change");
+    let blocks = scoped_blocks(after, "src/AGENTS.md");
+    assert_eq!(blocks.len(), 1, "exactly one block per source: {blocks:?}");
+    assert!(blocks[0].text.contains("v2-header"), "{}", blocks[0].text);
+    assert!(
+        !after.control_context.text().contains("v1-header"),
+        "the stale rule must not survive in the request"
+    );
+}
+
+/// DF-06: a deleted nested document is no longer a rule. The block disappears
+/// with the file; the transcript keeps only history.
+#[tokio::test]
+async fn a_deleted_scoped_rule_is_removed_from_the_live_context() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/AGENTS.md"),
+        "# Source header\nbegin every file with `// must-header`\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+    let script = Script::new(vec![
+        read("src/lib.rs"),
+        tool_calls(vec![(
+            "d1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Delete File: src/AGENTS.md\n*** End Patch"}),
+        )]),
+        read("src/lib.rs"),
+        answer("done"),
+    ]);
+    executor(dir.path(), script.clone())
+        .run(
+            "delete the source rule, then keep working",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(!dir.path().join("src/AGENTS.md").exists());
+    let requests = script.requests.lock().unwrap();
+    let after = requests.last().expect("a request after the deletion");
+    assert!(
+        scoped_blocks(after, "src/AGENTS.md").is_empty(),
+        "a deleted rule must not stay live: {:?}",
+        after.control_context.text()
+    );
+    assert!(!after.control_context.text().contains("must-header"));
+}
+
+/// DF-14: the pre-edit pause costs ONE denial for the path that needs the rule.
+/// A call in the same batch for a different directory is not refused for it,
+/// and the rule is loaded inside this round rather than on a later re-discovery.
+#[tokio::test]
+async fn an_edit_pause_blocks_only_the_path_that_needs_the_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::create_dir(dir.path().join("answers")).unwrap();
+    std::fs::write(
+        dir.path().join("src/AGENTS.md"),
+        "# Source header\nbegin every file with `// v1-header`\n",
+    )
+    .unwrap();
+
+    let script = Script::new(vec![
+        tool_calls(vec![
+            (
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "src/fresh.rs", "content": "pub fn fresh() -> i32 { 7 }\n"}),
+            ),
+            (
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "answers/answer.txt", "content": "done\n"}),
+            ),
+        ]),
+        tool_calls(vec![(
+            "w3",
+            "write_file",
+            serde_json::json!({
+                "path": "src/fresh.rs",
+                "content": "// v1-header\npub fn fresh() -> i32 { 7 }\n",
+            }),
+        )]),
+        answer("done"),
+    ]);
+    executor(dir.path(), script.clone())
+        .run(
+            "write a new source file without reading anything first",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = script.requests.lock().unwrap();
+    // One pause, for `src/fresh.rs` only.
+    assert_eq!(
+        pause_messages(&requests[1]),
+        1,
+        "one pause for one path: {:?}",
+        requests[1].messages
+    );
+    // The unrelated path ran in the same round instead of being refused.
+    assert!(
+        dir.path().join("answers/answer.txt").is_file(),
+        "an unrelated path must not be blocked by another directory's rules"
+    );
+    // The rule reached the very next request.
+    assert!(
+        requests[1].control_context.text().contains("v1-header"),
+        "the rule must be in the next request, not a later one"
+    );
+    // And it did not pause a second time for the same file.
+    assert_eq!(pause_messages(&requests[2]), 1, "no second pause");
+    assert!(dir.path().join("src/fresh.rs").is_file());
+}
