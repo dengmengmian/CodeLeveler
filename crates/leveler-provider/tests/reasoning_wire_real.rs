@@ -125,6 +125,16 @@ fn registry() -> ProviderRegistry {
             "glm-5.3",
             ReasoningStyle::ThinkingFlag,
         ),
+        // The same GLM model through the gateway. The official Coding-Plan
+        // credential in this lab expires independently of the code, so this
+        // route is what keeps the preserved-mode wire measurable; its result is
+        // reported as gateway evidence and never as the official endpoint's.
+        (
+            "glm-5.3",
+            "taotoken",
+            "glm-5.3",
+            ReasoningStyle::ThinkingFlag,
+        ),
         (
             "kimi-k3",
             "taotoken",
@@ -1500,6 +1510,9 @@ async fn real_preserved_modes_replay_a_tool_free_turn() {
     let registry = registry();
     for (provider_id, id) in [
         ("bigmodel", "glm-5.3"),
+        // Same model, gateway route: real evidence for the wire shape, never a
+        // substitute for the official Coding-Plan endpoint's acceptance.
+        ("taotoken", "glm-5.3"),
         // The same K3 model through a gateway: real evidence for the wire
         // shape, not a substitute for the official endpoint's acceptance.
         ("taotoken", "kimi-k3"),
@@ -1555,7 +1568,7 @@ async fn real_preserved_modes_replay_a_tool_free_turn() {
             );
         }
         let (status, body) = send_body(&context, &first).await;
-        if kimi && !entitled(label_kimi(id), status, &body) {
+        if !entitled(format!("{provider_id}/{id}"), status, &body) {
             continue;
         }
         assert_eq!(status, 200, "{id}: the first tool-free request is accepted");
@@ -1609,7 +1622,7 @@ async fn real_preserved_modes_replay_a_tool_free_turn() {
             );
         }
         let (status, body) = send_body(&context, &second).await;
-        if kimi && !entitled(label_kimi(id), status, &body) {
+        if !entitled(format!("{provider_id}/{id}"), status, &body) {
             continue;
         }
         let continued = body["choices"][0]["message"]["content"]
@@ -1892,10 +1905,10 @@ fn entitled(label: String, status: u16, body: &serde_json::Value) -> bool {
     // Two environment gaps, neither of which is a protocol result:
     //  * 403 `permission_denied_error`: the subscription does not cover this
     //    model;
-    //  * 401 `invalid_authentication_error`: the credential is not valid for
-    //    that endpoint (a key for a different host, or one that expired).
-    let denied = (status == 403 && body["error"]["type"] == "permission_denied_error")
-        || (status == 401 && body["error"]["type"] == "invalid_authentication_error");
+    //  * 401: the credential was refused (expired, or issued for another host).
+    //    The body shape differs per vendor, so the status is the fact.
+    let denied =
+        (status == 403 && body["error"]["type"] == "permission_denied_error") || status == 401;
     assert!(denied, "{label}: unexpected status {status}: {body}");
     eprintln!(
         "[{label}] NOT VERIFIED: the official endpoint answered HTTP {status} \
