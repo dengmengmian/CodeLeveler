@@ -277,6 +277,8 @@ fn visible_choices(style: ReasoningStyle, supported: &[ReasoningEffort]) -> Vec<
             style,
             default_effort: supported.last().copied(),
             supported_efforts: supported.to_vec(),
+            preserved_thinking: None,
+            forced: false,
         },
     )
     .levels()

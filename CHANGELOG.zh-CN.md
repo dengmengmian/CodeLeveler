@@ -8,6 +8,17 @@
 
 ### 新增
 
+- 推理回放有了来源归属。每条 assistant 回合记录产生它的路由（provider、线上 model、协议，以及已知时的部署地址），历史推理只回放给产生它的路由，且按回合判断：A → B → A 之后，A 早期的推理重新属于 A。切换模型时保留用户目标、assistant 正文、工具调用与工具结果，只丢弃不属于新模型的私有推理；协议要求该字段存在时发送合法空值，既不让别家推理冒充本模型，也不把推理拼进可见正文
+- 本路由完成但确实没产生推理记为“空”；旧数据没有来源记录记为“未知”；流中断的内容不会变成消息，因此不完整推理不可能被当成完整内容回放。投影会分别报告外来、未知和空的回合数，而不是把它们合并成一个数
+- GLM 的保留式思考按路由声明发送（`thinking: {"type": "enabled", "clear_thinking": false}`），工具循环因此保留模型本该复用的推理链。无法关闭思考的路由（GLM-5.3/5.3-FLASH）不再提供 `off`
+- Kimi K3 及其点版本在能力表中属于硬性回放族（必须回传完整 assistant 消息，含 `reasoning_content`）；Kimi K2.x 思考模型在工具循环内要求回放推理，但不要求空键
+
+### 变更
+- `leveler login` 只写模型事实。生成的配置不再包含 `reasoning_replay_scope` 与 `reasoning_content_key_required`：回放契约属于路由的线协议能力，由 `ReasoningReplayContract::for_route` 在启动时统一解析。两个字段仍可作为高级覆盖用于行为与官方要求不同的部署，旧的 `passback_reasoning_content` 布尔写法继续兼容
+- 内置模型文件不再重复声明该族要求，能力表成为该事实的唯一来源
+
+### 新增
+
 - `/memory` 成为运行时 listing 的管理页：按关键词筛选标题与正文、按 Scope 与 Lane 收窄、打开记录查看带自身身份与元数据的完整正文、复制正文或 `scope:id`、固定/标记过期/归档。破坏性动作需要二次确认；所有动作都经记忆服务执行，远端设备一律拒绝
 - 每轮的 `MemoryRecalled` 事件给出请求实际携带的记录（scope、受限标题、mode）。`/memory` 用当前 listing 解析这些名字，因此用户之后遗忘的记录只被计数，不再显示标题
 - `memory.enabled` 为 true 时，记忆属于第一轮请求：`memory`、`remember`、`forget` 以及指导、catalog、召回不再需要先调用 `capability(enable)`。记忆写入的审批规则不变

@@ -77,6 +77,7 @@ fn shell(id: &str, cmd: &str) -> ModelResponse {
                     arguments: serde_json::json!({ "cmd": cmd }),
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),

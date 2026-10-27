@@ -72,6 +72,7 @@ impl ScriptedModel {
                 origin: None,
                 role: Role::Assistant,
                 content,
+                route: None,
             },
             finish_reason,
             usage,

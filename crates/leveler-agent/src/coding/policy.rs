@@ -938,6 +938,8 @@ mod tests {
             style: leveler_model::ReasoningStyle::ThinkingFlag,
             supported_efforts: vec![leveler_model::ReasoningEffort::Max],
             default_effort: Some(leveler_model::ReasoningEffort::Max),
+            preserved_thinking: None,
+            forced: false,
         };
         assert_eq!(
             lab.compatibility,

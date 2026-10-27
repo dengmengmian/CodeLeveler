@@ -127,6 +127,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            route: None,
         }
     }
 
@@ -144,6 +145,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            route: None,
         }
     }
 

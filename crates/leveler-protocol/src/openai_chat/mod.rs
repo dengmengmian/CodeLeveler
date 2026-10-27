@@ -68,13 +68,29 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         // Effective effort is resolved before encode. The adapter does not
         // fall back to the profile or remap levels.
         let effort = request.reasoning_effort;
+        // Preserved thinking is a route declaration, not a preference: the
+        // endpoint's own default clears prior thinking, and `clear_thinking`
+        // is the only word the wire has for the other mode. `None` sends no
+        // field at all, which is how every route that never declared the mode
+        // stays byte-identical to what it sent before.
+        let preserved = context.reasoning.preserved_thinking;
+        let thinking_on = || Thinking {
+            kind: "enabled",
+            clear_thinking: preserved.map(|preserved| !preserved),
+        };
         let (thinking, reasoning_effort) = if request.thinking_disabled {
             // An explicit `off` from the canonical Thinking Level. Only the
             // thinking-flag style has a word for it; the others have no way to
             // say "no thinking", which is why the canonical layer does not
             // offer `off` on them in the first place.
             match context.reasoning.style {
-                ReasoningStyle::ThinkingFlag => (Some(Thinking { kind: "disabled" }), None),
+                ReasoningStyle::ThinkingFlag => (
+                    Some(Thinking {
+                        kind: "disabled",
+                        clear_thinking: None,
+                    }),
+                    None,
+                ),
                 ReasoningStyle::OpenAiEffort | ReasoningStyle::None => (None, None),
                 ReasoningStyle::AdaptiveThinking | ReasoningStyle::BudgetedThinking { .. } => {
                     return Err(ProtocolError::Encode(
@@ -90,7 +106,13 @@ impl ProtocolAdapter for OpenAiChatAdapter {
             // does not avoid the rejection. Keep the ToolChoice contract and
             // disable thinking explicitly for exactly this request; effort is a
             // thinking knob, so it is dropped with it.
-            (Some(Thinking { kind: "disabled" }), None)
+            (
+                Some(Thinking {
+                    kind: "disabled",
+                    clear_thinking: None,
+                }),
+                None,
+            )
         } else {
             match context.reasoning.style {
                 ReasoningStyle::AdaptiveThinking | ReasoningStyle::BudgetedThinking { .. } => {
@@ -100,10 +122,9 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 }
                 ReasoningStyle::None => (None, None),
                 ReasoningStyle::OpenAiEffort => (None, effort.map(|e| e.as_wire().to_string())),
-                ReasoningStyle::ThinkingFlag => (
-                    Some(Thinking { kind: "enabled" }),
-                    effort.map(|e| e.as_wire().to_string()),
-                ),
+                ReasoningStyle::ThinkingFlag => {
+                    (Some(thinking_on()), effort.map(|e| e.as_wire().to_string()))
+                }
             }
         };
 
@@ -217,6 +238,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 origin: None,
                 role: Role::Assistant,
                 content,
+                route: None,
             },
             finish_reason,
             usage,
@@ -495,6 +517,8 @@ mod tests {
                 style,
                 supported_efforts: effort.into_iter().collect(),
                 default_effort: effort,
+                preserved_thinking: None,
+                forced: false,
             },
             ..ctx()
         }
@@ -585,6 +609,54 @@ mod tests {
         let body = encode_with(&ctx_reasoning(ReasoningStyle::ThinkingFlag, None));
         assert_eq!(body["thinking"]["type"], "enabled");
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// Preserved thinking is a route declaration. Its wire spelling is
+    /// `thinking: {type: "enabled", clear_thinking: false}`; without the second
+    /// field the endpoint's default clears prior thinking and a tool loop loses
+    /// the chain it was built to keep.
+    #[test]
+    fn a_preserved_thinking_route_sends_clear_thinking_false() {
+        let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
+        context.reasoning.preserved_thinking = Some(true);
+        let body = encode_with(&context);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["clear_thinking"], false);
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // The explicit opposite is honoured too, for a deployment that must not
+        // inherit another endpoint's preserved mode.
+        context.reasoning.preserved_thinking = Some(false);
+        let body = encode_with(&context);
+        assert_eq!(body["thinking"]["clear_thinking"], true);
+    }
+
+    #[test]
+    fn a_route_that_never_declared_preserved_thinking_sends_no_field() {
+        // Byte-identical to the previous wire: no `clear_thinking` invented for
+        // a route that never asked for the mode.
+        let body = encode_with(&ctx_reasoning(
+            ReasoningStyle::ThinkingFlag,
+            Some(ReasoningEffort::High),
+        ));
+        assert!(body["thinking"].get("clear_thinking").is_none(), "{body}");
+    }
+
+    #[test]
+    fn thinking_off_sends_no_clear_thinking() {
+        let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
+        context.reasoning.preserved_thinking = Some(true);
+        let mut req = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        req.thinking_disabled = true;
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&req, &context, true)
+            .unwrap()
+            .body;
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body["thinking"].get("clear_thinking").is_none(), "{body}");
     }
 
     /// Encode with tools attached and a specific tool choice — the shape the
@@ -742,6 +814,7 @@ mod tests {
                     origin: None,
                     role: Role::Assistant,
                     content: assistant_parts,
+                    route: None,
                 },
                 Message {
                     origin: None,
@@ -753,6 +826,7 @@ mod tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 },
             ],
         );
@@ -811,6 +885,8 @@ mod tests {
                 style: ReasoningStyle::ThinkingFlag,
                 supported_efforts: vec![ReasoningEffort::High],
                 default_effort: Some(ReasoningEffort::High),
+                preserved_thinking: None,
+                forced: false,
             },
             compatibility: leveler_model::CompatibilityConfig::default(),
             pricing: None,
@@ -859,6 +935,7 @@ mod tests {
             origin: None,
             role: Role::Assistant,
             content,
+            route: None,
         }
     }
 
@@ -873,6 +950,7 @@ mod tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }
     }
 
@@ -1048,6 +1126,7 @@ mod tests {
                             },
                         },
                     ],
+                    route: None,
                 },
                 Message {
                     origin: None,
@@ -1059,6 +1138,7 @@ mod tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 },
             ]
         }
@@ -1165,6 +1245,7 @@ mod tests {
                             },
                         },
                     ],
+                    route: None,
                 },
                 Message {
                     origin: None,
@@ -1176,6 +1257,7 @@ mod tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 },
             ],
         );
@@ -1251,6 +1333,7 @@ mod tests {
                     origin: None,
                     role: Role::Assistant,
                     content: assistant,
+                    route: None,
                 },
                 Message {
                     origin: None,
@@ -1262,6 +1345,7 @@ mod tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 },
             ]
         }
@@ -1399,6 +1483,7 @@ mod tests {
                 origin: None,
                 role: Role::Assistant,
                 content,
+                route: None,
             }
         }
 
@@ -1426,6 +1511,7 @@ mod tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 },
             ];
             let tool = ToolDefinition {
@@ -1553,6 +1639,88 @@ mod tests {
         );
     }
 
+    /// Provenance on the wire: a historical assistant turn another route wrote
+    /// keeps its text and its tool call, and its private reasoning never appears
+    /// in this request. This is the cross-model case the projection exists for.
+    #[test]
+    fn another_models_reasoning_never_reaches_the_wire() {
+        use leveler_model::{ContentPart, RequestProjection, RouteIdentity};
+
+        let author = RouteIdentity {
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: None,
+        };
+        let current = RouteIdentity {
+            provider: "bigmodel".into(),
+            model: "glm-5.3".into(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: None,
+        };
+        let mut assistant = Message::from_parts(
+            Role::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: "another model's private thought".into(),
+                },
+                ContentPart::Text {
+                    text: "calling the clock".into(),
+                },
+                ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: leveler_core::ToolCallId::new("c1"),
+                        name: "clock".into(),
+                        arguments: serde_json::json!({"tz": "UTC"}),
+                    },
+                },
+            ],
+            None,
+        );
+        assistant.route = Some(author);
+        let messages = vec![
+            Message::text(Role::User, "what time is it?"),
+            assistant,
+            Message::from_parts(
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: leveler_core::ToolCallId::new("c1"),
+                        content: "12:00 UTC".into(),
+                        is_error: false,
+                    },
+                }],
+                None,
+            ),
+        ];
+        let mut req = ModelRequest::new(ModelRef::new("bigmodel", "glm-5.3"), messages.clone());
+        req.tools = vec![ToolDefinition {
+            name: "clock".into(),
+            description: "returns the time".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        req.projection = Some(RequestProjection::project_for_route(
+            &messages,
+            &req.tools,
+            reasoning_carrying_contract(),
+            leveler_model::ReasoningRetention::All,
+            Some(&current),
+        ));
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&req, &ctx(), true)
+            .unwrap()
+            .body;
+
+        let replayed = &body["messages"][1];
+        assert_eq!(replayed["role"], "assistant");
+        assert_eq!(replayed["content"], "calling the clock");
+        assert_eq!(replayed["tool_calls"][0]["function"]["name"], "clock");
+        // The channel is present because this contract requires the key, but it
+        // carries no foreign content.
+        assert_eq!(replayed["reasoning_content"], "");
+        assert_eq!(body["messages"][2]["role"], "tool");
+    }
+
     /// The scope is a contract value, not a hard-coded `has_tools` check: a
     /// route that declares `Always` carries reasoning even with no tools, and a
     /// route that declares `Never` carries none even with tools.
@@ -1576,6 +1744,7 @@ mod tests {
                     content: vec![ContentPart::Reasoning {
                         text: "thought".into(),
                     }],
+                    route: None,
                 },
                 Message::text(Role::User, "again"),
             ],
@@ -1690,6 +1859,7 @@ mod tests {
                             text: "done".into(),
                         },
                     ],
+                    route: None,
                 },
                 Message::text(Role::User, "continue with tools"),
             ],
@@ -1731,6 +1901,7 @@ mod tests {
                             text: "done".into(),
                         },
                     ],
+                    route: None,
                 },
                 Message::text(Role::User, "continue without tools"),
             ],
@@ -2033,6 +2204,7 @@ mod tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }];
         let converted = convert_messages(&leveler_model::RequestProjection::project(
             &msgs,
@@ -2066,6 +2238,7 @@ mod tests {
                     },
                 },
             ],
+            route: None,
         }];
         let converted = convert_messages(&leveler_model::RequestProjection::project(
             &msgs,

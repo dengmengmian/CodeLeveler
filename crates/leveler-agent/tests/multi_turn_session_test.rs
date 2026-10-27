@@ -122,6 +122,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
                     arguments: args,
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),
@@ -1400,6 +1401,7 @@ fn tool_round_payloads(id: &str, pad: &str) -> [String; 2] {
                 arguments: serde_json::json!({"path": "src/lib.rs"}),
             },
         }],
+        route: None,
     };
     let result = Message {
         origin: None,
@@ -1411,6 +1413,7 @@ fn tool_round_payloads(id: &str, pad: &str) -> [String; 2] {
                 is_error: false,
             },
         }],
+        route: None,
     };
     [
         serde_json::to_string(&call).unwrap(),

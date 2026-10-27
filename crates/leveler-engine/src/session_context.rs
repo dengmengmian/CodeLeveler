@@ -305,12 +305,11 @@ impl RawTranscript {
                         if let Some(capacity) = hard_capacity
                             && projected > capacity
                         {
-                            let (shrunk, reduced) =
-                                leveler_context::shrink_externalized_results(
-                                    &folded,
-                                    capacity,
-                                    |messages| measure(messages),
-                                );
+                            let (shrunk, reduced) = leveler_context::shrink_externalized_results(
+                                &folded,
+                                capacity,
+                                |messages| measure(messages),
+                            );
                             if reduced > 0 {
                                 projected = measure(&shrunk);
                                 folded = shrunk;
@@ -513,6 +512,7 @@ mod projection_pressure_tests {
                         text: "observed".into(),
                     },
                 ],
+                route: None,
             });
         }
         assert!(leveler_context::estimate_tokens(&messages) > 1_000);
@@ -747,11 +747,8 @@ mod fold_semantics_tests {
 
         let store = leveler_storage::MemoryEventStore::default();
         let log = EventLog::new(&store, SessionId::generate());
-        let saved = leveler_model::tool_output::saved_reference(
-            "/tmp/artifacts/abc.txt",
-            "abc",
-            400_000,
-        );
+        let saved =
+            leveler_model::tool_output::saved_reference("/tmp/artifacts/abc.txt", "abc", 400_000);
         let mut messages = transcript();
         messages.push(Message::from_parts(
             Role::Assistant,

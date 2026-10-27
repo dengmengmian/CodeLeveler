@@ -113,6 +113,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
                     arguments: args,
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),

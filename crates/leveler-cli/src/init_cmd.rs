@@ -173,13 +173,13 @@ mod tests {
         assert_eq!(profile["parallel_tool_calls"].as_bool(), Some(true));
         assert_eq!(profile["supports_temperature"].as_bool(), Some(true));
         assert_eq!(profile["max_parallel_tool_calls"].as_integer(), Some(0));
-        assert_eq!(
-            profile["reasoning_replay_scope"].as_str(),
-            Some("when_tools_present")
-        );
-        assert_eq!(
-            profile["reasoning_content_key_required"].as_bool(),
-            Some(true)
+        // The generated config states model facts only. DeepSeek's replay
+        // requirement is resolved from the wire family at startup, so no
+        // protocol field is written for the user to keep in sync.
+        assert!(profile.get("reasoning_replay_scope").is_none(), "{text}");
+        assert!(
+            profile.get("reasoning_content_key_required").is_none(),
+            "{text}"
         );
     }
 

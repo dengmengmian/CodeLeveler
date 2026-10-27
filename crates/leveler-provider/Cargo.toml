@@ -25,6 +25,8 @@ tokio-util = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 leveler-test-support = { workspace = true }
+# Real-provider acceptance drives the production fold over a live transcript.
+leveler-context = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }

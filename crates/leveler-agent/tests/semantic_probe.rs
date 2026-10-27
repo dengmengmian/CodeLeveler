@@ -79,6 +79,8 @@ fn model_profile(model_id: &str) -> ModelProfile {
                 ReasoningEffort::Max,
             ],
             default_effort: Some(ReasoningEffort::Low),
+            preserved_thinking: None,
+            forced: false,
         },
         compatibility: Default::default(),
         thinking: None,

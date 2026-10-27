@@ -132,6 +132,7 @@ mod tests {
             origin: None,
             role: Role::Assistant,
             content,
+            route: None,
         }
     }
 
@@ -151,6 +152,7 @@ mod tests {
                     },
                 },
             ],
+            route: None,
         }
     }
 
@@ -165,6 +167,7 @@ mod tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }
     }
 

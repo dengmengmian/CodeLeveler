@@ -111,5 +111,6 @@ pub async fn dispatch_calls(
         origin: None,
         role: Role::Tool,
         content: results,
+        route: None,
     })
 }

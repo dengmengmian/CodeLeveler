@@ -741,6 +741,7 @@ fn tool_call_message(ids: &[&str]) -> leveler_model::Message {
                 },
             })
             .collect(),
+        route: None,
     }
 }
 
@@ -758,6 +759,7 @@ fn tool_result_message(ids: &[&str]) -> leveler_model::Message {
                 },
             })
             .collect(),
+        route: None,
     }
 }
 

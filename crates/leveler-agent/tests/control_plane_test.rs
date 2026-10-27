@@ -111,6 +111,7 @@ fn read(path: &str) -> ModelResponse {
                     arguments: serde_json::json!({"path":path}),
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),
@@ -425,6 +426,7 @@ async fn compaction_summarizes_history_and_preserves_current_control() {
         leveler_model::ReasoningReplayContract::NONE,
         leveler_model::ReasoningRetention::All,
         &stable_control,
+        None,
     )
     .estimated_tokens();
     assert!(

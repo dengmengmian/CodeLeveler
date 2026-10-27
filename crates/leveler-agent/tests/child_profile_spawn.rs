@@ -92,6 +92,7 @@ fn assistant_with(parts: Vec<ContentPart>, finish: FinishReason) -> ModelRespons
             origin: None,
             role: Role::Assistant,
             content: parts,
+            route: None,
         },
         finish_reason: finish,
         usage: TokenUsage::default(),

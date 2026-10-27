@@ -329,6 +329,7 @@ pub fn assistant_call(id: &str, name: &str, arguments: serde_json::Value) -> Mod
                     arguments,
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),

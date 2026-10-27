@@ -201,6 +201,27 @@ pub struct ReasoningConfig {
     pub supported_efforts: Vec<ReasoningEffort>,
     #[serde(default, alias = "effort")]
     pub default_effort: Option<ReasoningEffort>,
+    /// Whether the route keeps its prior turns' thinking available to the model
+    /// instead of discarding it between requests.
+    ///
+    /// This is a route fact about the provider's own preserved-thinking mode,
+    /// not a harness preference: GLM spells it `thinking: {type: "enabled",
+    /// clear_thinking: false}`, and omitting the field means the endpoint's
+    /// default (clear). A route that does not declare it sends no such field, so
+    /// a provider that never asked for it is unaffected. Kimi's K3 family
+    /// preserves thinking unconditionally and has no request field for it, so
+    /// the declaration there would describe a fact with no wire effect; its
+    /// profiles therefore leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_thinking: Option<bool>,
+    /// Whether the route cannot be told to stop thinking.
+    ///
+    /// GLM-5.3 and GLM-5.3-FLASH always think: the thinking parameter cannot
+    /// disable it. The canonical Thinking layer must not offer `off` for such a
+    /// route, because asking would either be ignored or rejected while the user
+    /// believes they turned it off.
+    #[serde(default)]
+    pub forced: bool,
 }
 
 impl ReasoningConfig {
@@ -290,7 +311,18 @@ pub fn validate_reasoning_config(
         if !config.supported_efforts.is_empty() || config.default_effort.is_some() {
             return Err("reasoning is disabled but supported_efforts/default_effort is set".into());
         }
+        if config.preserved_thinking.is_some() {
+            return Err("reasoning is disabled but preserved_thinking is declared".into());
+        }
+        if config.forced {
+            return Err("reasoning is disabled but the route is declared forced-thinking".into());
+        }
         return Ok(());
+    }
+    if config.forced && matches!(config.style, ReasoningStyle::None) {
+        return Err(
+            "style=none cannot be forced-thinking: there is no thinking request at all".into(),
+        );
     }
     match config.style {
         ReasoningStyle::None => {
@@ -739,6 +771,8 @@ mod tests {
                 style: ReasoningStyle::ThinkingFlag,
                 supported_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
                 default_effort: Some(ReasoningEffort::High),
+                preserved_thinking: None,
+                forced: false,
             },
             compatibility: CompatibilityConfig {
                 // Non-default on purpose: a roundtrip that only ever sees the
@@ -906,6 +940,8 @@ mod tests {
                 ReasoningEffort::High,
             ],
             default_effort: Some(ReasoningEffort::Medium),
+            preserved_thinking: None,
+            forced: false,
         };
         let r = resolve_reasoning_effort(Some(ReasoningEffort::Medium), &cfg);
         assert_eq!(r.effective, Some(ReasoningEffort::Medium));
@@ -918,6 +954,8 @@ mod tests {
             style: ReasoningStyle::ThinkingFlag,
             supported_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
             default_effort: Some(ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         let r = resolve_reasoning_effort(Some(ReasoningEffort::Medium), &cfg);
         assert_eq!(r.effective, Some(ReasoningEffort::High));
@@ -929,6 +967,8 @@ mod tests {
             style: ReasoningStyle::OpenAiEffort,
             supported_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
             default_effort: Some(ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         let r = resolve_reasoning_effort(Some(ReasoningEffort::Max), &cfg);
         assert_eq!(r.effective, Some(ReasoningEffort::High));
@@ -940,6 +980,8 @@ mod tests {
             style: ReasoningStyle::ThinkingFlag,
             supported_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
             default_effort: Some(ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         let r = resolve_reasoning_effort(None, &cfg);
         assert_eq!(r.effective, Some(ReasoningEffort::High));
@@ -952,6 +994,8 @@ mod tests {
             style: ReasoningStyle::ThinkingFlag,
             supported_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
             default_effort: Some(ReasoningEffort::Medium),
+            preserved_thinking: None,
+            forced: false,
         };
         let err = validate_reasoning_config(true, &cfg).unwrap_err();
         assert!(err.contains("not in supported_efforts"), "{err}");
@@ -963,6 +1007,8 @@ mod tests {
             style: ReasoningStyle::None,
             supported_efforts: vec![],
             default_effort: None,
+            preserved_thinking: None,
+            forced: false,
         };
         validate_reasoning_config(true, &cfg).unwrap();
     }
@@ -982,6 +1028,8 @@ mod tests {
             style: ReasoningStyle::ThinkingFlag,
             supported_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
             default_effort: Some(ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         let r = resolve_reasoning_effort(Some(ReasoningEffort::XHigh), &cfg);
         assert_eq!(r.effective, Some(ReasoningEffort::Max));
@@ -993,6 +1041,8 @@ mod tests {
             style: ReasoningStyle::None,
             supported_efforts: vec![ReasoningEffort::High],
             default_effort: Some(ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         let err = validate_reasoning_config(false, &cfg).unwrap_err();
         assert!(err.contains("reasoning is disabled"), "{err}");
@@ -1004,6 +1054,8 @@ mod tests {
             style: ReasoningStyle::None,
             supported_efforts: vec![],
             default_effort: Some(ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         let err = validate_reasoning_config(true, &cfg).unwrap_err();
         assert!(err.contains("style=none"), "{err}");
@@ -1015,6 +1067,8 @@ mod tests {
             style: ReasoningStyle::None,
             supported_efforts: vec![],
             default_effort: None,
+            preserved_thinking: None,
+            forced: false,
         };
         let r = resolve_reasoning_effort(Some(ReasoningEffort::Max), &cfg);
         assert_eq!(r.effective, Some(ReasoningEffort::Max));

@@ -27,11 +27,17 @@
 //! 3. The compatibility default (`never`, omit an empty key).
 //!
 //! A family entry declares how strongly its rule binds. A
-//! [`ReasoningReplayEnforcement::Required`] rule (DeepSeek) rejects a request
-//! that weakens it, so a weaker declaration is a [`ReasoningRouteConflict`]
-//! instead of a provider 400. A [`ReasoningReplayEnforcement::Default`] rule
-//! (GLM, Kimi) is the documented default for tool loops; a deployment that
-//! knows it disabled preservation may opt out explicitly.
+//! [`ReasoningReplayEnforcement::Required`] rule (DeepSeek, Kimi K3) rejects a
+//! request that weakens it, so a weaker declaration is a
+//! [`ReasoningRouteConflict`] instead of a provider 400. A
+//! [`ReasoningReplayEnforcement::Default`] rule (GLM) is the documented default
+//! for tool loops; a deployment that knows it disabled preserved thinking may
+//! opt out explicitly.
+//!
+//! The family is not the whole story. Kimi's older thinking models only require
+//! the channel when the route actually reasons, so their rule reads the
+//! profile's `capabilities.reasoning`; DeepSeek's does not, because its thinking
+//! is a server-side default that a config can forget to declare.
 
 use crate::profile::{ModelProfile, ProtocolKind};
 use crate::projection::{
@@ -97,12 +103,29 @@ enum WireReasoningFamily {
     ///
     /// Source: <https://docs.z.ai/guides/capabilities/thinking-mode>
     Glm,
-    /// Kimi thinking models: within a tool-call loop all reasoning content from
-    /// the context must be sent back; preserved thinking keeps every historical
-    /// assistant message's `reasoning_content` as-is.
+    /// Kimi K3 and its point releases: always thinking, and the provider
+    /// requires the complete assistant message back — `reasoning_content`
+    /// included — so a tool-bearing request is malformed without it. The empty
+    /// string covers a turn that captured none, exactly as DeepSeek needs.
     ///
-    /// Source: <https://platform.kimi.ai/docs/guide/use-thinking-models>
-    Kimi,
+    /// Sources:
+    /// * <https://platform.kimi.ai/docs/guide/use-reasoning-effort> ("For
+    ///   multi-turn conversations and tool calls, K3 requires the complete
+    ///   assistant message returned by the API to be passed back ... including
+    ///   `reasoning_content` and `tool_calls`")
+    /// * <https://huggingface.co/moonshotai/Kimi-K3> (same requirement)
+    KimiK3,
+    /// Kimi's earlier thinking models (K2.5/K2.6/K2.7): while thinking is on,
+    /// a tool-call turn must carry its `reasoning_content` back, but a turn that
+    /// produced none carries no key — the protocol never asked for a
+    /// placeholder. Preservation is a mode these models can also run without,
+    /// so the requirement is read only for a route that declares it reasons.
+    ///
+    /// Sources:
+    /// * <https://platform.kimi.ai/docs/guide/use-thinking-models>
+    /// * measured 400s when the field is missing on a tool-call turn
+    ///   (<https://github.com/BerriAI/litellm/issues/26156>)
+    KimiToolLoop,
 }
 
 fn wire_family(model_id: &str) -> Option<WireReasoningFamily> {
@@ -119,11 +142,22 @@ fn wire_family(model_id: &str) -> Option<WireReasoningFamily> {
         Some(WireReasoningFamily::DeepSeek)
     } else if wire.starts_with("glm") {
         Some(WireReasoningFamily::Glm)
-    } else if wire.starts_with("kimi") {
-        Some(WireReasoningFamily::Kimi)
+    } else if is_kimi_k3(&wire) {
+        Some(WireReasoningFamily::KimiK3)
+    } else if wire.starts_with("kimi") || wire.starts_with("k2") || wire.starts_with("k3") {
+        Some(WireReasoningFamily::KimiToolLoop)
     } else {
         None
     }
+}
+
+/// K3 and its point releases (`k3`, `k3-256k`, `k3.1-pro`, `kimi-k3`,
+/// `kimi-k3.1-pro-highspeed`). Their request format differs from K2's: effort
+/// is a top-level `reasoning_effort`, thinking cannot be turned off, and the
+/// complete assistant message must come back.
+fn is_kimi_k3(wire: &str) -> bool {
+    let id = wire.strip_prefix("kimi-").unwrap_or(wire);
+    id == "k3" || id.starts_with("k3-") || id.starts_with("k3.")
 }
 
 /// The protocol requirement this route's model family imposes, if any.
@@ -133,32 +167,72 @@ fn wire_family(model_id: &str) -> Option<WireReasoningFamily> {
 /// Responses/Gemini adapters do not exist in this build, so a family fact never
 /// invents a channel on those protocols.
 ///
-/// The model profile's `capabilities.reasoning` flag is deliberately NOT
-/// consulted: it is a user-declared model fact, while this requirement belongs
-/// to the provider's wire protocol. DeepSeek's thinking is a server-side
-/// default, so a config that forgot to declare reasoning would otherwise be
-/// exactly the config that sends a tool request the provider rejects.
+/// This entry point answers the family's unconditional form. The model
+/// profile's `capabilities.reasoning` flag is deliberately NOT consulted here:
+/// DeepSeek's thinking is a server-side default, so a config that forgot to
+/// declare reasoning would otherwise be exactly the config that sends a tool
+/// request the provider rejects. Kimi's older thinking models are the case that
+/// does depend on the declaration; they resolve through
+/// [`required_reasoning_replay_for`], which every runtime path uses.
 pub fn required_reasoning_replay(
     protocol: ProtocolKind,
     model_id: &str,
+) -> Option<RequiredReasoningReplay> {
+    required_replay_for_route(protocol, model_id, true)
+}
+
+/// The family requirement for a route, given whether the route declares that it
+/// reasons. `declares_reasoning` is only consulted by families whose
+/// requirement is conditioned on thinking being on; DeepSeek's server-side
+/// default deliberately ignores it, and K3 always thinks.
+fn required_replay_for_route(
+    protocol: ProtocolKind,
+    model_id: &str,
+    declares_reasoning: bool,
 ) -> Option<RequiredReasoningReplay> {
     if protocol != ProtocolKind::OpenAiChat {
         return None;
     }
     let family = wire_family(model_id)?;
+    let (missing, enforcement) = match family {
+        WireReasoningFamily::DeepSeek => (
+            MissingReasoningReplay::EmptyString,
+            ReasoningReplayEnforcement::Required,
+        ),
+        WireReasoningFamily::Glm => (
+            MissingReasoningReplay::Omit,
+            ReasoningReplayEnforcement::Default,
+        ),
+        WireReasoningFamily::KimiK3 => (
+            MissingReasoningReplay::EmptyString,
+            ReasoningReplayEnforcement::Required,
+        ),
+        WireReasoningFamily::KimiToolLoop => {
+            if !declares_reasoning {
+                // A non-thinking Kimi model has no historical reasoning channel
+                // to protect, so it gets no rule of its own.
+                return None;
+            }
+            (
+                MissingReasoningReplay::Omit,
+                ReasoningReplayEnforcement::Required,
+            )
+        }
+    };
     Some(RequiredReasoningReplay {
         scope: ReasoningReplayScope::WhenToolsPresent,
-        missing: match family {
-            WireReasoningFamily::DeepSeek => MissingReasoningReplay::EmptyString,
-            WireReasoningFamily::Glm | WireReasoningFamily::Kimi => MissingReasoningReplay::Omit,
-        },
-        enforcement: match family {
-            WireReasoningFamily::DeepSeek => ReasoningReplayEnforcement::Required,
-            WireReasoningFamily::Glm | WireReasoningFamily::Kimi => {
-                ReasoningReplayEnforcement::Default
-            }
-        },
+        missing,
+        enforcement,
     })
+}
+
+/// The family requirement for one configured route.
+pub fn required_reasoning_replay_for(profile: &ModelProfile) -> Option<RequiredReasoningReplay> {
+    required_replay_for_route(
+        profile.protocol,
+        &profile.model_id,
+        profile.capabilities.reasoning,
+    )
 }
 
 fn replay_rank(scope: ReasoningReplayScope) -> u8 {
@@ -185,7 +259,7 @@ impl ReasoningReplayContract {
     /// an illegal request.
     pub fn for_route(profile: &ModelProfile) -> Self {
         let declared = Self::resolve(profile.protocol, &profile.compatibility);
-        let Some(required) = required_reasoning_replay(profile.protocol, &profile.model_id) else {
+        let Some(required) = required_reasoning_replay_for(profile) else {
             return declared;
         };
 
@@ -227,7 +301,7 @@ impl ReasoningReplayContract {
     /// The message names the model, the field and the provider outcome so a
     /// configuration mistake is diagnosable without a live 400.
     pub fn check_route(profile: &ModelProfile) -> Result<(), ReasoningRouteConflict> {
-        let Some(required) = required_reasoning_replay(profile.protocol, &profile.model_id) else {
+        let Some(required) = required_reasoning_replay_for(profile) else {
             return Ok(());
         };
 

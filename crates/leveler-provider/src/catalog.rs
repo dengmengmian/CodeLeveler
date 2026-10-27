@@ -367,9 +367,10 @@ limits:
         }
     }
 
-    /// The bundled YAML and the wire-family capability table must not drift:
-    /// every shipped reasoning model must resolve exactly the contract it
-    /// declares, and its declaration must not weaken a hard family rule.
+    /// The bundled YAML states model facts; the wire-family table states the
+    /// protocol requirement. A shipped profile must resolve the family's
+    /// contract WITHOUT repeating it in configuration (one fact, one source),
+    /// and its declaration must never weaken a hard family rule.
     #[test]
     fn bundled_profiles_agree_with_the_wire_family_requirement() {
         for (provider, model) in [
@@ -387,10 +388,19 @@ limits:
                 profile.protocol,
                 &profile.compatibility,
             );
-            let resolved = leveler_model::ReasoningReplayContract::for_route(&profile);
             assert_eq!(
-                resolved, declared,
-                "{model}: the bundled declaration must already state the family requirement"
+                declared,
+                leveler_model::ReasoningReplayContract::NONE,
+                "{model}: the bundled profile must not repeat the family requirement"
+            );
+            let family = leveler_model::required_reasoning_replay_for(&profile)
+                .unwrap_or_else(|| panic!("{model}: a reasoning family requirement exists"));
+            let resolved = leveler_model::ReasoningReplayContract::for_route(&profile);
+            assert_eq!(resolved.scope, family.scope, "{model}");
+            assert_eq!(resolved.missing, family.missing, "{model}");
+            assert_eq!(
+                resolved.integrity,
+                leveler_model::ReasoningIntegrity::RetainedExact
             );
             assert!(
                 resolved.replays_captured(true),
@@ -429,9 +439,9 @@ limits:
         assert_eq!(flash.limits.max_parallel_tool_calls, 0);
         assert!(!flash.compatibility.thinking_supports_forced_tool_choice);
         // The shipped route's RESOLVED replay contract: the wire behaviour is a
-        // fact about the route, not something the encoder decides per message.
-        let replay =
-            leveler_model::ReasoningReplayContract::resolve(flash.protocol, &flash.compatibility);
+        // fact about the route, not something the encoder decides per message,
+        // and the bundled profile does not restate it.
+        let replay = leveler_model::ReasoningReplayContract::for_route(&flash);
         assert_eq!(replay.arm_name(), "when_tools+empty");
         assert!(replay.replays_captured(true));
         assert!(!replay.replays_captured(false));

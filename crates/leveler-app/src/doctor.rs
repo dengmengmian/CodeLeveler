@@ -691,6 +691,8 @@ mod tests {
                 leveler_model::ReasoningEffort::Max,
             ],
             default_effort: Some(leveler_model::ReasoningEffort::Max),
+            preserved_thinking: None,
+            forced: false,
         };
         let config = LoadedConfig {
             providers: vec![sample_provider("deepseek")],
@@ -725,6 +727,8 @@ mod tests {
                 leveler_model::ReasoningEffort::High,
             ],
             default_effort: Some(leveler_model::ReasoningEffort::High),
+            preserved_thinking: None,
+            forced: false,
         };
         // A global default that this model cannot distinguish.
         model.profile.thinking = Some(leveler_model::ThinkingLevel::Medium);

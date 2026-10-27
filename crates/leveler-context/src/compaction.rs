@@ -195,6 +195,7 @@ pub fn objective_pin_message(objective: &str) -> Message {
                  This is the active request for this turn."
             ),
         }],
+        route: None,
     }
 }
 
@@ -301,6 +302,7 @@ pub fn compact_messages(
         origin: Some(TranscriptOrigin::CompactionSummary),
         role: Role::User,
         content: vec![ContentPart::Text { text: body }],
+        route: None,
     };
 
     let mut out =
@@ -441,11 +443,14 @@ pub async fn summary_request(
     }
     request.max_output_tokens = Some(output_cap);
     request.reasoning_effort = reasoning_effort;
-    request.projection = Some(leveler_model::RequestProjection::project(
+    // The summary request sees the same history the seat does, so it must use
+    // the same route: another model's reasoning is not this model's context.
+    request.projection = Some(leveler_model::RequestProjection::project_for_route(
         &request.messages,
         &request.tools,
         leveler_model::ReasoningReplayContract::for_route(&profile),
         leveler_model::ReasoningRetention::All,
+        runtime.route_identity(model).as_ref(),
     ));
 
     Some(request)
@@ -493,6 +498,7 @@ mod summary_acceptance_tests {
             content: vec![ContentPart::Reasoning {
                 text: "unfinished internal reasoning".into(),
             }],
+            route: None,
         };
         assert_eq!(
             accepted_summary(&response),
@@ -533,6 +539,7 @@ mod estimate_tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }]);
         assert!(
             as_tool > as_text * 3 / 2,
@@ -574,6 +581,7 @@ mod estimate_tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 }
             } else {
                 Message::text(Role::User, fixture.to_string())
@@ -631,6 +639,7 @@ mod span_tests {
                     arguments: Default::default(),
                 },
             }],
+            route: None,
         }
     }
 
@@ -645,6 +654,7 @@ mod span_tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }
     }
 

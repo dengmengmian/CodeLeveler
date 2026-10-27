@@ -361,6 +361,25 @@ impl ModelRuntime for ProviderRegistry {
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
         Ok(self.entry(model)?.profile.clone())
     }
+
+    /// The provider entry is this configuration's identity for one deployment:
+    /// it owns exactly one `base_url`. Recording both makes two gateways that
+    /// serve the same wire model id two distinct routes.
+    fn route_identity(&self, model: &ModelRef) -> Option<leveler_model::RouteIdentity> {
+        let entry = self
+            .models
+            .get(&(model.provider.clone(), model.model.clone()))?;
+        let deployment = self
+            .providers
+            .get(&entry.profile.provider)
+            .map(|provider| provider.config.base_url.clone());
+        Some(leveler_model::RouteIdentity {
+            provider: entry.profile.provider.clone(),
+            model: entry.profile.model_id.clone(),
+            api: Some(entry.profile.protocol),
+            deployment,
+        })
+    }
 }
 
 /// Select the protocol adapter for a provider.

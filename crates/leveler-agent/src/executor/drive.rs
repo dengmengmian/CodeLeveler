@@ -1456,6 +1456,7 @@ impl Drive<'_> {
                 self.executor.policy.reasoning_replay,
                 self.executor.policy.reasoning_retention,
                 &self.request_context(rt),
+                self.executor.route_identity().as_ref(),
             )
             .estimated_tokens(),
         );
@@ -4619,6 +4620,7 @@ impl AgentHarness for Drive<'_> {
             origin: None,
             role: Role::Tool,
             content: results,
+            route: None,
         };
         messages.push(tool_message.clone());
         // Flush spend BEFORE transcript persistence: tools already ran, so
@@ -4802,6 +4804,7 @@ impl AgentHarness for Drive<'_> {
                 self.executor.policy.reasoning_replay,
                 self.executor.policy.reasoning_retention,
                 &self.request_context(rt),
+                self.executor.route_identity().as_ref(),
             )
             .estimated_tokens(),
         );
@@ -4853,6 +4856,7 @@ impl AgentHarness for Drive<'_> {
                         self.executor.policy.reasoning_replay,
                         self.executor.policy.reasoning_retention,
                         &self.request_context(rt),
+                        self.executor.route_identity().as_ref(),
                     )
                     .estimated_tokens()
                 });
@@ -5024,6 +5028,7 @@ impl AgentHarness for Drive<'_> {
                                         self.executor.policy.reasoning_replay,
                                         self.executor.policy.reasoning_retention,
                                         &self.request_context(rt),
+                                        self.executor.route_identity().as_ref(),
                                     )
                                     .estimated_tokens(),
                                 ),
@@ -5094,6 +5099,7 @@ impl AgentHarness for Drive<'_> {
                     self.executor.policy.reasoning_replay,
                     self.executor.policy.reasoning_retention,
                     &self.request_context(rt),
+                    self.executor.route_identity().as_ref(),
                 )
                 .estimated_tokens(),
             );
@@ -5119,6 +5125,7 @@ impl AgentHarness for Drive<'_> {
                             self.executor.policy.reasoning_replay,
                             self.executor.policy.reasoning_retention,
                             &self.request_context(rt),
+                            self.executor.route_identity().as_ref(),
                         )
                         .estimated_tokens(),
                     )

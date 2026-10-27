@@ -1147,6 +1147,7 @@ impl CodingRuntime {
                 policy.reasoning_replay,
                 policy.reasoning_retention,
                 &control,
+                executor.route_identity().as_ref(),
             )
             .estimated_tokens()
         };
@@ -1226,6 +1227,7 @@ impl CodingRuntime {
                 policy.reasoning_replay,
                 policy.reasoning_retention,
                 &control,
+                executor.route_identity().as_ref(),
             )
             .estimated_tokens()
         };

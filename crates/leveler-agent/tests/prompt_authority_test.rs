@@ -113,6 +113,7 @@ fn read(path: &str) -> ModelResponse {
                     arguments: serde_json::json!({"path": path}),
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),
@@ -784,6 +785,7 @@ fn tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ModelResponse {
                     },
                 })
                 .collect(),
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),

@@ -828,3 +828,95 @@ fn repeated_folds_keep_one_advisory_summary_and_a_whole_exchange() {
         messages = folded;
     }
 }
+
+/// A fold that happens *with* a model switch keeps every task fact and drops
+/// only the foreign reasoning.
+///
+/// The switch and the fold are independent mechanisms (one changes the route,
+/// the other changes the active surface), and their combination is where a
+/// naive implementation loses the task: the retained rounds came from model A,
+/// the request goes to model B, and B still needs the user's objective, the
+/// assistant's prose, the tool calls and their results.
+#[test]
+fn a_fold_across_a_model_switch_keeps_the_task_not_the_private_reasoning() {
+    use leveler_model::{ProtocolKind, RouteIdentity};
+
+    let author = RouteIdentity {
+        provider: "deepseek".into(),
+        model: "deepseek-flash".into(),
+        api: Some(ProtocolKind::OpenAiChat),
+        deployment: None,
+    };
+    let current = RouteIdentity {
+        provider: "bigmodel".into(),
+        model: "glm-5.3".into(),
+        api: Some(ProtocolKind::OpenAiChat),
+        deployment: None,
+    };
+    let tools = tools();
+
+    // Rounds authored by A carry A's reasoning.
+    let mut messages = transcript(6, 200, 80);
+    for message in messages.iter_mut() {
+        if message.role == Role::Assistant {
+            message.route = Some(author.clone());
+        }
+    }
+    let folded = compact_messages(&messages, 3, 0, Some("briefing"), Some("fix the bug"));
+
+    let projected = RequestProjection::project_for_route(
+        &folded,
+        &tools,
+        route(),
+        ReasoningRetention::All,
+        Some(&current),
+    );
+    let replayed: Vec<String> = projected
+        .messages()
+        .iter()
+        .filter_map(|message| match &message.reasoning {
+            leveler_model::ProjectedReasoning::Captured(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        replayed.is_empty(),
+        "A's reasoning is not replayed to B after a fold: {replayed:?}"
+    );
+    assert!(
+        projected.summary().foreign_turns > 0,
+        "the retained turns are reported as another route's"
+    );
+
+    // The fold's own breadcrumb and the retained tool exchange survive, so B can
+    // continue the task.
+    let texts: Vec<String> = projected
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("briefing")),
+        "the fold briefing reaches the new model: {texts:?}"
+    );
+    assert!(
+        projected
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|part| matches!(part, ContentPart::ToolResult { .. })),
+        "the retained tool results reach the new model"
+    );
+    assert!(
+        projected
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|part| matches!(part, ContentPart::ToolCall { .. })),
+        "the retained tool calls reach the new model"
+    );
+}
