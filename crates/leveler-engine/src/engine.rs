@@ -771,6 +771,7 @@ mod multi_turn_session_tests {
                     arguments: serde_json::json!({}),
                 },
             }],
+            route: None,
         }
     }
 
@@ -785,6 +786,7 @@ mod multi_turn_session_tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }
     }
 

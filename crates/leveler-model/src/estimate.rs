@@ -210,6 +210,7 @@ mod tests {
                     text: "b".repeat(4000),
                 },
             ],
+            route: None,
         }];
         let without = vec![Message::text(Role::Assistant, "b".repeat(4000))];
         assert_eq!(estimate_tokens(&with) - estimate_tokens(&without), 1000);
@@ -229,6 +230,7 @@ mod tests {
                     is_error: false,
                 },
             }],
+            route: None,
         }]);
         assert!(
             as_tool > as_text * 3 / 2,
@@ -248,6 +250,7 @@ mod tests {
                     arguments: serde_json::json!({"pattern": "x".repeat(100)}),
                 },
             }],
+            route: None,
         };
         let mut split_estimate = TokenEstimate::new();
         split_estimate.add_message(&message);
@@ -304,6 +307,7 @@ mod tests {
                     url: "https://x/y.png".to_string(),
                 },
             }],
+            route: None,
         }];
         assert!(estimate_tokens(&with_image) >= 256);
     }
@@ -329,6 +333,7 @@ mod tests {
                         },
                     },
                 ],
+                route: None,
             },
         ];
         let mut per_message = 0;

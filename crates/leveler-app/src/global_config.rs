@@ -63,8 +63,8 @@ use serde::Deserialize;
 use toml_edit::{DocumentMut, value};
 
 use leveler_model::{
-    CompatibilityConfig, MissingReasoningReplay, ModelCapabilities, ModelLimits, ModelProfile,
-    ProtocolKind, ReasoningConfig, ReasoningEffort, ReasoningStyle, ThinkingLevel,
+    CompatibilityConfig, ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind,
+    ReasoningConfig, ReasoningEffort, ReasoningStyle, ThinkingLevel,
 };
 use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
@@ -407,6 +407,16 @@ struct GlobalModel {
     /// when that field is set.
     #[serde(default)]
     supported_efforts: Vec<ReasoningEffort>,
+    /// Whether the route keeps its earlier turns' thinking available to the
+    /// model (`thinking: {type: "enabled", clear_thinking: false}`). Absent
+    /// sends no such field, which is the endpoint's own default.
+    #[serde(default)]
+    preserved_thinking: Option<bool>,
+    /// Whether the route always thinks and cannot be told to stop. `off` is not
+    /// offered for such a model, because it would be a request the route cannot
+    /// honour.
+    #[serde(default)]
+    forced: bool,
     /// RETIRED. Per-model system prompts were removed; every model shares the
     /// one CodeLeveler base prompt (`crates/leveler-agent/prompts/base.md`).
     /// The field exists only so an old config still parses: it is never read,
@@ -498,6 +508,8 @@ impl GlobalModel {
             style: self.reasoning_style,
             supported_efforts: supported,
             default_effort: self.reasoning_effort,
+            preserved_thinking: self.preserved_thinking,
+            forced: self.forced,
         }
     }
 }
@@ -624,7 +636,7 @@ impl GlobalConfig {
     /// Parse global config from TOML text. Provider `api_key` may be set as
     /// plaintext (local convenience) and/or via `api_key_env`. MCP `env`
     /// values must still be env-name references (never raw secrets).
-    fn from_toml_str(text: &str) -> Result<Self, GlobalConfigError> {
+    pub fn from_toml_str(text: &str) -> Result<Self, GlobalConfigError> {
         let value: toml::Value =
             toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
         reject_mcp_env_secrets(&value)?;
@@ -928,6 +940,15 @@ pub fn render_init_config_with_profile(
     if let Some(effort) = profile.reasoning.default_effort {
         model["reasoning_effort"] = value(effort.as_wire());
     }
+    // Preserved thinking and forced thinking are MODEL/route facts, not
+    // protocol details: a generated config that dropped them would silently
+    // give the user a route that discards its own reasoning between turns.
+    if let Some(preserved) = profile.reasoning.preserved_thinking {
+        model["preserved_thinking"] = value(preserved);
+    }
+    if profile.reasoning.forced {
+        model["forced"] = value(true);
+    }
     model["context_window"] = value(i64::from(profile.limits.context_window));
     model["reliable_context"] = value(i64::from(profile.limits.reliable_context));
     model["max_output_tokens"] = value(i64::from(profile.limits.max_output_tokens));
@@ -939,23 +960,17 @@ pub fn render_init_config_with_profile(
     model["supports_temperature"] = value(profile.compatibility.supports_temperature);
     model["thinking_supports_forced_tool_choice"] =
         value(profile.compatibility.thinking_supports_forced_tool_choice);
-    // Write what the route actually resolves to: an explicit declaration, or
-    // the requirement the model family's wire protocol imposes. A model with
-    // no historical-reasoning channel writes neither field, so a generated
-    // config never claims a channel the provider does not have.
-    let required = leveler_model::required_reasoning_replay(profile.protocol, &profile.model_id);
-    if let Some(scope) = profile
-        .compatibility
-        .reasoning_replay_scope
-        .or(required.map(|required| required.scope))
-    {
+    // The replay contract is NOT written here. It is a property of the route's
+    // wire family (and, for an override, of this profile's own declaration),
+    // resolved by `ReasoningReplayContract::for_route` at startup. Writing the
+    // resolved values into a generated config would duplicate the fact and let
+    // the two copies drift — and a user would have to understand a protocol
+    // detail to get a working model. `reasoning_replay_scope` and
+    // `reasoning_content_key_required` remain accepted as advanced overrides.
+    if let Some(scope) = profile.compatibility.reasoning_replay_scope {
         model["reasoning_replay_scope"] = value(scope.as_str());
     }
-    if let Some(required_key) = profile
-        .compatibility
-        .reasoning_content_key_required
-        .or(required.map(|required| required.missing == MissingReasoningReplay::EmptyString))
-    {
+    if let Some(required_key) = profile.compatibility.reasoning_content_key_required {
         model["reasoning_content_key_required"] = value(required_key);
     }
     annotate_generated_config(&mut doc);
@@ -1154,6 +1169,16 @@ const MODEL_SETTING_COMMENTS: &[(&str, &str, &str)] = &[
         "reasoning_content_key_required",
         "无推理的历史轮次是否仍需发送空的 reasoning_content 键。",
         "Whether a replayed assistant turn with no captured reasoning is sent an empty reasoning_content key.",
+    ),
+    (
+        "preserved_thinking",
+        "该路由是否保留历史轮次的思考（GLM：clear_thinking: false）。",
+        "Whether the route preserves its earlier turns' thinking (GLM: clear_thinking: false).",
+    ),
+    (
+        "forced",
+        "该路由是否无法关闭思考；关闭时不会向用户提供 off。",
+        "Whether the route cannot stop thinking; `off` is then not offered.",
     ),
 ];
 
@@ -1795,9 +1820,9 @@ mod tests {
         }
     }
 
-    /// The lab/dogfood config and the `leveler login` output must resolve to
-    /// the SAME replay contract even though only login writes the two
-    /// compatibility fields. The route's model family is the capability source.
+    /// The lab/dogfood config and the `leveler login` output must resolve to the
+    /// SAME replay contract, and neither needs to write the two protocol fields:
+    /// the route's model family is the capability source.
     #[test]
     fn a_hand_written_route_resolves_the_same_contract_as_login() {
         // Shape of the Release-lab config: a DeepSeek wire model with a
@@ -1833,9 +1858,9 @@ reasoning_effort = "max"
         assert_eq!(lab_contract.arm_name(), "when_tools+empty");
         leveler_model::ReasoningReplayContract::check_route(lab_profile).unwrap();
 
-        // The login path renders the requirement it resolved, so a generated
-        // config declares the same fact instead of depending on the reader's
-        // family table.
+        // Login renders model facts only. It must not write the resolved
+        // protocol requirement, or a generated config would be a second copy
+        // of the family table and the two could drift.
         let builtin = leveler_provider::builtin_model_profile("deepseek", "deepseek-flash")
             .unwrap()
             .unwrap();
@@ -1851,13 +1876,10 @@ reasoning_effort = "max"
         let login_profile = &login_bundle.models[0].profile;
         let login_contract = leveler_model::ReasoningReplayContract::for_route(login_profile);
         assert_eq!(login_contract, lab_contract);
-        assert_eq!(
-            login_profile.compatibility.reasoning_replay_scope,
-            Some(leveler_model::ReasoningReplayScope::WhenToolsPresent)
-        );
+        assert_eq!(login_profile.compatibility.reasoning_replay_scope, None);
         assert_eq!(
             login_profile.compatibility.reasoning_content_key_required,
-            Some(true)
+            None
         );
     }
 
@@ -1896,14 +1918,13 @@ reasoning_replay_scope = "never"
         assert!(message.contains("HTTP 400"), "{message}");
     }
 
-    /// A provider with no historical-reasoning channel must not receive fields
-    /// it never asked for, whatever the route is called.
+    /// A generated config writes no replay fields at all, and a provider with no
+    /// historical-reasoning channel never receives fields it never asked for.
     #[test]
     fn a_non_replay_route_keeps_writing_no_replay_fields() {
         let profile = leveler_provider::builtin_model_profile("bigmodel", "glm-5.3")
             .unwrap()
             .unwrap();
-        assert!(profile.compatibility.reasoning_replay_scope.is_some());
         let text = render_init_config_with_profile(
             "bigmodel",
             "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -1911,10 +1932,24 @@ reasoning_replay_scope = "never"
             &profile,
         );
         let doc: DocumentMut = text.parse().unwrap();
-        assert_eq!(
-            doc["models"]["glm-5.3"]["reasoning_replay_scope"].as_str(),
-            Some("when_tools_present")
+        assert!(
+            doc["models"]["glm-5.3"]
+                .get("reasoning_replay_scope")
+                .is_none(),
+            "{text}"
         );
+        assert!(
+            doc["models"]["glm-5.3"]
+                .get("reasoning_content_key_required")
+                .is_none(),
+            "{text}"
+        );
+        // The facts that ARE the route's own are written.
+        assert_eq!(
+            doc["models"]["glm-5.3"]["preserved_thinking"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(doc["models"]["glm-5.3"]["forced"].as_bool(), Some(true));
 
         let mut plain = profile.clone();
         plain.model_id = "gpt-4o".into();

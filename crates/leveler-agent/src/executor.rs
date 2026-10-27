@@ -2315,6 +2315,13 @@ impl Executor {
     }
 
     /// Apply the route's resolved reasoning-replay contract.
+    /// The route this executor addresses, when the runtime can name it. Passed
+    /// to every projection so foreign reasoning is never replayed as this
+    /// model's own.
+    pub(crate) fn route_identity(&self) -> Option<leveler_model::RouteIdentity> {
+        self.runtime.route_identity(&self.model)
+    }
+
     pub fn with_reasoning_replay(
         mut self,
         reasoning_replay: leveler_model::ReasoningReplayContract,
@@ -4575,6 +4582,7 @@ mod request_pressure_accounting_tests {
             leveler_model::ReasoningReplayContract::NONE,
             leveler_model::ReasoningRetention::All,
             &control,
+            None,
         )
         .estimated_tokens();
         assert!(

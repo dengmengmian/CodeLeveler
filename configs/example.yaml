@@ -140,28 +140,42 @@ reasoning:
   style: thinking_flag
   supported_efforts: [low, high, max]
   default_effort: max        # CodeLeveler default; DeepSeek's own default is high
+  # Optional, and only for a route whose preserved-thinking mode differs from
+  # the endpoint default: `preserved_thinking: true` spells
+  # `thinking: {type: "enabled", clear_thinking: false}` (GLM keeps earlier
+  # turns' reasoning across a tool loop). Omit it and no such field is sent.
+  # `forced: true` means the model always thinks; `off` is then not offered.
+  # preserved_thinking: true
+  # forced: true
 limits:
   context_window: 1048576    # hard window (DeepSeek v4 = 1M)
   reliable_context: 786432   # auto-compaction threshold
   max_output_tokens: 393216  # official max output 384K; keep input+output ≤ window
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 0  # provider supports parallel calls; no published hard cap
-# Compatibility facts. Omitting this block does NOT mean "never" for a model
-# family whose wire protocol requires historical reasoning: the route resolves
-# the requirement from the wire `model_id` (DeepSeek thinking mode replays the
-# full reasoning of every historical assistant turn on tool-bearing requests,
-# including turns that called no tool; a turn that captured none carries the
-# empty key). Declaring a WEAKER value than a hard protocol requirement is a
-# startup error naming this model and field; a documented family default (GLM,
-# Kimi) may be opted out when the deployment disabled preserved thinking.
+# Compatibility facts.
+#
+# You do NOT need to configure Reasoning Replay. It is resolved from the route:
+# DeepSeek thinking mode replays the full reasoning of every historical
+# assistant turn on tool-bearing requests, including turns that called no tool,
+# and carries the empty key on a turn that captured none; Kimi K3 does the same;
+# GLM and Kimi's K2.x models replay captured reasoning in a tool loop and omit
+# the key for a turn that produced none. A provider with no such channel gets no
+# field. The same resolution runs for `leveler login`, a hand-written config,
+# the lab and every client.
+#
+# The two fields below are ADVANCED overrides for a deployment whose behaviour
+# differs from its model family's published requirement. Declaring a WEAKER
+# value than a hard requirement is a startup error naming this model and field;
+# only a documented family default may be opted out of.
 #   reasoning_replay_scope: never | when_tools_present | always
 #   reasoning_content_key_required: bool
 # The legacy boolean `passback_reasoning_content` is still accepted for the
 # scope (`true` = when_tools_present, `false` = never) and does not express the
 # empty-key requirement.
-compatibility:
-  reasoning_replay_scope: when_tools_present
-  reasoning_content_key_required: true
+# compatibility:
+#   reasoning_replay_scope: when_tools_present
+#   reasoning_content_key_required: true
 
 # Pricing is omitted because DeepSeek peak/off-peak and cache rates are
 # dynamic; a static USD/MTok value would produce false cost accounting.

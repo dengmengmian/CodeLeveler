@@ -202,7 +202,8 @@ impl ThinkingCapabilities {
         }
         // The style is the route's own declaration of how it spells a reasoning
         // request, and only one of them has a word for "disabled".
-        let supports_disable = matches!(config.style, ReasoningStyle::ThinkingFlag);
+        let supports_disable =
+            matches!(config.style, ReasoningStyle::ThinkingFlag) && !config.forced;
         let mut supported = if config.supported_efforts.is_empty() {
             config.default_effort.into_iter().collect::<Vec<_>>()
         } else {
@@ -361,6 +362,8 @@ mod tests {
             style,
             supported_efforts: supported.to_vec(),
             default_effort: supported.last().copied(),
+            preserved_thinking: None,
+            forced: false,
         }
     }
 
@@ -615,11 +618,44 @@ mod tests {
                 style: ReasoningStyle::OpenAiEffort,
                 supported_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
                 default_effort: None,
+                preserved_thinking: None,
+                forced: false,
             },
         );
         assert_eq!(
             no_default.project(ThinkingLevel::Auto),
             Some(ThinkingProjection::Omit)
+        );
+    }
+
+    /// A route that always thinks has no word for "stop thinking". Offering
+    /// `off` would either be ignored or rejected while the user believed it took
+    /// effect, so the level is not accepted at all.
+    #[test]
+    fn a_forced_thinking_route_does_not_offer_off() {
+        let caps = ThinkingCapabilities::of(
+            true,
+            &ReasoningConfig {
+                style: ReasoningStyle::ThinkingFlag,
+                supported_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                default_effort: Some(ReasoningEffort::High),
+                preserved_thinking: Some(true),
+                forced: true,
+            },
+        );
+        assert!(!caps.accepts(ThinkingLevel::Off));
+        assert_eq!(caps.project(ThinkingLevel::Off), None);
+        assert_eq!(caps.request(ThinkingLevel::Off), ThinkingProjection::Omit);
+        assert!(
+            !caps.levels().contains(&ThinkingLevel::Off),
+            "the selector must not show a level the route cannot honour: {:?}",
+            caps.levels()
+        );
+        // A hint that carried `off` from another model does not become a
+        // disable request on this one.
+        assert_eq!(
+            caps.request(ThinkingLevel::Max),
+            ThinkingProjection::Effort(ReasoningEffort::High)
         );
     }
 
@@ -666,6 +702,8 @@ mod tests {
                 style: ReasoningStyle::None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
+                preserved_thinking: None,
+                forced: false,
             },
         );
         assert_eq!(fixed.access(), ThinkingAccess::Fixed);
@@ -684,6 +722,8 @@ mod tests {
                 style: ReasoningStyle::AdaptiveThinking,
                 supported_efforts: Vec::new(),
                 default_effort: None,
+                preserved_thinking: None,
+                forced: false,
             },
         );
         assert_eq!(caps.access(), ThinkingAccess::Fixed);

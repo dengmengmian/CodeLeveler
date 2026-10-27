@@ -29,10 +29,11 @@ limits:
   max_parallel_tool_calls: 0
 compatibility:
   thinking_supports_forced_tool_choice: false
-  # DeepSeek's thinking mode requires a tool-bearing request to replay the full
-  # reasoning of every historical assistant turn still in active context; the
-  # retention arm cannot strip a retained turn's reasoning.
-  reasoning_replay_scope: when_tools_present
-  # DeepSeek validates the key's presence on a replayed assistant turn that
-  # produced no reasoning; the empty string satisfies it (measured 2026-08-07).
-  reasoning_content_key_required: true
+  # The replay contract is NOT declared here: DeepSeek's thinking mode requires
+  # a tool-bearing request to replay the full reasoning of every historical
+  # assistant turn still in active context, and to carry the `reasoning_content`
+  # key (empty string) on a turn that produced none. That is a property of the
+  # wire family, resolved by `ReasoningReplayContract::for_route`, so writing it
+  # again here would be a second source of the same fact. Declare
+  # `reasoning_replay_scope` / `reasoning_content_key_required` only to override
+  # a deployment whose behaviour differs from the family default.

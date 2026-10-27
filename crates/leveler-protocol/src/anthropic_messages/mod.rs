@@ -217,6 +217,7 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
                 origin: None,
                 role: Role::Assistant,
                 content,
+                route: None,
             },
             finish_reason,
             usage,
@@ -494,6 +495,8 @@ mod tests {
                     leveler_model::ReasoningEffort::High,
                 ],
                 default_effort: Some(leveler_model::ReasoningEffort::High),
+                preserved_thinking: None,
+                forced: false,
             },
             ..ctx()
         };
@@ -809,6 +812,7 @@ mod tests {
                     origin: None,
                     role: Role::Assistant,
                     content: vec![ContentPart::ToolCall { call }],
+                    route: None,
                 },
                 Message {
                     origin: None,
@@ -820,6 +824,7 @@ mod tests {
                             is_error: false,
                         },
                     }],
+                    route: None,
                 },
                 Message::text(Role::System, "Project rules:\nno unwrap"),
             ],
@@ -860,6 +865,7 @@ mod tests {
                             },
                         })
                         .collect(),
+                    route: None,
                 },
                 Message {
                     origin: None,
@@ -874,6 +880,7 @@ mod tests {
                             },
                         })
                         .collect(),
+                    route: None,
                 },
             ],
         );
@@ -910,6 +917,7 @@ mod tests {
                         is_error: false,
                     },
                 }],
+                route: None,
             }],
         );
         let enc = AnthropicMessagesAdapter::new()
@@ -935,6 +943,7 @@ mod tests {
                         arguments: serde_json::json!({"pattern": "x"}),
                     },
                 }],
+                route: None,
             }],
         );
         let enc = AnthropicMessagesAdapter::new()

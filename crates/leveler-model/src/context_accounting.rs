@@ -586,6 +586,7 @@ mod tests {
             reasoning_route(),
             ReasoningRetention::All,
             &control,
+            None,
         );
         let plain = projection(&messages, &[]);
         assert_eq!(projected.messages(), plain.messages());
@@ -676,11 +677,13 @@ mod tests {
                     text(Role::Assistant, "reading").content[0].clone(),
                     tool_call("read_file", "c1", serde_json::json!({"path": "a"})),
                 ],
+                route: None,
             },
             Message {
                 origin: None,
                 role: Role::Tool,
                 content: vec![tool_result("c1", &"x".repeat(4000))],
+                route: None,
             },
         ];
         let tools = vec![ToolDefinition {
@@ -733,11 +736,13 @@ mod tests {
                     },
                     tool_call("read_file", "c1", serde_json::json!({"path": "a.rs"})),
                 ],
+                route: None,
             },
             Message {
                 origin: None,
                 role: Role::Tool,
                 content: vec![tool_result("c1", &"body ".repeat(200))],
+                route: None,
             },
             Message {
                 origin: None,
@@ -747,6 +752,7 @@ mod tests {
                         url: "https://x/y.png".into(),
                     },
                 }],
+                route: None,
             },
         ];
         let tools = vec![ToolDefinition {
@@ -784,6 +790,7 @@ mod tests {
                     text: "done".into(),
                 },
             ],
+            route: None,
         }];
         let without = vec![Message {
             origin: None,
@@ -791,6 +798,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: "done".into(),
             }],
+            route: None,
         }];
         let acc = ContextAccounting::compute(model(), &projection(&with, &[]), None, None, None);
         let reasoning = category(&acc, "messages")
@@ -836,16 +844,19 @@ mod tests {
                     "c1",
                     serde_json::json!({"cmd": "test"}),
                 )],
+                route: None,
             },
             Message {
                 origin: None,
                 role: Role::Tool,
                 content: vec![tool_result("c1", &large)],
+                route: None,
             },
             Message {
                 origin: None,
                 role: Role::Assistant,
                 content: vec![text(Role::Assistant, small).content[0].clone()],
+                route: None,
             },
         ];
         let acc = ContextAccounting::compute(
@@ -888,6 +899,7 @@ mod tests {
             origin: None,
             role: Role::Tool,
             content: vec![tool_result("never-seen", "body")],
+            route: None,
         }];
         let acc =
             ContextAccounting::compute(model(), &projection(&messages, &[]), None, None, None);

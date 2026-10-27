@@ -17,6 +17,15 @@ reasoning:
   style: thinking_flag
   supported_efforts: [low, high, max]
   default_effort: max
+  # Preserved thinking: the model keeps its earlier turns' reasoning instead of
+  # discarding it between requests. The wire spelling is
+  # `thinking: {type: "enabled", clear_thinking: false}`; without it the
+  # endpoint's default clears prior thinking and a tool loop loses the chain it
+  # was built to keep. Source: https://docs.z.ai/guides/capabilities/thinking-mode
+  preserved_thinking: true
+  # GLM-5.3 and GLM-5.3-FLASH always think: the thinking parameter cannot turn
+  # it off, so `off` is not offered for this route. Source: the same page.
+  forced: true
 limits:
   context_window: 1048576
   # Quality bound: where long-context recall is expected to degrade. The
@@ -25,12 +34,10 @@ limits:
   max_output_tokens: 131072
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
-compatibility:
-  # GLM's interleaved thinking with tools requires the thinking blocks to be
-  # preserved and returned with the tool results; preserved thinking requires
-  # the complete, unmodified `reasoning_content` of every historical assistant
-  # turn. Source: https://docs.z.ai/guides/capabilities/thinking-mode
-  reasoning_replay_scope: when_tools_present
-  # Unlike DeepSeek, GLM has no measured requirement for the key on a turn that
-  # produced no reasoning, so such a turn omits it.
-  reasoning_content_key_required: false
+# No `compatibility:` block: nothing here overrides a default.
+#
+# The replay contract is NOT declared: the GLM wire family's tool-loop
+# requirement is resolved from the model id. Use
+# `reasoning_replay_scope` / `reasoning_content_key_required` only to override
+# a deployment whose behaviour differs from the family default.
+# Source: https://docs.z.ai/guides/capabilities/thinking-mode

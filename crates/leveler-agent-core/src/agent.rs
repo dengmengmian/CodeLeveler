@@ -217,6 +217,11 @@ impl Agent {
             .into());
         }
         let mut ctx = LoopContext::new(self.limits, cancellation);
+        // The route this run addresses, when the runtime can name it. Projected
+        // requests need it to tell their own historical reasoning from another
+        // model's; a runtime that reports no identity leaves it unknown, which
+        // is a recorded fact rather than an assumption.
+        let route = self.runtime.route_identity(&self.model);
 
         loop {
             match harness.on_round_start(&mut ctx, &mut messages).await? {
@@ -308,6 +313,7 @@ impl Agent {
                 self.reasoning_replay,
                 self.reasoning_retention,
                 &request.control_context,
+                route.as_ref(),
             ));
             request.tool_choice = ToolChoice::Auto;
             request.max_output_tokens = self.max_output_tokens;
@@ -510,6 +516,9 @@ mod tests {
     struct Scripted {
         responses: Mutex<Vec<ModelResponse>>,
         requests: Mutex<Vec<ModelRequest>>,
+        /// The route this runtime reports, as a real provider registry does.
+        /// `None` = a runtime that cannot name itself (the default).
+        route: Option<leveler_model::RouteIdentity>,
     }
 
     impl Scripted {
@@ -517,7 +526,13 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 requests: Mutex::new(Vec::new()),
+                route: None,
             }
+        }
+
+        fn with_route(mut self, route: leveler_model::RouteIdentity) -> Self {
+            self.route = Some(route);
+            self
         }
     }
 
@@ -555,6 +570,10 @@ mod tests {
                 "unused",
             ))
         }
+
+        fn route_identity(&self, _model: &ModelRef) -> Option<leveler_model::RouteIdentity> {
+            self.route.clone()
+        }
     }
 
     fn text(t: &str) -> ModelResponse {
@@ -585,6 +604,7 @@ mod tests {
                         arguments: args,
                     },
                 }],
+                route: None,
             },
             finish_reason: FinishReason::ToolCalls,
             usage: TokenUsage::default(),
@@ -614,6 +634,7 @@ mod tests {
                         },
                     },
                 ],
+                route: None,
             },
             finish_reason: FinishReason::ToolCalls,
             usage: TokenUsage::default(),
@@ -788,6 +809,7 @@ mod tests {
                         text: format!("t{i}"),
                     },
                 ],
+                route: None,
             }
         }
         fn tool_turn(i: usize) -> Message {
@@ -801,6 +823,7 @@ mod tests {
                         is_error: false,
                     },
                 }],
+                route: None,
             }
         }
         fn transcript() -> Vec<Message> {
@@ -911,6 +934,205 @@ mod tests {
             assert_eq!(
                 visible_reasoning, 5,
                 "{policy:?} must not mutate the transcript"
+            );
+        }
+    }
+
+    /// A cross-model handover, end to end through the kernel.
+    ///
+    /// Model A runs a tool round with private reasoning, the user switches to
+    /// model B, B continues the same task, and then switches back to A. What
+    /// must hold:
+    ///
+    /// * B never receives A's reasoning as if it were its own thinking;
+    /// * B receives the whole task: the user turn, A's assistant text, A's tool
+    ///   call and the tool result;
+    /// * switching back to A makes A's own earlier reasoning replayable again;
+    /// * the transcript handed to the caller is never rewritten.
+    #[tokio::test]
+    async fn a_cross_model_handover_keeps_the_task_and_drops_private_reasoning() {
+        let route_a = leveler_model::RouteIdentity {
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: None,
+        };
+        let route_b = leveler_model::RouteIdentity {
+            provider: "bigmodel".into(),
+            model: "glm-5.3".into(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: None,
+        };
+
+        // A: one tool round whose assistant turn reasons before calling.
+        let reasoning_call = ModelResponse {
+            request_id: RequestId::generate(),
+            message: Message {
+                origin: None,
+                role: Role::Assistant,
+                content: vec![
+                    ContentPart::Reasoning {
+                        text: "A's private reasoning".into(),
+                    },
+                    ContentPart::Text {
+                        text: "checking the clock".into(),
+                    },
+                    ContentPart::ToolCall {
+                        call: ToolCall {
+                            id: ToolCallId::new("c1"),
+                            name: "echo".into(),
+                            arguments: serde_json::json!({"text": "12:00 UTC"}),
+                        },
+                    },
+                ],
+                route: None,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            usage: TokenUsage::default(),
+        };
+        let (agent_a, model_a) = agent(
+            Scripted::new(vec![reasoning_call, text("A finished")]).with_route(route_a.clone()),
+        );
+        let agent_a =
+            agent_a.with_reasoning_replay(leveler_model::ReasoningReplayContract::raw_field(
+                leveler_model::ReasoningReplayScope::WhenToolsPresent,
+                leveler_model::MissingReasoningReplay::EmptyString,
+            ));
+        let mut harness = BasicHarness::new(Echo);
+        let stop = agent_a
+            .run(
+                vec![Message::user_input("what time is it? use the tool")],
+                &mut harness,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let transcript = stop.messages;
+        {
+            let requests = model_a.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            // Same route: the second A request replays A's own reasoning.
+            let replayed: Vec<String> = requests[1]
+                .projection
+                .as_ref()
+                .unwrap()
+                .messages()
+                .iter()
+                .filter_map(|m| match &m.reasoning {
+                    leveler_model::ProjectedReasoning::Captured(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replayed, vec!["A's private reasoning"]);
+        }
+        // The kernel stamped the producing route on the assistant turn.
+        let authored = transcript
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("an assistant turn");
+        assert_eq!(authored.route.as_ref(), Some(&route_a));
+
+        // B continues the same transcript. Its route is not A's.
+        let (agent_b, model_b) =
+            agent(Scripted::new(vec![text("B continued")]).with_route(route_b.clone()));
+        let agent_b =
+            agent_b.with_reasoning_replay(leveler_model::ReasoningReplayContract::raw_field(
+                leveler_model::ReasoningReplayScope::WhenToolsPresent,
+                leveler_model::MissingReasoningReplay::Omit,
+            ));
+        let mut harness = BasicHarness::new(Echo);
+        let stop_b = agent_b
+            .run(transcript.clone(), &mut harness, CancellationToken::new())
+            .await
+            .unwrap();
+        {
+            let requests = model_b.requests.lock().unwrap();
+            // The handover request is the first one B sends.
+            let projection = requests[0].projection.as_ref().unwrap();
+            let summary = projection.summary();
+            assert_eq!(
+                summary.foreign_turns, 2,
+                "both of A's assistant turns are another route's"
+            );
+            assert_eq!(summary.carried_turns, 0);
+            for message in projection.messages() {
+                if message.role == Role::Assistant {
+                    assert_ne!(
+                        message.reasoning.as_wire(),
+                        Some("A's private reasoning"),
+                        "another model's reasoning must never be replayed"
+                    );
+                }
+            }
+            // The task survives: assistant text, tool call and tool result.
+            let contents: Vec<&ContentPart> = projection
+                .messages()
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .collect();
+            assert!(contents.iter().any(|part| matches!(
+                part,
+                ContentPart::Text { text } if text == "checking the clock"
+            )));
+            assert!(
+                contents
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::ToolCall { .. })),
+                "B must see the tool call A made"
+            );
+            assert!(
+                contents
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::ToolResult { .. })),
+                "B must see the tool result the task depends on"
+            );
+        }
+
+        // Switching back to A: A's own turn is this model's reasoning again, and
+        // B's prose joins the same history as plain task context.
+        let switched_back = stop_b.messages;
+        let (agent_a2, model_a2) =
+            agent(Scripted::new(vec![text("A resumed")]).with_route(route_a.clone()));
+        let agent_a2 =
+            agent_a2.with_reasoning_replay(leveler_model::ReasoningReplayContract::raw_field(
+                leveler_model::ReasoningReplayScope::WhenToolsPresent,
+                leveler_model::MissingReasoningReplay::EmptyString,
+            ));
+        let mut harness = BasicHarness::new(Echo);
+        agent_a2
+            .run(switched_back, &mut harness, CancellationToken::new())
+            .await
+            .unwrap();
+        {
+            let requests = model_a2.requests.lock().unwrap();
+            let projection = requests[0].projection.as_ref().unwrap();
+            let replayed: Vec<String> = projection
+                .messages()
+                .iter()
+                .filter_map(|m| match &m.reasoning {
+                    leveler_model::ProjectedReasoning::Captured(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                replayed,
+                vec!["A's private reasoning"],
+                "A's own history is replayable again after switching back"
+            );
+            assert!(
+                projection.summary().foreign_turns >= 1,
+                "B's turn is foreign"
+            );
+            assert!(
+                projection
+                    .messages()
+                    .iter()
+                    .any(|m| m.role == Role::Assistant
+                        && m.content.iter().any(|p| matches!(
+                            p,
+                            ContentPart::Text { text } if text == "B continued"
+                        ))),
+                "B's answer stays in the task context"
             );
         }
     }

@@ -1049,6 +1049,8 @@ mod tests {
                     style,
                     supported_efforts: supported,
                     default_effort: None,
+                    preserved_thinking: None,
+                    forced: false,
                 },
                 compatibility: leveler_model::CompatibilityConfig::default(),
                 pricing: None,

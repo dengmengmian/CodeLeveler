@@ -107,6 +107,23 @@ pub enum ReasoningReplayScope {
     Always,
 }
 
+/// Who wrote a historical assistant turn, relative to the route this request
+/// addresses.
+///
+/// This is the provenance half of the replay decision, and it is deliberately
+/// three-valued: "nobody recorded it" is neither "same route" nor "another
+/// route".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnProvenance {
+    /// The turn records the same route this request addresses.
+    SameRoute,
+    /// The turn records another provider, model, protocol or deployment.
+    Foreign,
+    /// The turn carries no recorded route (historical payload, or a runtime
+    /// that cannot report one).
+    Unknown,
+}
+
 /// What a replayed assistant turn carries when it captured no reasoning.
 ///
 /// Orthogonal to [`ReasoningReplayScope`]: "should reasoning be replayed?" and
@@ -516,6 +533,23 @@ pub struct ReasoningProjectionSummary {
     /// applied, and the request's reasoning cost cannot be reduced by the arm:
     /// the lever is the context lifecycle, which removes whole turns.
     pub protocol_protected_turns: usize,
+    /// Assistant turns another route produced. Their reasoning is private to
+    /// the model that wrote it, so it is never carried to this one: the turn's
+    /// text, tool calls and tool results stay, its thinking does not. Counted
+    /// rather than silently dropped.
+    #[serde(default)]
+    pub foreign_turns: usize,
+    /// Assistant turns whose producing route was not recorded (a payload
+    /// written before provenance existed, or a request assembled by a runtime
+    /// that cannot report its route). Not the same fact as
+    /// [`Self::empty_turns`]: "nobody said" is not "the model produced none".
+    #[serde(default)]
+    pub unknown_provenance_turns: usize,
+    /// Assistant turns THIS route produced that captured no reasoning. The
+    /// provider completed the turn and returned no thinking, which is a fact
+    /// about the turn, not a gap in the record.
+    #[serde(default)]
+    pub empty_turns: usize,
 }
 
 impl ReasoningProjectionSummary {
@@ -570,6 +604,29 @@ impl RequestProjection {
             contract,
             retention,
             &crate::ControlContext::default(),
+            None,
+        )
+    }
+
+    /// Project for a route this caller can name, with no control context.
+    ///
+    /// Prefer this over [`Self::project`] wherever the route is known: only a
+    /// named route lets the projection tell its own historical reasoning from
+    /// another model's.
+    pub fn project_for_route(
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        contract: ReasoningReplayContract,
+        retention: ReasoningRetention,
+        route: Option<&crate::RouteIdentity>,
+    ) -> Self {
+        Self::project_with_control_context(
+            messages,
+            tools,
+            contract,
+            retention,
+            &crate::ControlContext::default(),
+            route,
         )
     }
 
@@ -580,6 +637,7 @@ impl RequestProjection {
         contract: ReasoningReplayContract,
         retention: ReasoningRetention,
         control_context: &crate::ControlContext,
+        route: Option<&crate::RouteIdentity>,
     ) -> Self {
         let has_tools = !tools.is_empty();
         let replay_captured = contract.replays_captured(has_tools);
@@ -596,6 +654,9 @@ impl RequestProjection {
             captured_turns: 0,
             carried_turns: 0,
             protocol_protected_turns: 0,
+            foreign_turns: 0,
+            unknown_provenance_turns: 0,
+            empty_turns: 0,
         };
 
         for (index, message) in messages.iter().enumerate() {
@@ -619,10 +680,48 @@ impl RequestProjection {
                 }
             }
 
+            // Reasoning is the producing route's own thought. Replaying it to
+            // another route would present foreign content as this model's
+            // native context, so a turn authored elsewhere keeps its text,
+            // tool calls and tool results but not its thinking. An unrecorded
+            // author is unknown — never assumed compatible and never assumed
+            // foreign: the captured text is the only evidence there is, so the
+            // contract's replay applies while the fact is counted.
+            let provenance = match (&message.route, route) {
+                (Some(author), Some(current)) => {
+                    if author.is_same_route(current) {
+                        TurnProvenance::SameRoute
+                    } else {
+                        TurnProvenance::Foreign
+                    }
+                }
+                _ => TurnProvenance::Unknown,
+            };
+            if message.role == Role::Assistant {
+                match provenance {
+                    TurnProvenance::Foreign => summary.foreign_turns += 1,
+                    TurnProvenance::Unknown => summary.unknown_provenance_turns += 1,
+                    // This route completed the turn and captured no reasoning:
+                    // a measured empty, not a gap in the record.
+                    TurnProvenance::SameRoute if !has_reasoning_part => summary.empty_turns += 1,
+                    TurnProvenance::SameRoute => {}
+                }
+            }
+            let replay_here = replay_captured && provenance != TurnProvenance::Foreign;
+
             let reasoning = if has_reasoning_part {
                 summary.captured_turns += 1;
-                if !replay_captured {
-                    ProjectedReasoning::Omitted
+                if !replay_here {
+                    // Another route's private reasoning never reaches this
+                    // model. The provider still validates the channel's
+                    // presence on a replayed assistant turn, so the legal
+                    // empty value carries the shape without the content —
+                    // a compatibility spelling, never a claim of completeness.
+                    if requires_empty_key {
+                        ProjectedReasoning::RequiredEmpty
+                    } else {
+                        ProjectedReasoning::Omitted
+                    }
                 } else if requested_carried.contains(&index) {
                     summary.carried_turns += 1;
                     ProjectedReasoning::Captured(captured)
@@ -693,6 +792,7 @@ impl RequestProjection {
                 contract,
                 crate::retention::ReasoningRetention::All,
                 &request.control_context,
+                None,
             )),
         }
     }
@@ -878,6 +978,7 @@ mod tests {
                         arguments: serde_json::json!({"path": "a.rs"}),
                     },
                 }],
+                route: None,
             },
             Message {
                 origin: None,
@@ -889,6 +990,7 @@ mod tests {
                         is_error: false,
                     },
                 }],
+                route: None,
             },
             Message::text(
                 Role::User,
@@ -988,6 +1090,7 @@ mod tests {
             origin: None,
             role: Role::Assistant,
             content,
+            route: None,
         }
     }
 
@@ -1133,6 +1236,7 @@ mod tests {
                         is_error: false,
                     },
                 }],
+                route: None,
             },
             assistant(Some("plain reasoning"), false),
         ];
@@ -1327,6 +1431,7 @@ mod signed_replay_tests {
             origin: None,
             role: Role::Assistant,
             content: parts.clone(),
+            route: None,
         }];
         let contract =
             ReasoningReplayContract::resolve(ProtocolKind::AnthropicMessages, &Default::default());

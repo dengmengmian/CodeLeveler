@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::ModelError;
 use crate::event::ModelEvent;
 use crate::profile::ModelProfile;
+use crate::provenance::RouteIdentity;
 use crate::request::{ModelRef, ModelRequest};
 use crate::response::ModelResponse;
 
@@ -35,6 +36,16 @@ pub trait ModelRuntime: Send + Sync {
 
     /// The capability profile for a model.
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError>;
+
+    /// The identity of the route `model` addresses, when this runtime knows it.
+    ///
+    /// The runtime that assembled an assistant turn stamps it with this so a
+    /// later replay can tell the route's own reasoning from another model's.
+    /// The default reports "unknown", which is the truth for a scripted or
+    /// in-process runtime: an unrecorded route must never be invented.
+    fn route_identity(&self, _model: &ModelRef) -> Option<RouteIdentity> {
+        None
+    }
 }
 
 /// Synthesize a normalized event stream from an assembled response — the ONE
@@ -123,6 +134,7 @@ mod stream_from_response_tests {
                         },
                     },
                 ],
+                route: None,
             },
             finish_reason: FinishReason::ToolCalls,
             usage: TokenUsage {

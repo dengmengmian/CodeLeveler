@@ -4071,12 +4071,14 @@ impl InProcessRuntimeClient {
                         )
                         .with_approver(Arc::new(AutoApprove))
                     });
+                    let route = app.registry.route_identity(&model);
                     let project = |messages: &[Message]| {
-                        leveler_model::RequestProjection::project(
+                        leveler_model::RequestProjection::project_for_route(
                             messages,
                             &tool_definitions,
                             policy.reasoning_replay,
                             policy.reasoning_retention,
+                            route.as_ref(),
                         )
                     };
                     // Pressure includes the entire side conversation and the
@@ -7510,11 +7512,12 @@ async fn compact_conversation(
     request.reasoning_effort =
         resolve_reasoning_effort(requested_effort, &profile.reasoning).effective;
     request.max_output_tokens = Some(profile.limits.max_output_tokens.min(4096));
-    request.projection = Some(leveler_model::RequestProjection::project(
+    request.projection = Some(leveler_model::RequestProjection::project_for_route(
         &request.messages,
         &request.tools,
         leveler_model::ReasoningReplayContract::resolve(profile.protocol, &profile.compatibility),
         leveler_model::ReasoningRetention::default(),
+        app.registry.route_identity(model).as_ref(),
     ));
     let estimated_tokens = request
         .projection

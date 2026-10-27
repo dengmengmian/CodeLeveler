@@ -557,6 +557,13 @@ async fn stream_round(
         "model round started"
     );
 
+    // Which route this round addresses, recorded on the assembled message so a
+    // later replay can tell this route's own reasoning from another model's.
+    // Asked before the request is consumed; `None` stays `None` — an unknown
+    // route is a fact, and guessing it is exactly the fabrication provenance
+    // exists to prevent.
+    let route = runtime.route_identity(&request.model);
+
     let started_stream = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(AgentCoreError::Cancelled),
@@ -833,6 +840,7 @@ async fn stream_round(
             origin: None,
             role: Role::Assistant,
             content,
+            route,
         },
         usage,
         finish_reason,
@@ -1270,6 +1278,7 @@ mod retry_decision_tests {
                         },
                     })
                     .collect(),
+                route: None,
             },
             Message {
                 origin: None,
@@ -1284,6 +1293,7 @@ mod retry_decision_tests {
                         },
                     })
                     .collect(),
+                route: None,
             },
         ];
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2114,6 +2124,143 @@ mod reasoning_assembly_tests {
         assert_eq!(
             reasoning_shape(&events),
             vec!["started", "delta", "delta", "completed", "assistant"]
+        );
+    }
+
+    /// Provenance: the runtime that assembled the turn stamps the route it
+    /// addressed, so a later replay can tell this model's own reasoning from
+    /// another model's. A runtime that cannot name its route reports nothing —
+    /// and "nothing" stays absent rather than being guessed.
+    #[tokio::test]
+    async fn the_assembled_message_records_the_route_that_produced_it() {
+        struct RoutedRuntime {
+            events: Vec<ModelEvent>,
+            route: Option<leveler_model::RouteIdentity>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelRuntime for RoutedRuntime {
+            async fn generate(
+                &self,
+                _r: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelResponse, ModelError> {
+                unimplemented!()
+            }
+
+            async fn stream(
+                &self,
+                _r: ModelRequest,
+                _c: CancellationToken,
+            ) -> Result<leveler_model::ModelEventStream, ModelError> {
+                let events: Vec<Result<ModelEvent, ModelError>> =
+                    self.events.iter().cloned().map(Ok).collect();
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+
+            async fn profile(
+                &self,
+                _m: &leveler_model::ModelRef,
+            ) -> Result<leveler_model::ModelProfile, ModelError> {
+                unimplemented!()
+            }
+
+            fn route_identity(
+                &self,
+                _m: &leveler_model::ModelRef,
+            ) -> Option<leveler_model::RouteIdentity> {
+                self.route.clone()
+            }
+        }
+
+        let completed = vec![
+            ModelEvent::MessageStarted {
+                request_id: leveler_core::RequestId::new("r"),
+            },
+            ModelEvent::ReasoningDelta {
+                delta: "thought".into(),
+            },
+            ModelEvent::MessageCompleted {
+                finish_reason: FinishReason::Stop,
+            },
+        ];
+        let route = leveler_model::RouteIdentity {
+            provider: "bigmodel".into(),
+            model: "glm-5.3".into(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: Some("https://open.bigmodel.cn/api/coding/paas/v4".into()),
+        };
+        let round = run_model_round(
+            &RoutedRuntime {
+                events: completed.clone(),
+                route: Some(route.clone()),
+            },
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await
+        .expect("scripted stream completes");
+        assert_eq!(round.message.route.as_ref(), Some(&route));
+
+        let unrouted = run_model_round(
+            &RoutedRuntime {
+                events: completed,
+                route: None,
+            },
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await
+        .expect("scripted stream completes");
+        assert_eq!(
+            unrouted.message.route, None,
+            "an unknown route is reported as unknown, never invented"
+        );
+    }
+
+    /// Integrity: a stream that breaks after emitting reasoning never yields an
+    /// assistant message, so an interrupted reasoning segment can never be
+    /// stored or replayed as a complete one.
+    #[tokio::test]
+    async fn an_interrupted_stream_never_promotes_partial_reasoning() {
+        let runtime = ScriptedStreamRuntime {
+            events: vec![
+                ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                },
+                ModelEvent::ReasoningDelta {
+                    delta: "half a thought".into(),
+                },
+            ],
+        };
+        // The retry policy is instant here: this asserts the integrity of one
+        // attempt, and waiting the real 3-minute backoff schedule would prove
+        // nothing about the message it never produced.
+        let result = run_model_round_with(
+            &runtime,
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |_| {},
+            RetryPolicy {
+                max_retries: 0,
+                delay_scale: 0.0,
+            },
+        )
+        .await;
+        let error = match result {
+            Err(AgentCoreError::Model(error)) => error,
+            other => panic!("a stream without a terminal event is not a message: {other:?}"),
+        };
+        assert_eq!(error.kind, ModelErrorKind::StreamInterrupted);
+        assert!(
+            matches!(
+                error.delivery_state,
+                leveler_model::DeliveryState::StreamInterrupted { progress } if progress.reasoning
+            ),
+            "the interrupted attempt reports that reasoning had started: {:?}",
+            error.delivery_state
         );
     }
 

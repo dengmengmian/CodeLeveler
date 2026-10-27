@@ -23,6 +23,7 @@ pub mod message;
 pub mod profile;
 pub mod projection;
 pub mod protocol;
+pub mod provenance;
 pub mod reasoning_route;
 pub mod request;
 pub mod response;
@@ -69,9 +70,10 @@ pub use projection::{
 pub use protocol::{
     EncodedRequest, ProtocolAdapter, ProtocolContext, ProtocolError, RawByteStream,
 };
+pub use provenance::RouteIdentity;
 pub use reasoning_route::{
     ReasoningReplayEnforcement, ReasoningRouteConflict, RequiredReasoningReplay,
-    required_reasoning_replay,
+    required_reasoning_replay, required_reasoning_replay_for,
 };
 pub use request::{
     ControlContext, ModelRef, ModelRequest, PromptSegment, RequestMetadata, TransportPolicy,

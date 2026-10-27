@@ -56,6 +56,12 @@ pub struct StreamOptions {
 pub struct Thinking {
     #[serde(rename = "type")]
     pub kind: &'static str,
+    /// Whether the endpoint discards the thinking of earlier turns. Z.AI/GLM
+    /// spells preserved thinking as `clear_thinking: false`; the field is
+    /// omitted entirely unless the route declares the preserved-thinking mode,
+    /// so an endpoint that never asked for it is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

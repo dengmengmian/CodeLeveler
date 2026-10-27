@@ -844,14 +844,43 @@ context_window = 131072
             assert_eq!(facts["max_output_tokens"].as_integer(), Some(393_216));
             assert_eq!(facts["supports_temperature"].as_bool(), Some(true));
             assert_eq!(facts["max_parallel_tool_calls"].as_integer(), Some(0));
-            assert_eq!(
-                facts["reasoning_replay_scope"].as_str(),
-                Some("when_tools_present")
+            // Login writes MODEL facts only. The replay contract is a property
+            // of DeepSeek's wire family, resolved at startup, so a generated
+            // config must not restate it: `leveler login` alone is enough for a
+            // correct model, with no protocol field to understand.
+            assert!(
+                facts.get("reasoning_replay_scope").is_none(),
+                "login must not write the resolved replay scope: {text}"
             );
-            assert_eq!(
-                facts["reasoning_content_key_required"].as_bool(),
-                Some(true)
+            assert!(
+                facts.get("reasoning_content_key_required").is_none(),
+                "login must not write the empty-key requirement: {text}"
             );
+        }
+    }
+
+    /// Whatever login writes must resolve exactly what the wire family requires.
+    #[test]
+    fn login_output_resolves_the_family_replay_contract() {
+        use leveler_provider::presets::preset;
+
+        for (provider, model, arm) in [
+            ("deepseek", "deepseek-flash", "when_tools+empty"),
+            ("deepseek", "deepseek-v4-pro", "when_tools+empty"),
+            ("bigmodel", "glm-5.3", "when_tools"),
+            ("bigmodel", "glm-5.3-flash", "when_tools"),
+        ] {
+            let text = starter_config(preset(provider).unwrap(), model).unwrap();
+            let bundle = leveler_app::global_config::GlobalConfig::from_toml_str(&text)
+                .unwrap()
+                .into_bundle();
+            let profile = &bundle.models[0].profile;
+            assert_eq!(
+                leveler_model::ReasoningReplayContract::for_route(profile).arm_name(),
+                arm,
+                "{provider}/{model}: {text}"
+            );
+            leveler_model::ReasoningReplayContract::check_route(profile).unwrap();
         }
     }
 

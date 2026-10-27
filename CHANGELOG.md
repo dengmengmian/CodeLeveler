@@ -10,6 +10,17 @@ display and archive boundaries.
 
 ### Added
 
+- Reasoning replay has an owner. Every assistant turn records the route that produced it (provider, wire model, protocol, deployment when known), and captured reasoning is replayed only to the route that produced it — per turn, so A → B → A replays A's own history again. A model switch keeps the user's objective, the assistant's prose, the tool calls and their results and drops only the foreign private reasoning; where the protocol requires the channel's presence it carries the legal empty value, never foreign content and never reasoning folded into the visible reply
+- An assistant turn this route completed that produced no reasoning is reported as *empty*; a payload with no recorded route is *unknown*; an interrupted stream never becomes a message, so partial reasoning cannot be replayed as complete. The projection reports foreign, unknown and empty turn counts instead of collapsing them
+- GLM preserved thinking is sent as the route declares it (`thinking: {"type": "enabled", "clear_thinking": false}`), so a tool loop keeps the reasoning chain the model was built to reuse. A route that cannot stop thinking (GLM-5.3/5.3-FLASH) no longer offers `off`
+- Kimi K3 and its point releases are a hard replay family in the wire-family table (complete assistant message, `reasoning_content` included); Kimi's K2.x thinking models require replay in a tool loop without requiring the empty key
+
+### Changed
+- `leveler login` writes model facts only. A generated config no longer carries `reasoning_replay_scope` or `reasoning_content_key_required`: the replay contract is a property of the route's wire family, resolved once at startup by `ReasoningReplayContract::for_route`. Both fields remain accepted as advanced overrides for a deployment whose behaviour differs from its family's published requirement, and the legacy `passback_reasoning_content` boolean still parses
+- The bundled model files no longer restate the family requirement, so the capability table is the single source of that fact
+
+### Added
+
 - `/memory` is a management page over the runtime's listing: filter titles and bodies by keyword, narrowing by scope and by lane, open a record to read its full text with its own identity and metadata, copy that text or its `scope:id`, and pin, deprecate or archive it. Destructive actions need a second press; every action goes through the memory service and the remote policy denies them
 - A turn's `MemoryRecalled` event names the records the request actually carried (scope, bounded title, mode). `/memory` resolves those names against the current listing, so a record the user has since forgotten is counted, never re-shown
 - Memory is part of the first request when `memory.enabled` is true: `memory`, `remember` and `forget` plus the guidance, catalog and recall no longer require a `capability(enable)` round trip. Approval rules for memory writes are unchanged

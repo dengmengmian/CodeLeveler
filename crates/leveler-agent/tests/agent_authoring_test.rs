@@ -94,6 +94,7 @@ fn batch(calls: Vec<(&str, serde_json::Value)>) -> ModelResponse {
                     },
                 })
                 .collect(),
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),

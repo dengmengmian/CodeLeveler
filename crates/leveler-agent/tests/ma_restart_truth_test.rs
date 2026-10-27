@@ -111,6 +111,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
                     arguments: args,
                 },
             }],
+            route: None,
         },
         finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),
@@ -1161,6 +1162,7 @@ async fn seed_interrupted_child_session_scoped(
                     arguments: serde_json::json!({"path": "src/lib.rs"}),
                 },
             }],
+            route: None,
         },
         Message {
             origin: None,
@@ -1172,6 +1174,7 @@ async fn seed_interrupted_child_session_scoped(
                     is_error: false,
                 },
             }],
+            route: None,
         },
     ];
     log.append(

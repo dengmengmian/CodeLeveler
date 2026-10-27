@@ -35,6 +35,7 @@ fn main() {
                         is_error: false,
                     },
                 }],
+                route: None,
             });
         } else {
             messages.push(Message::text(

@@ -38,6 +38,8 @@ fn canonical_capability_wire_matrix() {
             style,
             default_effort: supported.last().copied(),
             supported_efforts: supported.clone(),
+            preserved_thinking: None,
+            forced: false,
         };
         let caps = ThinkingCapabilities::of(reasons, &config);
         let context = ProtocolContext {

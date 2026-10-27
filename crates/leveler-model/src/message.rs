@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use leveler_core::ToolCallId;
 
 use crate::authority::TranscriptOrigin;
+use crate::provenance::RouteIdentity;
 
 /// The role of a message in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,14 @@ pub struct Message {
     /// Absent on historical payloads. Absence is not user input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<TranscriptOrigin>,
+    /// The route that produced this assistant turn, when this build recorded
+    /// it. Absent on historical payloads and on non-model rows.
+    ///
+    /// Reasoning is only meaningful as the same route's continued thought, so
+    /// a replay decision needs to know which route authored the turn. See
+    /// [`RouteIdentity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteIdentity>,
 }
 
 impl Message {
@@ -68,6 +77,7 @@ impl Message {
             role,
             content,
             origin,
+            route: None,
         }
     }
 
@@ -81,6 +91,20 @@ impl Message {
                 "{text}\n\n[Response interrupted before completion. This is incomplete output; no tool calls from this response were executed.]"
             ),
         )
+    }
+
+    /// Record the route that produced this row.
+    ///
+    /// The runtime that assembled the message knows the route it addressed;
+    /// nothing downstream may re-derive or guess it.
+    pub fn with_route(mut self, route: RouteIdentity) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// The route that produced this row, if this build recorded one.
+    pub fn route(&self) -> Option<&RouteIdentity> {
+        self.route.as_ref()
     }
 
     /// A harness protocol repair stored on the user transport role.
@@ -242,6 +266,7 @@ mod tests {
                 ContentPart::Text { text: "b".into() },
             ],
             origin: None,
+            route: None,
         };
         assert_eq!(msg.text_content(), "ab");
     }
