@@ -22,9 +22,9 @@
 use leveler_context::{compact_messages, estimate_tokens};
 use leveler_core::ToolCallId;
 use leveler_model::{
-    ContentPart, Message, MissingReasoningReplay, PromptAuthority, PromptSource,
+    ContentPart, Message, MissingReasoningReplay, PromptAuthority, PromptSource, ProtocolKind,
     ReasoningReplayContract, ReasoningReplayScope, ReasoningRetention, RequestProjection, Role,
-    ToolCall, ToolDefinition, ToolResultContent,
+    RouteIdentity, ToolCall, ToolDefinition, ToolResultContent,
 };
 
 fn route() -> ReasoningReplayContract {
@@ -32,6 +32,28 @@ fn route() -> ReasoningReplayContract {
         ReasoningReplayScope::WhenToolsPresent,
         MissingReasoningReplay::EmptyString,
     )
+}
+
+/// The route these fixtures were produced by. Provenance is recorded by the
+/// runtime; a turn nobody stamped is unproven and its reasoning is withheld, so
+/// a lifecycle fixture must be a conversation the runtime could produce.
+fn own_route() -> RouteIdentity {
+    RouteIdentity {
+        provider: "gateway".into(),
+        model: "wire-model".into(),
+        api: Some(ProtocolKind::OpenAiChat),
+        deployment: None,
+    }
+}
+
+/// Project one request for `own_route`, the way the runtime does.
+fn project_for_own(
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    contract: ReasoningReplayContract,
+    retention: ReasoningRetention,
+) -> RequestProjection {
+    RequestProjection::project_for_route(messages, tools, contract, retention, Some(&own_route()))
 }
 
 fn tools() -> Vec<ToolDefinition> {
@@ -63,7 +85,8 @@ fn thought_round(index: usize, thinking: &str, result: &str) -> Vec<Message> {
                 },
             ],
             None,
-        ),
+        )
+        .with_route(own_route()),
         Message::from_parts(
             Role::Tool,
             vec![ContentPart::ToolResult {
@@ -99,7 +122,7 @@ fn replayed_reasoning(
     contract: ReasoningReplayContract,
     retention: ReasoningRetention,
 ) -> Vec<String> {
-    RequestProjection::project(messages, tools, contract, retention)
+    project_for_own(messages, tools, contract, retention)
         .messages()
         .iter()
         .filter_map(|message| match &message.reasoning {
@@ -114,7 +137,7 @@ fn replayed_reasoning_tokens(
     tools: &[ToolDefinition],
     retention: ReasoningRetention,
 ) -> u64 {
-    RequestProjection::project(messages, tools, route(), retention).estimated_tokens()
+    project_for_own(messages, tools, route(), retention).estimated_tokens()
 }
 
 /// R1: historical reasoning does not grow without bound across a session. It is
@@ -125,7 +148,7 @@ fn historical_reasoning_is_released_by_the_fold_not_replayed_forever() {
     let tools = tools();
     let messages = transcript(10, 400, 100);
 
-    let unfolded = RequestProjection::project(&messages, &tools, route(), ReasoningRetention::All);
+    let unfolded = project_for_own(&messages, &tools, route(), ReasoningRetention::All);
     let unfolded_reasoning = unfolded
         .messages()
         .iter()
@@ -144,8 +167,7 @@ fn historical_reasoning_is_released_by_the_fold_not_replayed_forever() {
         folded.len()
     );
     let projectable: Vec<Message> = folded.clone();
-    let folded_reasoning =
-        RequestProjection::project(&projectable, &tools, route(), ReasoningRetention::All);
+    let folded_reasoning = project_for_own(&projectable, &tools, route(), ReasoningRetention::All);
     let carried = folded_reasoning
         .messages()
         .iter()
@@ -179,12 +201,11 @@ fn historical_reasoning_is_released_by_the_fold_not_replayed_forever() {
         Some("updated briefing"),
         Some("fix the bug"),
     );
-    let twice_carried =
-        RequestProjection::project(&twice, &tools, route(), ReasoningRetention::All)
-            .messages()
-            .iter()
-            .filter(|message| message.reasoning.is_present())
-            .count();
+    let twice_carried = project_for_own(&twice, &tools, route(), ReasoningRetention::All)
+        .messages()
+        .iter()
+        .filter(|message| message.reasoning.is_present())
+        .count();
     assert!(
         twice_carried <= carried,
         "repeated folding never regrows history"
@@ -203,7 +224,7 @@ fn a_tool_exchange_keeps_the_reasoning_the_contract_requires() {
         ReasoningRetention::LastTurns(1),
         ReasoningRetention::None,
     ] {
-        let projection = RequestProjection::project(&messages, &tools, route(), retention);
+        let projection = project_for_own(&messages, &tools, route(), retention);
         let summary = projection.summary();
         assert_eq!(
             summary.captured_turns, 6,
@@ -240,7 +261,7 @@ fn the_arm_never_breaks_a_retained_tool_exchange() {
         ReasoningRetention::LastTurns(1),
         ReasoningRetention::None,
     ] {
-        let projection = RequestProjection::project(&messages, &tools, route(), retention);
+        let projection = project_for_own(&messages, &tools, route(), retention);
         let projected: Vec<Message> = projection
             .messages()
             .iter()
@@ -313,7 +334,7 @@ fn the_folded_surface_is_what_resume_reloads() {
     let messages = transcript(8, 400, 100);
     let folded = compact_messages(&messages, 4, 0, Some("briefing"), Some("fix the bug"));
 
-    let reloaded = RequestProjection::project(&folded, &tools, route(), ReasoningRetention::All);
+    let reloaded = project_for_own(&folded, &tools, route(), ReasoningRetention::All);
     let reloaded_thinking: Vec<String> = reloaded
         .messages()
         .iter()
@@ -627,8 +648,7 @@ fn a_lab_route_keeps_its_resolved_contract_across_a_fold() {
     leveler_model::validate_tool_exchange(&folded)
         .expect("a fold never splits an assistant tool call from its result");
 
-    let projection =
-        RequestProjection::project(&folded, &tools(), contract, ReasoningRetention::All);
+    let projection = project_for_own(&folded, &tools(), contract, ReasoningRetention::All);
     for message in projection.messages() {
         if message.role != Role::Assistant {
             continue;
@@ -733,8 +753,7 @@ fn context_cuts_keep_exchanges_whole_and_the_contract_valid() {
             Some("briefing"),
             None,
         );
-        let projected =
-            RequestProjection::project(&folded, &tools, contract, ReasoningRetention::All);
+        let projected = project_for_own(&folded, &tools, contract, ReasoningRetention::All);
         // Every retained assistant reasoning is exact under the raw contract.
         for message in projected.messages() {
             if let leveler_model::ProjectedReasoning::Captured(text) = &message.reasoning {
@@ -797,8 +816,7 @@ fn repeated_folds_keep_one_advisory_summary_and_a_whole_exchange() {
             summaries <= 1,
             "round {round}: one active summary, got {summaries}"
         );
-        let projection =
-            RequestProjection::project(&folded, &tools, route(), ReasoningRetention::All);
+        let projection = project_for_own(&folded, &tools, route(), ReasoningRetention::All);
         for class in projection.transcript_authority() {
             if class.source == PromptSource::CompactionSummary {
                 assert_eq!(

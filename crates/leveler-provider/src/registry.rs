@@ -352,6 +352,15 @@ impl ModelRuntime for ProviderRegistry {
                 .decode_response(&body, &context)
                 .map_err(|e| ModelError::new(ModelErrorKind::Decode, e.to_string()))?;
             decoded.request_id = RequestId::new(request.request_id.into_inner());
+            // The runtime that addressed this route records it on the turn it
+            // produced. This is not a guess: the request just went to this
+            // route. Callers that assemble a conversation from `generate`
+            // (side questions, auxiliary calls) therefore get the same
+            // provenance the agent loop stamps, instead of a turn nobody can
+            // attribute — which is never replayed as native reasoning.
+            if let Some(route) = self.route_identity(&request.model) {
+                decoded.message.route = Some(route);
+            }
             Ok(decoded)
         }
         .await;
@@ -369,10 +378,13 @@ impl ModelRuntime for ProviderRegistry {
         let entry = self
             .models
             .get(&(model.provider.clone(), model.model.clone()))?;
+        // The deployment is recorded as its normalized identity: one endpoint
+        // has one identity, and a `base_url` that carries credentials in a
+        // query or userinfo must not write them into the session record.
         let deployment = self
             .providers
             .get(&entry.profile.provider)
-            .map(|provider| provider.config.base_url.clone());
+            .map(|provider| leveler_model::deployment_identity(&provider.config.base_url));
         Some(leveler_model::RouteIdentity {
             provider: entry.profile.provider.clone(),
             model: entry.profile.model_id.clone(),

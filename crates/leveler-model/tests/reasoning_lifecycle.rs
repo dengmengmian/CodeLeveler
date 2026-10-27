@@ -23,7 +23,7 @@ use leveler_model::{
     CompatibilityConfig, ContentPart, MissingReasoningReplay, ModelCapabilities, ModelLimits,
     ModelProfile, ProjectedReasoning, ProtocolKind, ReasoningConfig, ReasoningReplayContract,
     ReasoningReplayScope, ReasoningRetention, RequestProjection, Role, RouteIdentity, ToolCall,
-    ToolResultContent,
+    ToolResultContent, deployment_identity,
 };
 
 fn route(provider: &str, model: &str) -> RouteIdentity {
@@ -249,26 +249,119 @@ fn switching_back_to_the_original_route_makes_its_own_history_replayable() {
 }
 
 #[test]
-fn an_unrecorded_author_is_unknown_and_never_reported_as_empty() {
-    // Historical payload (or a runtime that cannot name its route): the
-    // captured text is the only evidence there is. It still replays — the
-    // alternative would discard this session's own history — but the projection
-    // records that it is unproven rather than measured.
+fn an_unrecorded_author_is_unknown_and_its_reasoning_is_not_replayed() {
+    // Historical payload (or a runtime that cannot name its route). Unknown is
+    // not SameRoute: the captured text is real, but nothing proves it belongs to
+    // the route this request addresses, so it never enters the request as this
+    // model's own thought. The turn itself — text, tool call, tool result —
+    // survives; only the private channel is withheld, and the projection says
+    // so instead of reporting a measured empty or a complete replay.
     let current = route("deepseek", "deepseek-flash");
     let messages = vec![
         user("go"),
-        assistant(None, Some("legacy thought"), ""),
+        assistant(None, Some("legacy thought"), "observed"),
         tool_result(),
     ];
     let projection = project(&messages, deepseek_contract(), &current);
-    assert_eq!(carried(&projection), vec!["legacy thought"]);
+    assert_eq!(carried(&projection), Vec::<String>::new());
     assert_eq!(projection.summary().unknown_provenance_turns, 1);
+    assert_eq!(projection.summary().unproven_reasoning_turns, 1);
     assert_eq!(
         projection.summary().empty_turns,
         0,
         "an unrecorded author is not evidence that the model produced nothing"
     );
     assert_eq!(projection.summary().foreign_turns, 0);
+    assert_eq!(
+        projection.summary().carried_turns,
+        0,
+        "an unproven channel is never counted as carried"
+    );
+    // DeepSeek validates the key's presence on a replayed assistant turn, so the
+    // legal wire form is the empty value — a compatibility spelling, never a
+    // claim of completeness.
+    assert_eq!(
+        projection.messages()[1].reasoning,
+        ProjectedReasoning::RequiredEmpty
+    );
+    assert_eq!(projection.messages()[1].content.len(), 2);
+    assert!(matches!(
+        projection.messages()[1].content.last(),
+        Some(ContentPart::ToolCall { .. })
+    ));
+    assert!(matches!(
+        projection.messages()[2].content.last(),
+        Some(ContentPart::ToolResult { .. })
+    ));
+}
+
+#[test]
+fn a_one_sided_deployment_is_unproven_in_both_directions() {
+    // The historical turn names its endpoint, this request does not (or the
+    // other way round). Provider, model and protocol agree, so the turn is not
+    // foreign — but one endpoint is unrecorded, which is not proof of the same
+    // deployment. Unproven reasoning is not replayed; the context is kept.
+    let mut recorded = route("gateway", "deepseek-flash");
+    recorded.deployment = Some(deployment_identity("https://gw.example.com/v1"));
+    let unnamed = route("gateway", "deepseek-flash");
+
+    for (author, current) in [
+        (recorded.clone(), unnamed.clone()),
+        (unnamed.clone(), recorded.clone()),
+    ] {
+        let messages = vec![
+            user("go"),
+            assistant(Some(author), Some("private thought"), ""),
+            tool_result(),
+        ];
+        let projection = project(&messages, deepseek_contract(), &current);
+        assert_eq!(carried(&projection), Vec::<String>::new());
+        assert_eq!(projection.summary().unknown_provenance_turns, 1);
+        assert_eq!(projection.summary().foreign_turns, 0);
+        assert_eq!(projection.summary().unproven_reasoning_turns, 1);
+    }
+}
+
+#[test]
+fn retargeting_a_provider_alias_to_another_endpoint_is_another_route() {
+    // One `[providers.*]` alias addresses exactly one deployment. Editing its
+    // `base_url` moves the alias to a different endpoint, and the history the
+    // old endpoint produced is foreign there even though provider, model and
+    // protocol all still match by name.
+    let mut author = route("gateway", "deepseek-flash");
+    author.deployment = Some(deployment_identity("https://old.example.com/v1"));
+    let mut current = route("gateway", "deepseek-flash");
+    current.deployment = Some(deployment_identity("https://new.example.com/v1"));
+
+    let messages = vec![
+        user("go"),
+        assistant(Some(author), Some("old endpoint thought"), ""),
+        tool_result(),
+    ];
+    let projection = project(&messages, deepseek_contract(), &current);
+    assert_eq!(carried(&projection), Vec::<String>::new());
+    assert_eq!(projection.summary().foreign_turns, 1);
+    assert_eq!(projection.summary().unknown_provenance_turns, 0);
+}
+
+#[test]
+fn the_same_deployment_spelled_differently_still_replays() {
+    // The registry records the normalized identity, so a trailing slash, host
+    // case or an explicit default port cannot turn one endpoint into two and
+    // silently drop the model's own chain.
+    let mut author = route("gateway", "deepseek-flash");
+    author.deployment = Some(deployment_identity("https://API.Gateway.example/v1/"));
+    let mut current = route("gateway", "deepseek-flash");
+    current.deployment = Some(deployment_identity("https://api.gateway.example:443/v1"));
+
+    let messages = vec![
+        user("go"),
+        assistant(Some(author), Some("its own thought"), ""),
+        tool_result(),
+    ];
+    let projection = project(&messages, deepseek_contract(), &current);
+    assert_eq!(carried(&projection), vec!["its own thought"]);
+    assert_eq!(projection.summary().unknown_provenance_turns, 0);
 }
 
 #[test]
@@ -442,11 +535,12 @@ fn the_family_table_separates_required_from_opt_out() {
         .expect("a GLM deployment may disable preserved thinking");
 
     // K2.6 keeps its own rule: replay is required while the route reasons, and
-    // a turn that produced none sends no key.
+    // a turn that produced none still carries the key the endpoint validates,
+    // with the legal empty value (measured on the live route).
     let k26 = profile("kimi-k2.6");
     assert_eq!(
         leveler_model::ReasoningReplayContract::for_route(&k26),
-        glm_contract()
+        deepseek_contract()
     );
     let mut k26_off = k26.clone();
     k26_off.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::Never);

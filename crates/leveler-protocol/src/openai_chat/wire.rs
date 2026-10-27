@@ -58,10 +58,17 @@ pub struct Thinking {
     pub kind: &'static str,
     /// Whether the endpoint discards the thinking of earlier turns. Z.AI/GLM
     /// spells preserved thinking as `clear_thinking: false`; the field is
-    /// omitted entirely unless the route declares the preserved-thinking mode,
-    /// so an endpoint that never asked for it is unaffected.
+    /// omitted entirely unless the route declares the preserved-thinking mode
+    /// AND its wire has that spelling, so an endpoint that never asked for it
+    /// is unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clear_thinking: Option<bool>,
+    /// Which of the earlier turns' thinking the endpoint keeps. Kimi's K2.x
+    /// line spells the same request fact as `keep: "all"` (`null`/omitted is
+    /// the endpoint's "ignore historical thinking" default). Omitted for a
+    /// family that does not have the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]

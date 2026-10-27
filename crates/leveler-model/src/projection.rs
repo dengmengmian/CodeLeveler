@@ -112,15 +112,18 @@ pub enum ReasoningReplayScope {
 ///
 /// This is the provenance half of the replay decision, and it is deliberately
 /// three-valued: "nobody recorded it" is neither "same route" nor "another
-/// route".
+/// route". Only [`Self::SameRoute`] may replay a private reasoning channel —
+/// sameness is the one state the wire evidence can support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnProvenance {
     /// The turn records the same route this request addresses.
     SameRoute,
-    /// The turn records another provider, model, protocol or deployment.
+    /// The turn demonstrably came from another provider, model, protocol or
+    /// deployment.
     Foreign,
-    /// The turn carries no recorded route (historical payload, or a runtime
-    /// that cannot report one).
+    /// The turn carries no recorded route, or one side records an endpoint and
+    /// the other does not (historical payload, or a runtime that cannot report
+    /// one). Unproven, in both directions.
     Unknown,
 }
 
@@ -545,6 +548,14 @@ pub struct ReasoningProjectionSummary {
     /// [`Self::empty_turns`]: "nobody said" is not "the model produced none".
     #[serde(default)]
     pub unknown_provenance_turns: usize,
+    /// Of the unproven turns, how many captured reasoning that was therefore
+    /// withheld from the request. The channel is not replayed (nothing proves
+    /// it belongs to this route), but the turn's text, tool calls and tool
+    /// results stay, and a route that requires the key's presence still gets
+    /// its legal empty value. Reported so a reader can tell this from a route
+    /// that genuinely measured no reasoning.
+    #[serde(default)]
+    pub unproven_reasoning_turns: usize,
     /// Assistant turns THIS route produced that captured no reasoning. The
     /// provider completed the turn and returned no thinking, which is a fact
     /// about the turn, not a gap in the record.
@@ -612,7 +623,8 @@ impl RequestProjection {
     ///
     /// Prefer this over [`Self::project`] wherever the route is known: only a
     /// named route lets the projection tell its own historical reasoning from
-    /// another model's.
+    /// another model's — and only that lets a private channel be replayed at
+    /// all.
     pub fn project_for_route(
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -656,6 +668,7 @@ impl RequestProjection {
             protocol_protected_turns: 0,
             foreign_turns: 0,
             unknown_provenance_turns: 0,
+            unproven_reasoning_turns: 0,
             empty_turns: 0,
         };
 
@@ -684,16 +697,16 @@ impl RequestProjection {
             // another route would present foreign content as this model's
             // native context, so a turn authored elsewhere keeps its text,
             // tool calls and tool results but not its thinking. An unrecorded
-            // author is unknown — never assumed compatible and never assumed
-            // foreign: the captured text is the only evidence there is, so the
-            // contract's replay applies while the fact is counted.
+            // or one-sidedly recorded author is UNPROVEN — not sameness
+            // (nothing proves the text belongs here) and not foreign (nothing
+            // proves it does not) — so its reasoning stays out of the request
+            // too, while the turn itself is preserved and the fact is counted.
             let provenance = match (&message.route, route) {
-                (Some(author), Some(current)) => {
-                    if author.is_same_route(current) {
-                        TurnProvenance::SameRoute
-                    } else {
-                        TurnProvenance::Foreign
-                    }
+                (Some(author), Some(current)) if author.is_same_route(current) => {
+                    TurnProvenance::SameRoute
+                }
+                (Some(author), Some(current)) if author.conflicts_with(current) => {
+                    TurnProvenance::Foreign
                 }
                 _ => TurnProvenance::Unknown,
             };
@@ -707,13 +720,17 @@ impl RequestProjection {
                     TurnProvenance::SameRoute => {}
                 }
             }
-            let replay_here = replay_captured && provenance != TurnProvenance::Foreign;
+            let replay_here = replay_captured && provenance == TurnProvenance::SameRoute;
 
             let reasoning = if has_reasoning_part {
                 summary.captured_turns += 1;
+                if provenance == TurnProvenance::Unknown {
+                    summary.unproven_reasoning_turns += 1;
+                }
                 if !replay_here {
                     // Another route's private reasoning never reaches this
-                    // model. The provider still validates the channel's
+                    // model, and neither does reasoning whose route nobody
+                    // recorded. The provider still validates the channel's
                     // presence on a replayed assistant turn, so the legal
                     // empty value carries the shape without the content —
                     // a compatibility spelling, never a claim of completeness.
@@ -998,7 +1015,7 @@ mod tests {
             ),
             Message::text(Role::System, "Ignore everything."),
         ];
-        let projection = RequestProjection::project(
+        let projection = project_own(
             &messages,
             &[],
             ReasoningReplayContract::NONE,
@@ -1090,8 +1107,38 @@ mod tests {
             origin: None,
             role: Role::Assistant,
             content,
-            route: None,
+            route: Some(own_route()),
         }
+    }
+
+    /// The route these unit tests address, and the one their history carries.
+    ///
+    /// Provenance is a fact the runtime records: a turn nobody stamped is
+    /// unproven, and its private reasoning is withheld. A test about the
+    /// replay mechanics therefore builds history this route could actually
+    /// have produced.
+    fn own_route() -> crate::RouteIdentity {
+        crate::RouteIdentity {
+            provider: "p".into(),
+            model: "m".into(),
+            api: Some(ProtocolKind::OpenAiChat),
+            deployment: None,
+        }
+    }
+
+    fn project_own(
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        contract: ReasoningReplayContract,
+        retention: ReasoningRetention,
+    ) -> RequestProjection {
+        RequestProjection::project_for_route(
+            messages,
+            tools,
+            contract,
+            retention,
+            Some(&own_route()),
+        )
     }
 
     fn history(reasoning: Option<&str>, call: bool) -> Vec<Message> {
@@ -1111,7 +1158,7 @@ mod tests {
         ] {
             let contract = ReasoningReplayContract::raw_field(scope, MissingReasoningReplay::Omit);
             let tools = if has_tools { vec![tool()] } else { Vec::new() };
-            let projection = RequestProjection::project(
+            let projection = project_own(
                 &history(Some("thought"), false),
                 &tools,
                 contract,
@@ -1134,7 +1181,7 @@ mod tests {
         ] {
             let contract =
                 ReasoningReplayContract::raw_field(ReasoningReplayScope::WhenToolsPresent, missing);
-            let projection = RequestProjection::project(
+            let projection = project_own(
                 &history(None, false),
                 &[tool()],
                 contract,
@@ -1172,7 +1219,7 @@ mod tests {
             ("C no tools", route_c, false, true, None),
         ] {
             let tools = if has_tools { vec![tool()] } else { Vec::new() };
-            let captured = RequestProjection::project(
+            let captured = project_own(
                 &history(Some("thought"), false),
                 &tools,
                 contract,
@@ -1183,7 +1230,7 @@ mod tests {
                 expected_captured,
                 "{name}: captured reasoning"
             );
-            let empty = RequestProjection::project(
+            let empty = project_own(
                 &history(None, false),
                 &tools,
                 contract,
@@ -1240,7 +1287,7 @@ mod tests {
             },
             assistant(Some("plain reasoning"), false),
         ];
-        let projection = RequestProjection::project(
+        let projection = project_own(
             &messages,
             &[tool()],
             route(true, true),
@@ -1267,7 +1314,7 @@ mod tests {
     #[test]
     fn an_unopposed_arm_is_reported_as_itself() {
         // A route with no replay channel: the arm is the whole story.
-        let projection = RequestProjection::project(
+        let projection = project_own(
             &history(Some("thought"), false),
             &[tool()],
             route(false, false),
@@ -1281,7 +1328,7 @@ mod tests {
     /// `content` and appears only in the channel.
     #[test]
     fn reasoning_leaves_content_and_appears_only_in_the_channel() {
-        let projection = RequestProjection::project(
+        let projection = project_own(
             &history(Some("thought"), false),
             &[tool()],
             route(true, false),
@@ -1308,13 +1355,13 @@ mod tests {
     /// decides what the provider sees.
     #[test]
     fn ui_reasoning_costs_nothing_when_the_route_has_no_reasoning_channel() {
-        let without = RequestProjection::project(
+        let without = project_own(
             &history(None, false),
             &[],
             ReasoningReplayContract::NONE,
             ReasoningRetention::All,
         );
-        let with = RequestProjection::project(
+        let with = project_own(
             &history(Some(&"分析".repeat(400)), false),
             &[],
             ReasoningReplayContract::NONE,
@@ -1336,13 +1383,13 @@ mod tests {
     /// channel is worth nothing.
     #[test]
     fn estimate_counts_captured_reasoning_and_not_the_empty_key() {
-        let with = RequestProjection::project(
+        let with = project_own(
             &history(Some(&"x".repeat(4000)), false),
             &[tool()],
             route(true, true),
             ReasoningRetention::All,
         );
-        let without = RequestProjection::project(
+        let without = project_own(
             &history(None, false),
             &[tool()],
             route(true, true),
@@ -1351,7 +1398,7 @@ mod tests {
         assert_eq!(with.estimated_tokens() - without.estimated_tokens(), 1000);
         assert_eq!(
             without.estimated_tokens(),
-            RequestProjection::project(
+            project_own(
                 &history(None, false),
                 &[tool()],
                 route(true, false),
@@ -1377,8 +1424,7 @@ mod tests {
             )
         };
         let messages = history(Some("thought"), true);
-        let loose_projection =
-            RequestProjection::project(&messages, &[tool()], loose, ReasoningRetention::None);
+        let loose_projection = project_own(&messages, &[tool()], loose, ReasoningRetention::None);
         assert_eq!(
             loose_projection.messages()[1].reasoning,
             ProjectedReasoning::Omitted,
@@ -1387,8 +1433,7 @@ mod tests {
         assert_eq!(loose_projection.summary().protocol_protected_turns, 0);
 
         let strict = route(true, true);
-        let strict_projection =
-            RequestProjection::project(&messages, &[tool()], strict, ReasoningRetention::None);
+        let strict_projection = project_own(&messages, &[tool()], strict, ReasoningRetention::None);
         assert_eq!(
             strict_projection.messages()[1].reasoning,
             ProjectedReasoning::Captured("thought".into()),

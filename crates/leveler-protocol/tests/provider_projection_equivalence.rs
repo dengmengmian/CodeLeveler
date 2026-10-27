@@ -13,8 +13,9 @@
 use leveler_core::ToolCallId;
 use leveler_model::{
     ContentPart, Message, MissingReasoningReplay, ModelRef, ModelRequest, ProtocolAdapter,
-    ProtocolContext, ReasoningConfig, ReasoningReplayContract, ReasoningReplayScope,
-    ReasoningRetention, RequestProjection, Role, ToolCall, ToolDefinition, ToolResultContent,
+    ProtocolContext, ProtocolKind, ReasoningConfig, ReasoningReplayContract, ReasoningReplayScope,
+    ReasoningRetention, RequestProjection, Role, RouteIdentity, ToolCall, ToolDefinition,
+    ToolResultContent,
 };
 use leveler_protocol::{AnthropicMessagesAdapter, OpenAiChatAdapter};
 
@@ -25,6 +26,18 @@ fn tool() -> ToolDefinition {
         name: "read_file".to_string(),
         description: "read a file".to_string(),
         input_schema: serde_json::json!({"type": "object"}),
+    }
+}
+
+/// The route this fixture was produced by. Provenance is recorded by the
+/// runtime: a turn nobody stamped is unproven and its reasoning is withheld, so
+/// a fixture about the wire must be a transcript the runtime could produce.
+fn own_route() -> RouteIdentity {
+    RouteIdentity {
+        provider: "route".into(),
+        model: "m".into(),
+        api: Some(ProtocolKind::OpenAiChat),
+        deployment: None,
     }
 }
 
@@ -47,7 +60,8 @@ fn unsigned_history() -> Vec<Message> {
                 },
             ],
             None,
-        ),
+        )
+        .with_route(own_route()),
         Message::from_parts(
             Role::Tool,
             vec![ContentPart::ToolResult {
@@ -146,11 +160,12 @@ fn anthropic_thinking(body: &serde_json::Value) -> Vec<String> {
 /// thinking carries none of it and fabricates no block.
 #[test]
 fn one_decision_is_what_both_adapters_encode() {
-    let projection = RequestProjection::project(
+    let projection = RequestProjection::project_for_route(
         &unsigned_history(),
         &[tool()],
         when_tools(),
         ReasoningRetention::All,
+        Some(&own_route()),
     );
     assert_eq!(projection.summary().carried_turns, 1);
     assert_eq!(projection.summary().captured_turns, 1);
@@ -235,11 +250,12 @@ fn an_authenticated_block_is_carried_by_the_route_that_authenticates_it() {
 #[test]
 fn the_adapter_encodes_the_decision_and_never_re_decides_it() {
     // Decision: carry.
-    let carried = RequestProjection::project(
+    let carried = RequestProjection::project_for_route(
         &unsigned_history(),
         &[tool()],
         when_tools(),
         ReasoningRetention::All,
+        Some(&own_route()),
     );
     let carried_request = request(unsigned_history(), carried);
     let body = OpenAiChatAdapter::new()
@@ -257,11 +273,12 @@ fn the_adapter_encodes_the_decision_and_never_re_decides_it() {
     );
 
     // Decision: drop (this route has no channel).
-    let dropped = RequestProjection::project(
+    let dropped = RequestProjection::project_for_route(
         &unsigned_history(),
         &[tool()],
         ReasoningReplayContract::NONE,
         ReasoningRetention::All,
+        Some(&own_route()),
     );
     let dropped_request = request(unsigned_history(), dropped);
     let body = OpenAiChatAdapter::new()
