@@ -367,6 +367,42 @@ limits:
         }
     }
 
+    /// The bundled YAML and the wire-family capability table must not drift:
+    /// every shipped reasoning model must resolve exactly the contract it
+    /// declares, and its declaration must not weaken a hard family rule.
+    #[test]
+    fn bundled_profiles_agree_with_the_wire_family_requirement() {
+        for (provider, model) in [
+            ("deepseek", "deepseek-flash"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("bigmodel", "glm-5.3"),
+            ("bigmodel", "glm-5.3-flash"),
+        ] {
+            let profile = builtin_model_profile(provider, model)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{provider}/{model} must be embedded"));
+            leveler_model::ReasoningReplayContract::check_route(&profile)
+                .unwrap_or_else(|conflict| panic!("{model}: {conflict}"));
+            let declared = leveler_model::ReasoningReplayContract::resolve(
+                profile.protocol,
+                &profile.compatibility,
+            );
+            let resolved = leveler_model::ReasoningReplayContract::for_route(&profile);
+            assert_eq!(
+                resolved, declared,
+                "{model}: the bundled declaration must already state the family requirement"
+            );
+            assert!(
+                resolved.replays_captured(true),
+                "{model}: a tool-bearing request replays"
+            );
+            assert!(
+                !resolved.replays_captured(false),
+                "{model}: a tool-free request keeps the legacy wire"
+            );
+        }
+    }
+
     #[test]
     fn builtin_deepseek_profiles_match_the_published_contract() {
         use leveler_model::{ReasoningEffort, ReasoningStyle};
