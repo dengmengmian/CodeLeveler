@@ -352,19 +352,16 @@ limits:
                 ]
             );
             assert_eq!(profile.reasoning.default_effort, Some(ReasoningEffort::Max));
-            // GLM's Coding Plan endpoint keeps its own thinking history
-            // server-side (`clear_thinking`) and CodeLeveler enables no
-            // preserved-thinking mode for it, so this route replays nothing.
+            // GLM's interleaved thinking with tools requires the thinking
+            // blocks to be preserved and returned with the tool results, and
+            // the Coding Plan endpoint has preserved thinking on by default.
             // The contract is resolved from GLM's OWN facts — not inherited
-            // from DeepSeek — and this is the GLM regression gate: a change
-            // that starts replaying reasoning (or fabricating the empty key)
-            // on this route fails here.
-            let replay = leveler_model::ReasoningReplayContract::resolve(
-                profile.protocol,
-                &profile.compatibility,
-            );
-            assert_eq!(replay.arm_name(), "never", "{file}");
-            assert!(!replay.replays_captured(true), "{file}");
+            // from DeepSeek — and this is the GLM regression gate: the scope
+            // is tool-bearing requests only, and GLM's empty turn omits the
+            // key (no measured requirement, unlike DeepSeek).
+            let replay = leveler_model::ReasoningReplayContract::for_route(&profile);
+            assert_eq!(replay.arm_name(), "when_tools", "{file}");
+            assert!(replay.replays_captured(true), "{file}");
             assert!(!replay.replays_captured(false), "{file}");
             assert_eq!(replay.missing, leveler_model::MissingReasoningReplay::Omit);
         }

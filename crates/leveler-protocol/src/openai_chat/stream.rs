@@ -457,6 +457,49 @@ mod tests {
         assert_eq!(call.id.as_str(), "call_0");
     }
 
+    /// Reasoning arrives as many small `reasoning_content` deltas before the
+    /// answer. They must be surfaced in order and never promoted into text:
+    /// the kernel concatenates the deltas into the assistant message it later
+    /// replays to the provider.
+    #[test]
+    fn fragmented_reasoning_deltas_are_surfaced_in_order_before_the_answer() {
+        let mut a = ChatStreamAssembler::new();
+        let mut events = Vec::new();
+        for (reasoning, content) in [
+            (Some("think "), None),
+            (Some("again "), None),
+            (Some(""), None),
+            (None, Some("answer")),
+        ] {
+            events.extend(a.on_chunk(chunk(serde_json::json!({
+                "choices": [{"delta": {
+                    "reasoning_content": reasoning,
+                    "content": content
+                }}]
+            }))));
+        }
+        events.extend(a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        }))));
+
+        let reasoning: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, vec!["think ", "again "]);
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::TextDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, vec!["answer"]);
+    }
+
     #[test]
     fn usage_is_surfaced() {
         let mut a = ChatStreamAssembler::new();

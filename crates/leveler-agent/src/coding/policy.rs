@@ -488,10 +488,7 @@ pub fn resolve_execution_policy(
     ResolvedExecutionPolicy {
         max_output_tokens: profile.limits.max_output_tokens,
         context_policy,
-        reasoning_replay: leveler_model::ReasoningReplayContract::resolve(
-            profile.protocol,
-            &profile.compatibility,
-        ),
+        reasoning_replay: leveler_model::ReasoningReplayContract::for_route(profile),
         max_parallel_tools,
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
         // Safety rail: only the eval seam may lower it.
@@ -911,7 +908,10 @@ mod tests {
     /// kernel applies the same contract the adapter encodes.
     #[test]
     fn resolution_carries_the_route_replay_contract() {
-        let p = profile();
+        // A route with no listed wire family and no declaration resolves to
+        // the conservative default.
+        let mut p = profile();
+        p.model_id = "gpt-4o".into();
         let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
         assert_eq!(
             resolved.reasoning_replay,
@@ -925,6 +925,27 @@ mod tests {
         .unwrap();
         let resolved = resolve_execution_policy(&passback, ExecutionRole::Main, &goal_turn(), None);
         assert_eq!(resolved.reasoning_replay.arm_name(), "when_tools+empty");
+    }
+
+    /// A lab/dogfood profile that never wrote the compatibility fields still
+    /// resolves the DeepSeek wire requirement: the executor receives the same
+    /// contract `leveler login` would have produced.
+    #[test]
+    fn resolution_derives_the_requirement_a_hand_written_route_omitted() {
+        let mut lab = profile();
+        lab.capabilities.reasoning = true;
+        lab.reasoning = leveler_model::ReasoningConfig {
+            style: leveler_model::ReasoningStyle::ThinkingFlag,
+            supported_efforts: vec![leveler_model::ReasoningEffort::Max],
+            default_effort: Some(leveler_model::ReasoningEffort::Max),
+        };
+        assert_eq!(
+            lab.compatibility,
+            leveler_model::CompatibilityConfig::default()
+        );
+        let resolved = resolve_execution_policy(&lab, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(resolved.reasoning_replay.arm_name(), "when_tools+empty");
+        leveler_model::ReasoningReplayContract::check_route(&lab).unwrap();
     }
 
     /// Migration contract: for a main seat with no overrides, resolution must

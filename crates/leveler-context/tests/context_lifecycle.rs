@@ -580,6 +580,76 @@ fn contract_one_raw_replay_retained_reasoning_is_exact() {
     );
 }
 
+/// A hand-written lab/dogfood route (no compatibility block) resolves the same
+/// contract as `leveler login` and keeps it across a fold: the retained tail
+/// still replays every assistant turn's reasoning, a turn that captured none
+/// carries the provider-required empty key, and no tool exchange is split.
+#[test]
+fn a_lab_route_keeps_its_resolved_contract_across_a_fold() {
+    let profile = leveler_model::ModelProfile {
+        id: "deepseek-flash".into(),
+        provider: "gateway".into(),
+        model_id: "deepseek-flash".into(),
+        protocol: leveler_model::ProtocolKind::OpenAiChat,
+        capabilities: leveler_model::ModelCapabilities {
+            streaming: true,
+            tool_calling: true,
+            parallel_tool_calls: true,
+            structured_output: true,
+            reasoning: true,
+            vision: false,
+        },
+        limits: leveler_model::ModelLimits {
+            context_window: 131_072,
+            reliable_context: 65_536,
+            max_output_tokens: 8_192,
+            max_tool_schema_bytes: 32_768,
+            max_parallel_tool_calls: 4,
+            max_tool_output_bytes: None,
+        },
+        context_quality: None,
+        thinking: None,
+        reasoning: Default::default(),
+        compatibility: Default::default(),
+        pricing: None,
+    };
+    let contract = ReasoningReplayContract::for_route(&profile);
+    assert_eq!(contract, route(), "the family requirement is the contract");
+
+    let mut messages = transcript(6, 200, 40);
+    // A session persisted before reasoning capture: the turn has no reasoning
+    // part and must still carry the empty key, never fabricated content.
+    messages.push(Message::text(
+        Role::Assistant,
+        "old answer without reasoning",
+    ));
+    let folded = compact_messages(&messages, 2, 0, Some("briefing"), None);
+    leveler_model::validate_tool_exchange(&folded)
+        .expect("a fold never splits an assistant tool call from its result");
+
+    let projection =
+        RequestProjection::project(&folded, &tools(), contract, ReasoningRetention::All);
+    for message in projection.messages() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        assert!(
+            message.reasoning.is_present(),
+            "every retained assistant turn carries the channel: {message:?}"
+        );
+    }
+    assert_eq!(
+        projection
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .filter(|message| message.reasoning.as_wire() == Some(""))
+            .count(),
+        1,
+        "the reasoning-less historical turn gets the empty key, nothing invented"
+    );
+}
+
 /// Contract-2: an authenticated/opaque block the route authenticates survives a
 /// retained turn intact, including its signature; a route that does not
 /// authenticate it neither keeps it nor re-spells it as plain reasoning.

@@ -781,6 +781,243 @@ mod tests {
         );
     }
 
+    /// Build the profile shape a hand-written lab/dogfood config produces:
+    /// reasoning on, thinking style declared, and no compatibility block.
+    fn lab_profile(wire_model: &str) -> leveler_model::ModelProfile {
+        leveler_model::ModelProfile {
+            id: wire_model.into(),
+            provider: "gateway".into(),
+            model_id: wire_model.into(),
+            protocol: leveler_model::ProtocolKind::OpenAiChat,
+            capabilities: leveler_model::ModelCapabilities {
+                streaming: true,
+                tool_calling: true,
+                parallel_tool_calls: true,
+                structured_output: true,
+                reasoning: true,
+                vision: false,
+            },
+            limits: leveler_model::ModelLimits {
+                context_window: 131_072,
+                reliable_context: 65_536,
+                max_output_tokens: 8_192,
+                max_tool_schema_bytes: 32_768,
+                max_parallel_tool_calls: 4,
+                max_tool_output_bytes: None,
+            },
+            context_quality: None,
+            thinking: None,
+            reasoning: ReasoningConfig {
+                style: ReasoningStyle::ThinkingFlag,
+                supported_efforts: vec![ReasoningEffort::High],
+                default_effort: Some(ReasoningEffort::High),
+            },
+            compatibility: leveler_model::CompatibilityConfig::default(),
+            pricing: None,
+        }
+    }
+
+    fn encode_history(
+        context: &ProtocolContext,
+        history: Vec<Message>,
+        with_tools: bool,
+    ) -> serde_json::Value {
+        let mut req = ModelRequest::new(ModelRef::new("gateway", "wire-model"), history);
+        if with_tools {
+            req.tools = vec![ToolDefinition {
+                name: "read_file".into(),
+                description: "read a file".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }];
+        }
+        OpenAiChatAdapter::new()
+            .encode_request(&req, context, true)
+            .unwrap()
+            .body
+    }
+
+    fn assistant_with(reasoning: Option<&str>, text: &str, call: Option<&str>) -> Message {
+        let mut content = Vec::new();
+        if let Some(reasoning) = reasoning {
+            content.push(ContentPart::Reasoning {
+                text: reasoning.into(),
+            });
+        }
+        if !text.is_empty() {
+            content.push(ContentPart::Text { text: text.into() });
+        }
+        if let Some(id) = call {
+            content.push(ContentPart::ToolCall {
+                call: ToolCall {
+                    id: leveler_core::ToolCallId::new(id),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "x"}),
+                },
+            });
+        }
+        Message {
+            origin: None,
+            role: Role::Assistant,
+            content,
+        }
+    }
+
+    fn tool_result_for(call: &str) -> Message {
+        Message {
+            origin: None,
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new(call),
+                    content: "file body".into(),
+                    is_error: false,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn a_lab_style_profile_replays_every_assistant_turns_reasoning() {
+        let profile = lab_profile("deepseek-v4-flash");
+        let context = ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let body = encode_history(
+            &context,
+            vec![
+                Message::text(Role::User, "go"),
+                assistant_with(Some("plan the read"), "", Some("call_1")),
+                tool_result_for("call_1"),
+                // A turn that answered without calling a tool while tools were
+                // still exposed: DeepSeek requires this turn's reasoning too.
+                assistant_with(Some("summarise the body"), "here it is", None),
+                Message::text(Role::User, "thanks"),
+            ],
+            true,
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["reasoning_content"], "plan the read");
+        assert_eq!(messages[3]["reasoning_content"], "summarise the body");
+        assert!(messages[2].get("reasoning_content").is_none(), "tool role");
+    }
+
+    #[test]
+    fn a_tool_bearing_request_with_no_tool_call_still_replays() {
+        // The export must not key on `tool_calls.length > 0`: DeepSeek's rule
+        // is about the request carrying `tools`, not about a turn that called
+        // one.
+        let profile = lab_profile("deepseek-flash");
+        let context = ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let body = encode_history(
+            &context,
+            vec![
+                Message::text(Role::User, "go"),
+                assistant_with(Some("thought without a call"), "answer", None),
+                Message::text(Role::User, "continue"),
+            ],
+            true,
+        );
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            "thought without a call"
+        );
+    }
+
+    #[test]
+    fn a_tool_free_request_keeps_the_legacy_wire() {
+        let profile = lab_profile("deepseek-flash");
+        let context = ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let body = encode_history(
+            &context,
+            vec![
+                Message::text(Role::User, "go"),
+                assistant_with(Some("private thought"), "answer", None),
+            ],
+            false,
+        );
+        assert!(
+            body["messages"][1].get("reasoning_content").is_none(),
+            "a tool-free request does not need the field"
+        );
+    }
+
+    #[test]
+    fn a_replayed_turn_with_no_captured_reasoning_carries_the_empty_key() {
+        let profile = lab_profile("deepseek-flash");
+        let context = ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let body = encode_history(
+            &context,
+            vec![
+                Message::text(Role::User, "go"),
+                // An old session persisted before reasoning was captured, or a
+                // turn that ran with thinking disabled.
+                assistant_with(None, "answer from history", None),
+                Message::text(Role::User, "continue"),
+            ],
+            true,
+        );
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn consecutive_tool_rounds_keep_each_turns_own_reasoning() {
+        let profile = lab_profile("deepseek-flash");
+        let context = ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let body = encode_history(
+            &context,
+            vec![
+                Message::text(Role::User, "go"),
+                assistant_with(Some("first"), "", Some("call_1")),
+                tool_result_for("call_1"),
+                assistant_with(Some("second"), "", Some("call_2")),
+                tool_result_for("call_2"),
+                assistant_with(Some("third"), "done", None),
+            ],
+            true,
+        );
+        let messages = body["messages"].as_array().unwrap();
+        let replayed: Vec<&str> = messages
+            .iter()
+            .filter_map(|message| message["reasoning_content"].as_str())
+            .collect();
+        assert_eq!(replayed, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn a_route_without_a_replay_channel_never_receives_the_field() {
+        let profile = lab_profile("gpt-4o");
+        let context = ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let body = encode_history(
+            &context,
+            vec![
+                Message::text(Role::User, "go"),
+                assistant_with(Some("private"), "", Some("call_1")),
+                tool_result_for("call_1"),
+            ],
+            true,
+        );
+        assert!(
+            body["messages"][1].get("reasoning_content").is_none(),
+            "a provider that never asked for the field must not receive it"
+        );
+    }
+
     /// Request-body contract for the reasoning-retention projection: a route
     /// that replays captured reasoning replays the full reasoning of every
     /// retained assistant turn, so the wire keeps every turn's reasoning under

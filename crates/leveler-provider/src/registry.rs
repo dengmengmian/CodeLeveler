@@ -47,10 +47,12 @@ impl Provider {
     }
 }
 
-/// A resolved model: its capability profile.
+/// A resolved model: its capability profile and the reasoning-replay contract
+/// resolved once from that profile.
 #[derive(Clone)]
 struct ModelEntry {
     profile: ModelProfile,
+    reasoning_replay: leveler_model::ReasoningReplayContract,
 }
 
 /// Errors building the registry.
@@ -75,6 +77,10 @@ pub enum RegistryError {
         reliable: u32,
         window: u32,
     },
+    #[error(
+        "model `{model}` declares a reasoning-replay contract its provider protocol does not accept: {reason}"
+    )]
+    InvalidReasoningReplay { model: String, reason: String },
     #[error("model `{model}` cannot describe a usable request: {reason}")]
     InvalidModelLimits { model: String, reason: String },
 }
@@ -120,9 +126,23 @@ impl ProviderRegistry {
             // only after a request is sent). Make that invariant explicit so a
             // misconfigured profile fails at startup instead of 400-ing mid-run.
             validate_limits(&profile.id, &profile.limits)?;
+            // One resolution for every entry point (login, hand-written config,
+            // lab, dogfood, clients). A declaration that would weaken a wire
+            // protocol's requirement is diagnosed here instead of becoming a
+            // provider 400 on the first tool-bearing request.
+            leveler_model::ReasoningReplayContract::check_route(&profile).map_err(|conflict| {
+                RegistryError::InvalidReasoningReplay {
+                    model: profile.id.clone(),
+                    reason: conflict.detail,
+                }
+            })?;
+            let reasoning_replay = leveler_model::ReasoningReplayContract::for_route(&profile);
             models.insert(
                 (profile.provider.clone(), profile.id.clone()),
-                ModelEntry { profile },
+                ModelEntry {
+                    profile,
+                    reasoning_replay,
+                },
             );
         }
 
@@ -162,7 +182,8 @@ impl ProviderRegistry {
             })
     }
 
-    fn context(&self, provider: &Provider, profile: &ModelProfile) -> ProtocolContext {
+    fn context(&self, provider: &Provider, entry: &ModelEntry) -> ProtocolContext {
+        let profile = &entry.profile;
         ProtocolContext {
             base_url: provider.config.base_url.clone(),
             model_id: profile.model_id.clone(),
@@ -174,12 +195,9 @@ impl ProviderRegistry {
             thinking_supports_forced_tool_choice: profile
                 .compatibility
                 .thinking_supports_forced_tool_choice,
-            // The route's protocol and declared compatibility resolve the
-            // replay contract once, here; nothing downstream re-decides it.
-            reasoning_replay: leveler_model::ReasoningReplayContract::resolve(
-                profile.protocol,
-                &profile.compatibility,
-            ),
+            // Resolved once when the registry was built; nothing downstream
+            // re-decides it.
+            reasoning_replay: entry.reasoning_replay,
         }
     }
 
@@ -219,7 +237,7 @@ impl ModelRuntime for ProviderRegistry {
         let out = async move {
             let provider = self.provider(&request.model.provider)?;
             let entry = self.entry(&request.model)?;
-            let mut context = self.context(provider, &entry.profile);
+            let mut context = self.context(provider, entry);
 
             refuse_broken_tool_exchange(&request)?;
             let encoded = provider
@@ -278,7 +296,7 @@ impl ModelRuntime for ProviderRegistry {
         let out = async move {
             let provider = self.provider(&request.model.provider)?;
             let entry = self.entry(&request.model)?;
-            let mut context = self.context(provider, &entry.profile);
+            let mut context = self.context(provider, entry);
 
             refuse_broken_tool_exchange(&request)?;
             let encoded = provider

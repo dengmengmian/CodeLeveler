@@ -25,3 +25,12 @@ limits:
   max_output_tokens: 131072
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
+compatibility:
+  # GLM's interleaved thinking with tools requires the thinking blocks to be
+  # preserved and returned with the tool results; preserved thinking requires
+  # the complete, unmodified `reasoning_content` of every historical assistant
+  # turn. Source: https://docs.z.ai/guides/capabilities/thinking-mode
+  reasoning_replay_scope: when_tools_present
+  # Unlike DeepSeek, GLM has no measured requirement for the key on a turn that
+  # produced no reasoning, so such a turn omits it.
+  reasoning_content_key_required: false
