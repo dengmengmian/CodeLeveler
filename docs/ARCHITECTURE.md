@@ -108,6 +108,12 @@ Likewise, a UI may display “completed,” but the task state must come from th
 
 ## 3. Seven Core Principles
 
+**Primary objective: maximize the capability each model can realize.**
+
+> **Harness is an amplifier of model capability, not a constraint on it.**
+>
+> **The model defines what is possible; the Harness determines how fully that capability can be realized.**
+
 The architecture can be reduced to seven statements:
 
 ```text
@@ -169,7 +175,7 @@ The Runtime fixes engineering problems—failure, concurrency, cancellation, rec
 
 ### 4.1 Model Independence: Maximize Model Capability, Minimize Model Adaptation
 
-One of CodeLeveler's core goals is to let different models exercise as much of their native capability as possible on the same stable Harness and Runtime, rather than maintaining model-specific execution logic for every model.
+CodeLeveler's goal is to let each model realize as much of its native capability as possible on a stable Harness and Runtime—not to equalize model outcomes, narrow performance gaps, or impose a shared capability ceiling. The Harness should enrich context, tools, execution, and feedback without taking over the model's planning or judgment. Reliability, safety, and host-authority boundaries are necessary for real-world execution, not reasons for unnecessary restrictions on model autonomy.
 
 Design goal:
 
