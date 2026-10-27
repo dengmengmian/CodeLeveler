@@ -1635,6 +1635,116 @@ async fn real_preserved_modes_replay_a_tool_free_turn() {
     }
 }
 
+/// Experiment 3, scoped to the Kimi route: an ordinary multi-turn
+/// conversation with no tools at all must still return the complete chain.
+///
+/// It is separate from the combined preserved-mode test because the official
+/// GLM credential in this lab is an environment input: when it is expired that
+/// test aborts before it reaches the Kimi routes, and a gateway PASS there
+/// would otherwise be reported without a Kimi measurement.
+#[tokio::test]
+#[ignore = "spends real model tokens; see the module docs for the command"]
+async fn real_kimi_replays_the_whole_chain_without_tools() {
+    let registry = registry();
+    for (provider_id, id) in [
+        ("taotoken", "kimi-k3"),
+        ("kimi-coding", "k3"),
+        ("kimi-coding", "k3.1-pro"),
+    ] {
+        let profile = registry
+            .profile(&ModelRef::new(provider_id, id))
+            .await
+            .expect("the Kimi route");
+        let contract = leveler_model::ReasoningReplayContract::for_route(&profile);
+        assert_eq!(contract.arm_name(), "always+empty", "{id}");
+        let route = registry
+            .route_identity(&ModelRef::new(provider_id, id))
+            .expect("a real route");
+        let context = live_context(&profile, contract);
+        let label = format!("{provider_id}/{id}");
+
+        let ask = Message::user_input(
+            "Think it through: a train leaves at 09:40 and takes 2h35m. What time does it arrive? \
+             Answer with the time and one sentence of reasoning.",
+        );
+        let first = encode_live(
+            &profile,
+            std::slice::from_ref(&ask),
+            &route,
+            Vec::new(),
+            false,
+        );
+        assert!(first.get("tools").is_none(), "{id}: {first}");
+        assert!(first.get("thinking").is_none(), "{id}: {first}");
+        let (status, body) = send_body(&context, &first).await;
+        if !entitled(label.clone(), status, &body) {
+            continue;
+        }
+        assert_eq!(status, 200, "{label}: turn 1");
+        let reasoning = body["choices"][0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let answer = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !reasoning.is_empty(),
+            "{label}: this model always thinks: {body}"
+        );
+
+        let assistant = Message::from_parts(
+            Role::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: reasoning.clone(),
+                },
+                ContentPart::Text {
+                    text: answer.clone(),
+                },
+            ],
+            None,
+        )
+        .with_route(route.clone());
+        let history = vec![
+            ask,
+            assistant,
+            Message::text(
+                Role::User,
+                "Now name the same arrival time in 24-hour form only.",
+            ),
+        ];
+        let second = encode_live(&profile, &history, &route, Vec::new(), false);
+        let wire_assistant = assistant_on_wire(&second).expect("the assistant turn");
+        assert_eq!(
+            wire_assistant["reasoning_content"].as_str(),
+            Some(reasoning.as_str()),
+            "{label}: the chain is replayed verbatim without tools"
+        );
+        let (status, body) = send_body(&context, &second).await;
+        if !entitled(label.clone(), status, &body) {
+            continue;
+        }
+        assert_eq!(status, 200, "{label}: the tool-free follow-up is accepted");
+        let continued = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        eprintln!(
+            "[{label} tool-free replay] status={status} reasoning_len={} reasoning_sha={} \
+             answer_len={} continued_len={}",
+            reasoning.chars().count(),
+            sha8(&reasoning),
+            answer.chars().count(),
+            continued.chars().count()
+        );
+        assert!(
+            !continued.trim().is_empty(),
+            "{label}: the conversation continues: {body}"
+        );
+    }
+}
+
 /// Experiment 4: Thinking On → Off → On with the production encoder.
 ///
 /// DeepSeek documents replay in terms of the request shape, not the current
