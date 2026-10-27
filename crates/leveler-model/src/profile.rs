@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// The wire protocol a model speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ProtocolKind {
     #[serde(rename = "openai_chat")]
     OpenAiChat,
