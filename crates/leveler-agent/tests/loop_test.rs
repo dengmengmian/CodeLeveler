@@ -187,6 +187,19 @@ impl ModelRuntime for MockRuntime {
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
         Ok(mock_profile(model))
     }
+
+    /// A scripted runtime still names the route it addresses: the loop records
+    /// that provenance on the turn it assembles, and reasoning whose producer
+    /// nobody recorded is not replayed. A mock that reported nothing would
+    /// silently disable the channel rather than exercise it.
+    fn route_identity(&self, model: &ModelRef) -> Option<leveler_model::RouteIdentity> {
+        Some(leveler_model::RouteIdentity {
+            provider: model.provider.clone(),
+            model: model.model.clone(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: None,
+        })
+    }
 }
 
 #[tokio::test]

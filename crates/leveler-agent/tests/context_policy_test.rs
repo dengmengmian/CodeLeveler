@@ -87,6 +87,19 @@ impl ModelRuntime for Script {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
+    /// A real runtime names the route it addresses, and the loop stamps it on
+    /// the turn it assembles. Provenance is never invented by the harness: a
+    /// runtime that reports nothing leaves the turn unproven, and unproven
+    /// reasoning is not replayed.
+    fn route_identity(&self, model: &ModelRef) -> Option<leveler_model::RouteIdentity> {
+        Some(leveler_model::RouteIdentity {
+            provider: model.provider.clone(),
+            model: model.model.clone(),
+            api: Some(leveler_model::ProtocolKind::OpenAiChat),
+            deployment: None,
+        })
+    }
+
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
         Ok(serde_json::from_value(serde_json::json!({
             "id": model.to_string(),

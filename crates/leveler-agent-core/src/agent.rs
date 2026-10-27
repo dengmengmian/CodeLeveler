@@ -797,6 +797,17 @@ mod tests {
     /// applied. The transcript handed back to the caller keeps every block.
     #[tokio::test]
     async fn reasoning_retention_projects_the_request_without_touching_the_transcript() {
+        /// The route this transcript was produced by. Provenance is recorded by
+        /// the runtime; an unproven turn's reasoning is withheld, so a test
+        /// about replay must build history this route could have produced.
+        fn own_route() -> leveler_model::RouteIdentity {
+            leveler_model::RouteIdentity {
+                provider: "p".into(),
+                model: "m".into(),
+                api: Some(leveler_model::ProtocolKind::OpenAiChat),
+                deployment: None,
+            }
+        }
         fn reasoning_turn(i: usize) -> Message {
             Message {
                 origin: None,
@@ -809,7 +820,7 @@ mod tests {
                         text: format!("t{i}"),
                     },
                 ],
-                route: None,
+                route: Some(own_route()),
             }
         }
         fn tool_turn(i: usize) -> Message {
@@ -880,7 +891,7 @@ mod tests {
             (ReasoningRetention::LastTurns(3), 5, 2),
             (ReasoningRetention::None, 5, 5),
         ] {
-            let (agent, model) = agent(Scripted::new(vec![text("done")]));
+            let (agent, model) = agent(Scripted::new(vec![text("done")]).with_route(own_route()));
             let agent = agent
                 .with_reasoning_replay(leveler_model::ReasoningReplayContract::raw_field(
                     leveler_model::ReasoningReplayScope::Always,

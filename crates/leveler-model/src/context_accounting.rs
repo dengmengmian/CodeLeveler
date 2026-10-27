@@ -562,9 +562,27 @@ mod tests {
         )
     }
 
+    /// The route these accounting tests address, and the one their history
+    /// carries. Provenance is recorded by the runtime; an unproven turn's
+    /// reasoning is withheld, which would measure the wrong request.
+    fn own_route() -> crate::RouteIdentity {
+        crate::RouteIdentity {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            api: Some(crate::ProtocolKind::OpenAiChat),
+            deployment: None,
+        }
+    }
+
     /// The provider-visible view of `messages` under a reasoning-carrying route.
     fn projection(messages: &[Message], tools: &[ToolDefinition]) -> RequestProjection {
-        RequestProjection::project(messages, tools, reasoning_route(), ReasoningRetention::All)
+        RequestProjection::project_for_route(
+            messages,
+            tools,
+            reasoning_route(),
+            ReasoningRetention::All,
+            Some(&own_route()),
+        )
     }
 
     fn model() -> ModelRef {
@@ -736,7 +754,7 @@ mod tests {
                     },
                     tool_call("read_file", "c1", serde_json::json!({"path": "a.rs"})),
                 ],
-                route: None,
+                route: Some(own_route()),
             },
             Message {
                 origin: None,
@@ -790,7 +808,7 @@ mod tests {
                     text: "done".into(),
                 },
             ],
-            route: None,
+            route: Some(own_route()),
         }];
         let without = vec![Message {
             origin: None,

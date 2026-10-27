@@ -70,10 +70,11 @@ pub use projection::{
 pub use protocol::{
     EncodedRequest, ProtocolAdapter, ProtocolContext, ProtocolError, RawByteStream,
 };
-pub use provenance::RouteIdentity;
+pub use provenance::{RouteIdentity, deployment_identity};
 pub use reasoning_route::{
-    ReasoningReplayEnforcement, ReasoningRouteConflict, RequiredReasoningReplay,
-    required_reasoning_replay, required_reasoning_replay_for,
+    PreservedThinkingWire, ReasoningReplayEnforcement, ReasoningRouteConflict,
+    RequiredReasoningReplay, preserved_thinking_wire, required_reasoning_replay,
+    required_reasoning_replay_for,
 };
 pub use request::{
     ControlContext, ModelRef, ModelRequest, PromptSegment, RequestMetadata, TransportPolicy,

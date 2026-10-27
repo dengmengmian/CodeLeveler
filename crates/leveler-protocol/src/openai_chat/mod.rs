@@ -69,14 +69,22 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         // fall back to the profile or remap levels.
         let effort = request.reasoning_effort;
         // Preserved thinking is a route declaration, not a preference: the
-        // endpoint's own default clears prior thinking, and `clear_thinking`
-        // is the only word the wire has for the other mode. `None` sends no
-        // field at all, which is how every route that never declared the mode
-        // stays byte-identical to what it sent before.
+        // endpoint's own default may clear prior thinking or keep it, and every
+        // family that has the mode spells it with its own word (GLM:
+        // `clear_thinking: false`, Kimi K2.x: `keep: "all"`). The spelling is a
+        // wire-family fact resolved in one table, so this adapter never sends
+        // another endpoint's field. `None` sends no field at all, which is how
+        // every route that never declared the mode stays byte-identical to what
+        // it sent before.
         let preserved = context.reasoning.preserved_thinking;
+        let (preserved_clear, preserved_keep) = preserved_thinking_fields(
+            leveler_model::preserved_thinking_wire(ProtocolKind::OpenAiChat, &context.model_id),
+            preserved,
+        );
         let thinking_on = || Thinking {
             kind: "enabled",
-            clear_thinking: preserved.map(|preserved| !preserved),
+            clear_thinking: preserved_clear,
+            keep: preserved_keep,
         };
         let (thinking, reasoning_effort) = if request.thinking_disabled {
             // An explicit `off` from the canonical Thinking Level. Only the
@@ -88,6 +96,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                     Some(Thinking {
                         kind: "disabled",
                         clear_thinking: None,
+                        keep: None,
                     }),
                     None,
                 ),
@@ -110,6 +119,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 Some(Thinking {
                     kind: "disabled",
                     clear_thinking: None,
+                    keep: None,
                 }),
                 None,
             )
@@ -346,6 +356,24 @@ impl ProtocolAdapter for OpenAiChatAdapter {
 /// blocks trail the transcript because they are rebuilt every round: ahead of
 /// the history they would break the provider's prefix cache on the first
 /// differing byte, which is the whole transcript.
+/// The preserved-thinking fields this route's wire accepts, given the mode the
+/// route declared.
+///
+/// The fact ("keep this route's earlier thinking") is the route's; the spelling
+/// is the wire family's. A family with no such field gets none — sending
+/// another endpoint's field would be a request the family never defined.
+fn preserved_thinking_fields(
+    wire: leveler_model::PreservedThinkingWire,
+    preserved: Option<bool>,
+) -> (Option<bool>, Option<&'static str>) {
+    use leveler_model::PreservedThinkingWire;
+    match (wire, preserved) {
+        (PreservedThinkingWire::ClearThinking, Some(preserved)) => (Some(!preserved), None),
+        (PreservedThinkingWire::KeepAll, Some(true)) => (None, Some("all")),
+        _ => (None, None),
+    }
+}
+
 fn convert_messages(projection: &RequestProjection) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     let control = projection.control_prefix_text();
@@ -618,6 +646,7 @@ mod tests {
     #[test]
     fn a_preserved_thinking_route_sends_clear_thinking_false() {
         let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
+        context.model_id = "glm-5.3".into();
         context.reasoning.preserved_thinking = Some(true);
         let body = encode_with(&context);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -629,6 +658,48 @@ mod tests {
         context.reasoning.preserved_thinking = Some(false);
         let body = encode_with(&context);
         assert_eq!(body["thinking"]["clear_thinking"], true);
+    }
+
+    /// Kimi's K2.x line spells the same route fact as `thinking.keep: "all"`.
+    /// Sending GLM's `clear_thinking` there would be a field the endpoint never
+    /// defined, and omitting `keep` would leave the client claiming a mode the
+    /// request never asks for.
+    #[test]
+    fn a_kimi_k2_route_asks_for_preserved_thinking_as_keep_all() {
+        let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
+        context.model_id = "kimi-k2.6".into();
+        context.reasoning.preserved_thinking = Some(true);
+        let body = encode_with(&context);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["keep"], "all");
+        assert!(body["thinking"].get("clear_thinking").is_none(), "{body}");
+
+        // Turning it off is the endpoint's own default (`keep: null`), not a
+        // field with an opinion. The request stops asking for preservation.
+        context.reasoning.preserved_thinking = Some(false);
+        let body = encode_with(&context);
+        assert!(body["thinking"].get("keep").is_none(), "{body}");
+    }
+
+    /// A family with no preserved-thinking field never receives another
+    /// endpoint's spelling. The declaration itself is refused at config load
+    /// (`ReasoningReplayContract::check_route`); the encoder still refuses to
+    /// invent a field for an unconfigured caller.
+    #[test]
+    fn a_family_without_a_preserved_mode_never_gets_another_endpoints_field() {
+        for model_id in ["deepseek-chat", "k3"] {
+            let mut context =
+                ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
+            context.model_id = model_id.into();
+            context.reasoning.preserved_thinking = Some(true);
+            let body = encode_with(&context);
+            assert_eq!(body["thinking"]["type"], "enabled", "{model_id}");
+            assert!(
+                body["thinking"].get("clear_thinking").is_none(),
+                "{model_id}: {body}"
+            );
+            assert!(body["thinking"].get("keep").is_none(), "{model_id}: {body}");
+        }
     }
 
     #[test]
@@ -793,7 +864,9 @@ mod tests {
     }
 
     /// Encode a tool-loop continuation: user → assistant(reasoning? + tool
-    /// call) → tool result. The shape DeepSeek's thinking mode validates.
+    /// call) → tool result. The shape DeepSeek's thinking mode validates, with
+    /// the turn stamped as this route's own (an unstamped turn is unproven, so
+    /// the replay channel is withheld).
     fn encode_tool_loop(context: &ProtocolContext, reasoning: Option<&str>) -> serde_json::Value {
         let mut assistant_parts = Vec::new();
         if let Some(text) = reasoning {
@@ -806,6 +879,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         });
+        let route = route_for("deepseek", "deepseek-chat");
         let mut req = ModelRequest::new(
             ModelRef::new("deepseek", "deepseek-chat"),
             vec![
@@ -814,7 +888,7 @@ mod tests {
                     origin: None,
                     role: Role::Assistant,
                     content: assistant_parts,
-                    route: None,
+                    route: Some(route.clone()),
                 },
                 Message {
                     origin: None,
@@ -835,6 +909,7 @@ mod tests {
             description: "read the clock".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
+        project_for(&mut req, context.reasoning_replay, &route);
         OpenAiChatAdapter::new()
             .encode_request(&req, context, true)
             .unwrap()
@@ -906,10 +981,42 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
             }];
         }
+        let route = route_for("gateway", "wire-model");
+        project_for(&mut req, context.reasoning_replay, &route);
         OpenAiChatAdapter::new()
             .encode_request(&req, context, true)
             .unwrap()
             .body
+    }
+
+    /// The route a test transcript was produced by.
+    ///
+    /// Provenance is a fact the runtime records, so a test that exercises the
+    /// replay channel must build a transcript the runtime could actually have
+    /// produced: a stamped assistant turn AND the same route on the request.
+    /// An unstamped turn is unproven and its private channel is withheld.
+    fn route_for(provider: &str, model: &str) -> leveler_model::RouteIdentity {
+        leveler_model::RouteIdentity {
+            provider: provider.into(),
+            model: model.into(),
+            api: Some(ProtocolKind::OpenAiChat),
+            deployment: None,
+        }
+    }
+
+    /// The projection an executor hands down on a live request.
+    fn project_for(
+        request: &mut ModelRequest,
+        contract: leveler_model::ReasoningReplayContract,
+        route: &leveler_model::RouteIdentity,
+    ) {
+        request.projection = Some(leveler_model::RequestProjection::project_for_route(
+            &request.messages,
+            &request.tools,
+            contract,
+            leveler_model::ReasoningRetention::All,
+            Some(route),
+        ));
     }
 
     fn assistant_with(reasoning: Option<&str>, text: &str, call: Option<&str>) -> Message {
@@ -935,7 +1042,7 @@ mod tests {
             origin: None,
             role: Role::Assistant,
             content,
-            route: None,
+            route: Some(route_for("gateway", "wire-model")),
         }
     }
 
@@ -1126,7 +1233,7 @@ mod tests {
                             },
                         },
                     ],
-                    route: None,
+                    route: Some(route_for("deepseek", "deepseek-flash")),
                 },
                 Message {
                     origin: None,
@@ -1150,6 +1257,7 @@ mod tests {
             reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
+        let route = route_for("deepseek", "deepseek-flash");
 
         for policy in [
             ReasoningRetention::All,
@@ -1165,11 +1273,12 @@ mod tests {
                 description: "read the clock".into(),
                 input_schema: serde_json::json!({"type": "object"}),
             }];
-            request.projection = Some(leveler_model::RequestProjection::project(
+            request.projection = Some(leveler_model::RequestProjection::project_for_route(
                 &request.messages,
                 &request.tools,
                 context.reasoning_replay,
                 policy,
+                Some(&route),
             ));
             let body = OpenAiChatAdapter::new()
                 .encode_request(&request, &context, true)
@@ -1245,7 +1354,7 @@ mod tests {
                             },
                         },
                     ],
-                    route: None,
+                    route: Some(route_for("deepseek", "deepseek-chat")),
                 },
                 Message {
                     origin: None,
@@ -1266,6 +1375,11 @@ mod tests {
             description: "read the clock".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
+        project_for(
+            &mut request,
+            context.reasoning_replay,
+            &route_for("deepseek", "deepseek-chat"),
+        );
 
         let body = OpenAiChatAdapter::new()
             .encode_request(&request, &context, true)
@@ -1483,7 +1597,7 @@ mod tests {
                 origin: None,
                 role: Role::Assistant,
                 content,
-                route: None,
+                route: Some(route_for("deepseek", "deepseek-chat")),
             }
         }
 
@@ -1539,6 +1653,11 @@ mod tests {
                     if tools {
                         request.tools = vec![tool.clone()];
                     }
+                    project_for(
+                        &mut request,
+                        context.reasoning_replay,
+                        &route_for("deepseek", "deepseek-chat"),
+                    );
                     let body = OpenAiChatAdapter::new()
                         .encode_request(&request, &context, true)
                         .unwrap()
@@ -1734,6 +1853,7 @@ mod tests {
             ),
             ..ctx()
         };
+        let route = route_for("deepseek", "deepseek-chat");
         let mut request = ModelRequest::new(
             ModelRef::new("deepseek", "deepseek-chat"),
             vec![
@@ -1744,30 +1864,26 @@ mod tests {
                     content: vec![ContentPart::Reasoning {
                         text: "thought".into(),
                     }],
-                    route: None,
+                    route: Some(route.clone()),
                 },
                 Message::text(Role::User, "again"),
             ],
         );
 
         // Always: no tools in the request, reasoning still carried.
+        let always = with_tools_already(ReasoningReplayScope::Always);
+        project_for(&mut request, always.reasoning_replay, &route);
         let body = OpenAiChatAdapter::new()
-            .encode_request(
-                &request,
-                &with_tools_already(ReasoningReplayScope::Always),
-                true,
-            )
+            .encode_request(&request, &always, true)
             .unwrap()
             .body;
         assert_eq!(body["messages"][1]["reasoning_content"], "thought");
 
         // WhenToolsPresent: the same request with no tools carries nothing.
+        let when_tools = with_tools_already(ReasoningReplayScope::WhenToolsPresent);
+        project_for(&mut request, when_tools.reasoning_replay, &route);
         let body = OpenAiChatAdapter::new()
-            .encode_request(
-                &request,
-                &with_tools_already(ReasoningReplayScope::WhenToolsPresent),
-                true,
-            )
+            .encode_request(&request, &when_tools, true)
             .unwrap()
             .body;
         assert!(body["messages"][1].get("reasoning_content").is_none());
@@ -1778,12 +1894,10 @@ mod tests {
             description: "search".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
+        let never = with_tools_already(ReasoningReplayScope::Never);
+        project_for(&mut request, never.reasoning_replay, &route);
         let body = OpenAiChatAdapter::new()
-            .encode_request(
-                &request,
-                &with_tools_already(ReasoningReplayScope::Never),
-                true,
-            )
+            .encode_request(&request, &never, true)
             .unwrap()
             .body;
         assert!(body["messages"][1].get("reasoning_content").is_none());
@@ -1844,6 +1958,7 @@ mod tests {
             reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
+        let route = route_for("deepseek", "deepseek-flash");
         let mut request = ModelRequest::new(
             ModelRef::new("deepseek", "deepseek-flash"),
             vec![
@@ -1859,7 +1974,7 @@ mod tests {
                             text: "done".into(),
                         },
                     ],
-                    route: None,
+                    route: Some(route.clone()),
                 },
                 Message::text(Role::User, "continue with tools"),
             ],
@@ -1869,6 +1984,7 @@ mod tests {
             description: "search".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
+        project_for(&mut request, context.reasoning_replay, &route);
 
         let body = OpenAiChatAdapter::new()
             .encode_request(&request, &context, true)

@@ -1918,6 +1918,57 @@ reasoning_replay_scope = "never"
         assert!(message.contains("HTTP 400"), "{message}");
     }
 
+    /// The exact configuration a user reaches for when they want to stop paying
+    /// for replayed reasoning on a preserved-thinking GLM route: the two settings
+    /// contradict each other, and the refusal must name the mode rather than the
+    /// generic protocol rule.
+    #[test]
+    fn a_preserved_thinking_route_cannot_disable_replay_from_a_user_config() {
+        let text = r#"
+[providers.bigmodel]
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+api_key_env = "BIGMODEL_API_KEY"
+
+[models."glm-5.3"]
+provider = "bigmodel"
+model_id = "glm-5.3"
+context_window = 1048576
+reliable_context = 786432
+max_output_tokens = 131072
+streaming = true
+reasoning = true
+reasoning_style = "thinking_flag"
+supported_efforts = ["low", "high", "max"]
+reasoning_effort = "max"
+preserved_thinking = true
+forced = true
+passback_reasoning_content = false
+"#;
+        let bundle = GlobalConfig::from_toml_str(text).unwrap().into_bundle();
+        let error = leveler_provider::ProviderRegistry::build(leveler_provider::RegistryInputs {
+            providers: Vec::new(),
+            models: bundle.models,
+        })
+        .err()
+        .expect("preserved thinking without replay is refused");
+        let message = error.to_string();
+        assert!(message.contains("glm-5.3"), "{message}");
+        assert!(message.contains("preserved_thinking"), "{message}");
+
+        // The same route with the mode turned off is a legal exit: the request
+        // then really clears prior thinking instead of only not returning it.
+        let cleared = text.replace("preserved_thinking = true", "preserved_thinking = false");
+        let bundle = GlobalConfig::from_toml_str(&cleared).unwrap().into_bundle();
+        let profile = bundle.models[0].profile.clone();
+        leveler_provider::ProviderRegistry::build(leveler_provider::RegistryInputs {
+            providers: Vec::new(),
+            models: bundle.models,
+        })
+        .expect("a cleared mode may stop replaying");
+        let contract = leveler_model::ReasoningReplayContract::for_route(&profile);
+        assert_eq!(contract.arm_name(), "never");
+    }
+
     /// A generated config writes no replay fields at all, and a provider with no
     /// historical-reasoning channel never receives fields it never asked for.
     #[test]
