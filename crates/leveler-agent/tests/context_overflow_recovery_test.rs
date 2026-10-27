@@ -292,20 +292,15 @@ async fn an_oversized_result_is_bounded_by_remaining_capacity_and_stays_retrieva
 
     let runtime = ScriptRuntime::new(vec![firehose_call(), answer("done")]);
     let mut events = Vec::new();
-    let outcome = executor(
-        dir.path(),
-        runtime.clone(),
-        registry(store.clone()),
-        policy,
-    )
-    .run(
-        "find the window boundary",
-        &mut |event| events.push(event),
-        &mut NoopSink,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("a result that fits the remaining room must not abort the turn");
+    let outcome = executor(dir.path(), runtime.clone(), registry(store.clone()), policy)
+        .run(
+            "find the window boundary",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a result that fits the remaining room must not abort the turn");
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     let requests = runtime.main_requests();
