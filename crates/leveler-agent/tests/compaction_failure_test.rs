@@ -392,7 +392,10 @@ async fn a_failing_soft_briefing_is_not_retried_every_round() {
 
     let main_rounds = runtime.main_requests().len();
     let attempts = runtime.summary_requests();
-    assert!(main_rounds >= 9, "the main rounds really ran: {main_rounds}");
+    assert!(
+        main_rounds >= 9,
+        "the main rounds really ran: {main_rounds}"
+    );
     assert!(
         attempts <= 2,
         "a failing briefing must not be retried every round: {attempts} attempts across \
