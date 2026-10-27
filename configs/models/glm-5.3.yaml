@@ -48,5 +48,10 @@ limits:
 # resolved by `ReasoningReplayContract::for_route`; declaring it again here
 # would be a second source of the same fact. Use
 # `reasoning_replay_scope` / `reasoning_content_key_required` only to override
-# a deployment whose behaviour differs from the family default.
+# a deployment whose behaviour differs from the family default. Preserved
+# thinking is such a fact: while `preserved_thinking = true` the endpoint is
+# asked to keep prior turns' thinking and requires it back, so a replay opt-out
+# is refused at startup; set `preserved_thinking = false` (which sends
+# `clear_thinking: true`) to run the route without preservation and without
+# replay.
 # Source: https://docs.z.ai/guides/capabilities/thinking-mode

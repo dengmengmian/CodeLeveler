@@ -39,5 +39,9 @@ limits:
 # The replay contract is NOT declared: the GLM wire family's tool-loop
 # requirement is resolved from the model id. Use
 # `reasoning_replay_scope` / `reasoning_content_key_required` only to override
-# a deployment whose behaviour differs from the family default.
+# a deployment whose behaviour differs from the family default. While
+# `preserved_thinking = true` the endpoint requires the retained thinking back,
+# so a replay opt-out is refused at startup; set `preserved_thinking = false`
+# (which sends `clear_thinking: true`) for a route that neither preserves nor
+# replays.
 # Source: https://docs.z.ai/guides/capabilities/thinking-mode
