@@ -31,7 +31,7 @@
 ### 修复
 
 - 1 万条记忆的召回：p95 从 1.67s 降到 7.6ms（出厂单 Lane 配置，release，同一 fixture）。派生索引增加 `documents(scope, kind, status, …)` 索引并在 reconcile 后 `optimize`；候选校验改为批量且足够即停。Experience lane 仍需第二次词法扫描（10k 时 15.8ms），因为 FTS5 无法在单次查询内按 kind 排名
-- 被拒绝的 `update_goal(complete)` 计入空转轮次：模型重复同一个被拒的完成声明时，会由既有的有界空转上限停止，而不是一直跑到预算耗尽（在无界 continuation 策略下则是无限循环）。拒绝仍然只是反馈，下一轮真实工作会重置计数
+- Goal 验证拒绝仍然是严格的命令不匹配，并以工具错误返回：指出哪条引用没对上、Runtime 记录的完整命令，以及纠正方式（原样引用该命令，或重新执行检查）。连续三轮只提交引用时到达上限，任务以 Incomplete 停止并写明原因，不会算作完成。需求核对拒绝和执行前拒绝仍计入空转轮次，并按该上限停止。之后真正执行命令的一轮会重置验证恢复计数
 - Goal 不能再以比用户请求更窄的 acceptance 完成。`commit_task` 会拒绝漏掉用户明确枚举交付项的 acceptance；`update_goal(complete)` 要求逐项记账，并用执行记录核对具名产物与命令。用户自己写下的后续豁免会移除对应要求并随 Goal 持久化，因此恢复与压缩既不会复活也不会抹掉范围
 - 敏感校验覆盖所有写入路径的 title、body、tags 与 provenance evidence
 - forget、supersede、expiry 在写归档前脱敏敏感内容；非敏感记录保持原样

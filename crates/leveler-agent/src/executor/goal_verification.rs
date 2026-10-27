@@ -79,25 +79,10 @@ pub(crate) fn decide(
                     continue;
                 }
                 let Some(last) = runs.iter().rev().find(|run| cites(&run.label, cited)) else {
-                    // The check stays exact; only the feedback improves. A
-                    // model that ran a semantically equivalent command can
-                    // copy a recorded label instead of replaying its whole
-                    // verification sequence to rediscover the exact string.
-                    let recorded: Vec<String> = runs
-                        .iter()
-                        .rev()
-                        .filter(|run| run.ok && is_verification_command(&run.label))
-                        .take(2)
-                        .map(|run| format!("`{}` (step {})", run.label, run.model_step))
-                        .collect();
-                    let hint = if recorded.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" Recorded: {}.", recorded.join("; "))
-                    };
-                    return VerificationDecision::Refuse(format!(
-                        "`{cited}` was cited as verification but never ran in this task. Run \
-                         the command that proves the objective, or cite one you actually ran.{hint}"
+                    return VerificationDecision::Refuse(unmatched_citation(
+                        cited,
+                        runs,
+                        mutation_ops,
                     ));
                 };
                 if !last.ok {
@@ -170,6 +155,152 @@ pub(crate) fn decide(
             }
         }
     }
+}
+
+/// Why a citation is not an execution record, and what the model can do.
+///
+/// Matching stays exact. The text only reports commands the runtime recorded.
+fn unmatched_citation(cited: &str, runs: &[VerificationRun], mutation_ops: u64) -> String {
+    let partial = closest_recorded_command(cited, runs);
+    let why = match &partial {
+        Some(partial) if partial.glued => format!(
+            "`{cited}` was cited as verification but it is only part of a recorded command, \
+             not a command that ran on its own. It lines up with `{label}` (step {step}) and \
+             that command continues (`{next}`). A subcommand of a compound shell command is \
+             not its own execution record.",
+            label = partial.run.label,
+            step = partial.run.model_step,
+            next = partial.next_token.as_deref().unwrap_or("")
+        ),
+        Some(partial) if partial.matched >= 3 => format!(
+            "`{cited}` was cited as verification but it does not match an execution record. \
+             The closest recorded command is `{label}` (step {step}); the citation diverges \
+             before the end of that command.",
+            label = partial.run.label,
+            step = partial.run.model_step
+        ),
+        _ => format!("`{cited}` was cited as verification but never ran in this task."),
+    };
+    let citable = citable_commands(
+        runs,
+        mutation_ops,
+        partial.as_ref().map(|partial| partial.run),
+    );
+    let recorded = if citable.is_empty() {
+        "No recorded command can be cited as a passing check.".to_string()
+    } else {
+        format!("Recorded commands that can be cited in full: {citable}.")
+    };
+    let unmet = if runs.iter().any(|run| {
+        run.ok && is_verification_command(&run.label) && run.mutation_ops >= mutation_ops
+    }) {
+        "The cited evidence is not accepted."
+    } else {
+        "No verification command has passed since the last file change."
+    };
+    format!(
+        "{why} {recorded} {unmet} Cite one recorded command in full, exactly as shown, or run \
+         the check again as its own command and cite that command."
+    )
+}
+
+struct RecordedPartial<'a> {
+    run: &'a VerificationRun,
+    matched: usize,
+    glued: bool,
+    next_token: Option<String>,
+}
+
+/// Longest token alignment between `cited` and a recorded command.
+///
+/// A trailing shell separator glued to the last argument (`--summary;`) is
+/// reported as glued. It is not a match: [`cites`] still requires equal tokens.
+fn closest_recorded_command<'a>(
+    cited: &str,
+    runs: &'a [VerificationRun],
+) -> Option<RecordedPartial<'a>> {
+    let cited_tokens = command_tokens(strip_trailing_note(cited));
+    if cited_tokens.is_empty() {
+        return None;
+    }
+    let mut best: Option<RecordedPartial<'a>> = None;
+    for run in runs.iter().rev() {
+        let label_tokens = command_tokens(&run.label);
+        for start in 0..label_tokens.len() {
+            let mut matched = 0;
+            while start + matched < label_tokens.len()
+                && matched < cited_tokens.len()
+                && label_tokens[start + matched] == cited_tokens[matched]
+            {
+                matched += 1;
+            }
+            let mut glued = false;
+            let next_token = if matched < cited_tokens.len() && start + matched < label_tokens.len()
+            {
+                let label_token = &label_tokens[start + matched];
+                let cited_token = &cited_tokens[matched];
+                if label_token
+                    .strip_prefix(cited_token.as_str())
+                    .is_some_and(is_shell_separator)
+                    && matched + 1 == cited_tokens.len()
+                {
+                    glued = true;
+                    matched += 1;
+                }
+                Some(label_token.clone())
+            } else {
+                label_tokens.get(start + matched).cloned()
+            };
+            let better = best
+                .as_ref()
+                .is_none_or(|current| matched > current.matched);
+            if matched > 0 && better {
+                best = Some(RecordedPartial {
+                    run,
+                    matched,
+                    glued,
+                    next_token,
+                });
+            }
+        }
+    }
+    best
+}
+
+fn is_shell_separator(rest: &str) -> bool {
+    !rest.is_empty() && rest.chars().all(|c| matches!(c, ';' | '&' | '|'))
+}
+
+/// Passing commands the model may copy. The closest record is included even
+/// when it is not classified as verification, because that is the command
+/// the citation almost named. Failed runs are omitted.
+fn citable_commands(
+    runs: &[VerificationRun],
+    mutation_ops: u64,
+    closest: Option<&VerificationRun>,
+) -> String {
+    let mut listed: Vec<String> = Vec::new();
+    let push = |listed: &mut Vec<String>, run: &VerificationRun| {
+        if !run.ok {
+            return;
+        }
+        let line = format!("`{}` (step {})", run.label, run.model_step);
+        if !listed.contains(&line) {
+            listed.push(line);
+        }
+    };
+    if let Some(run) = closest {
+        push(&mut listed, run);
+    }
+    for run in runs.iter().rev().filter(|run| {
+        run.ok && is_verification_command(&run.label) && run.mutation_ops >= mutation_ops
+    }) {
+        push(&mut listed, run);
+        if listed.len() >= 3 {
+            break;
+        }
+    }
+    listed.join("; ")
 }
 
 /// The most recent verification-class failure with no later verification
@@ -630,9 +761,68 @@ mod tests {
                     message.contains("go test -count=1 ./..."),
                     "the refusal must name a recorded command: {message}"
                 );
+                assert!(
+                    message.contains("in full") && message.contains("own command"),
+                    "the refusal must say how to correct the citation: {message}"
+                );
             }
             other => panic!("expected refusal, got {other:?}"),
         }
+    }
+
+    /// The T6 shape: the model cites one segment of a compound shell command.
+    /// The runtime recorded the whole script, and the separator is glued to
+    /// the last argument, so the segment is not an execution record. The
+    /// refusal must name that full command and the correction, and must not
+    /// pretend the script never ran.
+    #[test]
+    fn a_compound_shell_subcommand_is_refused_and_names_the_full_command() {
+        let recorded = "/bin/sh ./verify.sh; echo marker";
+        let runs = vec![run(recorded, true, 9, 2)];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["/bin/sh ./verify.sh".into()]),
+            &runs,
+            2,
+            true,
+        );
+        match decision {
+            VerificationDecision::Refuse(message) => {
+                assert!(
+                    message.contains(recorded),
+                    "the refusal must name the recorded command: {message}"
+                );
+                assert!(
+                    message.contains("continues") || message.contains("subcommand"),
+                    "the refusal must explain the mismatch: {message}"
+                );
+                assert!(
+                    message.contains("in full") && message.contains("own command"),
+                    "the refusal must say how to correct it: {message}"
+                );
+                assert!(
+                    !message.contains("never ran"),
+                    "the compound command did run: {message}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    /// Citing the recorded script itself is the correction. The gate stays
+    /// exact: only the full command matches.
+    #[test]
+    fn citing_the_full_compound_command_is_accepted() {
+        let recorded = "/bin/sh ./verify.sh; echo marker";
+        let runs = vec![run(recorded, true, 9, 2)];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec![recorded.into()]),
+                &runs,
+                2,
+                true
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
     }
 
     #[test]
