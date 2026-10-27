@@ -1813,6 +1813,25 @@ async fn ship_changes_and_print(
     println!();
 }
 
+/// The terminal line for a run that ended honestly without a verified
+/// completion.
+///
+/// The runtime's `stop_detail` is the reason the Goal Gate, a recovery bound
+/// or a budget stopped the turn. Reporting only "completeness could not be
+/// established" hid that cause from the person reading the run while the TUI
+/// and the durable record both carried it.
+fn incomplete_line(model_steps: u32, stop_detail: Option<&str>) -> String {
+    match stop_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        Some(detail) => format!("Stopped after {model_steps} model step(s): {detail}"),
+        None => format!(
+            "Stopped after {model_steps} model step(s): completeness could not be established."
+        ),
+    }
+}
+
 /// Exit code for a run that ended honestly without an independently verified
 /// completion: `Blocked`, `Stalled`, `Incomplete`, `BudgetExhausted` or
 /// `TurnLimitReached`. `Answered` joins them only for a Goal axis; for chat and
@@ -1938,9 +1957,9 @@ fn finish(
                     }
                     StopReason::Incomplete => println!(
                         "{}",
-                        Line::warn(&format!(
-                            "Stopped after {} model step(s): completeness could not be established.",
-                            outcome.model_steps
+                        Line::warn(&incomplete_line(
+                            outcome.model_steps,
+                            outcome.stop_detail.as_deref()
                         ))
                     ),
                     StopReason::BudgetExhausted => println!(
@@ -1984,6 +2003,7 @@ fn finish(
                     // value is the model-step count (a mechanical iteration
                     // count, never a task-progress measure).
                     "rounds": outcome.model_steps,
+                    "stop_detail": outcome.stop_detail,
                     "modified_files": outcome.modified_files,
                 }));
             }
@@ -3485,9 +3505,38 @@ mod handover_recovery_tests {
 
 #[cfg(test)]
 mod outcome_exit_code_tests {
-    use super::{NOT_COMPLETED_EXIT_CODE, outcome_exit_code};
+    use super::{NOT_COMPLETED_EXIT_CODE, incomplete_line, outcome_exit_code};
     use leveler_agent::StopReason;
     use leveler_app::CollaborationExecution;
+
+    /// A run that stopped Incomplete must show the runtime's own reason. The
+    /// generic sentence is the fallback for a stop that carried none, never a
+    /// replacement for a reason that exists.
+    #[test]
+    fn an_incomplete_stop_shows_its_detail() {
+        let line = incomplete_line(
+            4,
+            Some("goal verification refused 3 times in a row without a corrected citation"),
+        );
+        assert!(line.contains("4 model step(s)"), "{line}");
+        assert!(line.contains("goal verification refused"), "{line}");
+        assert!(
+            !line.contains("could not be established"),
+            "the generic fallback must not appear beside a real reason: {line}"
+        );
+    }
+
+    /// No detail (or a blank one) still reports the terminal honestly.
+    #[test]
+    fn an_incomplete_stop_without_detail_uses_the_fallback() {
+        for detail in [None, Some(""), Some("   ")] {
+            let line = incomplete_line(7, detail);
+            assert!(
+                line.contains("could not be established"),
+                "{detail:?} → {line}"
+            );
+        }
+    }
 
     fn code(reason: StopReason, execution: CollaborationExecution) -> std::process::ExitCode {
         outcome_exit_code(reason, execution)

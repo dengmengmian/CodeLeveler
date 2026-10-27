@@ -22,9 +22,13 @@ pub enum TurnPhase {
 /// tick per stalled drive, so `continue_active_goal` cannot re-drive it
 /// forever).
 ///
-/// A goal-verification refusal does not tick this. That refusal is feedback
-/// the model can correct, and the agent bounds those rounds itself. A
-/// requirements refusal and a pre-execution denial still tick it.
+/// The refused-round tick applies at every depth: a delegated child that only
+/// re-issues a refusal is making no progress either, and its parent waits for
+/// it. A goal-verification refusal does not tick this. That refusal is feedback
+/// the model can correct, and the agent bounds those rounds itself — including
+/// in a round that also carried a pre-execution denial, which therefore neither
+/// advances nor clears the streak. A requirements refusal and a round whose
+/// refusals were all pre-execution denials still tick it.
 ///
 /// This is not a quiet-round rule. A running drive never ticks: any executed
 /// tool, failed or not, counts as progress, and rounds that merely produce
@@ -409,6 +413,20 @@ mod tests {
         assert_eq!(parent.cumulative_duration_ms, 0);
         assert_eq!(parent.cumulative_modified_files, 3);
         assert!(parent.cumulative_modified_paths.contains(&"c.rs".into()));
+    }
+
+    /// A child's refusal streak is its own drive. Folding the child's work
+    /// into the parent must not make the parent look blocked.
+    #[test]
+    fn absorb_child_work_does_not_copy_the_no_progress_streak() {
+        let mut parent = ProgressLedger::default();
+        parent.note_progress(1);
+        let mut child = ProgressLedger::default();
+        child.note_no_progress_round(1);
+        child.note_no_progress_round(2);
+        parent.absorb_child_work(&child);
+        assert_eq!(parent.no_progress_streak, 0);
+        assert_eq!(child.no_progress_streak, 2);
     }
 
     /// Spend arrives one record at a time, and the unreported share stays
