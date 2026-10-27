@@ -1,0 +1,38 @@
+# Kimi K3.1 Pro — flagship coding model (Kimi Code model id: k3.1-pro).
+# Docs: https://www.kimi.com/code/docs/kimi-code/models (read 2026-10-27)
+#       https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart
+# 1M context, 3T-class parameters.
+# Reasoning: `reasoning_effort` low | high | max. Thinking cannot be disabled:
+# the Kimi Code endpoint rejects a request that turns it off (HTTP 400), and the
+# API endpoint always reasons. CodeLeveler default: max.
+# The request takes no `thinking` field, and preservation is unconditional: the
+# complete assistant message (including `reasoning_content`) is returned on
+# every request, in multi-turn conversation as much as in a tool call.
+# `max_completion_tokens` defaults to 131072 and may be raised up to 1048576;
+# this route requests the documented default.
+id: k3.1-pro
+provider: kimi
+model_id: k3.1-pro
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: true
+  structured_output: true
+  reasoning: true
+  vision: true
+reasoning:
+  style: open_ai_effort
+  supported_efforts: [low, high, max]
+  # Provider default is `high` on the Kimi Code endpoint and `max` on the API
+  # platform; CodeLeveler's own stated default is `max`.
+  default_effort: max
+limits:
+  context_window: 1048576
+  reliable_context: 786432
+  max_output_tokens: 131072
+  max_tool_schema_bytes: 32768
+  max_parallel_tool_calls: 16
+compatibility:
+  # Fixed at the provider's own value; the endpoint rejects a caller-chosen one.
+  supports_temperature: false

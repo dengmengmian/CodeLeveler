@@ -65,8 +65,8 @@ pub const PRESETS: &[ProviderPreset] = &[
         protocol: ProtocolKind::OpenAiChat,
         key_env: "MOONSHOT_API_KEY",
         console_url: "https://platform.moonshot.cn/console/api-keys",
-        suggested_model: "kimi-k2-0905-preview",
-        suggested_context: 131_072,
+        suggested_model: "kimi-k2.7-code",
+        suggested_context: 262_144,
     },
     ProviderPreset {
         id: "openai",
@@ -176,5 +176,15 @@ mod tests {
         let p = preset("deepseek").expect("DeepSeek must be a first-class login preset");
         assert_eq!(p.suggested_model, "deepseek-flash");
         assert_eq!(p.suggested_context, 1_048_576);
+    }
+
+    #[test]
+    fn moonshot_preset_suggests_a_supported_kimi_generation() {
+        // The product supports Kimi K2.7 and later. The preset is only a
+        // starting point, but it must not point a first run at a model the
+        // reasoning lifecycle no longer covers.
+        let p = preset("moonshot").expect("Moonshot / Kimi must stay selectable");
+        assert_eq!(p.suggested_model, "kimi-k2.7-code");
+        assert_eq!(p.suggested_context, 262_144);
     }
 }

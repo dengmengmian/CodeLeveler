@@ -42,6 +42,13 @@ fn deepseek_contract() -> ReasoningReplayContract {
     )
 }
 
+fn always_empty_contract() -> ReasoningReplayContract {
+    ReasoningReplayContract::raw_field(
+        ReasoningReplayScope::Always,
+        MissingReasoningReplay::EmptyString,
+    )
+}
+
 fn glm_contract() -> ReasoningReplayContract {
     ReasoningReplayContract::raw_field(
         ReasoningReplayScope::WhenToolsPresent,
@@ -512,14 +519,13 @@ fn a_stamped_message_round_trips_through_the_transcript_payload() {
 
 #[test]
 fn the_family_table_separates_required_from_opt_out() {
-    // K3's protocol requires the complete assistant message back, so a weaker
-    // declaration is refused. GLM documents replay as the tool-loop default and
-    // may be opted out of by a deployment that disabled preserved thinking.
+    // K3's protocol requires the complete assistant message back on every
+    // request, so a weaker declaration is refused.
     let k3 = profile("k3");
     assert_eq!(
         leveler_model::ReasoningReplayContract::for_route(&k3),
-        deepseek_contract(),
-        "K3 requires replay AND the empty key, like DeepSeek"
+        always_empty_contract(),
+        "K3 requires every historical turn's reasoning and the empty key"
     );
     let mut k3_off = k3.clone();
     k3_off.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::Never);
@@ -534,26 +540,25 @@ fn the_family_table_separates_required_from_opt_out() {
     leveler_model::ReasoningReplayContract::check_route(&glm_off)
         .expect("a GLM deployment may disable preserved thinking");
 
-    // K2.6 keeps its own rule: replay is required while the route reasons, and
-    // a turn that produced none still carries the key the endpoint validates,
-    // with the legal empty value (measured on the live route).
-    let k26 = profile("kimi-k2.6");
+    // K2.7 Code always thinks and always preserves, so its rule is the same
+    // hard one: every historical assistant message comes back.
+    let k27 = profile("kimi-k2.7-code");
     assert_eq!(
-        leveler_model::ReasoningReplayContract::for_route(&k26),
-        deepseek_contract()
+        leveler_model::ReasoningReplayContract::for_route(&k27),
+        always_empty_contract()
     );
-    let mut k26_off = k26.clone();
-    k26_off.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::Never);
+    let mut k27_off = k27.clone();
+    k27_off.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::Never);
     assert!(
-        leveler_model::ReasoningReplayContract::check_route(&k26_off).is_err(),
-        "the tool-loop requirement is not an optional cross-turn preference"
+        leveler_model::ReasoningReplayContract::check_route(&k27_off).is_err(),
+        "the unconditional preservation requirement is not an option"
     );
 
-    // A Kimi model that does not reason has no channel to protect.
-    let mut plain = profile("kimi-k2-0905-preview");
-    plain.capabilities.reasoning = false;
+    // A Kimi id below K2.7 is no longer a supported family, so it does not
+    // inherit the requirement by name similarity.
+    let legacy = profile("kimi-k2-0905-preview");
     assert_eq!(
-        leveler_model::ReasoningReplayContract::for_route(&plain),
+        leveler_model::ReasoningReplayContract::for_route(&legacy),
         ReasoningReplayContract::NONE
     );
 }

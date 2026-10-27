@@ -3,6 +3,13 @@
 # The id was upgraded in place: K2.8 Preview replaced K2.7 Code under the same
 # model id ("kimi-for-coding 直接升级、无需修改配置"), so the facts below are the
 # new model's, not the ones that id used to have.
+#
+# Protocol (https://platform.kimi.ai/docs/guide/use-thinking-models,
+# https://www.kimi.com/code/docs/kimi-code/models): thinking is always on and is
+# configured with the top-level `reasoning_effort`; the K2.x `thinking` object is
+# not part of this call shape. Preservation is unconditional — every historical
+# assistant message's `reasoning_content` is replayed on every request — so the
+# profile declares neither `preserved_thinking` nor a replay field.
 id: kimi-for-coding
 provider: kimi
 model_id: kimi-for-coding
