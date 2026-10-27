@@ -325,11 +325,7 @@ pub fn cap_output(s: &str) -> String {
 /// middle, and then the model would hold a partial result with no way to know
 /// what it lost. The saved content is the only copy that is not subject to
 /// this budget.
-fn cap_result(
-    s: &str,
-    budget: usize,
-    store: Option<&leveler_execution::ArtifactStore>,
-) -> String {
+fn cap_result(s: &str, budget: usize, store: Option<&leveler_execution::ArtifactStore>) -> String {
     if s.len() <= budget {
         return s.to_string();
     }
@@ -1478,10 +1474,8 @@ mod result_offload {
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "leveler-offload-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("leveler-offload-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1491,8 +1485,7 @@ mod result_offload {
         if let Some(store) = store {
             capabilities = capabilities.with_artifact_store(store);
         }
-        let mut registry =
-            super::model_surface(super::CapabilityPacks::NONE, &capabilities);
+        let mut registry = super::model_surface(super::CapabilityPacks::NONE, &capabilities);
         registry.register(Arc::new(Firehose {
             payload: payload.to_string(),
         }));
@@ -1500,10 +1493,8 @@ mod result_offload {
     }
 
     fn context(dir: &std::path::Path, budget: usize) -> ToolContext {
-        let mut context = ToolContext::new(
-            Workspace::new(dir).unwrap(),
-            PermissionProfile::Assisted,
-        );
+        let mut context =
+            ToolContext::new(Workspace::new(dir).unwrap(), PermissionProfile::Assisted);
         context.policy.tool_output_budget = budget;
         context
     }
@@ -1581,7 +1572,8 @@ mod result_offload {
 
         assert!(out.content.len() <= 4 * 1024);
         assert!(
-            out.content.contains(leveler_model::tool_output::TOOL_OUTPUT_ELIDED_MARKER),
+            out.content
+                .contains(leveler_model::tool_output::TOOL_OUTPUT_ELIDED_MARKER),
             "without a store the loss must be stated: {}",
             &out.content[..out.content.len().min(300)]
         );
