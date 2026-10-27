@@ -109,6 +109,14 @@ const MAX_DECODE_RETRIES: u32 = 2;
 /// to execute and fail immediately.
 const MAX_LENGTH_CONTINUATIONS: u32 = 2;
 
+/// Consecutive rounds whose every call was a goal-verification refusal.
+///
+/// Two is the failure this bound exists to avoid: the second refusal ends
+/// the turn before the model can read it and cite the recorded command or
+/// run the check again. Three lets that correction land, then stops.
+/// A round that executes a tool resets the count.
+const MAX_VERIFICATION_RECOVERY_ROUNDS: u32 = 3;
+
 /// Tokens held back from each call's share of the remaining context capacity.
 /// The estimator deliberately prices message content only, not the per-message
 /// role framing or the JSON envelope a provider also counts (see
@@ -191,6 +199,11 @@ pub(crate) struct Drive<'a> {
     /// of these facts, and a failed test/build is hard evidence against
     /// `update_goal(complete)`.
     verification_runs: Vec<super::goal_verification::VerificationRun>,
+    /// Consecutive rounds whose every call was a recoverable goal-verification
+    /// refusal. Not the generic no-progress streak: the model must be able to
+    /// read the refusal and cite the recorded command or run the check again.
+    /// A round that executes a tool resets it. A new drive starts it over.
+    goal_gate_recovery_rounds: u32,
     /// Facts the terminal must carry even though the Goal resolved: accepted
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
@@ -601,6 +614,7 @@ impl Executor {
             // mechanism (goal resolution, empty answer).
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
             verification_runs: self.seeded_verification_runs.clone(),
+            goal_gate_recovery_rounds: 0,
             completion_warnings: Vec::new(),
             decode_retries: 0,
             length_continuations: 0,
@@ -1266,12 +1280,15 @@ impl<'a> Drive<'a> {
         stop: StopReason,
         detail: &str,
         fallback: &str,
+        announce: Option<String>,
     ) -> Result<AgentOutcome, AgentError> {
         self.progress.enter_closed();
         (self.observer)(AgentEvent::ProgressUpdated {
             ledger: self.progress.clone(),
         });
-        let final_text = if self.last_text.trim().is_empty() {
+        let final_text = if let Some(announce) = announce {
+            announce
+        } else if self.last_text.trim().is_empty() {
             fallback.to_string()
         } else {
             self.last_text.clone()
@@ -1360,7 +1377,10 @@ impl Drive<'_> {
     /// evidence the estimator is too high (cache accounting differs by
     /// route), so this only ever widens the safety margin.
     fn measured_estimate_gap(&self) -> u64 {
-        match (self.last_projected_input_tokens, self.last_actual_input_tokens) {
+        match (
+            self.last_projected_input_tokens,
+            self.last_actual_input_tokens,
+        ) {
             (Some(estimated), Some(actual)) => actual.saturating_sub(estimated),
             _ => 0,
         }
@@ -2207,7 +2227,8 @@ impl AgentHarness for Drive<'_> {
         // so what is left is exactly the room they may use. Every call in the
         // batch shares it; a static ceiling that ignores the window is what
         // let one `grep` result crowd out the task (G7/T8).
-        let tool_result_budget = self.tool_result_budget_bytes(rt, messages.as_slice(), calls.len());
+        let tool_result_budget =
+            self.tool_result_budget_bytes(rt, messages.as_slice(), calls.len());
         // Tool results, filled by call index. Parallel-safe read-only tools
         // may finish out of order, but the model must receive their results
         // in the original call order — providers reject reordered results.
@@ -2233,8 +2254,11 @@ impl AgentHarness for Drive<'_> {
         // (a resolution the runtime would not accept). A round consisting
         // solely of these is no progress — it feeds the all-refused streak,
         // so a model repeating the same refused resolution cannot spin under
-        // an unbounded continuation policy.
+        // an unbounded continuation policy. A goal-verification refusal is
+        // counted in `verification_refusals_this_round` instead: that
+        // feedback is recoverable, and it has its own bound.
         let mut denied_calls_this_round: usize = 0;
+        let mut verification_refusals_this_round: usize = 0;
         // User cancel observed inside this batch. The batch stops, but the
         // round is still committed (results + spend) before Cancelled
         // surfaces — completed tools' side effects are already on disk.
@@ -2785,7 +2809,7 @@ impl AgentHarness for Drive<'_> {
                             }
                         }
                         super::goal_verification::VerificationDecision::Refuse(message) => {
-                            denied_calls_this_round += 1;
+                            verification_refusals_this_round += 1;
                             (self.observer)(AgentEvent::GoalIntercepted {
                                 kind: "verification_refused".to_string(),
                                 detail: message.clone(),
@@ -4547,9 +4571,39 @@ impl AgentHarness for Drive<'_> {
         // making no progress, and stopping is lifecycle correctness rather
         // than advice to the model. Nothing here reads a policy flag, because
         // a safety boundary is not an experiment.
+        //
+        // A round that is only a goal-verification refusal is not that case.
+        // The tool result tells the model which citation failed and which
+        // command was recorded. Stopping on the second such round ends the
+        // turn before the model can read the latest refusal. Those rounds
+        // have their own bound and do not tick the guard streak.
+        let pure_verification_recovery =
+            !call_snapshot.is_empty() && verification_refusals_this_round == call_snapshot.len();
         let all_refused =
             !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len();
-        if all_refused {
+        if pure_verification_recovery {
+            self.goal_gate_recovery_rounds = self.goal_gate_recovery_rounds.saturating_add(1);
+            if self.executor.depth == 0
+                && self.goal_gate_recovery_rounds >= MAX_VERIFICATION_RECOVERY_ROUNDS
+            {
+                let detail = format!(
+                    "goal verification refused {} times in a row without a corrected citation \
+                     or a new command",
+                    self.goal_gate_recovery_rounds
+                );
+                return Ok(Flow::Stop(
+                    self.stop_now(
+                        rt,
+                        messages,
+                        StopReason::Incomplete,
+                        &detail,
+                        &detail,
+                        Some(detail.clone()),
+                    )
+                    .await?,
+                ));
+            }
+        } else if all_refused {
             self.progress.note_no_progress_round(model_steps);
             (self.observer)(AgentEvent::ProgressUpdated {
                 ledger: self.progress.clone(),
@@ -4566,12 +4620,14 @@ impl AgentHarness for Drive<'_> {
                         StopReason::Incomplete,
                         "no-progress streak; model steps that only repeated refused calls short-circuited",
                         "Stopped: no progress (every attempted action was refused).",
+                        None,
                     )
                     .await?,
                 ));
             }
         } else if !call_snapshot.is_empty() {
             self.progress.note_progress(model_steps);
+            self.goal_gate_recovery_rounds = 0;
         }
 
         // Goal mode: an explicit update_goal this round ends the run now that

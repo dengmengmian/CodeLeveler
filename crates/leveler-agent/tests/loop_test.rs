@@ -6585,6 +6585,291 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+fn goal_full_access(dir: &std::path::Path, runtime: Arc<MockRuntime>, steps: u32) -> Executor {
+    let workspace = Workspace::new(dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        steps,
+    )
+    .with_goal_mode(true)
+}
+
+fn passed_goal(id: &str, detail: &str) -> ModelResponse {
+    assistant_tool_call(
+        id,
+        "update_goal",
+        serde_json::json!({
+            "status": "complete",
+            "summary": "done",
+            "verification": {"status": "passed", "detail": detail}
+        }),
+    )
+}
+
+/// Three consecutive citation refusals are the recovery bound. The turn
+/// stops Incomplete with that reason, and does not keep calling the model.
+#[tokio::test]
+async fn goal_gate_recovery_stops_after_repeated_citation_refusals() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-recovery-bound-{}",
+        std::process::id() as u64 * 43 + 3
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = || passed_goal("g", "go test ./...");
+    let runtime = Arc::new(MockRuntime::new(vec![
+        bad(),
+        bad(),
+        bad(),
+        bad(),
+        bad(),
+        assistant_text("should not be requested"),
+    ]));
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the bound stops the turn; it does not exhaust the script");
+
+    assert_eq!(outcome.stop_reason, StopReason::Incomplete);
+    assert_ne!(outcome.stop_reason, StopReason::Completed);
+    let detail = outcome.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("verification refused"),
+        "the incomplete reason must name the exhausted recovery: {detail}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "three citation-only rounds are the bound; a fourth must not run"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two refusals are not the end. Citing the command the runtime actually
+/// recorded completes the goal.
+#[tokio::test]
+async fn goal_gate_recovery_accepts_the_recorded_command_after_two_refusals() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-recovery-cite-{}",
+        std::process::id() as u64 * 43 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let recorded = format!("{} --version", env!("CARGO"));
+    let mut events = Vec::new();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": env!("CARGO"), "args": ["--version"]}),
+        ),
+        passed_goal("g1", "echo nope"),
+        passed_goal("g2", "echo nope"),
+        passed_goal("g3", &recorded),
+    ]));
+    let outcome = goal_full_access(&dir, runtime.clone(), 20)
+        .run(
+            "do the task",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a corrected citation completes");
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "citing the recorded command after two refusals must complete: {outcome:?}"
+    );
+    assert_eq!(runtime.recorded_requests().len(), 4);
+    let refusals = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "verification_refused"
+            )
+        })
+        .count();
+    assert_eq!(refusals, 2, "both bad citations are refused: {events:?}");
+    let requests = runtime.recorded_requests();
+    let correction = &requests[2];
+    assert!(
+        correction.messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::ToolResult { result }
+                            if result.is_error && result.content.contains("never ran")
+                    )
+                })
+        }),
+        "the refusal must reach the model as a tool error"
+    );
+    assert!(
+        correction.messages.iter().all(|message| {
+            message.role != Role::User
+                || message.content.iter().all(|part| match part {
+                    ContentPart::Text { text } => !text.contains("never ran"),
+                    _ => true,
+                })
+        }),
+        "the refusal must not be disguised as a user message"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After two citation refusals the model may run the check again and cite
+/// that new command.
+#[tokio::test]
+async fn goal_gate_recovery_accepts_a_rerun_after_two_refusals() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-recovery-rerun-{}",
+        std::process::id() as u64 * 43 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let recorded = format!("{} --version", env!("CARGO"));
+    let rerun = || {
+        assistant_tool_call(
+            "c",
+            "run_command",
+            serde_json::json!({"program": env!("CARGO"), "args": ["--version"]}),
+        )
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![
+        rerun(),
+        passed_goal("g1", "echo nope"),
+        passed_goal("g2", "echo nope"),
+        rerun(),
+        passed_goal("g3", &recorded),
+    ]));
+    let outcome = goal_full_access(&dir, runtime, 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("re-running the check completes");
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "a command run after the refusals must be citable: {outcome:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A passing claim over a command that failed cannot close the goal, including
+/// a later `not_applicable`.
+#[tokio::test]
+async fn goal_gate_recovery_does_not_accept_a_failed_check_as_passed() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-recovery-fail-{}",
+        std::process::id() as u64 * 43 + 9
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("verify.sh"), "exit 1\n").unwrap();
+    let cited = "/bin/sh ./verify.sh";
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "v1",
+            "run_command",
+            serde_json::json!({
+                "program": "/bin/sh",
+                "args": ["./verify.sh"]
+            }),
+        ),
+        passed_goal("g1", cited),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "ignore the failure",
+                "verification": {"status": "not_applicable", "detail": "treat it as done"}
+            }),
+        ),
+        assistant_tool_call(
+            "g3",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "the check fails"}),
+        ),
+    ]));
+    let outcome = goal_full_access(&dir, runtime, 20)
+        .run(
+            "do the task",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a failed check resolves as blocked, not as an error");
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert_ne!(outcome.stop_reason, StopReason::Completed);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A subcommand of a compound shell command is refused. Citing the recorded
+/// script, after a second refusal, completes.
+#[cfg(unix)]
+#[tokio::test]
+async fn goal_gate_recovery_accepts_the_full_shell_command_after_a_subcommand_citation() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-recovery-shell-{}",
+        std::process::id() as u64 * 43 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let recorded = format!("{} --version; echo marker", env!("CARGO"));
+    let subcommand = format!("{} --version", env!("CARGO"));
+    let mut events = Vec::new();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("s1", "shell_command", serde_json::json!({"cmd": recorded})),
+        passed_goal("g1", &subcommand),
+        passed_goal("g2", &subcommand),
+        passed_goal("g3", &recorded),
+    ]));
+    let outcome = goal_full_access(&dir, runtime, 20)
+        .run(
+            "do the task",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("citing the full shell command completes");
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Completed,
+        "the full recorded command must complete after the subcommand refusals: {outcome:?}"
+    );
+    let detail = events.iter().find_map(|event| match event {
+        AgentEvent::GoalIntercepted { kind, detail } if kind == "verification_refused" => {
+            Some(detail.clone())
+        }
+        _ => None,
+    });
+    let detail = detail.expect("the subcommand citation is refused");
+    assert!(
+        detail.contains(&recorded),
+        "the refusal must name the recorded script: {detail}"
+    );
+    assert!(
+        !detail.contains("never ran"),
+        "the script did run: {detail}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The all-refused rule covers `spawn_agent` guard rejections too: a round
 /// whose only spawn call is refused (here an empty task) made no progress,
 /// so repeated rounds must feed the no-progress streak and hard-stop rather

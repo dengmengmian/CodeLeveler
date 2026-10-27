@@ -22,6 +22,10 @@ pub enum TurnPhase {
 /// tick per stalled drive, so `continue_active_goal` cannot re-drive it
 /// forever).
 ///
+/// A goal-verification refusal does not tick this. That refusal is feedback
+/// the model can correct, and the agent bounds those rounds itself. A
+/// requirements refusal and a pre-execution denial still tick it.
+///
 /// This is not a quiet-round rule. A running drive never ticks: any executed
 /// tool, failed or not, counts as progress, and rounds that merely produce
 /// text are untouched. Ending a run because recent rounds looked quiet was
@@ -30,10 +34,11 @@ pub enum TurnPhase {
 /// the absolute round ceiling and budgets remain the hard boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressCaps {
-    /// Consecutive no-progress ticks (a round whose calls were all refused or
-    /// rejected by the goal gate, or a stalled goal drive) before the turn
-    /// stops. Not a calibrated threshold: the inputs are binary, so this only
-    /// answers "how many repeats of a fully blocked round to allow".
+    /// Consecutive no-progress ticks (a round whose calls were all refused
+    /// before they ran, a requirements refusal, or a stalled goal drive)
+    /// before the turn stops. Not a calibrated threshold: the inputs are
+    /// binary, so this only answers "how many repeats of a fully blocked
+    /// round to allow".
     pub no_progress_rounds: u32,
 }
 
