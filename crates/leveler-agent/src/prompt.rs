@@ -104,6 +104,9 @@ pub(crate) struct TurnContext {
     pub(crate) network_scope: NetworkScope,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) project_rules: Vec<ProjectInstruction>,
+    /// Why rule delivery could not honour the host's policy this turn (an
+    /// unreadable `.leveler/config.yaml`). Empty when delivery is intact.
+    pub(crate) rule_diagnostics: Vec<String>,
     /// The language the user is writing in, when we can name it. `None` falls
     /// back to the generic "mirror the user" rule.
     pub(crate) user_language: Option<&'static str>,
@@ -406,19 +409,12 @@ impl TurnContext {
             true,
             format!("\n\n{}", self.operating_rules(network == "allowed")),
         ));
-        if let Some(map) = self.repo_map.as_deref().filter(|m| !m.trim().is_empty()) {
-            segments.push(PromptSegment::control(
-                "repo_map",
-                PromptSource::WorkspaceListing,
-                PromptAuthority::ExternalData,
-                SegmentLifecycle::Turn,
-                false,
-                format!(
-                    "\n\nWorkspace files (bounded listing):\n{}\n",
-                    map.trim_end()
-                ),
-            ));
-        }
+        // Project rules come BEFORE the workspace listing. They are
+        // instructions; the listing is external data. Ordering them the other
+        // way buried the binding sections behind a long, non-instructional
+        // index, which measurably cost rule adherence while changing no
+        // declared authority. Position inside the block is decided by
+        // `plan_rule_delivery`: mandatory sections lead it.
         if !self.project_rules.is_empty() {
             let paths = self
                 .project_rules
@@ -434,6 +430,32 @@ impl TurnContext {
                 format!(
                     "\n\nProject rules:\n{}",
                     render_instructions(&self.project_rules)
+                ),
+            ));
+        }
+        if !self.rule_diagnostics.is_empty() {
+            segments.push(PromptSegment::control(
+                "project_rule_delivery",
+                PromptSource::ProjectRules { paths: Vec::new() },
+                PromptAuthority::RuntimeFact,
+                SegmentLifecycle::Turn,
+                false,
+                format!(
+                    "\n\nProject rule delivery:\n- {}",
+                    self.rule_diagnostics.join("\n- ")
+                ),
+            ));
+        }
+        if let Some(map) = self.repo_map.as_deref().filter(|m| !m.trim().is_empty()) {
+            segments.push(PromptSegment::control(
+                "repo_map",
+                PromptSource::WorkspaceListing,
+                PromptAuthority::ExternalData,
+                SegmentLifecycle::Turn,
+                false,
+                format!(
+                    "\n\nWorkspace files (bounded listing):\n{}\n",
+                    map.trim_end()
                 ),
             ));
         }
@@ -551,6 +573,7 @@ mod tests {
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/w")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级工具库"),
                 repo_map: None,
             })
@@ -583,6 +606,7 @@ mod tests {
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: None,
                 repo_map: None,
             })
@@ -606,6 +630,7 @@ mod tests {
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: None,
                 repo_map: None,
             })
@@ -622,6 +647,7 @@ mod tests {
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/Users/example/project")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: None,
                 repo_map: None,
             })
@@ -641,6 +667,7 @@ mod tests {
                 network_scope: NetworkScope::Internet,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: None,
                 repo_map: None,
             })
@@ -965,6 +992,7 @@ mod tests {
             },
             cwd: Some(std::path::PathBuf::from("/repo")),
             project_rules: Vec::new(),
+            rule_diagnostics: Vec::new(),
             user_language: None,
             repo_map: None,
         }
@@ -1200,6 +1228,7 @@ mod tests {
                     source: "src/AGENTS.md".to_string(),
                     content: "Prefer small modules.".to_string(),
                 }],
+                rule_diagnostics: Vec::new(),
                 user_language: None,
                 repo_map: None,
             })
@@ -1225,6 +1254,7 @@ mod tests {
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级的 Go 工具库"),
                 repo_map: None,
             })
@@ -1249,6 +1279,7 @@ mod tests {
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
+                rule_diagnostics: Vec::new(),
                 user_language: user_language("make this repo production ready"),
                 repo_map: None,
             })
@@ -1439,6 +1470,59 @@ mod tests {
         assert!(a.contains("[pref] Prefer workspace-write"));
         assert!(!a.contains("PermissionProfile")); // body text must not appear
     }
+    /// Position is part of the contract: instructions precede the workspace
+    /// listing, and the listing never separates the model from the rules.
+    #[test]
+    fn project_rules_are_delivered_before_the_workspace_listing() {
+        let mut ctx = context(PermissionProfile::Assisted, true);
+        ctx.project_rules = vec![leveler_context::ProjectInstruction {
+            source: "AGENTS.md".to_string(),
+            content: "## Release marker\nwrite the token".to_string(),
+        }];
+        ctx.repo_map = Some("- src/lib.rs".to_string());
+        let segments = PromptBuilder::new().turn_context(ctx).segments();
+        let names: Vec<&str> = segments.iter().map(|s| s.name.as_str()).collect();
+        let rules = names.iter().position(|n| *n == "project_rules").unwrap();
+        let listing = names.iter().position(|n| *n == "repo_map").unwrap();
+        assert!(
+            rules < listing,
+            "rules must not be buried behind the listing: {names:?}"
+        );
+        assert_eq!(
+            segments[rules].authority,
+            leveler_model::PromptAuthority::ProjectInstruction,
+            "position is not authority: the block keeps its declared class"
+        );
+        assert_eq!(
+            segments[listing].authority,
+            leveler_model::PromptAuthority::ExternalData
+        );
+        // The user still outranks project rules; only the position changed.
+        assert_eq!(
+            leveler_model::PromptAuthority::UserIntent
+                .instruction_outranks(leveler_model::PromptAuthority::ProjectInstruction),
+            Some(true),
+            "position is not authority: the user still outranks project rules"
+        );
+    }
+
+    /// Delivery failures are stated in the prompt instead of being invisible.
+    #[test]
+    fn an_unreadable_rule_policy_is_reported_to_the_model() {
+        let mut ctx = context(PermissionProfile::Assisted, true);
+        ctx.rule_diagnostics = vec!["policy unreadable".to_string()];
+        let segments = PromptBuilder::new().turn_context(ctx).segments();
+        let delivery = segments
+            .iter()
+            .find(|segment| segment.name == "project_rule_delivery")
+            .expect("a delivery diagnostic block");
+        assert!(delivery.text.contains("policy unreadable"));
+        assert_eq!(
+            delivery.authority,
+            leveler_model::PromptAuthority::RuntimeFact,
+            "a delivery fact is not a project instruction"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1498,92 +1582,45 @@ mod prompt_budget {
         assert_eq!(joined, builder.build());
     }
 
-    /// The repo's configured delivery policy, read from the SAME
-    /// `.leveler/config.yaml` the runtime reads, so this measurement cannot
-    /// drift from production.
-    fn repo_rule_delivery_policy(root: &std::path::Path) -> leveler_context::RuleDeliveryPolicy {
-        let Ok(raw) = std::fs::read_to_string(root.join(".leveler/config.yaml")) else {
-            return leveler_context::RuleDeliveryPolicy::default();
-        };
-        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&raw) else {
-            return leveler_context::RuleDeliveryPolicy::default();
-        };
-        let Some(rules) = value.get("rules") else {
-            return leveler_context::RuleDeliveryPolicy::default();
-        };
-        let always = rules
-            .get("always_delivered")
-            .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let budget_bytes = rules
-            .get("budget_bytes")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        leveler_context::RuleDeliveryPolicy {
-            always,
-            budget_bytes,
-        }
-    }
-
-    /// The real repository's root AGENTS.md is far larger than one delivery
-    /// budget. Delivery keeps the selected sections verbatim, says how many
-    /// sections were left out, and points at the retrieval tool. It does not
-    /// repeat every omitted heading.
+    /// The repository's own rules must survive the real delivery policy: the
+    /// mandatory sections it declares arrive first, and nothing it needs is
+    /// silently omitted. Read through the SAME loader and the SAME
+    /// `.leveler/config.yaml` the runtime uses, so this cannot drift from
+    /// production.
     #[test]
-    fn the_real_rules_document_can_be_delivered_and_indexed() {
+    fn the_real_rules_document_is_delivered_under_its_own_policy() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .expect("workspace root")
             .to_path_buf();
-        let path = root.join("AGENTS.md");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return; // a checkout without the repository's own rules
+        let Ok(config) = leveler_project::ProjectConfig::load(&root).ok_or(()) else {
+            return; // a checkout without the repository's own config
         };
-        if content.len() <= leveler_context::MAX_RULE_BYTES {
-            return;
-        }
-        let policy = repo_rule_delivery_policy(&root);
-        let delivery =
-            leveler_context::deliver_sections_with_policy("AGENTS.md", content.trim(), &policy);
+        let policy = leveler_context::RuleDeliveryPolicy {
+            always: config.rules.always_delivered,
+            budget_bytes: config.rules.budget_bytes,
+        };
+        let plan = leveler_context::plan_rule_delivery(&root, &policy);
+        let delivered = plan
+            .documents
+            .iter()
+            .map(|rule| rule.content.as_str())
+            .collect::<String>();
         assert!(
-            !delivery.omitted.is_empty(),
-            "an over-budget document must record that sections were omitted"
+            plan.report.unmatched_mandatory.is_empty(),
+            "always_delivered entry matched no section: {:?}",
+            plan.report.unmatched_mandatory
         );
-        // Section selection is whole-section: no delivered section is a byte cut.
-        for section in &delivery.delivered {
-            assert_eq!(section.bytes, section.content.len());
-        }
-        let rendered = leveler_context::render_instructions_with(
-            &[leveler_context::ProjectInstruction {
-                source: "AGENTS.md".to_string(),
-                content: content.trim().to_string(),
-            }],
-            &policy,
-        );
-        assert!(rendered.contains("were not included"), "{rendered:.400}");
-        assert!(rendered.contains(leveler_context::READ_PROJECT_RULES_TOOL));
         assert!(
-            !rendered.contains(&format!("[{}]", delivery.omitted[0].id)),
-            "omitted section ids are listed by read_project_rules, not inlined"
+            plan.report.undelivered_mandatory.is_empty(),
+            "mandatory rules did not fit the budget: {:?}",
+            plan.report.undelivered_mandatory
         );
-        // Every configured always-on entry must have matched something that was
-        // actually delivered. A typo in `.leveler/config.yaml` otherwise
-        // silently drops an authority-bearing section into the omitted tail.
         for needle in &policy.always {
-            let needle_lower = needle.to_lowercase();
             assert!(
-                delivery.delivered.iter().any(|section| section
-                    .heading
-                    .to_lowercase()
-                    .contains(&needle_lower)
-                    || section.id.to_lowercase().contains(&needle_lower)),
-                "always_delivered entry `{needle}` matched no delivered section"
+                delivered.to_lowercase().contains(&needle.to_lowercase()),
+                "mandatory section `{needle}` was not delivered"
             );
         }
     }

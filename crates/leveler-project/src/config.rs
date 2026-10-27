@@ -153,18 +153,21 @@ impl Default for MemoryConfig {
 /// `rules:` — deterministic delivery policy for project-rule documents.
 ///
 /// Rule documents are authority-bearing, so their DELIVERY is decided by the
-/// runtime, never by a model. This block names which sections must always be
-/// present in full (heading substrings, matched case-insensitively) and the
-/// per-document delivery budget. Everything else stays indexed and retrievable
-/// verbatim through `read_project_rules`, so nothing loses authority.
+/// runtime, never by a model. This block names which sections are MANDATORY
+/// (heading substrings, matched case-insensitively) and the one byte budget
+/// every rule document of a request shares. Anything else is optional and
+/// fills what the budget leaves; anything undelivered is named in the prompt
+/// with its source and section id so `read_project_rules` can return it
+/// verbatim.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct RulesConfig {
-    /// Heading or section-id substrings always delivered first, in document
-    /// order. An empty list means document order only.
+    /// Heading or section-id substrings that are always delivered first, in
+    /// document order. An empty list means no section is mandatory and
+    /// document order fills the budget.
     #[serde(default)]
     pub always_delivered: Vec<String>,
-    /// Per-document delivery budget in bytes. `None` uses the loader's
-    /// built-in default.
+    /// Request-wide delivery budget in bytes (all rule documents together).
+    /// `None` uses the loader's built-in default.
     #[serde(default)]
     pub budget_bytes: Option<usize>,
 }
@@ -198,6 +201,19 @@ pub struct ProjectConfig {
     pub ignore: Vec<String>,
 }
 
+/// The result of reading the rule delivery policy: the policy itself plus why
+/// it could not be read when it could not.
+///
+/// `.leveler/config.yaml` is a whole-project file, so one malformed key
+/// (a `limits:` typo, say) used to make the rule policy vanish in silence. For
+/// a non-authority setting that is fine; for the policy that decides which
+/// project rules are mandatory it is not, so the reason travels with the
+/// value.
+pub struct LoadedRulesPolicy {
+    pub policy: RulesConfig,
+    pub diagnostic: Option<String>,
+}
+
 impl ProjectConfig {
     /// Load `<root>/.leveler/config.yaml`, or `None` if it is absent or invalid
     /// (invalid config is non-fatal — the tool falls back to defaults).
@@ -205,6 +221,29 @@ impl ProjectConfig {
         let path = root.join(".leveler/config.yaml");
         let raw = std::fs::read_to_string(path).ok()?;
         serde_yaml::from_str(&raw).ok()
+    }
+
+    /// The rule delivery policy, with the reason when the file exists but
+    /// cannot be parsed. An absent file is not a diagnostic: a project without
+    /// `.leveler/config.yaml` simply has no mandatory declarations.
+    pub fn load_rules_policy(root: &std::path::Path) -> LoadedRulesPolicy {
+        let path = root.join(".leveler/config.yaml");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return LoadedRulesPolicy {
+                policy: RulesConfig::default(),
+                diagnostic: None,
+            };
+        };
+        match serde_yaml::from_str::<ProjectConfig>(&raw) {
+            Ok(config) => LoadedRulesPolicy {
+                policy: config.rules,
+                diagnostic: None,
+            },
+            Err(error) => LoadedRulesPolicy {
+                policy: RulesConfig::default(),
+                diagnostic: Some(format!(".leveler/config.yaml: {error}")),
+            },
+        }
     }
 }
 

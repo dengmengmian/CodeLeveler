@@ -2,8 +2,6 @@
 
 Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
-Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
-
 ## [Unreleased]
 
 Durable memory becomes a first-class, default-on product surface when the
@@ -20,21 +18,35 @@ display and archive boundaries.
 - A Chat turn can declare an explicitly delegated task with the injected `commit_task` tool. The turn binds to a durable Goal (identity, turn WAL and budget scope) without changing the session's `chat` axis, then uses the existing Goal closeout, verification, cancellation and resume contract. The tool is offered only to top-level authoring Chat turns, never to Plan/read-only surfaces or sub-agents
 - The TUI shows the task badge and goal-mode status while a delegated task runs, keeps a paused task visible, and restores it from the session snapshot on reconnect
 - Agent experience memory: a completed Chat or Goal task that mechanically resolved a failure is extracted into an evidence-bound lesson without the user asking. Verification is derived from the runtime's own facts (a failure and a later success of the same command after the last change); a passing test is never treated as proof of the explanation. Experience is recalled only when relevant, never injected as a standing preference, and cannot replace a user fact without consent. `/memory status` reports verified/unverified/pending experience and the separate experience queue
+- Memory has two independently controllable lanes over the same store and lifecycle: `memory.user_enabled` and `memory.experience_enabled`. Closing one stops its turn admission, extraction, tools, recall and injection without deleting existing data; `memory.enabled` remains the total switch and no permission mode can reopen a closed lane. Experience recall has its own small quota after the user facts, `/memory status` reports both switches, user-only counts and the experience lane's experimental status, and an existing config that never declared `experience_enabled` reads as experience closed
 
 ### Changed
-
+- Full Access removes permission decisions, not tool-surface disclosure. Optional capability packs (skills, delegation, host input, code intelligence, web, browser, authoring, external tools) stay discoverable through the `capability` catalog and enter the request only after an immediate, approval-free enable. The full registry, the core tools and a user-named `$skill` procedure remain reachable, so no capability is lost
 - Reading durable memory no longer reopens the Markdown store per call: the runtime keeps one initialised handle per scope and re-reads current Markdown under a shared lock, so an external or cross-process write is still visible at the next read
 - Orphan cleanup became a lifecycle event. Opening a store or an explicit recovery scans the private state tree once; reads, listings, searches and committed writes no longer scan one directory per historical record
+
+- `memory.experience_enabled` defaults to off. User facts keep their historical on-by-default behaviour, while automatic experience stays closed until the project writes an explicit `true`; an explicit `false` and every stored experience entry are unaffected, and `memory.enabled = false` still closes both lanes
+
+- A stable project fact the user states themselves is admitted by the same lifecycle without a second confirmation step. Conflicts, inferred or model-proposed facts, and content that reaches a destructive operation still wait in `pending/` for a person. The pre-turn notice reports only candidates that will actually wait, so an explicit fact is no longer announced as pending immediately before it is admitted
+
 - `remember` now records model-inference authority with `agent_remember_tool` provenance. Human approval authorizes the write; it does not claim the user said the fact, and the entry can never replace a fact the user wrote directly
 - `memory.enabled = false` removes the memory pack before capability disclosure, so Full Access cannot expose memory tools, guidance, catalog or recall. Automatic interactive candidate extraction also obeys the switch
 - Background extraction tolerates a reasoning model's first-token latency (90 s) instead of converting a healthy call into a retry at 20 s
 - Resume treats `turn.payload.goal_id` as sufficient Goal identity, so an interrupted delegated Chat turn resumes under the Goal profile without changing the session axis
 
 ### Fixed
-
 - Memory recall at 10k records: p95 1.67s → 7.6ms in the shipped single-lane configuration (release, same fixture). The derived index gained a `documents(scope, kind, status, …)` index and an `optimize` after reconcile, and candidate validation is batched and stops as soon as enough candidates survive. The experience lane still costs a second lexical pass (15.8ms at 10k) because FTS5 cannot rank per kind inside one query
+
+- Experience presentation states the strongest claim the evidence supports: `verified` only when a failure and its later pass were both observed, `observed` for a runtime-observed constraint with no resolution, and `inferred` when no mechanical link exists. An observation-only lesson no longer renders or counts as a verified resolution. Extraction rejects task-local wording (`this task`, `step N`), fix locations the task did not change, and `invalid_if` conditions bound to an unmodified status script; an invalidation condition is no longer indexed as positive recall material
 - A goal-verification refusal stays a strict mismatch and comes back as a tool error that names the unmatched citation, the full recorded command, and the correction: cite that command in full, or run the check again. Three consecutive citation-only rounds are the bound; the turn then stops Incomplete with that reason, and it is not a success. A requirements refusal or a pre-execution denial still counts as a no-progress round and stops on that streak. A later round that runs a command resets the verification-recovery count
 - A Goal can no longer complete on a narrower acceptance than the user's request. `commit_task` refuses an acceptance list that drops an explicitly enumerated deliverable; `update_goal(complete)` requires one accounting entry per requirement and checks named artifacts and commands against the execution record. A user-authored continuation waiver removes a requirement and is persisted with the goal, so resume and compaction cannot resurrect or erase scope
+- Project rules reach the model because the host decided they must, not because a model chose to look them up. `.leveler/config.yaml` marks the mandatory sections; they are delivered first, ahead of optional sections, under one byte budget shared by every rule document of the request. Mandatory sections can no longer be displaced by optional prose, an unmatched `always_delivered` entry and an unreadable config are reported instead of silently falling back, and an undelivered or clipped mandatory section is named in the prompt rather than dropped. The optional-omission notice names source, section id and heading and says plainly that those sections are optional, which removed the retrieval round trips the old "still project rules" wording invited
+- Project rules are delivered before the workspace listing instead of after it. The block keeps `ProjectInstruction` authority; only its position changed, so a project file still cannot outrank the user or the core contract
+- A nested `AGENTS.md` is tracked by its current bytes: a changed file replaces its block, a deleted one is removed from the live context, and an unchanged one is not re-sent. Resume re-reads the file through the same loader, and a fold cannot restore a stale copy
+- `read_project_rules` is an optional query over the same loader the prompt uses. It resolves a nested `src/AGENTS.md` on demand (the injected document used to be unreadable here) and refuses anything that is not a rule document, so it cannot promote arbitrary file content into project authority
+- The pre-edit pause is decided per target path: only the call whose own directory needs a rule is refused, the rule is loaded in that round, and a second call in the same round for the same directory is not a new discovery. One pause per path instead of one per call
+- A goal scope that contradicts itself no longer traps the run. A backticked path inside a deletion clause is a removal requirement (it used to be read as "must exist" beside a "must be removed" from the same sentence), the nearest verb decides which one applies, and opposite statements about one path keep the user's last word. A gate that returns the same refusal three times while other work continues now ends the run as incomplete with the gate's own reason instead of looping: the recorded failure was 30 rounds, 661k tokens, then Blocked
+
 - Sensitive-material validation covers title, body, tags and provenance evidence on every write path
 - Forget, supersede and expiry redact credential-shaped content before writing an archive; a non-sensitive record is unchanged
 - CLI, TUI, Web projections, notifications and logs no longer print a historical sensitive title or body; clients receive a redacted marker and the `sensitive` flag
