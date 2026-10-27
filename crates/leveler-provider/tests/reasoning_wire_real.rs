@@ -970,8 +970,9 @@ async fn a_real_route_without_a_replay_channel_gets_no_reasoning_field() {
 ///
 /// * GLM-5.3 with preserved thinking OFF and replay off must send
 ///   `clear_thinking: true` (a real mode change) and no historical reasoning.
-/// * Kimi K2.6 declaring preserved thinking must send `thinking.keep: "all"`
-///   and replay the retained reasoning.
+/// * A Kimi K2.7+ route that declares preserved thinking is refused: the mode
+///   is unconditional there and has no request field, so the resolved contract
+///   still replays without inventing one.
 /// * Kimi K3 / K2.7-code take no `thinking` field at all, and still replay.
 #[tokio::test]
 #[ignore = "spends real model tokens; see the module docs for the command"]

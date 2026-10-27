@@ -73,8 +73,8 @@ pub use protocol::{
 pub use provenance::{RouteIdentity, deployment_identity};
 pub use reasoning_route::{
     PreservedThinkingWire, ReasoningReplayEnforcement, ReasoningRouteConflict,
-    RequiredReasoningReplay, preserved_thinking_wire, required_reasoning_replay,
-    required_reasoning_replay_for,
+    RequiredReasoningReplay, accepts_thinking_field, preserved_thinking_wire,
+    required_reasoning_replay, required_reasoning_replay_for,
 };
 pub use request::{
     ControlContext, ModelRef, ModelRequest, PromptSegment, RequestMetadata, TransportPolicy,

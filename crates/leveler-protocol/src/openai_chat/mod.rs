@@ -82,9 +82,23 @@ impl ProtocolAdapter for OpenAiChatAdapter {
             leveler_model::preserved_thinking_wire(ProtocolKind::OpenAiChat, &context.model_id),
             preserved,
         );
-        let thinking_on = || Thinking {
-            kind: "enabled",
-            clear_thinking: preserved_clear,
+        // A family that defines no `thinking` object (Kimi K2.7 and later,
+        // K3/K3.1) must not receive one. The family table owns that fact, so a
+        // route whose config declares a style that would spell it still sends
+        // the documented call shape instead of a field the endpoint rejects.
+        let thinking_field =
+            leveler_model::accepts_thinking_field(ProtocolKind::OpenAiChat, &context.model_id);
+        let thinking_on = || {
+            thinking_field.then_some(Thinking {
+                kind: "enabled",
+                clear_thinking: preserved_clear,
+            })
+        };
+        let thinking_off = || {
+            thinking_field.then_some(Thinking {
+                kind: "disabled",
+                clear_thinking: None,
+            })
         };
         let (thinking, reasoning_effort) = if request.thinking_disabled {
             // An explicit `off` from the canonical Thinking Level. Only the
@@ -92,13 +106,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
             // say "no thinking", which is why the canonical layer does not
             // offer `off` on them in the first place.
             match context.reasoning.style {
-                ReasoningStyle::ThinkingFlag => (
-                    Some(Thinking {
-                        kind: "disabled",
-                        clear_thinking: None,
-                    }),
-                    None,
-                ),
+                ReasoningStyle::ThinkingFlag => (thinking_off(), None),
                 ReasoningStyle::OpenAiEffort | ReasoningStyle::None => (None, None),
                 ReasoningStyle::AdaptiveThinking | ReasoningStyle::BudgetedThinking { .. } => {
                     return Err(ProtocolError::Encode(
@@ -114,13 +122,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
             // does not avoid the rejection. Keep the ToolChoice contract and
             // disable thinking explicitly for exactly this request; effort is a
             // thinking knob, so it is dropped with it.
-            (
-                Some(Thinking {
-                    kind: "disabled",
-                    clear_thinking: None,
-                }),
-                None,
-            )
+            (thinking_off(), None)
         } else {
             match context.reasoning.style {
                 ReasoningStyle::AdaptiveThinking | ReasoningStyle::BudgetedThinking { .. } => {
@@ -131,7 +133,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 ReasoningStyle::None => (None, None),
                 ReasoningStyle::OpenAiEffort => (None, effort.map(|e| e.as_wire().to_string())),
                 ReasoningStyle::ThinkingFlag => {
-                    (Some(thinking_on()), effort.map(|e| e.as_wire().to_string()))
+                    (thinking_on(), effort.map(|e| e.as_wire().to_string()))
                 }
             }
         };
@@ -666,21 +668,36 @@ mod tests {
     /// load; the encoder still never invents a field).
     #[test]
     fn a_kimi_k27_route_never_sends_a_thinking_field() {
+        // The family defines no `thinking` object: the only accepted form is
+        // the omission, and a route that asks for one anyway (a hand-written
+        // `reasoning_style` the config check rejects) must still not put an
+        // illegal field on the wire.
         for model_id in [
             "kimi-k2.7-code",
             "kimi-k2.7-code-highspeed",
+            "kimi-for-coding",
             "kimi-for-coding-highspeed",
+            "k3",
+            "k3.1-pro",
         ] {
             let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, None);
             context.model_id = model_id.into();
             context.reasoning.preserved_thinking = Some(true);
             let body = encode_with(&context);
-            assert_eq!(body["thinking"]["type"], "enabled", "{model_id}: {body}");
-            assert!(
-                body["thinking"].get("clear_thinking").is_none(),
-                "{model_id}: {body}"
+            assert!(body.get("thinking").is_none(), "{model_id}: {body}");
+
+            // The same holds for the one request shape that asks for thinking
+            // off: no `disabled` object either.
+            let mut request = ModelRequest::new(
+                ModelRef::new("kimi", model_id),
+                vec![Message::text(Role::User, "hi")],
             );
-            assert!(body["thinking"].get("keep").is_none(), "{model_id}: {body}");
+            request.thinking_disabled = true;
+            let body = OpenAiChatAdapter::new()
+                .encode_request(&request, &context, true)
+                .unwrap()
+                .body;
+            assert!(body.get("thinking").is_none(), "{model_id}: {body}");
         }
 
         // The shipped K2.7 route declares no reasoning style at all: the
@@ -705,7 +722,13 @@ mod tests {
             context.model_id = model_id.into();
             context.reasoning.preserved_thinking = Some(true);
             let body = encode_with(&context);
-            assert_eq!(body["thinking"]["type"], "enabled", "{model_id}");
+            if model_id == "deepseek-chat" {
+                assert_eq!(body["thinking"]["type"], "enabled", "{model_id}");
+            } else {
+                // These families define no `thinking` object at all, so there is
+                // nothing to spell the mode in.
+                assert!(body.get("thinking").is_none(), "{model_id}: {body}");
+            }
             assert!(
                 body["thinking"].get("clear_thinking").is_none(),
                 "{model_id}: {body}"

@@ -477,6 +477,42 @@ fn the_legacy_alias_still_parses_but_cannot_weaken_a_hard_requirement() {
 }
 
 #[test]
+fn a_kimi_route_that_spells_a_thinking_object_is_refused() {
+    // The K2.7+/K3 families define no `thinking` request object: K2.7 Code is
+    // always thinking and takes no parameter for it, K3/K3.1 address reasoning
+    // with a top-level `reasoning_effort`. A `thinking_flag` declaration would
+    // put an illegal field on the wire (or be silently dropped), so it is a
+    // diagnosed contradiction instead.
+    for wire in [
+        "k2.7-code",
+        "kimi-k2.7-code",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+        "k3",
+        "k3.1-pro",
+    ] {
+        let mut p = profile(wire, ProtocolKind::OpenAiChat, true);
+        p.reasoning.style = leveler_model::ReasoningStyle::ThinkingFlag;
+        p.reasoning.supported_efforts = vec![leveler_model::ReasoningEffort::High];
+        let conflict = ReasoningReplayContract::check_route(&p)
+            .expect_err("a family without a thinking field cannot declare one");
+        assert!(
+            conflict.to_string().contains("thinking"),
+            "{wire}: {conflict}"
+        );
+
+        // The documented styles stay legal: effort on K3/K3.1 and K2.8, and no
+        // style at all on K2.7 Code.
+        p.reasoning.style = leveler_model::ReasoningStyle::OpenAiEffort;
+        ReasoningReplayContract::check_route(&p).expect("effort-addressed routes are legal");
+        p.reasoning.style = leveler_model::ReasoningStyle::None;
+        p.reasoning.supported_efforts.clear();
+        p.reasoning.default_effort = None;
+        ReasoningReplayContract::check_route(&p).expect("K2.7 Code takes no effort knob");
+    }
+}
+
+#[test]
 fn a_protocol_without_a_reasoning_content_field_is_not_widened_by_a_model_family() {
     // The Messages protocol has its own authenticated-block channel; the
     // families here describe the OpenAI-Chat `reasoning_content` field only.

@@ -52,7 +52,7 @@
 //! ([`PreservedThinkingWire`]) — GLM says `clear_thinking`, and a family with
 //! no such field must not receive another endpoint's spelling.
 
-use crate::profile::{ModelProfile, ProtocolKind};
+use crate::profile::{ModelProfile, ProtocolKind, ReasoningStyle};
 use crate::projection::{
     MissingReasoningReplay, ReasoningIntegrity, ReasoningReplayContract, ReasoningReplayScope,
     ReasoningRepresentation,
@@ -336,6 +336,36 @@ pub fn preserved_thinking_wire(protocol: ProtocolKind, model_id: &str) -> Preser
     }
 }
 
+impl WireReasoningFamily {
+    /// Whether this family's request shape has a `thinking` object at all.
+    ///
+    /// DeepSeek and GLM spell thinking (and GLM preservation) with it. Kimi
+    /// K2.7 and later and K3/K3.1 have none: K2.7 Code is always thinking and
+    /// takes no parameter for it, and K3/K3.1 address reasoning with a
+    /// top-level `reasoning_effort`. An optional field that the endpoint
+    /// validates as `{type: "enabled", keep: "all"}` or nothing is not a
+    /// knob, and sending `{type: "enabled"}` is a request the vendor says not
+    /// to make.
+    const fn takes_thinking_field(self) -> bool {
+        match self {
+            Self::DeepSeek | Self::Glm => true,
+            Self::KimiK3 | Self::KimiK27 => false,
+        }
+    }
+}
+
+/// Whether a route's wire defines a `thinking` request object.
+///
+/// The encoder asks this before emitting one, so a route whose family has no
+/// such field cannot receive another family's spelling even when its config
+/// declares a style that would.
+pub fn accepts_thinking_field(protocol: ProtocolKind, model_id: &str) -> bool {
+    if protocol != ProtocolKind::OpenAiChat {
+        return true;
+    }
+    wire_family(model_id).is_none_or(|family| family.takes_thinking_field())
+}
+
 fn replay_rank(scope: ReasoningReplayScope) -> u8 {
     match scope {
         ReasoningReplayScope::Never => 0,
@@ -402,6 +432,24 @@ impl ReasoningReplayContract {
     /// The message names the model, the field and the provider outcome so a
     /// configuration mistake is diagnosable without a live 400.
     pub fn check_route(profile: &ModelProfile) -> Result<(), ReasoningRouteConflict> {
+        if !accepts_thinking_field(profile.protocol, &profile.model_id)
+            && matches!(profile.reasoning.style, ReasoningStyle::ThinkingFlag)
+        {
+            // The family defines no `thinking` object. A declaration that
+            // spells one would either be an illegal request or be silently
+            // dropped by the encoder; neither is what the config asked for, so
+            // the contradiction is reported instead of absorbed.
+            return Err(ReasoningRouteConflict {
+                model_id: profile.model_id.clone(),
+                detail: "this wire family takes no `thinking` request field — its thinking \
+                         (and, on K2.7 and later, its preservation) is unconditional, and \
+                         K3/K3.1 address reasoning with a top-level `reasoning_effort`; \
+                         `reasoning_style = thinking_flag` cannot be honoured here, so use \
+                         `open_ai_effort` (or omit the style when the route has no effort knob)"
+                    .into(),
+            });
+        }
+
         let preserved = profile.reasoning.preserved_thinking;
         if preserved.is_some()
             && preserved_thinking_wire(profile.protocol, &profile.model_id)
