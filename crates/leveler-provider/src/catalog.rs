@@ -356,13 +356,17 @@ limits:
             // blocks to be preserved and returned with the tool results, and
             // the Coding Plan endpoint has preserved thinking on by default.
             // The contract is resolved from GLM's OWN facts — not inherited
-            // from DeepSeek — and this is the GLM regression gate: the scope
-            // is tool-bearing requests only, and GLM's empty turn omits the
-            // key (no measured requirement, unlike DeepSeek).
+            // from DeepSeek — and this is the GLM regression gate: the bundled
+            // route declares preserved thinking, so every request owes the
+            // retained chain back, not just a tool-bearing one, and GLM's empty
+            // turn omits the key (no measured requirement, unlike DeepSeek).
             let replay = leveler_model::ReasoningReplayContract::for_route(&profile);
-            assert_eq!(replay.arm_name(), "when_tools", "{file}");
+            assert_eq!(replay.arm_name(), "always", "{file}");
             assert!(replay.replays_captured(true), "{file}");
-            assert!(!replay.replays_captured(false), "{file}");
+            assert!(
+                replay.replays_captured(false),
+                "{file}: preserved thinking is not a tool-loop detail"
+            );
             assert_eq!(replay.missing, leveler_model::MissingReasoningReplay::Omit);
         }
     }
@@ -406,11 +410,74 @@ limits:
                 resolved.replays_captured(true),
                 "{model}: a tool-bearing request replays"
             );
-            assert!(
-                !resolved.replays_captured(false),
-                "{model}: a tool-free request keeps the legacy wire"
+            // Whether a tool-free request replays is the SCOPE's answer, not a
+            // separate decision: `always` (GLM's declared preserved mode) does,
+            // DeepSeek's tools-keyed rule does not.
+            assert_eq!(
+                resolved.replays_captured(false),
+                family.scope == leveler_model::ReasoningReplayScope::Always,
+                "{model}: a tool-free request follows the resolved scope"
             );
         }
+    }
+
+    /// The Kimi catalog is K2.7-and-later only. Every shipped Kimi route must
+    /// resolve the unconditional-preservation rule, declare no
+    /// preserved-thinking field (none exists for these models), and never
+    /// declare a thinking-flag style that would send a `thinking` object its
+    /// endpoint does not take.
+    #[test]
+    fn bundled_kimi_profiles_follow_the_k27_and_k3_protocol() {
+        use leveler_model::{MissingReasoningReplay, ReasoningReplayScope, ReasoningStyle};
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/models");
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                continue;
+            }
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            let profile = load_model_config(&path).unwrap().profile;
+            if profile.provider != "kimi" {
+                continue;
+            }
+            seen += 1;
+            leveler_model::ReasoningReplayContract::check_route(&profile)
+                .unwrap_or_else(|conflict| panic!("{file}: {conflict}"));
+            let replay = leveler_model::ReasoningReplayContract::for_route(&profile);
+            assert_eq!(
+                replay.scope,
+                ReasoningReplayScope::Always,
+                "{file}: thinking and preservation are unconditional"
+            );
+            assert_eq!(
+                replay.missing,
+                MissingReasoningReplay::EmptyString,
+                "{file}"
+            );
+            assert!(replay.replays_captured(false), "{file}");
+            assert_eq!(
+                profile.reasoning.preserved_thinking, None,
+                "{file}: this family has no request field for the mode"
+            );
+            assert_eq!(
+                leveler_model::preserved_thinking_wire(profile.protocol, &profile.model_id),
+                leveler_model::PreservedThinkingWire::None,
+                "{file}"
+            );
+            assert_ne!(
+                profile.reasoning.style,
+                ReasoningStyle::ThinkingFlag,
+                "{file}: a thinking flag would send a field this endpoint does not take"
+            );
+        }
+        // k3, k3-256k, k3.1-pro, k3.1-pro-highspeed, kimi-for-coding,
+        // kimi-for-coding-highspeed.
+        assert!(
+            seen >= 6,
+            "the Kimi catalog must ship the K2.7+/K2.8/K3/K3.1 routes (saw {seen})"
+        );
     }
 
     #[test]

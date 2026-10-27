@@ -69,22 +69,22 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         // fall back to the profile or remap levels.
         let effort = request.reasoning_effort;
         // Preserved thinking is a route declaration, not a preference: the
-        // endpoint's own default may clear prior thinking or keep it, and every
-        // family that has the mode spells it with its own word (GLM:
-        // `clear_thinking: false`, Kimi K2.x: `keep: "all"`). The spelling is a
-        // wire-family fact resolved in one table, so this adapter never sends
-        // another endpoint's field. `None` sends no field at all, which is how
-        // every route that never declared the mode stays byte-identical to what
-        // it sent before.
+        // endpoint's own default may clear prior thinking or keep it, and the
+        // one family with a request field for it spells it with its own word
+        // (GLM: `clear_thinking: false`). The spelling is a wire-family fact
+        // resolved in one table, so this adapter never sends another endpoint's
+        // field. `None` sends no field at all, which is how every route that
+        // never declared the mode — and every Kimi K2.7+/K3 route, whose
+        // preservation is unconditional — stays byte-identical to what it sent
+        // before.
         let preserved = context.reasoning.preserved_thinking;
-        let (preserved_clear, preserved_keep) = preserved_thinking_fields(
+        let preserved_clear = preserved_thinking_fields(
             leveler_model::preserved_thinking_wire(ProtocolKind::OpenAiChat, &context.model_id),
             preserved,
         );
         let thinking_on = || Thinking {
             kind: "enabled",
             clear_thinking: preserved_clear,
-            keep: preserved_keep,
         };
         let (thinking, reasoning_effort) = if request.thinking_disabled {
             // An explicit `off` from the canonical Thinking Level. Only the
@@ -96,7 +96,6 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                     Some(Thinking {
                         kind: "disabled",
                         clear_thinking: None,
-                        keep: None,
                     }),
                     None,
                 ),
@@ -119,7 +118,6 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 Some(Thinking {
                     kind: "disabled",
                     clear_thinking: None,
-                    keep: None,
                 }),
                 None,
             )
@@ -361,16 +359,17 @@ impl ProtocolAdapter for OpenAiChatAdapter {
 ///
 /// The fact ("keep this route's earlier thinking") is the route's; the spelling
 /// is the wire family's. A family with no such field gets none — sending
-/// another endpoint's field would be a request the family never defined.
+/// another endpoint's field would be a request the family never defined, and
+/// Kimi K2.7+/K3 preserve thinking unconditionally, so they need no request to
+/// ask for it.
 fn preserved_thinking_fields(
     wire: leveler_model::PreservedThinkingWire,
     preserved: Option<bool>,
-) -> (Option<bool>, Option<&'static str>) {
+) -> Option<bool> {
     use leveler_model::PreservedThinkingWire;
     match (wire, preserved) {
-        (PreservedThinkingWire::ClearThinking, Some(preserved)) => (Some(!preserved), None),
-        (PreservedThinkingWire::KeepAll, Some(true)) => (None, Some("all")),
-        _ => (None, None),
+        (PreservedThinkingWire::ClearThinking, Some(preserved)) => Some(!preserved),
+        _ => None,
     }
 }
 
@@ -660,25 +659,38 @@ mod tests {
         assert_eq!(body["thinking"]["clear_thinking"], true);
     }
 
-    /// Kimi's K2.x line spells the same route fact as `thinking.keep: "all"`.
-    /// Sending GLM's `clear_thinking` there would be a field the endpoint never
-    /// defined, and omitting `keep` would leave the client claiming a mode the
-    /// request never asks for.
+    /// Kimi K2.7 Code and later take no `thinking` parameter at all: thinking
+    /// and preservation are unconditional, and the vendor says not to pass the
+    /// field. Neither a `keep` nor GLM's `clear_thinking` may appear, even when
+    /// a route declared the preserved mode (that declaration is refused at
+    /// load; the encoder still never invents a field).
     #[test]
-    fn a_kimi_k2_route_asks_for_preserved_thinking_as_keep_all() {
-        let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
-        context.model_id = "kimi-k2.6".into();
-        context.reasoning.preserved_thinking = Some(true);
-        let body = encode_with(&context);
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["keep"], "all");
-        assert!(body["thinking"].get("clear_thinking").is_none(), "{body}");
+    fn a_kimi_k27_route_never_sends_a_thinking_field() {
+        for model_id in [
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-for-coding-highspeed",
+        ] {
+            let mut context = ctx_reasoning(ReasoningStyle::ThinkingFlag, None);
+            context.model_id = model_id.into();
+            context.reasoning.preserved_thinking = Some(true);
+            let body = encode_with(&context);
+            assert_eq!(body["thinking"]["type"], "enabled", "{model_id}: {body}");
+            assert!(
+                body["thinking"].get("clear_thinking").is_none(),
+                "{model_id}: {body}"
+            );
+            assert!(body["thinking"].get("keep").is_none(), "{model_id}: {body}");
+        }
 
-        // Turning it off is the endpoint's own default (`keep: null`), not a
-        // field with an opinion. The request stops asking for preservation.
-        context.reasoning.preserved_thinking = Some(false);
+        // The shipped K2.7 route declares no reasoning style at all: the
+        // request carries neither a `thinking` object nor an effort, which is
+        // exactly the documented call shape.
+        let mut context = ctx_reasoning(ReasoningStyle::None, Some(ReasoningEffort::High));
+        context.model_id = "kimi-for-coding-highspeed".into();
         let body = encode_with(&context);
-        assert!(body["thinking"].get("keep").is_none(), "{body}");
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
     /// A family with no preserved-thinking field never receives another
@@ -687,7 +699,7 @@ mod tests {
     /// invent a field for an unconfigured caller.
     #[test]
     fn a_family_without_a_preserved_mode_never_gets_another_endpoints_field() {
-        for model_id in ["deepseek-chat", "k3"] {
+        for model_id in ["deepseek-chat", "k3", "k3.1-pro", "kimi-for-coding"] {
             let mut context =
                 ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::High));
             context.model_id = model_id.into();
@@ -698,7 +710,6 @@ mod tests {
                 body["thinking"].get("clear_thinking").is_none(),
                 "{model_id}: {body}"
             );
-            assert!(body["thinking"].get("keep").is_none(), "{model_id}: {body}");
         }
     }
 
@@ -973,7 +984,17 @@ mod tests {
         history: Vec<Message>,
         with_tools: bool,
     ) -> serde_json::Value {
+        encode_history_with_mode(context, history, with_tools, false)
+    }
+
+    fn encode_history_with_mode(
+        context: &ProtocolContext,
+        history: Vec<Message>,
+        with_tools: bool,
+        thinking_disabled: bool,
+    ) -> serde_json::Value {
         let mut req = ModelRequest::new(ModelRef::new("gateway", "wire-model"), history);
+        req.thinking_disabled = thinking_disabled;
         if with_tools {
             req.tools = vec![ToolDefinition {
                 name: "read_file".into(),
@@ -1130,6 +1151,72 @@ mod tests {
         assert!(
             body["messages"][1].get("reasoning_content").is_none(),
             "a tool-free request does not need the field"
+        );
+    }
+
+    /// Thinking On → Off → On across one transcript.
+    ///
+    /// DeepSeek states its replay requirement in terms of the request shape, not
+    /// the current mode: "If the request carries the `tools` parameter: the
+    /// `reasoning_content` of all previous turns should be passed back". So the
+    /// off request keeps the history it is given and simply stops generating
+    /// reasoning of its own; it does not retroactively delete a fact from the
+    /// context, and switching back on replays the same bytes.
+    #[test]
+    fn thinking_off_and_on_keep_the_documented_replay_semantics() {
+        let profile = lab_profile("deepseek-flash");
+        let context = ProtocolContext {
+            model_id: "deepseek-flash".into(),
+            reasoning: profile.reasoning.clone(),
+            reasoning_replay: leveler_model::ReasoningReplayContract::for_route(&profile),
+            ..ctx()
+        };
+        let history = vec![
+            Message::text(Role::User, "go"),
+            assistant_with(Some("first thought"), "", Some("call_1")),
+            tool_result_for("call_1"),
+            assistant_with(Some("second thought"), "done", None),
+        ];
+
+        // On: the documented tool-bearing shape.
+        let on = encode_history(&context, history.clone(), true);
+        assert_eq!(on["thinking"]["type"], "enabled");
+        assert_eq!(on["messages"][1]["reasoning_content"], "first thought");
+        assert_eq!(on["messages"][3]["reasoning_content"], "second thought");
+
+        // Off: the mode applies to this request only. The tool-bearing request
+        // still owes the documented replay, and no reasoning/effort field is
+        // invented alongside the explicit disable.
+        let off = encode_history_with_mode(&context, history.clone(), true, true);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(off.get("reasoning_effort").is_none(), "{off}");
+        assert_eq!(off["messages"][1]["reasoning_content"], "first thought");
+        assert_eq!(off["messages"][3]["reasoning_content"], "second thought");
+
+        // A tool-free off request is not the shape the requirement covers.
+        let off_no_tools = encode_history_with_mode(&context, history.clone(), false, true);
+        assert_eq!(off_no_tools["thinking"]["type"], "disabled");
+        assert!(
+            off_no_tools["messages"][1]
+                .get("reasoning_content")
+                .is_none(),
+            "{off_no_tools}"
+        );
+        assert!(
+            off_no_tools["messages"][3]
+                .get("reasoning_content")
+                .is_none(),
+            "{off_no_tools}"
+        );
+
+        // Back on: the same bytes come back, so the provider sees its own chain
+        // again rather than a truncated record.
+        let back_on = encode_history(&context, history, true);
+        assert_eq!(back_on["thinking"]["type"], "enabled");
+        assert_eq!(back_on["messages"][1]["reasoning_content"], "first thought");
+        assert_eq!(
+            back_on["messages"][3]["reasoning_content"],
+            "second thought"
         );
     }
 

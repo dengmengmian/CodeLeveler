@@ -1,6 +1,13 @@
 # Kimi K2.7 Code HighSpeed — same coding ability, ~5–6× output speed (3× quota).
 # Model id: kimi-for-coding-highspeed. Allegretto+ membership required.
 # Docs: https://www.kimi.com/code/docs/kimi-code/models (read 2026-09-17)
+#
+# Protocol (https://platform.kimi.ai/docs/guide/use-thinking-models,
+# https://platform.kimi.ai/docs/api/models-overview): thinking is always on and
+# cannot be disabled; the model does not take `reasoning_effort`, and the vendor
+# says not to send the K2.x `thinking` parameter at all (omission is treated as
+# "enabled + keep all"). Preservation is unconditional, so every historical
+# assistant message's `reasoning_content` is replayed on every request.
 id: kimi-for-coding-highspeed
 provider: kimi
 model_id: kimi-for-coding-highspeed

@@ -3,6 +3,8 @@
 # Cheaper than the 1M id: k3 (1M) consumes about twice as much.
 # Moderato and above may call it; 1M context is what needs Allegretto, and this
 # id does not ask for it.
+# Thinking is always on and takes no `thinking` field; preservation is
+# unconditional (the same protocol as `k3`).
 id: k3-256k
 provider: kimi
 model_id: k3-256k

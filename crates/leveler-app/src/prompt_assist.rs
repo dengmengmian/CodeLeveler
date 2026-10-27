@@ -147,12 +147,11 @@ fn assist_request(
     request.max_output_tokens = Some(max_output_tokens);
     request.temperature = Some(0.2);
     request.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
-    request.thinking_disabled = matches!(
-        style,
-        leveler_model::ReasoningStyle::None
-            | leveler_model::ReasoningStyle::OpenAiEffort
-            | leveler_model::ReasoningStyle::ThinkingFlag
-    );
+    // Only the thinking-flag style has a word for "off". The effort styles
+    // (Kimi K3/K3.1, K2.8) are told how much to think, not whether to: asking
+    // them to disable would drop the effort with it and silently run the
+    // provider's own default, so they keep the explicit `low` above instead.
+    request.thinking_disabled = matches!(style, leveler_model::ReasoningStyle::ThinkingFlag);
     request
 }
 
@@ -269,6 +268,35 @@ mod tests {
             leveler_model::ReasoningStyle::AdaptiveThinking,
         );
         assert!(!request.thinking_disabled);
+    }
+
+    /// A route whose thinking is addressed by `reasoning_effort` (Kimi K3/K3.1,
+    /// K2.8) has no word for "off". The assist request must keep its explicit
+    /// low effort instead: asking to disable thinking there drops the effort
+    /// too, so the encoder would send neither field and the provider would run
+    /// its own default — the maximum — on a budget sized for a short thought.
+    #[test]
+    fn an_effort_route_keeps_its_low_effort_instead_of_asking_for_off() {
+        for style in [
+            leveler_model::ReasoningStyle::OpenAiEffort,
+            leveler_model::ReasoningStyle::None,
+        ] {
+            let request = assist_request(
+                ModelRef::parse("kimi/k3.1-pro").expect("model ref"),
+                AssistKind::PromptSuggestion,
+                "context",
+                style,
+            );
+            assert!(
+                !request.thinking_disabled,
+                "{style:?}: this style has no `off` word, so it must keep its effort"
+            );
+            assert_eq!(
+                request.reasoning_effort,
+                Some(leveler_model::ReasoningEffort::Low),
+                "{style:?}"
+            );
+        }
     }
 
     #[test]

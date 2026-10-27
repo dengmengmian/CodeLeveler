@@ -94,21 +94,153 @@ fn a_replay_accepting_family_also_declares_its_requirement() {
             "{wire_id}"
         );
     }
-    // Kimi's K2.x line validates the key's presence on a replayed tool-call
-    // turn, so a turn that captured none carries the legal empty value instead
-    // of omitting a key the endpoint checks.
-    for wire_id in ["kimi-k2.6", "kimi-k2.7-code"] {
+    // Kimi K2.7 and later always think and always preserve thinking, so every
+    // historical assistant message's reasoning comes back — on a tool loop and
+    // on an ordinary multi-turn conversation alike. The key's presence is the
+    // conservative spelling: a turn that captured none carries the legal empty
+    // value instead of omitting a key the K2.x line validates.
+    for wire_id in [
+        "kimi-k2.7-code",
+        "kimi-k2.7-code-highspeed",
+        "kimi-k2.8-preview",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+        "k3",
+        "k3-256k",
+        "k3.1-pro",
+        "k3.1-pro-highspeed",
+        "kimi-k3.1-pro",
+    ] {
         let contract =
             ReasoningReplayContract::for_route(&profile(wire_id, ProtocolKind::OpenAiChat, true));
         assert_eq!(
             contract,
             ReasoningReplayContract::raw_field(
-                ReasoningReplayScope::WhenToolsPresent,
+                ReasoningReplayScope::Always,
                 MissingReasoningReplay::EmptyString,
             ),
             "{wire_id}"
         );
     }
+}
+
+#[test]
+fn a_preserved_thinking_route_replays_a_tool_free_turn() {
+    // Preserved thinking is the mode, not a tool-loop detail: the endpoint is
+    // asked to keep every earlier turn's reasoning, so a request that carries
+    // no tools still owes it back. GLM documents this as the condition of
+    // `clear_thinking: false` without a tools caveat.
+    let mut preserved = profile("glm-5.3", ProtocolKind::OpenAiChat, true);
+    preserved.reasoning.style = leveler_model::ReasoningStyle::ThinkingFlag;
+    preserved.reasoning.preserved_thinking = Some(true);
+    let contract = ReasoningReplayContract::for_route(&preserved);
+    assert_eq!(
+        contract,
+        ReasoningReplayContract::raw_field(
+            ReasoningReplayScope::Always,
+            MissingReasoningReplay::Omit,
+        )
+    );
+    assert!(contract.replays_captured(false), "a tool-free turn replays");
+    assert!(contract.requires_exact_retained_reasoning(false));
+
+    // A weaker declaration contradicts the mode: the endpoint is told to keep
+    // a chain the client would not return on every request.
+    let mut weaker = preserved.clone();
+    weaker.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::WhenToolsPresent);
+    let conflict = ReasoningReplayContract::check_route(&weaker)
+        .expect_err("preserved thinking with a tool-only scope is illegal");
+    assert!(
+        conflict.to_string().contains("preserved_thinking"),
+        "{conflict}"
+    );
+}
+
+#[test]
+fn the_resolved_scope_decides_what_a_tool_free_request_carries() {
+    // The scope is the contract's own answer; the projection must not decide
+    // it again. A preserved-thinking route owes its chain back on a request
+    // that exposes no tools, and the same history on a route that only replays
+    // inside a tool loop must not carry it.
+    use leveler_model::{
+        ContentPart, Message, ReasoningRetention, ReasoningStyle, RequestProjection, Role,
+        RouteIdentity,
+    };
+
+    let route = RouteIdentity {
+        provider: "gateway".into(),
+        model: "glm-5.3".into(),
+        api: Some(ProtocolKind::OpenAiChat),
+        deployment: None,
+    };
+    let handled = Message::from_parts(
+        Role::Assistant,
+        vec![
+            ContentPart::Reasoning {
+                text: "kept chain".into(),
+            },
+            ContentPart::Text {
+                text: "answer".into(),
+            },
+        ],
+        None,
+    )
+    .with_route(route.clone());
+    let history = vec![
+        Message::user_input("go"),
+        handled,
+        Message::text(Role::User, "continue"),
+    ];
+
+    let mut preserved = profile("glm-5.3", ProtocolKind::OpenAiChat, true);
+    preserved.reasoning.style = ReasoningStyle::ThinkingFlag;
+    preserved.reasoning.preserved_thinking = Some(true);
+    let projection = RequestProjection::project_for_route(
+        &history,
+        &[],
+        ReasoningReplayContract::for_route(&preserved),
+        ReasoningRetention::All,
+        Some(&route),
+    );
+    assert_eq!(
+        projection.messages()[1].reasoning.as_wire(),
+        Some("kept chain"),
+        "preserved thinking owes the chain back without tools"
+    );
+
+    let mut tool_loop_only = profile("glm-5.3", ProtocolKind::OpenAiChat, true);
+    tool_loop_only.reasoning.style = ReasoningStyle::ThinkingFlag;
+    let projection = RequestProjection::project_for_route(
+        &history,
+        &[],
+        ReasoningReplayContract::for_route(&tool_loop_only),
+        ReasoningRetention::All,
+        Some(&route),
+    );
+    assert_eq!(
+        projection.messages()[1].reasoning.as_wire(),
+        None,
+        "a tool-only requirement leaves a tool-free request unchanged"
+    );
+}
+
+#[test]
+fn an_unlisted_below_k27_kimi_id_keeps_the_conservative_default() {
+    // The product supports Kimi K2.7 and later only. An id that is not a
+    // documented K2.7+/K3 model must not inherit their rule by string
+    // similarity: it keeps the conservative `never` default, and a config that
+    // wants replay declares its own scope.
+    for wire_id in ["kimi-k2.6", "kimi-k2.5", "kimi-k2-0905-preview"] {
+        let contract =
+            ReasoningReplayContract::for_route(&profile(wire_id, ProtocolKind::OpenAiChat, true));
+        assert_eq!(contract, ReasoningReplayContract::NONE, "{wire_id}");
+    }
+    let mut legacy = profile("kimi-k2.6", ProtocolKind::OpenAiChat, true);
+    legacy.reasoning.preserved_thinking = Some(true);
+    assert!(
+        ReasoningReplayContract::check_route(&legacy).is_err(),
+        "the unsupported id has no verified preserved-thinking field"
+    );
 }
 
 #[test]
@@ -243,7 +375,7 @@ fn a_preserved_thinking_route_may_not_stop_replaying() {
     assert_eq!(
         ReasoningReplayContract::for_route(&preserved),
         ReasoningReplayContract::raw_field(
-            ReasoningReplayScope::WhenToolsPresent,
+            ReasoningReplayScope::Always,
             MissingReasoningReplay::Omit,
         )
     );
@@ -260,7 +392,7 @@ fn a_preserved_thinking_route_may_not_stop_replaying() {
     // contract still replays.
     assert_eq!(
         ReasoningReplayContract::for_route(&stop).scope,
-        ReasoningReplayScope::WhenToolsPresent
+        ReasoningReplayScope::Always
     );
 }
 
@@ -283,11 +415,20 @@ fn a_deployment_that_turned_preserved_thinking_off_may_stop_replaying() {
 #[test]
 fn the_preserved_mode_is_a_family_fact_not_a_universal_one() {
     // A preserved-thinking declaration only means something where the wire has
-    // a word for it: GLM spells it `clear_thinking`, Kimi's K2.x line spells it
-    // `thinking.keep`. DeepSeek and K3 have no such field at all, so accepting
-    // the declaration there would send another endpoint's field (or silently do
-    // nothing).
-    for wire in ["deepseek-flash", "k3", "k3.1-pro"] {
+    // a field for it, and today only GLM spells the mode (`clear_thinking`).
+    // DeepSeek has no such field; Kimi K2.7 and later and K3/K3.1 preserve
+    // thinking unconditionally and take no `thinking` parameter at all, so a
+    // declaration there would either send another endpoint's field or do
+    // nothing — both are silent lies about the request.
+    for wire in [
+        "deepseek-flash",
+        "k3",
+        "k3.1-pro",
+        "kimi-k2.7-code",
+        "kimi-k2.8-preview",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+    ] {
         let mut p = profile(wire, ProtocolKind::OpenAiChat, true);
         p.reasoning.preserved_thinking = Some(true);
         assert!(
@@ -296,20 +437,14 @@ fn the_preserved_mode_is_a_family_fact_not_a_universal_one() {
         );
     }
 
-    let mut k26 = profile("kimi-k2.6", ProtocolKind::OpenAiChat, true);
-    k26.reasoning.style = leveler_model::ReasoningStyle::ThinkingFlag;
-    k26.reasoning.preserved_thinking = Some(true);
-    ReasoningReplayContract::check_route(&k26)
-        .expect("kimi-k2.6 enables preserved thinking via keep");
-    // Asking the endpoint to preserve history also binds the replay of that
-    // history: the model is told to keep it, so the client must supply it.
-    assert_eq!(
-        ReasoningReplayContract::for_route(&k26).scope,
-        ReasoningReplayScope::WhenToolsPresent
-    );
-    let mut k26_stop = k26.clone();
-    k26_stop.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::Never);
-    assert!(ReasoningReplayContract::check_route(&k26_stop).is_err());
+    // GLM is the one family that spells the mode, in both directions.
+    let mut glm = profile("glm-5.3", ProtocolKind::OpenAiChat, true);
+    glm.reasoning.style = leveler_model::ReasoningStyle::ThinkingFlag;
+    glm.reasoning.preserved_thinking = Some(true);
+    ReasoningReplayContract::check_route(&glm).expect("GLM honours clear_thinking");
+    let mut glm_stop = glm.clone();
+    glm_stop.compatibility.reasoning_replay_scope = Some(ReasoningReplayScope::Never);
+    assert!(ReasoningReplayContract::check_route(&glm_stop).is_err());
 }
 
 #[test]

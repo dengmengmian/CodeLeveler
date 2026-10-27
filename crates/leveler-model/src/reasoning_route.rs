@@ -27,27 +27,30 @@
 //! 3. The compatibility default (`never`, omit an empty key).
 //!
 //! A family entry declares how strongly its rule binds. A
-//! [`ReasoningReplayEnforcement::Required`] rule (DeepSeek, Kimi K3, Kimi's
-//! K2.x tool loop) rejects a request that weakens it, so a weaker declaration
-//! is a [`ReasoningRouteConflict`] instead of a provider 400. A
-//! [`ReasoningReplayEnforcement::Default`] rule (GLM) is the documented default
-//! for tool loops; a deployment that knows it disabled preserved thinking may
-//! opt out explicitly.
+//! [`ReasoningReplayEnforcement::Required`] rule (DeepSeek, Kimi K2.7 and
+//! later, Kimi K3/K3.1) rejects a request that weakens it, so a weaker
+//! declaration is a [`ReasoningRouteConflict`] instead of a provider 400. A
+//! [`ReasoningReplayEnforcement::Default`] rule (GLM without preserved
+//! thinking) is the documented default for tool loops; a deployment that knows
+//! it disabled preserved thinking may opt out explicitly.
 //!
-//! The family is not the whole story, in two directions.
-//!
-//! Kimi's older thinking models only require the channel when the route actually
-//! reasons, so their rule reads the profile's `capabilities.reasoning`;
-//! DeepSeek's does not, because its thinking is a server-side default that a
-//! config can forget to declare.
+//! The family is not the whole story. DeepSeek's rule reads only the request
+//! shape (`tools` present or not): the provider states the requirement that way
+//! and its thinking is a server-side default a config can forget to declare.
+//! GLM's rule also reads the mode the route declared, because the vendor
+//! documents replay as the condition of preserved thinking: once the route asks
+//! the endpoint to keep prior turns' thinking, every request owes that thinking
+//! back, not just a tool-bearing one. Kimi K2.7 and later and K3/K3.1 have no
+//! such switch at all — thinking and preservation are unconditional there — so
+//! their rule is hard on every request.
 //!
 //! A route that asks the endpoint to PRESERVE prior thinking
-//! (`preserved_thinking = true`) makes its family's rule binding: both
-//! documented preserved modes require the retained reasoning back, so
+//! (`preserved_thinking = true`) makes its family's rule binding: the
+//! documented preserved mode requires the retained reasoning back, so
 //! "preserve it, then send nothing" is a contradiction rather than a
 //! deployment difference. The field that spells that request is per family
-//! ([`PreservedThinkingWire`]) — GLM says `clear_thinking`, Kimi's K2.x line
-//! says `keep`, and a family with neither must not receive the other's field.
+//! ([`PreservedThinkingWire`]) — GLM says `clear_thinking`, and a family with
+//! no such field must not receive another endpoint's spelling.
 
 use crate::profile::{ModelProfile, ProtocolKind};
 use crate::projection::{
@@ -58,8 +61,9 @@ use crate::projection::{
 /// How strongly a wire family's replay rule binds a route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningReplayEnforcement {
-    /// The provider rejects a tool-bearing request that omits the channel
-    /// (DeepSeek: HTTP 400). An explicit weaker declaration is a startup error.
+    /// The provider rejects a request that omits a required channel
+    /// (DeepSeek: HTTP 400 on a tool-bearing request; Kimi: malformed request).
+    /// An explicit weaker declaration is a startup error.
     Required,
     /// The family documents replay as the correct default for tool loops, but
     /// a deployment may turn preservation off (for example a standard GLM
@@ -76,8 +80,10 @@ pub enum ReasoningReplayEnforcement {
 /// endpoint's field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreservedThinkingWire {
-    /// The family has no preserved-thinking request field. GLM's spelling is
-    /// not one of its own, so declaring the mode is not a request it can
+    /// The family has no preserved-thinking request field: either the
+    /// endpoint keeps nothing between requests (DeepSeek) or preservation is
+    /// unconditional and cannot be asked for (Kimi K2.7+/K3). GLM's spelling is
+    /// not one of theirs, so declaring the mode is not a request they can
     /// honour.
     None,
     /// GLM: `thinking: {type: "enabled", clear_thinking: false}` keeps prior
@@ -85,17 +91,9 @@ pub enum PreservedThinkingWire {
     /// default depends on the plan (Coding Plan preserves, the standard API
     /// clears), so an unrequested mode sends neither field.
     ClearThinking,
-    /// Kimi's K2.x line: `thinking: {keep: "all"}`.
-    ///
-    /// Sources:
-    /// * <https://platform.kimi.ai/docs/guide/use-thinking-models> (`keep`:
-    ///   `null` (default, ignores historical turns' thinking) / `"all"`
-    ///   (keeps previous turns' `reasoning_content`, enabling Preserved
-    ///   Thinking))
-    KeepAll,
 }
 
-/// The replay a wire family requires when its protocol carries a tools array.
+/// The replay a wire family requires, and how strongly it binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequiredReasoningReplay {
     pub scope: ReasoningReplayScope,
@@ -142,32 +140,39 @@ enum WireReasoningFamily {
     Glm,
     /// Kimi K3 and its point releases: always thinking, and the provider
     /// requires the complete assistant message back — `reasoning_content`
-    /// included — so a tool-bearing request is malformed without it. The empty
-    /// string covers a turn that captured none, exactly as DeepSeek needs.
+    /// included — on multi-turn conversations and tool calls. The empty string
+    /// covers a turn that captured none, exactly as DeepSeek needs. K3 takes no
+    /// `thinking` field: effort is a top-level `reasoning_effort`, and its
+    /// preservation is unconditional.
     ///
     /// Sources:
-    /// * <https://platform.kimi.ai/docs/guide/use-reasoning-effort> ("For
-    ///   multi-turn conversations and tool calls, K3 requires the complete
-    ///   assistant message returned by the API to be passed back ... including
-    ///   `reasoning_content` and `tool_calls`")
-    /// * <https://huggingface.co/moonshotai/Kimi-K3> (same requirement)
+    /// * <https://platform.kimi.ai/docs/guide/use-thinking-models> (`thinking`:
+    ///   no value for K3/K3.1; complete assistant message required)
+    /// * <https://platform.kimi.ai/docs/api/models-overview> (`thinking` is a
+    ///   K2.x-only request parameter)
+    /// * <https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart> ("Return
+    ///   the complete assistant message unchanged in multi-turn conversations
+    ///   and tool calls")
     KimiK3,
-    /// Kimi's earlier thinking models (K2.5/K2.6/K2.7): while thinking is on,
-    /// a tool-call turn must carry its `reasoning_content` back. The provider
-    /// validates the key's PRESENCE on that turn (measured 400s when it is
-    /// missing), so a turn that captured none carries the empty value rather
-    /// than omitting a key the endpoint checks. Preservation across turns is a
-    /// mode these models can also run without, so the requirement is read only
-    /// for a route that declares it reasons.
+    /// Kimi K2.7 Code, its high-speed variant, K2.8 Preview and the Kimi Code
+    /// ids that currently resolve to them: thinking is always on and Preserved
+    /// Thinking is always on, so every historical assistant message's
+    /// `reasoning_content` must come back — in an ordinary multi-turn
+    /// conversation as much as in a tool loop. The endpoint accepts no other
+    /// mode, and it asks for this one by omission: passing `thinking` is
+    /// unnecessary and, for everything but
+    /// `{type: "enabled", keep: "all"}`, an error. CodeLeveler sends no
+    /// `thinking` field for this family.
     ///
     /// Sources:
-    /// * <https://platform.kimi.ai/docs/guide/use-thinking-models>
-    /// * measured 400s when the field is missing on a tool-call turn
-    ///   (<https://github.com/BerriAI/litellm/issues/26156>)
-    /// * measured 200 with `reasoning_content: ""` on a tool-call turn of
-    ///   `kimi-k2.6` (2026-10-27), which is the compatibility spelling this
-    ///   rule sends
-    KimiToolLoop,
+    /// * <https://platform.kimi.ai/docs/guide/use-thinking-models> ("you do not
+    ///   need to (and should not) pass the `thinking` parameter"; "Preserved
+    ///   Thinking is always on and cannot be turned off")
+    /// * <https://platform.kimi.ai/docs/api/models-overview> (`thinking` may be
+    ///   omitted; if set, only `{type: "enabled", keep: "all"}` is accepted)
+    /// * <https://www.kimi.com/code/docs/kimi-code/models> (Kimi Code model ids
+    ///   and the K2.7 Code Highspeed / K2.8 Preview mapping)
+    KimiK27,
 }
 
 fn wire_family(model_id: &str) -> Option<WireReasoningFamily> {
@@ -186,20 +191,45 @@ fn wire_family(model_id: &str) -> Option<WireReasoningFamily> {
         Some(WireReasoningFamily::Glm)
     } else if is_kimi_k3(&wire) {
         Some(WireReasoningFamily::KimiK3)
-    } else if wire.starts_with("kimi") || wire.starts_with("k2") || wire.starts_with("k3") {
-        Some(WireReasoningFamily::KimiToolLoop)
+    } else if is_kimi_k27(&wire) {
+        Some(WireReasoningFamily::KimiK27)
     } else {
         None
     }
 }
 
 /// K3 and its point releases (`k3`, `k3-256k`, `k3.1-pro`, `kimi-k3`,
-/// `kimi-k3.1-pro-highspeed`). Their request format differs from K2's: effort
+/// `kimi-k3.1-pro-highspeed`). Their request format differs from K2.7's: effort
 /// is a top-level `reasoning_effort`, thinking cannot be turned off, and the
 /// complete assistant message must come back.
 fn is_kimi_k3(wire: &str) -> bool {
     let id = wire.strip_prefix("kimi-").unwrap_or(wire);
     id == "k3" || id.starts_with("k3-") || id.starts_with("k3.")
+}
+
+/// K2.7 Code and later, by documented model id.
+///
+/// The list is deliberately explicit. The product supports K2.7 and later
+/// only, and the wire ids above that line do not share a prefix with the ones
+/// below it (`kimi-k2-0905-preview` is an earlier model, and comparing version
+/// strings would be a guess about an alias the provider re-maps in place). An
+/// id that is not listed keeps the conservative default instead of inheriting
+/// the requirement of a model it may not be.
+///
+/// `kimi-for-coding` / `kimi-for-coding-highspeed` are the Kimi Code ids: at the
+/// time of writing they resolve to K2.8 Preview and K2.7 Code Highspeed, both
+/// of which are above the supported line.
+fn is_kimi_k27(wire: &str) -> bool {
+    let id = wire.strip_prefix("kimi-").unwrap_or(wire);
+    matches!(
+        id,
+        "k2.7-code"
+            | "k2.7-code-highspeed"
+            | "k2.8-preview"
+            | "for-coding"
+            | "for-coding-highspeed"
+    ) || id.starts_with("k2.7-")
+        || id.starts_with("k2.8-")
 }
 
 /// The protocol requirement this route's model family imposes, if any.
@@ -209,88 +239,70 @@ fn is_kimi_k3(wire: &str) -> bool {
 /// Responses/Gemini adapters do not exist in this build, so a family fact never
 /// invents a channel on those protocols.
 ///
-/// This entry point answers the family's unconditional form. The model
-/// profile's `capabilities.reasoning` flag is deliberately NOT consulted here:
-/// DeepSeek's thinking is a server-side default, so a config that forgot to
-/// declare reasoning would otherwise be exactly the config that sends a tool
-/// request the provider rejects. Kimi's older thinking models are the case that
-/// does depend on the declaration; they resolve through
-/// [`required_reasoning_replay_for`], which every runtime path uses.
+/// This entry point answers the family's unconditional form, i.e. without a
+/// preserved-thinking declaration. The model profile's
+/// `capabilities.reasoning` flag is deliberately NOT consulted: every listed
+/// family thinks by protocol (DeepSeek by server-side default, Kimi K2.7+ and
+/// K3 unconditionally), so a config that forgot to declare reasoning would
+/// otherwise be exactly the config that sends a request the provider rejects.
+/// Every runtime path resolves through [`required_reasoning_replay_for`], which
+/// also reads the declared preserved mode.
 pub fn required_reasoning_replay(
     protocol: ProtocolKind,
     model_id: &str,
 ) -> Option<RequiredReasoningReplay> {
-    required_replay_for_route(protocol, model_id, true)
+    required_replay_for_route_with(protocol, model_id, None)
 }
 
-/// The family requirement for a route, given whether the route declares that it
-/// reasons. `declares_reasoning` is only consulted by families whose
-/// requirement is conditioned on thinking being on; DeepSeek's server-side
-/// default deliberately ignores it, and K3 always thinks.
-fn required_replay_for_route(
-    protocol: ProtocolKind,
-    model_id: &str,
-    declares_reasoning: bool,
-) -> Option<RequiredReasoningReplay> {
-    required_replay_for_route_with(protocol, model_id, declares_reasoning, None)
-}
-
-/// The family requirement for one route, including the mode the route declared.
-///
-/// Asking the endpoint to preserve prior thinking (`preserved_thinking = true`)
-/// is what makes replay binding: both documented families state that preserved
-/// thinking must be returned complete and unmodified, so a route that requests
-/// preservation may not also declare that it returns nothing. A family whose
-/// mode is not engaged keeps its documented default, which a deployment may
-/// still opt out of.
+/// The family requirement for a route, given the preserved-thinking mode the
+/// route declared. Only GLM's rule reads it: the other families have no request
+/// field for the mode and their requirements do not depend on it.
 fn required_replay_for_route_with(
     protocol: ProtocolKind,
     model_id: &str,
-    declares_reasoning: bool,
     preserves_thinking: Option<bool>,
 ) -> Option<RequiredReasoningReplay> {
     if protocol != ProtocolKind::OpenAiChat {
         return None;
     }
     let family = wire_family(model_id)?;
-    // Only a family whose base rule is a documented DEFAULT becomes binding
-    // when the route asks the endpoint to preserve prior thinking: the two
-    // documented preserved modes both require the retained reasoning back, so
-    // "preserve, then send nothing" is not a deployment difference. A family
-    // whose rule is already hard stays hard whatever the mode.
-    let enforced = if preserves_thinking == Some(true) {
-        ReasoningReplayEnforcement::Required
-    } else {
-        ReasoningReplayEnforcement::Default
-    };
-    let (missing, enforcement) = match family {
+    // GLM documents replay as the tool-loop default, but preserved thinking is
+    // the mode that states the condition: while the route asks the endpoint to
+    // keep prior turns' thinking, every request owes it back. That is what
+    // makes the rule binding (and lets a deployment that turned preservation
+    // off opt out).
+    let glm_preserves = preserves_thinking == Some(true);
+    let (scope, missing, enforcement) = match family {
         WireReasoningFamily::DeepSeek => (
+            ReasoningReplayScope::WhenToolsPresent,
             MissingReasoningReplay::EmptyString,
             ReasoningReplayEnforcement::Required,
         ),
-        WireReasoningFamily::Glm => (MissingReasoningReplay::Omit, enforced),
-        WireReasoningFamily::KimiK3 => (
+        WireReasoningFamily::Glm => (
+            if glm_preserves {
+                ReasoningReplayScope::Always
+            } else {
+                ReasoningReplayScope::WhenToolsPresent
+            },
+            MissingReasoningReplay::Omit,
+            if glm_preserves {
+                ReasoningReplayEnforcement::Required
+            } else {
+                ReasoningReplayEnforcement::Default
+            },
+        ),
+        // K2.7+ and K3/K3.1 always think and always preserve. The complete
+        // assistant message comes back on every request, and a turn that
+        // captured none carries the legal empty value rather than a missing key
+        // the K2.x line validates.
+        WireReasoningFamily::KimiK3 | WireReasoningFamily::KimiK27 => (
+            ReasoningReplayScope::Always,
             MissingReasoningReplay::EmptyString,
             ReasoningReplayEnforcement::Required,
         ),
-        WireReasoningFamily::KimiToolLoop => {
-            if !declares_reasoning {
-                // A non-thinking Kimi model has no historical reasoning channel
-                // to protect, so it gets no rule of its own.
-                return None;
-            }
-            // K2.x validates the channel inside a tool loop whether or not the
-            // route asks for cross-turn preservation, so this is hard. The key
-            // must be present on a replayed tool-call turn, so a turn that
-            // captured none carries the empty value.
-            (
-                MissingReasoningReplay::EmptyString,
-                ReasoningReplayEnforcement::Required,
-            )
-        }
     };
     Some(RequiredReasoningReplay {
-        scope: ReasoningReplayScope::WhenToolsPresent,
+        scope,
         missing,
         enforcement,
     })
@@ -301,7 +313,6 @@ pub fn required_reasoning_replay_for(profile: &ModelProfile) -> Option<RequiredR
     required_replay_for_route_with(
         profile.protocol,
         &profile.model_id,
-        profile.capabilities.reasoning,
         profile.reasoning.preserved_thinking,
     )
 }
@@ -310,19 +321,18 @@ pub fn required_reasoning_replay_for(profile: &ModelProfile) -> Option<RequiredR
 ///
 /// Keyed on the wire model id for the same reason the replay table is: the same
 /// model served through another alias is still the same model family. A family
-/// absent from this table has no preserved-thinking field at all.
+/// absent from this table has no preserved-thinking field at all — either
+/// because it keeps nothing between requests (DeepSeek) or because preservation
+/// is unconditional there (Kimi K2.7+/K3).
 pub fn preserved_thinking_wire(protocol: ProtocolKind, model_id: &str) -> PreservedThinkingWire {
     if protocol != ProtocolKind::OpenAiChat {
         return PreservedThinkingWire::None;
     }
     match wire_family(model_id) {
         Some(WireReasoningFamily::Glm) => PreservedThinkingWire::ClearThinking,
-        Some(WireReasoningFamily::KimiToolLoop) => PreservedThinkingWire::KeepAll,
-        // DeepSeek keeps nothing between requests and K3's preservation is
-        // unconditional; neither exposes a request field for it.
-        Some(WireReasoningFamily::DeepSeek | WireReasoningFamily::KimiK3) | None => {
-            PreservedThinkingWire::None
-        }
+        Some(WireReasoningFamily::DeepSeek)
+        | Some(WireReasoningFamily::KimiK3 | WireReasoningFamily::KimiK27)
+        | None => PreservedThinkingWire::None,
     }
 }
 
@@ -402,9 +412,11 @@ impl ReasoningReplayContract {
             // what the request asks for.
             return Err(ReasoningRouteConflict {
                 model_id: profile.model_id.clone(),
-                detail: "this wire family has no preserved-thinking request field, so \
-                         `preserved_thinking` cannot be honoured — it would send another \
-                         endpoint's field or change nothing; remove the declaration"
+                detail: "this wire family has no preserved-thinking request field — either \
+                         the endpoint keeps nothing between requests, preservation is \
+                         unconditional and cannot be asked for, or the route is not a \
+                         supported model — so `preserved_thinking` cannot be honoured; \
+                         remove the declaration"
                     .into(),
             });
         }
@@ -439,10 +451,13 @@ impl ReasoningReplayContract {
             return Err(ReasoningRouteConflict {
                 model_id: profile.model_id.clone(),
                 detail: format!(
-                    "this wire protocol requires historical reasoning replay on every \
-                     tool-bearing request, but `reasoning_replay_scope = {}` disables it; \
-                     the provider rejects such a request with HTTP 400 — remove the \
-                     override or declare `{}`/`always`",
+                    "this wire protocol requires historical reasoning replay {}, but \
+                     `reasoning_replay_scope = {}` returns less; the provider rejects such a \
+                     request with HTTP 400 — remove the override or declare `{}`/`always`",
+                    match required.scope {
+                        ReasoningReplayScope::Always => "on every request",
+                        _ => "on every tool-bearing request",
+                    },
                     declared.as_str(),
                     required.scope.as_str()
                 ),

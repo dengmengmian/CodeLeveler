@@ -60,15 +60,10 @@ pub struct Thinking {
     /// spells preserved thinking as `clear_thinking: false`; the field is
     /// omitted entirely unless the route declares the preserved-thinking mode
     /// AND its wire has that spelling, so an endpoint that never asked for it
-    /// is unaffected.
+    /// is unaffected. Kimi K2.7 and later and K3/K3.1 have no such field: their
+    /// preservation is unconditional and the request does not ask for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clear_thinking: Option<bool>,
-    /// Which of the earlier turns' thinking the endpoint keeps. Kimi's K2.x
-    /// line spells the same request fact as `keep: "all"` (`null`/omitted is
-    /// the endpoint's "ignore historical thinking" default). Omitted for a
-    /// family that does not have the field.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub keep: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]

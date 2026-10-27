@@ -205,19 +205,22 @@ pub struct ReasoningConfig {
     /// instead of discarding it between requests.
     ///
     /// This is a route fact about the provider's own preserved-thinking mode,
-    /// not a harness preference, and every family that has the mode spells it
-    /// itself: GLM as `thinking: {type: "enabled", clear_thinking: false}`,
-    /// Kimi's K2.x line as `thinking: {keep: "all"}`. Omitting the field means
-    /// the endpoint's default (GLM clears, Kimi ignores historical thinking).
-    /// A route that does not declare it sends no such field, so a provider that
-    /// never asked for it is unaffected. Kimi K3 and K3.1 preserve thinking
-    /// unconditionally and expose no request field for it, so a declaration
-    /// there describes a fact with no wire effect and is refused at load time;
-    /// their profiles therefore leave it absent.
+    /// not a harness preference. GLM is the family that spells it on the wire
+    /// (`thinking: {type: "enabled", clear_thinking: false}`); omitting the
+    /// field leaves the endpoint's default, which depends on the plan (Coding
+    /// Plan preserves, the standard API clears). A route that does not declare
+    /// it sends no such field, so a provider that never asked for it is
+    /// unaffected.
+    ///
+    /// Kimi K2.7 Code and later and K3/K3.1 preserve thinking unconditionally
+    /// and take no `thinking` parameter at all, so a declaration there
+    /// describes a fact with no wire effect and is refused at load time; their
+    /// profiles therefore leave it absent.
     ///
     /// Declaring it is not free: a route that asks the endpoint to preserve
     /// prior thinking must return it, so the declaration also binds the route's
-    /// reasoning-replay contract (`ReasoningReplayContract::for_route`).
+    /// reasoning-replay contract (`ReasoningReplayContract::for_route`) to every
+    /// request that spans the history, not only tool-bearing ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserved_thinking: Option<bool>,
     /// Whether the route cannot be told to stop thinking.

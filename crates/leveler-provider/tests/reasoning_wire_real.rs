@@ -20,10 +20,12 @@
 //! Nothing here prints an API key or the reasoning text: only lengths and
 //! short hashes.
 //!
-//! Route coverage: `taotoken` serves DeepSeek V4-Flash, Kimi K3 and Kimi K2.6;
-//! `bigmodel` serves GLM-5.3 on its official coding endpoint. Ark's coding plan
-//! answers 403 (expired subscription) and the Kimi coding endpoint answers 403
-//! (no subscription), so those two are not asserted here.
+//! Route coverage: `taotoken` serves DeepSeek V4-Flash and Kimi K3; `bigmodel`
+//! serves GLM-5.3 on its official coding endpoint. The official Kimi Code
+//! endpoint (`api.kimi.com/coding/v1`) answers 401 for the credential available
+//! here, so the Kimi K2.7/K2.8 protocol is asserted at the request-serialization
+//! level and recorded as NOT VERIFIED on the live endpoint — an older Kimi
+//! generation on a gateway never stands in for it.
 
 use leveler_model::{
     ContentPart, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, ProtocolAdapter,
@@ -129,15 +131,23 @@ fn registry() -> ProviderRegistry {
             "kimi-k3",
             ReasoningStyle::OpenAiEffort,
         ),
-        (
-            "kimi-k2.6",
-            "taotoken",
-            "kimi-k2.6",
-            ReasoningStyle::ThinkingFlag,
-        ),
-        // The official Kimi Code ids: K3 always thinks and takes no `thinking`
-        // field, K2.7-code always thinks AND always preserves.
+        // The official Kimi Code ids. Every supported Kimi (K2.7 and later)
+        // always thinks and always preserves, and takes no `thinking` field:
+        // K3/K3.1 are addressed by `reasoning_effort`, K2.8 Preview the same,
+        // and K2.7 Code has no effort knob at all.
         ("k3", "kimi-coding", "k3", ReasoningStyle::OpenAiEffort),
+        (
+            "k3.1-pro",
+            "kimi-coding",
+            "k3.1-pro",
+            ReasoningStyle::OpenAiEffort,
+        ),
+        (
+            "kimi-for-coding",
+            "kimi-coding",
+            "kimi-for-coding",
+            ReasoningStyle::OpenAiEffort,
+        ),
         (
             "kimi-for-coding-highspeed",
             "kimi-coding",
@@ -227,18 +237,25 @@ async fn send_json(
     context: &ProtocolContext,
     encoded: &leveler_model::EncodedRequest,
 ) -> (u16, serde_json::Value) {
+    send_body(context, &encoded.body).await
+}
+
+/// Send a request body the production encoder produced.
+async fn send_body(
+    context: &ProtocolContext,
+    body: &serde_json::Value,
+) -> (u16, serde_json::Value) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap();
     let response = client
         .post(format!(
-            "{}{}",
-            context.base_url.trim_end_matches('/'),
-            encoded.path
+            "{}/chat/completions",
+            context.base_url.trim_end_matches('/')
         ))
         .bearer_auth(context.api_key.clone().unwrap_or_default())
-        .json(&encoded.body)
+        .json(body)
         .send()
         .await
         .expect("the request is sent");
@@ -366,7 +383,7 @@ fn evidence(label: &str, response: &leveler_model::ModelResponse, body: &serde_j
 async fn real_routes_capture_and_replay_their_own_reasoning() {
     let registry = registry();
     let mut profiles: Vec<ModelProfile> = Vec::new();
-    for id in ["deepseek-flash", "glm-5.3", "kimi-k3", "kimi-k2.6"] {
+    for id in ["deepseek-flash", "glm-5.3", "kimi-k3"] {
         let provider_id = match id {
             "glm-5.3" => "bigmodel",
             _ => "taotoken",
@@ -385,9 +402,13 @@ async fn real_routes_capture_and_replay_their_own_reasoning() {
         assert_eq!(
             leveler_model::ReasoningReplayContract::for_route(&profile).arm_name(),
             match profile.model_id.as_str() {
-                // The families whose tool loop validates the key's presence.
-                "deepseek-flash" | "kimi-k3" | "kimi-k2.6" => "when_tools+empty",
-                _ => "when_tools",
+                // The tool-keyed family: replay is required with `tools` and
+                // ignored by the endpoint without them.
+                "deepseek-flash" => "when_tools+empty",
+                // K3 preserves unconditionally; GLM's bundled profile declares
+                // preserved thinking, so every request owes the chain back.
+                "kimi-k3" => "always+empty",
+                _ => "always",
             },
             "{}: the resolved contract comes from the wire family",
             profile.model_id
@@ -1032,63 +1053,78 @@ async fn real_routes_accept_the_preserved_mode_their_family_spells() {
     );
     assert_eq!(status, 200, "the cleared-mode request is accepted");
 
-    // --- Kimi K2.6: preserved thinking is `keep: "all"` -------------------
-    let mut k26 = registry
-        .profile(&ModelRef::new("taotoken", "kimi-k2.6"))
-        .await
-        .expect("kimi-k2.6");
-    k26.reasoning.preserved_thinking = Some(true);
-    let contract = leveler_model::ReasoningReplayContract::for_route(&k26);
-    assert_eq!(contract.arm_name(), "when_tools+empty");
-    leveler_model::ReasoningReplayContract::check_route(&k26).expect("keep is a family fact");
-    let context = live_context(&k26, contract);
-    let ask = vec![Message::user_input(
-        "Think first, then call the clock tool: what time is it in UTC?",
-    )];
-    let mut request = ModelRequest::new(ModelRef::new("taotoken", "kimi-k2.6"), ask.clone());
-    request.tools = tools();
-    request.reasoning_effort = k26.reasoning.default_effort;
-    request.max_output_tokens = Some(2048);
-    let route = registry
-        .route_identity(&ModelRef::new("taotoken", "kimi-k2.6"))
-        .unwrap();
-    request.projection = Some(RequestProjection::project_for_route(
-        &ask,
-        &request.tools,
-        contract,
-        ReasoningRetention::All,
-        Some(&route),
-    ));
-    let encoded_request = OpenAiChatAdapter::new()
-        .encode_request(&request, &context, false)
-        .expect("encodes");
-    assert_eq!(
-        encoded_request.body["thinking"]["keep"], "all",
-        "preserved thinking is spelled the Kimi way: {}",
-        encoded_request.body
-    );
-    assert!(
-        encoded_request.body["thinking"]
-            .get("clear_thinking")
-            .is_none(),
-        "GLM's field never travels to Kimi: {}",
-        encoded_request.body
-    );
-    let (status, body) = send_json(&context, &encoded_request).await;
-    let reasoning = body["choices"][0]["message"]["reasoning_content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    eprintln!(
-        "[kimi-k2.6 keep=all] status={status} reasoning_len={} reasoning_sha={} tool_calls={}",
-        reasoning.chars().count(),
-        sha8(&reasoning),
-        body["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0)
-    );
-    assert_eq!(status, 200, "the endpoint accepts keep: all");
+    // --- Kimi K2.7+/K2.8: no `thinking` field, and the declaration of a
+    // preserved mode is refused because the mode has no request field ------
+    for (provider_id, id) in [
+        ("kimi-coding", "kimi-for-coding"),
+        ("kimi-coding", "kimi-for-coding-highspeed"),
+    ] {
+        let mut kimi = registry
+            .profile(&ModelRef::new(provider_id, id))
+            .await
+            .expect("the Kimi route");
+        kimi.reasoning.preserved_thinking = Some(true);
+        let conflict = leveler_model::ReasoningReplayContract::check_route(&kimi)
+            .expect_err("Kimi K2.7+ preservation is unconditional, not a request field");
+        assert!(
+            conflict.to_string().contains("preserved_thinking"),
+            "{conflict}"
+        );
+        // The resolved contract still replays legally, so an unchecked caller
+        // cannot build a request that withholds the complete assistant message.
+        let contract = leveler_model::ReasoningReplayContract::for_route(&kimi);
+        assert_eq!(contract.arm_name(), "always+empty", "{id}");
+        let context = live_context(&kimi, contract);
+        let ask = vec![Message::user_input(
+            "Call the clock tool for UTC, then answer in one sentence.",
+        )];
+        let route = registry
+            .route_identity(&ModelRef::new(provider_id, id))
+            .unwrap();
+        let mut request = ModelRequest::new(ModelRef::new(provider_id, id), ask.clone());
+        request.tools = tools();
+        request.reasoning_effort = kimi.reasoning.default_effort;
+        request.max_output_tokens = Some(2048);
+        request.projection = Some(RequestProjection::project_for_route(
+            &ask,
+            &request.tools,
+            contract,
+            ReasoningRetention::All,
+            Some(&route),
+        ));
+        let encoded_request = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, false)
+            .expect("encodes");
+        assert!(
+            encoded_request.body.get("thinking").is_none(),
+            "{id}: this family documents no `thinking` parameter: {}",
+            encoded_request.body
+        );
+        assert!(
+            encoded_request.body.get("reasoning_effort").is_some()
+                == (kimi.reasoning.style == ReasoningStyle::OpenAiEffort),
+            "{id}: effort is sent exactly where the endpoint supports it: {}",
+            encoded_request.body
+        );
+        let (status, body) = send_json(&context, &encoded_request).await;
+        if !entitled(label_kimi(id), status, &body) {
+            continue;
+        }
+        let reasoning = body["choices"][0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        eprintln!(
+            "[kimi {id}] status={status} reasoning_len={} reasoning_sha={} tool_calls={}",
+            reasoning.chars().count(),
+            sha8(&reasoning),
+            body["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0)
+        );
+        assert_eq!(status, 200);
+    }
 
     // --- Kimi K3 (official): no `thinking` field at all, still replays ----
     let k3 = registry
@@ -1096,7 +1132,7 @@ async fn real_routes_accept_the_preserved_mode_their_family_spells() {
         .await
         .expect("k3");
     let contract = leveler_model::ReasoningReplayContract::for_route(&k3);
-    assert_eq!(contract.arm_name(), "when_tools+empty");
+    assert_eq!(contract.arm_name(), "always+empty");
     let route = registry
         .route_identity(&ModelRef::new("kimi-coding", "k3"))
         .unwrap();
@@ -1228,7 +1264,7 @@ async fn real_routes_accept_the_preserved_mode_their_family_spells() {
         .await
         .expect("k2.7-code");
     let contract = leveler_model::ReasoningReplayContract::for_route(&k27);
-    assert_eq!(contract.arm_name(), "when_tools+empty");
+    assert_eq!(contract.arm_name(), "always+empty");
     let route = registry
         .route_identity(&ModelRef::new("kimi-coding", "kimi-for-coding-highspeed"))
         .unwrap();
@@ -1417,6 +1453,317 @@ async fn real_routes_accept_unproven_and_foreign_history_without_its_reasoning()
     }
 }
 
+/// Encode one live request through the production adapter, with the same
+/// contract and projection the runtime would hand over.
+fn encode_live(
+    profile: &ModelProfile,
+    history: &[Message],
+    route: &RouteIdentity,
+    tools: Vec<ToolDefinition>,
+    thinking_disabled: bool,
+) -> serde_json::Value {
+    let contract = leveler_model::ReasoningReplayContract::for_route(profile);
+    let context = live_context(profile, contract);
+    let mut request = ModelRequest::new(
+        ModelRef::new(profile.provider.clone(), profile.id.clone()),
+        history.to_vec(),
+    );
+    request.tools = tools.clone();
+    request.reasoning_effort = profile.reasoning.default_effort;
+    request.max_output_tokens = Some(2048);
+    request.thinking_disabled = thinking_disabled;
+    request.projection = Some(RequestProjection::project_for_route(
+        history,
+        &tools,
+        contract,
+        ReasoningRetention::All,
+        Some(route),
+    ));
+    OpenAiChatAdapter::new()
+        .encode_request(&request, &context, false)
+        .expect("the request encodes")
+        .body
+}
+
+/// Experiment 1/2/3: a preserved mode replays a TOOL-FREE turn.
+///
+/// Each section first asks a question with no tools at all, then sends the
+/// assistant turn the endpoint returned plus one follow-up — still with no
+/// tools — and checks the encoded body: the historical `reasoning_content`
+/// comes back byte for byte, GLM still says `clear_thinking: false`, and no
+/// Kimi route invents a `thinking` field. The follow-up is a real call, so the
+/// endpoint has the chance to reject the shape.
+#[tokio::test]
+#[ignore = "spends real model tokens; see the module docs for the command"]
+async fn real_preserved_modes_replay_a_tool_free_turn() {
+    let registry = registry();
+    for (provider_id, id) in [
+        ("bigmodel", "glm-5.3"),
+        // The same K3 model through a gateway: real evidence for the wire
+        // shape, not a substitute for the official endpoint's acceptance.
+        ("taotoken", "kimi-k3"),
+        ("kimi-coding", "kimi-for-coding"),
+        ("kimi-coding", "k3"),
+    ] {
+        let profile = registry
+            .profile(&ModelRef::new(provider_id, id))
+            .await
+            .expect("the acceptance route");
+        let contract = leveler_model::ReasoningReplayContract::for_route(&profile);
+        assert_eq!(
+            contract.arm_name(),
+            if profile.reasoning.preserved_thinking == Some(true) && id.starts_with("glm") {
+                "always"
+            } else {
+                "always+empty"
+            },
+            "{id}: the preserved mode is not a tool-loop detail"
+        );
+        let route = registry
+            .route_identity(&ModelRef::new(provider_id, id))
+            .expect("a real route");
+        let context = live_context(&profile, contract);
+        // The family fact, not the endpoint: every Kimi K2.7+/K3 route takes no
+        // `thinking` field, whichever gateway serves it.
+        let kimi = id.starts_with("kimi") || id.starts_with("k3");
+
+        // Turn 1: no tools.
+        let ask = Message::user_input(
+            "In two sentences, explain why the sky is blue. Think it through, then answer.",
+        );
+        let first = encode_live(
+            &profile,
+            std::slice::from_ref(&ask),
+            &route,
+            Vec::new(),
+            false,
+        );
+        assert!(
+            first.get("tools").is_none(),
+            "{id}: the request exposes no tools: {first}"
+        );
+        if kimi {
+            assert!(
+                first.get("thinking").is_none(),
+                "{id}: Kimi K2.7+ takes no `thinking` field: {first}"
+            );
+        } else {
+            assert_eq!(
+                first["thinking"]["clear_thinking"], false,
+                "{id}: preserved thinking is requested in the family's own word: {first}"
+            );
+        }
+        let (status, body) = send_body(&context, &first).await;
+        if kimi && !entitled(label_kimi(id), status, &body) {
+            continue;
+        }
+        assert_eq!(status, 200, "{id}: the first tool-free request is accepted");
+        let reasoning = body["choices"][0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let answer = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !reasoning.is_empty(),
+            "{id}: this model always thinks: {body}"
+        );
+        assert!(!answer.trim().is_empty(), "{id}: it answered: {body}");
+        let answer_len = answer.chars().count();
+
+        // Turn 2: the complete assistant message plus a follow-up, still no
+        // tools, so only the preserved-mode contract can put the chain back.
+        let assistant = Message::from_parts(
+            Role::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: reasoning.clone(),
+                },
+                ContentPart::Text { text: answer },
+            ],
+            None,
+        )
+        .with_route(route.clone());
+        let history = vec![
+            ask,
+            assistant,
+            Message::text(Role::User, "Now say it in one short sentence."),
+        ];
+        let second = encode_live(&profile, &history, &route, Vec::new(), false);
+        let wire_assistant = assistant_on_wire(&second).expect("the assistant turn");
+        assert_eq!(
+            wire_assistant["reasoning_content"].as_str(),
+            Some(reasoning.as_str()),
+            "{id}: the preserved chain is replayed verbatim"
+        );
+        assert!(second.get("tools").is_none(), "{id}: {second}");
+        if kimi {
+            assert!(second.get("thinking").is_none(), "{id}: {second}");
+        } else {
+            assert_eq!(
+                second["thinking"]["clear_thinking"], false,
+                "{id}: {second}"
+            );
+        }
+        let (status, body) = send_body(&context, &second).await;
+        if kimi && !entitled(label_kimi(id), status, &body) {
+            continue;
+        }
+        let continued = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        eprintln!(
+            "[{id} tool-free replay] status={status} reasoning_len={} reasoning_sha={} \
+             answer_len={} continued_len={}",
+            reasoning.chars().count(),
+            sha8(&reasoning),
+            answer_len,
+            continued.chars().count()
+        );
+        assert_eq!(
+            status, 200,
+            "{id}: the endpoint accepts the replayed tool-free history"
+        );
+        assert!(
+            !continued.trim().is_empty(),
+            "{id}: the conversation continues: {body}"
+        );
+    }
+}
+
+/// Experiment 4: Thinking On → Off → On with the production encoder.
+///
+/// DeepSeek documents replay in terms of the request shape, not the current
+/// mode. The off request is therefore legal in both shapes: a tool-bearing one
+/// keeps the historical `reasoning_content`, a tool-free one omits it, and the
+/// explicit `thinking: {"type": "disabled"}` never travels with an effort.
+/// Turning thinking back on replays the same bytes.
+#[tokio::test]
+#[ignore = "spends real model tokens; see the module docs for the command"]
+async fn real_thinking_off_and_on_stay_legal_and_keep_the_replay_rule() {
+    let registry = registry();
+    let profile = registry
+        .profile(&ModelRef::new("taotoken", "deepseek-flash"))
+        .await
+        .expect("deepseek-flash");
+    let contract = leveler_model::ReasoningReplayContract::for_route(&profile);
+    assert_eq!(contract.arm_name(), "when_tools+empty");
+    let route = registry
+        .route_identity(&ModelRef::new("taotoken", "deepseek-flash"))
+        .expect("a real route");
+    let context = live_context(&profile, contract);
+
+    // Turn 1, thinking on, no tools: a reasoning-heavy question that leaves a
+    // captured chain to replay in the later shapes.
+    let ask = Message::user_input(
+        "Think step by step: what is 17 * 23, and which UTC offset does Beijing use in October? \
+         Answer in two short sentences.",
+    );
+    let first = encode_live(
+        &profile,
+        std::slice::from_ref(&ask),
+        &route,
+        Vec::new(),
+        false,
+    );
+    assert_eq!(first["thinking"]["type"], "enabled");
+    let (status, body) = send_body(&context, &first).await;
+    assert_eq!(status, 200, "the first turn is accepted");
+    let reasoning = body["choices"][0]["message"]["reasoning_content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let answer = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(!reasoning.is_empty(), "the model thought: {body}");
+    assert!(!answer.trim().is_empty(), "the model answered: {body}");
+    let answer_text = answer.clone();
+
+    // The next turn exposes tools and asks for a call, so the request is the
+    // shape DeepSeek validates and the history is one it must replay.
+    let assistant = Message::from_parts(
+        Role::Assistant,
+        vec![
+            ContentPart::Reasoning {
+                text: reasoning.clone(),
+            },
+            ContentPart::Text { text: answer },
+        ],
+        None,
+    )
+    .with_route(route.clone());
+    let history = vec![
+        ask,
+        assistant,
+        Message::text(
+            Role::User,
+            "Now call the clock tool for UTC and state the time in one sentence.",
+        ),
+    ];
+
+    // On: the documented tool-bearing replay.
+    let on = encode_live(&profile, &history, &route, tools(), false);
+    assert_eq!(on["thinking"]["type"], "enabled");
+    assert_eq!(on["messages"][1]["reasoning_content"], reasoning.as_str());
+    let (status, _) = send_body(&context, &on).await;
+    eprintln!(
+        "[deepseek on+tools] status={status} reasoning_sha={}",
+        sha8(&reasoning)
+    );
+    assert_eq!(status, 200);
+
+    // Off, tools present: legal, and the history it is given is not rewritten.
+    let off = encode_live(&profile, &history, &route, tools(), true);
+    assert_eq!(off["thinking"]["type"], "disabled");
+    assert!(off.get("reasoning_effort").is_none(), "{off}");
+    assert_eq!(off["messages"][1]["reasoning_content"], reasoning.as_str());
+    let (status, _) = send_body(&context, &off).await;
+    eprintln!("[deepseek off+tools] status={status}");
+    assert_eq!(status, 200, "a tool-bearing off request is accepted");
+
+    // Off, no tools: the requirement does not cover this shape, so the channel
+    // is absent and nothing else is lost.
+    let off_no_tools = encode_live(&profile, &history, &route, Vec::new(), true);
+    assert_eq!(off_no_tools["thinking"]["type"], "disabled");
+    assert!(
+        off_no_tools["messages"][1]
+            .get("reasoning_content")
+            .is_none(),
+        "{off_no_tools}"
+    );
+    assert_eq!(
+        off_no_tools["messages"][1]["content"], answer_text,
+        "the visible answer is a task fact, not reasoning: it stays"
+    );
+    let (status, _) = send_body(&context, &off_no_tools).await;
+    eprintln!("[deepseek off no tools] status={status}");
+    assert_eq!(status, 200, "a tool-free off request is accepted");
+
+    // On again: the same chain comes back, so the provider sees its own
+    // reasoning rather than a record that quietly lost it.
+    let back_on = encode_live(&profile, &history, &route, tools(), false);
+    assert_eq!(back_on["thinking"]["type"], "enabled");
+    assert_eq!(
+        back_on["messages"][1]["reasoning_content"],
+        reasoning.as_str()
+    );
+    let (status, body) = send_body(&context, &back_on).await;
+    eprintln!(
+        "[deepseek back on] status={status} answer_len={}",
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .count()
+    );
+    assert_eq!(status, 200);
+}
+
 fn label_kimi(model: &str) -> String {
     format!("kimi-coding/{model}")
 }
@@ -1431,11 +1778,18 @@ fn entitled(label: String, status: u16, body: &serde_json::Value) -> bool {
     if status == 200 {
         return true;
     }
-    let denied = status == 403 && body["error"]["type"] == "permission_denied_error";
+    // Two environment gaps, neither of which is a protocol result:
+    //  * 403 `permission_denied_error`: the subscription does not cover this
+    //    model;
+    //  * 401 `invalid_authentication_error`: the credential is not valid for
+    //    that endpoint (a key for a different host, or one that expired).
+    let denied = (status == 403 && body["error"]["type"] == "permission_denied_error")
+        || (status == 401 && body["error"]["type"] == "invalid_authentication_error");
     assert!(denied, "{label}: unexpected status {status}: {body}");
     eprintln!(
-        "[{label}] NOT VERIFIED: the official endpoint refuses this subscription \
-         (HTTP {status} permission_denied_error); nothing about its wire behaviour is claimed"
+        "[{label}] NOT VERIFIED: the official endpoint answered HTTP {status} \
+         ({}); nothing about its wire behaviour is claimed",
+        body["error"]["type"].as_str().unwrap_or("unknown")
     );
     false
 }
