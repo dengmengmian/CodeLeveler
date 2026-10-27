@@ -12,7 +12,7 @@
 - 本路由完成但确实没产生推理记为“空”；旧数据没有来源记录记为“未知”；流中断的内容不会变成消息，因此不完整推理不可能被当成完整内容回放。投影会分别报告外来、未知和空的回合数，而不是把它们合并成一个数
 - GLM 的保留式思考按路由声明发送（`thinking: {"type": "enabled", "clear_thinking": false}`），工具循环因此保留模型本该复用的推理链。无法关闭思考的路由（GLM-5.3/5.3-FLASH）不再提供 `off`
 - 回放范围跟随真正使其生效的模式，而不是一个固定值。声明保留式思考的 GLM 在每次跨历史请求都回传推理链，带不带工具一样；DeepSeek 仍以“请求是否携带 `tools`”为触发条件，这正是其协议的表达方式；Kimi K2.7 Code 与 K3/K3.1 因为思考与保留均为无条件，每个请求都回放
-- Kimi 线协议以 K2.7 为最低版本。K2.7 Code / K2.7 Code Highspeed / K2.8 Preview / K3 / K3.1 完全不发送 `thinking` 参数（官方明确不应发送；省略即表示“开启且保留全部”），因此 K2.6 专用的 `thinking.keep` 路径已删除；在这些路由上声明 `preserved_thinking` 会在加载时报错，而不是发送它们并未定义的字段。K2.7 以下的 id 故意不在表内并保持保守默认；Moonshot 预设改为建议 `kimi-k2.7-code`
+- Kimi 线协议以 K2.7 为最低版本。K2.7 Code / K2.7 Code Highspeed / K2.8 Preview / K3 / K3.1 完全不发送 `thinking` 参数（官方明确不应发送；省略即表示“开启且保留全部”），因此 K2.6 专用的 `thinking.keep` 路径已删除；在这些路由上声明 `preserved_thinking` 会在加载时报错，声明 `reasoning_style = thinking_flag` 同样在加载时被拒绝——编码器不会给没有该对象的模型族发送 `thinking` 字段。K2.7 以下的 id 故意不在表内并保持保守默认；Moonshot 预设改为建议 `kimi-k2.7-code`
 - 关闭思考只影响当前请求。DeepSeek 的回放规则按请求形态判定：带工具的关闭请求仍保留历史推理，不带工具的则省略；重新开启后回放同样的字节。提示补全不再让以 effort 表达思考的路由（K3/K3.1/K2.8）“关闭思考”——那会连显式的 low effort 一起丢掉、静默跑供应商默认档——而是保留 low effort
 
 ### 变更
