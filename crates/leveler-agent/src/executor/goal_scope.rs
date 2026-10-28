@@ -669,17 +669,20 @@ fn find_account<'a>(
     requirement: &Requirement,
 ) -> Option<&'a RequirementAccount> {
     let need = normalize(&requirement.text);
-    if need.chars().count() < 2 {
-        return None;
-    }
     // The requirement and the model's account may spell the same artifact at
     // different lengths: the user names `internal/report/aggregate.go` once
     // and `aggregate.go` later, and the model accounts for the shorter form
     // while its evidence names the full path. Naming it in either field is
     // still accounting for it; the artifact check below remains mechanical.
     accounts.iter().find(|account| {
-        covers(&normalize(&account.requirement), &need)
-            || covers(&normalize(&account.evidence), &need)
+        let accounted = normalize(&account.requirement);
+        if need.chars().count() < 2 {
+            // Containment cannot match a one-character requirement: every
+            // account contains it. Exact identity is the only honest match,
+            // and without it the requirement could never be accounted for.
+            return accounted == need;
+        }
+        covers(&accounted, &need) || covers(&normalize(&account.evidence), &need)
     })
 }
 
@@ -762,6 +765,11 @@ fn collect_backticks(
         if span.is_empty() || span.chars().count() > 120 {
             continue;
         }
+        // An illustration is not a deliverable. Skip the whole span so its
+        // tokens cannot be re-added by the bare-path scan either.
+        if example_context(segment, span) {
+            continue;
+        }
         let mut added_path = false;
         for token in span.split_whitespace() {
             let token = clean_token(token);
@@ -819,7 +827,7 @@ fn collect_paths(
 ) {
     for raw in segment.split(|c: char| TOKEN_BREAKS.contains(&c)) {
         let token = clean_token(raw);
-        if !path_like(&token) || looks_like_url(&token) {
+        if !path_like(&token) || looks_like_url(&token) || example_context(segment, &token) {
             continue;
         }
         // A path mentioned in a prohibition is a constraint, not a deliverable.
@@ -979,6 +987,39 @@ const OBLIGATION_CJK: &[&str] = &["必须", "需要", "应当", "应该"];
 /// and a clause that states its own obligation ("but you must update
 /// `README.md`") keeps that clause's paths. An obligation also covers the
 /// items listed after it until another permission starts.
+/// Markers that introduce an illustration rather than a deliverable.
+const EXAMPLE_MARKERS: &[&str] = &[
+    "e.g.",
+    "e.g",
+    "for example",
+    "such as",
+    "例如",
+    "比如",
+    "譬如",
+];
+
+/// Whether `token` is the immediate illustration of an example marker.
+///
+/// ``e.g. `p01.txt` `` names the shape of a file, not one the user wants
+/// produced. Only the token directly introduced by the marker is skipped, so a
+/// real deliverable later in the same sentence is still owed.
+fn example_context(segment: &str, token: &str) -> bool {
+    let Some(end) = last_match_end(segment, token) else {
+        return false;
+    };
+    // `last_match_end` is the END of the token; the context between the
+    // marker and the token starts before it.
+    let start = end.saturating_sub(token.len());
+    let prefix = &segment[..start];
+    EXAMPLE_MARKERS.iter().any(|marker| {
+        last_match_end(prefix, marker).is_some_and(|end| {
+            prefix[end..].chars().all(|c| {
+                c.is_whitespace() || "`'\"“”‘’。，,、；;：:!?！？()（）[]【】{}<>".contains(c)
+            })
+        })
+    })
+}
+
 fn permission_only(segment: &str, token: &str) -> bool {
     if token.is_empty() || !segment.contains(token) {
         return false;
@@ -2377,6 +2418,79 @@ mod tests {
                 artifact: &present,
             }),
             ScopeDecision::Accept { warnings: vec![] }
+        );
+    }
+
+    /// The exact RC3 shape: a file-name format illustrated with `e.g.
+    /// `p01.txt``. An illustration is not a deliverable; extracting it makes
+    /// a correct completion impossible because no such file is owed.
+    #[test]
+    fn an_illustrated_example_is_not_a_deliverable() {
+        assert!(
+            example_context("the exact file name, e.g. `p01.txt`)", "p01.txt"),
+            "helper must see the immediate example"
+        );
+        let requirements = extract(
+            "`data/chain.txt` starts with a line `NEXT=<file>`. Follow that link \
+             (files live in `data/`; `<file>` is the exact file name, e.g. `p01.txt`).\
+             \nWrite the answer into `src/answer.txt`.",
+            &[],
+        );
+        let found = texts(&requirements);
+        assert!(
+            !found.contains(&"p01.txt"),
+            "an illustrated example is not a deliverable: {found:?}"
+        );
+        assert!(found.contains(&"data/chain.txt"), "{found:?}");
+        assert!(
+            found.contains(&"src/answer.txt"),
+            "a real deliverable later in the request must remain: {found:?}"
+        );
+    }
+
+    /// A one-character requirement must be accountable: the matcher used to
+    /// require two characters, so a correct account could never satisfy it and
+    /// the goal could never complete.
+    #[test]
+    fn a_one_character_requirement_is_matched_only_exactly() {
+        let requirements = extract(
+            "Keep following `NEXT` until it says `NEXT=END`, summing every `N` value you pass.",
+            &[],
+        );
+        let n = requirements
+            .iter()
+            .find(|requirement| requirement.text == "N")
+            .expect("the value name is a requirement");
+        let accept = decide(&ScopeFacts {
+            requirements: std::slice::from_ref(n),
+            accounting: Some(&[account(
+                "`N`",
+                AccountStatus::Done,
+                "summed every N value to 296",
+            )]),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        assert!(
+            matches!(accept, ScopeDecision::Accept { .. }),
+            "an exact account must satisfy a one-character requirement: {accept:?}"
+        );
+
+        let refuse = decide(&ScopeFacts {
+            requirements: std::slice::from_ref(n),
+            accounting: Some(&[account(
+                "N values",
+                AccountStatus::Done,
+                "summed every N value to 296",
+            )]),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        assert!(
+            matches!(refuse, ScopeDecision::Refuse(_)),
+            "a longer account must not stand in for the exact requirement: {refuse:?}"
         );
     }
 }
