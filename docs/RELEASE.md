@@ -16,9 +16,9 @@ into one full-width background band.
 
 ## Complete output
 
-- The exact stdout/stderr and the arrival-order combined stream are retained in per-execution capture files, not a lossy 1 MiB tail.
-- `/output` opens the complete capture in a windowed page; `/copy output` copies it cleanly. The page indexes the capture off the paint loop and renders only the visible window, so a 50 MiB result costs the same per frame as a small one.
-- Rows can be selected and copied with tabs preserved and soft wraps rejoined. Capture directories are `0700` and files `0600`, and a persisted capture is validated against the local shell-output root before it is opened.
+- The complete stdout/stderr and the arrival-order combined stream are retained, not a lossy 1 MiB tail.
+- `/output` opens the complete result in a windowed page; `/copy output` copies it cleanly. A large result costs the same per frame as a small one.
+- Rows can be selected and copied with tabs preserved and soft wraps rejoined.
 
 ## Background handoff
 
@@ -34,5 +34,3 @@ into one full-width background band.
 ## Fixes
 
 - The background-wait row's marker animates with the shared 120 ms spinner while the wait target is running; reduced motion keeps it static.
-- Background user-shell protocol types and their exported schemas stay current, and remote policy classifies `background_user_shell` explicitly.
-- Two capture integration fixtures now create a real state root, so the `/output` and `/copy output` validation is exercised against the same shape production writes.
