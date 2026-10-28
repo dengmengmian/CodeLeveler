@@ -52,7 +52,6 @@ leveler-chat-*.md
 .shots*/
 
 # Local internal documentation, not part of the public source tree.
-/AGENTS.md
 /docs/ARCHITECTURE.md
 /docs/ARCHITECTURE.zh-CN.md
 /assets/brand/README.md
