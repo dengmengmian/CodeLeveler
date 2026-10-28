@@ -702,6 +702,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_current_root_is_rejected() {
         let dir = tempdir().unwrap();

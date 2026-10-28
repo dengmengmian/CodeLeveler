@@ -4,8 +4,10 @@
 //! rename crosses a device boundary. These tests prove that claim by placing
 //! the two roots on different mounted filesystems and walking the lifecycle.
 //!
-//! Only macOS can mount a volume unprivileged here; on other hosts the
-//! behavior is reported as not verified rather than silently passing.
+//! Only macOS can mount a volume unprivileged here, so the whole test crate is
+//! compiled away elsewhere: cross-device memory is NOT VERIFIED on other hosts.
+
+#![cfg(target_os = "macos")]
 
 mod memory_v2_common;
 
