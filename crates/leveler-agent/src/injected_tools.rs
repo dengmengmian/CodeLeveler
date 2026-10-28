@@ -228,24 +228,28 @@ pub(crate) const COMMIT_TASK_TOOL: &str = "commit_task";
 ///
 /// The description carries the decision rule because it is the only place the
 /// model is told when a request stops being a question and becomes delegated
-/// work. The runtime never classifies the user's text for it.
+/// work. The runtime never classifies the user's text for it: no keyword,
+/// length, tool count or round count decides this — the model reads the
+/// request's meaning and expected result.
 pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     let description = String::from(
-        "Declare that the user's request is an execution task this turn must carry \
-            to completion, and commit the turn to the task lifecycle. Call this before the \
-            first edit when the user explicitly asked you to perform work (implement, fix, \
-            migrate, test) AND the request names two or more deliverables (files, modules, \
-            stages, endpoints, components), or told you to finish everything before stopping, \
-            or when you are about to end the turn while explicitly requested work is still \
-            unfinished. Call it even if you expect to finish in this turn: the commitment is \
-            what keeps the turn alive if the work outlasts it. Do NOT call it for a \
-            question, an explanation, a discussion, a single small fix, or when the user asked \
-            you not to modify anything; do not use it to enlarge the request. `objective` is the \
-            user's stated end state, not a narrower version of it. `acceptance` lists \
-            the concrete checks that will prove it. After the commit, the runtime keeps \
-            this turn running: a stage summary or a quiet end does NOT finish the task. \
-            Continue the work and resolve it with update_goal(complete|blocked). The \
-            session itself stays a Chat session.",
+        "Declare that the user's request is execution work this turn must carry \
+            to completion, and commit the turn to the task lifecycle. Call it before the \
+            first edit only when ALL THREE hold: (1) the user asked you to perform work, \
+            not to explain, discuss, check or confirm something; (2) the request states a \
+            concrete result you can deliver (files, modules, endpoints, stages, migrations); \
+            (3) finishing it needs several steps, tracking or acceptance, so a stage summary \
+            would not prove it done — or the user said to finish everything before stopping. \
+            Call it even when you expect to finish this turn: the commitment is what keeps it \
+            alive if the work outlasts it, and call it instead of summarizing when requested \
+            work is still unfinished. Do NOT call it for a question, an explanation, a status \
+            or verification check, a discussion, a single small fix, or when the user asked you \
+            not to modify anything. If you are unsure whether this is execution work, do not \
+            call it. `objective` is the user's stated end state, not a narrower version of it \
+            and never an enlargement of it. `acceptance` lists the concrete checks that will \
+            prove it. After the commit, the runtime keeps this turn running: a stage summary \
+            or a quiet end does NOT finish the task. Continue the work and resolve it with \
+            update_goal(complete|blocked). The session itself stays a Chat session.",
     );
     ToolDefinition {
         name: COMMIT_TASK_TOOL.to_string(),
@@ -275,17 +279,16 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
 /// the model declares the commitment with `commit_task`, and every behavior
 /// change follows that durable fact. Kept as a constant so its prompt cost is
 /// measured, not guessed.
-pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK DELEGATION: if the user explicitly asks you to carry out work \
-     to completion (implement, fix, migrate, test) and the request names two or more \
-     deliverables (files, modules, stages, endpoints, components) or says to finish \
-     everything before stopping, call `commit_task` before the first edit — even if you \
-     expect to finish this turn; the commitment keeps the turn alive if the work outlasts \
-     it. Use the objective as the user stated it and the checks that will prove it. If you \
-     are already mid-task and about to end while requested work is unfinished, call \
-     `commit_task` instead of summarizing what remains. Do not call it for a question, an \
-     explanation, a discussion, a single small fix, or when the user asked you not to modify \
-     anything. Once committed, the runtime keeps the turn running until update_goal resolves \
-     the task.";
+pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK DELEGATION: if the user asked you to carry out work to \
+     completion and the request states a concrete deliverable that needs several steps, tracking or \
+     acceptance (or the user said to finish everything before stopping), call `commit_task` before the \
+     first edit — even if you expect to finish this turn; the commitment keeps the turn alive if the \
+     work outlasts it. Use the objective as the user stated it and the checks that will prove it. If \
+     you are already mid-task and about to end while requested work is unfinished, call `commit_task` \
+     instead of summarizing what remains. Do not call it for a question, an explanation, a status or \
+     verification check, a discussion, a single small fix, or when the user asked you not to modify \
+     anything; if unsure, do not call it. Once committed, the runtime keeps the turn running until \
+     update_goal resolves the task.";
 
 /// The name of the injected request-permissions tool.
 pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
@@ -1132,6 +1135,43 @@ mod tests {
         println!("commit_task schema tokens: {tokens}; guidance tokens: {guidance}");
         assert!(tokens < 700, "commit_task surface grew to {tokens} tokens");
         assert!(guidance < 300, "task guidance grew to {guidance} tokens");
+    }
+
+    /// The upgrade decision is semantic evidence about the request, not a
+    /// mechanical trigger. A question, a status/verification check and an
+    /// explanation must all be excluded by name, and no counting rule (message
+    /// length, tool count, keyword list) may appear as the trigger.
+    #[test]
+    fn the_task_upgrade_needs_evidence_and_never_counts_words() {
+        let def = commit_task_tool_definition();
+        let rule = format!("{} {}", def.description, TASK_COMMIT_GUIDANCE);
+        for required in [
+            "perform work",
+            "concrete result",
+            "several steps",
+            "question",
+            "status or verification check",
+            "explanation",
+            "if unsure, do not",
+        ] {
+            assert!(
+                rule.contains(required),
+                "the upgrade rule must state {required:?}: {rule}"
+            );
+        }
+        for forbidden in [
+            "two or more",
+            "at least three",
+            "characters",
+            "tokens",
+            "tool calls",
+            "number of",
+        ] {
+            assert!(
+                !rule.to_lowercase().contains(forbidden),
+                "the upgrade rule must not be a mechanical trigger ({forbidden:?}): {rule}"
+            );
+        }
     }
 
     #[test]

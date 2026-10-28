@@ -178,20 +178,15 @@ async fn settled(app: &Application, session: &leveler_core::SessionId, min_turns
     loop {
         let db = app.open_database().await.unwrap();
         let turns = TurnRepository::new(&db).list(session).await.unwrap();
-        let stores = EngineStores::from_database(&db);
-        let goals = match stores.tasks.task_for_session(session).await.unwrap() {
-            Some(task) => stores.goals.for_task(&task).await.unwrap(),
-            None => Vec::new(),
-        };
-        if turns.len() >= min_turns
-            && turns.iter().all(|turn| turn.status != "running")
-            && goals.iter().all(|goal| goal.state == GoalState::Settled)
-        {
+        // The wait is about TURNS. A goal that still owes work (blocked,
+        // recoverably failed, budget-stopped) is a normal resting state, not
+        // evidence that something is still running.
+        if turns.len() >= min_turns && turns.iter().all(|turn| turn.status != "running") {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the turn and its goals did not settle in time: turns={turns:?} goals={goals:?}"
+            "the turn did not settle in time: turns={turns:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -593,7 +588,11 @@ async fn continue_after_a_blocked_goal_retries_the_same_record() {
     let goals = stores.goals.for_task(&task).await.unwrap();
     assert_eq!(goals.len(), 1);
     let goal_id = goals[0].id.clone();
-    assert_eq!(goals[0].state, GoalState::Settled);
+    assert_eq!(
+        goals[0].state,
+        GoalState::Running,
+        "a blocked goal still owes its work; only the window ended"
+    );
     drop(db);
 
     let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
@@ -703,7 +702,11 @@ async fn an_explicit_new_goal_after_blocked_stays_independent() {
         .iter()
         .find(|goal| goal.objective == "finish the inventory work")
         .expect("the blocked goal is kept");
-    assert_eq!(old.state, GoalState::Settled);
+    assert_eq!(
+        old.state,
+        GoalState::Running,
+        "an explicit new task does not settle work the user never delivered"
+    );
     let new = goals
         .iter()
         .find(|goal| goal.objective == "迁移到新的构建系统")
@@ -971,7 +974,11 @@ async fn a_failed_verification_survives_into_the_retry() {
     let goals = stores.goals.for_task(&task).await.unwrap();
     assert_eq!(goals.len(), 1);
     let goal_id = goals[0].id.clone();
-    assert_eq!(goals[0].state, GoalState::Settled);
+    assert_eq!(
+        goals[0].state,
+        GoalState::Running,
+        "a blocked goal still owes its work; only the window ended"
+    );
     drop(db);
 
     // The fix lands between windows; the retry must still remember the fail.

@@ -105,8 +105,29 @@ pub struct GoalTerminalUpdate {
     pub goal_id: GoalId,
     /// Number of work windows completed by this invocation.
     pub windows_delta: u32,
-    /// Whether the Harness decided that this goal owes no further work.
+    /// Whether the Harness decided that this goal's work window is over.
+    ///
+    /// A window is over when nothing can follow it up in this task. Settling
+    /// is therefore the mirror of the task's resumability: a blocked, failed or
+    /// budget-stopped window leaves the goal `running` (it still owes work and a
+    /// continuation re-enters it), while a delivered or explicitly cancelled one
+    /// settles it.
     pub settle: bool,
+    /// Whether this terminal also returns the session to Chat.
+    ///
+    /// The session's Goal axis is the route its NEXT ordinary message takes, so
+    /// a goal window drives it and a closed window ends it — here, atomically
+    /// with the terminal.
+    ///
+    /// This is independent of [`Self::settle`]. A blocked or interrupted goal
+    /// still owes work and still ends the route: continuing it is the user's
+    /// explicit `继续`, while an ordinary message after the window closes is a
+    /// conversation. Leaving the axis armed after a closed window is what turned
+    /// such a message into a NEW goal whose objective was that message.
+    ///
+    /// A pending `/goal <task>` declaration is never discarded by this flag —
+    /// the user's newer instruction outranks the ending goal.
+    pub ends_session_goal: bool,
 }
 
 /// The engine-facing atomic terminal-commit contract.
@@ -889,6 +910,7 @@ mod tests {
             goal_id: goal.clone(),
             windows_delta: 2,
             settle: true,
+            ends_session_goal: false,
         };
 
         terminal.fail_commits(true);
@@ -964,6 +986,7 @@ mod tests {
             goal_id: goal.clone(),
             windows_delta: 3,
             settle: true,
+            ends_session_goal: false,
         };
         assert!(
             terminal

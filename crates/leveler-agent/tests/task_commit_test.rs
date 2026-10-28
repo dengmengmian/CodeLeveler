@@ -866,7 +866,11 @@ async fn a_completion_cannot_omit_a_user_named_deliverable() {
     assert!(!fx.dir.path().join("stage-2.txt").exists());
     let goals = goal_records(&fx).await;
     assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Running,
+        "a blocked goal still owes the deliverables it could not produce"
+    );
     assert_eq!(
         goals[0].acceptance.len(),
         4,
@@ -1059,5 +1063,150 @@ async fn a_test_requirement_cannot_be_satisfied_by_a_build_check() {
                 if kind == "requirements_refused" && detail.contains("test")
         )),
         "the refusal must name the test requirement: {events:?}"
+    );
+}
+
+/// ONE task owes ONE goal.
+///
+/// A later Chat window that commits the same work must JOIN the goal the task
+/// already owes. Opening a sibling would split one intent across two identities
+/// and restart the acceptance the user's request was committed against, and the
+/// model's paraphrase of the objective is not evidence of a new task. The user's
+/// new instruction becomes an amendment on that goal, never a replacement of its
+/// objective.
+#[tokio::test]
+async fn a_later_commit_joins_the_owed_goal_instead_of_opening_a_second_one() {
+    let fx = fixture(
+        vec![
+            Scripted::commit(),
+            Scripted::Text("第一阶段完成，后面的还没做。"),
+            // A new Chat window: the user asks for the rest in their own words,
+            // and the model commits again with a restated objective.
+            commit_with(vec!["stage-2.txt 存在"], "把清单剩下的部分做完"),
+            Scripted::Text("还在继续。"),
+        ],
+        false,
+    )
+    .await;
+    // Window 1 commits and is then interrupted, leaving the task owed.
+    fx.runtime.cancel_after.store(2, Ordering::SeqCst);
+    let first = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: USER_REQUEST.into(),
+            }],
+            &mut |_| {},
+            fx.cancel.clone(),
+        )
+        .await;
+    assert!(first.is_err(), "the interrupted window reports no success");
+    let owed = goal_records(&fx).await;
+    assert_eq!(owed.len(), 1);
+    let goal_id = owed[0].id.clone();
+    assert_eq!(
+        owed[0].state,
+        leveler_storage::GoalState::Running,
+        "an interrupted window leaves the task owed"
+    );
+    let windows_after_first = owed[0].windows_run;
+
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: "把清单剩下的部分做完".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "one task owes one goal; a restated objective must not open a second: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].id, goal_id,
+        "the identity of the owed task is kept"
+    );
+    assert_eq!(
+        goals[0].objective, USER_REQUEST,
+        "the objective is the user's, never the model's paraphrase"
+    );
+    assert_eq!(
+        goals[0].acceptance.len(),
+        2,
+        "the acceptance the task was committed against is not replaced: {goals:?}"
+    );
+    assert!(
+        goals[0]
+            .amendments
+            .iter()
+            .any(|amendment| amendment.contains("剩下的部分")),
+        "the user's new instruction is recorded as scope, not as a new goal: {goals:?}"
+    );
+    assert!(
+        goals[0].windows_run > windows_after_first,
+        "the joined window is counted on the same goal: {} then {}",
+        windows_after_first,
+        goals[0].windows_run
+    );
+}
+
+/// A Chat conversation with several tool rounds is not a task. Only the model's
+/// explicit declaration may commit one — tool count, rounds and file writes are
+/// not a reason to upgrade.
+#[tokio::test]
+async fn a_multi_round_chat_with_tools_does_not_upgrade_itself() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "notes.md", "content": "# notes\n"}),
+            ),
+            Scripted::Tool("read_file", serde_json::json!({"path": "notes.md"})),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({"program": "sh", "args": ["-c", "true"], "reason": "check"}),
+            ),
+            Scripted::Text("记下了，没有需要持续跟踪的任务。"),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat(&fx).await;
+
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "an ordinary conversation must not commit a goal: {:?}",
+        goal_records(&fx).await
+    );
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| tool_names(request).contains(&"commit_task")),
+            "the delegation entry stays available to the model"
+        );
+    }
+    assert_eq!(
+        SessionRepository::new(&fx.db)
+            .get(&fx.session)
+            .await
+            .unwrap()
+            .unwrap()
+            .collaboration,
+        "chat",
+        "the session's axis is untouched"
     );
 }

@@ -30,6 +30,9 @@ pub use policy::{
     ExecutionOverrides, ExecutionRole, IndependentReviewPolicy, PostEditThroughputMode,
     ResolvedExecutionPolicy, resolve_execution_policy, resolve_tool_limits,
 };
-pub use run::{CodingRuntime, CodingTaskSpec, RuntimeTaskSpec, TaskReport, TaskSpec, mode_str};
+pub use run::{
+    CodingRuntime, CodingTaskSpec, RuntimeTaskSpec, TaskReport, TaskSpec, mode_str,
+    task_outcome_is_resumable,
+};
 pub use turn::TurnInput;
 pub use workspace::GitWorkspace;

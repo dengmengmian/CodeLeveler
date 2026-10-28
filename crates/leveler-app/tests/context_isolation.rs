@@ -1976,11 +1976,12 @@ async fn btw_reports_an_unreachable_budget_instead_of_sending_it() {
         })
         .to_string(),
     };
-    // The read-only surface plus the `/btw` runtime projection is ~3.0k tokens;
-    // a 3 400 reliable budget leaves no room for a retained tail after a fold,
-    // so the side question must report that truth instead of sending it.
+    // The read-only surface plus the `/btw` runtime projection is ~4.4k tokens,
+    // and a fold leaves ~3.1k; a 2 800 reliable budget leaves no room for that
+    // retained tail, so the side question must report that truth instead of
+    // sending it.
     let (_tmp, server, app, client, session) =
-        harness_with_window(vec![response], 8_192, 3_400).await;
+        harness_with_window(vec![response], 8_192, 2_800).await;
     let db = app.open_database().await.unwrap();
     let repo = MessageRepository::new(&db);
     let history: Vec<String> = (0..8)

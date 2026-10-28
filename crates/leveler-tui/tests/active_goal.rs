@@ -124,9 +124,9 @@ fn a_submitted_turn_shows_a_running_goal_with_its_clock() {
         header.starts_with(" CodeLeveler"),
         "identity intact: {header:?}"
     );
-    assert!(header.contains("◆ 修复断线后任务续接 · 0s"), "{header:?}");
+    assert!(header.contains("◎ /goal 执行中 (0s)"), "{header:?}");
     assert!(
-        header.contains("目标模式 · 执行中"),
+        header.contains("/goal 执行中"),
         "the right-hand goal keeps one column off the terminal edge: {header:?}"
     );
 }
@@ -136,7 +136,7 @@ fn no_goal_means_no_indicator() {
     let mut state = state();
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
-    assert!(!header.contains('◆'));
+    assert!(!header.contains('◎'));
     assert!(!header.contains('◐'));
     assert!(!header.contains('✓'));
 }
@@ -149,7 +149,7 @@ fn explicit_goal_header_distinguishes_submission_from_runtime_execution() {
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
     assert!(
-        header.contains("目标模式") && header.contains("发送中"),
+        header.contains("/goal") && header.contains("发送中"),
         "{header}"
     );
     assert!(!header.contains("执行中"), "{header}");
@@ -164,14 +164,14 @@ fn explicit_goal_header_distinguishes_submission_from_runtime_execution() {
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
     assert!(
-        header.contains("目标模式") && header.contains("执行中"),
+        header.contains("/goal") && header.contains("执行中"),
         "{header}"
     );
     reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCancelled));
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
     assert!(
-        header.contains("目标模式") && header.contains("已暂停"),
+        header.contains("/goal") && header.contains("已暂停"),
         "{header}"
     );
 }
@@ -188,12 +188,12 @@ fn goal_mode_remains_visible_without_an_active_turn_and_clears_explicitly() {
     for width in [40, 80] {
         let screen = rendered(&mut state, width, 12);
         let header = screen.lines().nth(1).unwrap();
-        assert!(header.contains("目标模式"), "width {width}: {header}");
+        assert!(header.contains("/goal"), "width {width}: {header}");
         assert!(!header.contains("执行中"), "{header}");
     }
     submit(&mut state, "/goal clear");
     let screen = rendered(&mut state, 80, 12);
-    assert!(!screen.lines().nth(1).unwrap().contains("目标模式"));
+    assert!(!screen.lines().nth(1).unwrap().contains("/goal"));
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn ordinary_chat_active_goal_does_not_claim_goal_mode() {
     let screen = rendered(&mut state, 80, 12);
     let header = screen.lines().nth(1).unwrap();
     assert!(!header.contains("修复断线"), "{header}");
-    assert!(!header.contains("目标模式"), "{header}");
+    assert!(!header.contains("/goal"), "{header}");
     assert!(!leveler_tui::active_goal::has_visible_goal(&state));
 }
 
@@ -218,7 +218,8 @@ fn goal_followups_keep_the_explicit_objective_until_a_new_goal_is_set() {
     assert_eq!(goal.objective(), "打通 MCP 页面操作");
     let screen = rendered(&mut state, 100, 12);
     let header = screen.lines().nth(1).unwrap();
-    assert!(header.contains("打通 MCP 页面操作"), "{header}");
+    assert!(header.contains("/goal"), "{header}");
+    assert!(!header.contains("打通 MCP 页面操作"), "{header}");
     assert!(!header.contains("按你说的顺序"), "{header}");
 
     reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCancelled));
@@ -262,7 +263,7 @@ fn a_reconnect_to_a_running_session_adopts_its_goal() {
     let goal = state.active_goal.as_ref().expect("live turn owns a goal");
     assert_eq!(goal.title(), "调查 Windows CI flaky test");
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("◆ 调查 Windows CI flak"), "{screen}");
+    assert!(screen.contains("◎ /goal 执行中 (0s)"), "{screen}");
 }
 
 #[test]
@@ -277,7 +278,7 @@ fn esc_pauses_the_goal_and_continue_resumes_the_same_one() {
     assert_eq!(paused.phase(), leveler_tui::active_goal::GoalPhase::Paused);
     assert_eq!(paused.title(), "修复断线后任务续接");
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("◐ 修复断线后任务续接"), "{screen}");
+    assert!(screen.contains("◎ /goal 已暂停"), "{screen}");
 
     // `继续` re-enters the same goal: same identity, no new goal, and the
     // `↻` mark while the runtime picks the task back up.
@@ -289,7 +290,17 @@ fn esc_pauses_the_goal_and_continue_resumes_the_same_one() {
     );
     assert_eq!(resuming.title(), "修复断线后任务续接");
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("↻ 修复断线后任务续接"), "{screen}");
+    assert!(screen.contains("◎ /goal 发送中"), "{screen}");
+    let command_id = state.pending_submissions.last().unwrap().command_id.clone();
+    reduce(
+        &mut state,
+        Action::EffectCompleted(leveler_tui::action::EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: None,
+        }),
+    );
+    let screen = rendered(&mut state, 80, 12);
+    assert!(screen.contains("◎ /goal 正在恢复"), "{screen}");
 
     // The first real model round settles it back to running.
     reduce(
@@ -303,7 +314,7 @@ fn esc_pauses_the_goal_and_continue_resumes_the_same_one() {
         leveler_tui::active_goal::GoalPhase::Running
     );
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("◆ 修复断线后任务续接"), "{screen}");
+    assert!(screen.contains("◎ /goal 执行中"), "{screen}");
 }
 
 #[test]
@@ -319,7 +330,7 @@ fn a_reconnecting_runtime_shows_the_resuming_mark() {
         }),
     );
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("↻ 调查 Windows CI"), "{screen}");
+    assert!(screen.contains("◎ /goal 正在恢复"), "{screen}");
 }
 
 #[test]
@@ -361,7 +372,7 @@ fn completion_turns_green_and_fails_stay() {
     assert!(!completed.is_expired(now + std::time::Duration::from_secs(3)));
     assert!(completed.is_expired(now + std::time::Duration::from_secs(60)));
     let screen = rendered(&mut completed_state, 80, 12);
-    assert!(screen.contains("✓ 调查 Windows CI flak"), "{screen}");
+    assert!(screen.contains("◎ /goal 已完成"), "{screen}");
 
     // A hard failure never times out.
     let mut failed = state();
@@ -379,7 +390,7 @@ fn completion_turns_green_and_fails_stay() {
     let screen = rendered(&mut failed, 80, 12);
     // The failure indicator stays (it is actionable) but must never read as a
     // live turn: it states the phase and drops the live marker.
-    assert!(screen.contains("! 调查 Windows CI flak"), "{screen}");
+    assert!(screen.contains("◎ /goal 失败"), "{screen}");
     assert!(
         screen.contains("失败"),
         "a failed turn says so in words: {screen}"
@@ -419,7 +430,7 @@ fn a_paused_turn_states_the_phase_and_drops_the_live_marker() {
     let goal = state.active_goal.as_ref().unwrap();
     assert_eq!(goal.phase(), leveler_tui::active_goal::GoalPhase::Paused);
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("◐"), "{screen}");
+    assert!(screen.contains("◎ /goal 已暂停"), "{screen}");
     assert!(screen.contains("已暂停"), "the phase is stated: {screen}");
     assert!(
         !screen.contains('↗'),
@@ -437,7 +448,7 @@ fn a_new_goal_replaces_a_completed_one() {
     assert_eq!(goal.title(), "goal b");
     assert_eq!(goal.phase(), leveler_tui::active_goal::GoalPhase::Running);
     let screen = rendered(&mut state, 80, 12);
-    assert!(screen.contains("◆ goal b"), "{screen}");
+    assert!(screen.contains("◎ /goal 执行中"), "{screen}");
     assert!(!screen.contains("goal a"), "{screen}");
 }
 
@@ -448,15 +459,21 @@ fn a_narrow_terminal_keeps_the_glyph_and_clock_and_never_overlaps() {
         &mut state,
         "修复断线 / ESC 后任务无法正确续接，需要调查 continuation runtime",
     );
-    // Wide: full title.
+    // Wide: compact mode, state and clock.
     let wide = rendered(&mut state, 100, 12);
-    assert!(wide.contains("修复断线"), "{wide}");
-    // Medium: title truncated, clock intact, still one row.
+    assert!(
+        wide.lines().nth(1).unwrap().contains("/goal 执行中 (0s)"),
+        "{wide}"
+    );
+    // Medium: the same badge and clock fit on one row.
     let medium = rendered(&mut state, 52, 12);
     let header = medium.lines().nth(1).unwrap();
-    assert!(header.contains('◆'), "{header:?}");
+    assert!(header.contains('◎'), "{header:?}");
     assert!(header.contains("0s"), "clock survives: {header:?}");
-    assert!(header.contains('…'), "title truncated: {header:?}");
+    assert!(
+        !header.contains("修复断线"),
+        "objective stays in detail: {header:?}"
+    );
     // Narrow: identity and clock only.
     let narrow = rendered(&mut state, 20, 12);
     let header = narrow.lines().nth(1).unwrap();
@@ -489,14 +506,14 @@ fn a_wide_header_caps_the_goal_instead_of_sacrificing_repository_context() {
         header.contains("/workspace/CodeLeveler"),
         "a long goal must leave the repository context readable: {header:?}"
     );
-    let goal = header.split('◆').nth(1).expect("running goal in header");
+    let goal = header.split('◎').nth(1).expect("running goal in header");
     assert!(
         UnicodeWidthStr::width(goal.trim()) <= 48,
         "goal chrome must have a fixed display-width ceiling: {header:?}"
     );
     assert!(
-        header.contains('…'),
-        "the capped goal should be explicit: {header:?}"
+        !header.contains("不要参考"),
+        "the objective belongs in the detail page: {header:?}"
     );
 }
 
@@ -540,7 +557,7 @@ fn clicking_the_header_goal_opens_the_same_detail_page() {
     submit_goal(&mut state, "检查完整目标的点击入口");
     let workbench = rendered(&mut state, 80, 12);
     let header = workbench.lines().nth(1).expect("header row");
-    let goal_byte = header.find('◆').expect("goal affordance");
+    let goal_byte = header.find('◎').expect("goal affordance");
     let goal_column = UnicodeWidthStr::width(&header[..goal_byte]) as u16 + 2;
 
     reduce(
@@ -564,11 +581,32 @@ fn an_emoji_or_cjk_title_stays_on_one_row() {
     submit_goal(&mut state, "🚀 修复断线后任务续接");
     let screen = rendered(&mut state, 40, 12);
     let header = screen.lines().nth(1).unwrap();
-    assert!(header.contains("目标模式"), "{header:?}");
+    assert!(header.contains("/goal"), "{header:?}");
     assert!(!header.contains('\n'));
     assert_eq!(
         header.width(),
         40,
         "no wrap on a narrow-ish row: {header:?}"
     );
+}
+
+#[test]
+fn compact_goal_badge_supports_both_interface_languages() {
+    for (locale, expected) in [
+        (leveler_tui::Locale::Zh, "◎ /goal 执行中 (0s)"),
+        (leveler_tui::Locale::En, "◎ /goal active (0s)"),
+    ] {
+        let mut state = state();
+        state.locale = locale;
+        submit_goal(
+            &mut state,
+            "a long objective that belongs in the detail page",
+        );
+        for width in [40, 80] {
+            let screen = rendered(&mut state, width, 12);
+            let header = screen.lines().nth(1).unwrap();
+            assert!(header.contains(expected), "{header}");
+            assert!(!header.contains("a long objective"), "{header}");
+        }
+    }
 }

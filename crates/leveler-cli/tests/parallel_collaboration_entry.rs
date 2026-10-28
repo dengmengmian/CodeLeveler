@@ -167,6 +167,44 @@ async fn run_collaborations(env: &TestEnv, task: &str) -> Vec<String> {
     found
 }
 
+/// How many goals each session that ran `task` opened.
+///
+/// This is the durable proof of which execution profile a run used: a goal
+/// profile opens the goal, and the axis is read afterwards — a finished window
+/// legitimately leaves `chat` behind it.
+async fn run_goal_counts(env: &TestEnv, task: &str) -> Vec<usize> {
+    let projects = env.home.join("state/projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let db_path = entry.path().join("sessions.db");
+        if !db_path.is_file() {
+            continue;
+        }
+        let db = Database::connect(&db_path).await.unwrap();
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        for session in SessionRepository::new(&db).list().await.unwrap() {
+            if session.goal != task {
+                continue;
+            }
+            let opened = match stores
+                .tasks
+                .task_for_session(&leveler_core::SessionId::new(session.id.as_str()))
+                .await
+                .unwrap()
+            {
+                Some(task_id) => stores.goals.for_task(&task_id).await.unwrap().len(),
+                None => 0,
+            };
+            found.push(opened);
+        }
+    }
+    found.sort();
+    found
+}
+
 /// How many git worktrees the repository has: the main checkout plus one per
 /// candidate. A refused run leaves exactly the main checkout.
 fn worktree_count(repo: &Path) -> usize {
@@ -273,9 +311,18 @@ async fn explicit_goal_parallel_axis_reaches_parent_and_children() {
     assert!(status.success(), "leveler run failed:\n{}", read_log(&log));
 
     assert_eq!(
+        run_goal_counts(&env, "parallel goal axis").await,
+        vec![0, 1, 1, 1],
+        "the parent dispatches, and all three candidates must run the goal profile"
+    );
+    // Every candidate closed its own Goal route with its terminal. The parent
+    // never opened a goal — it only dispatches — so it keeps the axis of a
+    // goal-run session: a later message there declares a new goal instead of
+    // silently continuing work nobody ran.
+    assert_eq!(
         run_collaborations(&env, "parallel goal axis").await,
-        vec!["goal", "goal", "goal", "goal"],
-        "the parent and all three candidates must run the goal axis"
+        vec!["chat", "chat", "chat", "goal"],
+        "candidate windows end their Goal route; the goal-less dispatcher keeps its declaration axis"
     );
     let bodies = server.request_bodies().await;
     assert_candidate_count(&bodies, &log);
@@ -296,9 +343,9 @@ async fn omitted_parallel_axis_is_goal() {
     assert!(status.success(), "leveler run failed:\n{}", read_log(&log));
 
     assert_eq!(
-        run_collaborations(&env, "parallel default axis").await,
-        vec!["goal", "goal", "goal"],
-        "an omitted axis must resolve to the product default"
+        run_goal_counts(&env, "parallel default axis").await,
+        vec![0, 1, 1],
+        "an omitted axis must resolve to the product default (goal) for the candidates"
     );
 }
 

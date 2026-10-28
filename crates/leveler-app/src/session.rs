@@ -385,6 +385,9 @@ pub(crate) async fn checkpoint_reaped_sessions(
                     goal_id: goal.id,
                     windows_delta: 0,
                     settle: true,
+                    // An explicit cancellation is terminal: no continuation
+                    // can re-enter this goal, so its session leaves Goal mode.
+                    ends_session_goal: true,
                 });
             engine
                 .finish_task(
@@ -1142,6 +1145,9 @@ impl Application {
                 // Cancelling is not a work window.
                 windows_delta: 0,
                 settle: true,
+                // The logical task ends: a later ordinary message is a
+                // conversation, not a new Goal.
+                ends_session_goal: true,
             });
         let mut events = Vec::new();
         engine

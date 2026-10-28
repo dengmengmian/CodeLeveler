@@ -237,13 +237,27 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
     }
 }
 
-fn goal_owes_no_more_work(result: &Result<TaskReport, EngineError>) -> bool {
-    match result {
-        Ok(report) => matches!(
-            report.outcome,
-            TaskOutcome::Completed | TaskOutcome::Blocked | TaskOutcome::Failed
-        ),
-        Err(_) => false,
+/// Record on the terminal whether its goal still owes work.
+///
+/// `resume` re-enters a goal whose last window left work owed, so an owed goal
+/// is exactly one a continuation can re-enter: [`task_outcome_is_resumable`].
+/// A blocked, interrupted or recoverably-failed goal is owed; a delivered or
+/// explicitly-cancelled one is not.
+///
+/// An INFRASTRUCTURE fault is not a verdict on the user's request. Nothing was
+/// decided there, and a restart must still be able to find the goal, so only a
+/// typed unrecoverable provider fault (`decided == false`, failure present)
+/// closes the work.
+fn settle_goal_from_terminal(terminal: &mut leveler_engine::TaskTerminal, decided: bool) {
+    let reenterable =
+        task_outcome_is_resumable(terminal.outcome, terminal.stop, terminal.failure.as_ref());
+    let settled = if decided {
+        !reenterable
+    } else {
+        terminal.failure.is_some() && !reenterable
+    };
+    if let Some(goal) = terminal.goal.as_mut() {
+        goal.settle = settled;
     }
 }
 
@@ -886,13 +900,38 @@ impl CodingRuntime {
     /// crash between `steer_into_goal` and the executor's next round it may be
     /// the only surviving copy of the user's objective, and a later `继续`
     /// must continue that objective rather than become one itself.
+    ///
+    /// `continue_running` says this turn is a message inside the session's
+    /// existing goal rather than a new declaration. A session that still owes a
+    /// running goal continues THAT goal: opening a sibling whose objective is
+    /// whatever sentence the user happened to type drops the original scope
+    /// and leaves two goals for one task. An explicit `/develop <task>` is a
+    /// new declaration and passes `false`.
     async fn open_goal_for_turn(
         &self,
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         fallback_objective: &str,
-    ) -> Result<leveler_core::GoalId, EngineError> {
+        continue_running: bool,
+    ) -> Result<(leveler_core::GoalId, bool), EngineError> {
         let pending = self.engine.stores.sessions.pending_goal(session_id).await?;
+        if pending.is_none() && continue_running {
+            // The session's route already decided this message is goal work, so
+            // it continues the work that route is about. One owed goal is
+            // unambiguous. With two owed goals the one this session was last
+            // DRIVING is still a durable fact (the turn's WAL binding), so that
+            // is continued instead of opening a third identity.
+            if let Some(goal) = self.single_running_goal(&token.task_id).await? {
+                return Ok((goal, true));
+            }
+            if let Some(goal_id) = self.latest_bound_goal(session_id).await?
+                && let Some(record) = self.engine.stores.goals.get(&goal_id).await?
+                && record.task_id == token.task_id
+                && record.state == leveler_storage::GoalState::Running
+            {
+                return Ok((record.id, true));
+            }
+        }
         let objective = match pending {
             Some(pending) => pending,
             None => {
@@ -925,7 +964,30 @@ impl CodingRuntime {
         // The declaration is consumed by the turn start, atomically with its
         // WAL row — never here. A crash before that start must leave the text
         // recoverable.
-        self.open_or_reuse_goal(token, &objective).await
+        Ok((self.open_or_reuse_goal(token, &objective).await?, false))
+    }
+
+    /// The task's running goal when identity is unambiguous.
+    ///
+    /// More than one running goal means the task hosts two live objectives, so
+    /// nothing here may pick one: the caller falls back to matching the
+    /// objective text (recovery) instead of guessing.
+    async fn single_running_goal(
+        &self,
+        task_id: &leveler_core::TaskId,
+    ) -> Result<Option<leveler_core::GoalId>, EngineError> {
+        let mut running = self
+            .engine
+            .stores
+            .goals
+            .for_task(task_id)
+            .await?
+            .into_iter()
+            .filter(|goal| goal.state == leveler_storage::GoalState::Running);
+        let Some(first) = running.next() else {
+            return Ok(None);
+        };
+        Ok(running.next().is_none().then_some(first.id))
     }
 
     /// Re-attribute every Chat window that was bound to this goal.
@@ -1449,19 +1511,39 @@ impl CodingRuntime {
         );
         let resolution_phase =
             begin_finalization_phase(&log, FINALIZATION_RESOLVING_OUTCOME, observer).await;
-        let mut goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
+        let goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
             goal_id: goal_id.clone(),
             windows_delta: result.as_ref().map(|report| report.windows).unwrap_or(1),
-            settle: goal_owes_no_more_work(result),
+            // Decided from the FINAL terminal below. The draft of an outcome is
+            // not evidence: a cancel observed while finalizing, or a
+            // continuation checkpoint that could not be cut, revises it.
+            settle: false,
+            // Decided with the terminal below, once the outcome is final.
+            ends_session_goal: false,
         });
+        // Whether this session routes ordinary messages to the Goal profile.
+        // Read at terminal time: a `/goal` accepted mid-turn is the user's
+        // current choice, and this is the commit that may end it.
+        let goal_session = self
+            .engine
+            .stores
+            .sessions
+            .collaboration(session_id)
+            .await?
+            .as_deref()
+            == Some(leveler_lifecycle::CollaborationMode::Goal.as_str());
         // A cooperative stop is `interrupted` (resumable) by default. When the
         // user explicitly cancelled the LOGICAL task, the same stop is
-        // `cancelled`: terminal, and it settles the goal instead of leaving it
-        // owed, so a later `继续` cannot reopen it.
+        // `cancelled`: terminal, so no later `继续` can reopen the work.
         let explicit_task_cancel = interrupted && self.task_cancel.load(Ordering::SeqCst);
-        if explicit_task_cancel && let Some(goal) = goal_update.as_mut() {
-            goal.settle = true;
-        }
+        // Is this terminal a DECISION about the work (the harness finished with
+        // a verdict, or the user ended it), or a fault that decided nothing?
+        // Only a decision can close a goal whose work was never delivered.
+        let decided = match &result {
+            Ok(_) => true,
+            Err(EngineError::Cancelled) => explicit_task_cancel,
+            Err(_) => false,
+        };
         let mut terminal = match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);
@@ -1577,9 +1659,6 @@ impl CodingRuntime {
                 terminal.failure = None;
                 terminal.status = SessionStatus::Interrupted;
                 terminal.state = AgentState::Execute;
-                if let Some(goal) = terminal.goal.as_mut() {
-                    goal.settle = false;
-                }
                 terminal.warnings.clear();
                 goal_continues = true;
             }
@@ -1614,9 +1693,6 @@ impl CodingRuntime {
             terminal.stop = None;
             terminal.status = SessionStatus::Interrupted;
             terminal.state = AgentState::Execute;
-            if let Some(goal) = terminal.goal.as_mut() {
-                goal.settle = false;
-            }
             terminal.warnings.clear();
             // Interrupted work retains its background processes. The ticket is
             // only a detached target set and has performed no side effect yet.
@@ -1628,6 +1704,13 @@ impl CodingRuntime {
         if interrupted {
             crate::test_barrier::hit_before_cancel_terminal_persist();
         }
+        // ONE rule decides whether the goal still owes work: the terminal's own
+        // resumability. It is derived from the terminal actually being
+        // committed, after every revision above, so no path can leave a goal
+        // settled that a `继续` could still re-enter (or owed when nothing can
+        // follow it up).
+        settle_goal_from_terminal(&mut terminal, decided);
+        end_session_goal_route(&mut terminal, goal_session);
         let mut settled = self
             .engine
             .finish_task(token, session_id, terminal.clone(), observer)
@@ -1642,9 +1725,6 @@ impl CodingRuntime {
             terminal.status = SessionStatus::Cancelled;
             terminal.state = AgentState::Cancelled;
             terminal.warnings.clear();
-            if let Some(goal) = terminal.goal.as_mut() {
-                goal.settle = true;
-            }
             cancelled_at_commit = true;
             if cleanup_ticket.is_none() {
                 cleanup_ticket = match self.factory.tool_context.session_scope.as_deref() {
@@ -1652,6 +1732,10 @@ impl CodingRuntime {
                     None => None,
                 };
             }
+            // Storage arbitrated the race with the user's own cancel: that is
+            // a decision, not a fault.
+            settle_goal_from_terminal(&mut terminal, true);
+            end_session_goal_route(&mut terminal, goal_session);
             settled = self
                 .engine
                 .finish_task(token, session_id, terminal, observer)
@@ -1786,8 +1870,15 @@ impl CodingRuntime {
                 },
             )
             .await?;
-        let goal = match self
-            .open_goal_for_turn(&token, session_id, &spec.runtime.goal)
+        let (goal, continued_running) = match self
+            .open_goal_for_turn(
+                &token,
+                session_id,
+                &spec.runtime.goal,
+                // `/develop <task>` is an explicit new objective; an ordinary
+                // goal-profile message is work inside the goal already owed.
+                !develop,
+            )
             .await
         {
             Ok(goal) => goal,
@@ -1806,6 +1897,28 @@ impl CodingRuntime {
                 return result;
             }
         };
+        // A message that continues a running goal is user scope authority for
+        // that goal: a requirement it adds must reach the completion gate, or
+        // the goal could be resolved on the narrower original wording. The
+        // declaration-free path records it here; `/goal` and resume record it
+        // through their own amendment paths.
+        let instruction = spec.runtime.goal.trim();
+        if continued_running
+            && !instruction.is_empty()
+            && let Err(error) = self
+                .engine
+                .stores
+                .goals
+                .append_amendment(&token, &goal, instruction)
+                .await
+        {
+            tracing::warn!(
+                %error,
+                %session_id,
+                goal = %goal,
+                "could not record the continuation instruction with its goal"
+            );
+        }
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
             session_id.clone(),
@@ -2260,6 +2373,21 @@ impl CodingRuntime {
             .engine
             .mark_running(session_id, AgentState::Execute)
             .await?;
+        // Work the task still owes is what a continuation continues, even when
+        // the turn in front of it was a conversation. A blocked (or failed)
+        // window hands the conversation back to the user; the question they ask
+        // then ends as an ordinary Chat turn that carries no goal of its own —
+        // yet `继续` must re-enter the goal that owes the work. Exactly one
+        // running goal IS that work. More than one is ambiguous, so nothing is
+        // guessed and the resume stays a Chat continuation.
+        if lineage_was_chat
+            && lineage.goal_id.is_none()
+            && pending.is_none()
+            && let Some(owed) = self.single_running_goal(&token.task_id).await?
+        {
+            lineage.goal_id = Some(owed);
+            lineage.kind = ResumeTurnKind::Goal;
+        }
         if matches!(lineage.kind, ResumeTurnKind::Goal) && lineage.goal_id.is_none() {
             // Identity first: a single running goal IS the work this turn was
             // continuing (the mid-turn bind). The durable declaration outranks
@@ -2267,14 +2395,15 @@ impl CodingRuntime {
             let bound = if lineage_was_chat && pending.is_none() {
                 match self.unique_legacy_running_goal(session_id).await? {
                     Some(goal_id) => Ok(goal_id),
-                    None => {
-                        self.open_goal_for_turn(&token, session_id, lineage.objective.text())
-                            .await
-                    }
+                    None => self
+                        .open_goal_for_turn(&token, session_id, lineage.objective.text(), true)
+                        .await
+                        .map(|(goal, _)| goal),
                 }
             } else {
-                self.open_goal_for_turn(&token, session_id, lineage.objective.text())
+                self.open_goal_for_turn(&token, session_id, lineage.objective.text(), true)
                     .await
+                    .map(|(goal, _)| goal)
             };
             lineage.goal_id = match bound {
                 Ok(goal_id) => Some(goal_id),
@@ -3846,6 +3975,82 @@ fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
     )
 }
 
+/// Whether the runtime's own continuation path can resume this terminal.
+///
+/// This is the ONE rule behind two surfaces: what the client offers as `继续`
+/// and what the resume path will accept. They must agree — a session that still
+/// advertises a continuation while `继续` is refused (or the reverse) is a lie
+/// in one of them.
+///
+/// Resumability is a different fact from the session's Goal route: a terminal
+/// can be resumable while its goal no longer claims the conversation, and the
+/// resume path reopens that goal by id when the user does continue.
+///
+/// It is a classification of the terminal fact, never of the user's words.
+pub fn task_outcome_is_resumable(
+    outcome: TaskOutcome,
+    stop: Option<crate::StopReason>,
+    failure: Option<&leveler_model::ModelError>,
+) -> bool {
+    use crate::StopReason;
+    match outcome {
+        TaskOutcome::Interrupted | TaskOutcome::BudgetLimited => true,
+        TaskOutcome::Failed => failure.is_some_and(|error| {
+            matches!(
+                error.kind,
+                leveler_model::ModelErrorKind::ProviderUnavailable
+                    | leveler_model::ModelErrorKind::Transport
+                    | leveler_model::ModelErrorKind::StreamInterrupted
+                    | leveler_model::ModelErrorKind::Timeout
+                    | leveler_model::ModelErrorKind::RateLimit
+            )
+        }),
+        // An answer is not a completion declaration. Every other Completed
+        // terminal (a declared `completed` stop, or a legacy row with no stop)
+        // is one.
+        TaskOutcome::Completed => stop == Some(StopReason::Answered),
+        // A blocked goal still owes its work, so `继续` retries that same goal.
+        // It no longer holds the session's route: the window ended, and the
+        // next ordinary message is a conversation.
+        TaskOutcome::Blocked => true,
+        TaskOutcome::Cancelled => false,
+    }
+}
+
+/// End the session's Goal route at a goal window's terminal.
+///
+/// The route answers exactly one question: is this session's next ordinary
+/// message a piece of goal work? Two kinds of terminal end it, because the
+/// window no longer speaks for the conversation:
+///
+/// - delivered or cancelled: there is nothing left to continue;
+/// - blocked or failed: the model handed control back, and the user's next
+///   message is them answering — a question, not a new work order.
+///
+/// Leaving the route behind after one of those is what minted a NEW goal whose
+/// objective was the sentence the user typed (`为什么没有权限？` — the reported
+/// accident).
+///
+/// A PAUSED window is different: an interruption or a round boundary left the
+/// work mid-flight with nothing for the user to answer, so the session keeps its
+/// route and the supplement they type next continues the same goal (one of the
+/// reasons a goal survives its work window at all).
+///
+/// Either way the goal keeps its identity, objective and recovery path: a
+/// continuation re-enters this exact goal by id (see `resume_goal`), and work
+/// declared from a Chat turn joins the task's one owed goal instead of opening a
+/// duplicate (see `TurnGoalBinder::bind`).
+fn end_session_goal_route(terminal: &mut leveler_engine::TaskTerminal, goal_session: bool) {
+    let Some(goal) = terminal.goal.as_mut() else {
+        return;
+    };
+    let paused = matches!(
+        terminal.outcome,
+        TaskOutcome::Interrupted | TaskOutcome::BudgetLimited
+    );
+    goal.ends_session_goal = goal_session && !paused;
+}
+
 /// Map non-success agent stops for Direct conclude (shipped path used by
 /// `conclude_direct`).
 pub(crate) fn direct_non_success_outcome(stop: crate::StopReason) -> Option<TaskOutcome> {
@@ -4291,5 +4496,85 @@ mod continuation_lineage_tests {
             Role::User,
             "Continue implementing feature X"
         )));
+    }
+}
+
+/// The continuation rule every Goal-route decision reads. A wrong answer here
+/// either strands owed work (a route released while `继续` still resumes it) or
+/// keeps a Goal session alive after its goal is over (every later message opens
+/// a new Goal). Both are product failures, so the table is locked.
+#[cfg(test)]
+mod continuation_rule_tests {
+    use super::*;
+    use leveler_lifecycle::StopReason;
+
+    fn recoverable() -> leveler_model::ModelError {
+        leveler_model::ModelError::new(leveler_model::ModelErrorKind::Transport, "connection reset")
+    }
+
+    fn hard() -> leveler_model::ModelError {
+        leveler_model::ModelError::new(leveler_model::ModelErrorKind::InvalidRequest, "bad request")
+    }
+
+    #[test]
+    fn a_declared_completion_is_final_and_an_answer_is_not() {
+        assert!(!task_outcome_is_resumable(
+            TaskOutcome::Completed,
+            Some(StopReason::Completed),
+            None
+        ));
+        // A legacy terminal with no stop is a declaration too.
+        assert!(!task_outcome_is_resumable(
+            TaskOutcome::Completed,
+            None,
+            None
+        ));
+        // A quiet answer proved nothing about the work.
+        assert!(task_outcome_is_resumable(
+            TaskOutcome::Completed,
+            Some(StopReason::Answered),
+            None
+        ));
+    }
+
+    #[test]
+    fn owed_and_interrupted_work_stays_resumable() {
+        for outcome in [
+            TaskOutcome::Interrupted,
+            TaskOutcome::BudgetLimited,
+            TaskOutcome::Blocked,
+        ] {
+            assert!(
+                task_outcome_is_resumable(outcome, None, None),
+                "{outcome:?} still owes its work"
+            );
+        }
+    }
+
+    #[test]
+    fn failures_are_resumable_only_when_the_fault_is_recoverable() {
+        assert!(task_outcome_is_resumable(
+            TaskOutcome::Failed,
+            None,
+            Some(&recoverable())
+        ));
+        assert!(!task_outcome_is_resumable(
+            TaskOutcome::Failed,
+            None,
+            Some(&hard())
+        ));
+        assert!(
+            !task_outcome_is_resumable(TaskOutcome::Failed, None, None),
+            "an untyped failure is not evidence of a recoverable fault"
+        );
+    }
+
+    #[test]
+    fn an_explicit_cancellation_is_never_resumable() {
+        assert!(!task_outcome_is_resumable(
+            TaskOutcome::Cancelled,
+            None,
+            None
+        ));
     }
 }

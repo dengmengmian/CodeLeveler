@@ -155,6 +155,29 @@ fn request(
     }
 }
 
+/// The tool names the model request actually advertised. A goal contract quoted
+/// inside the conversation history (an earlier `update_goal` call) is not a
+/// surface: only the request's own `tools` table decides what the turn can do.
+fn tool_names(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    value["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool["function"]["name"]
+                        .as_str()
+                        .or_else(|| tool["name"].as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn collaboration_of(app: &Application, session: &SessionId) -> String {
     let db = app.open_database().await.unwrap();
     SessionRepository::new(&db)
@@ -178,7 +201,10 @@ async fn wait_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) 
                 | RuntimeEvent::TurnTruncated { .. }
                 | RuntimeEvent::TurnIncomplete { .. }
                 | RuntimeEvent::TurnFailed { .. }
-                | RuntimeEvent::TurnCancelled => return,
+                | RuntimeEvent::TurnCancelled
+                // An explicit logical-task cancellation is terminal too; without
+                // this arm a test waiting on it would hang instead of failing.
+                | RuntimeEvent::TaskCancelled => return,
                 _ => continue,
             },
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
@@ -305,13 +331,17 @@ async fn omitted_axis_is_goal_and_survives_a_reopen() {
     );
 }
 
-/// E + F — `/goal <task>` writes the axis durably; only an explicit axis change
-/// returns the session to chat.
+/// E + F — `/goal <task>` writes the axis durably, and a window the runtime
+/// merely paused keeps it; only an explicit axis change (or the window ending)
+/// leaves Goal mode.
 #[tokio::test]
 async fn run_goal_is_durable_and_explicit_chat_restores_chat() {
     use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
 
-    let (_tmp, _server, app, client) = harness(vec![goal_complete_tool_call()]).await;
+    // Paused, not blocked: an interrupted window leaves the goal owed with
+    // nothing for the user to answer, which is the state a durable Goal route
+    // exists for.
+    let (_tmp, _server, app, client) = harness(vec![long_tool_call(10)]).await;
     let session = client
         .create_session(request("start as chat", CollaborationMode::Chat))
         .await
@@ -328,11 +358,19 @@ async fn run_goal_is_durable_and_explicit_chat_restores_chat() {
         })
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
     wait_terminal(&mut rx).await;
     assert_eq!(
         collaboration_of(&app, &session).await,
         "goal",
-        "`/goal <task>` must leave a durable goal axis, not a one-turn override"
+        "`/goal <task>` must leave a durable goal axis while the paused goal is \
+         owed, not a one-turn override"
     );
 
     // `/goal clear` / `/collab chat` is the explicit way back.
@@ -659,7 +697,8 @@ fn slow_tool_call() -> MockResponse {
 
 /// The real incident's entry path: a client sends the literal `/goal <task>`
 /// as an ordinary message. The runtime must parse it, write the durable goal
-/// axis, and run a Goal turn — the command cannot be a per-client feature.
+/// axis, and run a Goal turn — the command cannot be a per-client feature. The
+/// completed goal then ends its own route.
 #[tokio::test]
 async fn submit_message_goal_command_enters_goal_mode_from_any_client() {
     use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
@@ -684,14 +723,22 @@ async fn submit_message_goal_command_enters_goal_mode_from_any_client() {
         .unwrap();
     wait_terminal(&mut rx).await;
 
+    let goals = goals_of(&app, &session).await;
+    assert_eq!(goals.len(), 1, "the command opened one goal: {goals:?}");
+    assert_eq!(
+        goals[0].objective, "now drive it",
+        "the objective is the user's text, not the command word"
+    );
     assert_eq!(
         collaboration_of(&app, &session).await,
-        "goal",
-        "`/goal <task>` sent as plain text must still write the durable axis"
+        "chat",
+        "the goal completed, so the route it wrote ended with it"
     );
     let bodies = server.request_bodies().await;
     assert!(
-        bodies.iter().any(|body| body.contains("\"update_goal\"")),
+        bodies
+            .iter()
+            .any(|body| tool_names(body).iter().any(|name| name == "update_goal")),
         "the turn must run the Goal executor: {bodies:?}"
     );
     assert!(
@@ -755,13 +802,24 @@ async fn steering_goal_command_upgrades_the_running_chat_turn() {
         .unwrap();
     wait_terminal(&mut rx).await;
 
-    assert_eq!(collaboration_of(&app, &session).await, "goal");
+    let goals = goals_of(&app, &session).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the steer opened one goal for the running turn: {goals:?}"
+    );
+    assert_eq!(goals[0].objective, "drive the goal now");
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "chat",
+        "the upgraded goal completed, so its route ended with it"
+    );
     let bodies = server.request_bodies().await;
     assert!(
         bodies
             .iter()
             .skip(1)
-            .any(|body| body.contains("\"update_goal\"")),
+            .any(|body| tool_names(body).iter().any(|name| name == "update_goal")),
         "the RUNNING turn must gain the goal surface: {bodies:?}"
     );
     assert!(
@@ -1092,4 +1150,282 @@ async fn a_mid_turn_upgrade_resumes_as_its_goal() {
             .any(|body| body.contains("\"update_goal\"")),
         "the resumed turn advertises the goal surface: {bodies:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The Goal route ends with the goal. A completed (or cancelled) goal can never
+// be continued, so its session must stop routing ordinary messages to the Goal
+// profile — otherwise every later message silently opens a NEW Goal and the UI
+// keeps claiming Goal mode the runtime no longer runs.
+// ---------------------------------------------------------------------------
+
+/// The task's goals, newest first.
+async fn goals_of(app: &Application, session: &SessionId) -> Vec<leveler_storage::GoalRecord> {
+    let db = app.open_database().await.unwrap();
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let Some(task) = stores.tasks.task_for_session(session).await.unwrap() else {
+        return Vec::new();
+    };
+    stores.goals.for_task(&task).await.unwrap()
+}
+
+/// Wait for the axis the runtime published to clients, and return it.
+async fn wait_published_axis(
+    rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    expected: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::SessionUpdated { session }))
+                if session.collaboration.as_deref() == Some(expected) =>
+            {
+                return;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => panic!("the runtime never published the `{expected}` axis"),
+        }
+    }
+}
+
+/// A goal that completed is over: the route ends with it, and the client is
+/// told (the UI displays the row, so a silent row change would leave a stale
+/// Goal chip behind).
+#[tokio::test]
+async fn a_completed_goal_ends_the_goal_route_and_publishes_it() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, _server, app, client) = harness(vec![goal_complete_tool_call()]).await;
+    let session = client
+        .create_session(request("drive it", CollaborationMode::Goal))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "do the work".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "chat",
+        "a completed goal must not leave the Goal route behind"
+    );
+    wait_published_axis(&mut rx, "chat").await;
+}
+
+/// The dogfood accident: after a completed goal, an ordinary message — and a
+/// bare `继续` that has nothing left to resume — are ordinary chat turns. No
+/// new Goal, no `update_goal` contract, and every tool stays available.
+#[tokio::test]
+async fn after_a_goal_completes_ordinary_messages_are_chat_turns() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, server, app, client) = harness(vec![
+        goal_complete_tool_call(),
+        text("已经推上去了，远端分支与本地一致。"),
+        text("没有可继续的任务。"),
+    ])
+    .await;
+    let session = client
+        .create_session(request("ship the change", CollaborationMode::Goal))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "ship it".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+    assert_eq!(collaboration_of(&app, &session).await, "chat");
+    let goals_after_completion = goals_of(&app, &session).await;
+    assert_eq!(goals_after_completion.len(), 1, "one goal ran");
+
+    // The exact sentence from the incident: a verification question.
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "确定都推上去了吗？".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    // A continuation word with nothing to resume falls back to the same path.
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: session.clone(),
+            content: "继续".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    let bodies = server.request_bodies().await;
+    assert_eq!(bodies.len(), 3, "goal, question, continuation: {bodies:?}");
+    for body in &bodies[1..] {
+        let tools = tool_names(body);
+        assert!(
+            !tools.iter().any(|name| name == "update_goal"),
+            "a plain message after a completed goal must not carry the goal contract: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|name| name == "run_command"),
+            "the ordinary agent keeps its full execution surface: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|name| name == "commit_task"),
+            "only an explicit model declaration may upgrade a Chat turn: {tools:?}"
+        );
+    }
+    assert!(
+        bodies[1].contains("确定都推上去了吗？"),
+        "the question reaches the model verbatim: {}",
+        bodies[1]
+    );
+    assert_eq!(
+        goals_of(&app, &session).await.len(),
+        1,
+        "an ordinary message must never create a second Goal"
+    );
+    assert_eq!(collaboration_of(&app, &session).await, "chat");
+}
+
+/// The reverse direction: a goal that still owes work keeps its route, and a
+/// plain supplement continues THAT goal instead of opening a sibling whose
+/// objective happens to be the user's sentence.
+#[tokio::test]
+async fn an_interrupted_goal_keeps_its_route_and_a_supplement_continues_it() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, _server, app, client) =
+        harness(vec![long_tool_call(10), goal_complete_tool_call()]).await;
+    let session = client
+        .create_session(request("保留原始目标", CollaborationMode::Goal))
+        .await
+        .unwrap()
+        .session
+        .id;
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "保留原始目标".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    // Interrupt the window while the slow tool call holds it open. The goal is
+    // owed, not finished, so the route must survive.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "goal",
+        "an interrupted goal still owes its work: the route stays"
+    );
+    let after_interrupt = goals_of(&app, &session).await;
+    assert_eq!(after_interrupt.len(), 1);
+    assert_eq!(
+        after_interrupt[0].state,
+        leveler_storage::GoalState::Running,
+        "the interrupted window did not settle the goal"
+    );
+
+    // A supplement without the word `继续`: still the same goal.
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "补充：只改 README 那一段".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    let goals = goals_of(&app, &session).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the supplement continues the running goal instead of opening a sibling: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].objective, "保留原始目标",
+        "identity stays the original objective, never the supplement text"
+    );
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Settled,
+        "the completed supplement settles the same goal"
+    );
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "chat",
+        "that settlement then ends the route"
+    );
+}
+
+/// An explicit cancellation is terminal: the goal can never be continued, so
+/// the session leaves Goal mode instead of turning the next message into a new
+/// Goal.
+#[tokio::test]
+async fn cancelling_the_logical_task_ends_the_goal_route() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, _server, app, client) = harness(vec![long_tool_call(10)]).await;
+    let session = client
+        .create_session(request("cancel me", CollaborationMode::Goal))
+        .await
+        .unwrap()
+        .session
+        .id;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "cancel me".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut rx).await;
+
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "chat",
+        "a cancelled goal is terminal: its session returns to Chat"
+    );
+    let goals = goals_of(&app, &session).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
 }

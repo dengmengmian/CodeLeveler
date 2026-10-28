@@ -389,6 +389,34 @@ impl TerminalRepository<'_> {
                     return Err(crate::OwnershipError::Storage(error.into()));
                 }
             }
+            // The goal's window ended, so its goal no longer claims the
+            // session's next message. Conditional on the declaration being
+            // absent: a `/goal <other>` written while this turn ran is the
+            // user's newer intent and must survive. Written here, in the same
+            // transaction as the terminal, so no message can be routed by a
+            // half-updated axis.
+            //
+            // A goal may end its route while still owing work (blocked,
+            // failed, or paused at a budget): that goal stays `running` and is
+            // re-entered by an explicit continuation, not by every later
+            // message.
+            if goal.ends_session_goal {
+                let released = sqlx::query(
+                    "UPDATE sessions SET collaboration = 'chat', updated_at = ?2 \
+                     WHERE id = ?1 AND collaboration = 'goal' AND pending_goal IS NULL",
+                )
+                .bind(session_id.as_str())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await;
+                match released {
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        return Err(crate::OwnershipError::Storage(error.into()));
+                    }
+                }
+            }
         }
         // The task terminal ends the execution, and with it the ownership it
         // ran under. The generation stays, so this token can never write
@@ -984,6 +1012,147 @@ mod tests {
         db.release(&new).await.unwrap();
     }
 
+    /// A closed window ends the session's Goal route EVEN WHEN THE GOAL STILL
+    /// OWES WORK.
+    ///
+    /// The two facts are independent: the goal owns the user's request, the
+    /// route owns the next ordinary message. A blocked window hands the
+    /// conversation back while the work stays owed and resumable, so the axis
+    /// must return to Chat without settling the goal.
+    #[tokio::test]
+    async fn a_route_may_end_while_its_goal_still_owes_work() {
+        let (db, session, token, goal) = db_with_owned_goal().await;
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 1,
+            settle: false,
+            ends_session_goal: true,
+        };
+
+        TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"blocked"}}"#,
+                TaskOutcome::Blocked,
+                SessionStatus::Blocked,
+                AgentState::Execute,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SessionRepository::new(&db)
+                .get(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .collaboration,
+            "chat",
+            "the closed window no longer claims the next message"
+        );
+        let owed = GoalStore::get(&db, &goal).await.unwrap().unwrap();
+        assert_eq!(
+            owed.state,
+            GoalState::Running,
+            "the work is still owed and resumable"
+        );
+        assert_eq!(owed.windows_run, 1, "the window is counted");
+    }
+
+    /// A goal terminal nothing can continue also ends the session's Goal route:
+    /// the next ordinary message must be an ordinary message, not a new Goal.
+    #[tokio::test]
+    async fn a_final_goal_terminal_ends_the_session_goal_route() {
+        let (db, session, token, goal) = db_with_owned_goal().await;
+        assert_eq!(
+            SessionRepository::new(&db)
+                .get(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .collaboration,
+            "goal",
+            "the fixture starts as a Goal session"
+        );
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 1,
+            settle: true,
+            ends_session_goal: true,
+        };
+        TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SessionRepository::new(&db)
+                .get(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .collaboration,
+            "chat",
+            "an ended goal must not leave the Goal route behind"
+        );
+    }
+
+    /// A declaration the user made while the goal was ending is newer intent and
+    /// outranks the ended goal: the route and its objective both survive.
+    #[tokio::test]
+    async fn a_pending_declaration_survives_an_ending_goal_terminal() {
+        let (db, session, token, goal) = db_with_owned_goal().await;
+        SessionRepository::new(&db)
+            .set_pending_goal_if_absent(&session, "next objective", leveler_core::now())
+            .await
+            .unwrap();
+        let update = GoalTerminalUpdate {
+            goal_id: goal.clone(),
+            windows_delta: 1,
+            settle: true,
+            ends_session_goal: true,
+        };
+        TerminalRepository::new(&db)
+            .finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                Some(&update),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let repo = SessionRepository::new(&db);
+        assert_eq!(
+            repo.get(&session).await.unwrap().unwrap().collaboration,
+            "goal",
+            "a newer `/goal <task>` declaration keeps the session in Goal mode"
+        );
+        assert_eq!(
+            repo.pending_goal(&session).await.unwrap().as_deref(),
+            Some("next objective")
+        );
+    }
+
     #[tokio::test]
     async fn owned_task_terminal_commits_goal_projection_atomically() {
         let (db, session, token, goal) = db_with_owned_goal().await;
@@ -991,6 +1160,7 @@ mod tests {
             goal_id: goal.clone(),
             windows_delta: 3,
             settle: true,
+            ends_session_goal: false,
         };
 
         TerminalRepository::new(&db)
@@ -1056,6 +1226,7 @@ mod tests {
             goal_id: goal.clone(),
             windows_delta: 4,
             settle: true,
+            ends_session_goal: false,
         };
         let goal_conflict = TerminalRepository::new(&db)
             .finish_task_owned(
@@ -1123,6 +1294,7 @@ mod tests {
             goal_id: goal.clone(),
             windows_delta: 2,
             settle: false,
+            ends_session_goal: false,
         };
 
         TerminalRepository::new(&db)
@@ -1176,6 +1348,7 @@ mod tests {
             goal_id: other_goal.clone(),
             windows_delta: 1,
             settle: true,
+            ends_session_goal: false,
         };
 
         let result = TerminalRepository::new(&db)
@@ -1227,6 +1400,7 @@ mod tests {
             goal_id: goal.clone(),
             windows_delta: 1,
             settle: true,
+            ends_session_goal: false,
         };
 
         let result = TerminalRepository::new(&db)

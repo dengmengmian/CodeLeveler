@@ -1961,3 +1961,36 @@ fn key_notation_is_identical_in_both_locales() {
     // The verbs, however, must differ.
     assert!(zh.contains("查看") && en.contains("inspect"));
 }
+
+/// A Goal mode chip is a claim about the turn being run. The runtime ends that
+/// claim with the goal (a completed/cancelled goal can never be continued), so
+/// the client must drop it from the row the runtime publishes — not from a
+/// local guess.
+#[test]
+fn the_goal_mode_chip_clears_when_the_runtime_returns_to_chat() {
+    let mut state = opened_state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionUpdated {
+            session: session_snapshot(Some("goal".to_string())),
+        }),
+    );
+    state.goal_mode_active = true;
+    let text = render_at(100, 24, &mut state);
+    assert!(
+        text.contains("goal") || text.contains("目标"),
+        "a Goal session shows its axis: {text:?}"
+    );
+
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionUpdated {
+            session: session_snapshot(Some("chat".to_string())),
+        }),
+    );
+    assert_eq!(state.collaboration, "chat");
+    assert!(
+        !state.goal_mode_active,
+        "the runtime's Chat axis ends the Goal turn claim"
+    );
+}

@@ -159,18 +159,43 @@ fn run_to_completion(env: &TestEnv, args: &[&str], timeout: Duration) -> ExitSta
 /// written before the first model round, the round fails, and the process
 /// exits. Waiting for the exit keeps this test's own database reads from racing
 /// the run's migrations.
-async fn run_and_read_axis(env: &TestEnv, goal: &str, args: &[&str]) -> String {
+/// Run one headless entry and read what it left behind: the session's axis and
+/// the goals it opened.
+///
+/// The axis is read AFTER the run, so it is the route the next ordinary message
+/// would take — not the profile the run executed under. A window whose terminal
+/// closed that route leaves `chat`; a window that merely paused leaves `goal`.
+async fn run_and_read(env: &TestEnv, goal: &str, args: &[&str]) -> (String, usize) {
     let status = run_to_completion(env, args, Duration::from_secs(60));
     assert!(
         !status.success(),
         "the provider is unreachable, so the run cannot succeed"
     );
-    sessions(env)
+    let session = sessions(env)
         .await
         .into_iter()
         .find(|session| session.goal == goal)
-        .unwrap_or_else(|| panic!("`leveler run {}` must persist `{goal}`", args.join(" ")))
-        .collaboration
+        .unwrap_or_else(|| panic!("`leveler run {}` must persist `{goal}`", args.join(" ")));
+    let goals = goals_of(env, session.id.as_str()).await;
+    (session.collaboration, goals)
+}
+
+/// The goals a session opened: the durable proof of which profile it ran.
+async fn goals_of(env: &TestEnv, session: &str) -> usize {
+    let state_dir = project_state_dir(env).expect("the environment has written state");
+    let db = Database::connect(&state_dir.join("sessions.db"))
+        .await
+        .unwrap();
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let Some(task) = stores
+        .tasks
+        .task_for_session(&leveler_core::SessionId::new(session))
+        .await
+        .unwrap()
+    else {
+        return 0;
+    };
+    stores.goals.for_task(&task).await.unwrap().len()
 }
 
 fn spawn_serve(env: &TestEnv, ready: &Path) -> ManagedChild {
@@ -339,21 +364,31 @@ async fn both_transports_open_a_new_interactive_session_as_chat() {
     assert_eq!(daemon_sessions[0].goal, embedded_sessions[0].goal);
 }
 
-/// T6 + T7 + T8 — resume preserves the persisted axis on both transports. The
-/// interactive default must not rewrite an existing session's axis.
+/// T6 + T7 + T8 — an interactive resume never rewrites the persisted axis, on
+/// either transport.
+///
+/// The headless run's window ends as a provider fault, so its terminal closes
+/// the Goal route while the goal itself keeps owing the work. Resuming it
+/// interactively must adopt that session as it is: the axis stays what the
+/// runtime wrote, and the goal identity is still there to continue.
 #[tokio::test]
 async fn resuming_a_session_keeps_its_persisted_axis() {
     let env = test_env("http://127.0.0.1:9");
 
-    // A Goal session, through the real headless entry.
-    let goal_axis = run_and_read_axis(
+    // A Goal run through the real headless entry: it opens a goal, and the
+    // failed window ends the route.
+    let (goal_axis, goals) = run_and_read(
         &env,
         "drive the goal",
         &["run", "--auto-approve", "drive the goal"],
     )
     .await;
-    assert_eq!(goal_axis, "goal", "`leveler run` keeps the goal axis");
-    let goal_id = sessions(&env)
+    assert_eq!(goals, 1, "`leveler run` executes the goal profile");
+    assert_eq!(
+        goal_axis, "chat",
+        "a failed window ends the Goal route; the goal stays owed and resumable"
+    );
+    let goal_session = sessions(&env)
         .await
         .into_iter()
         .find(|session| session.goal == "drive the goal")
@@ -371,31 +406,36 @@ async fn resuming_a_session_keeps_its_persisted_axis() {
 
     let before = sessions(&env).await.len();
 
-    // T7 — resume the Goal session in-process: it is still a Goal.
+    // T7 — resume the Goal run in-process: the runtime's persisted axis stands.
     let _ = run_to_completion(
         &env,
-        &["tui", "--session", goal_id.as_str(), "--in-process"],
+        &["tui", "--session", goal_session.as_str(), "--in-process"],
         Duration::from_secs(60),
     );
     assert_eq!(
-        axis_of(&env, goal_id.as_str()).await,
-        "goal",
-        "an embedded resume must not rewrite a Goal session to the interactive default"
+        axis_of(&env, goal_session.as_str()).await,
+        "chat",
+        "an embedded resume must not rewrite the axis the runtime persisted"
+    );
+    assert_eq!(
+        goals_of(&env, goal_session.as_str()).await,
+        1,
+        "and the goal identity it owes is still there"
     );
 
-    // T6 — resume the same Goal session through the daemon.
+    // T6 — resume the same session through the daemon.
     let ready = env.home.join("ready.json");
     let mut daemon = spawn_serve(&env, &ready);
     wait_ready(&env, &ready, &mut daemon, Duration::from_secs(30));
     let _ = run_to_completion(
         &env,
-        &["tui", "--session", goal_id.as_str()],
+        &["tui", "--session", goal_session.as_str()],
         Duration::from_secs(60),
     );
     assert_eq!(
-        axis_of(&env, goal_id.as_str()).await,
-        "goal",
-        "a daemon resume must not rewrite a Goal session either"
+        axis_of(&env, goal_session.as_str()).await,
+        "chat",
+        "a daemon resume must not rewrite it either"
     );
 
     // T8 — a Chat session stays chat on resume.
@@ -414,34 +454,40 @@ async fn resuming_a_session_keeps_its_persisted_axis() {
     );
 }
 
-/// T9 — the headless entry is untouched: its axis is the product default (goal)
-/// unless the user states one.
+/// T9 — the headless entry is untouched: its axis is the coding-session axis
+/// (goal) unless the user states one, so the run opens a goal; a
+/// `--collaboration chat` run opens none.
 #[tokio::test]
 async fn the_headless_entry_keeps_its_goal_default() {
     let env = test_env("http://127.0.0.1:9");
 
-    let default_axis = run_and_read_axis(
+    let (default_axis, goals) = run_and_read(
         &env,
         "default axis",
         &["run", "--auto-approve", "default axis"],
     )
     .await;
     assert_eq!(
-        default_axis, "goal",
-        "the headless default is still the coding-session axis"
+        goals, 1,
+        "the headless default runs the goal profile and opens its goal"
+    );
+    assert_eq!(
+        default_axis, "chat",
+        "the failed window's terminal ends the route it opened"
     );
 
-    let explicit_axis = run_and_read_axis(
+    let (explicit_axis, chat_goals) = run_and_read(
         &env,
         "explicit axis",
         &[
             "run",
+            "--auto-approve",
             "--collaboration",
             "chat",
-            "--auto-approve",
             "explicit axis",
         ],
     )
     .await;
-    assert_eq!(explicit_axis, "chat", "an explicit axis wins");
+    assert_eq!(chat_goals, 0, "an explicit chat run opens no goal at all");
+    assert_eq!(explicit_axis, "chat");
 }

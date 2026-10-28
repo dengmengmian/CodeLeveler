@@ -434,8 +434,9 @@ async fn a_goal_without_its_turn_recovers_the_original_objective() {
             .unwrap()
             .unwrap()
             .collaboration,
-        "goal",
-        "recovery keeps the session on the Goal axis"
+        "chat",
+        "the faulted window's terminal ended the session's Goal route; the goal \
+         is recovered by its identity, not by a lingering axis"
     );
     assert_eq!(pending(&fx).await, None, "the start consumed it");
 
@@ -766,7 +767,11 @@ async fn a_pending_goal_adopted_by_resume_roots_its_checkpoint_at_its_own_turn()
     assert_eq!(goals.len(), 1);
     assert_eq!(goals[0].id, goal);
     assert_eq!(goals[0].objective, OBJECTIVE_A);
-    assert_eq!(goals[0].state, GoalState::Settled);
+    assert_eq!(
+        goals[0].state,
+        GoalState::Running,
+        "a blocked goal still owes its work; only the window ended"
+    );
     let turns = turns(&fx).await;
     assert_eq!(turns.len(), 2);
     let lineage = leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap())
