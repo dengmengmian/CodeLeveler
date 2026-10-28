@@ -100,31 +100,6 @@ sudo apt install bubblewrap
 
 不安装时 CodeLeveler 可以启动，但需要 Linux 隔离的命令会直接失败，不会降级成无沙箱执行。运行 `leveler doctor` 可以查看当前机器实际具备的能力。
 
-## 开发
-
-日常入口是 `./dev`。`./dev fmt` 只格式化本任务拥有的 Rust 文件，不会执行 `cargo fmt --all`。发布资格由外部实验室判定：先 `release_check.py`，再 `rc_check.py`。`./dev` 只调用这两支脚本，不另写一套门禁。命令列表见 `./dev help`。
-
-### 镜像源（AtomGit、GitHub 代理）
-
-每个稳定版也发布在 AtomGit（`atomgit.com/dengmengmian/CodeLeveler`），
-所以只要网络能到达其中一个主机，就有下载来源。
-
-`leveler update` 和 `install.sh` 优先使用 GitHub 地址，失败后回退到镜像，
-并且**始终由 SHA-256 校验决定**：镜像返回的内容只要不是发布的那份，就会
-校验失败，不会被安装。支持两种镜像，都是可选的逗号分隔列表：
-
-```sh
-# 代理式：把完整的原始 URL 拼在自己的路径后面（ghproxy 风格）
-# https://mirror.example/https://github.com/...
-LEVELER_UPDATE_MIRRORS="https://mirror.example/"
-
-# 托管式：文件放在自己的目录结构下，只接资产文件名；
-# `{version}` 会替换成正在获取的版本。
-LEVELER_UPDATE_ASSET_BASE="https://atomgit.com/dengmengmian/CodeLeveler/releases/download/v{version}/"
-```
-
-GitHub 原始地址始终排在第一位，镜像只是追加候选。
-
 ## 更新
 
 CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时最多每 `check_interval_hours` 检查一次；发现新版本后会下载、校验 SHA-256、替换当前二进制并重启。检查失败不会阻止启动：当前版本正常运行，失败原因写入日志。
@@ -249,13 +224,11 @@ TUI 中点击底部的后台任务摘要（`↗`）打开列表，点击任务�
 
 ## TUI 输入与终端诊断
 
-输入区支持 `Ctrl+Z` 撤销、`Ctrl+Shift+Z` 或 `Alt+Z` 重做，`Ctrl+Y` 恢复最近删除的文字。撤销会恢复粘贴块、文件引用及图片的原附件绑定；提交和切换会话会结束这份草稿的撤销历史。每个撤销／重做栈最多保存 100 条、8 MiB。
+输入区支持 `Ctrl+Z` 撤销、`Ctrl+Shift+Z` 或 `Alt+Z` 重做，`Ctrl+Y` 恢复最近删除的文字；提交和切换会话会结束这份草稿的撤销历史。
 
-`Ctrl+R` 搜索已提交的输入历史。`Enter` 把选中项放回草稿供编辑，不会直接发送；`Esc` 或 `Ctrl+C` 取消搜索并保留原草稿。`/help` 支持搜索命令、快捷键和说明。
+`Ctrl+R` 搜索已提交的输入历史：`Enter` 把选中项放回草稿供编辑，不会直接发送；`Esc` 或 `Ctrl+C` 取消搜索并保留原草稿。`/help` 支持搜索命令、快捷键和说明。
 
-`/doctor` 查看本地终端诊断；`leveler doctor` 也会列出终端、SSH／tmux、颜色提示、换行键和剪贴板路线。诊断不会修改剪贴板或终端配置，无法确认的能力显示为未知。
-
-选择对话文字后，普通本地终端优先使用原生剪贴板并回读验证。SSH 下跳过远端主机的原生剪贴板，使用 OSC52；tmux 无法确认当前客户端位置，因此也跳过原生剪贴板，并写入 tmux 粘贴缓冲区、发送 OSC52。OSC52／tmux 发送成功只显示“已发送，未验证本机剪贴板”，终端可能需要自行开启剪贴板转发或 passthrough。OSC52 文本上限为 64 KiB，超限会明确提示。
+`leveler doctor` 和 `/doctor` 报告终端、SSH／tmux、颜色、换行键和剪贴板诊断，不会修改终端设置或剪贴板内容；无法确认的能力显示为未知。复制会说明能证明什么：本机原生剪贴板写入且读回一致才算已验证，SSH 和 tmux 的 OSC52 或粘贴缓冲区只表示已发送、未验证。
 
 ## 浏览器和网页搜索
 
@@ -286,9 +259,7 @@ Coding Harness 解析定义，能力准入和 Host Authority 强制执行边界�
 
 ## 实验性移动端
 
-`apps/leveler-mobile` 是已经冻结的源码预览，不是已分发产品。目前的验证证据只覆盖 iOS 模拟器配对流程；Android 构建、真机与蜂窝网络测试、TestFlight 和 Play 分发都尚未完成。
-
-远程控制会让会话流量经过配置的 relay。消息有签名，但端到端 AEAD 加密尚未实现，TLS 终止方可以读取会话流量。评估这一功能时应自托管 relay。使用前请阅读[移动端状态](apps/leveler-mobile/README.md)。
+`apps/leveler-mobile` 是已经冻结的源码预览，不是已分发产品；目前只验证过 iOS 模拟器配对流程。远程控制会让会话流量经过配置的 relay：消息有签名，但端到端加密尚未实现，评估这一功能时应自托管 relay。使用前请阅读[移动端状态](apps/leveler-mobile/README.md)。
 
 ## 文档
 
