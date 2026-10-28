@@ -105,7 +105,13 @@ pub(crate) fn bind_to_current_source(workspace: &Path, state_dir: &Path) -> Resu
             continue;
         }
         let path = workspace.join(relative);
-        let file = std::fs::File::open(&path)
+        // Windows refuses `set_times` on a read-only handle; the write access
+        // requested there is only for the timestamp, never for the content.
+        #[cfg(windows)]
+        let opened = std::fs::OpenOptions::new().write(true).open(&path);
+        #[cfg(not(windows))]
+        let opened = std::fs::File::open(&path);
+        let file = opened
             .map_err(|error| format!("open {} to bind the check to it: {error}", path.display()))?;
         // Only the timestamp moves: the content is exactly what the user wrote.
         // A source file that cannot be marked as changed is one this check
