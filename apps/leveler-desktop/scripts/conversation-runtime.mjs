@@ -98,6 +98,8 @@ async function deliver(id, command, endpoint = base) {
   }), { base: endpoint, token, id, command, commandId });
 }
 async function sendUI(content) { if (client === 'web') { await page.locator('.composer textarea').fill(content); await page.getByRole('button', { name: '发送', exact: true }).click(); } else { await page.locator('#message').fill(content); await page.locator('#send').click(); } }
+// The two renderers name the same live reasoning row differently.
+const liveThoughts = () => page.locator(client === 'web' ? '.thought.live' : '.thought-row.thought-live').count();
 async function selected() { if (client === 'desktop') return await page.locator('.session-row[aria-selected="true"]').count() ? page.locator('.session-row[aria-selected="true"]').first().getAttribute('data-session-id') : null; if (await page.locator('.sess.active').count() !== 1) return null; return page.evaluate(() => localStorage.getItem('leveler.web.lastSession')); }
 async function thoughts() {
   if (client === 'web') {
@@ -199,7 +201,7 @@ try {
   record(caseIds[2], { tool_ids: exploration, ...live });
   const collaboration = (await snapshot(id)).collaboration; assert.equal(collaboration, 'chat');
   record(caseIds[3], { ui_created_collaboration: collaboration });
-  assert.equal(await page.locator('.thought-row.thought-live').count(), 0); assert.equal(await page.getByText('已同步最新模型。', { exact: true }).count(), 1);
+  assert.equal(await liveThoughts(), 0); assert.equal(await page.getByText('已同步最新模型。', { exact: true }).count(), 1);
   record(caseIds[4], { native_terminal: (await snapshot(id)).task_status, final_count: 1, live_activity_cleared: true });
   // Actually compact the model context, then replay the durable transcript.
   const beforeContext = await snapshot(id); let compactTransport;
@@ -231,14 +233,14 @@ try {
   if (client === 'web') { await page.getByRole('button', { name: 'New Task', exact: true }).click(); const creating = page.waitForResponse(response => response.request().method() === 'POST' && response.url().includes('/api/sessions/identified')); await sendUI('受控取消：在真实推理流中停止'); cancelId = (await (await creating).json()).session.id; }
   else { await page.locator('#new-session').click(); cancelId = await poll('cancel session selection', selected, value => value && value !== id); await sendUI('受控取消：在真实推理流中停止'); }
   ownSelectedSession = cancelId;
-  await poll('real held SSE reasoning arrived', () => page.locator('.thought-row.thought-live').count(), count => count === 1); assert.ok(held && releaseLate, 'provider gate handshake missing');
+  await poll('real held SSE reasoning arrived', liveThoughts, count => count === 1); assert.ok(held && releaseLate, 'provider gate handshake missing');
   const ack = await deliver(cancelId, { type: 'cancel_task', session_id: cancelId }); if (client === 'web') assert.equal(ack.type, 'ack'); else assert.equal(ack.ok, true, JSON.stringify(ack));
   cancelAckObserved = true;
   await poll('permanent native Task Cancelled', () => snapshot(cancelId), value => value.task_status === 'cancelled');
   releaseLate(); await deliver(cancelId, { type: 'query_session_history', session_id: cancelId, query_id: randomUUID() });
-  await poll('native cancellation terminal rendered with no live thought', () => page.locator('.thought-row.thought-live').count(), count => count === 0);
+  await poll('native cancellation terminal rendered with no live thought', liveThoughts, count => count === 0);
   const cancelled = facts(cancelId); assert.equal((await snapshot(cancelId)).task_status, 'cancelled');
-  assert.ok(!JSON.stringify(cancelled).includes('长推理结束。'), 'late provider final persisted after cancellation'); assert.equal(await page.getByText('长推理结束。', { exact: true }).count(), 0); assert.equal(await page.locator('.thought-row.thought-live').count(), 0);
+  assert.ok(!JSON.stringify(cancelled).includes('长推理结束。'), 'late provider final persisted after cancellation'); assert.equal(await page.getByText('长推理结束。', { exact: true }).count(), 0); assert.equal(await liveThoughts(), 0);
   let resumeEndpoint = base;
   if (resumeTransportFault) {
     const closed = createServer(); await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
