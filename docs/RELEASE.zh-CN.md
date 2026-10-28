@@ -1,4 +1,4 @@
-# CodeLeveler 1.0.20
+# CodeLeveler 1.0.21
 
 [English](RELEASE.md) · [历史版本](../CHANGELOG.zh-CN.md)
 
