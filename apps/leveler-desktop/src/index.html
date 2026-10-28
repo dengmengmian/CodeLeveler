@@ -119,13 +119,16 @@
           </div>
           <div id="attachment-chips" class="attachment-chips" aria-label="待发送附件" hidden></div>
           <div class="composer-row">
-            <button id="attachment-add" class="composer-round" type="button" aria-label="添加附件或调用指令" data-tooltip="添加附件或调用指令"></button>
-            <button id="permission-picker" class="composer-trigger" type="button" aria-label="访问模式"></button>
-            <button id="plan-mode" class="composer-trigger plan-mode" type="button" aria-label="计划模式" data-tooltip="计划模式（未接入）"></button>
-            <div class="composer-spacer"></div>
-            <button id="model-picker" class="composer-trigger model-trigger" type="button" aria-haspopup="menu"></button>
-            <button id="send" class="send-button" type="button" aria-label="发送"></button>
-            <button id="stop" class="send-button stop-button" type="button" aria-label="停止" data-tooltip="停止当前回合" hidden></button>
+            <div class="composer-tools">
+              <button id="attachment-add" class="composer-round" type="button" aria-label="添加附件或调用指令" data-tooltip="添加附件或调用指令"></button>
+              <button id="permission-picker" class="composer-trigger" type="button" aria-label="访问模式"></button>
+              <button id="plan-mode" class="composer-trigger plan-mode" type="button" aria-label="计划模式" data-tooltip="计划模式（未接入）"></button>
+            </div>
+            <div class="composer-trailing">
+              <button id="model-picker" class="composer-trigger model-trigger" type="button" aria-haspopup="menu"></button>
+              <button id="send" class="send-button" type="button" aria-label="发送"></button>
+              <button id="stop" class="send-button stop-button" type="button" aria-label="停止" data-tooltip="停止当前回合" hidden></button>
+            </div>
           </div>
         </div>
         <div id="context-stats" class="context-stats" hidden></div>

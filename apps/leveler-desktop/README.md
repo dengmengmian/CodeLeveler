@@ -19,7 +19,7 @@ npm start
 - **左侧栏**：品牌区、新会话、插件 / 自动化任务入口、工作区与会话列表、搜索、分组/排序/归档视图选项、添加工作区、账号菜单。
 - **Conversation**：会话头部、`对话 / 轨迹` view tabs、用户气泡、Narration（完整独立正文）、默认收起的执行组（读取 / 搜索、命令、修改文件）、实时分析行、Final Answer、回合收据（回答结束 / 完成 / 有警告 / 未完成 / 失败 / 取消 / 无最终回答）、失败与取消摘要、审批 / 用户问题 takeover、运行状态、消息复制、会话搜索、重命名、模型/权限切换、上下文统计。完整已确认 Diff 在右侧「本次修改 / 工作区变更」查看器中呈现；对话只保留修改摘要与文件入口。
 - **Trajectory**：按轮次分组的 durable 事件账本、请求编号、输入/模型/工具时间线、时长与调用折叠、轨迹搜索、事件检查器（概述 / 参数 / 结果 / Schema / 计时）与宽度拖拽；缺失的 Token、系统提示词和计时明确显示不可用。
-- **Composer**：28px 圆角输入卡、附件上传、权限 / 模型 / 计划模式入口、参考命令菜单（添加 / 指令）、@ 引用提示、发送 / 停止、按会话保存草稿（重启后恢复）。
+- **Composer**：28px 圆角输入卡、附件上传、权限 / 模型 / 计划模式入口、参考命令菜单（添加 / 指令）、@ 引用提示、发送 / 停止、按会话保存草稿（重启后恢复）。布局按 Composer 自身宽度响应：容器收紧时压缩间距、权限模式图标化、模型名省略但保留 Tooltip、控件组整体换行；上下文统计在窄宽只显示 Runtime Context Accounting 的占用率，详情浮层保留输入 / 输出 / 缓存 / 推理 / 窗口。
 - **右侧边栏**：固定的 Start 引导标签（卡片新开标签，不会被占用或拖走）、多标签、分栏、标签拖动/跨栏移动、栏宽调整、浮窗及返回停靠区、全屏、Open In App、按会话持久化布局。
 - **Settings**：800×684 modal，通用设置、模型、内置插件、Agent 模式；主题、字号、工作步骤展示/收起、性能与用量等。
 - **浅色 / 深色 / 跟随系统**，以及 1024 / 768 / 520 等窄窗口布局。
@@ -47,7 +47,7 @@ npm run lint            # ESLint
 
 真实验收使用隔离 `LEVELER_HOME`、Electron profile 与 workspace。
 
-当前 `scripts/` 验收入口全部通过：`interactions`、`conversation`、`files-and-tabs`、`composer`、`session-actions`、`settings-queries`、`commands-settings`、`settings-branches`、`project-interactions`、`sidebar-compact`、`responsive-theme`、`responsive-long-home`、`upload-deadline`、`views`、`browser-dock`、`browser-native`、`product`、`long-session`（合成渲染）、`background-tasks`、`recovery`、`ui-capture`、`presentation-parity`、`thought-layout`、`conversation-architecture`，以及真实 Provider 的 `acceptance`、`real-provider-files` 与 `real-provider-presentation`。`workbench.mjs` 已标记 SUPERSEDED 并直接运行 `files-and-tabs.mjs`。`conversation-runtime.mjs` 是 release/RC 资格通道，要求干净候选与按 HEAD 构建的二进制，不属于日常验收。
+当前 `scripts/` 验收入口全部通过：`interactions`、`conversation`、`files-and-tabs`、`composer`、`composer-narrow`、`terminal-permissions`、`terminal-permissions-finder`、`session-actions`、`settings-queries`、`commands-settings`、`settings-branches`、`project-interactions`、`sidebar-compact`、`responsive-theme`、`responsive-long-home`、`upload-deadline`、`views`、`browser-dock`、`browser-native`、`product`、`long-session`（合成渲染）、`background-tasks`、`recovery`、`ui-capture`、`presentation-parity`、`thought-layout`、`conversation-architecture`，以及真实 Provider 的 `acceptance`、`real-provider-files` 与 `real-provider-presentation`。`workbench.mjs` 已标记 SUPERSEDED 并直接运行 `files-and-tabs.mjs`。`conversation-runtime.mjs` 是 release/RC 资格通道，要求干净候选与按 HEAD 构建的二进制，不属于日常验收。
 
 `conversation-architecture` 用合成 JSONL 对端覆盖默认折叠、展开保持、失败摘要、审批单一入口、思考生命周期、Diff 归属、收据、960×600 / 700 宽与历史恢复；`real-provider-presentation` 用真实 Provider + 临时工作区覆盖读取、成功/失败命令、真实编辑、Workbench 完整 Diff 与 Resume。
 
@@ -56,7 +56,7 @@ npm run lint            # ESLint
 ## 已知限制
 
 - Files / Preview 已接入真实只读目录与文件读取（文本、代码、Markdown、JSON/YAML/TOML、CSV、图片、行号跳转）。PDF / Office 仍为 UI_ONLY；界面明示不可预览，不伪造内容。
-- 内置终端通过 Rust Runtime 接入同一个 Execution Host，支持 Unix PTY；macOS 已实测，Windows 明确不支持。要求会话有工作区；旧宿主缺少终端能力时明确报错，不在 Electron 中另行启动 Shell。关闭标签等待进程退出；输入结果未知时不会自动重发。
+- 内置终端通过 Rust Runtime 接入同一个 Execution Host，支持 Unix PTY；macOS 已实测，Windows 明确不支持。它是用户自己的交互式 Shell：按系统用户权限运行，不继承 Agent Permission Mode 的 Seatbelt 写/网络围栏，也不请求审批；Agent 命令仍按各自模式受限。要求会话有工作区；旧宿主缺少终端能力时明确报错，不在 Electron 中另行启动 Shell。关闭标签等待进程退出；输入结果未知时不会自动重发。
 - 工具卡输出来自 Runtime 的 1200 字符预览；超长输出以省略号截断，当前没有完整输出查看入口。
 - 对话的完整已确认 Diff 不再内联：修改摘要打开右侧「本次修改」（历史 `applied_diff`，带工具调用身份），`/diff` 打开「工作区变更」（当前 Git 状态）。两个来源使用同一个查看器，标签与说明不同。文件卡片只保留在修改组的展开内容中，不再在最终回答下重复。
 - Deliverables、插件市场、自动化调度、Session 日志、登录/反馈提交没有 Desktop bridge 接口，界面完整呈现真实未接入状态。
