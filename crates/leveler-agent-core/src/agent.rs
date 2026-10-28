@@ -342,7 +342,7 @@ impl Agent {
                     self.headroom,
                 )
             };
-            harness.on_event(AgentEvent::ContextUsage(accounting));
+            harness.on_event(AgentEvent::ContextUsage(Box::new(accounting)));
 
             let estimated_request_tokens = request
                 .projection

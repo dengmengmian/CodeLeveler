@@ -865,9 +865,7 @@ async fn a_real_streamed_round_captures_reasoning_for_the_next_turn() {
         "the streamed reasoning is what the next request replays"
     );
     assert_eq!(
-        body["messages"][1]["reasoning_content"]
-            .as_str()
-            .map(|text| sha8(text)),
+        body["messages"][1]["reasoning_content"].as_str().map(sha8),
         Some(sha8(&reasoning))
     );
 }
