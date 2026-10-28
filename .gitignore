@@ -16,6 +16,8 @@
 .leveler/hooks.yaml
 .leveler/media/
 .leveler/drafts/
+.leveler/local/
+.leveler/memory/
 .local-leveler/
 
 # Local developer entry config (may name a machine-specific dogfood lab).
@@ -28,6 +30,9 @@
 .idea/
 .vscode/
 .DS_Store
+
+# Ad-hoc process id files left by local debugging
+/proxy.pid
 
 # Secrets
 .env
