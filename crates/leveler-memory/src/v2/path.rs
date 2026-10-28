@@ -646,13 +646,12 @@ fn check_layout(
     if current == state || is_inside(current, state) || is_inside(state, current) {
         return Err(PathError::RootsNested);
     }
-    if let Some(repo_root) = repo_root {
-        if is_inside(state, repo_root)
+    if let Some(repo_root) = repo_root
+        && (is_inside(state, repo_root)
             || is_inside(state, &repo_root.join(".git"))
-            || is_inside(current, &repo_root.join(".git"))
-        {
-            return Err(PathError::StateInsideRepo);
-        }
+            || is_inside(current, &repo_root.join(".git")))
+    {
+        return Err(PathError::StateInsideRepo);
     }
     if scope == MemoryScope::Local && repo_root.is_none() {
         return Err(PathError::ScopeUnavailable(

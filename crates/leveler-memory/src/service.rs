@@ -1638,6 +1638,25 @@ fn v2_experience(record: &ExperienceRecord) -> v2::Experience {
 /// was said in. The runtime supplies the identities because it read the turn —
 /// an extractor's output never carries them — so a stored `user_stated` fact
 /// can always be traced back to a real message instead of only to a string.
+fn user_turn_source(span: &str, session: Option<&str>, turn: Option<&str>) -> v2::SourceRef {
+    v2::SourceRef {
+        kind: v2::SourceRefKind::UserTurn,
+        session_id: session.map(str::to_string),
+        turn_id: turn.map(str::to_string),
+        tool_call_id: None,
+        task_id: None,
+        pending_id: None,
+        evidence_span: Some(span.to_string()),
+        message_digest: None,
+        span_range: None,
+        file_sha256: None,
+        legacy_store: None,
+        legacy_id: None,
+        legacy_sha256: None,
+        extra: serde_yaml::Mapping::new(),
+    }
+}
+
 #[cfg(test)]
 mod lazy_open_tests {
     use super::{MemoryRoots, MemoryService, ServiceScope};
@@ -1813,24 +1832,5 @@ mod lazy_open_tests {
             matches!(error, super::ServiceError::NeedsReview(_)),
             "{error}"
         );
-    }
-}
-
-fn user_turn_source(span: &str, session: Option<&str>, turn: Option<&str>) -> v2::SourceRef {
-    v2::SourceRef {
-        kind: v2::SourceRefKind::UserTurn,
-        session_id: session.map(str::to_string),
-        turn_id: turn.map(str::to_string),
-        tool_call_id: None,
-        task_id: None,
-        pending_id: None,
-        evidence_span: Some(span.to_string()),
-        message_digest: None,
-        span_range: None,
-        file_sha256: None,
-        legacy_store: None,
-        legacy_id: None,
-        legacy_sha256: None,
-        extra: serde_yaml::Mapping::new(),
     }
 }
