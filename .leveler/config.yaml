@@ -1,4 +1,18 @@
 # Verification commands used by repository contract tests.
+# Mandatory contributor rules delivered to the model.
+rules:
+  always_delivered:
+    - 核心原则
+    - 任务与授权
+    - TDD 与调试
+    - 验证策略
+    - 架构门禁
+    - Permission Mode 产品契约
+    - 工程与安全
+    - 专项工作
+    - 输出与完成
+  budget_bytes: 16000
+
 verify:
   format:
     program: cargo
