@@ -9,12 +9,18 @@ use tokio::io::unix::AsyncFd;
 
 pub struct PtyMaster(AsyncFd<OwnedFd>, tokio::sync::Mutex<()>);
 impl PtyMaster {
+    // `AsyncFd::register` is the only non-deprecated constructor; it is unsafe
+    // because the descriptor must outlive the registration, which `OwnedFd`
+    // guarantees here.
+    #[allow(unsafe_code)]
     pub fn new(fd: OwnedFd) -> io::Result<Arc<Self>> {
         use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
         fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
         fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
+        // SAFETY: `fd` is an owned descriptor handed to the `AsyncFd`, which
+        // keeps it open and unchanged until it is dropped.
         Ok(Arc::new(Self(
-            AsyncFd::new(fd)?,
+            unsafe { AsyncFd::register(fd)? },
             tokio::sync::Mutex::new(()),
         )))
     }
