@@ -1716,6 +1716,34 @@ impl Application {
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
     }
+
+    /// Build the user's interactive terminal request.
+    ///
+    /// This shell is the person's own process, not an Agent command: the
+    /// Permission Mode and its OS write/network fence do not apply. Session
+    /// ownership, PTY lifecycle, the immutable environment snapshot and
+    /// provider-credential scrubbing still apply. `unrestricted_execution`
+    /// stays false on purpose so a sealed eval host keeps its read denials and
+    /// the child still loses provider secrets.
+    pub(crate) fn user_terminal_execution(
+        &self,
+        shell: String,
+    ) -> Result<leveler_execution::ProcessRequest, AppError> {
+        let cwd = self
+            .layout
+            .require_workspace()
+            .map_err(|error| AppError::NotFound(error.to_string()))?
+            .to_path_buf();
+        let mut request = leveler_execution::ProcessRequest::new(shell, vec!["-l".into()], cwd);
+        request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
+        request.deny_network = false;
+        request.write_scope = leveler_execution::WriteScope::Unrestricted;
+        request.deny_env =
+            provider_secret_env_names(&self.config.providers, self.config.web_search.as_ref());
+        // The persistent Execution Host rebuilds the child environment from its
+        // own snapshot; no app-side CommandRunner is involved in this path.
+        Ok(request)
+    }
 }
 
 /// Resolve the configured search backend.
@@ -2058,6 +2086,43 @@ mod model_step_ceiling_tests {
             model_step_ceiling_from_flag(None),
             Some(leveler_agent::DEFAULT_MODEL_STEP_CEILING),
             "a run with no flag must still get the mechanical breaker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod user_terminal_execution_tests {
+    use super::Application;
+    use leveler_execution::WriteScope;
+    use leveler_project::Layout;
+
+    /// The interactive terminal is the person's own shell. Its request must not
+    /// inherit the Agent profile's write fence or network denial, while the
+    /// credential scrub and the trusted-host default stay in force.
+    #[test]
+    fn the_user_terminal_is_not_agent_confined() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = Application::assemble(Layout::from_parts(
+            directory.path().to_path_buf(),
+            directory.path().join("configs"),
+            directory.path().join("state"),
+        ))
+        .unwrap();
+        let request = app.user_terminal_execution("/bin/zsh".into()).unwrap();
+        assert_eq!(request.cwd.as_path(), directory.path());
+        assert_eq!(request.program, "/bin/zsh");
+        assert_eq!(request.args, vec!["-l".to_string()]);
+        assert_eq!(request.write_scope, WriteScope::Unrestricted);
+        assert!(!request.deny_network);
+        assert!(
+            !request.unrestricted_execution,
+            "the user shell must still lose provider credentials"
+        );
+        assert!(
+            request
+                .deny_env
+                .iter()
+                .any(|name| name == "LEVELER_SEARCH_API_KEY")
         );
     }
 }

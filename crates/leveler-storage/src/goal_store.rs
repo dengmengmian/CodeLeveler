@@ -27,12 +27,21 @@ use crate::{Database, OwnershipError, StorageError};
 /// `Running` by a process that died IS the interrupted one, and task ownership
 /// already records whether a live runtime is driving it. A third state would
 /// be a second writer for a fact ownership already holds.
+///
+/// `Running` is also the state of a goal whose window ended without delivering
+/// it — blocked, recoverably failed, interrupted, or stopped at a budget. The
+/// work is still owed and an explicit continuation re-enters it, which is why
+/// those windows do not settle the goal. `Settled` means no window can follow
+/// this goal any more: it was delivered, the user cancelled it, or the runtime
+/// classified the failure as unrecoverable. How it went is `sessions.outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalState {
-    /// Work is owed. Whether anyone is currently driving it is an ownership
-    /// question, not a goal-state question.
+    /// Work is owed and a continuation can re-enter it. Whether anyone is
+    /// currently driving it is an ownership question, not a goal-state
+    /// question.
     Running,
-    /// No further work is owed. How it went is `sessions.outcome`.
+    /// Nothing can follow this goal up any more. How it went is
+    /// `sessions.outcome`.
     Settled,
 }
 

@@ -631,31 +631,9 @@ pub(crate) fn task_outcome_is_resumable(
     stop: Option<leveler_lifecycle::StopReason>,
     failure: Option<&leveler_model::ModelError>,
 ) -> bool {
-    use leveler_lifecycle::{StopReason, TaskOutcome};
-    match outcome {
-        TaskOutcome::Interrupted | TaskOutcome::BudgetLimited => true,
-        TaskOutcome::Failed => failure.is_some_and(|error| {
-            matches!(
-                error.kind,
-                leveler_model::ModelErrorKind::ProviderUnavailable
-                    | leveler_model::ModelErrorKind::Transport
-                    | leveler_model::ModelErrorKind::StreamInterrupted
-                    | leveler_model::ModelErrorKind::Timeout
-                    | leveler_model::ModelErrorKind::RateLimit
-            )
-        }),
-        // An answer is not a completion declaration. Every other Completed
-        // terminal (a declared `completed` stop, or a legacy row with no stop)
-        // is one.
-        TaskOutcome::Completed => stop == Some(StopReason::Answered),
-        // A blocked goal still owes its work. `继续` retries that same goal;
-        // the alternative — treating it as an ordinary goal-mode message —
-        // opens a second goal whose objective is the word the user typed,
-        // which loses the original intent on the exact path they chose to
-        // resume it.
-        TaskOutcome::Blocked => true,
-        TaskOutcome::Cancelled => false,
-    }
+    // The agent owns the resume rule; this reader must never grow its own copy
+    // (the terminal that keeps a session's Goal route uses the same one).
+    leveler_agent::coding::task_outcome_is_resumable(*outcome, stop, failure)
 }
 
 /// What a continuation intent means for a session's persisted terminal.
@@ -735,14 +713,20 @@ async fn runtime_quiescence(
 }
 
 /// An in-process runtime client backed by an [`Application`].
+///
+/// Cloning yields another handle to the SAME runtime: every mutable field is
+/// shared, so a detached turn can publish a fact it committed (the session's
+/// Goal route ending, say) through the same event streams and projection as the
+/// command that started it.
+#[derive(Clone)]
 pub struct InProcessRuntimeClient {
     app: Arc<Application>,
     /// Defaults for sessions created by this runtime service.
     default_runtime: SessionRuntimeConfig,
     /// Model/mode/path selected independently by each live or restored session.
-    session_runtime: Mutex<HashMap<SessionId, SessionRuntimeConfig>>,
+    session_runtime: Arc<Mutex<HashMap<SessionId, SessionRuntimeConfig>>>,
     // Serialize committed settings with their live permission projection.
-    settings_edits: tokio::sync::Mutex<()>,
+    settings_edits: Arc<tokio::sync::Mutex<()>>,
     /// When true, skip the approval overlay (AutoApprove) so unattended TUI
     /// PTY drivers and CI dogfood can run interactive turns.
     auto_approve: bool,
@@ -775,7 +759,7 @@ pub struct InProcessRuntimeClient {
     /// Why this runtime is retiring, when a client asked it to hand over. Set
     /// once alongside `shutting_down`; read by `runtime_info` so a waiting
     /// client can say WHICH generation change asked for the handover.
-    retiring_reason: std::sync::Mutex<Option<leveler_client_protocol::RestartReason>>,
+    retiring_reason: Arc<std::sync::Mutex<Option<leveler_client_protocol::RestartReason>>>,
     /// Cancelled to retire the process once work has drained. `None` for an
     /// in-process runtime, which has no process of its own to retire.
     process_shutdown: Option<CancellationToken>,
@@ -1359,8 +1343,8 @@ impl InProcessRuntimeClient {
                 approval_policy: ApprovalPolicy::Interactive,
                 thinking: None,
             },
-            session_runtime: Mutex::new(HashMap::new()),
-            settings_edits: tokio::sync::Mutex::new(()),
+            session_runtime: Arc::new(Mutex::new(HashMap::new())),
+            settings_edits: Arc::new(tokio::sync::Mutex::new(())),
             auto_approve,
             media_root,
             events,
@@ -1378,7 +1362,7 @@ impl InProcessRuntimeClient {
             btw: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(ActiveTurns::with_retiring(shutting_down.clone())),
             shutting_down: shutting_down.clone(),
-            retiring_reason: std::sync::Mutex::new(None),
+            retiring_reason: Arc::new(std::sync::Mutex::new(None)),
             process_shutdown: None,
             client_presence: None,
             in_flight,
@@ -1759,6 +1743,27 @@ impl InProcessRuntimeClient {
             session_id,
             config,
         ))
+    }
+
+    /// Publish the session row after a turn that may have ended its Goal route.
+    ///
+    /// The terminal commit ends Goal mode in the SAME transaction as the
+    /// terminal fact (a goal nothing can continue ends the route), so no client
+    /// may keep painting a Goal turn: the next submit would be predicted as
+    /// Goal while the runtime runs Chat. A turn whose axis did not move — the
+    /// overwhelming majority — pays one indexed read and no snapshot.
+    async fn publish_axis_if_changed(&self, session_id: &SessionId, axis_at_start: &str) {
+        let Ok(axis) = self.app.session_product_axes(session_id).await else {
+            return;
+        };
+        if axis.as_str() == axis_at_start {
+            return;
+        }
+        if let Ok(session) = self.snapshot(session_id).await {
+            let _ = self
+                .events_for(session_id)
+                .send(RuntimeEvent::SessionUpdated { session });
+        }
     }
 
     fn config_from_settings(
@@ -3090,11 +3095,13 @@ impl InProcessRuntimeClient {
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
+        let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
         let model = config.model;
         let mode = config.mode;
         let sandbox = config.sandbox;
+        let axis_at_start = config.collaboration.clone();
         let repo = self.app.layout.repo_root.clone();
         let cancel = admission.cancellation();
         let approver = self.approver(&session_id, cancel.clone());
@@ -3165,6 +3172,11 @@ impl InProcessRuntimeClient {
                 } else {
                     active.finish(&admission);
                 }
+                // The goal's terminal may have ended this session's Goal route;
+                // publish the row so the UI stops claiming a Goal that is over.
+                client
+                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .await;
                 // Session-owned background reap moved to the engine's terminal
                 // settlement (finish_from_result) so chat-routed continuations
                 // are covered too — one reap site, not one per spawn function
@@ -3414,8 +3426,15 @@ impl InProcessRuntimeClient {
             );
         }
         let instruction = Message::user_input(content.clone());
+        let axis_at_start = self
+            .app
+            .session_product_axes(&session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .as_str()
+            .to_string();
         let cancel = self.stage_turn(&session_id, &content, false, 0).await?;
-        let accepted = self.spawn_resume_turn(session_id, instruction, cancel);
+        let accepted = self.spawn_resume_turn(session_id, instruction, cancel, axis_at_start);
         await_turn_acceptance(accepted).await
     }
 
@@ -3456,6 +3475,25 @@ impl InProcessRuntimeClient {
                 .terminal_turn_ordinal
                 .is_some_and(|ordinal| turn.ordinal > ordinal)
         });
+        // Owed work outranks the last terminal. A goal that is still running
+        // says no window has finished the task, and the resume path re-enters
+        // that goal by identity. This matters exactly when the terminal in
+        // front of the user belongs to something else: after a blocked window
+        // the question they asked ends as its own settled Chat turn, and a
+        // `继续` after it is still about the goal's work.
+        if let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await {
+            let running = stores
+                .goals
+                .for_task(&task)
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+                .into_iter()
+                .filter(|goal| goal.state == leveler_storage::GoalState::Running)
+                .count();
+            if running == 1 {
+                return Ok(ContinuationState::Resumable);
+            }
+        }
         if let Some(row) = facts.terminal.as_ref().filter(|_| !newer_turn) {
             if row.schema_version > leveler_storage::EVENT_SCHEMA_VERSION {
                 return Err(ClientError::Runtime(
@@ -3541,8 +3579,10 @@ impl InProcessRuntimeClient {
         session_id: SessionId,
         instruction: Message,
         admission: crate::active_turns::TurnLease,
+        axis_at_start: String,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
+        let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
         let repo = self.app.layout.repo_root.clone();
@@ -3607,6 +3647,10 @@ impl InProcessRuntimeClient {
                 } else {
                     active.finish(&admission);
                 }
+                // A resume that ends its goal for good also ends Goal mode.
+                client
+                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .await;
             });
         });
         accepted_rx
@@ -3626,11 +3670,13 @@ impl InProcessRuntimeClient {
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
+        let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
         let model = config.model;
         let mode = config.mode;
         let sandbox = config.sandbox;
+        let axis_at_start = config.collaboration.clone();
         let repo = self.app.layout.repo_root.clone();
         let cancel = admission.cancellation();
         let approver = self.approver(&session_id, cancel.clone());
@@ -3696,6 +3742,9 @@ impl InProcessRuntimeClient {
                 } else {
                     active.finish(&admission);
                 }
+                client
+                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .await;
             });
         });
         accepted_rx
@@ -4480,11 +4529,13 @@ impl InProcessRuntimeClient {
         config: SessionRuntimeConfig,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
+        let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
         let model = config.model;
         let mode = config.mode;
         let sandbox = config.sandbox;
+        let axis_at_start = config.collaboration.clone();
         let repo = self.app.layout.repo_root.clone();
         let cancel = admission.cancellation();
         let approver = self.approver(&session_id, cancel.clone());
@@ -4556,6 +4607,13 @@ impl InProcessRuntimeClient {
                 } else {
                     active.finish(&admission);
                 }
+                // A turn can end the session's Goal route (a final goal
+                // terminal, or a `commit_task` goal that has now settled).
+                // Clients display the row, so the new axis is published while
+                // the turn that committed it is still the only writer.
+                client
+                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .await;
             });
         });
         accepted_rx
@@ -5971,6 +6029,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // A running turn carries the flag to its terminal, so the
                 // engine records `cancelled` (not resumable `interrupted`).
                 // With nothing running, commit that terminal here.
+                let axis_before = self
+                    .app
+                    .session_product_axes(&session_id)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?
+                    .as_str()
+                    .to_string();
                 let delivered = self
                     .app
                     .request_active_task_cancel(&session_id)
@@ -5983,6 +6048,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         Ok(Some(event)) => {
                             let mut bridge = EventBridge::new(self.events_for(&session_id));
                             bridge.forward(event);
+                            // The cancelled goal can never be continued, so its
+                            // terminal ended the session's Goal route too.
+                            self.publish_axis_if_changed(&session_id, &axis_before)
+                                .await;
                         }
                         Ok(None) => self.notify_error(
                             &session_id,
@@ -6854,16 +6923,13 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             ));
         }
         // Hydrates durable settings and validates this session's canonical source.
-        let config = self.runtime_config(&request.session_id).await?;
+        // The profile itself is deliberately NOT applied to this shell.
+        self.runtime_config(&request.session_id).await?;
         let id = format!("host-{}", request.terminal_id.replace('-', ""));
         let owner = request.session_id.as_str();
         let registry = self.app.background_tasks();
         let observation = match request.operation {
             TerminalOperation::Create { cols, rows } => {
-                let (_, mut process, _) = self
-                    .app
-                    .user_shell_execution(config.mode, config.sandbox, "")
-                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
                 let shell = self
                     .app
                     .environment
@@ -6872,11 +6938,11 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                         std::path::Path::new(s).is_absolute() && std::path::Path::new(s).is_file()
                     })
                     .unwrap_or_else(|| "/bin/zsh".into());
-                process.program = shell;
-                process.args = vec!["-l".into()];
+                let mut process = self
+                    .app
+                    .user_terminal_execution(shell)
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
                 process.pty = Some(PtySize { cols, rows });
-                process.unrestricted_execution =
-                    config.mode == leveler_execution::PermissionProfile::FullAccess;
                 registry
                     .create_terminal(&id, process, owner)
                     .await
@@ -6903,6 +6969,16 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             TerminalOperation::Close => {
                 registry
                     .kill_owned(&id, owner)
+                    .await
+                    .map_err(ClientError::Runtime)?;
+                let shutdown = self.process_shutdown.clone().unwrap_or_default();
+                registry
+                    .wait_owned(
+                        &id,
+                        owner,
+                        Some(std::time::Duration::from_secs(5)),
+                        &shutdown,
+                    )
                     .await
                     .map_err(ClientError::Runtime)?;
                 registry
@@ -6933,6 +7009,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             next_cursor: observation.next_cursor,
             data: observation.data,
             truncated: observation.truncated,
+            output_error: observation.output_error,
         }))
     }
 

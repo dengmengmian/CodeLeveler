@@ -536,18 +536,27 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
         // Reopen a running goal for this exact objective if one exists —
         // a crash between `open` and the declaration clear leaves both facts
         // and must not create a duplicate identity.
-        let existing = self
+        let running: Vec<leveler_storage::GoalRecord> = self
             .stores
             .goals
             .for_task(&self.token.task_id)
             .await
             .map_err(binder_store_error)?
             .into_iter()
-            .find(|goal| {
-                goal.state == leveler_storage::GoalState::Running && goal.objective == objective
-            });
+            .filter(|goal| goal.state == leveler_storage::GoalState::Running)
+            .collect();
+        let same_objective = running.iter().find(|goal| goal.objective == objective);
+        // ONE task owes ONE goal. When nothing was declared and the task already
+        // owes exactly one goal, this commitment is about that work: opening a
+        // sibling would split one intent across two identities, restart the
+        // acceptance checks it was committed against, and make the count of
+        // work windows a half-truth. A model's restatement of the objective is
+        // not evidence of a new task; an explicit declaration is, and that case
+        // is settled above by the pending declaration.
+        let adopted = same_objective.is_none() && pending.is_none() && running.len() == 1;
+        let existing = same_objective.or_else(|| adopted.then(|| &running[0]));
         let goal = match existing {
-            Some(goal) => goal.id,
+            Some(goal) => goal.id.clone(),
             None => self
                 .stores
                 .goals
@@ -555,6 +564,17 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
                 .await
                 .map_err(binder_ownership_error)?,
         };
+        if adopted {
+            // The user's instruction for this window is scope authority for the
+            // goal it joined, exactly as a continuation message is: the
+            // completion gate must cover what they asked for here, not only the
+            // wording the goal was opened with.
+            self.stores
+                .goals
+                .append_amendment(&self.token, &goal, objective)
+                .await
+                .map_err(binder_ownership_error)?;
+        }
         // The running turn's lineage is what a resume or blocked-retry reads
         // to return to THIS goal. Bind it BEFORE consuming the declaration: a
         // crash between the two then leaves the declaration recoverable, and

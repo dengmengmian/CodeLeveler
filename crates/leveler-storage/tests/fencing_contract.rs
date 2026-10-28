@@ -292,6 +292,7 @@ async fn assert_fencing_contract(
         goal_id: goal.clone(),
         windows_delta: 1,
         settle: true,
+        ends_session_goal: false,
     };
 
     // Scenario E: stale terminal commits roll back atomically — no event, no

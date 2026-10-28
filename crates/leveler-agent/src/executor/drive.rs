@@ -1409,7 +1409,26 @@ impl Drive<'_> {
             self.last_projected_input_tokens,
             self.last_actual_input_tokens,
         ) {
-            (Some(estimated), Some(actual)) => actual.saturating_sub(estimated),
+            (Some(estimated), Some(actual)) => {
+                // A provider's prompt count cannot exceed the window it just
+                // accepted the request in. A larger figure is not a
+                // measurement of THIS request (cumulative accounting, a
+                // mislabelled field, a route that reports another quantity),
+                // and carrying it forward as a fixed gap would make every
+                // later fold fail against a cost that folding cannot remove.
+                // Keep the estimator's own count instead.
+                let window = u64::from(self.executor.policy.context_policy.context_window);
+                if window > 0 && actual > window {
+                    tracing::warn!(
+                        estimated,
+                        actual,
+                        window,
+                        "provider-reported prompt exceeds the model window; ignoring it as an estimate gap"
+                    );
+                    return 0;
+                }
+                actual.saturating_sub(estimated)
+            }
             _ => 0,
         }
     }
@@ -2655,11 +2674,41 @@ impl AgentHarness for Drive<'_> {
                                         // The committed window carries the goal
                                         // contract from the next request on.
                                         self.tools = self.executor.request_tool_definitions();
-                                        let checks = acceptance
+                                        // Report the DURABLE scope, not the
+                                        // model's restatement. When this turn
+                                        // joined a goal the task already owed,
+                                        // that goal's objective and acceptance
+                                        // are what the completion gate reads,
+                                        // and the model must not believe it
+                                        // declared a second task.
+                                        let bound = binder.scope().await.ok().flatten();
+                                        let (bound_objective, bound_acceptance) = bound
+                                            .map(|scope| (scope.objective, scope.acceptance))
+                                            .unwrap_or_else(|| {
+                                                (goal_objective.clone(), acceptance.clone())
+                                            });
+                                        let joined = bound_objective != goal_objective;
+                                        let checks = bound_acceptance
                                             .iter()
                                             .map(|check| format!("- {check}"))
                                             .collect::<Vec<_>>()
                                             .join("\n");
+                                        let requirements = goal_scope::extract(
+                                            &bound_objective,
+                                            &self.objective.amendments,
+                                        );
+                                        let header = if joined {
+                                            format!(
+                                                "Execution task joined: goal {goal}. This session \
+                                                 already owed this task, so the runtime did not \
+                                                 open a second one.\nObjective: {bound_objective}\n"
+                                            )
+                                        } else {
+                                            format!(
+                                                "Execution task committed as goal {goal}.\n\
+                                                 Objective: {bound_objective}\n"
+                                            )
+                                        };
                                         let scope = if requirements.is_empty() {
                                             String::new()
                                         } else {
@@ -2678,9 +2727,7 @@ impl AgentHarness for Drive<'_> {
                                         (
                                             true,
                                             format!(
-                                                "Execution task committed as goal {goal}.\n\
-                                                 Objective: {goal_objective}\n\
-                                                 {scope}Acceptance:\n{checks}\n\
+                                                "{header}{scope}Acceptance:\n{checks}\n\
                                                  This turn stays running until the task is \
                                                  resolved. A stage summary does not end it. \
                                                  Continue the work, then call \

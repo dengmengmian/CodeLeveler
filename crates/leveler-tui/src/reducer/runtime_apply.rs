@@ -39,6 +39,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::SessionUpdated { session } => {
             let previous = state.mode;
             apply_meta(state, &session);
+            // The runtime's axis is the route the NEXT turn takes. A session the
+            // runtime returned to Chat is not running a Goal turn, so the mode
+            // chip must not keep claiming one after a goal lifecycle ended.
+            if !state.collaboration.eq_ignore_ascii_case("goal") {
+                state.goal_mode_active = false;
+            }
             if state.pending_permission == Some(state.mode) {
                 state.pending_permission = None;
             }

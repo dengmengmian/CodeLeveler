@@ -141,6 +141,38 @@ async fn wait_for(mut child: Child, log: &Path, timeout: Duration) -> std::proce
 }
 
 /// The axis each persisted session for `task` carries.
+/// The goals opened for a task, as durable evidence of the profile that ran.
+/// A completed goal ends its session's Goal route, so the axis after a run is
+/// no longer the witness for "which profile executed".
+async fn task_goals(env: &TestEnv, task: &str) -> Vec<String> {
+    let projects = env.home.join("state/projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let db_path = entry.path().join("sessions.db");
+        if !db_path.is_file() {
+            continue;
+        }
+        let db = Database::connect(&db_path).await.unwrap();
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        for session in SessionRepository::new(&db).list().await.unwrap() {
+            if session.goal != task {
+                continue;
+            }
+            let sid = leveler_core::SessionId::new(session.id);
+            let Some(task_id) = stores.tasks.task_for_session(&sid).await.unwrap() else {
+                continue;
+            };
+            for goal in stores.goals.for_task(&task_id).await.unwrap() {
+                found.push(goal.objective);
+            }
+        }
+    }
+    found
+}
+
 async fn session_axes(env: &TestEnv, task: &str) -> Vec<String> {
     let projects = env.home.join("state/projects");
     let Ok(entries) = std::fs::read_dir(&projects) else {
@@ -224,7 +256,16 @@ async fn headless_goal_keeps_the_goal_terminal_contract() {
         "update_goal(complete) is the goal terminal:\n{}",
         read_log(&log)
     );
-    assert_eq!(session_axes(&env, "goal complete").await, vec!["goal"]);
+    assert_eq!(
+        task_goals(&env, "goal complete").await,
+        vec!["goal complete"],
+        "the run executed the Goal profile and opened its goal"
+    );
+    assert_eq!(
+        session_axes(&env, "goal complete").await,
+        vec!["chat"],
+        "the completed goal ended its own route: nothing is owed any more"
+    );
 
     // The same axis with only a quiet answer stays unresolved.
     let server = MockServer::start_one(text_response("looks done to me")).await;
@@ -290,5 +331,9 @@ async fn omitted_collaboration_is_goal() {
     let child = spawn_run(&env, &["--auto-approve", "goal default"], &log);
     let status = wait_for(child, &log, Duration::from_secs(120)).await;
     assert!(status.success(), "leveler run failed:\n{}", read_log(&log));
-    assert_eq!(session_axes(&env, "goal default").await, vec!["goal"]);
+    assert_eq!(
+        task_goals(&env, "goal default").await,
+        vec!["goal default"],
+        "an omitted `--collaboration` is the Goal default: it opened a goal"
+    );
 }
