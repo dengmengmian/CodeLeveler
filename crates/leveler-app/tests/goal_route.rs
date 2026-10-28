@@ -202,6 +202,26 @@ async fn settled(f: &Fixture, min_turns: usize) {
     }
 }
 
+/// Wait until the session's goal records satisfy `done`.
+///
+/// A goal is settled in the task's terminal transaction, which lands after the
+/// turn row stops running; reading the record before that commit observes a
+/// state the window has already left.
+async fn wait_for_goals(f: &Fixture, done: impl Fn(&[GoalRecord]) -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let goals = goals(f).await;
+        if done(&goals) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the goal did not reach its terminal state: {goals:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn run_goal_turn(f: &Fixture, content: &str) {
     f.app
         .run_in_session_bounded(
@@ -372,6 +392,12 @@ async fn a_blocked_goal_resumes_the_same_identity_after_an_ordinary_question() {
         .await
         .unwrap();
     settled(&f, 3).await;
+    wait_for_goals(&f, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.id == goal_id && goal.state == GoalState::Settled)
+    })
+    .await;
 
     let goals = goals(&f).await;
     assert_eq!(
@@ -604,6 +630,7 @@ async fn a_recoverably_failed_goal_answers_a_question_then_resumes_the_same_goal
         .await
         .unwrap();
     settled(&f, 3).await;
+    wait_for_goals(&f, |goals| goals.iter().any(|goal| goal.windows_run >= 2)).await;
 
     let goals = goals(&f).await;
     assert_eq!(goals.len(), 1, "the retry is the same goal: {goals:?}");

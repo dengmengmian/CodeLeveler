@@ -719,6 +719,15 @@ fn verifier_label() -> &'static str {
     }
 }
 
+/// The acceptance item that names the verifier the Objective itself names.
+fn verifier_acceptance() -> &'static str {
+    if cfg!(windows) {
+        "cmd /c verify.cmd 通过"
+    } else {
+        "sh ./verify.sh 通过"
+    }
+}
+
 fn verifier_call() -> serde_json::Value {
     if cfg!(windows) {
         serde_json::json!({"program": "cmd", "args": ["/c", "verify.cmd"], "reason": "run the acceptance check"})
@@ -793,7 +802,7 @@ async fn a_completion_cannot_omit_a_user_named_deliverable() {
                     "stage-1.txt 存在",
                     "stage-2.txt 存在",
                     "stage-3.txt 存在",
-                    "sh ./verify.sh 通过",
+                    verifier_acceptance(),
                 ],
                 staged_objective(),
             ),
@@ -935,7 +944,7 @@ async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
                     "stage-1.txt 存在",
                     "stage-2.txt 存在",
                     "stage-3.txt 存在",
-                    "sh ./verify.sh 通过",
+                    verifier_acceptance(),
                 ],
                 staged_objective(),
             ),

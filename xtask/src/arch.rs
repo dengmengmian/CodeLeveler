@@ -1029,7 +1029,8 @@ mod tests {
         std::fs::remove_file(dir.path().join(EXCEPTIONS_PATH)).unwrap();
         let text = report(dir.path());
         assert!(text.contains(EXCEPTIONS_PATH), "{text}");
-        assert!(text.contains("No such file"), "{text}");
+        // The OS message differs per platform; what matters is the verdict.
+        assert!(!text.contains("arch: PASS"), "{text}");
     }
 
     #[test]

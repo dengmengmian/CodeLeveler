@@ -367,8 +367,20 @@ fn a_sigkilled_writer_leaves_a_store_a_new_process_can_recover() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    let script = format!("kill -9 {}", writer.id());
-    let status = Command::new("sh").arg("-c").arg(&script).status().unwrap();
+    #[cfg(windows)]
+    let status = {
+        let pid = writer.id().to_string();
+        Command::new("taskkill")
+            .args(["/F", "/PID", pid.as_str()])
+            .status()
+            .unwrap()
+    };
+    #[cfg(not(windows))]
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -9 {}", writer.id()))
+        .status()
+        .unwrap();
     assert!(status.success());
     let _ = writer.wait();
 
