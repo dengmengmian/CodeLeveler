@@ -91,5 +91,5 @@ oversights. Reports that only restate them will be closed as known.
 
 ## Supported versions
 
-Until CodeLeveler reaches 1.0, security fixes are applied to the latest release
-and the default branch. Older pre-release versions may not receive backports.
+Security fixes are applied to the latest release and the default branch. Older
+versions may not receive backports.
