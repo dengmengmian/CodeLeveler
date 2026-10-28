@@ -807,11 +807,14 @@ impl<'a> Drive<'a> {
             Kernel::ContextUsage(accounting) => {
                 // The one place the estimate is captured: it describes the
                 // request this round is about to send, so the ledger row for
-                // that round can carry it.
+                // that round can carry it. The kernel boxes the value; this
+                // event still carries the accounting itself.
                 self.last_projected_input_tokens = Some(accounting.used_tokens);
                 self.last_projected_reasoning_tokens =
                     Some(accounting.projected_reasoning_tokens());
-                AgentEvent::ContextUsage { accounting }
+                AgentEvent::ContextUsage {
+                    accounting: *accounting,
+                }
             }
             Kernel::ModelRetrying {
                 attempt,

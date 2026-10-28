@@ -749,9 +749,8 @@ mod tests {
             ],
             &policy,
         );
-        assert_eq!(
+        assert!(
             plan.report.mandatory_bytes + plan.report.optional_bytes <= 10_000,
-            true,
             "the ceiling is the request, not each document: {plan:?}"
         );
         // The first document spends the budget; the second is indexed.

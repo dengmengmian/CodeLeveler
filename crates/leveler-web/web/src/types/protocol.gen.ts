@@ -475,7 +475,7 @@ export type RuntimeEvent =
   /** Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`]. */
   | { type: 'memory_status'; query_id?: CommandId | null; status: UiMemoryStatus }
   /** The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies. */
-  | { type: 'memory_recalled'; count: number; experience_count?: number; ids: string[] }
+  | { type: 'memory_recalled'; count: number; experience_count?: number; ids: string[]; injected?: UiMemoryReference[] }
   /** A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body. */
   | { type: 'memory_changed'; authority?: string | null; id: string; operation: string; title: string }
   /** Side-question (`/btw`) started; not persisted to session history. */
@@ -929,6 +929,8 @@ export interface UiMemoryCandidate {
   id: string;
   /** Free-form label as stored (`preference`, `package_manager`, …). */
   kind: string;
+  /** Which store is holding this pending record. Accept/reject must carry it back so a decision can never land in another scope. */
+  scope?: UiMemoryScope;
   /** Who proposed it (`user_explicit`, `system_propose`, …). */
   source: string;
   title: string;
@@ -936,12 +938,26 @@ export interface UiMemoryCandidate {
 
 /** Compact durable-memory row for TUI list surfaces. */
 export interface UiMemoryEntry {
+  /** Who established this memory (`user_explicit`, `runtime_observed`, ...). This is the store's own vocabulary, not a client guess. */
+  authority?: string | null;
+  /** The stored content. A title alone cannot answer "what do I actually remember?", and the detail page must not guess it. Additive: absent on older runtimes (empty string). */
+  body?: string;
   id: string;
   /** What this memory is, which decides how it reaches the model. Additive: absent on older runtimes. */
   kind?: UiMemoryKind | null;
+  /** Pinned by the person, not by a model hint. */
+  pinned?: boolean;
+  /** The revision this row was read at, so a detail page can name exactly what it is showing instead of "the current one". */
+  revision?: number | null;
+  /** Which store this row came from; part of the row's identity. */
+  scope?: UiMemoryScope;
   /** Held back from every automatic path because it looks like a credential. Kept in the listing so the user can find and archive it. */
   sensitive?: boolean;
+  /** The lifecycle state the store reports for this row (`active`, `pending`, `superseded`, `deprecated`). Additive: absent on older runtimes, and the page then says nothing it cannot prove. */
+  status?: string | null;
   title: string;
+  /** When the store last changed this record (RFC 3339). */
+  updated_at?: string | null;
 }
 
 /** The outcome of one experience extraction. Counts only; `reason` is a stable skip class, never entry text or provider output. */
@@ -984,6 +1000,20 @@ export type UiMemoryKind =
   /** Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog. */
   | 'experience';
 
+/** One record a turn's request actually carried. */
+export interface UiMemoryReference {
+  id: string;
+  /** `standing`, `candidate` or `experience`. */
+  mode?: string | null;
+  /** Which store the record came from; `(scope, id)` is its identity. */
+  scope?: UiMemoryScope;
+  /** A bounded summary. Redacted when the record looks like a credential. */
+  title?: string | null;
+}
+
+/** The scope a memory row or decision belongs to. `(scope, id)` is the record's identity: the same id in two scopes is two independent memories. An older runtime that sends no scope predates multi-scope listings and only ever served the project store. */
+export type UiMemoryScope = 'global' | 'project' | 'local';
+
 /** Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error. */
 export interface UiMemoryStatus {
   active: number;
@@ -992,6 +1022,9 @@ export interface UiMemoryStatus {
   experience_active?: number;
   /** Experience rows retired by supersede/expiry/forget. */
   experience_archived?: number;
+  experience_enabled?: boolean;
+  /** Agent experience is still experimental. */
+  experience_experimental?: boolean;
   experience_inbox_failed_retryable?: number;
   /** The experience lane's durable queue, kept separate from the user-turn inbox so "no lesson" and "not extracted yet" are distinguishable. */
   experience_inbox_pending?: number;
@@ -1020,6 +1053,13 @@ export interface UiMemoryStatus {
   /** Most recent retry attempt number, when one is waiting. */
   retry_attempt?: number | null;
   sensitive: number;
+  /** The project's effective switches. `*_enabled` is already the conjunction with `total_enabled`; an old daemon that sends no switches is read as the historical all-on state. */
+  total_enabled?: boolean;
+  /** User-lane entries only, so a client can show the two lanes separately and still account for every active/pending/archived row. */
+  user_active?: number;
+  user_archived?: number;
+  user_enabled?: boolean;
+  user_pending?: number;
 }
 
 /** A rendered message in the transcript. */
@@ -1394,14 +1434,20 @@ export type ClientCommand =
   | { type: 'list_memory'; include_archived?: boolean; query_id?: CommandId | null; session_id: SessionId }
   /** Project memory health (store counts + durable extraction queue). */
   | { type: 'memory_status'; query_id?: CommandId | null; session_id: SessionId }
+  /** Pin or unpin one active memory. A user pin is a standing constraint: it is recalled first and is never crowded out by a weak candidate. A model pin is only a ranking hint, which is why this command exists only on the user's surface. */
+  | { type: 'set_memory_pin'; id: string; pinned: boolean; scope?: UiMemoryScope; session_id: SessionId }
+  /** Retire one active memory as no longer true (`deprecated`), keeping its history. Distinct from [`Self::ForgetMemory`], which removes the record from every read path. */
+  | { type: 'deprecate_memory'; id: string; revision: number; scope?: UiMemoryScope; session_id: SessionId }
+  /** Rewrite the title and body of one active memory the user is looking at. `revision` is the revision the page opened: a mismatch is a conflict the user has to resolve, never a silent overwrite of a newer record. The user's own edit IS the authority, so this command is minted by a client surface; the model edits through `memory.update` and its own admission path instead. */
+  | { type: 'update_memory'; body: string; id: string; revision: number; scope?: UiMemoryScope; session_id: SessionId; title: string }
   /** Archive (forget) one active memory id — user-authoritative (no model). */
-  | { type: 'forget_memory'; id: string; session_id: SessionId }
+  | { type: 'forget_memory'; id: string; scope?: UiMemoryScope; session_id: SessionId }
   /** Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable. */
-  | { type: 'accept_memory'; id: string; session_id: SessionId }
+  | { type: 'accept_memory'; id: string; scope?: UiMemoryScope; session_id: SessionId }
   /** Decline one pending candidate and suppress the same signal from being re-proposed. Distinct from [`Self::ForgetMemory`], which archives an ACTIVE entry: sending a pending id to forget did nothing at all, which is what the Web "忽略" button was doing. */
-  | { type: 'reject_memory'; id: string; session_id: SessionId }
+  | { type: 'reject_memory'; id: string; scope?: UiMemoryScope; session_id: SessionId }
   /** Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose. */
-  | { type: 'remember_memory'; body: string; kind?: UiMemoryKind | null; session_id: SessionId }
+  | { type: 'remember_memory'; body: string; kind?: UiMemoryKind | null; scope?: UiMemoryScope; session_id: SessionId }
   /** Recompute and return the working-tree diff. */
   | { type: 'request_diff'; query_id?: CommandId | null; session_id: SessionId }
   /** Summarize and compact the conversation history (spec §28, §53). */

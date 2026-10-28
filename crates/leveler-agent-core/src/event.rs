@@ -33,7 +33,8 @@ pub enum AgentEvent {
     /// The context accounting of the request the loop is ABOUT to send: what
     /// the exact next model-visible payload is made of, category by category.
     /// Computed from the real `messages` + `tools`, never from a UI transcript.
-    ContextUsage(ContextAccounting),
+    /// Boxed so this variant does not inflate every other event.
+    ContextUsage(Box<ContextAccounting>),
     /// A model round is about to retry the same request. Transient: a
     /// connectivity fact for a live status line, never a transcript item and
     /// never an executor outcome. This is the ONE retry lifecycle for a model
