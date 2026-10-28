@@ -3216,6 +3216,20 @@
             }
           ]
         },
+        "empty_turns": {
+          "description": "Assistant turns THIS route produced that captured no reasoning. The provider completed the turn and returned no thinking, which is a fact about the turn, not a gap in the record.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "foreign_turns": {
+          "description": "Assistant turns another route produced. Their reasoning is private to the model that wrote it, so it is never carried to this one: the turn's text, tool calls and tool results stay, its thinking does not. Counted rather than silently dropped.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
         "protocol_protected_turns": {
           "description": "Turns the requested arm would have dropped but the provider contract requires. A route that replays captured reasoning requires the full reasoning of every retained assistant turn, so this is the arm's difference from `All`. Non-zero ⇒ the requested treatment was NOT fully applied, and the request's reasoning cost cannot be reduced by the arm: the lever is the context lifecycle, which removes whole turns.",
           "type": "integer",
@@ -3229,6 +3243,20 @@
               "$ref": "#/definitions/ReasoningRetention"
             }
           ]
+        },
+        "unknown_provenance_turns": {
+          "description": "Assistant turns whose producing route was not recorded (a payload written before provenance existed, or a request assembled by a runtime that cannot report its route). Not the same fact as [`Self::empty_turns`]: \"nobody said\" is not \"the model produced none\".",
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "unproven_reasoning_turns": {
+          "description": "Of the unproven turns, how many captured reasoning that was therefore withheld from the request. The channel is not replayed (nothing proves it belongs to this route), but the turn's text, tool calls and tool results stay, and a route that requires the key's presence still gets its legal empty value. Reported so a reader can tell this from a route that genuinely measured no reasoning.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         }
       }
     },

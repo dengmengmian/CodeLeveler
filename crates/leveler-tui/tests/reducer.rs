@@ -9262,6 +9262,39 @@ fn a_submission_confirmed_after_reconnect_syncs_runtime_state_without_resending(
     assert!(note.contains("已送达"), "{note}");
 }
 
+/// The confirmation snapshot is taken when the submission is admitted, so a
+/// request the turn raised afterwards can still be missing from it by the time
+/// the client applies it. The control queue is live-event truth: a delivery
+/// confirmation must not close a prompt the user has not answered — that would
+/// leave the gated call waiting with no way to decide it.
+#[test]
+fn a_delivery_confirmation_snapshot_does_not_close_a_live_approval() {
+    let mut s = state();
+    s.composer.replace("删除过期文件");
+    let (_, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: approval_req(),
+        }),
+    );
+    assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+
+    // Admitted before the turn asked: the snapshot knows nothing of the request.
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: Some(Box::new(snapshot())),
+        }),
+    );
+    assert!(
+        matches!(s.overlay, Some(Overlay::Approval(_))),
+        "an unanswered approval survives a stale confirmation: {:?}",
+        s.overlay
+    );
+}
+
 /// The runtime answered "not run": the input goes back into the composer, the
 /// optimistic busy state yields to the runtime's, and a new submission is a
 /// new logical command with a new id.

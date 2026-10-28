@@ -2021,36 +2021,46 @@ fn apply_session_with(
         state.status = RuntimeStatus::Busy;
     }
 
-    // A reconnect snapshot replaces the live control queue. Only in-process
-    // waiters are included, so stale requests from interrupted turns are never
-    // resurrected after a runtime restart.
-    if matches!(
-        state.overlay,
-        Some(Overlay::Approval(_)) | Some(Overlay::Clarification(_))
-    ) {
-        state.overlay = None;
-    }
-    state.pending_interactions.clear();
-    for interaction in session.pending_interactions.iter().cloned() {
-        let pending = match interaction {
-            leveler_client_protocol::UiPendingInteraction::Approval(request) => {
-                PendingInteraction::Approval(request)
-            }
-            leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
-                PendingInteraction::Clarification(request)
-            }
-        };
-        if state.overlay.is_none() {
-            state.overlay = Some(match pending {
-                PendingInteraction::Approval(request) => {
-                    Overlay::Approval(Box::new(ApprovalOverlay::new(request)))
+    // A snapshot that IS the view (opening a session, resyncing after events
+    // were missed) replaces the live control queue. Only in-process waiters are
+    // included, so stale requests from interrupted turns are never resurrected
+    // after a runtime restart.
+    //
+    // A confirmation snapshot is a point-in-time answer to a command this
+    // client sent, captured as the command was admitted. A request the turn
+    // raised afterwards is absent from it, so rebuilding the queue here would
+    // close a prompt the user never answered — and leave the gated call
+    // waiting with no way to decide it. The live event stream stays the truth
+    // for the queue; only what the view is built from is the snapshot's job.
+    if adoption == TranscriptAdoption::Replace {
+        if matches!(
+            state.overlay,
+            Some(Overlay::Approval(_)) | Some(Overlay::Clarification(_))
+        ) {
+            state.overlay = None;
+        }
+        state.pending_interactions.clear();
+        for interaction in session.pending_interactions.iter().cloned() {
+            let pending = match interaction {
+                leveler_client_protocol::UiPendingInteraction::Approval(request) => {
+                    PendingInteraction::Approval(request)
                 }
-                PendingInteraction::Clarification(request) => {
-                    Overlay::Clarification(Box::new(ClarificationOverlay::new(request)))
+                leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
+                    PendingInteraction::Clarification(request)
                 }
-            });
-        } else {
-            state.pending_interactions.push_back(pending);
+            };
+            if state.overlay.is_none() {
+                state.overlay = Some(match pending {
+                    PendingInteraction::Approval(request) => {
+                        Overlay::Approval(Box::new(ApprovalOverlay::new(request)))
+                    }
+                    PendingInteraction::Clarification(request) => {
+                        Overlay::Clarification(Box::new(ClarificationOverlay::new(request)))
+                    }
+                });
+            } else {
+                state.pending_interactions.push_back(pending);
+            }
         }
     }
 

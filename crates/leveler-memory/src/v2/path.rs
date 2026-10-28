@@ -107,24 +107,13 @@ impl StorePaths {
             .map_err(|error| PathError::io(&roots.current, error))?;
         let state =
             fs::canonicalize(&roots.state).map_err(|error| PathError::io(&roots.state, error))?;
-        if current == state || is_inside(&current, &state) || is_inside(&state, &current) {
-            return Err(PathError::RootsNested);
-        }
-        if let Some(repo_root) = &roots.repo_root {
-            let repo =
-                fs::canonicalize(repo_root).map_err(|error| PathError::io(repo_root, error))?;
-            if is_inside(&state, &repo) {
-                return Err(PathError::StateInsideRepo);
+        let repo = match &roots.repo_root {
+            Some(repo_root) => {
+                Some(fs::canonicalize(repo_root).map_err(|error| PathError::io(repo_root, error))?)
             }
-            if is_inside(&state, &repo.join(".git")) || is_inside(&current, &repo.join(".git")) {
-                return Err(PathError::StateInsideRepo);
-            }
-        }
-        if roots.scope == MemoryScope::Local && roots.repo_root.is_none() {
-            return Err(PathError::ScopeUnavailable(
-                "local scope requires repo_root for Git isolation".into(),
-            ));
-        }
+            None => None,
+        };
+        check_layout(roots.scope, &current, &state, repo.as_deref())?;
 
         let paths = Self::layout(roots.scope, current, state, roots.repo_root.clone());
         for dir in [
@@ -172,6 +161,29 @@ impl StorePaths {
             state,
             roots.repo_root.clone(),
         ))
+    }
+
+    /// Validate the roots a store would occupy without creating anything.
+    ///
+    /// A caller that finds no store yet still has to answer for the layout: a
+    /// configuration that can never be opened must be reported, not read as
+    /// an empty store. Every structural rule [`Self::prepare`] can answer
+    /// before it creates a directory is answered here. The checks that need
+    /// the roots on disk — symlink rejection and the local-scope Git ignore
+    /// probe — stay with the write that creates them.
+    pub fn validate(roots: &ScopeRoots) -> Result<(), PathError> {
+        if roots.current.as_os_str().is_empty() || roots.state.as_os_str().is_empty() {
+            return Err(PathError::ScopeUnavailable(
+                "current_root and state_root are required".into(),
+            ));
+        }
+        let current = absolute(&roots.current)?;
+        let state = absolute(&roots.state)?;
+        let repo = match &roots.repo_root {
+            Some(repo_root) => Some(absolute(repo_root)?),
+            None => None,
+        };
+        check_layout(roots.scope, &current, &state, repo.as_deref())
     }
 
     fn layout(
@@ -585,21 +597,69 @@ pub fn is_inside(child: &Path, parent: &Path) -> bool {
 }
 
 /// Best-effort absolute path for inspection. A root that does not exist yet
-/// keeps its spelling instead of being created just to be inspected.
+/// keeps its spelling instead of being created just to be inspected, but its
+/// deepest existing ancestor is resolved: two spellings of the same directory
+/// must compare equal, or a boundary check would answer about the spelling
+/// rather than the path.
 fn absolute(path: &Path) -> Result<PathBuf, PathError> {
-    match fs::canonicalize(path) {
-        Ok(canonical) => Ok(canonical),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if path.is_absolute() {
-                Ok(path.to_path_buf())
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(path))
-                    .map_err(|error| PathError::io(path, error))
+    let mut candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| PathError::io(path, error))?
+            .join(path)
+    };
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match fs::canonicalize(&candidate) {
+            Ok(mut resolved) => {
+                for part in tail.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match (candidate.file_name(), candidate.parent()) {
+                    (Some(name), Some(parent)) => {
+                        tail.push(name.to_owned());
+                        candidate = parent.to_path_buf();
+                    }
+                    _ => return Err(PathError::io(&candidate, error)),
+                }
+            }
+            Err(error) => return Err(PathError::io(&candidate, error)),
         }
-        Err(error) => Err(PathError::io(path, error)),
     }
+}
+
+/// Structural rules a store layout satisfies before any directory is created.
+///
+/// [`StorePaths::prepare`] runs it on canonical paths; [`StorePaths::validate`]
+/// runs it on the paths a store would occupy. One owner, so a read that finds
+/// no store still answers for the same layout an open would.
+fn check_layout(
+    scope: MemoryScope,
+    current: &Path,
+    state: &Path,
+    repo_root: Option<&Path>,
+) -> Result<(), PathError> {
+    if current == state || is_inside(current, state) || is_inside(state, current) {
+        return Err(PathError::RootsNested);
+    }
+    if let Some(repo_root) = repo_root {
+        if is_inside(state, repo_root)
+            || is_inside(state, &repo_root.join(".git"))
+            || is_inside(current, &repo_root.join(".git"))
+        {
+            return Err(PathError::StateInsideRepo);
+        }
+    }
+    if scope == MemoryScope::Local && repo_root.is_none() {
+        return Err(PathError::ScopeUnavailable(
+            "local scope requires repo_root for Git isolation".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn temp_sequence() -> u64 {

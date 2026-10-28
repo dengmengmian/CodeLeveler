@@ -1413,15 +1413,20 @@ impl Drive<'_> {
             self.last_actual_input_tokens,
         ) {
             (Some(estimated), Some(actual)) => {
-                // A provider's prompt count cannot exceed the window it just
-                // accepted the request in. A larger figure is not a
-                // measurement of THIS request (cumulative accounting, a
-                // mislabelled field, a route that reports another quantity),
-                // and carrying it forward as a fixed gap would make every
-                // later fold fail against a cost that folding cannot remove.
-                // Keep the estimator's own count instead.
+                // A provider's prompt count is a measurement of THIS request
+                // only when a window was declared and the count fits in it.
+                // Without a window there is nothing to check the figure
+                // against, so last reported usage must not become the next
+                // request's size. A count past a declared window is the same
+                // kind of non-measurement (cumulative accounting, a
+                // mislabelled field, a route that reports another quantity):
+                // carrying it forward as a fixed gap would make every later
+                // fold fail against a cost that folding cannot remove.
                 let window = u64::from(self.executor.policy.context_policy.context_window);
-                if window > 0 && actual > window {
+                if window == 0 {
+                    return 0;
+                }
+                if actual > window {
                     tracing::warn!(
                         estimated,
                         actual,
