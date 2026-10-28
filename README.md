@@ -13,6 +13,12 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 License"></a>
 </p>
 
+> **Harness is an amplifier of model capability, not a constraint on it.**
+>
+> **The model defines what is possible; the Harness determines how fully that capability can be realized.**
+
+CodeLeveler aims to maximize each model's own capabilities—not to narrow performance gaps between models or make their behavior converge. Context, tools, execution, and feedback should amplify the model's reasoning and autonomy, not replace them.
+
 Give CodeLeveler a task. It can read the repository, edit files, run builds and tests, and use Git. Conversations, approvals, events, and changed files remain available when a session stops. Session state is stored on your machine, and model requests go to the provider you configure.
 
 The terminal UI (`leveler`), Web UI (`leveler web`), and headless CLI (`leveler run`) use the same runtime. CodeLeveler currently targets macOS, Linux, and Windows.

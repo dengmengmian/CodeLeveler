@@ -13,6 +13,12 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 License"></a>
 </p>
 
+> **Harness 是模型能力的放大器，而不是限制器。**
+>
+> **模型决定能力的可能性，Harness 决定这些能力能在多大程度上得到发挥。**
+
+CodeLeveler 的目标是尽可能发挥每个模型自身的最大能力，而不是缩小不同模型之间的差距或让其表现趋同。上下文、工具、执行环境和反馈机制应放大模型的推理与自主执行能力，而不是取代它们。
+
 给 CodeLeveler 一个任务。它可以读仓库、改文件、运行构建和测试，也可以使用 Git。会话停止后，对话、审批、事件记录和改过的文件仍然保留。会话状态存储在你的机器上，模型请求只发给你配置的服务商。
 
 终端界面（`leveler`）、浏览器界面（`leveler web`）和无界面命令行（`leveler run`）使用同一套运行时。CodeLeveler 当前面向 macOS、Linux 和 Windows。
