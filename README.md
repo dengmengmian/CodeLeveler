@@ -100,47 +100,6 @@ sudo apt install bubblewrap
 
 CodeLeveler can start without it, but commands that require Linux isolation fail closed instead of running unsandboxed. Run `leveler doctor` to inspect the capabilities available on the current machine.
 
-## Development
-
-Daily commands are `./dev`. `./dev fmt` formats only the Rust files owned by the current task and does not run `cargo fmt --all`. Release eligibility is the external lab: `release_check.py`, then `rc_check.py`. `./dev` invokes those scripts and does not replace them. Run `./dev help` for the command list.
-
-### Releasing
-
-`./dev publish` is one release transaction: it bumps the version and commits it, then runs four stages and stops at the first failure.
-
-| Stage | What it runs |
-| --- | --- |
-| 1 build & static | fmt, clippy, the release build, the supply-chain checks, the frozen binary's identity |
-| 2 automated tests | the full workspace suite, the release contracts, the permission gates, TUI and PTY |
-| 3 real dogfood | the model-driven cases and performance evidence, then the RC qualification |
-| 4 CI/CD & publish | push the frozen commit, wait for the required CI on exactly that commit, dispatch the release workflow once, then verify the tag, the release, the published assets and their SHA-256 |
-
-Each stage records the inputs it decided on and a digest of the evidence it accepted. `./dev publish --resume` re-earns only the stages whose inputs changed and keeps the version already in progress, so a fix after a failed stage 3 still ships as the same version. `--status` reports where the transaction stands, `--report` rewrites the report, `--dry-run` prints the plan, and `--stop-after <1..4>` stops early.
-
-A release is only `RELEASED` in the report once the tag, the GitHub release and the published assets have been verified; a dispatch is never treated as a result. Reports are written to `.dev/release/<version>/RELEASE_REPORT.md` and `release.json`, and archived next to the dogfood evidence when there is a run.
-
-### Mirrors (AtomGit, GitHub proxies)
-
-Every stable release is also published on AtomGit (`atomgit.com/dengmengmian/CodeLeveler`),
-so a network that reaches one host but not the other still has a source.
-
-`leveler update` and `install.sh` prefer the GitHub URL and fall back to mirrors,
-and **the SHA-256 checksum always decides**: a mirror that serves anything else
-fails verification instead of being installed. Two kinds of mirror are supported,
-both optional and both comma-separated:
-
-```sh
-# A proxy that takes the whole canonical URL appended to its own path
-# (ghproxy-style): https://mirror.example/https://github.com/...
-LEVELER_UPDATE_MIRRORS="https://mirror.example/"
-
-# A host that stores our files under its own layout and takes the bare asset
-# name. `{version}` is substituted with the release being fetched.
-LEVELER_UPDATE_ASSET_BASE="https://atomgit.com/dengmengmian/CodeLeveler/releases/download/v{version}/"
-```
-
-The canonical GitHub URL is always tried first; mirrors only add candidates.
-
 ## Updates
 
 CodeLeveler keeps itself on the latest **stable** GitHub release. At start-up it checks at most once per `check_interval_hours`, and when a newer release exists it downloads it, verifies its SHA-256, replaces the running binary, and restarts. A failed check never blocks start-up: the current version runs normally and the reason is logged.
@@ -265,13 +224,11 @@ The default permission profile is `assisted`. Ordinary repository writes, builds
 
 ## TUI editing and terminal diagnostics
 
-In the input area, `Ctrl+Z` undoes an edit, `Ctrl+Shift+Z` or `Alt+Z` redoes it, and `Ctrl+Y` restores recently killed text. Undo restores paste blocks, file references, and the original image attachment bindings. Submission and session changes end the draft's edit history. Each undo/redo stack is bounded to 100 entries and 8 MiB.
+In the input area, `Ctrl+Z` undoes, `Ctrl+Shift+Z` or `Alt+Z` redoes, and `Ctrl+Y` restores recently killed text. Submission and session changes end the draft's edit history.
 
-`Ctrl+R` searches submitted input history. `Enter` restores the selected entry to the draft for editing without sending it; `Esc` or `Ctrl+C` closes search and preserves the original draft. `/help` searches commands, shortcuts, and descriptions.
+`Ctrl+R` searches submitted input history: `Enter` restores the selected entry to the draft without sending it, and `Esc` or `Ctrl+C` closes search and keeps the original draft. `/help` searches commands, shortcuts, and descriptions.
 
-`/doctor` shows local terminal diagnostics. `leveler doctor` also reports terminal, SSH/tmux, color hints, newline keys, and clipboard routes. Diagnostics do not change clipboard contents or terminal settings; capabilities without evidence remain unknown.
-
-In an ordinary local terminal, copying selected conversation text prefers the native clipboard with readback verification. Over SSH, the remote host's native clipboard is skipped in favor of OSC52. Since a tmux server cannot establish its current client's location, tmux also skips the native clipboard, writes the tmux paste buffer, and sends OSC52. Successful OSC52/tmux writes are reported as sent with local clipboard delivery unverified. Clipboard forwarding or passthrough may need to be enabled in your terminal. OSC52 text is limited to 64 KiB, with an explicit error above the limit.
+`leveler doctor` and `/doctor` report terminal, SSH/tmux, colour, newline-key, and clipboard diagnostics without changing terminal settings or clipboard contents; capabilities without evidence stay unknown. Copying states what it can prove: a native clipboard write with matching readback is verified, while SSH and tmux report OSC52 or paste-buffer delivery as sent but unverified.
 
 ## Browser and web search
 
@@ -302,9 +259,7 @@ The coding harness resolves the definition, while capability admission and host 
 
 ## Experimental mobile client
 
-`apps/leveler-mobile` is a frozen source preview, not a distributed product. The current evidence covers an iOS simulator pairing flow. Android builds, physical-device and cellular testing, TestFlight, and Play distribution have not been completed.
-
-Remote control sends session traffic through the configured relay. Messages are signed, but end-to-end AEAD encryption is not implemented yet; the TLS terminator can read session traffic. Self-host the relay if you evaluate this feature. See [the mobile status](apps/leveler-mobile/README.md) before using it.
+`apps/leveler-mobile` is a frozen source preview, not a distributed product; only an iOS simulator pairing flow has been exercised. Remote control sends session traffic through the configured relay: messages are signed, but end-to-end encryption is not implemented, so self-host the relay if you evaluate it. See [the mobile status](apps/leveler-mobile/README.md).
 
 ## Documentation
 
