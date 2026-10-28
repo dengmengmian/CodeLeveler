@@ -94,6 +94,10 @@ struct ResumeLineage {
     /// The pending declaration this resume will consume, when it is the exact
     /// objective of the goal being continued.
     declaration: Option<String>,
+    /// The newest user/chat turn itself reached `completed`. A finished
+    /// question is not the work a later `继续` continues; a failed or
+    /// interrupted turn is.
+    latest_completed: bool,
 }
 
 fn continuation_root_is_valid(
@@ -665,6 +669,7 @@ impl CodingRuntime {
                     turn_ids: Vec::new(),
                     goal_id: None,
                     declaration: None,
+                    latest_completed: turn.status == "completed",
                 });
                 break;
             };
@@ -733,6 +738,7 @@ impl CodingRuntime {
                     turn_ids: Vec::new(),
                     goal_id: lineage.goal_id,
                     declaration: None,
+                    latest_completed: turn.status == "completed",
                 });
                 break;
             }
@@ -765,6 +771,7 @@ impl CodingRuntime {
                     turn_ids: Vec::new(),
                     goal_id: None,
                     declaration: None,
+                    latest_completed: turn.status == "completed",
                 });
                 break;
             }
@@ -812,6 +819,7 @@ impl CodingRuntime {
             turn_ids: vec![TurnId::new(root.id.clone())],
             goal_id,
             declaration: None,
+            latest_completed: root.status == "completed",
         })
     }
 
@@ -2373,14 +2381,16 @@ impl CodingRuntime {
             .engine
             .mark_running(session_id, AgentState::Execute)
             .await?;
-        // Work the task still owes is what a continuation continues, even when
-        // the turn in front of it was a conversation. A blocked (or failed)
-        // window hands the conversation back to the user; the question they ask
-        // then ends as an ordinary Chat turn that carries no goal of its own —
-        // yet `继续` must re-enter the goal that owes the work. Exactly one
-        // running goal IS that work. More than one is ambiguous, so nothing is
-        // guessed and the resume stays a Chat continuation.
+        // Work the task still owes is what a continuation continues, once the
+        // turn in front of it has finished. A blocked or failed goal window
+        // hands the conversation back; the question they ask ends as a
+        // completed Chat turn that carries no goal of its own, and `继续`
+        // re-enters the one goal that owes the work. A Chat turn that itself
+        // failed or was interrupted IS the work being resumed: `继续` stays on
+        // that chat objective instead of pinning the older goal. More than one
+        // running goal is ambiguous, so nothing is guessed.
         if lineage_was_chat
+            && lineage.latest_completed
             && lineage.goal_id.is_none()
             && pending.is_none()
             && let Some(owed) = self.single_running_goal(&token.task_id).await?

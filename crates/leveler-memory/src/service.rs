@@ -369,6 +369,49 @@ impl MemoryService {
         Ok(stores.entry(scope).or_insert(service).clone())
     }
 
+    /// The current root has never been created. A missing parent is the same
+    /// fact: nothing has been written into this scope.
+    fn current_root_absent(&self, scope: ServiceScope) -> bool {
+        let Some(roots) = self.roots.scope_roots(scope) else {
+            return false;
+        };
+        matches!(
+            std::fs::symlink_metadata(&roots.current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
+    /// Nothing has ever been written into `scope`.
+    ///
+    /// The layout is still validated on this path: a root pair that can never
+    /// be opened is a configuration error, and an empty read would hide it
+    /// behind a store that is not there.
+    fn never_written(&self, scope: ServiceScope) -> Result<bool, ServiceError> {
+        if !self.current_root_absent(scope) {
+            return Ok(false);
+        }
+        if let Some(roots) = self.roots.scope_roots(scope) {
+            v2::StorePaths::validate(roots).map_err(store_error)?;
+        }
+        Ok(true)
+    }
+
+    /// Open a scope whose current root already exists.
+    ///
+    /// `Ok(None)` is an empty store that has never been written. Creating it
+    /// on a read would put `<repo>/.leveler` into `git status` for a session
+    /// that never stored a record. Writes still go through
+    /// [`Self::markdown_service`], which prepares the roots.
+    fn existing_markdown(
+        &self,
+        scope: ServiceScope,
+    ) -> Result<Option<Arc<v2::MemoryService>>, ServiceError> {
+        if self.never_written(scope)? {
+            return Ok(None);
+        }
+        self.markdown_service(scope).map(Some)
+    }
+
     // ---------------------------------------------------------------- reads
 
     /// Current records in one scope. `lanes` filters experience entries for a
@@ -381,7 +424,9 @@ impl MemoryService {
         limit: Option<usize>,
     ) -> Result<Vec<MemoryView>, ServiceError> {
         let _ = actor;
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
         let mut records = service.effective_active()?;
         records.retain(|entry| match entry.record.frontmatter.kind {
             v2::MemoryKind::Experience => lanes.experience,
@@ -412,7 +457,9 @@ impl MemoryService {
         scope: ServiceScope,
         lanes: MemoryLanes,
     ) -> Result<Vec<MemoryView>, ServiceError> {
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
         let summaries = service.list(
             &actor_user(),
             v2::ListQuery {
@@ -446,9 +493,11 @@ impl MemoryService {
         id: &str,
     ) -> Result<MemoryView, ServiceError> {
         let _ = actor;
-        let service = self.markdown_service(scope)?;
         let id =
             v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Err(ServiceError::NotFound(id.to_string()));
+        };
         let record = service.read(actor, &id)?;
         if record.record.frontmatter.sensitive {
             return Err(ServiceError::NotFound(id.to_string()));
@@ -469,9 +518,11 @@ impl MemoryService {
         scope: ServiceScope,
         id: &str,
     ) -> Result<MemoryView, ServiceError> {
-        let service = self.markdown_service(scope)?;
         let id =
             v2::MemoryId::parse(id).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Err(ServiceError::NotFound(id.to_string()));
+        };
         let record = match service.read(actor, &id) {
             Ok(record) => record,
             Err(error) => return Err(error.into()),
@@ -491,7 +542,15 @@ impl MemoryService {
         scope: ServiceScope,
         ids: &[String],
     ) -> Result<Vec<Result<MemoryView, ServiceError>>, ServiceError> {
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(ids
+                .iter()
+                .map(|id| match v2::MemoryId::parse(id) {
+                    Ok(parsed) => Err(ServiceError::NotFound(parsed.to_string())),
+                    Err(_) => Err(ServiceError::Invalid(format!("not a memory id: {id}"))),
+                })
+                .collect());
+        };
         let parsed: Vec<Option<v2::MemoryId>> =
             ids.iter().map(|id| v2::MemoryId::parse(id).ok()).collect();
         let known: Vec<v2::MemoryId> = parsed.iter().flatten().cloned().collect();
@@ -526,8 +585,12 @@ impl MemoryService {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(MemoryView, f64)>, ServiceError> {
-        let service = self.markdown_service(scope)?;
-        let index = self.fresh_index(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
+        let Some(index) = self.fresh_index(scope)? else {
+            return Ok(Vec::new());
+        };
         let hits = index
             .search(query, limit.max(1).saturating_mul(4), lanes)
             .map_err(index_error)?;
@@ -624,7 +687,9 @@ impl MemoryService {
     /// This is the controlled recovery path after index damage and the cold
     /// start path for a new process. It never writes Markdown.
     pub fn refresh_index(&self, scope: ServiceScope) -> Result<v2::ReconcileReport, ServiceError> {
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(v2::ReconcileReport::default());
+        };
         let records = service.effective_active()?;
         self.index_for(scope)?
             .reconcile(&records)
@@ -636,6 +701,9 @@ impl MemoryService {
         &self,
         scope: ServiceScope,
     ) -> Result<Option<v2::IndexDiagnostics>, ServiceError> {
+        if self.never_written(scope)? {
+            return Ok(None);
+        }
         self.index_for(scope)?
             .diagnostics()
             .map(Some)
@@ -653,7 +721,10 @@ impl MemoryService {
         scope: ServiceScope,
         limit: usize,
     ) -> Result<Vec<v2::DerivedRow>, ServiceError> {
-        self.fresh_index(scope)?
+        let Some(index) = self.fresh_index(scope)? else {
+            return Ok(Vec::new());
+        };
+        index
             .catalog_rows(scope.to_v2(), limit)
             .map_err(index_error)
     }
@@ -664,19 +735,27 @@ impl MemoryService {
         scope: ServiceScope,
         limit: usize,
     ) -> Result<Vec<v2::DerivedRow>, ServiceError> {
-        self.fresh_index(scope)?
+        let Some(index) = self.fresh_index(scope)? else {
+            return Ok(Vec::new());
+        };
+        index
             .standing_rows(scope.to_v2(), limit)
             .map_err(index_error)
     }
 
-    fn fresh_index(&self, scope: ServiceScope) -> Result<Arc<v2::MemoryIndex>, ServiceError> {
-        let service = self.markdown_service(scope)?;
+    fn fresh_index(
+        &self,
+        scope: ServiceScope,
+    ) -> Result<Option<Arc<v2::MemoryIndex>>, ServiceError> {
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(None);
+        };
         let index = self.index_for(scope)?;
         if index.is_dirty().map_err(index_error)? {
             let records = service.effective_active()?;
             index.reconcile(&records).map_err(index_error)?;
         }
-        Ok(index)
+        Ok(Some(index))
     }
 
     /// Private state root for one scope, when it is configured. Used by the
@@ -752,7 +831,9 @@ impl MemoryService {
 
     /// `(current, archived)` counts.
     pub fn counts(&self, scope: ServiceScope) -> Result<(usize, usize), ServiceError> {
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok((0, 0));
+        };
         let active = service.effective_active()?.len();
         let archived = service
             .list(
@@ -784,7 +865,9 @@ impl MemoryService {
         limit: Option<usize>,
     ) -> Result<Vec<MemoryView>, ServiceError> {
         let _ = actor;
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
         let mut records = service.archived()?;
         records.retain(|record| match record.frontmatter.kind {
             v2::MemoryKind::Experience => lanes.experience,
@@ -1054,7 +1137,16 @@ impl MemoryService {
         actor: &Actor,
         scope: ServiceScope,
     ) -> Result<Vec<MemoryView>, ServiceError> {
-        let service = self.markdown_service(scope)?;
+        // Authority, not content: an empty store does not make an external
+        // actor a reader of the review queue.
+        if !matches!(actor, Actor::User { .. } | Actor::Migration { .. }) {
+            return Err(ServiceError::NeedsReview(
+                "pending memory is only visible to a user review path".into(),
+            ));
+        }
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
         Ok(service
             .pending(actor)?
             .iter()
@@ -1068,7 +1160,9 @@ impl MemoryService {
         scope: ServiceScope,
         limit: usize,
     ) -> Result<Vec<IdentityContextEntry>, ServiceError> {
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
         Ok(service
             .identity_context(limit)?
             .into_iter()
@@ -1096,7 +1190,9 @@ impl MemoryService {
         scope: ServiceScope,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<MemoryView>, ServiceError> {
-        let service = self.markdown_service(scope)?;
+        let Some(service) = self.existing_markdown(scope)? else {
+            return Ok(Vec::new());
+        };
         let due: Vec<MemoryView> = service
             .effective_active()?
             .into_iter()
@@ -1139,6 +1235,10 @@ impl MemoryService {
 
 fn index_error(error: v2::IndexError) -> ServiceError {
     ServiceError::Unavailable(error.to_string())
+}
+
+fn store_error(error: v2::PathError) -> ServiceError {
+    v2::StoreError::Path(error).into()
 }
 
 #[derive(Debug, Clone)]
@@ -1538,6 +1638,184 @@ fn v2_experience(record: &ExperienceRecord) -> v2::Experience {
 /// was said in. The runtime supplies the identities because it read the turn —
 /// an extractor's output never carries them — so a stored `user_stated` fact
 /// can always be traced back to a real message instead of only to a string.
+#[cfg(test)]
+mod lazy_open_tests {
+    use super::{MemoryRoots, MemoryService, ServiceScope};
+    use crate::MemoryLanes;
+    use crate::v2::{Actor, MemoryScope, ScopeRoots, UserInvocationId};
+
+    /// A session-open listing reads every configured scope. That read must not
+    /// materialize `<repo>/.leveler`, or a repository the user never wrote
+    /// memory into shows up dirty in `git status`.
+    #[test]
+    fn reading_an_uninitialized_scope_does_not_create_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        std::fs::write(repo.path().join("readme.md"), "hi\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=p@e.com",
+                "-c",
+                "user.name=probe",
+                "commit",
+                "-qm",
+                "fixture",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+
+        let service = MemoryService::new(
+            MemoryRoots::new()
+                .with_project(ScopeRoots::new(
+                    MemoryScope::Project,
+                    repo.path().join(".leveler/memory"),
+                    state.path().join("project"),
+                ))
+                .with_local(
+                    ScopeRoots::new(
+                        MemoryScope::Local,
+                        repo.path().join(".leveler/local/memory"),
+                        state.path().join("local"),
+                    )
+                    .with_repo_root(repo.path()),
+                ),
+        );
+        let actor = Actor::User {
+            invocation: UserInvocationId::mint("ui:memory-probe"),
+        };
+        for scope in [ServiceScope::Project, ServiceScope::Local] {
+            assert!(
+                service
+                    .listing_for_user(scope, MemoryLanes::ALL)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                service
+                    .archived(&actor, scope, MemoryLanes::ALL, None)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(service.pending(&actor, scope).unwrap().is_empty());
+            assert!(
+                service
+                    .search(&actor, scope, MemoryLanes::USER_ONLY, "anything", 8)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            !repo.path().join(".leveler").exists(),
+            "a read created {}",
+            repo.path().join(".leveler").display()
+        );
+        let status = std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout).trim(),
+            "",
+            "git status is dirty"
+        );
+
+        let outcome = service
+            .remember(
+                &actor,
+                super::RememberRequest::new(
+                    "op-lazy-1",
+                    ServiceScope::Project,
+                    "keep",
+                    "keep this",
+                    "note",
+                ),
+            )
+            .unwrap();
+        assert!(outcome.applied_id().is_some(), "{outcome:?}");
+        assert!(repo.path().join(".leveler/memory").is_dir());
+        assert_eq!(
+            service
+                .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!repo.path().join(".leveler/local").exists());
+    }
+
+    /// A read of a scope that was never written answers "empty" only when a
+    /// store could exist at those roots at all. A layout that can never be
+    /// opened is a configuration error and must not be hidden behind an
+    /// empty result — the caller would act on a store that is not there.
+    #[test]
+    fn reading_an_unopenable_layout_reports_it_instead_of_empty() {
+        let repo = tempfile::tempdir().unwrap();
+        let service = MemoryService::new(
+            MemoryRoots::new().with_project(
+                ScopeRoots::new(
+                    MemoryScope::Project,
+                    repo.path().join(".leveler/memory"),
+                    // State inside the repository can never be a store.
+                    repo.path().join("state"),
+                )
+                .with_repo_root(repo.path()),
+            ),
+        );
+
+        let error = service
+            .listing_for_user(ServiceScope::Project, MemoryLanes::ALL)
+            .expect_err("an unopenable layout must not read as an empty store");
+        assert!(
+            error.to_string().contains("inside the repository"),
+            "{error}"
+        );
+        assert!(
+            !repo.path().join(".leveler").exists(),
+            "reporting the layout must not create it"
+        );
+    }
+
+    /// The review queue is user authority, not store content. An external
+    /// actor asking about a store that was never written must still be
+    /// refused, not told there is nothing to review.
+    #[test]
+    fn pending_review_keeps_its_authority_on_an_empty_store() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let service = MemoryService::new(MemoryRoots::new().with_project(ScopeRoots::new(
+            MemoryScope::Project,
+            repo.path().join(".leveler/memory"),
+            state.path().join("project"),
+        )));
+
+        let error = service
+            .pending(&Actor::External, ServiceScope::Project)
+            .expect_err("an external actor must not read the review queue");
+        assert!(
+            matches!(error, super::ServiceError::NeedsReview(_)),
+            "{error}"
+        );
+    }
+}
+
 fn user_turn_source(span: &str, session: Option<&str>, turn: Option<&str>) -> v2::SourceRef {
     v2::SourceRef {
         kind: v2::SourceRefKind::UserTurn,

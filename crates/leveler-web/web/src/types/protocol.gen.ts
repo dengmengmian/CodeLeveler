@@ -271,10 +271,18 @@ export interface ReasoningProjectionSummary {
   carried_turns: number;
   /** The route contract the projection ran under. */
   contract: ReasoningReplayContract;
+  /** Assistant turns THIS route produced that captured no reasoning. The provider completed the turn and returned no thinking, which is a fact about the turn, not a gap in the record. */
+  empty_turns?: number;
+  /** Assistant turns another route produced. Their reasoning is private to the model that wrote it, so it is never carried to this one: the turn's text, tool calls and tool results stay, its thinking does not. Counted rather than silently dropped. */
+  foreign_turns?: number;
   /** Turns the requested arm would have dropped but the provider contract requires. A route that replays captured reasoning requires the full reasoning of every retained assistant turn, so this is the arm's difference from `All`. Non-zero ⇒ the requested treatment was NOT fully applied, and the request's reasoning cost cannot be reduced by the arm: the lever is the context lifecycle, which removes whole turns. */
   protocol_protected_turns: number;
   /** The arm the caller requested. */
   requested: ReasoningRetention;
+  /** Assistant turns whose producing route was not recorded (a payload written before provenance existed, or a request assembled by a runtime that cannot report its route). Not the same fact as [`Self::empty_turns`]: "nobody said" is not "the model produced none". */
+  unknown_provenance_turns?: number;
+  /** Of the unproven turns, how many captured reasoning that was therefore withheld from the request. The channel is not replayed (nothing proves it belongs to this route), but the turn's text, tool calls and tool results stay, and a route that requires the key's presence still gets its legal empty value. Reported so a reader can tell this from a route that genuinely measured no reasoning. */
+  unproven_reasoning_turns?: number;
 }
 
 /** The resolved reasoning contract for one route. Four orthogonal dimensions, none of which is a model or provider name: * [`Self::representation`] — the form captured reasoning takes on the wire; * [`Self::scope`] / [`Self::missing`] — when it is carried, and what an empty replayed turn carries; * [`Self::integrity`] — whether retained reasoning may be changed; * [`Self::state`] / [`Self::native_context`] — who owns the validated state, and what context management the provider offers. The context lifecycle reads this contract to decide whether a cut boundary keeps the protocol valid. A provider never gets a branch of its own. */
