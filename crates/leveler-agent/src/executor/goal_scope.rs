@@ -719,9 +719,42 @@ fn collect_segments(
 }
 
 fn split_segments(text: &str) -> Vec<String> {
-    text.split(|c: char| CLAUSE_BREAKS.contains(&c))
-        .map(str::to_string)
-        .collect()
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        // A hard-wrapped sentence is one clause: the line break is whitespace,
+        // not a boundary. A lowercase line continues the sentence above it, so
+        // a permission survives the wrap ("you may add fixtures under /
+        // a `testdata/` directory") instead of turning the paths it lists into
+        // demands the user never made. Only a line above a permission can
+        // absorb a continuation, and a paragraph break, a new sentence or a
+        // list item still starts its own clause.
+        let continues = !current.is_empty()
+            && line.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && has_marker(&current, PERMISSION_ASCII, PERMISSION_CJK);
+        if continues {
+            current.push(' ');
+            current.push_str(line.trim());
+            continue;
+        }
+        if !current.is_empty() {
+            segments.extend(
+                current
+                    .split(|c: char| CLAUSE_BREAKS.contains(&c))
+                    .map(str::to_string),
+            );
+        }
+        current.clear();
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        segments.extend(
+            current
+                .split(|c: char| CLAUSE_BREAKS.contains(&c))
+                .map(str::to_string),
+        );
+    }
+    segments
 }
 
 fn collect_segment(
@@ -1997,6 +2030,23 @@ mod tests {
                 .any(|requirement| requirement.kind == RequirementKind::Tests),
             "a required test run stays a requirement: {requirements:?}"
         );
+    }
+
+    /// A hard-wrapped sentence is still one sentence. The permission does not
+    /// end at the line break, so the paths it lists stay permitted rather than
+    /// becoming demands the user never made.
+    #[test]
+    fn a_wrapped_permission_still_permits() {
+        let requirements = extract(
+            "Scope: you may add or change `*_test.go` files anywhere, add fixtures under\n\
+             a `testdata/` directory, and update `docs/`. Every OTHER change must be\n\
+             production code in the package where the defect actually lives.",
+            &[],
+        );
+        let found = texts(&requirements);
+        for absent in ["testdata/", "docs/", "*_test.go"] {
+            assert!(!found.contains(&absent), "{absent} is permitted: {found:?}");
+        }
     }
 
     #[test]
