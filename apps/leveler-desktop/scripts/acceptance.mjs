@@ -7,7 +7,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 const root=fileURLToPath(new URL('..',import.meta.url));
 if(!process.env.LEVELER_HOME)throw new Error('Set LEVELER_HOME to an isolated home with a working real provider configuration.');
-const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-output');
+const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root, '../../test-output/desktop');
 await mkdir(output,{recursive:true});
 const marker=`desktop-acceptance-${Date.now()}`;
 let application,page;

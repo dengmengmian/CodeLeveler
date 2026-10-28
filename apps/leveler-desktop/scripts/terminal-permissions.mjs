@@ -14,7 +14,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-terminal-permissions-');
 const workspace = path.join(temporary, 'workspace');
 const home = path.join(temporary, 'home');
-const output = path.join(root, 'acceptance-output/desktop');
+const output = path.join(root, '../../test-output/desktop');
 await mkdir(workspace); await mkdir(home); await mkdir(output, { recursive: true });
 await writeFile(path.join(home, 'config.toml'), 'default_model="fixture/m"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="http://127.0.0.1:9"\napi_key="test-only"\n[models.m]\nprovider="fixture"\nmodel_id="fixture"\ncontext_window=131072\n');
 const evidence = {

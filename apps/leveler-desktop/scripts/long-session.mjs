@@ -7,7 +7,7 @@ import path from 'node:path';
 import http from 'node:http';
 import {performance} from 'node:perf_hooks';
 const root=fileURLToPath(new URL('..',import.meta.url));
-const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-output/desktop');await mkdir(output,{recursive:true});
+const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root, '../../test-output/desktop');await mkdir(output,{recursive:true});
 const temporary=await mkdtemp('/tmp/leveler-desktop-long-');const wrapper=path.join(temporary,'bridge');
 const quote=value=>"'"+value.replaceAll("'","'\\''")+"'";
 await writeFile(wrapper,`#!/bin/sh\nexec ${quote(process.execPath)} ${quote(path.join(root,'test/fixtures/long-session.cjs'))}\n`);await chmod(wrapper,0o700);

@@ -11,7 +11,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {provider} from '../test/fixtures/provider.mjs';
 const root=fileURLToPath(new URL('..',import.meta.url));
 const temporary=await mkdtemp('/tmp/leveler-desktop-session-actions-'),home=path.join(temporary,'home');await mkdir(home);
-const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-output/desktop');await mkdir(output,{recursive:true});
+const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root, '../../test-output/desktop');await mkdir(output,{recursive:true});
 const fixture=await provider();
 const config=`default_model = "fixture/first"\n[providers.fixture]\nprotocol = "openai_chat"\nbase_url = "${fixture.baseURL}"\napi_key = "test-only-fixture"\n[models.first]\nprovider = "fixture"\nmodel_id = "first-model"\ncontext_window = 131072\n[models.second]\nprovider = "fixture"\nmodel_id = "second-model"\ncontext_window = 131072\n`;
 await writeFile(path.join(home,'config.toml'),config,{mode:0o600});

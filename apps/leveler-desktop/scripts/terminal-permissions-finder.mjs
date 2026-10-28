@@ -13,7 +13,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-terminal-finder-');
-const output = path.join(root, 'acceptance-output/desktop');
+const output = path.join(root, '../../test-output/desktop');
 await mkdir(output, { recursive: true });
 const electronApp = path.join(root, 'node_modules/electron/dist/Electron.app');
 const profile = path.join(temporary, 'electron');

@@ -11,7 +11,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-desktop-product-');
 const home = path.join(temporary, 'home');
 const workspace = path.join(temporary, 'workspace');
-const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, 'acceptance-output/desktop');
+const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, '../../test-output/desktop');
 await mkdir(home, { recursive: true });
 await mkdir(workspace, { recursive: true });
 await writeFile(path.join(workspace, 'readme.txt'), 'PRODUCT_FIRST_USE\n');

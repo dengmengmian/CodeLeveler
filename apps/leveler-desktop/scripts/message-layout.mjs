@@ -8,7 +8,7 @@ import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 const root=fileURLToPath(new URL('..',import.meta.url));
 const temp=await mkdtemp('/tmp/leveler-message-layout-'),home=path.join(temp,'home'),workspace=path.join(temp,'workspace');
-const output=process.env.LEVELER_ACCEPTANCE_OUTPUT??path.join(root,'acceptance-output/message-layout');
+const output=process.env.LEVELER_ACCEPTANCE_OUTPUT??path.join(root, '../../test-output/desktop/message-layout');
 await mkdir(home);await mkdir(workspace);await mkdir(output,{recursive:true});
 await writeFile(path.join(workspace,'README.md'),'# Before\n');
 const answer='两项修改：\n\n1. `README.md` 已更新。\n2. [源码](src/util.ts) 已创建。\n\n普通代码 `imaginary.ts` 不代表已创建文件。';

@@ -10,7 +10,7 @@ import path from 'node:path';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-desktop-settings-branches-');
 const home = path.join(temporary, 'home');
-const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, 'acceptance-output/desktop');
+const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, '../../test-output/desktop');
 await mkdir(home, { recursive: true });
 await mkdir(output, { recursive: true });
 await writeFile(path.join(home, 'config.toml'), 'default_model="fixture/m"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="http://127.0.0.1:1"\napi_key="test-only"\n[models.m]\nprovider="fixture"\nmodel_id="m"\ncontext_window=131072\n[models.n]\nprovider="fixture"\nmodel_id="n"\ncontext_window=131072\n', { mode: 0o600 });

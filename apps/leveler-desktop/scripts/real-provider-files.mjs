@@ -12,7 +12,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-real-provider-');
 const home = path.join(temporary, 'home');
 const workspace = path.join(temporary, 'workspace');
-const output = path.join(root, 'acceptance-output/round5-real-provider');
+const output = path.join(root, '../../test-output/desktop/round5-real-provider');
 await mkdir(home);
 await mkdir(workspace);
 await mkdir(output, { recursive: true });

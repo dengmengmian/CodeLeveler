@@ -45,5 +45,19 @@ crates/leveler-execution/leveler-tool-cache/
 # /export conversation dumps
 leveler-chat-*.md
 
-# Screenshot scratch
+# Local test artifacts (screenshots, logs, acceptance reports)
+/test-output/
+
+# Legacy screenshot scratch
 .shots*/
+
+# Local internal documentation, not part of the public source tree.
+/AGENTS.md
+/docs/ARCHITECTURE.md
+/docs/ARCHITECTURE.zh-CN.md
+/assets/brand/README.md
+/crates/leveler-storage/migrations/README.md
+/crates/leveler-web/README.md
+/testdata/context_statistics/v1/README.md
+/testdata/conversation_presentation/v1/README.md
+/apps/leveler-mobile/ios/Runner/Assets.xcassets/LaunchImage.imageset/README.md

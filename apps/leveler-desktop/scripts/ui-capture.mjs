@@ -8,7 +8,7 @@ import path from 'node:path';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-desktop-ui-capture-');
 const home = path.join(temporary, 'home');
-const output = path.join(root, 'acceptance-output/ui-parity-round2-2026-10-20');
+const output = path.join(root, '../../test-output/desktop/ui-parity-round2-2026-10-20');
 await mkdir(home, { recursive: true });
 await mkdir(output, { recursive: true });
 await writeFile(path.join(home, 'config.toml'), 'default_model="fixture/m"\n[providers.fixture]\nprotocol="openai_chat"\nbase_url="http://127.0.0.1:1"\napi_key="test-only"\n[models.m]\nprovider="fixture"\nmodel_id="fixture"\ncontext_window=131072\nvision=true\n', { mode: 0o600 });

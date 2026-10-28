@@ -11,13 +11,13 @@
 set -euo pipefail
 
 DEVICE="${1:-}"
-OUT="${2:-/tmp/leveler-shots}"
 if [[ -z "$DEVICE" ]]; then
   echo "用法: $0 <simulator-udid> [输出目录]" >&2
   exit 2
 fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+OUT="${2:-$REPO/test-output/mobile/screenshots}"
 LEVELER="$REPO/target/debug/leveler"
 RELAY="$REPO/target/debug/leveler-relay"
 for binary in "$LEVELER" "$RELAY"; do

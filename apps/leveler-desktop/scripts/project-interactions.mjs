@@ -13,7 +13,7 @@ const temporary = await mkdtemp('/tmp/leveler-desktop-project-');
 const home = path.join(temporary, 'home');
 const first = path.join(temporary, 'a/shared');
 const second = path.join(temporary, 'b/shared');
-const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, 'acceptance-output/desktop');
+const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, '../../test-output/desktop');
 await mkdir(home, { recursive: true });
 await mkdir(first, { recursive: true });
 await mkdir(second, { recursive: true });
