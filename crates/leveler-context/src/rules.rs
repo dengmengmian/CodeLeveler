@@ -636,18 +636,26 @@ mod tests {
     }
 
     #[test]
-    fn repository_rules_deliver_tdd_and_minimum_verification() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|path| path.parent())
-            .expect("workspace root");
-        let config = leveler_project::config::ProjectConfig::load(root)
-            .expect("repository verification config");
+    fn configured_rules_deliver_tdd_and_minimum_verification() {
+        let root = temp_dir("configured-rules");
+        std::fs::create_dir_all(root.join(".leveler")).unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Project rules\n\n## TDD\n先写一个最小测试。\n\n## Verification\n最小充分验证。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".leveler/config.yaml"),
+            "rules:\n  always_delivered: [TDD, Verification]\n  budget_bytes: 16000\n",
+        )
+        .unwrap();
+        let config = leveler_project::config::ProjectConfig::load(&root)
+            .expect("fixture verification config");
         let policy = RuleDeliveryPolicy {
             always: config.rules.always_delivered,
             budget_bytes: config.rules.budget_bytes,
         };
-        let plan = plan_rule_delivery(root, &policy);
+        let plan = plan_rule_delivery(&root, &policy);
         let delivered = plan
             .documents
             .iter()
@@ -677,6 +685,7 @@ mod tests {
                 "configured mandatory section was not delivered: {needle}"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

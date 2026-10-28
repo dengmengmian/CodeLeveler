@@ -12,7 +12,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-desktop-composer-narrow-');
 const workspace = path.join(temporary, 'workspace');
 const home = path.join(temporary, 'home');
-const output = path.join(root, 'acceptance-output/desktop');
+const output = path.join(root, '../../test-output/desktop');
 await mkdir(workspace); await mkdir(home); await mkdir(output, { recursive: true });
 const requests = [];
 const server = createServer(async (req, res) => {

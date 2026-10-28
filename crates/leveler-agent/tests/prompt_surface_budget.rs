@@ -4,14 +4,14 @@
 //! tools and the request projection. The estimator is
 //! [`leveler_model::TokenEstimate`]. This file does not keep a second counter.
 //!
-//! The workspace is this repository. User-level skills and agents are pointed
-//! at an empty home so the figure is the repo's own surface. Search, browser
+//! The workspace is a self-contained fixture. User-level skills and agents
+//! are pointed at an empty home. Search, browser
 //! and image tools stay off: this pin is a non-vision model with no search key
 //! and no browser handle. Production adds those packs only when the host
 //! actually has them.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -125,12 +125,21 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     }
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
+fn project_fixture() -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    std::fs::create_dir_all(root.join("crates/leveler-agent/src")).unwrap();
+    std::fs::write(
+        root.join("crates/leveler-agent/src/lib.rs"),
+        "// Fixture.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("AGENTS.md"),
+        "# Project rules\n\n## Testing\nTest changes before reporting completion.\n\n## Scope\nKeep edits within the requested scope.\n",
+    )
+    .unwrap();
+    fixture
 }
 
 fn isolated_env(root: &Path, home: &Path) -> Arc<EnvSnapshot> {
@@ -361,10 +370,11 @@ async fn capture(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn current_prompt_surface_inventory() {
-    let root = repo_root();
+    let fixture = project_fixture();
+    let root = fixture.path().to_path_buf();
     assert!(
         root.join("AGENTS.md").is_file() || root.join("Agents.md").is_file(),
-        "inventory measures this repo's project rules: {root:?}"
+        "inventory measures the fixture project rules: {root:?}"
     );
     let home = tempfile::tempdir().unwrap();
     let simple = "What is 2+2?";
@@ -489,8 +499,7 @@ async fn current_prompt_surface_inventory() {
         ("chat", &chat, 23_961_u64),
         ("minimal_baseline", &minimal_baseline, 19_715),
         ("full_baseline", &full_baseline, 23_961),
-        // Raised when the memory anti-regression rule landed in AGENTS.md:
-        // the goal case was already 3 tokens under its old ceiling.
+        // Preserve the existing maximum while using public fixture rules.
         ("goal", &goal, 24_484),
         ("explorer", &explorer, 13_820),
         // Same Memory 2.0 pack as chat; the worker surface carries it too.
@@ -555,7 +564,8 @@ async fn current_prompt_surface_inventory() {
 /// initial surface. This fixture is not a user-selectable product mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_baseline_inventory() {
-    let root = repo_root();
+    let fixture = project_fixture();
+    let root = fixture.path().to_path_buf();
     let home = tempfile::tempdir().unwrap();
 
     let initial_baseline = {
@@ -703,7 +713,8 @@ async fn initial_baseline_inventory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn progressive_initial_surface_inventory() {
     use leveler_agent::capability::{CapabilityDisclosure, CapabilityId, control_definition};
-    let root = repo_root();
+    let fixture = project_fixture();
+    let root = fixture.path().to_path_buf();
     let home = tempfile::tempdir().unwrap();
     let available = vec![
         CapabilityId::Memory,
@@ -840,7 +851,8 @@ async fn progressive_initial_surface_inventory() {
 async fn full_access_uses_the_progressive_initial_surface() {
     use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
 
-    let root = repo_root();
+    let fixture = project_fixture();
+    let root = fixture.path().to_path_buf();
     let home = tempfile::tempdir().unwrap();
     let available = vec![
         CapabilityId::Memory,

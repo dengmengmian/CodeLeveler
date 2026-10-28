@@ -11,7 +11,7 @@ import path from 'node:path';
 if(process.env.LEVELER_CONVERSATION_SCENARIO==='full-execution'){await import('./conversation-runtime.mjs');}else{
 const root=fileURLToPath(new URL('..',import.meta.url));
 const temporary=await mkdtemp('/tmp/leveler-desktop-conversation-'),home=path.join(temporary,'home');await mkdir(home);
-const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-output/desktop');await mkdir(output,{recursive:true});
+const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root, '../../test-output/desktop');await mkdir(output,{recursive:true});
 const literalCode='const sample = "<script>window.__markdownExecuted = true</script>";\nconst padding = "'+'x'.repeat(120)+'";\nconsole.log(sample);';
 let rich='',providerCalls=0,imageRequests=0,documentRequests=0,streamWrites=0;const providerErrors=[];
 const server=createServer(async(request,response)=>{

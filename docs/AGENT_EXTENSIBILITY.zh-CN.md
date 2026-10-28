@@ -1,184 +1,70 @@
 # 自定义 Agent
 
-英文版：[`AGENT_EXTENSIBILITY.md`](AGENT_EXTENSIBILITY.md)
+[English](AGENT_EXTENSIBILITY.md) · [返回首页](../README.zh-CN.md)
 
-一个 Agent 就是一个目录，里面两份文件。`agent.yaml` 说明它可以做什么；`instructions.md` 说明它该怎么做。CodeLeveler 解析当前项目能用哪些 Agent，主 Agent 在任务需要时挑选一个（你也可以直接点名），运行时强制执行定义里的每一条边界。新增 Agent 不需要改代码，也不需要重新编译。
+自定义 Agent 为特定工作提供固定说明，例如只读代码审查或前端开发。
 
-## 怎么创建
+## 创建
 
-| 你是 | 这样做 |
+可以直接让 CodeLeveler 创建，也可以在 Web 界面的「设置 → Agents」中创建。通过对话保存或删除定义前，会展示内容并要求你确认。
+
+手动创建时，每个 Agent 是一个目录，包含 `agent.yaml` 和 `instructions.md`：
+
+| 位置 | 生效范围 |
 | --- | --- |
-| 在对话里 | 说「给这个项目创建一个只读的安全审查 Agent」。CodeLeveler 会提出定义并展示给你；未经确认不会写入。 |
-| 用 Web UI | 打开一次对话，然后 设置 → Agents → 创建 Agent。 |
-| 自己改文件 | 创建 `.leveler/agents/<name>/agent.yaml` 和 `instructions.md`。 |
-| 一个团队 | 把项目的 `.leveler/agents/` 目录提交进 Git。 |
+| `.leveler/agents/<name>/` | 当前项目，可提交到 Git 与团队共享 |
+| `~/.leveler/agents/<name>/` | 当前用户的所有项目 |
 
-查看实际解析结果：`leveler agents list`（或 `--json`）、`leveler agents show <name>`、TUI 里的 `/agents`，或 Web UI 的 设置 → Agents。
+同名时项目定义优先，其次是用户定义，最后是内置定义。`default`、`explorer`、`worker`、`reviewer` 是保留名称，不能用作自定义 Agent 名。
 
-## 目录布局
+## 最小示例
 
-```text
-<repo>/.leveler/agents/<name>/agent.yaml         项目 Agent
-<repo>/.leveler/agents/<name>/instructions.md
-~/.leveler/agents/<name>/agent.yaml              用户 Agent，对每个项目生效
-~/.leveler/agents/<name>/instructions.md         （设置了 $LEVELER_HOME 时用 $LEVELER_HOME/agents）
-```
-
-内置 Agent 随二进制发布：运行时角色 `default`、`explorer`、`worker`、`reviewer`，以及人格 `code-explorer`、`code-architect`、`code-reviewer`。
-
-目录名就是 Agent 名。隐藏条目和普通文件会被忽略。更早构建的单文件 `<name>.md` 不再读取；`leveler doctor` 会报告它以及应该迁到的目录，系统不会替你迁移或删除。
-
-## 优先级
-
-同名时，项目 Agent 盖住用户 Agent，用户 Agent 盖住内置：
-
-```text
-项目  >  用户  >  内置
-```
-
-被盖住的定义仍会报告出来（`shadows user`、`shadows builtin`）。
-
-- **坏定义不会回退。** 项目里的 `foo` 无效，`foo` 就是无效：不会改用用户的 `foo`。Spawn 会被拒绝并给出原因。
-- **运行时角色名是保留的。** `default`、`explorer`、`worker`、`reviewer` 在运行时有结构含义，因此这些名字的目录会被报告为问题并且不加载。人格是普通定义，可以被覆盖。
-
-## `agent.yaml`
-
-```yaml
-version: 1                      # 必填；当前构建只读 version 1
-name: security-reviewer         # 必填；必须等于目录名
-description: Reviews Rust changes for exploitable security issues.
-capability: read_only           # 必填：read_only | writer | scoped_writer
-model: deepseek/deepseek-flash  # 可选；省略 = 父 Agent 的模型
-reasoning_effort: high          # 可选：minimal|low|medium|high|xhigh|max
-skills: [rust-security]         # 可选；已安装的 skill 名
-tools: [read_file, grep, git_diff, find_files]   # 可选，收窄工具集
-workspace:                      # 可选；仅 writer 类
-  write_roots: [crates/leveler-web/web]
-budget:                         # 可选
-  max_rounds: 40
-  max_duration_secs: 900
-```
-
-| 字段 | 规则 |
-| --- | --- |
-| `version` | 必填，且必须是 `1`。缺了就拒绝，不会猜。 |
-| `name` | 小写 `[a-z][a-z0-9-]*`，最多 64 字符，不能以 `-` 结尾，不能是 Windows 设备名，且必须等于目录名。 |
-| `description` | 一行，最多 200 字符。主 Agent 每一轮选人时读的就是它。 |
-| `capability` | 这个 Agent 跑在哪一类运行时契约下——见下。 |
-| `model` | `provider/model`。本机必须已配置，否则不可用；永远不会被换成别的模型。 |
-| `reasoning_effort` | 必须是该模型恰好提供的档位，否则不可用。 |
-| `skills` | 每个 skill 必须已安装，否则不可用。 |
-| `tools` | 收窄该类的工具集。`read_only` Agent 只能列只读工具，不能列 MCP 工具，`[]` 是错误。列出的每个工具都是必需的，当前会话缺少一个（例如没有搜索 key 时的 `web_search`），这个 Agent 就不能在这里跑。 |
-| `workspace.write_roots` | 仅 writer 类。仓库相对路径，用 `/` 分隔，不要 `..`，不要 glob，不要仓库根。 |
-| `budget.max_rounds` | 1–1000。 |
-| `budget.max_duration_secs` | 1–1200。 |
-
-未知字段在每一层都会让定义失败，拼错的字段会让 Agent 直接无效而不是被静默忽略。没有任何字段可以放凭据。
-
-## 能力类
-
-定义不会创造一种新的 Agent。它跑在运行时已有的子 Agent 契约下，声明的每一条边界都只能收窄这份契约：
-
-| `capability` | 按谁跑 | 可以写什么 |
-| --- | --- | --- |
-| `read_only` | Explorer 契约 | 什么都不能写。可变工具根本不会出现，包括 `run_command`。 |
-| `writer` | Default 子 Agent 契约 | 只有读完代码后用 `claim_write_scope` 声明的路径；若设了 `write_roots`，还只能在那些根里面。 |
-| `scoped_writer` | Worker 契约 | 只有 spawn 时拿到的独占 `files`；若设了 `write_roots`，这些文件必须落在里面。 |
-
-```text
-agent maximum   = capability class ∩ tools ∩ write_roots   (agent.yaml)
-spawn request   = agent + files                              (spawn_agent 调用)
-effective       = 运行时准入实际允许的 ⊆ agent maximum
-```
-
-Spawn 可以重复 Agent 自己的类，但不能改类。子 Agent 永远拿不到 MCP 工具和 Agent 编写工具，也不能再 spawn 自己的子 Agent。
-
-## `instructions.md`
-
-角色相关的指引：看什么、报什么、怎么报。必填，必须是非空 UTF-8 文本，最多 64 KiB。
-
-Spawn 时，子 Agent 的第一条系统消息按这个顺序拼：
-
-```text
-base prompt → 项目规则（AGENTS.md、.leveler/instructions.md）→ 能力类文本
-→ Agent instructions → 每一个绑定的 skill
-```
-
-子 Agent 的任务仍然是它自己的用户消息。主 Agent 只看到名字和描述。
-
-**Instructions 不是权限。** 它们塑造 Agent 怎么工作，不改变它持有哪些工具、可以写哪些文件。不要把运行时规则、工具 schema、权限机制或凭据写进去——它们会被发给模型。
-
-## 有效性与可用性
-
-| 状态 | 含义 | 能否 spawn |
-| --- | --- | --- |
-| `available` | 有效，并且它点名的东西在这里都已配置。 | 能 |
-| `unavailable` | 有效，但模型未配置、缺 skill，或模型不提供这个 reasoning effort。 | 不能 |
-| `invalid` | 文件本身就不对：YAML、schema、名字、缺 instructions、符号链接。 | 不能 |
-
-一个坏 Agent 不影响其他 Agent，也不会阻止 CodeLeveler 启动，`leveler doctor` 按名字报告无效定义。`available` 是配置检查，不是 provider 检查：钉死的模型缺 API key 时，失败发生在子 Agent 第一次请求。因此 Web UI 把这个状态标成「已配置」。
-
-## 使用一个 Agent
-
-主 Agent 可以为任务的一部分挑选一个 Agent；出现在列表里只表示它可用，并不表示它会被用。你也可以直接点名：「让 security-reviewer 检查这次改动」。名字解析失败是错误，并列出当前可用的 Agent——永远不会回退到默认子 Agent。
-
-Harness 独立拉起的 Reviewer 不是你可以点名的 Agent，名字里带 "reviewer" 也不会获得特殊权威。
-
-## 正在跑的子 Agent 沿用 spawn 时的定义
-
-Agent 被 spawn 时，解析后的定义会记在子 Agent 的持久化启动记录上，instructions 和 skills 也进入它自己的第一条系统消息。重启后的子 Agent 严格按这份快照继续跑，不再读文件：
-
-- 编辑一个 Agent 只影响之后的 spawn；
-- 删除一个 Agent 不会停掉正在跑的子 Agent，已结算的历史仍显示这个 Agent 的名字；
-- 以只读 spawn 的子 Agent，即使文件后来改成 `writer`，仍然只读。
-
-定义指纹用于检查和调试，不是签名。Registry 在需要时重读，没有文件监视器，也不需要重启。
-
-## 安全地改 Agent
-
-所有界面都走同一个 store：create 先写进隐藏暂存目录再 rename 就位，update 换入整个新目录并原样保留未变化的文件，delete 先 rename 走再删除。没有 rename 操作：用新名字 create，再 delete 旧的。内置 Agent 不能编辑，只能复制成另一个名字的项目或用户 Agent。
-
-Agent 自己的编辑工具不能原地改 `.leveler/agents/`，所以从对话里做的修改一定走这条路径，并在加载时校验。`save_agent` 和 `delete_agent` 先校验提案，然后在每一种权限模式（包括完全访问）下都要你确认，确认里展示范围、能力类、写入边界、工具、模型、effort、skills 和 instructions。一次 session 批准只覆盖那份精确提案，写 Agent 永远不会变成一条常驻权限规则。
-
-## Trust
-
-**项目 Agent 是仓库控制的 instructions。** 和 `AGENTS.md` 一样，它们来自写这个仓库的人。对不信任的仓库，先审查 `.leveler/agents/`。无论 instructions 写了什么，权威都是上面的能力类和边界；instructions 不能授予工具或写入范围。
-
-用户 Agent 在仓库外面，仓库内容不能创建它们：从对话写用户 Agent 需要你明确确认，Web UI 只在你操作时写入。远程客户端能看到正在跑的子 Agent 名字，但不能列出或修改 Agent。
-
-## 例子
-
-只读审查：
+创建 `.leveler/agents/security-reviewer/agent.yaml`：
 
 ```yaml
 version: 1
 name: security-reviewer
-description: Reviews changes for exploitable security issues and reports only high-confidence findings.
+description: Reviews code for security issues.
 capability: read_only
-reasoning_effort: high
-tools: [read_file, grep, find_files, git_diff, git_status]
 ```
+
+在同一目录创建 `instructions.md`：
 
 ```markdown
-Review the change you are given for vulnerabilities an attacker could use:
-injection, path traversal, authorization gaps, secrets in code or logs.
-Report each with file:line, the input that triggers it and the consequence.
-Report nothing you are not confident in.
+检查用户指定的改动，只报告有充分证据的安全问题。
+每条说明影响、触发条件和修复方向；没有发现就直接说明。
 ```
 
-限定在一个子树里写前端：
+名字需与目录名一致，使用小写字母、数字和连字符，并以字母开头。工作说明不要放凭据，会随请求发送给模型。
+
+## 常用设置
+
+| 字段 | 用途 |
+| --- | --- |
+| `capability` | `read_only` 只读；`writer` 可在声明范围内写入；`scoped_writer` 只写被分配的文件 |
+| `model` | 可选，填写已配置的 `provider/model`；省略则沿用父 Agent 模型 |
+| `reasoning_effort` | 可选，必须是所选模型支持的档位 |
+| `skills` | 可选，填写已安装的技能名称列表 |
+| `tools` | 可选，限制工具列表；不能为空，也不能授予额外权限 |
+| `workspace.write_roots` | 可选，限制可写目录；使用仓库相对路径，不使用 `..` 或通配符 |
+
+例如，限制写入前端目录：
 
 ```yaml
 version: 1
 name: frontend-worker
-description: Implements small React/TypeScript changes under the web app.
+description: Implements frontend changes.
 capability: writer
 workspace:
   write_roots: [crates/leveler-web/web/src]
-budget:
-  max_rounds: 60
 ```
 
-## 这一版没有的东西
+## 使用与排错
 
-市场或远程安装、签名或打包的 Agent 包、代码或 WASM 插件、能互相通话的 Agent、定义之间的继承（`extends:`）、按 Agent 的生命周期 hooks、远程 instructions URL、Agent 自定义工具、移动端编辑器、文件监视器。
+运行 `leveler agents list` 查看可用 Agent，`leveler agents show <name>` 查看定义，或在终端输入 `/agents`。
+
+在对话中点名即可，例如「让 security-reviewer 检查这次改动」。无效定义、缺失模型或技能会明确报错，可用 `leveler doctor` 排查；缺 API Key 仍可能在实际调用时失败。
+
+修改定义只影响之后启动的 Agent。删除定义不会停止已经运行的任务。
+
+项目 Agent 来自仓库；使用不信任的项目之前，请先检查其定义。工作说明不能扩大工具或写入权限。

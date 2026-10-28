@@ -14,7 +14,7 @@ const source = path.resolve(process.env.LEVELER_ACCEPTANCE_SOURCE ?? fileURLToPa
 const client = process.env.LEVELER_ACCEPTANCE_CLIENT ?? 'desktop';
 assert.ok(['web', 'desktop'].includes(client), 'explicit client required');
 const binary = path.resolve(process.env.LEVELER_BINARY ?? path.join(source, 'target/debug/leveler'));
-const out = path.resolve(process.env.LEVELER_ACCEPTANCE_OUTPUT ?? path.join(source, 'apps/leveler-desktop/acceptance-output/conversation-runtime'));
+const out = path.resolve(process.env.LEVELER_ACCEPTANCE_OUTPUT ?? path.join(source, 'test-output/desktop/conversation-runtime'));
 const dog = path.resolve(process.env.DOGFOOD_ROOT ?? path.join(source, '../dogfood'));
 const providerPath = path.join(dog, 'eval/pty/mock_provider.py');
 await mkdir(out, { recursive: true });

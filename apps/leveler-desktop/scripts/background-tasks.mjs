@@ -12,7 +12,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const temporary = await mkdtemp('/tmp/leveler-desktop-background-');
 const home = path.join(temporary, 'home');
 const workspace = path.join(temporary, 'workspace');
-const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, 'acceptance-output/desktop');
+const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, '../../test-output/desktop');
 await mkdir(home, { recursive: true });
 await mkdir(workspace, { recursive: true });
 await mkdir(output, { recursive: true });

@@ -1,12 +1,13 @@
-# Documentation
+# User guides
 
-Chinese: [`README.zh-CN.md`](README.zh-CN.md)
+[中文](README.zh-CN.md)
 
-| Document | What it covers |
+| Guide | Contents |
 | --- | --- |
-| [Architecture](ARCHITECTURE.md) | How CodeLeveler is layered: model, domain, runtime, capabilities, and who is allowed to change your machine |
-| [Custom agents](AGENT_EXTENSIBILITY.md) | How to add a project or user agent with `agent.yaml` and `instructions.md` |
-| [Durable memory](MEMORY.md) | What CodeLeveler remembers: record format, authority, pending review, retrieval, injection, forget and known limits |
-| [Release notes](RELEASE.md) | What this release includes, and what it does not |
-
-Install and everyday use are in the [root README](../README.md). Version history is in the [changelog](../CHANGELOG.md).
+| [Install and get started](../README.md) | Install, configure a provider, and run your first task |
+| [Everyday use](USAGE.md) | Models, shortcuts, sessions, browser, and search |
+| [Custom agents](AGENT_EXTENSIBILITY.md) | Create and use your own agents |
+| [Durable memory](MEMORY.md) | View, manage, and disable memory |
+| [Latest release](RELEASE.md) | Changes in the current release |
+| [Version history](../CHANGELOG.md) | Highlights from earlier versions |
+| [Security](../SECURITY.md) | Privacy, limitations, and vulnerability reports |

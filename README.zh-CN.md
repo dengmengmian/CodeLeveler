@@ -4,274 +4,79 @@
 
 <h1 align="center">CodeLeveler</h1>
 
-<p align="center">
-  <strong>一个在本地仓库里工作的编程智能体；需要改代码时，留下可审查的改动。</strong>
-</p>
+<p align="center">在本地仓库里工作的编程智能体</p>
+<p align="center"><a href="README.md">English</a> · <a href="LICENSE-APACHE">Apache 2.0</a></p>
 
-<p align="center">
-  <a href="README.md">English</a> ·
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 License"></a>
-</p>
+给 CodeLeveler 一个任务，让它读代码、修改文件、运行测试。你可以随时查看改动，关闭后也能继续会话。
 
-> **Harness 是模型能力的放大器，而不是限制器。**
->
-> **模型决定能力的可能性，Harness 决定这些能力能在多大程度上得到发挥。**
-
-CodeLeveler 的目标是尽可能发挥每个模型自身的最大能力，而不是缩小不同模型之间的差距或让其表现趋同。上下文、工具、执行环境和反馈机制应放大模型的推理与自主执行能力，而不是取代它们。
-
-给 CodeLeveler 一个任务。它可以读仓库、改文件、运行构建和测试，也可以使用 Git。会话停止后，对话、审批、事件记录和改过的文件仍然保留。会话状态存储在你的机器上，模型请求只发给你配置的服务商。
-
-终端界面（`leveler`）、浏览器界面（`leveler web`）和无界面命令行（`leveler run`）使用同一套运行时。CodeLeveler 当前面向 macOS、Linux 和 Windows。
-
-```sh
-cd your-project
-leveler
-# 或者
-leveler run "找出失败的测试并修好"
-```
-
-## 它能做什么
-
-- 需要修改代码时，在仓库里产生可检查的改动，而不是把智能体的一句“已完成”当成证据。
-- 持久化会话；关闭界面后，可以用 `leveler resume` 继续。
-- 支持智谱 BigModel（GLM Coding Plan）、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic，以及其他 OpenAI 兼容接口。
-- 提供显式的 `/develop` 工作流：分析 → 编码 → 验证 → 评审。
-- 可选支持浏览器自动化、网页搜索、自定义 Agent 和并行候选 worktree。
+支持终端、浏览器和命令行，以及 BigModel、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic 和其他 OpenAI 兼容服务。会话保存在本机，模型请求发送给你配置的服务商。
 
 ## 安装
 
-### 安装脚本（macOS、Linux）
+macOS、Linux：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh | sh
 ```
 
-脚本会从最新稳定版中挑选当前平台的压缩包，SHA-256 校验不通过就拒绝安装，并把 `leveler` 放到 `~/.local/bin`（可用 `LEVELER_BIN_DIR` 改目录）。`LEVELER_VERSION=v1.0.0` 可固定版本。
+默认安装到 `~/.local/bin`，请确保该目录在 `PATH` 中。
 
-### Homebrew（macOS、Linux x86_64）
+也可以使用 Homebrew（macOS、Linux x86_64）：
 
 ```sh
 brew install dengmengmian/tap/leveler
 ```
 
-更新用 `brew upgrade leveler`。内置更新器不识别 Homebrew，会绕过 Homebrew 直接替换二进制，所以通过 Homebrew 安装时请在 `[update]` 里设置 `auto_update = false`（见[更新](#更新)）。
+Windows 请从[发布页](https://github.com/dengmengmian/CodeLeveler/releases)下载对应压缩包，校验附带的 SHA-256，解压后将目录加入 `PATH`。保持 `leveler.exe` 与 `leveler-confine.exe` 在同一目录。
 
-### 发布包
+Linux 使用受限命令前需安装 `bubblewrap`，例如 `sudo apt install bubblewrap`。
 
-每个 release 都会为支持的平台发布带 SHA-256 校验的压缩包：
-
-| 平台 | 压缩包 |
-| --- | --- |
-| macOS（Apple Silicon） | `leveler-v<version>-aarch64-apple-darwin.tar.gz` |
-| macOS（Intel） | `leveler-v<version>-x86_64-apple-darwin.tar.gz` |
-| Linux（x86_64） | `leveler-v<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows（x86_64） | `leveler-v<version>-x86_64-pc-windows-msvc.zip` |
-
-从[发布页](https://github.com/dengmengmian/CodeLeveler/releases)下载对应平台的压缩包和它的 `.sha256` 文件，校验后解压 `leveler` 并放入 `PATH`：
+## 开始使用
 
 ```sh
-shasum -a 256 -c leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf leveler-v1.0.0-aarch64-apple-darwin.tar.gz
-mkdir -p ~/.local/bin && mv leveler-v1.0.0-aarch64-apple-darwin/leveler ~/.local/bin/
-leveler --version
-```
-
-Windows 请解压 `.zip`，并保持 `leveler.exe` 与 `leveler-confine.exe` 在同一目录。
-
-### 从源码
-
-安装 Rust 1.90+、Node.js 22+、npm 和 Git 后：
-
-```sh
-npm --prefix crates/leveler-web/web ci
-npm --prefix crates/leveler-web/web run build
-cargo install --path crates/leveler-cli --locked
-leveler --version
-```
-
-必须先构建前端再执行 `cargo install`，因为 Rust 编译时会把前端产物嵌入
-`leveler` 二进制。
-
-Linux 在运行智能体命令前需要安装 `bubblewrap`：
-
-```sh
-sudo apt install bubblewrap
-```
-
-不安装时 CodeLeveler 可以启动，但需要 Linux 隔离的命令会直接失败，不会降级成无沙箱执行。运行 `leveler doctor` 可以查看当前机器实际具备的能力。
-
-## 更新
-
-CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时最多每 `check_interval_hours` 检查一次；发现新版本后会下载、校验 SHA-256、替换当前二进制并重启。检查失败不会阻止启动：当前版本正常运行，失败原因写入日志。
-
-手动更新：
-
-```sh
-leveler update            # 安装最新稳定版
-leveler update --check    # 有更新时退出码为 2
-leveler update --version v1.0.8
-```
-
-在 TUI 中：
-
-```
-/update
-```
-
-任务运行期间 `/update` 会被拒绝，不会在有任务执行时替换二进制。
-
-配置（`~/.leveler/config.toml`）：
-
-启动自动更新默认开启。首次启动的登录引导会把以下配置写入配置文件：
-
-```toml
-[update]
-auto_update = true           # false 关闭启动自动检查；手动更新仍可用
-check_interval_hours = 1     # 成功检查之间的间隔小时数（最小 1）
-```
-
-只追踪稳定版。预发布版本只在显式指定 `--version` 时安装。
-
-## 第一次使用
-
-```sh
-leveler                    # 无配置时先选择语言，再进入与 login 相同的首次设置引导
-leveler login              # 也可以显式运行
-leveler doctor
+leveler login              # 选择服务商并配置 API Key
 cd your-project
 leveler
 ```
 
-`leveler login` 支持智谱 BigModel（GLM Coding Plan）、DeepSeek、Moonshot/Kimi、OpenAI 和 Anthropic。服务商支持模型发现时，它会列出该 key 可见的模型。配置写入 `~/.leveler/config.toml`；在 Unix 上，该文件会被限制为 `0600`。可以用 `leveler login bigmodel`、`leveler login deepseek` 或 `leveler login moonshot` 跳过菜单。
+建议从干净的 Git 工作区开始，方便检查改动。遇到配置或环境问题时运行 `leveler doctor`。
 
-DeepSeek Flash 的模型引用是 `deepseek/deepseek-flash`。已有配置中的预发布名称 `deepseek/deepseek-v4-flash` 需要替换为该名称。
-
-接入其他 OpenAI 兼容接口时，先运行 `leveler init`，再修改 `~/.leveler/config.toml`。[configs/example.yaml](configs/example.yaml) 只是带注释的配置结构参考；这个 YAML 文件本身不会被加载。
-
-### 思考强度（Thinking Level）
-
-模型想多深，用一套词表达，所有模型都一样：
-
-```
-auto     不主动指定强度，用 Provider 自己的默认
-off      尽量关闭额外推理
-minimal  最低可用强度
-low      轻量推理
-medium   均衡推理
-high     深度推理（全局默认）
-max      该模型能提供的最高强度
-```
-
-全局默认是 `high`，单模型配置优先。`/thinking reset` 只清除会话覆盖，回到配置默认；显式 `auto` 仍是不主动指定 Provider 推理强度。模型不支持或不可调时，不会声称 High 已生效。
-
-想临时调整，在 TUI 里输入：
-
-```
-/thinking high
-/thinking reset     # 回到配置的默认值
-```
-
-想长期改默认值，写进 `~/.leveler/config.toml`：
-
-```toml
-# 全局默认
-thinking = "high"
-
-# 单个模型的默认（覆盖上面的全局值）
-[models.deepseek-chat]
-provider = "deepseek"
-thinking = "low"
-```
-
-默认 `high` 表示深度推理；显式 `auto` 交给 Provider 默认；`low` 表示轻量推理；`max` 使用当前模型的最高能力。
-
-`high` 和 `max` 不同：`max` 表示"该模型最高"，会随模型能力变化，配置文件里存的是 `max` 而不是某个服务商的参数。服务商自己的取值（例如 `xhigh`、token 预算）属于模型能力声明，不写在这些字段里。当前模型能不能调、有哪些档位，由模型自身声明的能力决定；`leveler doctor` 会列出每个模型的可用档位。
-
-第一次使用建议从干净的 Git worktree 开始，改动更容易检查或丢弃。
-
-## 命令
-
-| 目标 | 命令 |
+| 想做什么 | 命令 |
 | --- | --- |
-| 打开终端界面 | `leveler` 或 `leveler tui` |
-| 运行完整开发工作流 | 在 TUI 中输入 `/develop <目标>` |
+| 打开终端界面 | `leveler` |
 | 打开浏览器界面 | `leveler web` |
-| 无界面运行一个任务（默认一直运行到目标终态） | `leveler run "…"` |
-| 回答一条消息后结束 | `leveler run "…" --collaboration chat` |
-| 在隔离 worktree 中运行并行候选 | `leveler run "…" --parallel 3` |
-| 在 TUI 中继续会话 | `leveler resume [session-id]` |
-| 查看会话事件记录 | `leveler trace [session-id]` |
+| 直接执行任务 | `leveler run "找出失败的测试并修好"` |
+| 继续之前的会话 | `leveler resume` |
+| 查看帮助 | `leveler --help` |
 
-`/develop` 在同一个会话中执行分析 → 编码 → 验证 → 评审。未配置 `[develop].model` 时，读取代码的阶段沿用当前会话模型。显式配置时必须写成 `provider/model`；无效值会报错，不会静默换成其他模型。
+终端里可以使用 `/develop <目标>` 完成分析、编码、验证和评审。`/help` 查看命令与快捷键，`/thinking` 调整模型思考强度。
 
-`--parallel` 是独立的候选实现流程，不等同于运行时子 Agent 委派。它要求 `--collaboration goal`、Git 工作区干净且已有提交；会创建隔离 worktree 和分支，为通过验证的候选创建提交，并把成功候选集成回当前分支。`chat` 与 `plan` 会被拒绝：它们都不保证产生集成步骤可以合并的候选提交。
+## 权限与隐私
 
-macOS 和 Linux 可以运行 `leveler serve`，通过本机 Unix 套接字让运行时在界面关闭后继续工作。Windows 没有本机 Unix 套接字 daemon，但持久化会话和 `resume` 仍然可用。
+默认 Auto 模式允许普通开发操作，危险操作需要批准。需要更严格的审批时选择 Restricted；Full 允许全部操作，请仅在信任的环境中使用。
 
-TUI 中点击底部的后台任务摘要（`↗`）打开列表，点击任务行的 `[停止]` 可单独停止该任务；详情页也提供 `[停止]` 按钮。键盘可用 ↑↓ 选择、Enter 查看详情、`x` 停止。Esc 只返回，不停止任务；连接 daemon 时，关闭终端窗口也不等于停止后台任务。
+模型可能读到工作区内容，并将相关内容发送给服务商。不要把密钥放在智能体可访问的工作区。权限与平台限制见[安全说明](SECURITY.md)。
 
-## 权限与隔离
+## 更新
 
-默认权限是 `assisted`。普通的仓库内写入、构建、测试、网络操作，以及 `git push`、发布包等命令，可能会在操作系统沙箱内自动执行。工作区外的删除、看不清目标的删除、提权和逃出主机边界的操作需要审批。工作区内路径写明的 `rm` 和 `rmdir` 会直接执行。如果希望审批边界更严格，使用 `request-approval`。
+Homebrew 安装：
 
-| 平台 | 受限命令的隔离方式 |
-| --- | --- |
-| macOS | Seatbelt |
-| Linux | bubblewrap；使用受限命令前必须安装 |
-| Windows | Low integrity。需要禁止网络的命令会被拒绝，因为当前还不能按命令隔离网络。 |
+```sh
+brew upgrade leveler
+```
 
-`leveler doctor` 会报告当前主机的实际能力。受限模式缺少所需隔离后端时，执行会失败，不会假装已经沙箱化。
+其他安装方式默认自动检查稳定版，也可以手动更新：
 
-## TUI 输入与终端诊断
+```sh
+leveler update
+```
 
-输入区支持 `Ctrl+Z` 撤销、`Ctrl+Shift+Z` 或 `Alt+Z` 重做，`Ctrl+Y` 恢复最近删除的文字；提交和切换会话会结束这份草稿的撤销历史。
+## 使用文档
 
-`Ctrl+R` 搜索已提交的输入历史：`Enter` 把选中项放回草稿供编辑，不会直接发送；`Esc` 或 `Ctrl+C` 取消搜索并保留原草稿。`/help` 支持搜索命令、快捷键和说明。
-
-`leveler doctor` 和 `/doctor` 报告终端、SSH／tmux、颜色、换行键和剪贴板诊断，不会修改终端设置或剪贴板内容；无法确认的能力显示为未知。复制会说明能证明什么：本机原生剪贴板写入且读回一致才算已验证，SSH 和 tmux 的 OSC52 或粘贴缓冲区只表示已发送、未验证。
-
-## 浏览器和网页搜索
-
-每个 goal 从基础编码工具开始。模型按需加载可选能力；运行时确认能力可用且权限允许后，对应工具才会进入模型的工具列表。
-
-- **Chrome、Edge 或 Chromium：** CodeLeveler 会启动独立的自动化会话。`browser_tab`、`browser_act` 和 `browser_inspect` 可以导航、交互，并读取 console、页面错误和网络记录。
-- **Safari：** 在 `~/.leveler/config.toml` 的 `[browser]` 下配置 `default = "safari"`，并打开 Safari Remote Automation。Safari 支持标签页和交互，但 WebDriver 后端不能提供 console、页面错误或网络检查。
-- **网页搜索：** 搜索后端在 `~/.leveler/config.toml` 中独立于对话模型配置：
-
-  ```toml
-  [web.search]
-  provider = "deepseek"          # deepseek | tavily
-  api_key_env = "LEVELER_SEARCH_API_KEY"
-  max_results = 5
-  timeout_ms = 15000
-  # base_url = "https://api.deepseek.com/v1/tools"
-  ```
-
-  DeepSeek 搜索每次工具调用只请求一次 `POST https://api.deepseek.com/v1/tools/search`，不产生辅助模型请求。任意已配置模型都可以使用它，切换模型不会改变搜索后端。模型 Provider 的 `base_url` 不会被当作搜索端点。当前支持的搜索 Provider 是 `deepseek` 和 `tavily`。只有该配置段能启用搜索：没有它，`web_search` 不可用；仅设置 `LEVELER_SEARCH_API_KEY` 不会自动打开搜索（旧的隐式回退已移除）。`web_search` 只发起一次 HTTP 请求，遵守配置的超时，不重试，也不会改走浏览器自动化。
-
-TUI 的 `/web` 和界面中打开的链接仍然使用操作系统默认浏览器。
-
-## 自定义 Agent
-
-自定义 Agent 是一个包含 `agent.yaml`（声明能力）和 `instructions.md`（工作说明）的目录。可以让 CodeLeveler 创建，也可以在 Web UI 的 设置 → Agents 中创建，或者把 `.leveler/agents/<name>/` 提交进 Git。
-
-Coding Harness 解析定义，能力准入和 Host Authority 强制执行边界。instructions 不能额外授予工具或写权限。详见[自定义 Agent](docs/AGENT_EXTENSIBILITY.zh-CN.md)。
-
-## 实验性移动端
-
-`apps/leveler-mobile` 是已经冻结的源码预览，不是已分发产品；目前只验证过 iOS 模拟器配对流程。远程控制会让会话流量经过配置的 relay：消息有签名，但端到端加密尚未实现，评估这一功能时应自托管 relay。使用前请阅读[移动端状态](apps/leveler-mobile/README.md)。
-
-## 文档
-
-- [架构说明](docs/ARCHITECTURE.zh-CN.md)
+- [日常使用](docs/USAGE.zh-CN.md)
 - [自定义 Agent](docs/AGENT_EXTENSIBILITY.zh-CN.md)
-- [发布说明](docs/RELEASE.zh-CN.md)
-- [更新日志](CHANGELOG.zh-CN.md)
-- [文档目录](docs/README.zh-CN.md)
-- [安全策略](SECURITY.md)
+- [持久记忆](docs/MEMORY.zh-CN.md)
+- [本版更新](docs/RELEASE.zh-CN.md)
+- [历史版本](CHANGELOG.zh-CN.md)
 
-运行 `leveler --help` 查看完整命令列表。保持最新版本见[更新](#更新)。
-
-安全漏洞请使用 [SECURITY.md](SECURITY.md) 中的非公开流程，不要提交公开 issue。
-
-项目采用 Apache License 2.0，见 [LICENSE-APACHE](LICENSE-APACHE)。
+安全漏洞请按[安全策略](SECURITY.md)私下报告。
