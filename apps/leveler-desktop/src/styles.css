@@ -941,6 +941,11 @@ body.composer-takeover .composer-seat { padding-bottom: 10px; background: linear
   width: 100%;
   max-width: calc(var(--chat-width) + 64px);
   padding: 0 16px;
+  /* The composer adapts to the width it actually gets, not the window: an
+     open right pane can leave the conversation with 320–400px while the
+     Electron window is still wide. The content box equals the card width. */
+  container-type: inline-size;
+  container-name: composer;
 }
 body.home .composer-stack { padding-bottom: 32px; }
 body.composer-takeover .composer-stack { display: none; }
@@ -998,7 +1003,17 @@ body.home .home-context { display: flex; }
 }
 .composer-input::placeholder { color: var(--text-tertiary); }
 body.home .composer-input, body.home .composer-input-wrap { min-height: 52px; }
-.composer-row { display: flex; align-items: center; gap: 12px; height: 28px; min-height: 28px; margin-top: 5px; padding: 0 8px; overflow: visible; }
+.composer-row {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 8px 12px;
+  min-height: 28px; height: auto;
+  margin-top: 5px; padding: 0 8px; overflow: visible;
+}
+.composer-tools, .composer-trailing { display: flex; align-items: center; min-width: 0; }
+.composer-tools { gap: 12px; }
+/* The right group keeps its controls at full size and moves to its own line
+   whole when the row runs out of width; it never overlaps the left group. */
+.composer-trailing { flex: none; gap: 12px; margin-left: auto; }
 .composer-spacer { flex: 1; }
 .composer-round {
   display: inline-flex; align-items: center; justify-content: center;
@@ -1009,12 +1024,44 @@ body.home .composer-input, body.home .composer-input-wrap { min-height: 52px; }
 .composer-round:hover { background: var(--hover-solid); color: var(--text-primary); }
 .composer-trigger {
   display: inline-flex; align-items: center; gap: 4px;
+  min-width: 0;
   height: 28px; padding: 0 4px 0 8px; border-radius: 8px;
   color: var(--text-secondary); font-size: 13px; line-height: 20px; font-weight: 500;
 }
 .composer-trigger:hover { background: var(--hover); color: var(--text-primary); }
-.composer-trigger svg { color: var(--text-tertiary); }
+.composer-trigger svg { flex: none; color: var(--text-tertiary); }
+.composer-trigger .trigger-label {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .model-trigger { font-weight: 400; padding-right: 8px; }
+#permission-picker, #model-picker { flex: 0 1 auto; }
+/* Default reading; the narrow rules below swap it for the percent. Declared
+   here, before the container queries, so source order cannot resurrect the
+   hidden variant. */
+.context-pill .context-full { display: inline; }
+.context-pill .context-compact { display: none; min-width: 4ch; text-align: right; }
+
+/* Composer-local breakpoints. 576px of card width is 560px of control row
+   (the row has 8px side pads); 476px is 460px. Reference values, measured
+   against these controls. Nothing here reads the window width. */
+@container composer (max-width: 576px) {
+  .composer-row { column-gap: 8px; }
+  .composer-tools, .composer-trailing { gap: 8px; }
+  .context-stats { gap: 4px; }
+  /* Narrow: the occupancy reading is the one line that matters; the
+     cumulative usage totals stay one click away in its detail panel. */
+  .context-pill.usage-pill { display: none; }
+  .context-pill .context-full { display: none; }
+  .context-pill .context-compact { display: inline; }
+}
+@container composer (max-width: 476px) {
+  /* The permission trigger carries a shield, so its text collapses first.
+     The full mode name stays in the tooltip and aria-label. */
+  #permission-picker .trigger-label { display: none; }
+  #permission-picker { padding-right: 6px; }
+  #model-picker { max-width: 132px; }
+  .composer-row { gap: 6px 8px; }
+}
 .send-button {
   display: inline-flex; align-items: center; justify-content: center;
   width: 34px; height: 34px; border-radius: 999px;
@@ -1888,13 +1935,20 @@ body.rightbar-overlay #floating-right-toggle, body.rightbar-overlay .header-acti
 .tab-items::-webkit-scrollbar { display: none; }
 
 .settings-content h2.settings-title-large { font-size: 18px; line-height: 26px; font-weight: 600; }
-.context-stats { display: flex; justify-content: center; gap: 8px; min-height: 0; margin-top: 2px; }
+.context-stats {
+  display: flex; flex-wrap: nowrap; justify-content: center; gap: 8px;
+  /* Stable chrome: usage updates replace the pills' text, never the row's
+     height, so the composer cannot breathe in and out while a turn streams. */
+  height: 28px; min-height: 28px; margin-top: 2px; overflow: hidden;
+}
 .context-pill {
   display: inline-flex; align-items: center; gap: 6px;
   height: 28px; padding: 1px 8px; border-radius: 8px;
   color: var(--text-tertiary); font-size: 12px; line-height: 18px; font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .context-pill:hover { background: var(--hover); color: var(--text-secondary); }
+.context-pill svg { flex: none; }
 body.home .context-stats { display: none; }
 
 :root[data-platform="darwin"] body.rightbar-expanded .pane-head { padding-left: 78px; }

@@ -17,7 +17,10 @@
     "test:long-session": "node scripts/long-session.mjs",
     "test:session-actions": "node scripts/session-actions.mjs",
     "test:conversation": "node scripts/conversation.mjs",
-    "test:composer": "node scripts/composer.mjs"
+    "test:composer": "node scripts/composer.mjs",
+    "test:composer-narrow": "node scripts/composer-narrow.mjs",
+    "test:terminal-permissions": "node scripts/terminal-permissions.mjs",
+    "test:terminal-permissions:finder": "node scripts/terminal-permissions-finder.mjs"
   },
   "devDependencies": {
     "electron": "44.5.1",

@@ -1741,14 +1741,17 @@ function renderComposerMeta() {
     el('span', 'trigger-label', mode ? permissionLabel(mode) : '工作区内修改'),
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
-  permission.dataset.tooltip = '访问模式';
-  permission.setAttribute('aria-label', `访问模式，当前：${mode ? permissionLabel(mode) : '工作区内修改'}`);
+  const permissionText = mode ? permissionLabel(mode) : '工作区内修改';
+  permission.dataset.tooltip = `访问模式：${permissionText}（仅影响 Agent，用户终端按系统用户权限运行）`;
+  permission.setAttribute('aria-label', `访问模式，当前：${permissionText}`);
   const model = current?.session.model;
+  const modelText = modelLabel(model) || '请选择模型';
   $('model-picker').replaceChildren(
-    el('span', 'trigger-label', modelLabel(model) || '请选择模型'),
+    el('span', 'trigger-label', modelText),
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
-  $('model-picker').dataset.tooltip = model ? `模型提供商：${model.provider}` : '选择模型';
+  $('model-picker').dataset.tooltip = model ? `模型：${modelText} · 提供商：${model.provider}` : '选择模型';
+  $('model-picker').setAttribute('aria-label', `选择模型，当前：${modelText}`);
   $('send').replaceChildren(iconNode('arrowUp', { size: 16, stroke: 1.8 }));
   // The running button shows a solid stop block, not an outlined icon glyph.
   $('stop').replaceChildren(el('span', 'stop-glyph'));
@@ -1762,20 +1765,59 @@ function formatTokenCount(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString('en-US') : '未提供';
 }
 
+/** Context occupancy from the Runtime accounting, never cumulative usage:
+ *  the compaction capacity is the authoritative denominator; the declared
+ *  model window is a different axis and only fills in when capacity is
+ *  unknown. */
+function contextUtilizationPercent(accounting) {
+  const used = accounting?.used_tokens;
+  if (!Number.isFinite(used)) return null;
+  const total = [accounting.input_capacity_tokens, accounting.context_window_tokens]
+    .find(value => Number.isFinite(value) && value > 0);
+  return total === undefined ? null : Math.min(100, Math.floor(used * 100 / total));
+}
+
+/** Usage totals for the context detail panel, so the compact pill loses no
+ *  information when the separate usage pill is hidden. */
+function usageDetailItems(usage) {
+  if (!usage) return [];
+  const rows = [];
+  const add = (label, value) => {
+    if (value !== undefined && value !== null) rows.push({ label: `${label}：${formatTokenCount(value)}`, disabled: true });
+  };
+  add('输入', usage.input_tokens);
+  add('输出', usage.output_tokens);
+  add('缓存读', usage.cached_input_tokens);
+  add('推理', usage.reasoning_tokens);
+  return rows.length ? [{ divider: true }, { heading: 'Token 用量' }, ...rows] : [];
+}
+
 function contextMeterPanel() {
   const accounting = current?.contextUsage;
   if (!accounting) return null;
   const button = el('button', 'context-pill');
   button.type = 'button';
+  const percent = contextUtilizationPercent(accounting);
   const used = formatTokenCount(accounting.used_tokens);
-  const capacity = formatTokenCount(accounting.input_capacity_tokens);
+  const denominator = Number.isFinite(accounting.input_capacity_tokens) && accounting.input_capacity_tokens > 0
+    ? accounting.input_capacity_tokens
+    : Number.isFinite(accounting.context_window_tokens) && accounting.context_window_tokens > 0
+      ? accounting.context_window_tokens
+      : null;
+  const full = denominator === null
+    ? `上下文 ${used}`
+    : `上下文 ${used} / ${formatTokenCount(denominator)}${percent === null ? '' : ` · ${percent}%`}`;
+  const compact = percent === null ? `上下文 ${used}` : `${percent}%`;
   button.append(iconNode('layers', { size: 14 }));
-  button.append(el('span', undefined, accounting.input_capacity_tokens == null ? `上下文 ${used}` : `上下文 ${used} / ${capacity}`));
-  button.dataset.tooltip = '上下文统计';
+  button.append(el('span', 'context-full', full), el('span', 'context-compact', compact));
+  button.dataset.tooltip = percent === null ? '上下文统计' : `上下文占用 ${percent}%（点击查看明细）`;
+  button.setAttribute('aria-label', percent === null ? '上下文统计' : `上下文占用 ${percent}%`);
+  button.setAttribute('aria-haspopup', 'menu');
   button.addEventListener('click', () => openMenu({
     anchor: button, width: 340, side: 'top', align: 'start',
     items: [
       { heading: '上下文统计' },
+      ...(percent === null ? [] : [{ label: `上下文占用：${percent}%`, disabled: true }]),
       { label: `已用输入：${ formatTokenCount(accounting.used_tokens) }`, disabled: true },
       { label: `有效输入容量（压缩口径）：${ formatTokenCount(accounting.input_capacity_tokens) }`, disabled: true },
       { label: `模型窗口（仅展示口径）：${ formatTokenCount(accounting.context_window_tokens) }`, disabled: true },
@@ -1784,6 +1826,7 @@ function contextMeterPanel() {
       { label: `安全余量：${ formatTokenCount(accounting.headroom_tokens) }`, disabled: true },
       { label: `压缩状态：${ ({ none: '正常', soft: '软压缩', hard_required: '已达硬容量' })[accounting.fold_state] ?? accounting.fold_state ?? '未提供' }`, disabled: true },
       { label: `统计方式：${ ({ exact: '精确分词', estimated: '估计', mixed: '模型报告总量，分类为估计' })[accounting.token_count_kind] ?? accounting.token_count_kind ?? '未提供' }`, disabled: true },
+      ...usageDetailItems(current?.usage),
     ],
   }));
   return button;
