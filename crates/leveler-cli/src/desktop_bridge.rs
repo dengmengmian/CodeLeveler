@@ -128,6 +128,7 @@ struct Bridge {
     client: Option<Arc<LocalSocketRuntimeClient>>,
     layout: Option<Layout>,
     selected: Option<SessionId>,
+    terminal_clients: std::collections::HashMap<(SessionId, String), Arc<LocalSocketRuntimeClient>>,
     subscription: Option<JoinHandle<()>>,
     output: mpsc::Sender<Value>,
 }
@@ -215,6 +216,50 @@ impl Bridge {
             }
         }));
         Ok(())
+    }
+    async fn terminal_client(
+        &mut self,
+        session: &SessionId,
+        terminal_id: &str,
+    ) -> anyhow::Result<Arc<LocalSocketRuntimeClient>> {
+        let key = (session.clone(), terminal_id.to_owned());
+        if let Some(client) = self.terminal_clients.get(&key) {
+            return Ok(client.clone());
+        }
+        // The index locates an existing owner; it cannot grant execution. The
+        // runtime revalidates the durable session and the host checks PTY ownership.
+        // No install/watch call here: terminal I/O must not change UI selection.
+        let index = leveler_app::global_task_index::query_global_tasks(&self.home, true).await;
+        anyhow::ensure!(
+            index.source_errors.is_empty(),
+            "terminal source discovery is incomplete"
+        );
+        let mut sources = index.tasks.iter().filter(|task| &task.id == session);
+        let source = sources
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("terminal session is not registered"))?;
+        anyhow::ensure!(
+            sources.next().is_none(),
+            "terminal session has ambiguous source ownership"
+        );
+        let client = leveler_runtime_host::connect_global_task_runtime(
+            &self.home,
+            &source.source_id,
+            session,
+            self.config_dir.clone(),
+            &self.launch()?,
+            Arc::new(DesktopHandoff(self.output.clone())),
+        )
+        .await?;
+        let layout = self.layout_for(source.primary_workspace.as_deref())?;
+        client.set_reviver(Arc::new(DaemonReviver::new(
+            layout,
+            self.launch()?,
+            Arc::new(DesktopHandoff(self.output.clone())),
+        )));
+        let client = Arc::new(client);
+        self.terminal_clients.insert(key, client.clone());
+        Ok(client)
     }
     async fn handle(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         match method {
@@ -320,10 +365,6 @@ impl Bridge {
                 use base64::Engine as _;
                 use leveler_client_protocol::{TerminalOperation, TerminalRequest};
                 let session_id = SessionId::new(required_string(&params, "session_id")?);
-                anyhow::ensure!(
-                    self.selected.as_ref() == Some(&session_id),
-                    "session is not selected"
-                );
                 let dimension = |key: &str| -> anyhow::Result<u16> {
                     params[key]
                         .as_u64()
@@ -360,14 +401,23 @@ impl Bridge {
                     _ => TerminalOperation::Close,
                 };
                 let request = TerminalRequest {
-                    session_id,
+                    session_id: session_id.clone(),
                     terminal_id: required_string(&params, "terminal_id")?.into(),
                     operation,
                 };
                 request.validate().map_err(anyhow::Error::msg)?;
-                match self.client()?.terminal(request).await? {
+                let client = self
+                    .terminal_client(&request.session_id, &request.terminal_id)
+                    .await?;
+                match client.terminal(request).await? {
                     None => Ok(Value::Null),
                     Some(mut state) => {
+                        if method == "close_terminal"
+                            && matches!(state.status.as_str(), "exited" | "killed")
+                        {
+                            self.terminal_clients
+                                .remove(&(session_id, state.terminal_id.clone()));
+                        }
                         let bytes = std::mem::take(&mut state.data);
                         let mut response = serde_json::to_value(state)?;
                         response.as_object_mut().unwrap().remove("data");
@@ -419,6 +469,7 @@ pub(crate) async fn run(config_dir: Option<PathBuf>) -> anyhow::Result<std::proc
         client: None,
         layout: None,
         selected: None,
+        terminal_clients: Default::default(),
         subscription: None,
         output: output.clone(),
     };

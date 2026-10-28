@@ -6,12 +6,11 @@
 //! [`PermissionProfile`] vocabulary the tool layer tags itself with, a
 //! [`CommandRunner`] with process-tree termination, the permission
 //! [`ApprovalPolicy`]/[`Approver`], and a [`Checkpoint`] for rollback.
-// `deny` (not `forbid`) with two audited, scoped allows: the Linux
-// PR_SET_PDEATHSIG pre-exec hook in `command.rs`, which keeps
-// grandchildren from surviving a force-killed parent, and the Windows
-// ShellExecuteW call in `url_open.rs`, which delegates an HTTP URL to the
-// registered system handler. Any new unsafe block still fails the build unless
-// explicitly allowed and justified like those boundaries.
+// `deny` (not `forbid`) with audited, scoped OS boundaries: the Linux
+// PR_SET_PDEATHSIG hook in `command.rs`, Windows ShellExecuteW in `url_open.rs`,
+// and PTY controlling-terminal/resize ioctls plus macOS process enumeration in
+// `pty.rs`. Each allow documents its descriptor, buffer, or post-fork invariant.
+// Other unsafe blocks still fail the build without an explicit justification.
 #![deny(unsafe_code)]
 
 pub mod approval;

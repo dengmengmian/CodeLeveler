@@ -1626,6 +1626,19 @@ impl CommandRunner {
                         program: request.program.clone(),
                         source: e.into(),
                     })?;
+                // openpty has no CLOEXEC flag; seal both descriptors immediately,
+                // before constructing stdio or touching the child environment.
+                for fd in [&descriptors.master, &descriptors.slave] {
+                    use std::os::fd::AsRawFd;
+                    nix::fcntl::fcntl(
+                        fd.as_raw_fd(),
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+                    )
+                    .map_err(|error| ProcessError::Io {
+                        program: request.program.clone(),
+                        source: error.into(),
+                    })?;
+                }
                 crate::pty::attach(&mut cmd, descriptors.slave).map_err(|source| {
                     ProcessError::Io {
                         program: request.program.clone(),

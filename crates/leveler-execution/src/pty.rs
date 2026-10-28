@@ -7,13 +7,16 @@ use std::{
 };
 use tokio::io::unix::AsyncFd;
 
-pub struct PtyMaster(AsyncFd<OwnedFd>);
+pub struct PtyMaster(AsyncFd<OwnedFd>, tokio::sync::Mutex<()>);
 impl PtyMaster {
     pub fn new(fd: OwnedFd) -> io::Result<Arc<Self>> {
         use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
         fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
         fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
-        Ok(Arc::new(Self(AsyncFd::new(fd)?)))
+        Ok(Arc::new(Self(
+            AsyncFd::new(fd)?,
+            tokio::sync::Mutex::new(()),
+        )))
     }
     pub async fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -27,6 +30,8 @@ impl PtyMaster {
         }
     }
     pub async fn write(&self, mut bytes: &[u8]) -> io::Result<()> {
+        // The host serializes the complete chunk, including partial writes.
+        let _input = self.1.lock().await;
         while !bytes.is_empty() {
             let mut ready = self.0.writable().await?;
             if let Ok(result) =
@@ -60,6 +65,11 @@ impl PtyMaster {
 
 #[allow(unsafe_code)]
 pub fn attach(cmd: &mut tokio::process::Command, slave: OwnedFd) -> io::Result<()> {
+    nix::fcntl::fcntl(
+        slave.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(io::Error::from)?;
     let slave: std::fs::File = slave.into();
     cmd.stdin(slave.try_clone()?)
         .stdout(slave.try_clone()?)

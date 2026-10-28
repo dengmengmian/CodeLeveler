@@ -64,6 +64,8 @@ pub struct TerminalState {
     pub next_cursor: u64,
     pub data: Vec<u8>,
     pub truncated: bool,
+    #[serde(default)]
+    pub output_error: Option<String>,
 }
 #[cfg(test)]
 mod tests {
