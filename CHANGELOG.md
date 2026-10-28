@@ -4,12 +4,16 @@
 
 ## [Unreleased]
 
-- Improved reasoning history when switching models, keeping private reasoning separate between models.
-- Fixed follow-up questions being treated as new goals after task completion and improved resuming paused work.
+## [1.0.21] - 2026-10-28
+
+- Improved reasoning history when switching models, keeping private reasoning separate between models. Historical reasoning is sent back only to the route that produced it, and only when that route declares the mode.
+- Fixed follow-up questions being treated as new goals after task completion, and improved resuming paused work. Ending a goal returns the session to ordinary chat.
+- Goal completion follows the request and its evidence. A path that was only permitted is not a required deliverable. A refused check can be recovered without starting the goal over.
 - Added a `/memory` management page to search, read, and manage records; `/memory status` shows processing activity.
-- User facts and experimental experience records have separate settings; experience recording is off by default.
+- User facts and experimental experience records have separate settings; experience recording is off by default. Recalled facts keep their source and authority.
 - Improved retrieval for large memory collections and protected historical sensitive records in UI and logs.
 - Improved project rule loading, session recovery, and completion checks to reduce missed requirements and repeated work.
+- A local terminal keeps its output, its owner, and its file descriptors.
 
 ## [1.0.20] - 2026-10-19
 
