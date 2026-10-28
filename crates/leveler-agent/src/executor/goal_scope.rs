@@ -827,6 +827,11 @@ fn collect_paths(
 ) {
     for raw in segment.split(|c: char| TOKEN_BREAKS.contains(&c)) {
         let token = clean_token(raw);
+        // A Windows interpreter flag (`cmd /c verify.cmd`) belongs to the
+        // command, not to the deliverables the user named.
+        if interpreter_flag(&token) {
+            continue;
+        }
         if !path_like(&token) || looks_like_url(&token) || example_context(segment, &token) {
             continue;
         }
@@ -1340,6 +1345,16 @@ fn command_text(text: &str) -> bool {
     PROGRAMS.contains(&base)
 }
 
+/// A one-letter absolute path is indistinguishable from a Windows interpreter
+/// flag (`/c`, `/k`), and under-extraction is preferred to a requirement the
+/// user never named.
+fn interpreter_flag(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next() == Some('/')
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.next().is_none()
+}
+
 fn path_like(token: &str) -> bool {
     let token = clean_token(token);
     if token.is_empty() || looks_like_url(&token) || token.contains("//") || glob_pattern(&token) {
@@ -1547,6 +1562,26 @@ mod tests {
                 requirement.text == "./verify.sh" && requirement.kind == RequirementKind::Command
             }),
             "a named script the user asked to run is a command requirement: {requirements:?}"
+        );
+    }
+
+    #[test]
+    fn an_interpreter_flag_is_not_a_deliverable() {
+        let requirements = extract(
+            "完成全部三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
+             最后运行 cmd /c verify.cmd，全部做完再结束。",
+            &[],
+        );
+        let found = texts(&requirements);
+        assert!(
+            !found.contains(&"/c"),
+            "the interpreter flag must not become a requirement: {found:?}"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.text == "verify.cmd" && requirement.kind == RequirementKind::Command
+            }),
+            "the named script stays a command requirement: {requirements:?}"
         );
     }
 
