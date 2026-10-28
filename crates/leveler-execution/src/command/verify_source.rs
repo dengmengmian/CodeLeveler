@@ -273,6 +273,16 @@ mod tests {
         (base, workspace)
     }
 
+    /// Windows refuses `set_times` on a read-only handle, the same way the
+    /// production path does.
+    fn open_for_times(path: &std::path::Path) -> std::fs::File {
+        #[cfg(windows)]
+        let opened = std::fs::OpenOptions::new().write(true).open(path);
+        #[cfg(not(windows))]
+        let opened = std::fs::File::open(path);
+        opened.unwrap()
+    }
+
     /// The receipt records content, so an input whose mtime moved without its
     /// bytes changing needs no recompile — and one whose bytes changed without
     /// its mtime moving is exactly what must be recompiled.
@@ -289,7 +299,7 @@ mod tests {
 
         // A save that bumps the clock but not the bytes.
         let source = workspace.join("src/main.rs");
-        let handle = std::fs::File::open(&source).unwrap();
+        let handle = open_for_times(&source);
         handle
             .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
             .unwrap();
@@ -299,7 +309,7 @@ mod tests {
         // A change that leaves the old mtime in place.
         let original = std::fs::metadata(&source).unwrap();
         std::fs::write(&source, "fn main() { this is not rust }\n").unwrap();
-        let handle = std::fs::File::open(&source).unwrap();
+        let handle = open_for_times(&source);
         handle
             .set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap()))
             .unwrap();

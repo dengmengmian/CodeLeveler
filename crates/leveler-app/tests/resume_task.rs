@@ -644,6 +644,12 @@ async fn continue_after_a_blocked_goal_retries_the_same_record() {
         .await
         .unwrap();
     settled(&f.app, &f.session, 2).await;
+    wait_for_goals(&f.app, &f.session, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.id == goal_id && goal.state == GoalState::Settled)
+    })
+    .await;
 
     let db = f.app.open_database().await.unwrap();
     let stores = EngineStores::from_database(&db);
