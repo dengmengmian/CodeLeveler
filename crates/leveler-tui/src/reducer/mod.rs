@@ -536,7 +536,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             snapshot,
         } => {
             if let Some(snapshot) = snapshot {
-                runtime_apply::apply_session_confirmation(state, *snapshot);
+                runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
             // Nothing is being stopped: the row goes back to offering a stop.
             if let ClientCommand::CancelToolCall { call_id, .. } = &command {
@@ -552,7 +552,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
         EffectCompletion::CommandUncertain { command, snapshot } => {
             let resynced = snapshot.is_some();
             if let Some(snapshot) = snapshot {
-                runtime_apply::apply_session_confirmation(state, *snapshot);
+                runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
             // The stop may or may not have reached the runtime. A call still
             // running says exactly that; one that settled says how.
@@ -598,8 +598,9 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             let Some(pending) = take_pending_submission(state, &command_id) else {
                 return;
             };
+            let settled_after_dispatch = state.settled_turns != pending.settled_turns;
             if let Some(snapshot) = snapshot_for_current_session(state, snapshot) {
-                runtime_apply::apply_session_confirmation(state, snapshot);
+                runtime_apply::apply_session_confirmation(state, snapshot, settled_after_dispatch);
             }
             // Admitted: the 待发送 item becomes conversation. A steer has no
             // runtime message event of its own, so this is where it enters; an
@@ -631,9 +632,14 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 state.pending_inputs.remove(index);
                 forget_pending_input_row(state);
             }
+            let settled_after_dispatch = state.settled_turns != pending.settled_turns;
             match snapshot_for_current_session(state, snapshot) {
                 Some(snapshot) => {
-                    runtime_apply::apply_session_confirmation(state, snapshot);
+                    runtime_apply::apply_session_confirmation(
+                        state,
+                        snapshot,
+                        settled_after_dispatch,
+                    );
                 }
                 // Busy was this input's own optimism; with no snapshot, undo
                 // exactly that.
@@ -671,9 +677,14 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             let Some(pending) = take_pending_submission(state, &command_id) else {
                 return;
             };
+            let settled_after_dispatch = state.settled_turns != pending.settled_turns;
             match snapshot_for_current_session(state, snapshot) {
                 Some(snapshot) => {
-                    runtime_apply::apply_session_confirmation(state, snapshot);
+                    runtime_apply::apply_session_confirmation(
+                        state,
+                        snapshot,
+                        settled_after_dispatch,
+                    );
                 }
                 // Busy was this input's own optimism (a steer rides a turn the
                 // runtime reported); with no snapshot, undo exactly that.

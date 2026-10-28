@@ -4335,7 +4335,9 @@ async function refreshMetadata() {
   const id = current.session.id;
   const snapshot = await api.snapshot(id);
   if (current?.session.id !== id) return;
-  current = attachExtras(applySessionMetadata(current, snapshot), snapshot);
+  // This confirmation is fetched after a command and has no sequence, so it
+  // cannot prove the plan or diff a live event already produced were cleared.
+  current = attachExtras(applySessionMetadata(current, snapshot, { liveProjection: false }), snapshot);
   renderHeader();
   renderComposerMeta();
   renderSidebar();

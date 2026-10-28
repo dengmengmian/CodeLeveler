@@ -461,6 +461,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.notification = None;
         }
         RuntimeEvent::TurnFailed { error, failure } => {
+            note_turn_settled(state);
             state.status = RuntimeStatus::Error;
             state.finalization_stage = None;
             clear_activity(state);
@@ -531,6 +532,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.turn_diff_files = None;
         }
         RuntimeEvent::TurnCancelled => {
+            note_turn_settled(state);
             state.status = RuntimeStatus::Idle;
             state.finalization_stage = None;
             clear_activity(state);
@@ -565,6 +567,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::TaskCancelled => {
             // The user cancelled the LOGICAL task. It is terminal: the resume
             // affordance is withdrawn so a `继续` cannot reopen it.
+            note_turn_settled(state);
             state.status = RuntimeStatus::Idle;
             state.finalization_stage = None;
             clear_activity(state);
@@ -1486,7 +1489,14 @@ fn turn_receipt(state: &AppState) -> crate::transcript::TurnReceipt {
     }
 }
 
+/// A turn terminal has been applied. A command confirmation dispatched before
+/// it carries a snapshot that cannot know the turn settled.
+fn note_turn_settled(state: &mut AppState) {
+    state.settled_turns = state.settled_turns.saturating_add(1);
+}
+
 fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<String>) {
+    note_turn_settled(state);
     state.status = RuntimeStatus::Idle;
     state.finalization_stage = None;
     state.resumable_task = false;
@@ -1965,7 +1975,20 @@ pub(super) enum TranscriptAdoption {
 /// Apply a snapshot that only confirms a command (a delivered submission, a
 /// rejected one): runtime truth for status and pending work, but never a
 /// reason to throw away the live transcript.
-pub(super) fn apply_session_confirmation(state: &mut AppState, session: UiSessionSnapshot) {
+///
+/// `settled_after_dispatch` says this client has applied a turn terminal since
+/// the command was dispatched. The snapshot was captured as the command was
+/// admitted, so every field in it is older than that terminal: adopting its
+/// `running` status would reopen a finished turn, and its cleanup would cancel
+/// the recap the finished turn just asked for. It has nothing left to say.
+pub(super) fn apply_session_confirmation(
+    state: &mut AppState,
+    session: UiSessionSnapshot,
+    settled_after_dispatch: bool,
+) {
+    if settled_after_dispatch {
+        return;
+    }
     apply_session_with(state, session, TranscriptAdoption::KeepLive);
 }
 

@@ -30,6 +30,9 @@ pub struct PendingSubmission {
     /// re-delivering the same envelope; until it settles, no new turn input is
     /// sent, because this one may already be running.
     pub unconfirmed: bool,
+    /// [`AppState::settled_turns`] when the command was dispatched. A snapshot
+    /// captured at admission cannot know about a turn that settled after it.
+    pub settled_turns: u64,
 }
 
 /// A runtime request that must eventually be answered by the user. Parked in
@@ -275,6 +278,10 @@ pub struct AppState {
     pub runtime_connected: bool,
     /// Version of metadata actually rendered from a runtime snapshot.
     pub snapshot_version: Option<i64>,
+    /// Turn-terminal events this client has applied. A command confirmation
+    /// carries a snapshot taken before it could observe these, so comparing
+    /// the count tells the client its live view is the newer one.
+    pub settled_turns: u64,
     pub session_id: SessionId,
     pub transcript: TranscriptState,
     /// Which conversation surface owns the viewport and the composer. One
@@ -687,6 +694,7 @@ impl AppState {
             running: true,
             runtime_connected: true,
             snapshot_version: None,
+            settled_turns: 0,
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
             surface: crate::btw::SurfaceFocus::Main,
