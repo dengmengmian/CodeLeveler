@@ -769,9 +769,14 @@ fn collect_backticks(
                 continue;
             }
             added_path = true;
+            // A permitted path is not a deliverable. Marking it seen also
+            // keeps the surrounding backtick span from becoming a named one.
+            if permission_only(segment, &token) {
+                continue;
+            }
             out.push((token.clone(), path_kind(segment, &token), source.clone()));
         }
-        if added_path || is_test_phrase(span) {
+        if added_path || is_test_phrase(span) || permission_only(segment, span) {
             continue;
         }
         // A backticked command the user asked to run is mechanical evidence,
@@ -827,6 +832,9 @@ fn collect_paths(
         } else {
             path_kind(segment, &token)
         };
+        if matches!(kind, RequirementKind::Artifact { .. }) && permission_only(segment, &token) {
+            continue;
+        }
         out.push((token, kind, source.clone()));
     }
 }
@@ -957,6 +965,122 @@ fn last_match_end(haystack: &str, needle: &str) -> Option<usize> {
         }
     }
     best
+}
+
+const PERMISSION_ASCII: &[&str] = &["may", "allowed", "optional"];
+const PERMISSION_CJK: &[&str] = &["也可以", "也可", "可以", "允许"];
+const OBLIGATION_ASCII: &[&str] = &["must", "required"];
+const OBLIGATION_CJK: &[&str] = &["必须", "需要", "应当", "应该"];
+
+/// A path the user permitted, rather than one the user required.
+///
+/// The permission covers later comma-separated items in the same sentence
+/// ("you may add A, add B, and update `docs/`"). It stops at the sentence,
+/// and a clause that states its own obligation ("but you must update
+/// `README.md`") keeps that clause's paths. An obligation also covers the
+/// items listed after it until another permission starts.
+fn permission_only(segment: &str, token: &str) -> bool {
+    if token.is_empty() || !segment.contains(token) {
+        return false;
+    }
+    let sentence = sentence_around(segment, token);
+    let mut permitted = false;
+    let mut obliged = false;
+    for clause in sentence.split([',', '，']) {
+        let local_obligation = has_marker(clause, OBLIGATION_ASCII, OBLIGATION_CJK);
+        let local_permission = has_marker(clause, PERMISSION_ASCII, PERMISSION_CJK);
+        if clause.contains(token) {
+            if local_obligation {
+                return false;
+            }
+            return local_permission || (permitted && !obliged);
+        }
+        if local_obligation {
+            obliged = true;
+            permitted = false;
+        }
+        if local_permission {
+            permitted = true;
+            obliged = false;
+        }
+    }
+    false
+}
+
+/// The sentence that contains `token`. A period ends it only when the next
+/// word starts a new sentence, so `README.md` and `./...` stay intact.
+fn sentence_around<'a>(segment: &'a str, token: &str) -> &'a str {
+    let Some(at) = segment.find(token) else {
+        return segment;
+    };
+    let mut start = 0;
+    let mut index = 0;
+    while index < at {
+        let ch = segment[index..].chars().next().unwrap();
+        if sentence_boundary(segment, index) {
+            start = index + ch.len_utf8();
+        }
+        index += ch.len_utf8();
+    }
+    let mut end = segment.len();
+    let mut index = at + token.len();
+    while index < segment.len() {
+        if sentence_boundary(segment, index) {
+            end = index;
+            break;
+        }
+        index += segment[index..].chars().next().unwrap().len_utf8();
+    }
+    &segment[start..end]
+}
+
+fn sentence_boundary(text: &str, index: usize) -> bool {
+    let rest = &text[index..];
+    let Some(ch) = rest.chars().next() else {
+        return false;
+    };
+    match ch {
+        '\n' | '。' | '；' | ';' | '!' | '?' | '！' | '？' => true,
+        '.' => {
+            let after = rest[ch.len_utf8()..].trim_start();
+            match after.chars().next() {
+                None => true,
+                Some(next) => next.is_uppercase(),
+            }
+        }
+        _ => false,
+    }
+}
+
+fn has_marker(text: &str, ascii: &[&str], cjk: &[&str]) -> bool {
+    let lower = text.to_lowercase();
+    if ascii.iter().any(|word| ascii_word(&lower, word)) {
+        return true;
+    }
+    cjk.iter().any(|marker| cjk_marker(text, marker))
+}
+
+fn ascii_word(lower: &str, word: &str) -> bool {
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == word)
+}
+
+/// CJK markers are substrings. A preceding `不` negates the marker
+/// (`不可以`, `不需要`), so that occurrence does not count.
+fn cjk_marker(text: &str, marker: &str) -> bool {
+    let mut rest = text;
+    while let Some(at) = rest.find(marker) {
+        if !rest[..at].ends_with('不') {
+            return true;
+        }
+        let next = at + marker.len();
+        if next >= rest.len() {
+            break;
+        }
+        rest = &rest[next..];
+    }
+    false
 }
 
 fn has_any(text: &str, needles: &[&str]) -> bool {
@@ -1761,6 +1885,42 @@ mod tests {
         let found = texts(&requirements);
         assert!(!found.contains(&"src/legacy.rs"), "{found:?}");
         assert!(found.contains(&"src/new.rs"), "{found:?}");
+    }
+
+    /// "you may A, B, and update `docs/`" permits the whole list. The comma
+    /// does not end the permission, and a delivery verb in a later item does
+    /// not turn that item into an obligation. A later sentence, and a clause
+    /// that itself says must, still name real deliverables.
+    #[test]
+    fn a_permitted_path_is_not_a_required_artifact() {
+        let requirements = extract(
+            "Acceptance: `go test ./...` passes.\n\
+             Scope: you may add or change `*_test.go` files anywhere, add fixtures under \
+             a `testdata/` directory, and update `docs/`. Every OTHER change must be \
+             production code in the package where the defect actually lives.\n\
+             Changes must stay inside `internal/window/`.\n\
+             You may update `notes/`, but you must update `README.md`.\n\
+             You may create `docs/a.md`.\n\
+             Create `docs/guide.md`.",
+            &[],
+        );
+        let found = texts(&requirements);
+        for absent in ["docs/", "testdata/", "notes/", "docs/a.md", "*_test.go"] {
+            assert!(!found.contains(&absent), "{absent} is permitted: {found:?}");
+        }
+        let chinese = extract("可以更新 `docs/`，必须更新 `README.md`。", &[]);
+        let chinese = texts(&chinese);
+        assert!(!chinese.contains(&"docs/"), "{chinese:?}");
+        assert!(chinese.contains(&"README.md"), "{chinese:?}");
+        for present in ["internal/window/", "README.md", "docs/guide.md"] {
+            assert!(found.contains(&present), "missing {present}: {found:?}");
+        }
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "a required test run stays a requirement: {requirements:?}"
+        );
     }
 
     #[test]
