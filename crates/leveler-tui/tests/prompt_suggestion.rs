@@ -13,7 +13,7 @@ use leveler_client_protocol::{
     AnswerEffect, ClientCommand, MessageId, PermissionProfile, RuntimeEvent, RuntimeStatus,
     SessionId, ToolCallId, UiSessionSnapshot,
 };
-use leveler_tui::action::{Action, Effect};
+use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::reducer::reduce;
 use leveler_tui::screen::Screen;
 use leveler_tui::state::{AppState, Boot, WorkbenchFocus};
@@ -517,6 +517,74 @@ fn away_summary_is_rendered_as_muted_recap_chrome() {
         shown.contains("※ 回顾: 已完成配置梳理，下一步修复覆盖顺序。"),
         "{shown}"
     );
+}
+
+/// The delivery confirmation is a snapshot taken as the command was admitted.
+/// It can reach the client after the turn it started has already settled; the
+/// older status it carries must not reopen the turn, and it must not cancel the
+/// recap the settled turn just asked for.
+#[test]
+fn a_late_command_confirmation_cannot_reopen_a_settled_turn() {
+    let mut s = opened();
+    s.composer.replace("整理忽略规则");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let command_id = match effects.as_slice() {
+        [Effect::Submit { command_id, .. }] => command_id.clone(),
+        other => panic!("expected one Submit, got {other:?}"),
+    };
+    s.transcript.push_user("整理忽略规则".into());
+    let message_id = MessageId::new("m-answer");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: message_id.clone(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: message_id.clone(),
+            delta: "忽略规则已经提交。".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id }),
+    );
+    let effects = reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+    assert_eq!(recap_requests(&effects), 1);
+    assert!(s.away_summary_pending);
+
+    // Captured at admission (`running`), delivered once the turn has settled.
+    let mut confirmed = snapshot();
+    confirmed.status = "running".into();
+    confirmed.last_sequence = Some(1);
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
+            command_id,
+            snapshot: Some(Box::new(confirmed)),
+        }),
+    );
+
+    assert_eq!(
+        s.status,
+        RuntimeStatus::Idle,
+        "a snapshot older than the settled turn cannot make it busy again"
+    );
+    assert!(
+        s.away_summary_pending,
+        "nor cancel the recap the settled turn asked for"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AwaySummary {
+            text: "RECAP-ROW: 回顾已跟上最新一轮".into(),
+        }),
+    );
+    assert!(s.transcript.items().iter().any(|item| {
+        matches!(item, TranscriptItem::AwaySummary(text) if text.contains("RECAP-ROW"))
+    }));
 }
 
 #[test]

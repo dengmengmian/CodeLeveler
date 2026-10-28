@@ -413,6 +413,7 @@ fn submit_turn_input(state: &mut AppState, command: ClientCommand) -> Vec<Effect
         command_id: command_id.clone(),
         command: command.clone(),
         unconfirmed: false,
+        settled_turns: state.settled_turns,
     });
     vec![Effect::Submit {
         command,

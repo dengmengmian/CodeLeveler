@@ -345,11 +345,17 @@ export function retainInterruptedThoughts(next,prior){
  return extra.length?{...next,thoughts:[...(next.thoughts??[]),...extra]}:next;
 }
 
-export function applySessionMetadata(state,snapshot){
+export function applySessionMetadata(state,snapshot,{liveProjection=true}={}){
   // SessionUpdated is metadata-only by the existing client protocol. A command
   // receipt is not a transcript checkpoint; live messages remain event-derived.
   const metadata={...snapshot};delete metadata.messages;
-  return {...state,session:{...state.session,...metadata},status:snapshot.task_status??snapshot.status??state.status,plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:snapshot.diff?null:state.diffError};
+  const next={...state,session:{...state.session,...metadata},status:snapshot.task_status??snapshot.status??state.status};
+  // A fetched confirmation snapshot carries no event sequence and may be taken
+  // before the turn produces its plan, so it cannot prove the plan or diff were
+  // cleared. Such callers keep the live projection; its status is still the
+  // admission-time signal that makes the running controls appear.
+  if(!liveProjection)return next;
+  return {...next,plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:snapshot.diff?null:state.diffError};
 }
 
 export function uploadDraft(draft,update){

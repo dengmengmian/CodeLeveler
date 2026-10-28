@@ -58,6 +58,20 @@ test('metadata-only session update preserves runtime live transcript and tool ev
  assert.equal(next.session.goal,'retitled');
  assert.equal(next.status,'running');
 });
+test('an unordered metadata confirmation cannot clear the live plan or diff',()=>{
+ let state=projectSnapshot({...snapshot,task_status:'idle'});
+ state=applyEvent(state,{type:'plan_updated',plan:{steps:[{index:0,description:'Read',status:'running'}]}});
+ state=applyEvent(state,{type:'diff_failed',message:'not a work tree'});
+ // A snapshot fetched at command admission predates the turn's plan and has no
+ // sequence, so it cannot prove the plan or diff were cleared.
+ const next=applySessionMetadata(state,{...snapshot,goal:'retitled',task_status:'running',plan:null,diff:null},{liveProjection:false});
+ assert.equal(next.session.goal,'retitled');
+ // The admission status is still adopted: it is what makes the running
+ // controls (the stop button) appear for the accepted turn.
+ assert.equal(next.status,'running');
+ assert.equal(next.plan.steps[0].description,'Read');
+ assert.equal(next.diffError,'not a work tree');
+});
 test('reasoning never becomes transcript or exposed state (Contract v1 §I5)',()=>{
  let state=projectSnapshot({id:'s1',messages:[],status:'running'});
  state=applyEvent(state,{type:'reasoning_delta',delta:'Provider reasoning'});
