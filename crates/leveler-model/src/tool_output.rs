@@ -39,9 +39,7 @@ pub fn saved_reference(path: &str, sha256: &str, size_bytes: usize) -> String {
 /// shape rather than the phrase keeps a complete result that merely mentions
 /// the phrase (source code, logs) from being mistaken for a truncated one.
 fn is_elision_marker_line(line: &str) -> bool {
-    line.starts_with("… [")
-        && line.ends_with("] …")
-        && line.contains(TOOL_OUTPUT_ELIDED_MARKER)
+    line.starts_with("… [") && line.ends_with("] …") && line.contains(TOOL_OUTPUT_ELIDED_MARKER)
 }
 
 /// Reduce an already-externalized tool result to what remains recoverable.

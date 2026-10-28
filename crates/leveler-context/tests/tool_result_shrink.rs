@@ -12,9 +12,7 @@
 use leveler_context::{compaction_span, shrink_externalized_results};
 use leveler_core::ToolCallId;
 use leveler_model::tool_output::saved_reference;
-use leveler_model::{
-    ContentPart, Message, Role, ToolCall, ToolResultContent, estimate_tokens,
-};
+use leveler_model::{ContentPart, Message, Role, ToolCall, ToolResultContent, estimate_tokens};
 
 const BIG: usize = 40_000;
 
@@ -169,8 +167,7 @@ fn reduction_preserves_the_tool_exchange_and_every_other_message() {
         .collect();
     assert_eq!(after_ids, before_ids, "pairing is identity, not content");
     assert_eq!(
-        reduced[3].content[1],
-        messages[3].content[1],
+        reduced[3].content[1], messages[3].content[1],
         "a result with no externalization marker is the only copy of its content"
     );
 }
