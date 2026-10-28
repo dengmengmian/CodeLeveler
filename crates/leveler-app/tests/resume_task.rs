@@ -15,7 +15,7 @@ use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
 use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{EngineStores, EventRepository, GoalState, TurnRepository};
+use leveler_storage::{EngineStores, EventRepository, GoalRecord, GoalState, TurnRepository};
 use leveler_test_support::{MockResponse, MockServer};
 use tokio_util::sync::CancellationToken;
 
@@ -192,6 +192,35 @@ async fn settled(app: &Application, session: &leveler_core::SessionId, min_turns
     }
 }
 
+/// Wait until the session's goal records satisfy `done`.
+///
+/// A goal is settled in the task's terminal transaction, which lands after the
+/// turn row stops running; reading the record before that commit observes a
+/// state the window has already left.
+async fn wait_for_goals(
+    app: &Application,
+    session: &leveler_core::SessionId,
+    done: impl Fn(&[GoalRecord]) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let db = app.open_database().await.unwrap();
+        let stores = EngineStores::from_database(&db);
+        let goals = match stores.tasks.task_for_session(session).await.unwrap() {
+            Some(task) => stores.goals.for_task(&task).await.unwrap(),
+            None => Vec::new(),
+        };
+        if done(&goals) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the goal did not reach its terminal state: {goals:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The core closure: an interrupted task + `继续` re-enters resume, keeps the
 /// task's goal, seeds its plan, and carries the amendment as an addition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -276,6 +305,12 @@ async fn assert_continuation_preserves_task(ordinary_submit: bool) {
     };
     client.send(command).await.unwrap();
     settled(&f.app, &f.session, 2).await;
+    wait_for_goals(&f.app, &f.session, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.id == goal_id && goal.state == GoalState::Settled)
+    })
+    .await;
 
     let db = f.app.open_database().await.unwrap();
     let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
@@ -683,6 +718,12 @@ async fn an_explicit_new_goal_after_blocked_stays_independent() {
         .await
         .unwrap();
     settled(&f.app, &f.session, 2).await;
+    wait_for_goals(&f.app, &f.session, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.objective == "迁移到新的构建系统" && goal.state == GoalState::Settled)
+    })
+    .await;
 
     let db = f.app.open_database().await.unwrap();
     let stores = EngineStores::from_database(&db);
@@ -1003,6 +1044,12 @@ async fn a_failed_verification_survives_into_the_retry() {
         .await
         .unwrap();
     settled(&f.app, &f.session, 2).await;
+    wait_for_goals(&f.app, &f.session, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.id == goal_id && goal.state == GoalState::Settled)
+    })
+    .await;
 
     let db = f.app.open_database().await.unwrap();
     let stores = EngineStores::from_database(&db);
