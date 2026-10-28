@@ -264,6 +264,8 @@ pub struct TerminalObservation {
     pub next_cursor: u64,
     pub data: Vec<u8>,
     pub truncated: bool,
+    #[serde(default)]
+    pub output_error: Option<String>,
 }
 
 #[cfg(unix)]
@@ -272,6 +274,7 @@ struct TerminalIo {
     size: crate::command::PtySize,
     bytes: std::collections::VecDeque<u8>,
     end: u64,
+    output_error: Option<String>,
 }
 
 struct TaskInner {
@@ -693,6 +696,11 @@ impl BackgroundTaskRegistry {
             .ok_or("persistent execution is not configured")?;
         let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
         client.require_terminal()?;
+        let already_exists = client
+            .list()
+            .await?
+            .iter()
+            .any(|task| task.snapshot.id == id);
         self.journal()?
             .prepare_with_scope(id, owner, owner, None, request.write_scope.clone())
             .await?;
@@ -702,7 +710,9 @@ impl BackgroundTaskRegistry {
         {
             Ok(task) => task,
             Err(crate::execution_host::SpawnError::Rejected(error)) => {
-                self.journal()?.abandon_prepared(id)?;
+                if !already_exists {
+                    self.journal()?.abandon_prepared(id)?;
+                }
                 return Err(error);
             }
             Err(crate::execution_host::SpawnError::OutcomeUnknown(error)) => return Err(error),
@@ -830,6 +840,7 @@ impl BackgroundTaskRegistry {
                 next_cursor: position + data.len() as u64,
                 data,
                 truncated: cursor < start,
+                output_error: terminal.output_error.clone(),
             })
         }
         #[cfg(not(unix))]
@@ -1142,6 +1153,7 @@ impl BackgroundTaskRegistry {
                     size: request.pty.expect("PTY size"),
                     bytes: Default::default(),
                     end: 0,
+                    output_error: None,
                 });
             }
             spawn_terminal_pump(
@@ -2363,7 +2375,17 @@ fn spawn_terminal_pump(
                 }
                 // PTY masters signal EIO after their final slave closes.
                 Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => break,
-                Err(_) => break,
+                Err(error) => {
+                    let mut state = reg.lock().await;
+                    if let Some(task) = state.tasks.get_mut(&id) {
+                        if let Some(terminal) = &mut task.terminal {
+                            terminal.output_error =
+                                Some(format!("terminal output read failed: {error}"));
+                        }
+                        task.changed.notify_waiters();
+                    }
+                    break;
+                }
             }
         }
         let mut state = reg.lock().await;
@@ -2478,6 +2500,7 @@ fn finalize_if_drained(task: &mut TaskInner) -> bool {
     if task.status.is_terminal() {
         return false;
     }
+    // Capture diagnostics are independent of the observed process lifecycle.
     task.status = match task.status {
         BackgroundTaskStatus::Killing => BackgroundTaskStatus::Killed,
         BackgroundTaskStatus::Running => BackgroundTaskStatus::Exited,
@@ -4704,5 +4727,278 @@ mod unified_runner_tests {
             "log_prefix_len": 0
         });
         serde_json::to_vec(&vec![task]).unwrap()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod terminal_acceptance_tests {
+    use super::*;
+    use nix::{
+        sys::signal::kill,
+        unistd::{Pid, getpgid},
+    };
+
+    async fn wait_until(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observable terminal condition deadline");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_failure_preserves_observed_process_exit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = BackgroundTaskRegistry::new();
+        for expected in [BackgroundTaskStatus::Exited, BackgroundTaskStatus::Killed] {
+            let mut request = ProcessRequest::new(
+                "/bin/sh",
+                vec!["-c".into(), "read line; exit 7".into()],
+                workspace.path().into(),
+            );
+            request.unrestricted_execution = true;
+            request.pty = Some(crate::command::PtySize { cols: 80, rows: 24 });
+            let id = registry
+                .spawn_owned(request, None, Some("owner"))
+                .await
+                .unwrap();
+            // Inject a capture failure at the capture boundary. The process
+            // exit below is real and independent of this diagnostic fact.
+            registry
+                .inner
+                .lock()
+                .await
+                .tasks
+                .get_mut(&id)
+                .unwrap()
+                .terminal
+                .as_mut()
+                .unwrap()
+                .output_error = Some("injected PTY capture failure".into());
+            if expected == BackgroundTaskStatus::Killed {
+                registry.kill_owned(&id, "owner").await.unwrap();
+            } else {
+                registry
+                    .terminal_write(&id, "owner", b"done\r".to_vec())
+                    .await
+                    .unwrap();
+            }
+            let result = registry
+                .wait_owned(
+                    &id,
+                    "owner",
+                    Some(Duration::from_secs(5)),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, expected);
+            if expected == BackgroundTaskStatus::Exited {
+                assert_eq!(result.exit_code, Some(7));
+            }
+            let observed = registry
+                .terminal_observe(&id, "owner", 0, 1024)
+                .await
+                .unwrap();
+            assert_eq!(observed.snapshot.status, expected);
+            assert_eq!(
+                observed.output_error.as_deref(),
+                Some("injected PTY capture failure")
+            );
+            assert_eq!(
+                registry.kill_owned(&id, "owner").await.unwrap().status,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_concurrent_input_preserves_complete_chunks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = BackgroundTaskRegistry::new();
+        let mut request = ProcessRequest::new(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "stty raw -echo; printf READY; dd bs=1 count=131072 of=input.bin 2>/dev/null"
+                    .into(),
+            ],
+            workspace.path().into(),
+        );
+        request.unrestricted_execution = true;
+        request.pty = Some(crate::command::PtySize { cols: 80, rows: 24 });
+        let id = registry
+            .spawn_owned(request, None, Some("owner"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry
+                    .terminal_observe(&id, "owner", 0, 1024)
+                    .await
+                    .unwrap()
+                    .data
+                    .windows(5)
+                    .any(|value| value == b"READY")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (a, b) = tokio::join!(
+            registry.terminal_write(&id, "owner", vec![b'A'; 65536]),
+            registry.terminal_write(&id, "owner", vec![b'B'; 65536])
+        );
+        a.unwrap();
+        b.unwrap();
+        let result = registry
+            .wait_owned(
+                &id,
+                "owner",
+                Some(Duration::from_secs(8)),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, BackgroundTaskStatus::Exited);
+        let bytes = std::fs::read(workspace.path().join("input.bin")).unwrap();
+        assert_eq!(bytes.len(), 131072);
+        assert!(bytes[..65536].iter().all(|byte| *byte == bytes[0]));
+        assert!(bytes[65536..].iter().all(|byte| *byte != bytes[0]));
+    }
+
+    #[tokio::test]
+    async fn terminal_zsh_jobs_ctrl_c_resize_and_close() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = "terminal-owner";
+        let registry = BackgroundTaskRegistry::new();
+        let mut request = ProcessRequest::new(
+            "/bin/zsh",
+            vec!["-f".into(), "-i".into()],
+            workspace.path().into(),
+        );
+        request.unrestricted_execution = true;
+        request.pty = Some(crate::command::PtySize { cols: 91, rows: 37 });
+        let id = registry
+            .spawn_owned(request, None, Some(owner))
+            .await
+            .unwrap();
+        let shell = registry.get_owned(&id, owner).await.unwrap().pid.unwrap() as i32;
+        let pid_file = workspace.path().join("background.pid");
+        registry
+            .terminal_write(
+                &id,
+                owner,
+                b"stty -echo; sleep 300 & print -r -- $! > background.pid; sleep 300\r".to_vec(),
+            )
+            .await
+            .unwrap();
+        wait_until(|| {
+            pid_file.exists()
+                && std::fs::read_to_string(&pid_file).is_ok_and(|s| s.trim().parse::<i32>().is_ok())
+        })
+        .await;
+        let background: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_until(|| crate::pty::session_members(shell).unwrap().len() >= 3).await;
+        let members = crate::pty::session_members(shell).unwrap();
+        let foreground = members
+            .iter()
+            .find(|pid| pid.as_raw() != shell && pid.as_raw() != background)
+            .unwrap()
+            .as_raw();
+        assert_ne!(
+            getpgid(Some(Pid::from_raw(background))).unwrap().as_raw(),
+            shell
+        );
+        assert_ne!(
+            getpgid(Some(Pid::from_raw(foreground))).unwrap().as_raw(),
+            shell
+        );
+        assert!(kill(Pid::from_raw(shell), None).is_ok());
+        assert!(kill(Pid::from_raw(background), None).is_ok());
+        assert!(kill(Pid::from_raw(foreground), None).is_ok());
+        assert!(
+            registry
+                .terminal_write(&id, "foreign-owner", vec![3])
+                .await
+                .is_err()
+        );
+        registry.terminal_write(&id, owner, vec![3]).await.unwrap();
+        wait_until(|| kill(Pid::from_raw(foreground), None).is_err()).await;
+        assert!(
+            kill(Pid::from_raw(shell), None).is_ok(),
+            "Ctrl-C preserves shell"
+        );
+        assert!(
+            kill(Pid::from_raw(background), None).is_ok(),
+            "Ctrl-C preserves background job"
+        );
+        registry
+            .terminal_resize(
+                &id,
+                owner,
+                crate::command::PtySize {
+                    cols: 113,
+                    rows: 41,
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .terminal_write(
+                &id,
+                owner,
+                b"stty size > dimensions; pwd > actual-cwd; sleep 300\r".to_vec(),
+            )
+            .await
+            .unwrap();
+        wait_until(|| {
+            std::fs::read_to_string(workspace.path().join("dimensions"))
+                .is_ok_and(|s| s.trim() == "41 113")
+                && workspace.path().join("actual-cwd").exists()
+                && crate::pty::session_members(shell).unwrap().len() >= 3
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("dimensions"))
+                .unwrap()
+                .trim(),
+            "41 113"
+        );
+        assert_eq!(
+            std::fs::canonicalize(
+                std::fs::read_to_string(workspace.path().join("actual-cwd"))
+                    .unwrap()
+                    .trim()
+            )
+            .unwrap(),
+            std::fs::canonicalize(workspace.path()).unwrap()
+        );
+        let owned = crate::pty::session_members(shell).unwrap();
+        registry.kill_owned(&id, owner).await.unwrap();
+        wait_until(|| owned.iter().all(|pid| kill(*pid, None).is_err())).await;
+        let done = registry
+            .wait_owned(
+                &id,
+                owner,
+                Some(Duration::from_secs(5)),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.status, BackgroundTaskStatus::Killed);
+        registry
+            .kill_owned(&id, owner)
+            .await
+            .expect("idempotent close");
     }
 }

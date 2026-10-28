@@ -21,7 +21,7 @@ use tokio::{
 };
 
 pub const PROTOCOL_MAJOR: u32 = 2;
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 /// Older majors this build can still talk to.
 ///
 /// The Execution Host is a persistent owner: a runtime upgrade must not strand
@@ -1024,9 +1024,6 @@ impl Host {
                     )
                 };
                 let mut entries = self.entries.lock().await;
-                if self.retiring.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Ok(Reply::SpawnRejected("Execution Host is retiring".into()));
-                }
                 if let Some(e) = entries.get(&id) {
                     if e.owner != owner
                         || e.writer != writer
@@ -1043,6 +1040,9 @@ impl Host {
                         .find(|t| t.snapshot.id == id)
                         .ok_or("missing spawn fact")?;
                     return Ok(Reply::Task(t.snapshot));
+                }
+                if self.retiring.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(Reply::SpawnRejected("Execution Host is retiring".into()));
                 }
                 if self.archive.lock().await.contains_key(&id) {
                     return Ok(Reply::SpawnRejected(
@@ -1462,6 +1462,142 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_host_replay_owner_raw_cursor_and_generation_lifetime() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let config = ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        let server = tokio::spawn(serve(config.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ExecutionHostClient::connect(config.clone()).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            repo.clone(),
+            std::env::temp_dir(),
+        ));
+        let registry = BackgroundTaskRegistry::with_environment(environment.clone())
+            .with_execution_host(config.clone());
+        let id = format!("host-{}", fresh_id().unwrap());
+        let mut request = ProcessRequest::new(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "head -c 300000 /dev/zero; printf '\\377\\033[31mEND'; sleep 30".into(),
+            ],
+            repo,
+        );
+        request.unrestricted_execution = true;
+        request.pty = Some(crate::command::PtySize { cols: 80, rows: 24 });
+        let first = registry
+            .create_terminal(&id, request.clone(), "owner")
+            .await
+            .unwrap();
+        let pid = first.snapshot.pid.unwrap();
+        assert!(process_alive(pid));
+        let replay = registry
+            .create_terminal(&id, request.clone(), "owner")
+            .await
+            .unwrap();
+        assert_eq!(
+            first.snapshot.pid, replay.snapshot.pid,
+            "same terminal id must not spawn again"
+        );
+        assert!(
+            registry
+                .create_terminal(&id, request.clone(), "foreign")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::host_settlement::SettlementJournal::open(&config.semantic_dir())
+                .unwrap()
+                .read(&id)
+                .unwrap()
+                .owner,
+            "owner"
+        );
+        let mut observation = registry
+            .terminal_observe(&id, "owner", 0, 65536)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observation.output_end < 300009 {
+                tokio::task::yield_now().await;
+                observation = registry
+                    .terminal_observe(&id, "owner", 0, 65536)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observation.truncated);
+        assert_eq!(
+            observation.output_end - observation.output_start,
+            256 * 1024
+        );
+        let capped = registry
+            .terminal_observe(&id, "owner", 0, 16)
+            .await
+            .unwrap();
+        assert_eq!(capped.data.len(), 16);
+        assert_eq!(capped.next_cursor, capped.output_start + 16);
+        let tail = registry
+            .terminal_observe(&id, "owner", observation.output_end - 9, 16)
+            .await
+            .unwrap();
+        assert_eq!(tail.data, b"\xff\x1b[31mEND");
+        assert!(!tail.truncated);
+        assert!(tail.output_error.is_none());
+        assert!(
+            registry
+                .terminal_observe(&id, "foreign", 0, 16)
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .terminal_observe(&id, "owner", observation.output_end + 1, 16)
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .terminal_observe(&id, "owner", 0, 65537)
+                .await
+                .is_err()
+        );
+        drop(registry);
+        assert!(
+            process_alive(pid),
+            "terminal survives runtime generation detach"
+        );
+        let next =
+            BackgroundTaskRegistry::with_environment(environment).with_execution_host(config);
+        assert_eq!(
+            next.terminal_observe(&id, "owner", tail.next_cursor, 16)
+                .await
+                .unwrap()
+                .snapshot
+                .pid,
+            Some(pid)
+        );
+        next.kill_session("owner").await.unwrap();
+        wait_until_dead(pid).await;
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unrestricted_host_task_control_crosses_sessions_without_owner_spoofing() {
