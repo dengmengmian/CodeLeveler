@@ -29,6 +29,7 @@ const CMD: &str = r#"{"cmd":"sleep 60"}"#;
 
 fn idle_snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".into()),
         task_status: None,
@@ -104,6 +105,7 @@ fn active_tool(
     model_step: Option<u32>,
 ) -> UiActiveToolCall {
     UiActiveToolCall {
+        timing: None,
         id: ToolCallId::new(id),
         name: name.into(),
         arguments: arguments.into(),

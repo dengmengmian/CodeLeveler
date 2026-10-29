@@ -66,6 +66,7 @@ fn opened(goal: &str) -> AppState {
         },
     );
     let snap = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("~/Develop/navsvc".into()),
         task_status: None,
@@ -691,6 +692,7 @@ fn s10_resume() {
     // A resumed session arrives as one snapshot carrying prior history.
     let mut s = opened("继续之前的退款审计任务");
     let snap = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("~/Develop/navsvc".into()),
         task_status: None,

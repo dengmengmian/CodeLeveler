@@ -1,16 +1,14 @@
 //! The permission approval overlay .
 //!
-//! Safe by default in two ways, both required by the spec: the initial focus is
-//! **Deny** (never the allow row), and dismissing the overlay (Esc / Ctrl+C)
-//! resolves to **Deny**, never to an approval. Letter shortcuts
-//! (`y` / `s` / `w` / `d`) give quick answers.
+//! Initial focus is "Allow once". Dismissing the overlay (Esc / Ctrl+C)
+//! still resolves to Deny. Letter shortcuts (`y` / `s` / `w` / `d`)
+//! and arrow navigation keep their existing decisions.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::{ApprovalDecision, UiApprovalRequest};
 
-/// The four decisions, ordered with the safe option last so the default
-/// cursor (Deny) sits on it.
+/// The decisions in display order, starting with the one-action grant.
 ///
 /// The decision is the constant; its wording is not. A permission prompt is
 /// the one surface where a reader who cannot read the label may still press a
@@ -59,9 +57,9 @@ pub struct ApprovalOverlay {
 }
 
 impl ApprovalOverlay {
-    /// Open the overlay with the cursor on the safe (Deny) option.
+    /// Open the overlay with the cursor on Allow once.
     pub fn new(request: UiApprovalRequest) -> Self {
-        let cursor = choices(&request).len() - 1;
+        let cursor = 0;
         let gated_call = request
             .call_id
             .as_deref()
@@ -257,7 +255,7 @@ mod tests {
                 .find(|(_, f)| *f)
                 .unwrap()
                 .0,
-            "拒绝"
+            "仅允许本次"
         );
         assert_eq!(ov.on_key(key(KeyCode::Char('w'))), ApprovalOutcome::None);
         assert_eq!(
@@ -265,7 +263,7 @@ mod tests {
             ApprovalOutcome::Decide(ApprovalDecision::Deny)
         );
         assert_eq!(ov.on_key(key(KeyCode::Char('4'))), ApprovalOutcome::None);
-        ov.on_key(key(KeyCode::Up));
+        ov.on_key(key(KeyCode::Down));
         assert_eq!(
             ov.on_key(key(KeyCode::Enter)),
             ApprovalOutcome::Decide(ApprovalDecision::ApproveSession)
@@ -349,22 +347,22 @@ mod tests {
     }
 
     #[test]
-    fn default_focus_is_deny() {
+    fn default_focus_is_allow_once() {
         let ov = ApprovalOverlay::new(request());
         let focused = ov
             .options(crate::i18n::Locale::Zh.text())
             .into_iter()
             .find(|(_, f)| *f)
             .unwrap();
-        assert_eq!(focused.0, "拒绝");
+        assert_eq!(focused.0, "仅允许本次");
     }
 
     #[test]
-    fn enter_on_default_denies() {
+    fn enter_on_default_allows_once() {
         let mut ov = ApprovalOverlay::new(request());
         assert_eq!(
             ov.on_key(key(KeyCode::Enter)),
-            ApprovalOutcome::Decide(ApprovalDecision::Deny)
+            ApprovalOutcome::Decide(ApprovalDecision::ApproveOnce)
         );
     }
 
@@ -399,9 +397,10 @@ mod tests {
     }
 
     #[test]
-    fn arrow_up_then_enter_approves_always() {
+    fn arrow_down_twice_then_enter_approves_always() {
         let mut ov = ApprovalOverlay::new(request());
-        ov.on_key(key(KeyCode::Up)); // Deny(3) -> Always(2)
+        ov.on_key(key(KeyCode::Down)); // Once -> Session
+        ov.on_key(key(KeyCode::Down)); // Session -> Always
         assert_eq!(
             ov.on_key(key(KeyCode::Enter)),
             ApprovalOutcome::Decide(ApprovalDecision::ApproveAlways)
@@ -409,11 +408,11 @@ mod tests {
     }
 
     #[test]
-    fn arrow_up_thrice_then_enter_approves_once() {
+    fn arrow_up_at_the_first_option_keeps_allow_once() {
         let mut ov = ApprovalOverlay::new(request());
-        ov.on_key(key(KeyCode::Up)); // Deny -> Always
-        ov.on_key(key(KeyCode::Up)); // Always -> Session
-        ov.on_key(key(KeyCode::Up)); // Session -> Once
+        ov.on_key(key(KeyCode::Up)); // The first option remains selected.
+        ov.on_key(key(KeyCode::Up)); // No wraparound.
+        ov.on_key(key(KeyCode::Up)); // Still Once.
         assert_eq!(
             ov.on_key(key(KeyCode::Enter)),
             ApprovalOutcome::Decide(ApprovalDecision::ApproveOnce)

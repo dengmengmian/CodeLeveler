@@ -282,6 +282,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 answer_effect,
             );
         }
+        RuntimeEvent::ToolTimingUpdated { id, timing } => {
+            state
+                .transcript
+                .set_tool_timing(&id, Some(timing), Some(state.elapsed_secs));
+        }
         RuntimeEvent::ToolCallCompleted {
             id,
             ok,
@@ -1873,6 +1878,15 @@ fn replay_history(
     entries: Vec<leveler_client_protocol::UiHistoryEntry>,
     omitted_turns: u32,
 ) {
+    restore_history(state, entries, omitted_turns, false);
+}
+
+fn restore_history(
+    state: &mut AppState,
+    entries: Vec<leveler_client_protocol::UiHistoryEntry>,
+    omitted_turns: u32,
+    keep_in_flight: bool,
+) {
     let mut scratch = AppState::new(
         crate::theme::Theme::no_color(),
         crate::state::Boot {
@@ -1900,13 +1914,22 @@ fn replay_history(
     }
     for entry in entries {
         if entry.turn_start {
+            scratch.transcript.finalize_in_flight();
             start_turn(&mut scratch);
         }
         scratch.elapsed_secs = entry.turn_elapsed_ms / 1000;
-        apply_runtime(&mut scratch, entry.event);
+        match entry.event {
+            // Replay offsets are wall-clock history, not this client's live clock.
+            RuntimeEvent::ToolTimingUpdated { id, timing } => {
+                scratch.transcript.set_tool_timing(&id, Some(timing), None);
+            }
+            event => apply_runtime(&mut scratch, event),
+        }
     }
     // A turn the log never closed (its runtime died) has no outcome to show.
-    scratch.transcript.finalize_in_flight();
+    if !keep_in_flight {
+        scratch.transcript.finalize_in_flight();
+    }
     state.transcript.replace_with(scratch.transcript);
 }
 
@@ -2276,6 +2299,21 @@ fn apply_session_with(
     // never fires for it. Decide it from the turn shape instead, or every
     // restored answer would render as undecided (and therefore bounded) prose.
     state.transcript.classify_replayed_history();
+    let restored_history = session
+        .history
+        .as_ref()
+        .is_some_and(|history| !history.entries.is_empty());
+    if let Some(history) = session
+        .history
+        .filter(|history| !history.entries.is_empty())
+    {
+        restore_history(
+            state,
+            history.entries,
+            history.omitted_turns,
+            state.is_busy(),
+        );
+    }
     // User shell executions (history + a still-running one) survive
     // reconnect via the snapshot; blocks are rebuilt in order.
     for shell in &session.user_shells {
@@ -2324,7 +2362,9 @@ fn apply_session_with(
             );
         }
     }
-    if let Some(report) = session.completion_report {
+    if let Some(report) = session.completion_report
+        && !restored_history
+    {
         state.transcript.push_completion(report);
     }
     state.turn_tool_calls = session.active_tools.len();
@@ -2342,15 +2382,30 @@ fn apply_session_with(
         // Same for the answer classification: a reconnected client decides the
         // FinalAnswer boundary exactly as the live one did.
         let answer_effect = tool.answer_effect;
-        state.transcript.push_tool_started(
-            tool.id,
-            tool.name,
-            tool.arguments,
-            false,
-            started,
-            model_step,
-            answer_effect,
-        );
+        let existing = state
+            .transcript
+            .tool_calls()
+            .into_iter()
+            .find(|call| call.id == id)
+            .map(|call| call.status);
+        if existing.is_some_and(|status| status != crate::transcript::ToolStatus::Running) {
+            continue;
+        }
+        if existing.is_none() {
+            state.transcript.push_tool_started(
+                tool.id,
+                tool.name,
+                tool.arguments,
+                false,
+                started,
+                model_step,
+                answer_effect,
+            );
+        }
+        state.transcript.resume_tool_clock(&id, started);
+        state
+            .transcript
+            .set_tool_timing(&id, tool.timing, Some(state.elapsed_secs));
         state.transcript.append_tool_output(&id, &tool.output_tail);
     }
 

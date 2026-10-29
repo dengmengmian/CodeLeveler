@@ -491,6 +491,7 @@ mod tests {
                 return Err(ClientError::SessionNotFound(session_id.clone()));
             }
             Ok(UiSessionSnapshot {
+                history: None,
                 id: session_id.clone(),
                 repository: Some("/repo".to_string()),
                 task_status: None,

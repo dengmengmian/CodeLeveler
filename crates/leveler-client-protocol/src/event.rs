@@ -313,6 +313,12 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answer_effect: Option<AnswerEffect>,
     },
+    /// An admitted tool reached an actual dispatch boundary. Announcement and
+    /// approval wait time are not execution time.
+    ToolTimingUpdated {
+        id: ToolCallId,
+        timing: crate::UiToolTiming,
+    },
     /// A tool call finished. `preview` is the runtime's truncated output;
     /// `duration_ms` is measured client-side.
     ToolCallCompleted {
@@ -1086,6 +1092,7 @@ mod tests {
 
     fn session_snapshot() -> UiSessionSnapshot {
         UiSessionSnapshot {
+            history: None,
             id: SessionId::new("sess-1"),
             repository: Some("repo".to_string()),
             task_status: None,

@@ -55,6 +55,7 @@ fn opened() -> AppState {
         &mut s,
         Action::Runtime(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
+                history: None,
                 id: SessionId::new("e2e"),
                 repository: Some("~/Develop/demo".into()),
                 task_status: None,

@@ -805,6 +805,27 @@ impl EventBridge {
                         .send(RuntimeEvent::AssistantMessageCompleted { message_id: id });
                 }
             }
+            EngineEvent::ToolExecutionTiming {
+                clock_id,
+                call_id,
+                agent_id: None,
+                started_ms,
+                elapsed_ms,
+                finished,
+            } => {
+                let _ = self.events.send(RuntimeEvent::ToolTimingUpdated {
+                    id: ToolCallId::new(call_id),
+                    timing: leveler_client_protocol::UiToolTiming {
+                        clock_id,
+                        started_ms,
+                        elapsed_ms,
+                        finished,
+                    },
+                });
+            }
+            EngineEvent::ToolExecutionTiming {
+                agent_id: Some(_), ..
+            } => {}
             // A delegated agent's canonical tool events are durable recovery
             // facts, not a second UI stream: the parent already surfaces child
             // work as attributed SubAgentActivity. Projecting them here would

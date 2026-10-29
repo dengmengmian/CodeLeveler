@@ -29,6 +29,7 @@ impl MockRuntimeClient {
     pub fn new(session_id: SessionId) -> Self {
         let (events, _) = broadcast::channel(1024);
         let snapshot = UiSessionSnapshot {
+            history: None,
             id: session_id,
             repository: Some("/repo".to_string()),
             task_status: None,

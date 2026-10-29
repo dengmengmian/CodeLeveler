@@ -21,6 +21,7 @@ fn legacy_tool_json() -> serde_json::Value {
 
 fn active_tool(id: &str, model_step: Option<u32>) -> UiActiveToolCall {
     UiActiveToolCall {
+        timing: None,
         id: ToolCallId::new(id),
         name: "run_command".into(),
         arguments: "{}".into(),
@@ -80,6 +81,7 @@ fn an_explicit_null_round_decodes_as_unknown() {
 #[test]
 fn a_session_snapshot_carries_the_rounds_of_its_running_calls() {
     let snapshot = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".into()),
         task_status: None,

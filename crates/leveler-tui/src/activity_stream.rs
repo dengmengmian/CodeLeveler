@@ -119,7 +119,14 @@ pub(crate) fn render_group_rows(
                 let members = &visible[cursor..end];
                 let at = out.len();
                 let expanded = folds.is_some_and(|f| f.contains(&first.id));
-                out.push(process_receipt_line(members, theme, width, t, expanded));
+                out.push(process_receipt_line(
+                    members,
+                    theme,
+                    width,
+                    t,
+                    expanded,
+                    now_elapsed_secs,
+                ));
                 rows.push(CommandRow {
                     disclosure: true,
                     line: at,
@@ -798,8 +805,9 @@ pub(crate) fn process_fold_receipt_line(
     width: usize,
     t: &UiText,
     expanded: bool,
+    now_elapsed_secs: u64,
 ) -> Line<'static> {
-    process_receipt_line(members, theme, width, t, expanded)
+    process_receipt_line(members, theme, width, t, expanded, now_elapsed_secs)
 }
 
 /// Counts only visible tool calls. Failed calls remain in their kind bucket,
@@ -810,6 +818,7 @@ fn process_receipt_line(
     width: usize,
     t: &UiText,
     expanded: bool,
+    now_elapsed_secs: u64,
 ) -> Line<'static> {
     let mut parts = Vec::new();
     let exploration = exploration_receipt_label(members, t, false);
@@ -923,7 +932,70 @@ fn process_receipt_line(
         ),
     ];
     spans.extend(attention);
-    clip_line(spans, width)
+    let mut line = clip_line(spans, width);
+    if let Some(ms) = process_elapsed_ms(members, now_elapsed_secs) {
+        let suffix = format!(" · {}", crate::status_line::fmt_elapsed(ms / 1000));
+        // Keep the existing status/count clipping contract at narrow widths.
+        if line
+            .width()
+            .saturating_add(UnicodeWidthStr::width(suffix.as_str()))
+            <= width
+        {
+            line.spans
+                .push(Span::styled(suffix, Style::default().fg(theme.text.muted)));
+        }
+    }
+    line
+}
+
+fn process_elapsed_ms(members: &[&ToolCallBlock], now_elapsed_secs: u64) -> Option<u64> {
+    // Detached receipts describe process lifetime, not the spawn call. The
+    // dispatch clock cannot prove that different lifetime's group span.
+    if members.iter().any(|call| started_in_background(call)) {
+        return None;
+    }
+    let pending = members
+        .iter()
+        .any(|call| call.status == ToolStatus::Running && call.timing.is_none());
+    let has_running_timing = members.iter().any(|call| {
+        call.timing
+            .as_ref()
+            .is_some_and(|timing| !timing.runtime.finished)
+    });
+    let mut clock_id = None;
+    let mut first = u64::MAX;
+    let mut last = 0;
+    for call in members {
+        let Some(timing) = call.timing.as_ref() else {
+            if call.status == ToolStatus::Running {
+                continue;
+            }
+            return None;
+        };
+        if timing.runtime.clock_id.is_empty() {
+            return None;
+        }
+        if clock_id.is_some_and(|clock| clock != timing.runtime.clock_id.as_str()) {
+            return None;
+        }
+        clock_id = Some(timing.runtime.clock_id.as_str());
+        if call.status != ToolStatus::Running && !timing.runtime.finished {
+            return None;
+        }
+        let running = !timing.runtime.finished || (pending && !has_running_timing);
+        let elapsed = if running {
+            timing.runtime.elapsed_ms.checked_add(
+                now_elapsed_secs
+                    .saturating_sub(timing.observed_elapsed_secs?)
+                    .checked_mul(1000)?,
+            )?
+        } else {
+            timing.runtime.elapsed_ms
+        };
+        first = first.min(timing.runtime.started_ms);
+        last = last.max(timing.runtime.started_ms.checked_add(elapsed)?);
+    }
+    last.checked_sub(first)
 }
 
 /// Preserve command cancellation using the same lifecycle projection as its own row.
@@ -3357,6 +3429,7 @@ pub(crate) fn child_activity_lines(
         .iter()
         .enumerate()
         .map(|(i, c)| ToolCallBlock {
+            timing: None,
             id: leveler_client_protocol::ToolCallId::new(format!("child-{i}")),
             name: c.tool.clone(),
             arguments: c.arguments.clone(),
@@ -3565,6 +3638,7 @@ mod tests {
 
     fn call(name: &str, args: &str, status: ToolStatus) -> ToolCallBlock {
         ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -6906,6 +6980,7 @@ mod compact_command_tests {
 
     fn cmd(args: &str, status: ToolStatus) -> ToolCallBlock {
         ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,

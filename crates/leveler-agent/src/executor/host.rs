@@ -1437,10 +1437,17 @@ impl Executor {
         let mut ctx = admitted.execution_context().clone();
         ctx.tool_call_scope = Some(call.id.as_str().into());
         ctx.output = output;
+        let started = std::time::Instant::now();
+        if let Some(barrier) = &self.event_barrier {
+            barrier.record_tool_timing(call.id.as_str(), self.agent_id.as_deref(), started, false);
+        }
         let executed = self
             .registry
             .execute(&call.name, call.arguments.clone(), ctx, call_cancel)
             .await;
+        if let Some(barrier) = &self.event_barrier {
+            barrier.record_tool_timing(call.id.as_str(), self.agent_id.as_deref(), started, true);
+        }
         if let Some(host) = &self.steering {
             host.tool_call_ended(call.id.as_str());
         }
@@ -1645,6 +1652,69 @@ mod authorize_tests {
             10,
         )
         .with_approver(approver)
+    }
+
+    #[tokio::test]
+    async fn execution_timing_starts_only_after_admission_and_pairs_actual_dispatch() {
+        use leveler_engine::{ChildToolEvent, EventBarrier, PortError};
+        #[derive(Default)]
+        struct TimingBarrier(std::sync::Mutex<Vec<bool>>);
+        #[async_trait::async_trait]
+        impl EventBarrier for TimingBarrier {
+            async fn flush(&self) -> Result<(), PortError> {
+                Ok(())
+            }
+            fn record_child_tool_event(&self, _: ChildToolEvent) {}
+            fn record_tool_timing(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: std::time::Instant,
+                finished: bool,
+            ) {
+                self.0.lock().unwrap().push(finished);
+            }
+        }
+        for decision in [ApprovalDecision::Deny, ApprovalDecision::ApproveOnce] {
+            let dir = tempfile::tempdir().unwrap();
+            let approver = Arc::new(FixedApprover::new(decision));
+            let barrier = Arc::new(TimingBarrier::default());
+            let executor = read_only_executor(dir.path(), approver.clone())
+                .with_event_barrier(barrier.clone());
+            let action = call(
+                "apply_patch",
+                serde_json::json!({"patch":"*** Begin Patch\n*** Add File: timing.txt\n+observed\n*** End Patch"}),
+            );
+            let admitted = executor
+                .admit(
+                    action,
+                    executor.tool_context.clone(),
+                    false,
+                    &mut HashSet::new(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(approver.asks(), 1);
+            assert!(
+                barrier.0.lock().unwrap().is_empty(),
+                "approval/admission must not start the clock"
+            );
+            if decision == ApprovalDecision::Deny {
+                assert!(admitted.is_err());
+                assert!(!dir.path().join("timing.txt").exists());
+            } else {
+                let admitted = admitted.ok().unwrap();
+                let (_, error, _) = executor
+                    .dispatch_raw(&admitted, &CancellationToken::new(), None)
+                    .await;
+                assert!(!error);
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("timing.txt")).unwrap(),
+                    "observed\n"
+                );
+                assert_eq!(*barrier.0.lock().unwrap(), [false, true]);
+            }
+        }
     }
 
     #[tokio::test]

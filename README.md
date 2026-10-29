@@ -53,6 +53,8 @@ Start with a clean Git working tree so changes are easy to review. Run `leveler 
 
 In the terminal, `/develop <goal>` walks through analysis, coding, verification, and review. Use `/help` for commands and shortcuts, and `/thinking` to adjust reasoning intensity.
 
+Tool execution summaries append elapsed time from actual admitted dispatch, update once per second, and freeze at the final execution boundary. Reconnects restore the runtime clock. Old history and detached process lifetimes without reliable execution timing keep their original summaries; unrelated clocks are never combined. Approval dialogs initially select **Allow once**; Esc still denies.
+
 ## Permissions and privacy
 
 The default Auto mode allows ordinary development actions and asks for approval for dangerous operations. Choose Restricted for stricter approval, or Full to allow all operations in an environment you trust.

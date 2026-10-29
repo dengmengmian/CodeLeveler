@@ -295,6 +295,7 @@ mod tests {
     #[test]
     fn downstream_snapshot_roundtrips_with_tag() {
         let snapshot = UiSessionSnapshot {
+            history: None,
             id: SessionId::new("s1"),
             repository: Some("/repo".to_string()),
             task_status: None,

@@ -25,6 +25,7 @@ const NEXT_STEP: &str = "查看 demo-order-01 的里程碑进度";
 
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".to_string()),
         task_status: None,

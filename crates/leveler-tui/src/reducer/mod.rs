@@ -3954,3 +3954,6 @@ mod final_nav_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tool_group_elapsed_tests;

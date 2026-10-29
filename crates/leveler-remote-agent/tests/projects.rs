@@ -67,6 +67,7 @@ impl InteractiveRuntimeClient for RecordingRuntime {
 
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
         Ok(UiSessionSnapshot {
+            history: None,
             id: session_id.clone(),
             // The label rides along so a test can tell which project answered.
             repository: Some(self.label.clone()),

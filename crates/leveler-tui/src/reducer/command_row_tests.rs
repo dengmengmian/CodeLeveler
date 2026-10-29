@@ -1102,6 +1102,7 @@ fn parallel_commands_keep_independent_identity() {
 fn a_reconnect_restores_the_running_clock_and_output() {
     let mut s = state();
     let mut snap = leveler_client_protocol::UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".into()),
         task_status: None,
@@ -1132,6 +1133,7 @@ fn a_reconnect_restores_the_running_clock_and_output() {
         children: Vec::new(),
     };
     snap.active_tools = vec![UiActiveToolCall {
+        timing: None,
         id: ToolCallId::new("c1"),
         name: "shell_command".into(),
         arguments: CMD.into(),
@@ -1328,6 +1330,7 @@ fn background_command_identity_is_complete_live_and_restored() {
     );
     assert!(live_label.contains("甲乙  丙丁") && live_label.contains('\n'));
     let mut snap = leveler_client_protocol::UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".into()),
         task_status: None,

@@ -54,6 +54,7 @@ fn opened(goal: &str) -> AppState {
         },
     );
     let snap = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("uxexp"),
         repository: Some("~/Develop/navsvc".into()),
         task_status: None,

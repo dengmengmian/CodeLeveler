@@ -490,6 +490,7 @@ fn submits(effects: &[Effect]) -> Vec<ClientCommand> {
 
 fn idle_snapshot() -> leveler_client_protocol::UiSessionSnapshot {
     leveler_client_protocol::UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".into()),
         task_status: None,

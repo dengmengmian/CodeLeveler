@@ -64,6 +64,7 @@ impl InteractiveRuntimeClient for WatchedRuntime {
 
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
         Ok(UiSessionSnapshot {
+            history: None,
             id: session_id.clone(),
             repository: Some("/repo".to_string()),
             task_status: None,

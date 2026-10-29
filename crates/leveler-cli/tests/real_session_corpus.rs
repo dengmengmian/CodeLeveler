@@ -116,6 +116,7 @@ fn boot() -> Boot {
 
 fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new(id),
         repository: repo.map(str::to_string),
         task_status: None,

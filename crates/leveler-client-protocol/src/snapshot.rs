@@ -14,6 +14,30 @@ use leveler_model::{ModelRef, ThinkingLevel};
 
 use crate::{UiCompletionReport, UiDiff, UiPlan};
 
+/// One tool's timing on a shared, turn-local runtime timeline. Live sources
+/// and replay sources use the same persisted monotonic execution facts.
+/// Wall-clock timestamps never stand in for missing execution boundaries.
+/// Absence means unknown, never an assumed zero. The start coordinate lets
+/// clients measure overlapping calls as a span instead of adding durations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiToolTiming {
+    /// Only coordinates with this exact clock identity can form one span.
+    pub clock_id: String,
+    pub started_ms: u64,
+    pub elapsed_ms: u64,
+    pub finished: bool,
+}
+
+/// The existing bounded history projection, captured with an in-flight
+/// snapshot so a reconnect preserves completed members and real group boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiSessionHistory {
+    pub entries: Vec<crate::UiHistoryEntry>,
+    pub omitted_turns: u32,
+}
+
 /// Identifies a single assistant/user message in the transcript.
 ///
 /// A protocol-level id (the runtime persists messages as an ordered log, not by
@@ -126,6 +150,7 @@ mod tests {
     #[test]
     fn snapshot_carries_product_axes_when_set() {
         let mut snap = UiSessionSnapshot {
+            history: None,
             id: crate::SessionId::new("s1"),
             repository: Some("/repo".into()),
             task_status: None,
@@ -199,6 +224,7 @@ mod tests {
     #[test]
     fn snapshot_omits_thinking_when_unset() {
         let snap = UiSessionSnapshot {
+            history: None,
             id: crate::SessionId::new("s1"),
             repository: Some("/repo".into()),
             task_status: None,
@@ -449,6 +475,9 @@ pub struct UiCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiActiveToolCall {
+    /// Runtime timeline and elapsed at the snapshot boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<UiToolTiming>,
     pub id: ToolCallId,
     pub name: String,
     pub arguments: String,
@@ -600,9 +629,11 @@ pub struct UiBackgroundTaskBlocker {
 }
 
 /// Everything a client needs to render a session's header and transcript.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiSessionSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<UiSessionHistory>,
     pub id: SessionId,
     pub repository: Option<String>,
     pub goal: String,
