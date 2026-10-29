@@ -15,6 +15,101 @@ use leveler_client_protocol::{
 
 use crate::AppError;
 
+/// An ordered publication boundary: update reconnect state before broadcasting.
+/// Closing the shared boundary also fences every retained producer clone.
+#[derive(Clone)]
+pub struct RuntimeEventSender(std::sync::Arc<std::sync::Mutex<Publication>>);
+
+struct Publication {
+    sender: Option<broadcast::Sender<RuntimeEvent>>,
+    project: Option<(
+        std::sync::Arc<crate::live_view::LiveViews>,
+        leveler_core::SessionId,
+    )>,
+    compatibility: Option<broadcast::Sender<RuntimeEvent>>,
+}
+
+impl From<broadcast::Sender<RuntimeEvent>> for RuntimeEventSender {
+    fn from(sender: broadcast::Sender<RuntimeEvent>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Publication {
+            sender: Some(sender),
+            project: None,
+            compatibility: None,
+        })))
+    }
+}
+
+impl RuntimeEventSender {
+    pub(crate) fn projected(
+        sender: broadcast::Sender<RuntimeEvent>,
+        compatibility: broadcast::Sender<RuntimeEvent>,
+        views: std::sync::Arc<crate::live_view::LiveViews>,
+        session_id: leveler_core::SessionId,
+    ) -> Self {
+        let publisher = Self::from(sender);
+        {
+            let mut publication = publisher.0.lock().unwrap();
+            publication.project = Some((views, session_id));
+            publication.compatibility = Some(compatibility);
+        }
+        publisher
+    }
+
+    pub fn send(
+        &self,
+        event: RuntimeEvent,
+    ) -> Result<usize, Box<broadcast::error::SendError<RuntimeEvent>>> {
+        let publication = self.0.lock().unwrap();
+        let Some(sender) = &publication.sender else {
+            return Err(Box::new(broadcast::error::SendError(event)));
+        };
+        if let Some((views, session_id)) = &publication.project {
+            views.apply(session_id, &event);
+        }
+        let delivered = publication
+            .compatibility
+            .as_ref()
+            .and_then(|all| all.send(event.clone()).ok())
+            .unwrap_or(0);
+        match sender.send(event) {
+            Ok(count) => Ok(count + delivered),
+            Err(_) if delivered > 0 => Ok(delivered),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+
+    pub(crate) fn receiver_count(&self) -> usize {
+        let publication = self.0.lock().unwrap();
+        publication
+            .sender
+            .as_ref()
+            .map_or(0, broadcast::Sender::receiver_count)
+            + publication
+                .compatibility
+                .as_ref()
+                .map_or(0, broadcast::Sender::receiver_count)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+        let publication = self.0.lock().unwrap();
+        match &publication.sender {
+            Some(sender) => sender.subscribe(),
+            None => {
+                let (sender, receiver) = broadcast::channel(1);
+                drop(sender);
+                receiver
+            }
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        let mut publication = self.0.lock().unwrap();
+        publication.sender.take();
+        publication.project.take();
+        publication.compatibility.take();
+    }
+}
+
 /// The client projection of a persisted plan table. One mapping for the live
 /// event and the reconnect snapshot, so the two cannot disagree on a status.
 pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
@@ -327,7 +422,7 @@ fn finalization_stage(phase: &str) -> Option<FinalizationStage> {
 /// out of order or after an interleaved serial tool). `tool_starts` records each
 /// call's start time by id for the client-side duration.
 pub struct EventBridge {
-    events: broadcast::Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     tool_starts: HashMap<String, Instant>,
     /// The in-flight assistant message id, open while deltas stream (spec §16).
     open_assistant: Option<MessageId>,
@@ -520,7 +615,8 @@ impl EventBridge {
         }
     }
 
-    pub fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
+    pub fn new(events: impl Into<RuntimeEventSender>) -> Self {
+        let events = events.into();
         Self {
             events,
             tool_starts: HashMap::new(),

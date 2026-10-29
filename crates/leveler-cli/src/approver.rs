@@ -11,10 +11,102 @@ pub struct CliApprover;
 // One terminal can present only one unambiguous consent question at a time.
 static INPUT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+type InputReply = tokio::sync::oneshot::Sender<Result<String, String>>;
+
+#[derive(Default)]
+struct InputState {
+    pending: Option<InputReply>,
+    closed: Option<String>,
+}
+
+#[derive(Default)]
+struct InputReader {
+    state: std::sync::Mutex<InputState>,
+    ready: std::sync::Condvar,
+}
+
+static INPUT_READER: std::sync::OnceLock<Result<std::sync::Arc<InputReader>, String>> =
+    std::sync::OnceLock::new();
+
+struct PendingInput<'a>(&'a InputReader);
+impl Drop for PendingInput<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().pending.take();
+    }
+}
+
+impl InputReader {
+    fn start() -> Result<std::sync::Arc<Self>, String> {
+        let reader = std::sync::Arc::new(Self::default());
+        let worker = reader.clone();
+        // A process-owned thread keeps blocking stdin outside Tokio's shutdown
+        // barrier. It routes each line to the current waiter, not a cancelled
+        // request, and never reads ahead while no approval is pending.
+        std::thread::Builder::new()
+            .name("approval-input".into())
+            .spawn(move || {
+                use std::io::{BufRead, Read};
+                let stdin = std::io::stdin();
+                loop {
+                    let mut state = worker.state.lock().unwrap();
+                    while state.pending.is_none() {
+                        state = worker.ready.wait(state).unwrap();
+                    }
+                    drop(state);
+                    let mut bytes = Vec::new();
+                    let mut input = stdin.lock();
+                    let result = (&mut input).take(4097).read_until(b'\n', &mut bytes);
+                    let result = match result {
+                        Ok(0) => Err("stdin closed".to_string()),
+                        Ok(_) if bytes.len() > 4096 => {
+                            // This reader is permanently closed below; no remaining
+                            // bytes can become a later approval.
+                            Err("approval reply exceeds 4096 bytes".to_string())
+                        }
+                        Ok(_) => String::from_utf8(bytes).map_err(|e| e.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    drop(input);
+                    let mut state = worker.state.lock().unwrap();
+                    if let Err(error) = &result {
+                        state.closed = Some(error.clone());
+                    }
+                    if let Some(sender) = state.pending.take() {
+                        let _ = sender.send(result);
+                    }
+                    if state.closed.is_some() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(reader)
+    }
+}
+
 #[async_trait]
 impl Approver for CliApprover {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
         let _input = INPUT_LOCK.lock().await;
+        let reader = match INPUT_READER.get_or_init(InputReader::start) {
+            Ok(reader) => reader,
+            Err(error) => {
+                eprintln!("approval input failed: {error}");
+                return ApprovalDecision::Deny;
+            }
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        {
+            let mut state = reader.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                eprintln!("approval input failed: {error}");
+                return ApprovalDecision::Deny;
+            }
+            state.pending = Some(sender);
+        }
+        // Drop before INPUT_LOCK: a cancelled waiter must be removed before
+        // the next prompt can register, without abandoning the stdin reader.
+        let _pending = PendingInput(reader);
         eprintln!();
         eprintln!(
             "{} {} wants to run a {:?} action:",
@@ -28,22 +120,7 @@ impl Approver for CliApprover {
         }
         eprint!("  Approve? {}: ", request_choices_prompt(request));
 
-        // Blocking terminal input must not hold Tokio's shutdown open after
-        // this approval is cancelled. The OS reader lives only with this CLI
-        // process; dropping its receiver cannot grant the abandoned request.
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        if let Err(error) = std::thread::Builder::new()
-            .name("approval-input".into())
-            .spawn(move || {
-                use std::io::BufRead;
-                let mut line = String::new();
-                let result = std::io::stdin().lock().read_line(&mut line).map(|_| line);
-                let _ = sender.send(result);
-            })
-        {
-            eprintln!("approval input failed: {error}");
-            return ApprovalDecision::Deny;
-        }
+        reader.ready.notify_one();
         let line = match receiver.await {
             Ok(Ok(line)) => line,
             Ok(Err(error)) => {
@@ -143,6 +220,79 @@ fn parse_answer(line: &str, always_persists: bool) -> ApprovalDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_replacement_child() {
+        if std::env::var_os("LEVELER_TEST_APPROVAL_REPLACEMENT").is_none() {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let request = ApprovalRequest {
+                id: leveler_core::ApprovalId::new("replacement"),
+                turn_id: None,
+                call_id: "replacement".into(),
+                agent_id: None,
+                action_fingerprint: "replacement".into(),
+                tool: "run_command".into(),
+                risk: leveler_execution::RiskLevel::Destructive,
+                description: "replacement input probe".into(),
+                command: None,
+                paths: Vec::new(),
+                grant: None,
+            };
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    CliApprover.decide(&request)
+                )
+                .await
+                .is_err()
+            );
+            let next = CliApprover.decide(&request);
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            use std::io::Write;
+            println!("READY_FOR_REPLY");
+            std::io::stdout().flush().unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), next)
+                    .await
+                    .expect("one reply must reach the current approval"),
+                ApprovalDecision::ApproveOnce
+            );
+        });
+    }
+
+    #[test]
+    fn cancelled_reader_does_not_consume_the_next_approval_reply() {
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "approver::tests::approval_replacement_child",
+                "--nocapture",
+            ])
+            .env("LEVELER_TEST_APPROVAL_REPLACEMENT", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let mut ready = false;
+        let mut output = std::io::BufReader::new(output);
+        for line in (&mut output).lines() {
+            if line.unwrap() == "READY_FOR_REPLY" {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "child must register its replacement approval");
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(b"yes\n").unwrap();
+        input.flush().unwrap();
+        assert!(child.wait().unwrap().success(), "the first reply was lost");
+    }
 
     #[test]
     fn approval_shutdown_child() {

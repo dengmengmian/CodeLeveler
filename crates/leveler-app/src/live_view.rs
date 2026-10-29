@@ -32,7 +32,7 @@ pub(crate) struct LiveSessionView {
 /// Bounded end of a running command's output kept for the reconnect snapshot.
 pub(crate) const TOOL_OUTPUT_TAIL_CAP: usize = 64 * 1024;
 
-/// Per-session live views, shared via `Arc` with the event forwarder tasks.
+/// Per-session live views, updated synchronously by the session event publisher.
 #[derive(Default)]
 pub(crate) struct LiveViews {
     views: Mutex<HashMap<SessionId, LiveSessionView>>,

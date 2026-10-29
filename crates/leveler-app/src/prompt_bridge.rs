@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, oneshot};
+#[cfg(test)]
+use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{ClarificationQuestionKind, ClarificationRequest, Clarifier, ClarifyOutcome};
@@ -96,12 +98,12 @@ pub(crate) type PendingClarifications = Arc<Mutex<HashMap<ClarificationId, Pendi
 enum PendingWaiterGuard {
     Approval {
         pending: PendingApprovals,
-        events: broadcast::Sender<RuntimeEvent>,
+        events: crate::event_bridge::RuntimeEventSender,
         id: ApprovalId,
     },
     Clarification {
         pending: PendingClarifications,
-        events: broadcast::Sender<RuntimeEvent>,
+        events: crate::event_bridge::RuntimeEventSender,
         id: ClarificationId,
     },
 }
@@ -217,7 +219,7 @@ pub(crate) fn validate_pending_session(
 
 /// A [`Clarifier`] that asks the UI over the protocol and awaits the answer.
 pub(crate) struct ChannelClarifier {
-    pub(crate) events: broadcast::Sender<RuntimeEvent>,
+    pub(crate) events: crate::event_bridge::RuntimeEventSender,
     pub(crate) pending: PendingClarifications,
     /// The current turn's cancel token, so a pending question is released (with
     /// the safe default) when the turn is cancelled instead of hanging forever.
@@ -306,7 +308,7 @@ impl Clarifier for ChannelClarifier {
 
 /// An [`Approver`] that asks the UI over the protocol and awaits the answer.
 pub(crate) struct ChannelApprover {
-    pub(crate) events: broadcast::Sender<RuntimeEvent>,
+    pub(crate) events: crate::event_bridge::RuntimeEventSender,
     pub(crate) pending: PendingApprovals,
     /// The current turn's cancel token, so a pending approval is released (as a
     /// Deny) when the turn is cancelled instead of hanging the blocking thread.
@@ -862,7 +864,7 @@ mod tests {
         drop(receiver);
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
         let approver = ChannelApprover {
-            events,
+            events: events.into(),
             pending: pending.clone(),
             cancel: CancellationToken::new(),
             session_id: SessionId::new("session-a"),
@@ -884,7 +886,7 @@ mod tests {
         drop(receiver);
         let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
         let clarifier = ChannelClarifier {
-            events,
+            events: events.into(),
             pending: pending.clone(),
             cancel: CancellationToken::new(),
             session_id: SessionId::new("session-a"),
@@ -918,7 +920,7 @@ mod tests {
         let (events, mut receiver) = broadcast::channel(4);
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
         let approver = ChannelApprover {
-            events,
+            events: events.into(),
             pending: pending.clone(),
             cancel: CancellationToken::new(),
             session_id: SessionId::new("session-a"),
@@ -948,7 +950,7 @@ mod tests {
         let (events, mut receiver) = broadcast::channel(4);
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
         let approver = ChannelApprover {
-            events,
+            events: events.into(),
             pending: pending.clone(),
             cancel: CancellationToken::new(),
             session_id: SessionId::new("session-a"),
@@ -973,7 +975,7 @@ mod tests {
         let (events, mut receiver) = broadcast::channel(4);
         let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
         let clarifier = ChannelClarifier {
-            events,
+            events: events.into(),
             pending: pending.clone(),
             cancel: CancellationToken::new(),
             session_id: SessionId::new("session-a"),
@@ -1011,7 +1013,7 @@ mod tests {
         let (events, mut receiver) = broadcast::channel(4);
         let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
         let clarifier = ChannelClarifier {
-            events,
+            events: events.into(),
             pending: pending.clone(),
             cancel: CancellationToken::new(),
             session_id: SessionId::new("session-a"),
@@ -1095,7 +1097,7 @@ mod tests {
             let (events, mut receiver) = broadcast::channel(4);
             let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
             let clarifier = ChannelClarifier {
-                events,
+                events: events.into(),
                 pending: pending.clone(),
                 cancel: CancellationToken::new(),
                 session_id: SessionId::new("session-a"),
