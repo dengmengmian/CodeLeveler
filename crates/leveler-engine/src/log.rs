@@ -448,8 +448,8 @@ fn set_pending(
 
 /// A persisted context snapshot plus the transcript watermark it supersedes.
 /// `through_ordinal: Some(n)` means restore appends exactly the transcript
-/// messages after the first `n`; `None` (legacy / executor in-loop snapshots)
-/// falls back to the suffix-overlap merge heuristic.
+/// messages after the first `n`; `None` cannot establish an overlap, so restore
+/// rebuilds from the authoritative transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotView {
     pub messages: Vec<leveler_model::Message>,

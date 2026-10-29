@@ -12,7 +12,7 @@ use leveler_client_protocol::{MessageId, RuntimeEvent, UiHistoryEntry, UiMessage
 use leveler_core::{SessionId, Timestamp, TurnId};
 use leveler_engine::EngineEvent;
 use leveler_model::{ContentPart, Message, TranscriptOrigin};
-use leveler_storage::{Database, EventStore, MessageRepository, TurnRecord, TurnRepository};
+use leveler_storage::{Database, EventRepository, MessageRepository, TurnRecord, TurnRepository};
 use tokio::sync::broadcast;
 
 use crate::AppError;
@@ -37,7 +37,37 @@ pub async fn load_session_history(
     db: &Database,
     session_id: &SessionId,
 ) -> Result<(Vec<UiHistoryEntry>, u32), AppError> {
-    let records = db.load(session_id).await.map_err(AppError::from)?;
+    let repository = EventRepository::new(db);
+    let headers = repository.headers(session_id).await?;
+    if !headers
+        .iter()
+        .any(|header| header.event_type == "turn_started")
+    {
+        return Ok((Vec::new(), 0));
+    }
+    // Group using ordering metadata first; old snapshots and tool payloads are
+    // never materialized merely to discard their turns afterward.
+    let mut groups = Vec::new();
+    let mut settled = false;
+    for header in &headers {
+        if groups.is_empty()
+            || header.event_type == "turn_started"
+            || (settled && header.event_type == "compacted")
+        {
+            groups.push(header);
+            settled = false;
+        }
+        if header.event_type == "task_finished" {
+            settled = true;
+        }
+    }
+    let omitted_before_load = groups.len().saturating_sub(HISTORY_TURNS_MAX);
+    let first = groups[omitted_before_load];
+    let records = repository
+        .load_after(session_id, first.sequence - 1)
+        .await?;
+    let since = (omitted_before_load > 0 && parse_time(&first.created_at).is_some())
+        .then_some(first.created_at.as_str());
     let mut events = Vec::with_capacity(records.len());
     for record in &records {
         let event = EngineEvent::from_payload(&record.payload).map_err(|e| {
@@ -62,7 +92,7 @@ pub async fn load_session_history(
     // cut touches, so re-project it here.
     let rebuild = rebuildable_turn_inputs(&events, db, session_id).await?;
     let messages: Vec<(Option<Timestamp>, Fact)> = MessageRepository::new(db)
-        .load_timed(session_id)
+        .load_timed_since(session_id, since)
         .await
         .map_err(AppError::from)?
         .into_iter()
@@ -132,7 +162,7 @@ pub async fn load_session_history(
     for turn in turns.into_iter().skip(omitted) {
         replay_turn(turn, &mut entries);
     }
-    Ok((entries, omitted as u32))
+    Ok((entries, omitted_before_load.saturating_add(omitted) as u32))
 }
 
 /// Project one turn through a fresh bridge — each turn has its own terminal,
@@ -353,8 +383,15 @@ async fn rebuildable_turn_inputs(
     if window.rebased_at.is_none() {
         return Ok(HashMap::new());
     }
+    let turn_ids: Vec<String> = events
+        .iter()
+        .filter_map(|(_, event)| match event {
+            EngineEvent::TurnStarted { turn_id, .. } => Some(turn_id.to_string()),
+            _ => None,
+        })
+        .collect();
     let turns = TurnRepository::new(db)
-        .list(session_id)
+        .list_by_ids(session_id, &turn_ids)
         .await
         .map_err(AppError::from)?;
     let inputs: HashMap<&str, &TurnRecord> = turns
@@ -825,6 +862,36 @@ mod tests {
             RuntimeEvent::UserMessageAdded { message } => assert_eq!(message.text, "问 3"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn reopening_recent_history_does_not_decode_omitted_events() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        db.append(
+            &sid,
+            None,
+            "unknown_old_event",
+            r#"{"type":"unknown_old_event"}"#,
+            t0,
+        )
+        .await
+        .unwrap();
+        for index in 0..HISTORY_TURNS_MAX + 1 {
+            turn(
+                &db,
+                &sid,
+                t0 + ms((index as i64 + 1) * 10_000),
+                "question",
+                "answer",
+            )
+            .await;
+        }
+        let result = load_session_history(&db, &sid).await;
+        assert!(
+            result.is_ok(),
+            "omitted payloads must not be read: {result:?}"
+        );
     }
 
     /// Nothing durable to replay: the client keeps the snapshot.

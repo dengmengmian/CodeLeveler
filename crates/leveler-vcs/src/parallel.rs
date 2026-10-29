@@ -85,9 +85,17 @@ impl GitWorkflow {
                 .await;
             match merged {
                 Ok(_) => outcome.integrated.push(candidate.branch.clone()),
-                Err(_) => {
-                    // Conflict (or nothing to merge). Abort and skip this one.
-                    let _ = self.git(&["merge", "--abort"], cancellation).await;
+                Err(error) => {
+                    if cancellation.is_cancelled() {
+                        return Err(error);
+                    }
+                    let unmerged = self
+                        .git(&["diff", "--name-only", "--diff-filter=U"], cancellation)
+                        .await?;
+                    if unmerged.trim().is_empty() {
+                        return Err(error);
+                    }
+                    self.git(&["merge", "--abort"], cancellation).await?;
                     outcome.conflicted.push(candidate.branch.clone());
                 }
             }
@@ -101,13 +109,41 @@ pub fn worktree_path(base_name: &str, index: usize) -> PathBuf {
     leveler_core::environment()
         .temp_dir()
         .to_path_buf()
-        .join(format!("leveler-wt-{base_name}-{index}"))
+        .join(format!(
+            "leveler-wt-{base_name}-{}-{index}",
+            leveler_core::new_uuid_string()
+        ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::{run_git, tmp};
+
+    #[test]
+    fn worktree_paths_do_not_collide_between_runs() {
+        assert_ne!(worktree_path("task", 0), worktree_path("task", 0));
+    }
+
+    #[tokio::test]
+    async fn integration_reports_non_conflict_failures() {
+        let dir = tmp("missing-candidate");
+        init_repo(&dir);
+        let result = GitWorkflow::new(&dir)
+            .integrate(
+                &[MergeCandidate {
+                    branch: "missing-branch".into(),
+                    verified: true,
+                }],
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a missing branch is not a merge conflict: {result:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Shared init plus the two-file base commit these merge tests build on.
     fn init_repo(dir: &Path) {

@@ -354,7 +354,7 @@ async fn a_soft_summary_error_keeps_the_original_history() {
     // Test E: nothing partial reaches the next-request surface either.
     assert!(
         !events.iter().any(|event| match event {
-            AgentEvent::ContextSnapshot { messages } => messages.iter().any(|message| message
+            AgentEvent::ContextSnapshot { messages, .. } => messages.iter().any(|message| message
                 .text_content()
                 .contains(COMPACTION_BREADCRUMB_MARKER)),
             _ => false,
@@ -549,7 +549,7 @@ async fn a_hard_summary_failure_folds_mechanically_when_that_fits() {
     );
     // The fallback still carries the breadcrumb that names the fold.
     assert!(events.iter().any(|event| match event {
-        AgentEvent::ContextSnapshot { messages } => messages.iter().any(|message| {
+        AgentEvent::ContextSnapshot { messages, .. } => messages.iter().any(|message| {
             message
                 .text_content()
                 .contains(COMPACTION_BREADCRUMB_MARKER)
@@ -636,7 +636,7 @@ async fn a_count_equal_fold_is_recorded_in_its_snapshot_not_the_notice() {
     let folded = events
         .iter()
         .find_map(|event| match event {
-            AgentEvent::ContextSnapshot { messages } => Some(messages.clone()),
+            AgentEvent::ContextSnapshot { messages, .. } => Some(messages.clone()),
             _ => None,
         })
         .expect("the folded surface is persisted for resume");

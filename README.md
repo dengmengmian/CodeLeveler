@@ -49,6 +49,8 @@ Start with a clean Git working tree so changes are easy to review. Run `leveler 
 | Resume a session | `leveler resume` |
 | Show help | `leveler --help` |
 
+`leveler run --parallel 2` preserves the selected permission profile, network restriction and model-step ceiling, and supports `--output jsonl`. Parallel runs reject shipping flags (`--commit`, `--push`, `--pr`, `--branch`, `--pr-base`) before starting; ship the reviewed integration separately. For single-task runs, shipping works with either output format and shipping failures return a non-zero exit code.
+
 In the terminal, `/develop <goal>` walks through analysis, coding, verification, and review. Use `/help` for commands and shortcuts, and `/thinking` to adjust reasoning intensity.
 
 ## Permissions and privacy

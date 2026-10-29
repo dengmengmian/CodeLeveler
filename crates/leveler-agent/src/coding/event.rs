@@ -201,11 +201,12 @@ impl From<AgentEvent> for EngineEvent {
             }
             A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },
             A::ProgressUpdated { ledger } => EngineEvent::ProgressUpdated { ledger },
-            A::ContextSnapshot { messages } => EngineEvent::ContextSnapshot {
+            A::ContextSnapshot {
                 messages,
-                // Executor in-loop snapshots carry no durable ordinal; they
-                // merge via the legacy overlap heuristic on restore.
-                through_ordinal: None,
+                through_ordinal,
+            } => EngineEvent::ContextSnapshot {
+                messages,
+                through_ordinal,
             },
             A::SubAgentStarted {
                 id,

@@ -1,7 +1,7 @@
 //! Read-only task directory facts. Scanning never creates or migrates a store.
 use crate::{Database, EventRecord, SessionRecord, StorageError, TurnRecord};
 use sqlx::SqliteConnection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Durable evidence needed by the shared client task projection.
@@ -15,7 +15,7 @@ pub struct SessionFacts {
     pub last_activity_at: String,
     /// First initiating user text for legacy placeholder titles.
     pub first_user_text: Option<String>,
-    /// Turn boundaries and ownership, ordered by ordinal.
+    /// Latest turn and every running turn, without input bodies, ordered by ordinal.
     pub turns: Vec<TurnRecord>,
     /// Latest task terminal, if any.
     pub terminal: Option<EventRecord>,
@@ -121,95 +121,112 @@ impl Database {
         // store projects the same values its migration would have written.
         let collaboration = schema.sessions.project("collaboration", "'goal'");
         let work_profile = schema.sessions.project("work_profile", "'balanced'");
-        let rows = if schema.sessions.has("archived_at") {
-            sqlx::query_as::<_, crate::session_repo::SessionRow>(&format!(
-                "SELECT id,repository,goal,status,model,state,created_at,updated_at,{collaboration} AS collaboration,{work_profile} AS work_profile FROM sessions WHERE (?1 OR archived_at IS NULL) AND (?2 IS NULL OR id=?2) ORDER BY updated_at DESC,id"))
-                .bind(include_archived).bind(id).fetch_all(&mut *tx).await?
+        let visibility = if schema.sessions.has("archived_at") {
+            "(?1 OR archived_at IS NULL) AND (?2 IS NULL OR id=?2)"
         } else {
-            sqlx::query_as::<_, crate::session_repo::SessionRow>(&format!(
-                "SELECT id,repository,goal,status,model,state,created_at,updated_at,{collaboration} AS collaboration,{work_profile} AS work_profile FROM sessions WHERE (?1 IS NULL OR id=?1) ORDER BY updated_at DESC,id"))
-                .bind(id).fetch_all(&mut *tx).await?
+            "(?1 OR NOT ?1) AND (?2 IS NULL OR id=?2)"
+        };
+        let selected = format!("SELECT id FROM sessions WHERE {visibility}");
+        let rows = sqlx::query_as::<_, crate::session_repo::SessionRow>(&format!(
+            "SELECT id,repository,goal,status,model,state,created_at,updated_at,{collaboration} AS collaboration,{work_profile} AS work_profile FROM sessions WHERE {visibility} ORDER BY updated_at DESC,id"))
+            .bind(include_archived).bind(id).fetch_all(&mut *tx).await?;
+        // A fixed set of batched queries, independent of the session count.
+        let mut archived: HashMap<String, Option<String>> = if schema.sessions.has("archived_at") {
+            sqlx::query_as::<_, (String, Option<String>)>(&format!(
+                "SELECT id,archived_at FROM sessions WHERE {visibility}"
+            ))
+            .bind(include_archived)
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect()
+        } else {
+            HashMap::new()
+        };
+        let mut turns_by_session: HashMap<String, Vec<TurnRecord>> = HashMap::new();
+        if let Some(columns) = &schema.turns {
+            let kind = columns.project("kind", "'user'");
+            let status = columns.project("status", "'running'");
+            let finished_at = columns.project("finished_at", "NULL");
+            let owner_boot_id = columns.project("owner_boot_id", "NULL");
+            let turns = sqlx::query_as::<_, TurnRecord>(&format!(
+                "SELECT id,session_id,ordinal,{kind} AS kind,NULL AS payload,{status} AS status,created_at,{finished_at} AS finished_at,{owner_boot_id} AS owner_boot_id FROM turns t WHERE session_id IN ({selected}) AND ({status}='running' OR ordinal=(SELECT MAX(ordinal) FROM turns newest WHERE newest.session_id=t.session_id)) ORDER BY session_id,ordinal"))
+                .bind(include_archived).bind(id).fetch_all(&mut *tx).await?;
+            for turn in turns {
+                turns_by_session
+                    .entry(turn.session_id.clone())
+                    .or_default()
+                    .push(turn);
+            }
+        }
+        let mut terminals: HashMap<String, EventRecord> = HashMap::new();
+        let mut coverage: HashMap<String, Option<i64>> = HashMap::new();
+        let mut starts: HashMap<String, Option<i64>> = HashMap::new();
+        if let Some(columns) = &schema.events {
+            let version = columns.project("schema_version", "1");
+            let records = sqlx::query_as::<_, EventRecord>(&format!(
+                "SELECT id,session_id,turn_id,sequence,type AS event_type,payload,created_at,{version} AS schema_version FROM events e WHERE session_id IN ({selected}) AND type='task_finished' AND sequence=(SELECT MAX(sequence) FROM events terminal WHERE terminal.session_id=e.session_id AND terminal.type='task_finished')"))
+                .bind(include_archived).bind(id).fetch_all(&mut *tx).await?;
+            for record in records {
+                terminals.insert(record.session_id.clone(), record);
+            }
+            starts = sqlx::query_as::<_, (String, Option<i64>)>(&format!(
+                "SELECT session_id,MAX(sequence) FROM events WHERE session_id IN ({selected}) AND type IN ('task_started','turn_started','turn_finished') GROUP BY session_id"))
+                .bind(include_archived).bind(id).fetch_all(&mut *tx).await?.into_iter().collect();
+            if schema.turns.is_some() {
+                coverage = sqlx::query_as::<_, (String, Option<i64>)>(&format!(
+                    "SELECT t.session_id,MAX(t.ordinal) FROM turns t JOIN events e ON e.turn_id=t.id AND e.session_id=t.session_id WHERE t.session_id IN ({selected}) AND e.sequence<=(SELECT MAX(sequence) FROM events terminal WHERE terminal.session_id=t.session_id AND terminal.type='task_finished') GROUP BY t.session_id"))
+                    .bind(include_archived).bind(id).fetch_all(&mut *tx).await?.into_iter().collect();
+            }
+        }
+        let mut activity = vec![format!(
+            "SELECT id AS session_id,updated_at AS ts FROM sessions WHERE {visibility}"
+        )];
+        if schema.messages.is_some() {
+            activity.push(format!("SELECT session_id,MAX(created_at) AS ts FROM session_messages WHERE session_id IN ({selected}) GROUP BY session_id"));
+        }
+        if schema.events.is_some() {
+            activity.push(format!("SELECT session_id,MAX(created_at) AS ts FROM events WHERE session_id IN ({selected}) GROUP BY session_id"));
+        }
+        if let Some(columns) = &schema.turns {
+            let finished = if columns.has("finished_at") {
+                "COALESCE(finished_at,created_at)"
+            } else {
+                "created_at"
+            };
+            activity.push(format!("SELECT session_id,MAX({finished}) AS ts FROM turns WHERE session_id IN ({selected}) GROUP BY session_id"));
+        }
+        let mut activity: HashMap<String, String> =
+            sqlx::query_as::<_, (String, String)>(&format!(
+                "SELECT session_id,MAX(ts) FROM ({}) GROUP BY session_id",
+                activity.join(" UNION ALL ")
+            ))
+            .bind(include_archived)
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
+        let mut inputs: HashMap<String, String> = if schema.messages.is_some() {
+            sqlx::query_as::<_, (String, String)>(&format!(
+                "SELECT session_id,payload FROM session_messages m WHERE session_id IN ({selected}) AND ordinal=(SELECT MIN(ordinal) FROM session_messages first WHERE first.session_id=m.session_id AND json_extract(first.payload,'$.role')='user')"))
+                .bind(include_archived).bind(id).fetch_all(&mut *tx).await?.into_iter().collect()
+        } else {
+            HashMap::new()
         };
         let mut facts = Vec::with_capacity(rows.len());
         for row in rows {
             let session = row.decode()?;
-            let archived_at: Option<String> = if schema.sessions.has("archived_at") {
-                sqlx::query_scalar("SELECT archived_at FROM sessions WHERE id=?1")
-                    .bind(&session.id)
-                    .fetch_one(&mut *tx)
-                    .await?
-            } else {
-                None
-            };
-            let turns = match &schema.turns {
-                Some(columns) => {
-                    let kind = columns.project("kind", "'user'");
-                    let payload = columns.project("payload", "NULL");
-                    let status = columns.project("status", "'running'");
-                    let finished_at = columns.project("finished_at", "NULL");
-                    let owner_boot_id = columns.project("owner_boot_id", "NULL");
-                    sqlx::query_as::<_, TurnRecord>(&format!(
-                        "SELECT id,session_id,ordinal,{kind} AS kind,{payload} AS payload,{status} AS status,created_at,{finished_at} AS finished_at,{owner_boot_id} AS owner_boot_id FROM turns WHERE session_id=?1 ORDER BY ordinal"))
-                        .bind(&session.id).fetch_all(&mut *tx).await?
-                }
-                None => Vec::new(),
-            };
-            let terminal = match &schema.events {
-                Some(columns) => {
-                    let schema_version = columns.project("schema_version", "1");
-                    sqlx::query_as::<_, EventRecord>(&format!(
-                        "SELECT id,session_id,turn_id,sequence,type AS event_type,payload,created_at,{schema_version} AS schema_version FROM events WHERE session_id=?1 AND type='task_finished' ORDER BY sequence DESC LIMIT 1"))
-                        .bind(&session.id).fetch_optional(&mut *tx).await?
-                }
-                None => None,
-            };
-            let terminal_turn_ordinal: Option<i64> = if let Some(terminal) = &terminal
-                && schema.turns.is_some()
-            {
-                sqlx::query_scalar("SELECT MAX(turns.ordinal) FROM turns JOIN events ON events.turn_id=turns.id WHERE turns.session_id=?1 AND events.session_id=?1 AND events.sequence<=?2")
-                    .bind(&session.id).bind(terminal.sequence).fetch_one(&mut *tx).await?
-            } else {
-                None
-            };
-            let latest_start_sequence: Option<i64> = if schema.events.is_some() {
-                sqlx::query_scalar("SELECT MAX(sequence) FROM events WHERE session_id=?1 AND type IN ('task_started','turn_started','turn_finished')")
-                    .bind(&session.id).fetch_one(&mut *tx).await?
-            } else {
-                None
-            };
-            let mut activity =
-                vec!["SELECT updated_at AS ts FROM sessions WHERE id=?1".to_string()];
-            if schema.messages.is_some() {
-                activity.push(
-                    "SELECT created_at AS ts FROM session_messages WHERE session_id=?1".into(),
-                );
-            }
-            if schema.events.is_some() {
-                activity.push("SELECT created_at AS ts FROM events WHERE session_id=?1".into());
-            }
-            if let Some(columns) = &schema.turns {
-                let finished = if columns.has("finished_at") {
-                    "COALESCE(finished_at,created_at)"
-                } else {
-                    "created_at"
-                };
-                activity.push(format!(
-                    "SELECT {finished} AS ts FROM turns WHERE session_id=?1"
-                ));
-            }
-            let last_activity_at: String = sqlx::query_scalar(&format!(
-                "SELECT MAX(ts) FROM ({})",
-                activity.join(" UNION ALL ")
-            ))
-            .bind(&session.id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let payload: Option<String> = if schema.messages.is_some() {
-                sqlx::query_scalar("SELECT payload FROM session_messages WHERE session_id=?1 AND json_extract(payload,'$.role')='user' ORDER BY ordinal LIMIT 1")
-                    .bind(&session.id).fetch_optional(&mut *tx).await?
-            } else {
-                None
-            };
+            let archived_at = archived.remove(&session.id).flatten();
+            let turns = turns_by_session.remove(&session.id).unwrap_or_default();
+            let terminal = terminals.remove(&session.id);
+            let terminal_turn_ordinal = coverage.remove(&session.id).flatten();
+            let latest_start_sequence = starts.remove(&session.id).flatten();
+            let last_activity_at = activity.remove(&session.id).ok_or_else(|| {
+                StorageError::InvalidData("session activity missing from read snapshot".into())
+            })?;
+            let payload = inputs.remove(&session.id);
             let first_user_text = payload
                 .map(|text| {
                     serde_json::from_str::<serde_json::Value>(&text)
@@ -262,6 +279,44 @@ impl Database {
 mod tests {
     use super::*;
     use crate::SessionRepository;
+
+    #[tokio::test]
+    async fn directory_reads_only_lifecycle_turn_evidence() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::without_workspace("goal", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let id = leveler_core::SessionId::new(record.id);
+        let turns = crate::TurnRepository::new(&db);
+        for _ in 0..3 {
+            let turn = turns
+                .start(
+                    &id,
+                    "chat",
+                    Some(r#"{"input":"large accepted input"}"#),
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            turns
+                .finish(
+                    &leveler_core::TurnId::new(turn.id),
+                    "completed",
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+        }
+        let facts = db.session_facts_for(&id).await.unwrap().unwrap();
+        assert_eq!(
+            facts.turns.len(),
+            1,
+            "only the latest settled turn affects the directory"
+        );
+        assert!(
+            facts.turns[0].payload.is_none(),
+            "directory never needs the accepted input body"
+        );
+    }
     #[tokio::test]
     async fn exclusive_locked_source_is_a_read_error_not_an_empty_directory() {
         use sqlx::Connection;
@@ -383,9 +438,9 @@ mod tests {
             Some("2025-01-03T00:00:00Z")
         );
         assert_eq!(facts[0].first_user_text.as_deref(), Some("legacy goal"));
-        assert_eq!(facts[0].turns.len(), 2);
-        assert_eq!(facts[0].turns[1].status, "running");
-        assert_eq!(facts[0].turns[1].owner_boot_id, None);
+        assert_eq!(facts[0].turns.len(), 1);
+        assert_eq!(facts[0].turns[0].status, "running");
+        assert_eq!(facts[0].turns[0].owner_boot_id, None);
         assert_eq!(facts[0].terminal.as_ref().unwrap().sequence, 1);
         assert_eq!(facts[0].terminal_turn_ordinal, Some(1));
 

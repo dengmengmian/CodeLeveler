@@ -358,6 +358,14 @@ impl TurnSink {
 
 #[async_trait::async_trait]
 impl TranscriptSink for TurnSink {
+    async fn watermark(&mut self) -> Result<Option<u64>, PortError> {
+        self.messages
+            .count(&self.session_id)
+            .await
+            .map(Some)
+            .map_err(|error| PortError::Persistence(error.to_string()))
+    }
+
     async fn append(&mut self, messages: &[Message]) -> Result<(), PortError> {
         let payloads: Vec<String> = messages
             .iter()

@@ -282,7 +282,10 @@ pub enum AgentEvent {
     PlanUpdated { steps: Vec<PlanStep> },
     /// Exact message list the next model request will see. Emitted at a round
     /// boundary so crash recovery does not reconstruct a different context.
-    ContextSnapshot { messages: Vec<Message> },
+    ContextSnapshot {
+        messages: Vec<Message>,
+        through_ordinal: Option<u64>,
+    },
     /// A sub-agent was spawned and began working (concurrent delegation).
     SubAgentStarted {
         id: String,

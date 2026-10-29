@@ -336,11 +336,21 @@ impl<'a> MessageRepository<'a> {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<TimedMessage>, StorageError> {
+        self.load_timed_since(session_id, None).await
+    }
+
+    /// A history tail, preserving rows whose timestamp cannot be interpreted.
+    pub async fn load_timed_since(
+        &self,
+        session_id: &SessionId,
+        since: Option<&str>,
+    ) -> Result<Vec<TimedMessage>, StorageError> {
         let rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT ordinal, created_at, payload FROM session_messages \
-             WHERE session_id = ?1 ORDER BY ordinal ASC",
+             WHERE session_id = ?1 AND (?2 IS NULL OR julianday(created_at) >= julianday(?2) OR julianday(created_at) IS NULL) ORDER BY ordinal ASC",
         )
         .bind(session_id.as_str())
+        .bind(since)
         .fetch_all(self.db.pool())
         .await?;
         Ok(rows

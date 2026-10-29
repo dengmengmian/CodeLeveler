@@ -35,6 +35,11 @@ pub trait MessageStore: Send + Sync {
     /// The session's full transcript payloads, in append order.
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError>;
 
+    /// Exclusive ordinal of the next append; identifies the transcript prefix.
+    async fn count(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        Ok(self.load(session_id).await?.len() as u64)
+    }
+
     /// Total bytes of the session's stored payloads.
     ///
     /// A size the caller can decide on without deserializing anything. The
@@ -138,6 +143,10 @@ pub trait ModelRequestStore: Send + Sync {
 /// The production SQLite adapters.
 #[async_trait]
 impl MessageStore for Database {
+    async fn count(&self, session_id: &SessionId) -> Result<u64, StorageError> {
+        MessageRepository::new(self).count(session_id).await
+    }
+
     async fn append_in_turn(
         &self,
         session_id: &SessionId,

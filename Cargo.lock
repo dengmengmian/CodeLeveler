@@ -1941,7 +1941,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1972,11 +1971,8 @@ dependencies = [
  "leveler-core",
  "leveler-model",
  "leveler-project",
- "leveler-skills",
  "serde",
  "serde_json",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]

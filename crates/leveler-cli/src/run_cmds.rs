@@ -95,23 +95,39 @@ pub(crate) async fn cmd_run(
             approver,
             sandbox,
             &mut |e| render_event(e, output),
-            cancellation,
+            cancellation.clone(),
         )
         .await;
 
-    // Shipping eligibility is not evidence that formatting, builds or tests passed.
-    if ship.any()
-        && output == OutputFormat::Text
+    let ship_result = if ship.any()
         && let Ok(outcome) = &result
-        && outcome.stop_reason == StopReason::Completed
+        && (outcome.stop_reason == StopReason::Completed
+            || (outcome.stop_reason == StopReason::Answered && execution.answer_is_the_terminal()))
         && !outcome.modified_files.is_empty()
     {
-        ship_changes_and_print(&app, &model_ref, &task, &outcome.modified_files, &ship).await;
-    }
+        ship_changes_and_print(
+            &app,
+            &model_ref,
+            &task,
+            &outcome.modified_files,
+            &ship,
+            output,
+            cancellation.clone(),
+        )
+        .await
+    } else {
+        Ok(())
+    };
 
     flush_memory_before_exit(&app, output).await;
-    finish(result, &session_id.to_string(), output, execution)
+    let code = finish(result, &session_id.to_string(), output, execution)?;
+    if cancellation.is_cancelled() {
+        return Ok(std::process::ExitCode::from(130));
+    }
+    ship_result?;
+    Ok(code)
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_run_parallel(
     layout: Layout,
     task: String,
@@ -119,34 +135,65 @@ pub(crate) async fn cmd_run_parallel(
     mode: Option<RunMode>,
     parallel: usize,
     collaboration: leveler_lifecycle::CollaborationMode,
+    auto_approve: bool,
+    sandbox: bool,
+    max_model_steps: Option<u32>,
+    output: OutputFormat,
+    ship: leveler_app::ShipOptions,
 ) -> anyhow::Result<std::process::ExitCode> {
+    if ship.any() || ship.branch.is_some() || ship.pr_base.is_some() {
+        anyhow::bail!(
+            "parallel shipping is unsupported; integrate candidates first, then push the reviewed result explicitly"
+        );
+    }
     // The explicit CLI axis wins over the product default here exactly as it
     // does on the single-agent path: `parallel_edit` reads this Application's
     // resolved collaboration for both the parent session and every child.
-    let app = Application::assemble(layout)?.with_collaboration(collaboration);
+    let app = Application::assemble(layout)?
+        .with_collaboration(collaboration)
+        .with_model_step_ceiling(max_model_steps);
     let model_ref = resolve_model(&app, model)?;
     let execution_mode = resolve_mode(mode, project_default_mode(&app.layout));
 
-    println!(
-        "{}",
-        Line::heading(&format!(
-            "Parallel edit: {parallel} agents with {model_ref}"
-        ))
-    );
-    println!("  mode: {execution_mode:?}");
-    println!("  task: {task}\n");
-    println!(
-        "{}",
-        Line::warn("Running agents concurrently in isolated worktrees…")
-    );
-
+    if output == OutputFormat::Text {
+        println!(
+            "{}",
+            Line::heading(&format!(
+                "Parallel edit: {parallel} agents with {model_ref}"
+            ))
+        );
+        println!("  mode: {execution_mode:?}");
+        println!("  task: {task}\n");
+        println!(
+            "{}",
+            Line::warn("Running agents concurrently in isolated worktrees…")
+        );
+    }
     let cancellation = CancellationToken::new();
     spawn_interrupt_handler(cancellation.clone());
 
     let outcome = app
-        .parallel_edit(&model_ref, execution_mode, &task, parallel, cancellation)
+        .parallel_edit(
+            &model_ref,
+            execution_mode,
+            &task,
+            parallel,
+            build_approver(auto_approve),
+            sandbox,
+            cancellation,
+        )
         .await?;
 
+    if output == OutputFormat::Jsonl {
+        emit_jsonl(
+            serde_json::json!({"type":"parallel_completed", "session_id":outcome.session, "candidates":outcome.candidates, "verified":outcome.verified, "integrated":outcome.integrated, "conflicted":outcome.conflicted}),
+        );
+        return Ok(if outcome.integrated.is_empty() {
+            std::process::ExitCode::FAILURE
+        } else {
+            std::process::ExitCode::SUCCESS
+        });
+    }
     println!();
     println!("{}", Line::heading("Parallel result"));
     println!(
@@ -1783,13 +1830,27 @@ async fn ship_changes_and_print(
     goal: &str,
     modified: &[String],
     ship: &leveler_app::ShipOptions,
-) {
-    println!("{}", Line::heading("Shipping changes"));
+    output: OutputFormat,
+    cancellation: CancellationToken,
+) -> anyhow::Result<()> {
+    if output == OutputFormat::Text {
+        println!("{}", Line::heading("Shipping changes"));
+    }
     match app
-        .ship_changes(goal, modified, model, ship, CancellationToken::new())
+        .ship_changes(goal, modified, model, ship, cancellation)
         .await
     {
         Ok(out) => {
+            let missing_pr = ship.open_pr && out.pr_url.is_none();
+            if output == OutputFormat::Jsonl {
+                emit_jsonl(
+                    serde_json::json!({"type": if missing_pr { "shipping_failed" } else { "shipping_completed" }, "branch":out.branch,"committed":out.committed,"commit_sha":out.commit_sha,"pushed":out.pushed,"pr_url":out.pr_url,"notes":out.notes}),
+                );
+                if missing_pr {
+                    anyhow::bail!("ship failed: the requested pull request was not created");
+                }
+                return Ok(());
+            }
             if out.committed {
                 let sha = out
                     .commit_sha
@@ -1807,10 +1868,19 @@ async fn ship_changes_and_print(
             for note in &out.notes {
                 println!("{}", Line::warn(note));
             }
+            if missing_pr {
+                anyhow::bail!("ship failed: the requested pull request was not created");
+            }
         }
-        Err(e) => println!("{}", Line::fail(&format!("ship failed: {e}"))),
+        Err(error) => {
+            if output == OutputFormat::Jsonl {
+                emit_jsonl(serde_json::json!({"type":"shipping_failed","error":error.to_string()}));
+            }
+            return Err(anyhow::anyhow!("ship failed: {error}"));
+        }
     }
     println!();
+    Ok(())
 }
 
 /// The terminal line for a run that ended honestly without a verified

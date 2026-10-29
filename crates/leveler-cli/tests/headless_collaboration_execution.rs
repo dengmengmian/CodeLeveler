@@ -337,3 +337,102 @@ async fn omitted_collaboration_is_goal() {
         "an omitted `--collaboration` is the Goal default: it opened a goal"
     );
 }
+
+fn edit_response() -> MockResponse {
+    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"edit","type":"function","function":{"name":"apply_patch","arguments":serde_json::json!({"patch":"*** Begin Patch\n*** Update File: seed.txt\n@@\n-seed\n+changed\n*** End Patch"}).to_string()}}]}}]}).to_string();
+    let finish =
+        serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}).to_string();
+    MockResponse::sse(&[&call, &finish])
+}
+
+#[tokio::test]
+async fn shipping_failure_is_reported_for_text_and_jsonl() {
+    for format in ["text", "jsonl"] {
+        let server = MockServer::start(vec![edit_response(), text_response("done")]).await;
+        let env = test_env(&server.base_url());
+        let log = env.tmp.path().join("shipping.log");
+        let child = spawn_run(
+            &env,
+            &[
+                "--collaboration",
+                "chat",
+                "--auto-approve",
+                "--push",
+                "--output",
+                format,
+                "perform requested work",
+            ],
+            &log,
+        );
+        let status = wait_for(child, &log, Duration::from_secs(30)).await;
+        assert_eq!(
+            std::fs::read_to_string(env.repo.join("seed.txt")).unwrap(),
+            "changed\n",
+            "the agent must actually edit before testing shipping"
+        );
+        assert!(
+            !status.success(),
+            "missing origin must fail shipping: {}",
+            read_log(&log)
+        );
+        assert!(read_log(&log).contains("ship"), "{}", read_log(&log));
+        if format == "jsonl" {
+            for line in read_stdout(&log).lines() {
+                serde_json::from_str::<serde_json::Value>(line).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn requested_pr_failure_does_not_become_a_successful_shipping_note() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start(vec![edit_response(), text_response("done")]).await;
+    let env = test_env(&server.base_url());
+    let remote = env.tmp.path().join("origin.git");
+    git::run(&env.repo, &["init", "--bare", remote.to_str().unwrap()]);
+    git::run(
+        &env.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let bin = env.tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\necho 'synthetic PR failure' >&2\nexit 42\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let paths = std::iter::once(bin).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>(),
+    );
+    let log = env.tmp.path().join("pr.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_leveler"))
+        .arg("--repo")
+        .arg(&env.repo)
+        .arg("run")
+        .args([
+            "--collaboration",
+            "chat",
+            "--auto-approve",
+            "--pr",
+            "perform requested work",
+        ])
+        .env("LEVELER_HOME", &env.home)
+        .env("LEVELER_CONFIG_DIR", &env.configs)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(log.with_extension("out")).unwrap())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let status = wait_for(child, &log, Duration::from_secs(30)).await;
+    assert!(
+        read_log(&log).contains("synthetic PR failure"),
+        "PR creation must have been attempted: {}",
+        read_log(&log)
+    );
+    assert!(
+        !status.success(),
+        "a requested PR was not delivered: {}",
+        read_log(&log)
+    );
+}

@@ -363,7 +363,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::Compacted { from, to } => serde_json::json!({
             "type": "compacted", "from": from, "to": to,
         }),
-        AgentEvent::ContextSnapshot { messages } => serde_json::json!({
+        AgentEvent::ContextSnapshot { messages, .. } => serde_json::json!({
             "type": "context_snapshot", "messages": messages,
         }),
         AgentEvent::PlanUpdated { steps } => serde_json::json!({

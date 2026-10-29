@@ -3,8 +3,6 @@
 
 use std::path::Path;
 
-use leveler_project::Language;
-
 const IGNORED: &[&str] = &[
     "target",
     "node_modules",
@@ -22,8 +20,6 @@ const MAX_FILES: usize = 400;
 pub struct RepositoryMap {
     /// Workspace-relative file paths, sorted.
     pub files: Vec<String>,
-    /// Detected languages.
-    pub languages: Vec<Language>,
     /// Whether the file list was truncated.
     pub truncated: bool,
 }
@@ -36,11 +32,7 @@ impl RepositoryMap {
         files.sort();
         let truncated = files.len() > MAX_FILES;
         files.truncate(MAX_FILES);
-        RepositoryMap {
-            files,
-            languages: leveler_project::detect_languages(root),
-            truncated,
-        }
+        RepositoryMap { files, truncated }
     }
 
     /// Render the map as a newline-separated list for prompting.
@@ -50,16 +42,6 @@ impl RepositoryMap {
             s.push_str("\n… [more files omitted]");
         }
         s
-    }
-
-    /// Source files (by extension) — candidates for editing.
-    pub fn source_files(&self) -> impl Iterator<Item = &String> {
-        self.files.iter().filter(|f| is_source(f))
-    }
-
-    /// Test files, identified by common naming conventions.
-    pub fn test_files(&self) -> impl Iterator<Item = &String> {
-        self.files.iter().filter(|f| is_test(f))
     }
 }
 
@@ -119,16 +101,6 @@ pub fn is_source(path: &str) -> bool {
     )
 }
 
-/// Whether a path looks like a test file.
-pub fn is_test(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.ends_with("_test.go")
-        || lower.contains("/tests/")
-        || lower.contains(".test.")
-        || lower.contains(".spec.")
-        || (lower.ends_with(".rs") && lower.contains("test"))
-}
-
 fn extension(path: &str) -> Option<&str> {
     path.rsplit('.').next().filter(|e| *e != path)
 }
@@ -138,13 +110,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_sources_and_tests() {
+    fn classifies_sources() {
         assert!(is_source("src/main.rs"));
         assert!(is_source("pkg/x.go"));
         assert!(!is_source("README.md"));
-        assert!(is_test("pkg/x_test.go"));
-        assert!(is_test("src/foo.test.ts"));
-        assert!(!is_test("src/main.rs"));
     }
 
     #[test]
@@ -162,40 +131,9 @@ mod tests {
     }
 
     #[test]
-    fn source_files_filters_by_extension() {
-        let map = RepositoryMap {
-            files: vec![
-                "src/main.rs".to_string(),
-                "README.md".to_string(),
-                "app.ts".to_string(),
-            ],
-            languages: vec![],
-            truncated: false,
-        };
-        let sources: Vec<_> = map.source_files().collect();
-        assert_eq!(sources, vec!["src/main.rs", "app.ts"]);
-    }
-
-    #[test]
-    fn test_files_filters_by_naming_convention() {
-        let map = RepositoryMap {
-            files: vec![
-                "src/main.rs".to_string(),
-                "src/lib_test.go".to_string(),
-                "tests/foo.test.ts".to_string(),
-            ],
-            languages: vec![],
-            truncated: false,
-        };
-        let tests: Vec<_> = map.test_files().collect();
-        assert_eq!(tests, vec!["src/lib_test.go", "tests/foo.test.ts"]);
-    }
-
-    #[test]
     fn render_includes_truncation_marker() {
         let map = RepositoryMap {
             files: vec!["a.rs".to_string(), "b.rs".to_string()],
-            languages: vec![],
             truncated: true,
         };
         assert_eq!(map.render(), "a.rs\nb.rs\n… [more files omitted]");

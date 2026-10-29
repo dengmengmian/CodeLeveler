@@ -180,6 +180,11 @@ pub enum ChildToolEvent {
 /// Called with the messages appended in each step (seed, then per round).
 #[async_trait]
 pub trait TranscriptSink: Send {
+    /// Unknown for non-durable sinks; never infer a boundary from message text.
+    async fn watermark(&mut self) -> Result<Option<u64>, PortError> {
+        Ok(None)
+    }
+
     async fn append(&mut self, messages: &[Message]) -> Result<(), PortError>;
 
     /// Persist only observed text from a failed invocation. Durable transcript

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_execution::RiskLevel;
 use leveler_lsp::LspSessions;
 
-use super::symbols::collect_source_files;
+use super::symbols::{read_source, source_files};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_SCAN_BYTES: usize = 64 * 1024;
@@ -63,10 +63,11 @@ impl Tool for FindSymbolTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let root = context.require_workspace()?.root().to_path_buf();
+        let workspace = context.execution_workspace()?;
+        let root = workspace.root().to_path_buf();
 
         // Precise path: ask a language server (session reused across calls).
         if let Some(located) = self.lsp.locate(&root, &input.symbol).await {
@@ -87,15 +88,16 @@ impl Tool for FindSymbolTool {
         // Fallback: dependency-free definition scan (files only). Labelled as a
         // scan in the result, because it answers a weaker question than the
         // server does — which files define the name, not where.
-        let mut files = Vec::new();
-        collect_source_files(&root, &root, &mut files);
+        let files = source_files(root.clone(), cancellation.clone()).await?;
         let mut hits = Vec::new();
         for rel in files {
-            let Ok(bytes) = std::fs::read(root.join(&rel)) else {
-                continue;
-            };
-            let slice = &bytes[..bytes.len().min(MAX_SCAN_BYTES)];
-            let text = String::from_utf8_lossy(slice);
+            let text = read_source(
+                &workspace,
+                &root.join(&rel),
+                &cancellation,
+                Some(MAX_SCAN_BYTES),
+            )
+            .await?;
             if leveler_context::defines(&text, &input.symbol) {
                 hits.push(rel);
             }
@@ -124,6 +126,40 @@ mod tests {
         FindSymbolTool::new(Arc::new(LspSessions::new(Arc::new(
             leveler_core::environment().clone(),
         ))))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symbol_scan_obeys_sensitive_path_authority() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join(".env");
+        std::fs::write(&secret, "fn private_marker() {}\n").unwrap();
+        std::os::unix::fs::symlink(&secret, repo.path().join("alias.rs")).unwrap();
+        for (mode, allowed) in [
+            (leveler_execution::PermissionProfile::RequestApproval, false),
+            (leveler_execution::PermissionProfile::FullAccess, true),
+        ] {
+            let ctx = ToolContext::new(
+                leveler_execution::Workspace::new(repo.path()).unwrap(),
+                mode,
+            );
+            let result = tool()
+                .execute(
+                    serde_json::json!({"symbol":"private_marker"}),
+                    ctx,
+                    CancellationToken::new(),
+                )
+                .await;
+            if allowed {
+                assert!(result.unwrap().content.contains("alias.rs"));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "sensitive symlink must require authority: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

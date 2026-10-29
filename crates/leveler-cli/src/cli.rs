@@ -309,7 +309,9 @@ pub enum Command {
         /// Run N agents concurrently in isolated worktrees and integrate the
         /// results (>=2 enables parallel multi-agent editing). Requires
         /// `--collaboration goal`: only a goal-typed candidate is driven to a
-        /// committed edit the integration step can merge.
+        /// committed edit the integration step can merge. Shipping flags
+        /// (--commit/--push/--pr/--branch/--pr-base) are not supported here;
+        /// review the integrated result before shipping it explicitly.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
     },
