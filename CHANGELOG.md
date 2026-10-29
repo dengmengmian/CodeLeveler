@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-## [1.0.21] - 2026-10-28
+## [1.0.21] - 2026-10-29
 
 - Improved reasoning history when switching models, keeping private reasoning separate between models. Historical reasoning is sent back only to the route that produced it, and only when that route declares the mode.
 - Fixed follow-up questions being treated as new goals after task completion, and improved resuming paused work. Ending a goal returns the session to ordinary chat.

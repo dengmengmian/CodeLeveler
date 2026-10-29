@@ -4890,11 +4890,12 @@ mod terminal_acceptance_tests {
             .unwrap();
         let shell = registry.get_owned(&id, owner).await.unwrap().pid.unwrap() as i32;
         let pid_file = workspace.path().join("background.pid");
+        let foreground_pid_file = workspace.path().join("foreground.pid");
         registry
             .terminal_write(
                 &id,
                 owner,
-                b"stty -echo; sleep 300 & print -r -- $! > background.pid; sleep 300\r".to_vec(),
+                b"stty -echo; sleep 300 & print -r -- $! > background.pid; /bin/sh -c 'echo $$ > foreground.pid; exec sleep 300'\r".to_vec(),
             )
             .await
             .unwrap();
@@ -4908,13 +4909,18 @@ mod terminal_acceptance_tests {
             .trim()
             .parse()
             .unwrap();
-        wait_until(|| crate::pty::session_members(shell).unwrap().len() >= 3).await;
-        let members = crate::pty::session_members(shell).unwrap();
-        let foreground = members
-            .iter()
-            .find(|pid| pid.as_raw() != shell && pid.as_raw() != background)
+        // A fork is visible in the session before zsh assigns its job group.
+        // The foreground command's own marker proves it has started instead.
+        wait_until(|| {
+            std::fs::read_to_string(&foreground_pid_file)
+                .is_ok_and(|s| s.trim().parse::<i32>().is_ok())
+        })
+        .await;
+        let foreground: i32 = std::fs::read_to_string(foreground_pid_file)
             .unwrap()
-            .as_raw();
+            .trim()
+            .parse()
+            .unwrap();
         assert_ne!(
             getpgid(Some(Pid::from_raw(background))).unwrap().as_raw(),
             shell
