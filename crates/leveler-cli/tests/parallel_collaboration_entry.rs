@@ -477,3 +477,147 @@ async fn parallel_preserves_network_denial_and_json_output() {
     }
     assert_eq!(sessions, 3);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn parallel_reports_cleanup_warnings_without_losing_integration() {
+    use std::os::unix::fs::PermissionsExt;
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    for format in ["jsonl", "text"] {
+        let server = MockServer::start_one(goal_complete_response()).await;
+        let env = test_env(&server.base_url());
+        let bin = env.tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        // Lock real worktrees immediately after creation. The implementation
+        // must report Git's real refusal, without unlocking a user's resource.
+        let quoted_git = format!("'{}'", real_git.to_str().unwrap().replace('\'', "'\\''"));
+        std::fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = worktree ] && [ "$2" = add ]; then
+    {quoted_git} "$@" || exit $?
+    exec {quoted_git} worktree lock "$5"
+fi
+exec {quoted_git} "$@"
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = std::iter::once(bin)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))
+            .collect::<Vec<_>>();
+        let log = env.tmp.path().join("run.log");
+        let child = Command::new(env!("CARGO_BIN_EXE_leveler"))
+            .arg("--repo")
+            .arg(&env.repo)
+            .arg("run")
+            .args([
+                "--parallel",
+                "2",
+                "--auto-approve",
+                "--output",
+                format,
+                "cleanup warning probe",
+            ])
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("LEVELER_HOME", &env.home)
+            .env("LEVELER_CONFIG_DIR", &env.configs)
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(log.with_extension("out")).unwrap())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let status = wait_for(child, &log, Duration::from_secs(60)).await;
+        let stdout = read_stdout(&log);
+        let listing = Command::new(&real_git)
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&env.repo)
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        let listing = String::from_utf8(listing.stdout).unwrap();
+        let retained = listing
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .filter(|path| path != &env.repo.canonicalize().unwrap())
+            .collect::<Vec<_>>();
+        // Remove only this fixture's retained worktrees before assertions.
+        for path in &retained {
+            git::run(&env.repo, &["worktree", "unlock", path.to_str().unwrap()]);
+            git::run(
+                &env.repo,
+                &["worktree", "remove", "--force", path.to_str().unwrap()],
+            );
+        }
+        assert!(status.success(), "{}", read_log(&log));
+        assert_eq!(retained.len(), 2, "the locks must prevent cleanup");
+        if format == "jsonl" {
+            let outcome = stdout
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|row| row["type"] == "parallel_completed")
+                .unwrap();
+            assert_eq!(outcome["integrated"].as_array().unwrap().len(), 2);
+            let warnings = outcome["warnings"]
+                .as_array()
+                .expect("cleanup warnings must reach JSONL clients");
+            assert_eq!(warnings.len(), 2);
+            for path in &retained {
+                assert!(warnings.iter().any(|warning| {
+                    warning.as_str().unwrap().contains(
+                        std::env::temp_dir()
+                            .join(path.file_name().unwrap())
+                            .to_str()
+                            .unwrap(),
+                    )
+                }));
+            }
+        } else {
+            for path in &retained {
+                assert!(
+                    stdout.contains(
+                        std::env::temp_dir()
+                            .join(path.file_name().unwrap())
+                            .to_str()
+                            .unwrap()
+                    ),
+                    "cleanup warning missing: {stdout}"
+                );
+            }
+        }
+        let mut terminals = Vec::new();
+        for entry in std::fs::read_dir(env.home.join("state/projects")).unwrap() {
+            let path = entry.unwrap().path().join("sessions.db");
+            if !path.exists() {
+                continue;
+            }
+            let db = Database::connect(&path).await.unwrap();
+            for session in SessionRepository::new(&db).list().await.unwrap() {
+                let events = leveler_storage::EventRepository::new(&db)
+                    .load(&leveler_core::SessionId::new(session.id))
+                    .await
+                    .unwrap();
+                for event in events {
+                    if let leveler_engine::EngineEvent::TaskFinished { warnings, .. } =
+                        leveler_engine::EngineEvent::from_payload(&event.payload).unwrap()
+                        && warnings.len() == 2
+                    {
+                        terminals.push(warnings);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            terminals.len(),
+            1,
+            "cleanup warnings must survive in the parent's terminal fact"
+        );
+    }
+}

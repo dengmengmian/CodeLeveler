@@ -186,7 +186,7 @@ pub(crate) async fn cmd_run_parallel(
 
     if output == OutputFormat::Jsonl {
         emit_jsonl(
-            serde_json::json!({"type":"parallel_completed", "session_id":outcome.session, "candidates":outcome.candidates, "verified":outcome.verified, "integrated":outcome.integrated, "conflicted":outcome.conflicted}),
+            serde_json::json!({"type":"parallel_completed", "session_id":outcome.session, "candidates":outcome.candidates, "verified":outcome.verified, "integrated":outcome.integrated, "conflicted":outcome.conflicted, "warnings":outcome.warnings}),
         );
         return Ok(if outcome.integrated.is_empty() {
             std::process::ExitCode::FAILURE
@@ -201,6 +201,9 @@ pub(crate) async fn cmd_run_parallel(
         outcome.candidates, outcome.verified
     );
     println!("  session: {}", outcome.session);
+    for warning in &outcome.warnings {
+        println!("{}", Line::warn(warning));
+    }
     if !outcome.integrated.is_empty() {
         println!(
             "  {} integrated: {}",
