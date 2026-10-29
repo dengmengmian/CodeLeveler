@@ -6786,6 +6786,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
         });
 
+        let user_shells = self.user_shells.snapshot(session_id);
+        let history = if self.active.is_running(session_id)
+            && !user_shells.iter().any(|shell| shell.status == "running")
+        {
+            let (entries, omitted_turns) =
+                crate::session_history::load_session_history(&db, session_id)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+            (!entries.is_empty()).then_some(leveler_client_protocol::UiSessionHistory {
+                entries,
+                omitted_turns,
+            })
+        } else {
+            None
+        };
         let live = self.live_views.view(session_id);
         let checkpoints = self.checkpoints.list(session_id);
 
@@ -6863,6 +6878,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .collect();
 
         Ok(UiSessionSnapshot {
+            history,
             id: session_id.clone(),
             repository: record.repository,
             task_status: Some(task_status),
@@ -6889,7 +6905,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             checkpoints,
             recaps,
             user_shells: {
-                let live = self.user_shells.snapshot(session_id);
+                let live = user_shells;
                 let live_ids: std::collections::HashSet<_> =
                     live.iter().map(|shell| shell.id.clone()).collect();
                 let mut restored = crate::user_shell::restore_from_events(&db, session_id)
@@ -7887,6 +7903,7 @@ async fn compact_conversation(
         };
         let _ = events.send(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
+                history: None,
                 id: session_id.clone(),
                 repository: record.repository,
                 task_status: Some(task_status),
@@ -9454,6 +9471,102 @@ mod session_stream_tests {
             PermissionProfile::Assisted,
             false,
         )
+    }
+
+    #[tokio::test]
+    async fn running_snapshot_carries_existing_bounded_execution_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        let db = runtime.app.open_database().await.unwrap();
+        let record = leveler_storage::SessionRecord::new(
+            runtime
+                .app
+                .layout
+                .primary_workspace()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+            "resume",
+            "unused/m",
+            leveler_core::now(),
+        );
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let payload =
+            serde_json::json!({"version":1,"initiating_message":Message::user_input("resume")})
+                .to_string();
+        let turn = leveler_storage::TurnRepository::new(&db)
+            .start(&session, "chat", Some(&payload), leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let mut bridge = EventBridge::new(runtime.events_for(&session));
+        for event in [
+            leveler_engine::EngineEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: leveler_engine::TurnKind::Chat,
+            },
+            leveler_engine::EngineEvent::ToolCallStarted {
+                call_id: "a".into(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+                model_step: Some(1),
+            },
+            leveler_engine::EngineEvent::ToolExecutionTiming {
+                clock_id: "turn".into(),
+                call_id: "a".into(),
+                agent_id: None,
+                started_ms: 5000,
+                elapsed_ms: 9000,
+                finished: true,
+            },
+            leveler_engine::EngineEvent::ToolCallFinished {
+                call_id: "a".into(),
+                name: "run_command".into(),
+                is_error: true,
+                preview: "failed".into(),
+                agent_id: None,
+                applied_diff: None,
+                exit_code: Some(1),
+                stop: None,
+            },
+            leveler_engine::EngineEvent::ToolCallStarted {
+                call_id: "b".into(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+                model_step: Some(1),
+            },
+        ] {
+            let (kind, payload) = event.to_row().unwrap();
+            leveler_storage::EventRepository::new(&db)
+                .append(
+                    &session,
+                    Some(&turn_id),
+                    &kind,
+                    &payload,
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            bridge.forward(event);
+        }
+        let lease = runtime.active.admit(&session).unwrap();
+        let snapshot = runtime.snapshot(&session).await.unwrap();
+        let history = snapshot.history.unwrap();
+        assert!(history.entries.iter().any(|entry| matches!(&entry.event,
+            RuntimeEvent::ToolCallCompleted {id,ok:false,..} if id.as_str()=="a")));
+        assert!(history.entries.iter().any(|entry| matches!(&entry.event,
+            RuntimeEvent::ToolTimingUpdated {timing,..} if timing.elapsed_ms==9000 && timing.finished)));
+        assert_eq!(snapshot.active_tools.len(), 1);
+        assert_eq!(snapshot.active_tools[0].id.as_str(), "b");
+        runtime.active.finish(&lease);
+        assert!(runtime.snapshot(&session).await.unwrap().history.is_none());
     }
 
     #[tokio::test]

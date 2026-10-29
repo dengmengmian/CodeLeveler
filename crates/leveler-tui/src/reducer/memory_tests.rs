@@ -39,6 +39,7 @@ fn state() -> AppState {
 
 fn snapshot(status: &str) -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/work/demo".into()),
         task_status: None,

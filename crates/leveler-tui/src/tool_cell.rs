@@ -1692,6 +1692,7 @@ mod m1_tests {
 
     fn edit_block(name: &str, args: serde_json::Value, applied: Option<&str>) -> ToolCallBlock {
         ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -1925,6 +1926,7 @@ mod m1_tests {
         .to_string();
         let mut out = Vec::new();
         let block = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -2301,6 +2303,7 @@ mod tests {
                        \n\
                        2. Second result";
         let block = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -2343,6 +2346,7 @@ mod tests {
 
     fn failed_block(preview: &str) -> ToolCallBlock {
         ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -2398,6 +2402,7 @@ mod tests {
     #[test]
     fn replace_edit_renders_an_inline_diff_like_apply_patch() {
         let block = ToolCallBlock {
+                        timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -2449,6 +2454,7 @@ mod tests {
     #[test]
     fn failed_replace_shows_the_error_not_a_diff() {
         let block = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -2491,6 +2497,7 @@ mod tests {
         // the model. The user sees a short localized "plan unchanged" line, not
         // the raw `— plan step "…" cannot …` internals.
         let block = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -2548,6 +2555,7 @@ mod tests {
     fn only_plan_and_goal_failures_get_a_substituted_note() {
         let render = |name: &str, preview: &str| {
             let block = ToolCallBlock {
+                timing: None,
                 exit_code: None,
                 output: String::new(),
                 output_truncated: false,
@@ -2642,6 +2650,7 @@ mod tests {
     #[test]
     fn unsupported_task_call_is_actionable_instead_of_raw() {
         let block = ToolCallBlock {
+                        timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,

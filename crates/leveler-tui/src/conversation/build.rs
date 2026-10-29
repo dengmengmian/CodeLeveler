@@ -823,7 +823,12 @@ fn render_process_fold(
         hits.push((out.len(), fold.anchor));
     }
     out.push(crate::activity_stream::process_fold_receipt_line(
-        &members, theme, width, t, expanded,
+        &members,
+        theme,
+        width,
+        t,
+        expanded,
+        state.elapsed_secs,
     ));
     sources.push(super::view::SourceSpan {
         receipt: true,

@@ -104,6 +104,7 @@ fn state_with_draft(draft_path: Option<std::path::PathBuf>) -> AppState {
 
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".to_string()),
         task_status: None,
@@ -2880,13 +2881,13 @@ fn page_up_scrolls_while_approval_is_open() {
     assert!(s.conv.scroll < 30, "PageUp must leave the parked offset");
     assert!(!s.conv.auto_scroll);
     assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
-    // The page key must not also move the approval cursor off Deny.
+    // The page key must not also move the approval cursor off Allow once.
     let decided = reduce(&mut s, key(KeyCode::Enter));
     assert_send_interaction(
         &decided,
         ClientCommand::ApprovalDecision {
             request_id: ApprovalId::new("r1"),
-            decision: ApprovalDecision::Deny,
+            decision: ApprovalDecision::ApproveOnce,
         },
         PendingInteraction::Approval(approval_req()),
     );
@@ -2975,14 +2976,14 @@ fn wheel_scrolls_while_clarification_is_open() {
 #[test]
 fn arrows_still_choose_while_approval_is_open() {
     let mut s = conversation_parked_under_approval();
-    reduce(&mut s, key(KeyCode::Up));
-    assert_eq!(s.conv.scroll, 30, "↑ chooses a row, it does not scroll");
+    reduce(&mut s, key(KeyCode::Down));
+    assert_eq!(s.conv.scroll, 30, "↓ chooses a row, it does not scroll");
     let decided = reduce(&mut s, key(KeyCode::Enter));
     assert_send_interaction(
         &decided,
         ClientCommand::ApprovalDecision {
             request_id: ApprovalId::new("r1"),
-            decision: ApprovalDecision::ApproveAlways,
+            decision: ApprovalDecision::ApproveSession,
         },
         PendingInteraction::Approval(approval_req()),
     );
@@ -3018,6 +3019,7 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
     let mut snap = snapshot();
     snap.status = "running".to_string();
     snap.active_tools = vec![UiActiveToolCall {
+        timing: None,
         elapsed_ms: 0,
         output_tail: String::new(),
         output_truncated: false,
@@ -3099,7 +3101,7 @@ fn second_approval_queues_and_advances_after_first_resolved() {
     assert_eq!(ov.request.id, ApprovalId::new("r1"));
     assert_eq!(s.pending_interactions.len(), 1);
 
-    // Answer the first (Enter → Deny). The decision targets r1; the second
+    // Answer the first (Enter → Allow once). The decision targets r1; the second
     // stays parked until the event loop confirms delivery (ACK), so a failed
     // send can restore the first overlay instead of losing both.
     let effects = reduce(&mut s, key(KeyCode::Enter));
@@ -3107,7 +3109,7 @@ fn second_approval_queues_and_advances_after_first_resolved() {
         &effects,
         ClientCommand::ApprovalDecision {
             request_id: ApprovalId::new("r1"),
-            decision: ApprovalDecision::Deny,
+            decision: ApprovalDecision::ApproveOnce,
         },
         PendingInteraction::Approval(approval_req()),
     );
@@ -3156,7 +3158,7 @@ fn clarification_queues_behind_open_approval_and_both_get_answered() {
         &effects,
         ClientCommand::ApprovalDecision {
             request_id: ApprovalId::new("r1"),
-            decision: ApprovalDecision::Deny,
+            decision: ApprovalDecision::ApproveOnce,
         },
         PendingInteraction::Approval(approval_req()),
     );
@@ -3185,7 +3187,7 @@ fn clarification_queues_behind_open_approval_and_both_get_answered() {
 }
 
 #[test]
-fn approval_enter_denies_by_default() {
+fn approval_enter_allows_once_by_default() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -3198,7 +3200,7 @@ fn approval_enter_denies_by_default() {
         &effects,
         ClientCommand::ApprovalDecision {
             request_id: ApprovalId::new("r1"),
-            decision: ApprovalDecision::Deny,
+            decision: ApprovalDecision::ApproveOnce,
         },
         PendingInteraction::Approval(approval_req()),
     );

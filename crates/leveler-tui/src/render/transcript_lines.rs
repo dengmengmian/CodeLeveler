@@ -2918,6 +2918,7 @@ mod tests {
         let t = Locale::Zh.text();
         let item = TranscriptItem::ToolGroup(ToolGroupBlock {
             calls: vec![ToolCallBlock {
+                timing: None,
                 exit_code: None,
                 output: String::new(),
                 output_truncated: false,

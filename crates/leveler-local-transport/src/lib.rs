@@ -16,6 +16,31 @@ use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+fn event_for_tool_timing_peer(
+    mut event: RuntimeEvent,
+    supports_timing: bool,
+) -> Option<RuntimeEvent> {
+    if !supports_timing {
+        match &mut event {
+            RuntimeEvent::ToolTimingUpdated { .. } => return None,
+            RuntimeEvent::SessionHistoryLoaded { entries, .. } => {
+                let mut turn_start = false;
+                entries.retain_mut(|entry| {
+                    turn_start |= entry.turn_start;
+                    if matches!(entry.event, RuntimeEvent::ToolTimingUpdated { .. }) {
+                        return false;
+                    }
+                    entry.turn_start = turn_start;
+                    turn_start = false;
+                    true
+                });
+            }
+            _ => {}
+        }
+    }
+    Some(event)
+}
+
 /// Re-exported so every client that builds a
 /// [`CreateSessionRequest`] names the collaboration axis through one type
 /// instead of inventing its own string vocabulary.
@@ -135,7 +160,7 @@ pub struct CreateSessionRequest {
 }
 
 /// Initial client state returned atomically with session creation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionBootstrap {
     pub session: UiSessionSnapshot,
     pub context_window: u32,
@@ -655,6 +680,9 @@ mod transport {
         let understands_optional_workspace = envelope
             .capabilities
             .contains(&leveler_client_protocol::ProtocolCapability::OptionalWorkspace);
+        let understands_tool_timing = envelope
+            .capabilities
+            .contains(&leveler_client_protocol::ProtocolCapability::ToolExecutionTiming);
         let request = envelope.into_body()?;
         if !runtime.has_primary_workspace() && !understands_optional_workspace {
             return send_result(
@@ -944,7 +972,11 @@ mod transport {
                         _ = reader.read_u8() => return Ok(()),
                         event = events.recv() => match event {
                             Ok(RuntimeEvent::GlobalTasksLoaded { .. }) if !transport_trusted || client_kind == ClientKind::Remote => continue,
-                            Ok(event) => send_response(&mut writer, WireResponse::Event(event)).await?,
+                            Ok(event) => {
+                                if let Some(event) = event_for_tool_timing_peer(event, understands_tool_timing) {
+                                    send_response(&mut writer, WireResponse::Event(event)).await?;
+                                }
+                            }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "local socket event subscriber lagged");
                                 // Force a reconnect. Session-scoped clients
@@ -2224,6 +2256,58 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn legacy_peers_receive_no_unknown_timing_variant_even_inside_history() {
+        let timing = RuntimeEvent::ToolTimingUpdated {
+            id: leveler_client_protocol::ToolCallId::new("a"),
+            timing: leveler_client_protocol::UiToolTiming {
+                clock_id: "turn".into(),
+                started_ms: 1000,
+                elapsed_ms: 9000,
+                finished: true,
+            },
+        };
+        assert!(event_for_tool_timing_peer(timing.clone(), false).is_none());
+        assert_eq!(
+            event_for_tool_timing_peer(timing.clone(), true),
+            Some(timing.clone())
+        );
+        let history = RuntimeEvent::SessionHistoryLoaded {
+            query_id: None,
+            session_id: SessionId::new("s"),
+            omitted_turns: 3,
+            entries: vec![
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_start: true,
+                    turn_elapsed_ms: 1000,
+                    event: timing,
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_start: false,
+                    turn_elapsed_ms: 2000,
+                    event: RuntimeEvent::TurnCompleted,
+                },
+            ],
+        };
+        let RuntimeEvent::SessionHistoryLoaded {
+            entries,
+            omitted_turns,
+            ..
+        } = event_for_tool_timing_peer(history, false).unwrap()
+        else {
+            panic!("history expected")
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, RuntimeEvent::TurnCompleted);
+        assert!(entries[0].turn_start);
+        assert_eq!(omitted_turns, 3);
+        assert!(
+            leveler_client_protocol::ProtocolEnvelope::wrap(())
+                .capabilities
+                .contains(&leveler_client_protocol::ProtocolCapability::ToolExecutionTiming)
+        );
+    }
+
     struct TestRuntime {
         events: broadcast::Sender<RuntimeEvent>,
         commands: Mutex<Vec<ClientCommand>>,
@@ -2250,6 +2334,7 @@ mod tests {
                 last_approval: Mutex::new(None),
                 last_attach: Mutex::new(None),
                 snapshot: Arc::new(Mutex::new(UiSessionSnapshot {
+                    history: None,
                     id: SessionId::new("s1"),
                     repository: Some("/repo".to_string()),
                     task_status: None,

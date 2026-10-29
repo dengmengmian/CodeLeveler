@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 1,
-    // 1.15: `UiPlan.state` (optional on decode; additive).
-    minor: 15,
+    // 1.16: tool execution timing and optional snapshot timing.
+    minor: 16,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
@@ -22,6 +22,7 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolCapability {
     OptionalWorkspace,
+    ToolExecutionTiming,
     #[serde(other)]
     Unknown,
 }
@@ -71,7 +72,10 @@ impl<T> ProtocolEnvelope<T> {
         Self {
             protocol: PROTOCOL_VERSION,
             body,
-            capabilities: vec![ProtocolCapability::OptionalWorkspace],
+            capabilities: vec![
+                ProtocolCapability::OptionalWorkspace,
+                ProtocolCapability::ToolExecutionTiming,
+            ],
         }
     }
 
@@ -129,7 +133,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":15},"body":{"type":"quit"},"capabilities":["optional_workspace"]}"#
+            r#"{"protocol":{"major":1,"minor":16},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

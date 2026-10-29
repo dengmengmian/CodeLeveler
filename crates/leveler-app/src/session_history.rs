@@ -458,6 +458,101 @@ mod tests {
         TurnRepository,
     };
 
+    #[tokio::test]
+    async fn execution_timing_replays_from_durable_facts_without_a_wall_clock() {
+        let (db, sid) = session().await;
+        let t = now();
+        event(
+            &db,
+            &sid,
+            t,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        for (when, fact) in [
+            (
+                t + ms(10),
+                EngineEvent::ToolCallStarted {
+                    call_id: "a".into(),
+                    name: "run_command".into(),
+                    arguments: "{}".into(),
+                    parallel: false,
+                    risk: None,
+                    agent_id: None,
+                    model_step: Some(1),
+                },
+            ),
+            (
+                t + ms(20),
+                EngineEvent::ToolExecutionTiming {
+                    clock_id: "turn".into(),
+                    call_id: "a".into(),
+                    agent_id: None,
+                    started_ms: 5000,
+                    elapsed_ms: 0,
+                    finished: false,
+                },
+            ),
+            // A wall-clock adjustment must not alter a recorded monotonic duration.
+            (
+                t - chrono::Duration::seconds(60),
+                EngineEvent::ToolExecutionTiming {
+                    clock_id: "turn".into(),
+                    call_id: "a".into(),
+                    agent_id: None,
+                    started_ms: 5000,
+                    elapsed_ms: 72_000,
+                    finished: true,
+                },
+            ),
+            (
+                t,
+                EngineEvent::ToolCallFinished {
+                    call_id: "a".into(),
+                    name: "run_command".into(),
+                    is_error: true,
+                    preview: "failed".into(),
+                    agent_id: None,
+                    applied_diff: None,
+                    exit_code: Some(1),
+                    stop: None,
+                },
+            ),
+        ] {
+            event(&db, &sid, when, fact).await;
+        }
+        for _ in 0..2 {
+            let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+            let times: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match &entry.event {
+                    RuntimeEvent::ToolTimingUpdated { timing, .. } => Some(timing.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                times,
+                [
+                    leveler_client_protocol::UiToolTiming {
+                        clock_id: "turn".into(),
+                        started_ms: 5000,
+                        elapsed_ms: 0,
+                        finished: false
+                    },
+                    leveler_client_protocol::UiToolTiming {
+                        clock_id: "turn".into(),
+                        started_ms: 5000,
+                        elapsed_ms: 72_000,
+                        finished: true
+                    }
+                ]
+            );
+        }
+    }
+
     async fn session() -> (Database, SessionId) {
         let db = Database::connect_in_memory().await.unwrap();
         let rec = SessionRecord::new("/repo", "history", "m/x", now());

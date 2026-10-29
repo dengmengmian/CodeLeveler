@@ -26,7 +26,8 @@ pub(crate) struct LiveSessionView {
     /// next request. `None` before the first model request of a session.
     pub context_usage: Option<leveler_model::ContextAccounting>,
     /// When each active tool started, by this runtime's clock.
-    tool_started: HashMap<leveler_core::ToolCallId, std::time::Instant>,
+    tool_started:
+        HashMap<leveler_core::ToolCallId, (std::time::Instant, Option<std::time::Instant>)>,
 }
 
 /// Bounded end of a running command's output kept for the reconnect snapshot.
@@ -57,8 +58,15 @@ impl LiveViews {
             .cloned()
             .unwrap_or_default();
         for tool in &mut view.active_tools {
-            if let Some(started) = view.tool_started.get(&tool.id) {
+            if let Some((started, observed)) = view.tool_started.get(&tool.id) {
                 tool.elapsed_ms = started.elapsed().as_millis() as u64;
+                if let (Some(timing), Some(observed)) = (&mut tool.timing, observed)
+                    && !timing.finished
+                {
+                    timing.elapsed_ms = timing
+                        .elapsed_ms
+                        .saturating_add(observed.elapsed().as_millis() as u64);
+                }
             }
         }
         view
@@ -99,8 +107,9 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         } => {
             view.active_tools.retain(|tool| tool.id != *id);
             view.tool_started
-                .insert(id.clone(), std::time::Instant::now());
+                .insert(id.clone(), (std::time::Instant::now(), None));
             view.active_tools.push(UiActiveToolCall {
+                timing: None,
                 id: id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
@@ -115,6 +124,14 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
                 // FinalAnswer boundary from the tool name.
                 answer_effect: *answer_effect,
             });
+        }
+        RuntimeEvent::ToolTimingUpdated { id, timing } => {
+            if let Some(tool) = view.active_tools.iter_mut().find(|tool| tool.id == *id) {
+                tool.timing = Some(timing.clone());
+                if let Some((_, observed)) = view.tool_started.get_mut(id) {
+                    *observed = Some(std::time::Instant::now());
+                }
+            }
         }
         RuntimeEvent::ToolCallCompleted { id, .. } => {
             view.active_tools.retain(|tool| tool.id != *id);
@@ -165,6 +182,76 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
 mod tests {
     use super::*;
     use leveler_core::ToolCallId;
+
+    #[test]
+    fn execution_clock_snapshot_resumes_without_rewriting_the_existing_call_clock() {
+        use std::time::{Duration, Instant};
+        let id = ToolCallId::new("a");
+        let session = SessionId::new("s");
+        let views = LiveViews::default();
+        views.apply(
+            &session,
+            &RuntimeEvent::ToolCallStarted {
+                id: id.clone(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                model_step: Some(1),
+                answer_effect: None,
+            },
+        );
+        views.apply(
+            &session,
+            &RuntimeEvent::ToolTimingUpdated {
+                id: id.clone(),
+                timing: leveler_client_protocol::UiToolTiming {
+                    clock_id: "turn".into(),
+                    started_ms: 40_000,
+                    elapsed_ms: 75_000,
+                    finished: false,
+                },
+            },
+        );
+        {
+            let mut all = views.views.lock().unwrap();
+            let clock = all
+                .get_mut(&session)
+                .unwrap()
+                .tool_started
+                .get_mut(&id)
+                .unwrap();
+            clock.0 = Instant::now() - Duration::from_secs(200);
+            clock.1 = Some(Instant::now() - Duration::from_secs(5));
+        }
+        let snapshot = views.view(&session);
+        let tool = &snapshot.active_tools[0];
+        assert!(
+            tool.elapsed_ms >= 200_000,
+            "the existing per-call clock must be unchanged"
+        );
+        assert_eq!(tool.timing.as_ref().unwrap().started_ms, 40_000);
+        assert!(tool.timing.as_ref().unwrap().elapsed_ms >= 80_000);
+        views.apply(
+            &session,
+            &RuntimeEvent::ToolTimingUpdated {
+                id,
+                timing: leveler_client_protocol::UiToolTiming {
+                    clock_id: "turn".into(),
+                    started_ms: 40_000,
+                    elapsed_ms: 83_000,
+                    finished: true,
+                },
+            },
+        );
+        assert_eq!(
+            views.view(&session).active_tools[0]
+                .timing
+                .as_ref()
+                .unwrap()
+                .elapsed_ms,
+            83_000
+        );
+    }
 
     fn plan() -> UiPlan {
         UiPlan {

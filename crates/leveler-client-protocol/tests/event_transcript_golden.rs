@@ -35,6 +35,7 @@ fn golden_path() -> PathBuf {
 
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s_golden"),
         repository: Some("/repo".to_string()),
         task_status: None,

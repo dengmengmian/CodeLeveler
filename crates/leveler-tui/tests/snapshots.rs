@@ -18,6 +18,7 @@ use leveler_tui::theme::Theme;
 
 fn session_snapshot(collaboration: Option<String>) -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("~/Develop/codeleveler".to_string()),
         task_status: None,

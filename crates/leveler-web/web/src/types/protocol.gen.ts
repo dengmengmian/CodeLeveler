@@ -388,6 +388,8 @@ export type RuntimeEvent =
   | { type: 'project_rules_loaded'; sources: string[] }
   /** A tool call started . */
   | { type: 'tool_call_started'; answer_effect?: AnswerEffect | null; arguments: string; id: ToolCallId; model_step?: number | null; name: string; parallel?: boolean }
+  /** An admitted tool reached an actual dispatch boundary. Announcement and approval wait time are not execution time. */
+  | { type: 'tool_timing_updated'; id: ToolCallId; timing: UiToolTiming }
   /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
   | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; exit_code?: number | null; id: ToolCallId; ok: boolean; preview: string; stop?: UiCommandStop | null }
   /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
@@ -560,6 +562,8 @@ export interface UiActiveToolCall {
   output_tail?: string;
   /** True when `output_tail` dropped earlier output. */
   output_truncated?: boolean;
+  /** Runtime timeline and elapsed at the snapshot boundary. */
+  timing?: UiToolTiming | null;
 }
 
 /** The runtime capability class an agent runs under. */
@@ -1188,6 +1192,12 @@ export interface UiRequestObservation {
 /** Who authored a message. */
 export type UiRole = 'user' | 'assistant' | 'system' | 'tool';
 
+/** The existing bounded history projection, captured with an in-flight snapshot so a reconnect preserves completed members and real group boundaries. */
+export interface UiSessionHistory {
+  entries: UiHistoryEntry[];
+  omitted_turns: number;
+}
+
 /** Session-level observation header + aggregates from durable stores. */
 export interface UiSessionObservation {
   avg_latency_ms?: number | null;
@@ -1246,6 +1256,7 @@ export interface UiSessionSnapshot {
   /** Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message. */
   finalization_stage?: FinalizationStage | null;
   goal: string;
+  history?: UiSessionHistory | null;
   id: SessionId;
   /** The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet). */
   last_sequence?: number | null;
@@ -1345,6 +1356,15 @@ export interface UiToolAggregate {
   total_ms?: number | null;
   /** `tool_call_started` with no matching `tool_call_finished`. */
   unfinished?: number;
+}
+
+/** One tool's timing on a shared, turn-local runtime timeline. Live sources and replay sources use the same persisted monotonic execution facts. Wall-clock timestamps never stand in for missing execution boundaries. Absence means unknown, never an assumed zero. The start coordinate lets clients measure overlapping calls as a span instead of adding durations. */
+export interface UiToolTiming {
+  /** Only coordinates with this exact clock identity can form one span. */
+  clock_id: string;
+  elapsed_ms: number;
+  finished: boolean;
+  started_ms: number;
 }
 
 /** One goal that still owes work. */

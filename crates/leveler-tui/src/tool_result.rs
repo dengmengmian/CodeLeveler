@@ -206,6 +206,7 @@ mod tests {
 
     fn command(preview: &str) -> ToolCallBlock {
         ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,

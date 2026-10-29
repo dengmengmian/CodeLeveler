@@ -33,6 +33,7 @@ fn state() -> AppState {
 
 fn idle_snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".to_string()),
         task_status: None,

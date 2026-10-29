@@ -54,6 +54,7 @@ fn opened() -> AppState {
     );
     state.size = (WIDTH as u16, HEIGHT);
     let snap = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("perf"),
         repository: Some("~/perf".into()),
         task_status: None,

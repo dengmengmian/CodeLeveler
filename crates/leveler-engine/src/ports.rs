@@ -125,6 +125,17 @@ pub trait EventBarrier: Send + Sync {
     /// successfully while silently discarding the record — the caller would
     /// then run a delegated side effect believing it was durable, which is
     /// the exact failure this method exists to prevent.
+    /// Optional display evidence from actual admitted dispatch. Hosts without
+    /// timing support leave it absent; clients must never invent it.
+    fn record_tool_timing(
+        &self,
+        _call_id: &str,
+        _agent_id: Option<&str>,
+        _started: std::time::Instant,
+        _finished: bool,
+    ) {
+    }
+
     fn record_child_tool_event(&self, event: ChildToolEvent);
 }
 

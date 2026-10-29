@@ -64,6 +64,7 @@ fn tool_completed(state: &mut AppState, id: &str, ok: bool) {
 
 fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".to_string()),
         task_status: None,

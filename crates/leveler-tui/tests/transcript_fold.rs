@@ -47,6 +47,7 @@ fn opened_bare() -> AppState {
     s.size = (W as u16, 30);
     s.conv.rect = Some((0, 0, W as u16, 24));
     let snap = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("~/x".into()),
         task_status: None,
