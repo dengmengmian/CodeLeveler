@@ -59,6 +59,7 @@ fn snapshot(
 ) -> UiSessionSnapshot {
     let current = session_override.unwrap_or(configured);
     UiSessionSnapshot {
+        history: None,
         id: leveler_client_protocol::SessionId::new("s1"),
         goal: "dogfood".into(),
         thinking: Some(leveler_client_protocol::UiThinkingState {
@@ -81,6 +82,7 @@ fn snapshot(
 /// Thinking Level, and every other field is the schema's own empty value.
 fn blank() -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: None,
         task_status: None,

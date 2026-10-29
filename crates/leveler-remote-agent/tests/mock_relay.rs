@@ -35,6 +35,7 @@ struct FakeRuntime {
 
 fn snapshot_for(session_id: &str) -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new(session_id),
         repository: Some("/repo".to_string()),
         task_status: None,

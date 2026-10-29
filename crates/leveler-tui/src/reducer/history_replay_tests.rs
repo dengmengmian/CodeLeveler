@@ -48,6 +48,7 @@ fn message(role: UiRole, text: &str) -> UiMessage {
 
 fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
     UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("/repo".into()),
         task_status: None,

@@ -1522,8 +1522,12 @@ mod layout_tests {
         let focused = content
             .lines
             .iter()
-            .find(|line| line.spans.iter().any(|span| span.content.contains("拒绝")))
-            .expect("deny row");
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("仅允许本次"))
+            })
+            .expect("allow once row");
         assert!(
             focused.spans.iter().all(|span| span.style.bg.is_none()),
             "no selection bar: {focused:?}"
@@ -1815,7 +1819,7 @@ mod layout_tests {
             .unwrap_or_else(|| panic!("no row for {needle}:\n{}", lines.join("\n")))
     }
 
-    /// A tall approval is scrolled so the default focus (Deny) and the keys that
+    /// A tall approval is scrolled so the default focus (Allow once) and the keys that
     /// resolve it stay on screen. Before this, the tail was clipped and Down moved
     /// a cursor nobody could see.
     #[test]
@@ -1834,8 +1838,10 @@ mod layout_tests {
         });
         let screen = frame_of(&Overlay::Approval(Box::new(ap)), 80, 16);
         assert!(
-            screen.iter().any(|l| l.contains("拒绝") && l.contains('❯')),
-            "the focused Deny scrolled off:\n{}",
+            screen
+                .iter()
+                .any(|l| l.contains("仅允许本次") && l.contains('❯')),
+            "the focused Allow once scrolled off:\n{}",
             screen.join("\n")
         );
         assert!(

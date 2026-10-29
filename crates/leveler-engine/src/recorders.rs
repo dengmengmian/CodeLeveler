@@ -28,6 +28,8 @@ use crate::ports::{ChildToolEvent, EventBarrier, PortError};
 /// never race the events it waits for.
 #[derive(Clone)]
 pub struct EventEmitter {
+    clock_origin: std::time::Instant,
+    clock_id: String,
     tx: Sender<PumpItem>,
     state: EventPumpState,
     cancel: CancellationToken,
@@ -62,6 +64,8 @@ impl EventEmitter {
         };
         (
             Self {
+                clock_origin: std::time::Instant::now(),
+                clock_id: leveler_core::new_uuid_string(),
                 tx,
                 state: state.clone(),
                 cancel,
@@ -138,6 +142,25 @@ pub struct PumpBarrier {
 impl EventBarrier for PumpBarrier {
     async fn flush(&self) -> Result<(), PortError> {
         self.events.flush().await.map_err(PortError::Persistence)
+    }
+
+    fn record_tool_timing(
+        &self,
+        call_id: &str,
+        agent_id: Option<&str>,
+        started: std::time::Instant,
+        finished: bool,
+    ) {
+        self.events.emit(EngineEvent::ToolExecutionTiming {
+            clock_id: self.events.clock_id.clone(),
+            call_id: call_id.into(),
+            agent_id: agent_id.map(str::to_owned),
+            started_ms: started
+                .saturating_duration_since(self.events.clock_origin)
+                .as_millis() as u64,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            finished,
+        });
     }
 
     /// Enqueue a delegated agent's tool event on the SAME queue `flush`
@@ -291,6 +314,46 @@ impl Clarifier for RecordingClarifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_timing_uses_one_monotonic_timeline_and_survives_the_event_queue() {
+        use std::time::{Duration, Instant};
+        let (mut events, mut rx, _) = EventEmitter::channel(4, CancellationToken::new());
+        let origin = Instant::now() - Duration::from_secs(100);
+        events.clock_origin = origin;
+        let barrier = PumpBarrier { events };
+        let started = origin + Duration::from_secs(5);
+        barrier.record_tool_timing("a", None, started, false);
+        barrier.record_tool_timing("a", None, started, true);
+        barrier.record_tool_timing("b", Some("child"), origin + Duration::from_secs(10), true);
+        for (id, agent, start, finished) in [
+            ("a", None, 5000, false),
+            ("a", None, 5000, true),
+            ("b", Some("child"), 10000, true),
+        ] {
+            let PumpItem::Event(event) = rx.try_recv().unwrap() else {
+                panic!("event expected")
+            };
+            assert!(!event.is_transient());
+            let (_, payload) = event.to_row().unwrap();
+            let EngineEvent::ToolExecutionTiming {
+                clock_id: _,
+                call_id,
+                agent_id,
+                started_ms,
+                elapsed_ms,
+                finished: ended,
+            } = EngineEvent::from_payload(&payload).unwrap()
+            else {
+                panic!("timing expected")
+            };
+            assert_eq!(call_id, id);
+            assert_eq!(agent_id.as_deref(), agent);
+            assert_eq!(started_ms, start);
+            assert_eq!(ended, finished);
+            assert!(elapsed_ms >= 90_000);
+        }
+    }
 
     struct ProjectApprover;
     #[async_trait]

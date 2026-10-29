@@ -105,9 +105,18 @@ impl ToolCallBlock {
     }
 }
 
+/// Projection of runtime timing onto the existing monotonic turn clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolTiming {
+    pub runtime: leveler_client_protocol::UiToolTiming,
+    /// None for replay: historical offsets cannot anchor a live client clock.
+    pub observed_elapsed_secs: Option<u64>,
+}
+
 /// A tool invocation .
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallBlock {
+    pub timing: Option<ToolTiming>,
     pub id: ToolCallId,
     pub name: String,
     /// Compacted JSON arguments.
@@ -1085,6 +1094,13 @@ impl TranscriptState {
                     for call in &mut group.calls {
                         if call.status == ToolStatus::Running {
                             call.status = ToolStatus::Unknown;
+                            if call
+                                .timing
+                                .as_ref()
+                                .is_none_or(|timing| !timing.runtime.finished)
+                            {
+                                call.timing = None;
+                            }
                         }
                     }
                 }
@@ -1162,6 +1178,7 @@ impl TranscriptState {
     ) {
         self.bump();
         let mut call = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -1204,6 +1221,30 @@ impl TranscriptState {
                 display: DisplayMode::Collapsed,
                 round: model_step,
             })),
+        }
+    }
+
+    /// Re-anchor an existing history row using the runtime's running snapshot.
+    pub fn resume_tool_clock(&mut self, id: &ToolCallId, started_elapsed_secs: i64) {
+        self.bump();
+        if let Some(call) = self.tool_call_mut(id) {
+            call.started_elapsed_secs = started_elapsed_secs;
+        }
+    }
+
+    /// Attach runtime execution facts and, when live, their observation anchor.
+    pub fn set_tool_timing(
+        &mut self,
+        id: &ToolCallId,
+        timing: Option<leveler_client_protocol::UiToolTiming>,
+        observed_elapsed_secs: Option<u64>,
+    ) {
+        self.bump();
+        if let Some(call) = self.tool_call_mut(id) {
+            call.timing = timing.map(|runtime| ToolTiming {
+                runtime,
+                observed_elapsed_secs,
+            });
         }
     }
 
@@ -3050,6 +3091,7 @@ mod tests {
     fn group(expanded: bool) -> ToolGroupBlock {
         ToolGroupBlock {
             calls: vec![ToolCallBlock {
+                timing: None,
                 exit_code: None,
                 output: String::new(),
                 output_truncated: false,

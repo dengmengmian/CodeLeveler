@@ -4390,6 +4390,7 @@ mod tests {
 
         let task = TranscriptItem::ToolGroup(ToolGroupBlock {
             calls: vec![ToolCallBlock {
+                timing: None,
                 exit_code: None,
                 output: String::new(),
                 output_truncated: false,
@@ -5360,6 +5361,7 @@ mod tests {
 
     fn tool_item(name: &str, args: &str, ms: u64) -> ToolCallBlock {
         ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -5549,6 +5551,7 @@ mod tests {
     #[test]
     fn failed_tool_output_is_available_in_expanded_details() {
         let item = ToolCallBlock {
+                       timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -5579,6 +5582,7 @@ mod tests {
     #[test]
     fn read_file_success_hides_noisy_preview_until_expanded() {
         let item = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -5614,6 +5618,7 @@ mod tests {
     #[test]
     fn update_goal_success_hides_internal_preview() {
         let item = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,
@@ -5653,6 +5658,7 @@ mod tests {
     fn update_goal_success_expands_full_summary_not_internal_preview() {
         let long = "已通过阅读 README.md, Cargo.toml, AGENTS.md 和目录结构, 确认这是一个 Rust 多 crate workspace 编程 Agent CLI，默认 Goal 模式需要 update_goal 显式结案。";
         let item = ToolCallBlock {
+            timing: None,
             exit_code: None,
             output: String::new(),
             output_truncated: false,

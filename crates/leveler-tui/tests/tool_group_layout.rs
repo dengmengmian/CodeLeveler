@@ -37,6 +37,7 @@ fn opened() -> AppState {
         },
     );
     let snap = UiSessionSnapshot {
+        history: None,
         id: SessionId::new("s1"),
         repository: Some("~/x".into()),
         task_status: None,

@@ -271,6 +271,15 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reasoning: Vec<leveler_model::ReasoningSegment>,
     },
+    /// Actual admitted execution boundaries, on the turn pump's monotonic clock.
+    ToolExecutionTiming {
+        clock_id: String,
+        call_id: String,
+        agent_id: Option<String>,
+        started_ms: u64,
+        elapsed_ms: u64,
+        finished: bool,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,
@@ -786,7 +795,8 @@ impl EngineEvent {
     /// worth knowing.
     pub fn producer(&self) -> &str {
         match self {
-            EngineEvent::ToolCallStarted { agent_id, .. }
+            EngineEvent::ToolExecutionTiming { agent_id, .. }
+            | EngineEvent::ToolCallStarted { agent_id, .. }
             | EngineEvent::ToolCallFinished { agent_id, .. } => {
                 agent_id.as_deref().unwrap_or("main")
             }
@@ -848,7 +858,8 @@ impl EngineEvent {
         match self {
             // Lifecycle, status, counts, ids, verdicts, and the remote-control
             // surface — safe for a sanitized projection.
-            EngineEvent::TaskStarted { .. }
+            EngineEvent::ToolExecutionTiming { .. }
+            | EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnStarted { .. }
             | EngineEvent::FinalizationStarted { .. }
             | EngineEvent::FinalizationPhaseStarted { .. }
@@ -1053,6 +1064,7 @@ impl EngineEvent {
             | EngineEvent::ReasoningDelta { .. }
             | EngineEvent::ReasoningCompleted { .. }
             | EngineEvent::AssistantMessage { .. }
+            | EngineEvent::ToolExecutionTiming { .. }
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallFinished { .. }
             | EngineEvent::WorkspaceSnapshotCreated { .. }

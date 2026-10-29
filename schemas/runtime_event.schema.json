@@ -549,6 +549,29 @@
       }
     },
     {
+      "description": "An admitted tool reached an actual dispatch boundary. Announcement and approval wait time are not execution time.",
+      "type": "object",
+      "required": [
+        "id",
+        "timing",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "timing": {
+          "$ref": "#/definitions/UiToolTiming"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool_timing_updated"
+          ]
+        }
+      }
+    },
+    {
       "description": "A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side.",
       "type": "object",
       "required": [
@@ -3959,6 +3982,29 @@
           }
         },
         {
+          "description": "An admitted tool reached an actual dispatch boundary. Announcement and approval wait time are not execution time.",
+          "type": "object",
+          "required": [
+            "id",
+            "timing",
+            "type"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/ToolCallId"
+            },
+            "timing": {
+              "$ref": "#/definitions/UiToolTiming"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool_timing_updated"
+              ]
+            }
+          }
+        },
+        {
           "description": "A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side.",
           "type": "object",
           "required": [
@@ -5907,6 +5953,17 @@
           "description": "True when `output_tail` dropped earlier output.",
           "default": false,
           "type": "boolean"
+        },
+        "timing": {
+          "description": "Runtime timeline and elapsed at the snapshot boundary.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiToolTiming"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -8101,6 +8158,27 @@
         "tool"
       ]
     },
+    "UiSessionHistory": {
+      "description": "The existing bounded history projection, captured with an in-flight snapshot so a reconnect preserves completed members and real group boundaries.",
+      "type": "object",
+      "required": [
+        "entries",
+        "omitted_turns"
+      ],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiHistoryEntry"
+          }
+        },
+        "omitted_turns": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "UiSessionObservation": {
       "description": "Session-level observation header + aggregates from durable stores.",
       "type": "object",
@@ -8376,6 +8454,16 @@
         },
         "goal": {
           "type": "string"
+        },
+        "history": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiSessionHistory"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "id": {
           "$ref": "#/definitions/SessionId"
@@ -8785,6 +8873,35 @@
           "default": 0,
           "type": "integer",
           "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiToolTiming": {
+      "description": "One tool's timing on a shared, turn-local runtime timeline. Live sources and replay sources use the same persisted monotonic execution facts. Wall-clock timestamps never stand in for missing execution boundaries. Absence means unknown, never an assumed zero. The start coordinate lets clients measure overlapping calls as a span instead of adding durations.",
+      "type": "object",
+      "required": [
+        "clock_id",
+        "elapsed_ms",
+        "finished",
+        "started_ms"
+      ],
+      "properties": {
+        "clock_id": {
+          "description": "Only coordinates with this exact clock identity can form one span.",
+          "type": "string"
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "finished": {
+          "type": "boolean"
+        },
+        "started_ms": {
+          "type": "integer",
+          "format": "uint64",
           "minimum": 0.0
         }
       }

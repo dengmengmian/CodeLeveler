@@ -177,6 +177,7 @@ fn input_recovery_session_switch_from_btw_clears_main_undo() {
         &mut s,
         Action::Runtime(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
+                history: None,
                 id: SessionId::new("new-session"),
                 repository: None,
                 task_status: None,
