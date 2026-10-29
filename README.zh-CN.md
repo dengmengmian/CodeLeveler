@@ -49,7 +49,7 @@ leveler
 | 继续之前的会话 | `leveler resume` |
 | 查看帮助 | `leveler --help` |
 
-`leveler run --parallel 2` 保留指定的权限模式、网络限制和模型步数上限，支持 `--output jsonl`。并行任务会在启动前拒绝 shipping 参数（`--commit`、`--push`、`--pr`、`--branch`、`--pr-base`）；请审查合并结果后单独提交或推送。单任务的 shipping 支持两种输出格式，失败时返回非零退出码。
+`leveler run --parallel 2` 保留指定的权限模式、网络限制和模型步数上限，支持 `--output jsonl`。并行任务会在启动前拒绝 shipping 参数（`--commit`、`--push`、`--pr`、`--branch`、`--pr-base`）；请审查合并结果后单独提交或推送。单任务的 shipping 支持两种输出格式，失败时返回非零退出码。 候选初始化、执行或提交出错时，会在集成前保留原始原因并返回失败，同时记录候选结束并清理本次 worktree。
 
 终端里可以使用 `/develop <目标>` 完成分析、编码、验证和评审。`/help` 查看命令与快捷键，`/thinking` 调整模型思考强度。
 

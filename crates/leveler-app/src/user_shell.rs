@@ -262,6 +262,16 @@ pub(crate) struct UserShellStore {
 }
 
 impl UserShellStore {
+    /// Forget a deleted session and stop its foreground execution. Background
+    /// processes are settled by the registry before the session is removed.
+    pub fn drop_session(&self, session_id: &SessionId) {
+        if let Some(shells) = self.inner.lock().unwrap().remove(session_id)
+            && let Some(active) = shells.active
+        {
+            active.cancel.cancel();
+        }
+    }
+
     pub fn begin(
         &self,
         session_id: &SessionId,

@@ -429,7 +429,7 @@ fn proposed_memory_projects_to_truthful_pending_notification() {
 /// The configured backend decides which store is read: the same one writes go
 /// to, never a second database.
 fn send_memory_list(
-    events: &tokio::sync::broadcast::Sender<RuntimeEvent>,
+    events: &crate::event_bridge::RuntimeEventSender,
     service: &leveler_memory::MemoryService,
     lanes: leveler_memory::MemoryLanes,
     memory_dir: &std::path::Path,
@@ -513,7 +513,7 @@ fn spawn_auxiliary_assist(
     assists: Arc<AuxiliaryAssists>,
     session_id: SessionId,
     model: ModelRef,
-    events: broadcast::Sender<RuntimeEvent>,
+    events: crate::event_bridge::RuntimeEventSender,
     kind: AssistKind,
 ) {
     if active.is_running(&session_id) {
@@ -582,7 +582,7 @@ fn session_status_wire(
     }
 }
 
-fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: Option<&Path>) {
+fn emit_project_rules(events: &crate::event_bridge::RuntimeEventSender, repo: Option<&Path>) {
     let Some(repo) = repo else {
         return;
     };
@@ -712,6 +712,26 @@ async fn runtime_quiescence(
     })
 }
 
+#[derive(Default)]
+struct SessionStreams {
+    streams: Mutex<HashMap<SessionId, SessionStream>>,
+    shutdown: CancellationToken,
+}
+
+struct SessionStream {
+    events: crate::event_bridge::RuntimeEventSender,
+    cancellation: CancellationToken,
+}
+
+impl Drop for SessionStreams {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        for stream in self.streams.get_mut().unwrap().values() {
+            stream.events.close();
+        }
+    }
+}
+
 /// An in-process runtime client backed by an [`Application`].
 ///
 /// Cloning yields another handle to the SAME runtime: every mutable field is
@@ -736,7 +756,7 @@ pub struct InProcessRuntimeClient {
     /// Compatibility stream containing events from every session.
     events: broadcast::Sender<RuntimeEvent>,
     /// Session-scoped streams used by daemon/socket clients.
-    session_events: Arc<Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>>,
+    session_events: Arc<SessionStreams>,
     pending: PendingApprovals,
     pending_clarify: PendingClarifications,
     /// User shell executions (`!command`): active + bounded history.
@@ -1292,15 +1312,19 @@ impl InProcessRuntimeClient {
         auto_approve: bool,
     ) -> Self {
         let (events, _) = broadcast::channel(2048);
-        let session_events: Arc<Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let session_events = Arc::new(SessionStreams::default());
         let mut memory_events = app.subscribe_memory_events();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let all_events = events.clone();
-            let scoped_events = session_events.clone();
+            let scoped_events = Arc::downgrade(&session_events);
+            let shutdown = session_events.shutdown.clone();
             handle.spawn(async move {
                 loop {
-                    let event = match memory_events.recv().await {
+                    let event = match tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        event = memory_events.recv() => event,
+                    } {
                         Ok(event) => event,
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "memory event bridge lagged");
@@ -1310,14 +1334,19 @@ impl InProcessRuntimeClient {
                     };
                     let session_id = event.session_id.clone();
                     let runtime_event = project_memory_consolidation_event(event);
-                    let _ = all_events.send(runtime_event.clone());
-                    if let Some(sender) = scoped_events
+                    let Some(streams) = scoped_events.upgrade() else {
+                        return;
+                    };
+                    let sender = streams
+                        .streams
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unwrap()
                         .get(&SessionId::new(session_id))
-                        .cloned()
-                    {
+                        .map(|stream| stream.events.clone());
+                    if let Some(sender) = sender {
                         let _ = sender.send(runtime_event);
+                    } else {
+                        let _ = all_events.send(runtime_event);
                     }
                 }
             });
@@ -1471,31 +1500,48 @@ impl InProcessRuntimeClient {
             });
     }
 
-    fn events_for(&self, session_id: &SessionId) -> broadcast::Sender<RuntimeEvent> {
-        let mut session_events = self.session_events.lock().unwrap();
-        if let Some(events) = session_events.get(session_id).cloned() {
-            return events;
+    fn forget_session(&self, session_id: &SessionId) {
+        if let Some(stream) = self
+            .session_events
+            .streams
+            .lock()
+            .unwrap()
+            .remove(session_id)
+        {
+            stream.cancellation.cancel();
+            stream.events.close();
         }
-        let (events, mut forward) = broadcast::channel(2048);
-        session_events.insert(session_id.clone(), events.clone());
-        drop(session_events);
+        self.session_runtime.lock().unwrap().remove(session_id);
+        self.live_views.clear(session_id);
+        self.checkpoints.drop_session(session_id);
+        self.drop_btw_thread(session_id);
+        self.user_shells.drop_session(session_id);
+        self.steering.lock().unwrap().remove(session_id);
+        self.goal_steering.lock().unwrap().remove(session_id);
+    }
+
+    fn events_for(&self, session_id: &SessionId) -> crate::event_bridge::RuntimeEventSender {
+        let mut streams = self.session_events.streams.lock().unwrap();
+        if let Some(stream) = streams.get(session_id) {
+            return stream.events.clone();
+        }
+        let (sender, _) = broadcast::channel(2048);
         let all_events = self.events.clone();
-        let live_views = self.live_views.clone();
-        let owned_session_id = session_id.clone();
-        tokio::spawn(async move {
-            loop {
-                match forward.recv().await {
-                    Ok(event) => {
-                        live_views.apply(&owned_session_id, &event);
-                        let _ = all_events.send(event);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "session event compatibility stream lagged");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        let events = crate::event_bridge::RuntimeEventSender::projected(
+            sender,
+            all_events,
+            self.live_views.clone(),
+            session_id.clone(),
+        );
+        let cancellation = self.session_events.shutdown.child_token();
+        streams.insert(
+            session_id.clone(),
+            SessionStream {
+                events: events.clone(),
+                cancellation: cancellation.clone(),
+            },
+        );
+        drop(streams);
         let background_registry = self.app.background_tasks().clone();
         let mut background_events = background_registry.subscribe();
         let background_session_id = session_id.clone();
@@ -1506,7 +1552,11 @@ impl InProcessRuntimeClient {
         let background_app = std::sync::Arc::downgrade(&self.app);
         tokio::spawn(async move {
             loop {
-                match background_events.recv().await {
+                match tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    event = background_events.recv() => event,
+                } {
                     Ok(leveler_execution::BackgroundTaskEvent::Started { owner_scope, task })
                         if owner_scope.as_deref() == Some(background_session_id.as_str()) =>
                     {
@@ -3528,7 +3578,15 @@ impl InProcessRuntimeClient {
             // Recovery committed this input under fencing. Do not let legacy
             // resume's compatibility search skip a corrupt latest input and
             // quietly bind continuation to an unrelated older objective.
-            let payload = turn.payload.as_deref().ok_or_else(|| {
+            let persisted = leveler_storage::TurnRepository::new(&db)
+                .list_by_ids(session_id, std::slice::from_ref(&turn.id))
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+                .pop()
+                .ok_or_else(|| {
+                    ClientError::Runtime("recovered interrupted turn is missing".into())
+                })?;
+            let payload = persisted.payload.as_deref().ok_or_else(|| {
                 ClientError::Runtime("recovered interrupted turn has no initiating payload".into())
             })?;
             leveler_engine::decode_turn_initiating_message_opt(payload)
@@ -5884,6 +5942,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     // only replace that one honest failure with a second one.
                     return Ok(());
                 }
+                self.forget_session(&session_id);
                 crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let _ = self.events.send(RuntimeEvent::SessionList {
                     sessions: self.list_sessions().await?,
@@ -5909,12 +5968,16 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     self.notify_error(&requester_session_id, format!("删除会话失败: {error}"));
                     return Ok(());
                 }
+                self.forget_session(&session_id);
                 crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
-                let _ = self
-                    .events_for(&requester_session_id)
-                    .send(RuntimeEvent::SessionList {
-                        sessions: self.list_sessions().await?,
-                    });
+                let event = RuntimeEvent::SessionList {
+                    sessions: self.list_sessions().await?,
+                };
+                if requester_session_id == session_id {
+                    let _ = self.events.send(event);
+                } else {
+                    let _ = self.events_for(&requester_session_id).send(event);
+                }
                 Ok(())
             }
             ClientCommand::ArchiveSession { session_id } => {
@@ -7528,7 +7591,7 @@ async fn projected_plan(
 /// checkpoints); `false` when history was left unchanged (short/no-op/error).
 async fn compact_conversation(
     app: &Application,
-    events: &broadcast::Sender<RuntimeEvent>,
+    events: &crate::event_bridge::RuntimeEventSender,
     live_views: &crate::live_view::LiveViews,
     model: &ModelRef,
     session_id: &SessionId,
@@ -8901,10 +8964,11 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
         let (attempt_tx, attempt_rx) = oneshot::channel();
         let (done_tx, mut done_rx) = oneshot::channel();
         let handle = tokio::runtime::Handle::current();
+        let command_client = client.clone();
         let consumer = std::thread::spawn(move || {
             attempt_tx.send(()).unwrap();
             handle
-                .block_on(client.send(ClientCommand::RequestPromptSuggestion {
+                .block_on(command_client.send(ClientCommand::RequestPromptSuggestion {
                     session_id: session,
                 }))
                 .unwrap();
@@ -9048,7 +9112,7 @@ mod memory_listing_tests {
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         for include_archived in [false, true] {
             send_memory_list(
-                &events,
+                &events.clone().into(),
                 &project_service(directory.path()),
                 leveler_memory::MemoryLanes::ALL,
                 directory.path(),
@@ -9086,7 +9150,7 @@ mod memory_listing_tests {
         .unwrap();
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         send_memory_list(
-            &events,
+            &events.clone().into(),
             &service,
             leveler_memory::MemoryLanes::ALL,
             directory.path(),
@@ -9130,7 +9194,7 @@ mod memory_listing_tests {
 
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         send_memory_list(
-            &events,
+            &events.clone().into(),
             &service,
             leveler_memory::MemoryLanes::ALL,
             directory.path(),
@@ -9173,7 +9237,7 @@ mod memory_listing_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         send_memory_list(
-            &events,
+            &events.clone().into(),
             &service,
             leveler_memory::MemoryLanes::ALL,
             directory.path(),
@@ -9370,5 +9434,147 @@ mod recovered_continuation_tests {
                 .unwrap();
             assert_eq!(client.continuation_state(&session).await.unwrap(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_stream_tests {
+    use super::*;
+
+    fn runtime(root: &Path) -> InProcessRuntimeClient {
+        let app = Application::assemble(leveler_project::Layout::from_parts(
+            root.to_path_buf(),
+            root.join("configs"),
+            root.join("state"),
+        ))
+        .unwrap();
+        InProcessRuntimeClient::new(
+            Arc::new(app),
+            ModelRef::new("unused", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn live_view_is_current_before_broadcast_consumers_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        let id = SessionId::new("stream");
+        let sender = runtime.events_for(&id);
+        let _receiver = sender.subscribe();
+        sender
+            .send(RuntimeEvent::ToolCallStarted {
+                id: leveler_core::ToolCallId::new("tool"),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                model_step: None,
+                answer_effect: None,
+            })
+            .unwrap();
+        assert_eq!(runtime.live_views.view(&id).active_tools.len(), 1);
+        sender.send(RuntimeEvent::TurnCancelled).unwrap();
+        for _ in 0..2048 {
+            sender
+                .send(RuntimeEvent::Notification {
+                    level: NotificationLevel::Info,
+                    message: "overflow".into(),
+                })
+                .unwrap();
+        }
+        assert!(runtime.live_views.view(&id).active_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_runtime_closes_session_streams() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        let mut receiver = runtime.subscribe_session(&SessionId::new("stream"));
+        drop(runtime);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv()).await,
+            Ok(Err(broadcast::error::RecvError::Closed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_session_closes_stream_and_clears_projection() {
+        delete_session(false).await;
+        delete_session(true).await;
+    }
+
+    async fn delete_session(scoped: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        let db = runtime.app.open_database().await.unwrap();
+        let record =
+            leveler_storage::SessionRecord::new("/repo", "delete", "unused/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let id = SessionId::new(record.id);
+        let cancel = CancellationToken::new();
+        runtime.btw.lock().unwrap().insert(
+            id.clone(),
+            BtwSession {
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            },
+        );
+        let shell_cancel = CancellationToken::new();
+        runtime.user_shells.begin(
+            &id,
+            leveler_core::UserShellId::new("shell"),
+            "echo test".into(),
+            "/repo".into(),
+            shell_cancel.clone(),
+            CancellationToken::new(),
+        );
+        let sender = runtime.events_for(&id);
+        let mut receiver = sender.subscribe();
+        sender
+            .send(RuntimeEvent::ToolCallStarted {
+                id: leveler_core::ToolCallId::new("tool"),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                model_step: None,
+                answer_effect: None,
+            })
+            .unwrap();
+        receiver.recv().await.unwrap();
+        runtime
+            .send(if scoped {
+                ClientCommand::DeleteSessionFor {
+                    requester_session_id: id.clone(),
+                    session_id: id.clone(),
+                }
+            } else {
+                ClientCommand::DeleteSession {
+                    session_id: id.clone(),
+                }
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv()).await,
+            Ok(Err(broadcast::error::RecvError::Closed))
+        ));
+        assert!(runtime.live_views.view(&id).active_tools.is_empty());
+        assert!(
+            !runtime
+                .session_events
+                .streams
+                .lock()
+                .unwrap()
+                .contains_key(&id)
+        );
+        assert!(runtime.user_shells.snapshot(&id).is_empty());
+        assert!(!runtime.btw.lock().unwrap().contains_key(&id));
+        assert!(cancel.is_cancelled());
+        assert!(shell_cancel.is_cancelled());
+        assert!(
+            sender.send(RuntimeEvent::TurnCancelled).is_err(),
+            "stale producers must stay closed"
+        );
     }
 }

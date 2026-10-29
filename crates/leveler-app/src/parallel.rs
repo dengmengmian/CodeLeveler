@@ -109,6 +109,7 @@ impl Application {
         // Once the parent is Running, every exit is converted into one
         // canonical terminal fact below. The body may fail at any worktree,
         // candidate-log, or integration step without stranding the parent.
+        let mut worktrees = Vec::new();
         let result: Result<ParallelEditOutcome, AppError> = async {
             log.append(
                 None,
@@ -126,7 +127,6 @@ impl Application {
             .map_err(crate::session::app_error_from_engine)?;
 
             // Create N isolated worktrees off the base commit.
-            let mut worktrees = Vec::new();
             for i in 0..n {
                 let path = worktree_path(&slug, i);
                 let branch = format!("leveler/parallel-{slug}-{parent}-{i}");
@@ -160,20 +160,14 @@ impl Application {
                 let model_step_ceiling = self.model_step_ceiling;
                 let cancellation = cancellation.child_token();
                 async move {
-                    let layout = Layout::resolve(path.clone(), Some(config_dir));
-                    // The candidate inherits the run's resolved axis; a fresh
-                    // Application would otherwise fall back to the product
-                    // default and silently re-open the axis the run closed.
-                    let mut app = Application::assemble(layout)
-                        .ok()?
-                        .with_collaboration(collaboration);
-                    app.model_step_ceiling = model_step_ceiling;
-                    // Direct tool loop only — no orchestrate dual path.
-                    let result = async {
-                        let session_id = app
-                            .create_session_with_mode(&model, &task, mode)
-                            .await
-                            .ok()?;
+                    let mut child_session = String::new();
+                    let result: Result<bool, AppError> = async {
+                        let layout = Layout::resolve(path.clone(), Some(config_dir));
+                        let mut app =
+                            Application::assemble(layout)?.with_collaboration(collaboration);
+                        app.model_step_ceiling = model_step_ceiling;
+                        let session_id = app.create_session_with_mode(&model, &task, mode).await?;
+                        child_session = session_id.to_string();
                         let outcome = app
                             .run_in_session(
                                 &session_id,
@@ -186,68 +180,64 @@ impl Application {
                                 cancellation.clone(),
                             )
                             .await;
-                        // A failed or cancelled candidate still admitted its
-                        // turn; settle memory before this worktree's process
-                        // state is discarded.
+                        // Settle admitted work even when its turn failed.
                         app.flush_memory_for_headless().await;
-                        Some((session_id, outcome.ok()?))
+                        let outcome = outcome?;
+                        let verified = matches!(
+                            outcome.stop_reason,
+                            leveler_agent::StopReason::Completed
+                                | leveler_agent::StopReason::Answered
+                        );
+                        if verified {
+                            let git = GitWorkflow::with_environment(&path, app.environment.clone());
+                            git.commit_changes("parallel candidate", &cancellation)
+                                .await?;
+                        }
+                        Ok(verified)
                     }
                     .await;
-
-                    // Commit the candidate's changes (never .leveler/).
-                    let git = GitWorkflow::with_environment(&path, app.environment.clone());
-                    git.commit_changes("parallel candidate", &cancellation)
-                        .await
-                        .ok()?;
-
-                    let (child_session, verified) = match result {
-                        Some((session_id, outcome)) => (
-                            session_id.to_string(),
-                            matches!(
-                                outcome.stop_reason,
-                                leveler_agent::StopReason::Completed
-                                    | leveler_agent::StopReason::Answered
-                            ),
-                        ),
-                        None => (String::new(), false),
-                    };
-                    Some((MergeCandidate { branch, verified }, child_session))
+                    (branch, child_session, result)
                 }
             });
 
             let mut candidates: Vec<MergeCandidate> = Vec::new();
-            for (candidate, child_session) in futures::future::join_all(futures)
-                .await
-                .into_iter()
-                .flatten()
-            {
+            let mut first_error = None;
+            for (branch, child_session, result) in futures::future::join_all(futures).await {
+                let verified = matches!(&result, Ok(true));
                 log.append(
                     None,
                     EngineEvent::CandidateFinished {
-                        branch: candidate.branch.clone(),
+                        branch: branch.clone(),
                         session_id: child_session,
-                        verified: candidate.verified,
+                        verified,
                     },
                     sink,
                 )
                 .await
                 .map_err(crate::session::app_error_from_engine)?;
-                if candidate.verified {
-                    candidates.push(candidate);
+                match result {
+                    Ok(true) => candidates.push(MergeCandidate { branch, verified }),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%branch, %error, "parallel candidate failed");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
                 }
+            }
+            // Infrastructure/provider failures are not unverified candidates.
+            // Preserve their typed cause and settle the parent as failed.
+            if let Some(error) = first_error {
+                return Err(error);
             }
             let verified = candidates.iter().filter(|c| c.verified).count();
 
             // Integrate into the main working tree.
             let merge = main_git.integrate(&candidates, &cancellation).await?;
 
-            // Clean up worktrees and their branches.
-            for (path, branch) in &worktrees {
-                main_git.remove_worktree(path, branch, &cancellation).await;
-            }
-
             Ok(ParallelEditOutcome {
-                candidates: candidates.len(),
+                candidates: n,
                 verified,
                 integrated: merge.integrated,
                 conflicted: merge.conflicted,
@@ -255,9 +245,12 @@ impl Application {
             })
         }
         .await;
-        // Child candidates intentionally collapse their local failures into
-        // absence, but cancellation is a parent lifecycle fact and must never
-        // be rewritten as a successful zero-candidate run.
+        // Cleanup is owned by this run and must also execute after setup,
+        // candidate, logging or integration failure, including cancellation.
+        let cleanup = CancellationToken::new();
+        for (path, branch) in &worktrees {
+            main_git.remove_worktree(path, branch, &cleanup).await;
+        }
         let result = honor_parent_cancellation(result, &cancellation);
 
         let terminal = match &result {
@@ -326,6 +319,107 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_failure_preserves_cause_and_settles_every_started_candidate() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "parallel::tests::candidate_failure_child",
+                "--nocapture",
+            ])
+            .env("LEVELER_TEST_PARALLEL_FAILURE", "1")
+            .env("LEVELER_HOME", home.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn candidate_failure_child() {
+        if std::env::var_os("LEVELER_TEST_PARALLEL_FAILURE").is_none() {
+            return;
+        }
+
+        use leveler_test_support::git::{run, scratch_repo};
+        let repo = scratch_repo();
+        std::fs::create_dir_all(repo.path().join(".leveler")).unwrap();
+        std::fs::write(
+            repo.path().join(".leveler/config.yaml"),
+            "memory:\n  enabled: false\n",
+        )
+        .unwrap();
+        run(repo.path(), &["add", "."]);
+        run(repo.path(), &["commit", "-qm", "seed"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let app = Application::assemble(Layout::from_parts(
+            repo.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        ))
+        .unwrap();
+        let error = app
+            .parallel_edit(
+                &ModelRef::new("unconfigured", "model"),
+                PermissionProfile::Assisted,
+                "failure-probe",
+                2,
+                Arc::new(leveler_execution::AutoApprove),
+                false,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("candidate errors must not become an empty success");
+        assert!(error.to_string().contains("unconfigured"), "{error}");
+        let db = app.open_database().await.unwrap();
+        let parent = leveler_storage::SessionRepository::new(&db)
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|session| session.goal == "failure-probe")
+            .unwrap();
+        let id = leveler_core::SessionId::new(parent.id);
+        let events = leveler_storage::EventRepository::new(&db)
+            .load(&id)
+            .await
+            .unwrap();
+        let finished: Vec<_> = events
+            .iter()
+            .filter_map(
+                |record| match EngineEvent::from_payload(&record.payload).unwrap() {
+                    EngineEvent::CandidateFinished {
+                        session_id,
+                        verified,
+                        ..
+                    } => Some((session_id, verified)),
+                    _ => None,
+                },
+            )
+            .collect();
+        assert_eq!(finished.len(), 2);
+        assert!(
+            finished
+                .iter()
+                .all(|(id, verified)| !id.is_empty() && !verified)
+        );
+        assert_eq!(parent.status, SessionStatus::Failed);
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn parent_cancellation_cannot_become_a_successful_empty_result() {
