@@ -1,10 +1,9 @@
-//! Presentation helpers shared by the code-intelligence tools.
+//! Bounded source scanning, authorized reads and symbol presentation.
 //!
 //! The language-server sessions themselves belong to
 //! [`leveler_lsp::LspSessions`], which every one of these tools is constructed
-//! with. What is left here is the part that is genuinely about rendering an
-//! answer to the model: which files a scan may look at, how a definition block
-//! is clipped, and how a path is shortened for display.
+//! with. Shared scans resolve file reads through the call's frozen workspace
+//! authority, and presentation bounds the definition block and display paths.
 //!
 //! `find_symbol` used to carry its own copy of the session start + locate
 //! logic, and three of these tools carried three drifting copies of the source
@@ -12,7 +11,9 @@
 //! extension list, so the same repository had two different ideas of what
 //! counts as source. There is one of each now.
 
-use std::path::Path;
+use crate::tool::ToolError;
+use std::path::{Path, PathBuf};
+use tokio_util::sync::CancellationToken;
 
 /// Cap on the files a dependency-free scan will walk.
 pub(crate) const MAX_SCAN_FILES: usize = 2000;
@@ -31,26 +32,105 @@ const IGNORED_DIRS: &[&str] = &[
 ///
 /// "Source" means whatever [`leveler_context::repo_map::is_source`] says, so
 /// the scan and the repository map agree about the same tree.
+#[cfg(test)]
 pub(crate) fn collect_source_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    if out.len() >= MAX_SCAN_FILES {
-        return;
+    scan(
+        root,
+        dir,
+        out,
+        &mut std::collections::HashSet::new(),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+}
+
+/// Directory traversal is blocking; cancellation is checked at each entry.
+pub(crate) async fn source_files(
+    root: PathBuf,
+    cancellation: CancellationToken,
+) -> Result<Vec<String>, ToolError> {
+    tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        scan(&root, &root, &mut files, &mut visited, &cancellation)?;
+        Ok(files)
+    })
+    .await
+    .map_err(|error| ToolError::Io(error.to_string()))?
+}
+
+fn scan(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    cancellation: &CancellationToken,
+) -> Result<(), ToolError> {
+    if cancellation.is_cancelled() {
+        return Err(ToolError::Io("symbol scan cancelled".into()));
     }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    if files.len() >= MAX_SCAN_FILES {
+        return Ok(());
+    }
+    let canonical = dir
+        .canonicalize()
+        .map_err(|error| ToolError::Io(error.to_string()))?;
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).map_err(|error| ToolError::Io(error.to_string()))? {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Io("symbol scan cancelled".into()));
+        }
+        if files.len() >= MAX_SCAN_FILES {
+            break;
+        }
+        let entry = entry.map_err(|error| ToolError::Io(error.to_string()))?;
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if !IGNORED_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
-                collect_source_files(root, &path, out);
+            if !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_str()) {
+                scan(root, &path, files, visited, cancellation)?;
             }
         } else if let Ok(rel) = path.strip_prefix(root) {
             let rel = rel.to_string_lossy().replace('\\', "/");
             if leveler_context::repo_map::is_source(&rel) {
-                out.push(rel);
+                files.push(rel);
             }
         }
+    }
+    Ok(())
+}
+
+/// Resolve every discovered or LSP-provided path through the frozen authority.
+pub(crate) async fn read_source(
+    workspace: &leveler_execution::Workspace,
+    path: &Path,
+    cancellation: &CancellationToken,
+    max_bytes: Option<usize>,
+) -> Result<String, ToolError> {
+    use tokio::io::AsyncReadExt;
+    let path = workspace.resolve_for_read(path)?;
+    let read = async {
+        let file = tokio::fs::File::open(&path).await?;
+        if !file.metadata().await?.is_file() {
+            return Err(std::io::Error::other("symbol source is not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        file.take(max_bytes.map_or(u64::MAX, |limit| limit as u64))
+            .read_to_end(&mut bytes)
+            .await?;
+        if max_bytes.is_some() {
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ToolError::Io("symbol read cancelled".into())),
+        result = read => result.map_err(|error| ToolError::Io(error.to_string())),
     }
 }
 
@@ -125,6 +205,17 @@ pub(crate) fn column_of(line_text: &str, name: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_scan_caps_a_flat_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..MAX_SCAN_FILES + 1 {
+            std::fs::write(dir.path().join(format!("file{index}.rs")), "").unwrap();
+        }
+        let mut files = Vec::new();
+        collect_source_files(dir.path(), dir.path(), &mut files);
+        assert_eq!(files.len(), MAX_SCAN_FILES);
+    }
 
     #[test]
     fn extract_block_marks_an_unclosed_clip() {

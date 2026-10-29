@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_execution::RiskLevel;
 use leveler_lsp::{Located, LspSessions};
 
-use super::symbols::{collect_source_files, column_of, relativize};
+use super::symbols::{column_of, read_source, relativize, source_files};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 200;
@@ -62,26 +62,25 @@ impl Tool for FindReferencesTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let root = context.require_workspace()?.root().to_path_buf();
+        let workspace = context.execution_workspace()?;
+        let root = workspace.root().to_path_buf();
 
         // Precise: locate the definition, then ask the server for references.
         if let Some(located) = self.lsp.locate(&root, &input.symbol).await
-            && let Some(body) = lsp_references(&located, &input.symbol, &root).await
+            && let Some(body) =
+                lsp_references(&located, &input.symbol, &root, &workspace, &cancellation).await?
         {
             return Ok(ToolOutput::ok(body));
         }
 
         // Fallback: whole-word scan across source files.
-        let mut files = Vec::new();
-        collect_source_files(&root, &root, &mut files);
+        let files = source_files(root.clone(), cancellation.clone()).await?;
         let mut hits = Vec::new();
         for rel in &files {
-            let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
-                continue;
-            };
+            let text = read_source(&workspace, &root.join(rel), &cancellation, None).await?;
             for (i, line) in text.lines().enumerate() {
                 let is_ref = line
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -122,11 +121,19 @@ impl Tool for FindReferencesTool {
 ///
 /// Reuses the session that answered the definition query — a second lookup
 /// could race a restart and answer about a different generation of the index.
-async fn lsp_references(located: &Located, symbol: &str, root: &Path) -> Option<String> {
-    let def = located.definitions.first()?;
+async fn lsp_references(
+    located: &Located,
+    symbol: &str,
+    root: &Path,
+    workspace: &leveler_execution::Workspace,
+    cancellation: &CancellationToken,
+) -> Result<Option<String>, ToolError> {
+    let Some(def) = located.definitions.first() else {
+        return Ok(None);
+    };
     let def_path = Path::new(&def.path);
-    let line_text = std::fs::read_to_string(def_path)
-        .ok()?
+    let line_text = read_source(workspace, def_path, cancellation, None)
+        .await?
         .lines()
         .nth(def.line as usize)
         .unwrap_or("")
@@ -138,13 +145,15 @@ async fn lsp_references(located: &Located, symbol: &str, root: &Path) -> Option<
         .client
         .open(def_path, &located.spec.language_id)
         .await;
-    let refs = located
+    let Ok(refs) = located
         .client
         .references(def_path, def.line, character, false)
         .await
-        .ok()?;
+    else {
+        return Ok(None);
+    };
     if refs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut body = format!("References to `{symbol}` (via {}):\n", located.spec.program);
     for r in refs.iter().take(MAX_HITS) {
@@ -157,7 +166,7 @@ async fn lsp_references(located: &Located, symbol: &str, root: &Path) -> Option<
             refs.len()
         ));
     }
-    Some(body)
+    Ok(Some(body))
 }
 
 #[cfg(test)]

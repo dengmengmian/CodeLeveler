@@ -58,15 +58,15 @@ pub(crate) fn merge_prior_messages_measured(
                 // A watermark beyond the live transcript means the transcript
                 // was truncated after the snapshot (context ops normally
                 // rewrite the snapshot too). Never guess a slice: fall back
-                // to the legacy overlap merge and say so.
+                // to the transcript and say so.
                 Some(_) => {
                     tracing::warn!(
                         through_ordinal = n,
                         raw_offset,
                         raw_len = raw.len(),
-                        "context snapshot watermark exceeds transcript; using overlap merge"
+                        "context snapshot watermark exceeds transcript; rebuilding from transcript"
                     );
-                    merge_snapshot_with_raw_tail(view.messages, &raw)
+                    raw
                 }
                 // The snapshot predates this load: the rows between its
                 // watermark and the load's start were never read. Never guess
@@ -75,12 +75,12 @@ pub(crate) fn merge_prior_messages_measured(
                     tracing::warn!(
                         through_ordinal = n,
                         raw_offset,
-                        "context snapshot watermark precedes the loaded transcript; using overlap merge"
+                        "context snapshot watermark precedes the loaded transcript; rebuilding from transcript"
                     );
-                    merge_snapshot_with_raw_tail(view.messages, &raw)
+                    raw
                 }
             },
-            None => merge_snapshot_with_raw_tail(view.messages, &raw),
+            None => raw,
         },
         _ => raw,
     };
@@ -97,38 +97,6 @@ pub(crate) fn merge_prior_messages_measured(
     )
 }
 
-/// Append raw messages that post-date the snapshot. Snapshot is often a
-/// compacted view (summary + recent window), so we locate the longest suffix of
-/// `snap` that appears as a contiguous slice of `raw` and keep everything after.
-fn merge_snapshot_with_raw_tail(
-    snap: Vec<leveler_model::Message>,
-    raw: &[leveler_model::Message],
-) -> Vec<leveler_model::Message> {
-    if raw.is_empty() {
-        return snap;
-    }
-    let snap_len = snap.len();
-    let max_k = snap_len.min(raw.len());
-    for k in (1..=max_k).rev() {
-        let suffix = &snap[snap_len - k..];
-        // Search from the end so we match the most recent occurrence.
-        for i in (0..=raw.len() - k).rev() {
-            if messages_slice_eq(suffix, &raw[i..i + k]) {
-                let mut out = snap;
-                out.extend_from_slice(&raw[i + k..]);
-                return out;
-            }
-        }
-    }
-    // No overlap (pure summary snapshot): keep snap + trailing raw window,
-    // widened to the round boundary so the window never opens on a result.
-    let keep = leveler_context::COMPACT_KEEP_RECENT.min(raw.len());
-    let start = leveler_context::round_boundary(raw, raw.len() - keep);
-    let mut out = snap;
-    out.extend_from_slice(&raw[start..]);
-    out
-}
-
 /// Whether a persisted snapshot may stand in for the transcript it was cut
 /// from. A snapshot is a derived view; one that breaks the tool-exchange
 /// invariant (a pre-fix merge wrote such views) would make every later request
@@ -140,6 +108,10 @@ fn merge_snapshot_with_raw_tail(
 /// the provider boundary.
 pub(crate) fn snapshot_is_usable(view: &SnapshotView) -> bool {
     use leveler_model::ToolExchangeViolation::UnansweredCall;
+    if view.through_ordinal.is_none() {
+        tracing::warn!("ignoring context snapshot without a durable transcript boundary");
+        return false;
+    }
     let messages = &view.messages;
     match leveler_model::validate_tool_exchange(messages) {
         Ok(()) => true,
@@ -159,10 +131,6 @@ pub(crate) fn snapshot_is_usable(view: &SnapshotView) -> bool {
             false
         }
     }
-}
-
-fn messages_slice_eq(a: &[leveler_model::Message], b: &[leveler_model::Message]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
 }
 
 /// The persistent task engine.
@@ -826,11 +794,9 @@ mod multi_turn_session_tests {
         assert!(leveler_model::validate_tool_exchange(&out).is_err());
     }
 
-    /// The watermark-less fallback keeps the last `COMPACT_KEEP_RECENT` raw
-    /// messages. When that count lands on a result, the exchange is kept whole
-    /// — the pre-fix fallback started the tail on the orphaned result.
+    /// An unwatermarked snapshot cannot replace any durable exchange.
     #[test]
-    fn the_overlap_fallback_keeps_the_exchange_at_its_count_boundary() {
+    fn an_unwatermarked_snapshot_preserves_the_full_transcript() {
         let mut raw = vec![msg(Role::User, "task")];
         for i in 0..6 {
             raw.push(assistant_call(&format!("c{i}")));
@@ -846,9 +812,8 @@ mod multi_turn_session_tests {
         let (out, _) = merge_prior_messages(raw.clone(), 0, Some(snap), 0);
         leveler_model::validate_tool_exchange(&out).expect("fallback tail pairs");
         assert_eq!(
-            out[1..],
-            raw[1..],
-            "tail begins on the call, not its result"
+            out, raw,
+            "an unknown boundary cannot discard durable messages"
         );
     }
 
@@ -928,35 +893,15 @@ mod multi_turn_session_tests {
         );
     }
 
-    /// HCH-OPT-5 characterization (reproduction only, no fix in this train):
-    /// a legacy snapshot with `through_ordinal: None` whose LAST message is
-    /// an in-memory-only injection (scoped rules / nudge — never persisted
-    /// to the transcript) defeats the suffix-overlap heuristic, and the
-    /// fallback appends the last 12 raw messages on top of a snapshot that
-    /// already contains that same recent window.
+    /// A snapshot without a durable boundary cannot prove which rows it owns.
     #[test]
-    fn characterize_overlap_fallback_duplicates_the_recent_window() {
+    fn unwatermarked_snapshot_does_not_duplicate_recent_messages() {
         let raw = long_prior(30);
-        // The executor's in-loop snapshot: summary + the recent window it
-        // already carries + a memory-only tail (never in the transcript).
-        let mut snap = vec![msg(Role::User, "[compact summary of earlier work]")];
+        let mut snap = vec![msg(Role::User, "summary")];
         snap.extend_from_slice(&raw[raw.len() - 12..]);
-        snap.push(msg(
-            Role::System,
-            "Project rules:\n- memory-only injection, never persisted",
-        ));
-        // The duplication is visible on the "merged base already fits"
-        // branch (over-threshold raw, under-threshold merge — the common
-        // real shape: raw is long, the snapshot is a folded view). When the
-        // merge itself is over threshold the subsequent fold swallows the
-        // duplicated window into the summarized middle — efficiency waste,
-        // not resent duplication.
-        let mut expected_base = snap.clone();
-        expected_base.extend_from_slice(&raw[raw.len() - 12..]);
-        let threshold = leveler_context::estimate_tokens(&expected_base) + 10;
-        assert!(leveler_context::estimate_tokens(&raw) > threshold);
-
-        let (out, merge) = merge_prior_messages(
+        snap.push(msg(Role::System, "transient project rules"));
+        let threshold = leveler_context::estimate_tokens(&snap) + 10;
+        let (out, _) = merge_prior_messages(
             raw.clone(),
             0,
             Some(SnapshotView {
@@ -965,28 +910,9 @@ mod multi_turn_session_tests {
             }),
             threshold,
         );
-        assert!(matches!(merge, PriorMerge::Fits { merged: true }));
-
-        // Quantify the duplication: every text in the last-12 raw window that
-        // appears more than once in the merged output is a duplicate.
-        let texts: Vec<String> = out.iter().map(|m| m.text_content()).collect();
-        let duplicated = raw[raw.len() - 12..]
-            .iter()
-            .filter(|m| {
-                let t = m.text_content();
-                texts.iter().filter(|x| **x == t).count() > 1
-            })
-            .count();
-        let inflation = leveler_context::estimate_tokens(&raw[raw.len() - 12..]);
-        let total = leveler_context::estimate_tokens(&out);
-        println!(
-            "OPT5: duplicated_messages={duplicated} duplicate_window_tokens={inflation} \
-             merged_total_tokens={total}"
-        );
-        assert!(
-            duplicated > 0,
-            "characterization: the fallback is expected to duplicate the window \
-             (if this starts passing with 0, the heuristic changed — re-audit OPT-5)"
+        assert_eq!(
+            out, raw,
+            "rebuild from durable rows instead of guessing overlap"
         );
     }
 

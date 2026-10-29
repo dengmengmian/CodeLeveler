@@ -5278,6 +5278,7 @@ impl AgentHarness for Drive<'_> {
         // measurement) restores the per-round copy on request.
         if has_next_model_step && (self.context_diverged || self.executor.policy.context_trace) {
             (self.observer)(AgentEvent::ContextSnapshot {
+                through_ordinal: self.sink.watermark().await?,
                 messages: messages.clone(),
             });
             self.context_diverged = false;

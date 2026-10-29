@@ -150,6 +150,18 @@ impl<'a> TurnRepository<'a> {
         Ok(rows)
     }
 
+    /// Accepted inputs only for the turns a bounded history will replay.
+    pub async fn list_by_ids(
+        &self,
+        session_id: &SessionId,
+        ids: &[String],
+    ) -> Result<Vec<TurnRecord>, StorageError> {
+        let ids = serde_json::to_string(ids)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        Ok(sqlx::query_as("SELECT id,session_id,ordinal,kind,payload,status,created_at,finished_at,owner_boot_id FROM turns WHERE session_id=?1 AND id IN (SELECT value FROM json_each(?2)) ORDER BY ordinal")
+            .bind(session_id.as_str()).bind(ids).fetch_all(self.db.pool()).await?)
+    }
+
     /// Running turns, optionally restricted to one session. Used by the engine
     /// reaper so each interrupted row can receive a canonical terminal event.
     pub async fn list_running(

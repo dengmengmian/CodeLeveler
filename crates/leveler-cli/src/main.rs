@@ -407,7 +407,20 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                 pr_base,
             };
             if parallel > 1 {
-                cmd_run_parallel(layout, task, model, mode, parallel, collab).await
+                cmd_run_parallel(
+                    layout,
+                    task,
+                    model,
+                    mode,
+                    parallel,
+                    collab,
+                    auto_approve,
+                    deny_network,
+                    max_model_steps,
+                    output,
+                    ship,
+                )
+                .await
             } else {
                 cmd_run(
                     layout,

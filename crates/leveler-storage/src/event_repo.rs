@@ -36,6 +36,17 @@ pub struct EventRecord {
     pub schema_version: i64,
 }
 
+/// Lightweight ordering facts used to choose a bounded replay window.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EventHeader {
+    /// Authoritative position in this session.
+    pub sequence: i64,
+    /// Persisted event tag, without its payload.
+    pub event_type: String,
+    /// Original RFC 3339 recording time.
+    pub created_at: String,
+}
+
 /// Read/write access to the `events` table.
 pub struct EventRepository<'a> {
     db: &'a Database,
@@ -45,6 +56,12 @@ impl<'a> EventRepository<'a> {
     /// Borrow `db` for the lifetime of this repository handle.
     pub fn new(db: &'a Database) -> Self {
         Self { db }
+    }
+
+    /// Choose replay boundaries without reading any event payloads.
+    pub async fn headers(&self, session_id: &SessionId) -> Result<Vec<EventHeader>, StorageError> {
+        Ok(sqlx::query_as("SELECT sequence,type AS event_type,created_at FROM events WHERE session_id=?1 ORDER BY sequence")
+            .bind(session_id.as_str()).fetch_all(self.db.pool()).await?)
     }
 
     /// Append one event, assigning the next per-session sequence atomically.

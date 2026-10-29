@@ -391,3 +391,89 @@ async fn chat_without_parallel_is_not_refused_by_the_parallel_contract() {
         "a legal single-agent chat run must reach the provider:\n{rendered}"
     );
 }
+
+#[tokio::test]
+async fn parallel_rejects_unsupported_shipping_before_any_work() {
+    let server = MockServer::start_one(goal_complete_response()).await;
+    let env = test_env(&server.base_url());
+    let log = env.tmp.path().join("unsupported.log");
+    let child = spawn_run(
+        &env,
+        &[
+            "--parallel",
+            "2",
+            "--push",
+            "--auto-approve",
+            "unsupported shipping",
+        ],
+        &log,
+    );
+    let status = wait_for(child, &log, Duration::from_secs(30)).await;
+    assert!(
+        !status.success(),
+        "unsupported shipping must fail: {}",
+        read_log(&log)
+    );
+    assert!(read_log(&log).contains("shipping"), "{}", read_log(&log));
+    assert_eq!(server.request_count(), 0);
+    assert_eq!(worktree_count(&env.repo), 1);
+}
+
+#[tokio::test]
+async fn parallel_preserves_network_denial_and_json_output() {
+    let server = MockServer::start_one(goal_complete_response()).await;
+    let env = test_env(&server.base_url());
+    let log = env.tmp.path().join("policy.log");
+    let task = "parallel policy";
+    let child = spawn_run(
+        &env,
+        &[
+            "--parallel",
+            "2",
+            "--deny-network",
+            "--max-model-steps",
+            "1",
+            "--output",
+            "jsonl",
+            "--auto-approve",
+            task,
+        ],
+        &log,
+    );
+    let status = wait_for(child, &log, Duration::from_secs(30)).await;
+    assert!(status.success(), "{}", read_log(&log));
+    for line in read_stdout(&log).lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("stdout must be JSONL");
+    }
+    let mut sessions = 0;
+    for entry in std::fs::read_dir(env.home.join("state/projects"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path().join("sessions.db");
+        if !path.is_file() {
+            continue;
+        }
+        let db = Database::connect(&path).await.unwrap();
+        let repo = SessionRepository::new(&db);
+        for row in repo
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.goal == task)
+        {
+            let (_, sandbox, _, _) = repo
+                .execution(&leveler_core::SessionId::new(row.id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                sandbox,
+                "every parallel session must persist --deny-network"
+            );
+            sessions += 1;
+        }
+    }
+    assert_eq!(sessions, 3);
+}

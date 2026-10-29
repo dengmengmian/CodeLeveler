@@ -968,19 +968,16 @@ impl Application {
     /// created once and shared — concurrent pools on one SQLite file contend
     /// for the write lock (`database is locked`).
     pub async fn open_database(&self) -> Result<Database, AppError> {
-        {
-            let guard = self.database.lock().await;
-            if let Some(db) = guard.as_ref() {
-                return Ok(db.clone());
-            }
+        let mut guard = self.database.lock().await;
+        if let Some(db) = guard.as_ref() {
+            return Ok(db.clone());
         }
         std::fs::create_dir_all(&self.layout.state_dir).map_err(|source| AppError::Io {
             path: self.layout.state_dir.display().to_string(),
             source,
         })?;
         let db = Database::connect(&self.layout.database_path()).await?;
-        let mut guard = self.database.lock().await;
-        let db = guard.get_or_insert_with(|| db).clone();
+        *guard = Some(db.clone());
         Ok(db)
     }
 

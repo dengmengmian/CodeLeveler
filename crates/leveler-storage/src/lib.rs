@@ -36,7 +36,7 @@ pub use command_receipt_repo::{Admission, CommandReceiptRepository, DispatchingB
 pub use context_epoch_repo::EpochEventRow;
 pub use database::{Database, StorageError, peek_repository};
 pub use engine_stores::EngineStores;
-pub use event_repo::{EVENT_SCHEMA_VERSION, EventRecord, EventRepository};
+pub use event_repo::{EVENT_SCHEMA_VERSION, EventHeader, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
 pub use experience_inbox_repo::{
     ExperienceInboxCounts, ExperienceInboxFailure, ExperienceInboxItem, ExperienceInboxProcessed,

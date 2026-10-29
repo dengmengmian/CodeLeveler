@@ -6,17 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Context compiler: repository map, candidate selection, rules, token budget."
+description = "Repository context, project rules, and compaction."
 
 [dependencies]
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }
-leveler-project = { workspace = true }
-leveler-skills = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
 
 [dev-dependencies]
+leveler-project = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }

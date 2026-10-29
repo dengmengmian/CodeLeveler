@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_execution::RiskLevel;
 use leveler_lsp::LspSessions;
 
-use super::symbols::{collect_source_files, extract_block, relativize};
+use super::symbols::{extract_block, read_source, relativize, source_files};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_BLOCK_LINES: usize = 200;
@@ -62,16 +62,24 @@ impl Tool for ReadSymbolTool {
         &self,
         input: serde_json::Value,
         context: ToolContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let root = context.require_workspace()?.root().to_path_buf();
+        let workspace = context.execution_workspace()?;
+        let root = workspace.root().to_path_buf();
 
         // Precise: language-server location, then read the block from the file.
         if let Some(located) = self.lsp.locate(&root, &input.symbol).await {
             let mut body = String::new();
             for m in located.definitions.iter().take(3) {
-                if let Ok(text) = std::fs::read_to_string(&m.path) {
+                {
+                    let text = read_source(
+                        &workspace,
+                        std::path::Path::new(&m.path),
+                        &cancellation,
+                        None,
+                    )
+                    .await?;
                     let block = extract_block(&text, m.line as usize, MAX_BLOCK_LINES);
                     body.push_str(&format!(
                         "{}:{}\n{}\n\n",
@@ -87,12 +95,9 @@ impl Tool for ReadSymbolTool {
         }
 
         // Fallback: find a defining file by scan, then extract the block there.
-        let mut files = Vec::new();
-        collect_source_files(&root, &root, &mut files);
+        let files = source_files(root.clone(), cancellation.clone()).await?;
         for rel in files {
-            let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
-                continue;
-            };
+            let text = read_source(&workspace, &root.join(&rel), &cancellation, None).await?;
             if !leveler_context::defines(&text, &input.symbol) {
                 continue;
             }

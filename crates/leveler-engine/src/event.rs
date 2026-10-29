@@ -569,8 +569,8 @@ pub enum EngineEvent {
         /// Transcript watermark: how many leading transcript messages this
         /// snapshot supersedes. Restore appends exactly the messages after it
         /// — no suffix-overlap inference. `None` marks a legacy snapshot or
-        /// an executor in-loop snapshot (no durable ordinal in scope); those
-        /// merge via the legacy overlap heuristic. Equal to the DB message
+        /// a non-durable sink; restore rebuilds from the transcript rather
+        /// than guessing which rows that snapshot covers. Equal to the DB message
         /// ordinal whenever the transcript has no unparsable rows (guaranteed
         /// on the strict resume/continuation paths).
         #[serde(default)]

@@ -8,9 +8,13 @@ use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver};
 /// Prompts the user on the terminal to approve/deny risky actions.
 pub struct CliApprover;
 
+// One terminal can present only one unambiguous consent question at a time.
+static INPUT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[async_trait]
 impl Approver for CliApprover {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        let _input = INPUT_LOCK.lock().await;
         eprintln!();
         eprintln!(
             "{} {} wants to run a {:?} action:",
@@ -24,15 +28,33 @@ impl Approver for CliApprover {
         }
         eprint!("  Approve? {}: ", request_choices_prompt(request));
 
-        let line = tokio::task::spawn_blocking(|| {
-            use std::io::BufRead;
-            let mut s = String::new();
-            let stdin = std::io::stdin();
-            let _ = stdin.lock().read_line(&mut s);
-            s
-        })
-        .await
-        .unwrap_or_default();
+        // Blocking terminal input must not hold Tokio's shutdown open after
+        // this approval is cancelled. The OS reader lives only with this CLI
+        // process; dropping its receiver cannot grant the abandoned request.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if let Err(error) = std::thread::Builder::new()
+            .name("approval-input".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let mut line = String::new();
+                let result = std::io::stdin().lock().read_line(&mut line).map(|_| line);
+                let _ = sender.send(result);
+            })
+        {
+            eprintln!("approval input failed: {error}");
+            return ApprovalDecision::Deny;
+        }
+        let line = match receiver.await {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => {
+                eprintln!("approval input failed: {error}");
+                return ApprovalDecision::Deny;
+            }
+            Err(error) => {
+                eprintln!("approval input failed: {error}");
+                return ApprovalDecision::Deny;
+            }
+        };
 
         request_answer(&line, request)
     }
@@ -121,6 +143,65 @@ fn parse_answer(line: &str, always_persists: bool) -> ApprovalDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_shutdown_child() {
+        if std::env::var_os("LEVELER_TEST_APPROVAL_SHUTDOWN").is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let request = ApprovalRequest {
+                id: leveler_core::ApprovalId::new("probe"),
+                turn_id: None,
+                call_id: "probe".into(),
+                agent_id: None,
+                action_fingerprint: "probe".into(),
+                tool: "run_command".into(),
+                risk: leveler_execution::RiskLevel::Destructive,
+                description: "cancelled input probe".into(),
+                command: None,
+                paths: Vec::new(),
+                grant: None,
+            };
+            let task = tokio::spawn(async move { CliApprover.decide(&request).await });
+            // This is a shutdown timing test: let the OS input read begin.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            task.abort();
+            let _ = task.await;
+        });
+        drop(runtime);
+    }
+
+    #[test]
+    fn cancelling_approval_does_not_block_runtime_shutdown() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "approver::tests::approval_shutdown_child",
+                "--nocapture",
+            ])
+            .env("LEVELER_TEST_APPROVAL_SHUTDOWN", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("cancelled approval kept the runtime alive with stdin still open");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     /// A resource-bound request offers exactly the resource scopes, and the
     /// prompt prints no part of the binding it matches on: the project identity,

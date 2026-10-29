@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_agent::coding::mode_str;
 use leveler_engine::{EngineEvent, EventLog, ExecutionKind, NewSession, TaskOutcome};
-use leveler_execution::{AutoApprove, PermissionProfile};
+use leveler_execution::{Approver, PermissionProfile};
 use leveler_lifecycle::{AgentState, SessionStatus};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
@@ -48,12 +48,15 @@ impl Application {
     /// textual answer and `plan` is a read-only overlay — neither is guaranteed
     /// to produce the integrable change this path requires. The combination is
     /// refused here, before a parent session, a worktree, or a provider request.
+    #[allow(clippy::too_many_arguments)]
     pub async fn parallel_edit(
         &self,
         model: &ModelRef,
         mode: PermissionProfile,
         task: &str,
         n: usize,
+        approver: Arc<dyn Approver>,
+        sandbox: bool,
         cancellation: CancellationToken,
     ) -> Result<ParallelEditOutcome, AppError> {
         if self.collaboration() != leveler_lifecycle::CollaborationMode::Goal {
@@ -89,7 +92,7 @@ impl Application {
                 goal: task.to_string(),
                 model: model.to_string(),
                 mode: mode_str(mode).to_string(),
-                sandbox: false,
+                sandbox,
                 kind: ExecutionKind::Parallel,
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: self.collaboration().as_str().to_string(),
@@ -113,7 +116,7 @@ impl Application {
                     goal: task.to_string(),
                     model: model.to_string(),
                     mode: mode_str(mode).to_string(),
-                    sandbox: false,
+                    sandbox,
                     kind: ExecutionKind::Parallel,
                     task_id: Some(token.task_id.clone()),
                 },
@@ -126,12 +129,7 @@ impl Application {
             let mut worktrees = Vec::new();
             for i in 0..n {
                 let path = worktree_path(&slug, i);
-                let branch = format!("leveler/parallel-{slug}-{i}");
-                let _ = std::fs::remove_dir_all(&path);
-                // Clean up a stale branch from a prior run.
-                let _ = main_git
-                    .remove_worktree(&path, &branch, &cancellation)
-                    .await;
+                let branch = format!("leveler/parallel-{slug}-{parent}-{i}");
                 main_git
                     .add_worktree(&path, &branch, &base, &cancellation)
                     .await?;
@@ -158,15 +156,18 @@ impl Application {
                 let config_dir = config_dir.clone();
                 let model = model.clone();
                 let task = task.to_string();
+                let approver = approver.clone();
+                let model_step_ceiling = self.model_step_ceiling;
                 let cancellation = cancellation.child_token();
                 async move {
                     let layout = Layout::resolve(path.clone(), Some(config_dir));
                     // The candidate inherits the run's resolved axis; a fresh
                     // Application would otherwise fall back to the product
                     // default and silently re-open the axis the run closed.
-                    let app = Application::assemble(layout)
+                    let mut app = Application::assemble(layout)
                         .ok()?
                         .with_collaboration(collaboration);
+                    app.model_step_ceiling = model_step_ceiling;
                     // Direct tool loop only — no orchestrate dual path.
                     let result = async {
                         let session_id = app
@@ -179,8 +180,8 @@ impl Application {
                                 &model,
                                 mode,
                                 &task,
-                                Arc::new(AutoApprove),
-                                false,
+                                approver,
+                                sandbox,
                                 &mut |_| {},
                                 cancellation.clone(),
                             )
@@ -363,6 +364,8 @@ mod tests {
                     PermissionProfile::Assisted,
                     "task",
                     3,
+                    Arc::new(leveler_execution::AutoApprove),
+                    false,
                     CancellationToken::new(),
                 )
                 .await

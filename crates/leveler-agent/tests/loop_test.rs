@@ -8948,7 +8948,7 @@ async fn only_a_diverged_context_is_snapshotted() {
         "read the files",
         &mut |event| match event {
             AgentEvent::StreamAttemptStarted => rounds += 1,
-            AgentEvent::ContextSnapshot { messages } => snapshots.push((
+            AgentEvent::ContextSnapshot { messages, .. } => snapshots.push((
                 rounds,
                 messages
                     .iter()
