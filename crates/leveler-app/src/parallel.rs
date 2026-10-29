@@ -23,6 +23,8 @@ pub struct ParallelEditOutcome {
     pub verified: usize,
     pub integrated: Vec<String>,
     pub conflicted: Vec<String>,
+    /// Cleanup failures; integration and the primary task outcome remain authoritative.
+    pub warnings: Vec<String>,
     /// The parent session recording the run (kind=parallel; its event log
     /// references every candidate's child session).
     pub session: String,
@@ -37,6 +39,25 @@ fn honor_parent_cancellation(
     } else {
         result
     }
+}
+
+async fn cleanup_worktrees(
+    git: &GitWorkflow,
+    worktrees: &[(std::path::PathBuf, String)],
+) -> Vec<String> {
+    let cancellation = CancellationToken::new();
+    let mut warnings = Vec::new();
+    for (path, branch) in worktrees {
+        if let Err(error) = git.remove_worktree(path, branch, &cancellation).await {
+            let warning = format!(
+                "Failed to clean up worktree {} (branch {branch}): {error}",
+                path.display()
+            );
+            tracing::warn!(%warning);
+            warnings.push(warning);
+        }
+    }
+    warnings
 }
 
 impl Application {
@@ -162,7 +183,12 @@ impl Application {
                 async move {
                     let mut child_session = String::new();
                     let result: Result<bool, AppError> = async {
-                        let layout = Layout::resolve(path.clone(), Some(config_dir));
+                        let layout = Layout::ephemeral_with_environment(
+                            path.clone(),
+                            Some(config_dir),
+                            self.layout.home().root(),
+                            &self.environment,
+                        );
                         let mut app =
                             Application::assemble(layout)?.with_collaboration(collaboration);
                         app.model_step_ceiling = model_step_ceiling;
@@ -241,17 +267,18 @@ impl Application {
                 verified,
                 integrated: merge.integrated,
                 conflicted: merge.conflicted,
+                warnings: Vec::new(),
                 session: parent.to_string(),
             })
         }
         .await;
         // Cleanup is owned by this run and must also execute after setup,
         // candidate, logging or integration failure, including cancellation.
-        let cleanup = CancellationToken::new();
-        for (path, branch) in &worktrees {
-            main_git.remove_worktree(path, branch, &cleanup).await;
+        let warnings = cleanup_worktrees(&main_git, &worktrees).await;
+        let mut result = honor_parent_cancellation(result, &cancellation);
+        if let Ok(summary) = &mut result {
+            summary.warnings = warnings.clone();
         }
-        let result = honor_parent_cancellation(result, &cancellation);
 
         let terminal = match &result {
             Ok(summary) if !summary.integrated.is_empty() => leveler_engine::TaskTerminal {
@@ -262,7 +289,7 @@ impl Application {
                 status: SessionStatus::Completed,
                 state: AgentState::Complete,
                 goal: None,
-                warnings: Vec::new(),
+                warnings: warnings.clone(),
             },
             Ok(summary) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
@@ -275,7 +302,7 @@ impl Application {
                 status: SessionStatus::Failed,
                 state: AgentState::Failed,
                 goal: None,
-                warnings: Vec::new(),
+                warnings: warnings.clone(),
             },
             Err(AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
                 leveler_engine::TaskTerminal {
@@ -286,7 +313,7 @@ impl Application {
                     status: SessionStatus::Interrupted,
                     state: AgentState::Execute,
                     goal: None,
-                    warnings: Vec::new(),
+                    warnings: warnings.clone(),
                 }
             }
             Err(error) => leveler_engine::TaskTerminal {
@@ -300,7 +327,7 @@ impl Application {
                 status: SessionStatus::Failed,
                 state: AgentState::Failed,
                 goal: None,
-                warnings: Vec::new(),
+                warnings: warnings.clone(),
             },
         };
         // Terminal event + every lifecycle column in ONE transaction — the
@@ -319,6 +346,53 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_reports_retained_paths_and_still_cleans_other_worktrees() {
+        use leveler_test_support::git::{run, scratch_repo};
+        let repo = scratch_repo();
+        run(repo.path(), &["commit", "--allow-empty", "-qm", "seed"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        let removable = tmp.path().join("removable");
+        for (path, branch) in [(&locked, "locked"), (&removable, "removable")] {
+            run(
+                repo.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+        }
+        run(repo.path(), &["worktree", "lock", locked.to_str().unwrap()]);
+        let warnings = cleanup_worktrees(
+            &GitWorkflow::new(repo.path()),
+            &[
+                (locked.clone(), "locked".into()),
+                (removable.clone(), "removable".into()),
+            ],
+        )
+        .await;
+        let retained = locked.exists();
+        let removed = !removable.exists();
+        run(
+            repo.path(),
+            &["worktree", "unlock", locked.to_str().unwrap()],
+        );
+        run(
+            repo.path(),
+            &["worktree", "remove", "--force", locked.to_str().unwrap()],
+        );
+        run(repo.path(), &["branch", "-D", "locked"]);
+        assert!(retained && removed);
+        assert_eq!(warnings.len(), 1, "cleanup failures must be reported");
+        assert!(warnings[0].contains(locked.to_str().unwrap()));
+        assert!(warnings[0].contains("locked"));
+    }
 
     #[test]
     fn candidate_failure_preserves_cause_and_settles_every_started_candidate() {
@@ -403,6 +477,28 @@ mod tests {
             finished
                 .iter()
                 .all(|(id, verified)| !id.is_empty() && !verified)
+        );
+        let projects = app.layout.home().projects_dir();
+        let mut child_sessions = Vec::new();
+        if projects.exists() {
+            for entry in std::fs::read_dir(projects).unwrap() {
+                let database = entry.unwrap().path().join("sessions.db");
+                if database.exists() {
+                    let child_db = leveler_storage::Database::connect(&database).await.unwrap();
+                    child_sessions.extend(
+                        leveler_storage::SessionRepository::new(&child_db)
+                            .list()
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .map(|row| row.id),
+                    );
+                }
+            }
+        }
+        assert!(
+            finished.iter().all(|(id, _)| child_sessions.contains(id)),
+            "candidate sessions must remain under the parent's isolated home"
         );
         assert_eq!(parent.status, SessionStatus::Failed);
         let output = std::process::Command::new("git")

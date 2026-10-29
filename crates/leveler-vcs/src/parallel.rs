@@ -48,18 +48,19 @@ impl GitWorkflow {
         Ok(())
     }
 
-    /// Remove a worktree and its branch (best effort).
+    /// Remove a worktree, then its branch. Preserve failures so the owner can
+    /// report retained resources without overriding its primary run outcome.
     pub async fn remove_worktree(
         &self,
         path: &Path,
         branch: &str,
         cancellation: &CancellationToken,
-    ) {
+    ) -> Result<(), VcsError> {
         let p = path.to_string_lossy().into_owned();
-        let _ = self
-            .git(&["worktree", "remove", "--force", &p], cancellation)
-            .await;
-        let _ = self.git(&["branch", "-D", branch], cancellation).await;
+        self.git(&["worktree", "remove", "--force", &p], cancellation)
+            .await?;
+        self.git(&["branch", "-D", branch], cancellation).await?;
+        Ok(())
     }
 
     /// Integrate `candidates` into the current worktree (which must be a clean
@@ -123,6 +124,33 @@ mod tests {
     #[test]
     fn worktree_paths_do_not_collide_between_runs() {
         assert_ne!(worktree_path("task", 0), worktree_path("task", 0));
+    }
+
+    #[tokio::test]
+    async fn removing_a_locked_worktree_reports_the_failure() {
+        let dir = tmp("locked-cleanup");
+        init_repo(&dir);
+        let path = dir.join("candidate");
+        let path_arg = path.to_str().unwrap();
+        run_git(
+            &dir,
+            &["worktree", "add", "-b", "candidate", path_arg, "HEAD"],
+        );
+        run_git(&dir, &["worktree", "lock", path_arg]);
+        let result = GitWorkflow::new(&dir)
+            .remove_worktree(&path, "candidate", &CancellationToken::new())
+            .await;
+        let error = format!("{result:?}");
+        let retained = path.exists();
+        run_git(&dir, &["worktree", "unlock", path_arg]);
+        run_git(&dir, &["worktree", "remove", "--force", path_arg]);
+        run_git(&dir, &["branch", "-D", "candidate"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(retained, "a lock must prevent removal");
+        assert!(
+            error.contains("locked") && error.contains(path_arg),
+            "cleanup must report the locked worktree and original error: {error}"
+        );
     }
 
     #[tokio::test]
