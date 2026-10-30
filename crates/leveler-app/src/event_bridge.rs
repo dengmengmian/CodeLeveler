@@ -123,10 +123,9 @@ pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
                 status: match s.status.as_str() {
                     "in_progress" => PlanStepStatus::Running,
                     "completed" => PlanStepStatus::Done,
-                    // The harness records a step the model replaced rather
-                    // than finished as `abandoned`. It is neither pending work
-                    // the runtime should keep driving nor delivery, so it has
-                    // its own projection instead of being read as a skip.
+                    // Older events may contain synthesized `abandoned` steps.
+                    // Keep their historical projection distinct from pending
+                    // work, delivery, and an explicit skip.
                     "abandoned" => PlanStepStatus::Abandoned,
                     _ => PlanStepStatus::Pending,
                 },

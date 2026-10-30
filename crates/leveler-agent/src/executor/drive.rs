@@ -3460,6 +3460,11 @@ impl AgentHarness for Drive<'_> {
                         });
                     }
                 }
+                let receipt = if reason == StopReason::Blocked {
+                    "Goal blocked."
+                } else {
+                    "Goal completed."
+                };
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
@@ -3467,7 +3472,7 @@ impl AgentHarness for Drive<'_> {
                     id: call.id.as_str().to_string(),
                     name: UPDATE_GOAL_TOOL.to_string(),
                     is_error: false,
-                    preview: "Goal resolved.".to_string(),
+                    preview: receipt.to_string(),
                     applied_diff: None,
                 });
                 let summary = call
@@ -3481,7 +3486,7 @@ impl AgentHarness for Drive<'_> {
                 results[index] = Some(ContentPart::ToolResult {
                     result: ToolResultContent {
                         call_id: call.id,
-                        content: "Goal resolved.".to_string(),
+                        content: receipt.to_string(),
                         is_error: false,
                     },
                 });
@@ -4376,30 +4381,13 @@ impl AgentHarness for Drive<'_> {
             {
                 match PlanState::from_model_explicit(steps) {
                     Ok(next) => {
-                        // The model may legitimately rewrite its plan; the
-                        // record must not lose a step that was replaced
-                        // instead of finished. The replaced step stays in the
-                        // list as `abandoned` (never `completed`) and the
-                        // model is told which one it dropped, so a re-declared
-                        // plan cannot turn unfinished delivery into 100%.
-                        let replaced = self.plan_state.absorb_declaration(next.steps);
+                        // The latest declaration is the entire current plan.
+                        // Earlier declarations already live in the event log;
+                        // rewording or omission does not declare abandonment.
+                        self.plan_state = next;
                         (self.observer)(AgentEvent::PlanUpdated {
                             steps: self.plan_state.steps.clone(),
                         });
-                        if !replaced.is_empty() {
-                            content.push_str(&format!(
-                                "\n\n[plan] {} step(s) from your previous plan were replaced \
-                                 rather than completed and are recorded as `abandoned`, not \
-                                 done:\n{}\nIf a replaced step is still owed, put it back and \
-                                 finish it; if it is no longer needed, say what changed.",
-                                replaced.len(),
-                                replaced
-                                    .iter()
-                                    .map(|step| format!("- {}", step.step))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            ));
-                        }
                     }
                     Err(msg) => {
                         content = msg;

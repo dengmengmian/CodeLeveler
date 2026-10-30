@@ -918,8 +918,8 @@ pub(crate) fn tool_lines(
         return;
     }
 
-    // Prefer the structured goal summary over the runtime's internal preview
-    // ("Goal resolved.") so expand shows what the model actually wrote.
+    // Prefer the structured goal summary over the runtime's lifecycle receipt
+    // so expand shows what the model actually wrote.
     let goal_body = if block.name == "update_goal" {
         update_goal_summary_from_arguments(&block.arguments, t)
     } else {

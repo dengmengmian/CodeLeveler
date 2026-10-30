@@ -62,10 +62,15 @@ async fn persist_task_terminal(app: &Application, session_id: &SessionId) {
 
 async fn persist_task_outcome(app: &Application, session_id: &SessionId, outcome: TaskOutcome) {
     let db = app.open_database().await.unwrap();
+    let stop = match outcome {
+        TaskOutcome::Completed => Some(StopReason::Completed),
+        TaskOutcome::Blocked => Some(StopReason::Blocked),
+        _ => None,
+    };
     let event = EngineEvent::TaskFinished {
         outcome,
         reason: None,
-        stop: Some(StopReason::Completed),
+        stop,
         failure: None,
         warnings: Vec::new(),
     };
@@ -195,35 +200,43 @@ async fn a_restarted_runtime_reports_a_completed_plan_as_history_not_active_work
 }
 
 #[tokio::test]
-async fn a_restarted_runtime_reports_an_interrupted_task_plan_as_interrupted() {
+async fn a_restarted_runtime_reports_blocked_and_interrupted_plans_as_history() {
     isolate_global_config();
-    let tmp = tempfile::tempdir().unwrap();
+    for outcome in [TaskOutcome::Blocked, TaskOutcome::Interrupted] {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = {
+            let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+            let session_id = app
+                .create_session(&ModelRef::new("mock", "m"), "stopped plan")
+                .await
+                .unwrap();
+            persist_plan(
+                &app,
+                &session_id,
+                serde_json::json!([
+                    {"step": "start services", "status": "completed"},
+                    {"step": "backend tests", "status": "completed"},
+                    {"step": "CI checks", "status": "completed"},
+                    {"step": "frontend tests", "status": "completed"},
+                    {"step": "regression tests", "status": "in_progress"},
+                    {"step": "summary", "status": "pending"}
+                ]),
+            )
+            .await;
+            persist_task_outcome(&app, &session_id, outcome).await;
+            session_id
+        };
 
-    let session_id = {
         let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
-        let session_id = app
-            .create_session(&ModelRef::new("mock", "m"), "interrupted plan")
-            .await
-            .unwrap();
-        persist_plan(
-            &app,
-            &session_id,
-            serde_json::json!([{"step": "half done", "status": "in_progress"}]),
-        )
-        .await;
-        persist_task_outcome(&app, &session_id, TaskOutcome::Interrupted).await;
-        session_id
-    };
-
-    let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
-    let plan = client(app)
-        .snapshot(&session_id)
-        .await
-        .unwrap()
-        .plan
-        .expect("an interrupted plan stays viewable");
-    assert_eq!(plan.state, UiPlanState::Interrupted);
-    assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+        let snapshot = client(app).snapshot(&session_id).await.unwrap();
+        let plan = snapshot.plan.expect("a stopped plan stays viewable");
+        assert_eq!(plan.state, UiPlanState::Interrupted, "{outcome:?}");
+        assert_eq!(plan.steps.len(), 6);
+        assert_eq!(plan.steps[4].status, PlanStepStatus::Running);
+        assert_eq!(plan.steps[4].description, "regression tests");
+        assert_eq!(plan.steps[5].status, PlanStepStatus::Pending);
+        assert_eq!(plan.steps[5].description, "summary");
+    }
 }
 
 #[tokio::test]

@@ -585,6 +585,90 @@ async fn consecutive_plan_declarations_advance_the_authoritative_state() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Rewording the six-step checklist from a real local session is a full-list
+/// replacement, including when the goal later stops blocked.
+#[tokio::test]
+async fn renamed_plan_steps_replace_the_declared_list_before_blocked_closeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = [
+        ("make up 启动本地全套服务并确认探活通过", "in_progress"),
+        ("后端全量测试", "pending"),
+        ("make ci", "pending"),
+        ("admin-web：vitest 全量 + oxlint", "pending"),
+        ("运行中的栈上执行 make regression 真实回归", "pending"),
+        ("汇总结果", "pending"),
+    ];
+    let revised = [
+        ("make up：api/mcp/worker 已起；portal 404", "completed"),
+        ("后端全量测试", "completed"),
+        ("make ci", "completed"),
+        ("admin-web：vitest 281 用例 + oxlint", "completed"),
+        ("运行中的栈上执行 make regression 真实回归", "in_progress"),
+        ("清理临时产物并汇总", "pending"),
+    ];
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call("original", &original),
+        plan_call("revised", &revised),
+        assistant_tool_call(
+            "blocked",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "Portal returns 404."}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "start the local services and run the tests",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    let plans: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        plans.len(),
+        2,
+        "blocked does not invent another plan declaration"
+    );
+    let final_plan: Vec<_> = plans[1]
+        .iter()
+        .map(|step| (step.step.as_str(), step.status.as_str()))
+        .collect();
+    assert_eq!(
+        final_plan, revised,
+        "the full list must be exactly the model declaration"
+    );
+    assert_eq!(runtime.recorded_requests().len(), 3);
+    assert!(
+        !runtime.recorded_requests()[2]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| matches!(part, ContentPart::ToolResult { result }
+                if result.content.contains("[plan]"))),
+        "renaming is not an inferred abandonment"
+    );
+}
+
 /// Plan order is the intended order, not an execution order. A later step
 /// whose outcome is already true may be declared completed while an earlier
 /// one is still open: real work detours and returns. Refusing that honest
@@ -1215,8 +1299,9 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
                 id,
                 name,
                 is_error,
+                preview,
                 ..
-            } if id == "g1" && name == "update_goal" && !is_error
+            } if id == "g1" && name == "update_goal" && !is_error && preview == "Goal completed."
         )),
         "update_goal needs a matching successful result so UIs do not mark it failed"
     );
@@ -1250,11 +1335,13 @@ async fn goal_mode_blocked_reports_blocked() {
     )
     .with_goal_mode(true);
 
+    let mut events = Vec::new();
+    let saved = Arc::new(Mutex::new(Vec::new()));
     let outcome = executor
         .run(
             "do the task",
-            &mut |_| {},
-            &mut NoopSink,
+            &mut |event| events.push(event),
+            &mut RecordingSink(saved.clone()),
             CancellationToken::new(),
         )
         .await
@@ -1262,6 +1349,24 @@ async fn goal_mode_blocked_reports_blocked() {
 
     assert_eq!(outcome.stop_reason, StopReason::Blocked);
     assert!(outcome.final_text.contains("credential"));
+    assert!(
+        events.iter().any(|event| matches!(event,
+            AgentEvent::ToolResult { name, preview, is_error: false, .. }
+            if name == "update_goal" && preview == "Goal blocked."
+        )),
+        "the accepted terminal receipt must state blocked: {events:?}"
+    );
+
+    assert!(
+        saved
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| matches!(part, ContentPart::ToolResult { result }
+            if result.call_id.as_str() == "g1" && result.content == "Goal blocked." && !result.is_error)),
+        "the transcript carries the same blocked receipt"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -5052,44 +5157,33 @@ async fn chat_ends_when_the_model_adjusts_its_plan_instead_of_doing_the_step() {
             _ => None,
         })
         .unwrap();
-    // The model may drop a step, and the turn ends. What the record must not do
-    // is claim the dropped step happened: it stays beside the completed one
-    // with `abandoned`, which is neither open work nor a delivery.
-    let abandoned: Vec<&leveler_agent::PlanStep> = final_plan
-        .iter()
-        .filter(|step| step.status == "abandoned")
-        .collect();
-    assert_eq!(abandoned.len(), 1, "{final_plan:?}");
-    assert_eq!(abandoned[0].step, "publish");
+    // The current declaration replaces the whole list. The event sequence
+    // retains the original declaration without inventing abandonment.
+    assert_eq!(final_plan.len(), 1);
+    assert_eq!(final_plan[0].step, "implement");
     assert_eq!(final_plan[0].status, "completed");
-    let state = leveler_agent::PlanState {
-        steps: final_plan.clone(),
-    };
-    assert!(
-        state.open_steps().is_empty(),
-        "a replaced step is not owed work to resume"
-    );
-    assert!(
-        !state.is_fully_completed(),
-        "a plan with a replaced step is not 100% delivered"
-    );
-    // The model is told what the record kept, so the adjustment is visible to
-    // the same model that made it.
-    let notice = runtime
-        .recorded_requests()
-        .last()
-        .unwrap()
-        .messages
+    assert!(leveler_agent::PlanState { steps: final_plan }.is_fully_completed());
+    let declarations: Vec<_> = events
         .iter()
-        .flat_map(|message| message.content.iter())
-        .filter_map(|part| match part {
-            ContentPart::ToolResult { result } => Some(result.content.clone()),
+        .filter_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps),
             _ => None,
         })
-        .find(|content| content.contains("[plan]"))
-        .expect("the plan update reports the replaced step to the model");
-    assert!(notice.contains("publish"), "{notice}");
-    assert!(notice.contains("abandoned"), "{notice}");
+        .collect();
+    assert_eq!(declarations.len(), 2);
+    assert_eq!(declarations[0][1].step, "publish");
+    assert_eq!(declarations[0][1].status, "pending");
+    assert!(
+        !runtime
+            .recorded_requests()
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| matches!(part, ContentPart::ToolResult { result }
+                if result.content.contains("[plan]")))
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

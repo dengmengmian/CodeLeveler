@@ -156,7 +156,7 @@ impl CheckpointPlan {
             .filter(|s| s.status == "completed")
             .map(|s| s.step.as_str())
             .collect();
-        // A replaced step is durable history, not work in the current plan. Its
+        // A legacy abandoned step is history, not current work. Its
         // count must not become the denominator of progress, and it can never
         // be counted as completed either.
         let current_total = plan
@@ -164,8 +164,8 @@ impl CheckpointPlan {
             .iter()
             .filter(|s| s.status != crate::plan::ABANDONED)
             .count() as u32;
-        // A step the model replaced rather than finished is recorded as
-        // abandoned and is not "next": resuming points at open work only.
+        // Legacy abandoned steps are not "next": resuming points at open
+        // work only.
         let next_step = plan
             .open_steps()
             .first()

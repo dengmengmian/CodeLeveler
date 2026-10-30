@@ -375,6 +375,77 @@ mod tests {
         );
     }
 
+    fn released_retirement_migration() -> sqlx::migrate::Migration {
+        sqlx::migrate::Migration::new(
+            47,
+            "retire memory".into(),
+            sqlx::migrate::MigrationType::Simple,
+            include_str!("../migration_compat/0047_retire_memory_v1_0_22.sql").into(),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn released_retirement_migration_reopens_without_rewriting_history_or_checksum() {
+        use sqlx::migrate::Migrate;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let legacy = released_retirement_migration();
+        let before;
+        {
+            let mut conn = create_legacy_database(&path, 47).await;
+            sqlx::query("INSERT INTO sessions(id,repository,goal,status,model,state,created_at,updated_at) VALUES('kept','/r','keep plan','blocked','m','execute','t','t')")
+                .execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO session_messages(session_id,ordinal,payload,created_at) VALUES('kept',0,'{\"role\":\"user\",\"content\":[]}','t')")
+                .execute(&mut conn).await.unwrap();
+            conn.apply(&legacy).await.unwrap();
+            // This body is newer than the retired migration and must not be
+            // erased by replaying its obsolete UPDATE while opening the DB.
+            sqlx::query("INSERT INTO events(id,session_id,sequence,type,payload,created_at) VALUES('kept-event','kept',1,'memory_changed','{\"type\":\"memory_changed\",\"payload\":{\"history\":true}}','t')")
+                .execute(&mut conn).await.unwrap();
+            before = sqlx::query_as::<_, (Vec<u8>, String, bool, i64)>("SELECT checksum,installed_on,success,execution_time FROM _sqlx_migrations WHERE version=47")
+                .fetch_one(&mut conn).await.unwrap();
+            assert_eq!(before.0, legacy.checksum.as_ref());
+        }
+
+        let db = Database::connect(&path).await.unwrap();
+        let after = sqlx::query_as::<_, (Vec<u8>, String, bool, i64)>("SELECT checksum,installed_on,success,execution_time FROM _sqlx_migrations WHERE version=47")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(after, before, "compatibility must not rewrite migration history");
+        let body: String = sqlx::query_scalar("SELECT payload FROM events WHERE id='kept-event'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(body, r#"{"type":"memory_changed","payload":{"history":true}}"#);
+        let goal: String = sqlx::query_scalar("SELECT goal FROM sessions WHERE id='kept'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(goal, "keep plan");
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_messages WHERE session_id='kept'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(messages, 1);
+        db.pool.close().await;
+        // Every later startup must accept the same immutable legacy record.
+        Database::connect(&path).await.unwrap().pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn retirement_compatibility_still_rejects_unknown_migration_checksums() {
+        use sqlx::migrate::Migrate;
+
+        for version in [46_i64, 47] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sessions.db");
+            {
+                let mut conn = create_legacy_database(&path, 47).await;
+                conn.apply(&released_retirement_migration()).await.unwrap();
+                sqlx::query("UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=?")
+                    .bind(version).execute(&mut conn).await.unwrap();
+            }
+            let error = Database::connect(&path).await.unwrap_err();
+            assert!(matches!(error, StorageError::Migrate(sqlx::migrate::MigrateError::VersionMismatch(rejected)) if rejected == version),
+                "unknown migration {version} must still fail closed: {error}");
+        }
+    }
+
     #[tokio::test]
     async fn migrations_apply_on_in_memory_db() {
         let db = Database::connect_in_memory().await.unwrap();

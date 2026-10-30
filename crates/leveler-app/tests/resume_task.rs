@@ -192,6 +192,37 @@ async fn settled(app: &Application, session: &leveler_core::SessionId, min_turns
     }
 }
 
+/// Wait for the turn row AND the runtime's admit lease.
+///
+/// `settled` stops at the durable row, but the runtime releases its per-session
+/// lease *after* the terminal event is enqueued, so a console that submits the
+/// follow-up in that window is refused with "already has an active turn". That
+/// is a race in the probe, not a product fact: the product's own admission
+/// contract is the lease.
+async fn settled_with_client(
+    app: &Application,
+    client: &InProcessRuntimeClient,
+    session: &leveler_core::SessionId,
+    min_turns: usize,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let row_stopped = {
+            let db = app.open_database().await.unwrap();
+            let turns = TurnRepository::new(&db).list(session).await.unwrap();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn did not settle in time: turns={turns:?}"
+            );
+            turns.len() >= min_turns && turns.iter().all(|turn| turn.status != "running")
+        };
+        if row_stopped && !client.has_live_turn(session) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Wait until the session's goal records satisfy `done`.
 ///
 /// A goal is settled in the task's terminal transaction, which lands after the
@@ -1185,12 +1216,13 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
         leveler_agent::CollaborationMode::Chat,
     )
     .await;
-    let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
+    let runtime = Arc::new(InProcessRuntimeClient::new(
         f.app.clone(),
         ModelRef::new("mock", "m"),
         PermissionProfile::Assisted,
         false,
     ));
+    let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
     client
         .send(ClientCommand::SubmitMessage {
             session_id: f.session.clone(),
@@ -1199,7 +1231,7 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
         })
         .await
         .unwrap();
-    settled(&f.app, &f.session, 1).await;
+    settled_with_client(&f.app, runtime.as_ref(), &f.session, 1).await;
     wait_for_goals(&f.app, &f.session, |goals| {
         goals.len() == 1 && goals[0].user_paused_at.is_some()
     })
@@ -1226,7 +1258,7 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
         })
         .await
         .unwrap();
-    settled(&f.app, &f.session, 2).await;
+    settled_with_client(&f.app, runtime.as_ref(), &f.session, 2).await;
     wait_for_goals(&f.app, &f.session, |goals| {
         goals
             .iter()
