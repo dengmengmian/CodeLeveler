@@ -16,7 +16,7 @@ const patch='*** Begin Patch\n*** Update File: README.md\n@@\n-# Before\n+# Afte
 let calls=0;const errors=[];
 const server=createServer(async(req,res)=>{
  try{let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);
- if(!body.tools?.length){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({id:'memory',choices:[{index:0,message:{role:'assistant',content:'{"candidates":[]}'},finish_reason:'stop'}]}));return;}
+ if(!body.tools?.length){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({id:'auxiliary',choices:[{index:0,message:{role:'assistant',content:'Fixture auxiliary response.'},finish_reason:'stop'}]}));return;}
  calls++;res.writeHead(200,{'content-type':'text/event-stream'});
  const frame=(delta,finish_reason=null)=>res.write('data: '+JSON.stringify({id:'layout',object:'chat.completion.chunk',created:1,model:'m',choices:[{index:0,delta,finish_reason}]})+'\n\n');
  if(!body.messages.some(message=>message.role==='tool')){frame({tool_calls:[{index:0,id:'layout-edit',type:'function',function:{name:'apply_patch',arguments:JSON.stringify({patch})}}]});frame({},'tool_calls');}

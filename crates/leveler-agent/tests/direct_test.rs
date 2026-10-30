@@ -167,33 +167,6 @@ fn patch_resolve_and_proven_ac() -> Vec<ModelResponse> {
     v
 }
 
-/// A project-scope Markdown memory service with one current user fact, so the
-/// capability-gated catalog has a real title to list.
-fn memory_service_with_one_fact(dir: &std::path::Path) -> Arc<leveler_memory::MemoryService> {
-    let service = leveler_memory::MemoryService::new(
-        leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-            leveler_memory::v2::MemoryScope::Project,
-            dir.join("memory"),
-            dir.join("state"),
-        )),
-    );
-    service
-        .remember(
-            &leveler_memory::v2::Actor::User {
-                invocation: leveler_memory::v2::UserInvocationId::mint("direct-test"),
-            },
-            leveler_memory::RememberRequest::new(
-                leveler_memory::v2::OpId::derived("direct-test", "title"),
-                leveler_memory::ServiceScope::Project,
-                "test memory title",
-                "The catalog lists current titles.",
-                "preference",
-            ),
-        )
-        .unwrap();
-    Arc::new(service)
-}
-
 struct Harness {
     engine: CodingRuntime,
     db: Database,
@@ -262,9 +235,7 @@ async fn harness_with_overrides(
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -274,7 +245,6 @@ async fn harness_with_overrides(
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -1724,9 +1694,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -1736,7 +1704,6 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -2404,9 +2371,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -2416,7 +2381,6 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Required,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -3359,9 +3323,7 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -3371,7 +3333,6 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -3716,104 +3677,17 @@ async fn a_failed_continuation_checkpoint_preserves_owed_goal_and_live_services_
 }
 
 #[tokio::test]
-async fn progressive_surface_loads_next_request_and_persists_exact_goal() {
-    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
-    let mut h = harness(vec![
-        tool_call("hidden", "find_symbol", serde_json::json!({"symbol":"old"})),
-        tool_call(
-            "enable",
-            "capability",
-            serde_json::json!({"action":"enable","id":"code_intelligence"}),
-        ),
-        tool_call("symbol", "find_symbol", serde_json::json!({"symbol":"old"})),
-        tool_call(
-            "memory",
-            "capability",
-            serde_json::json!({"action":"enable","id":"memory"}),
-        ),
-        tool_call(
-            "done",
-            "update_goal",
-            serde_json::json!({"status":"complete","summary":"inspected old"}),
-        ),
-    ])
-    .await;
-    h.engine.factory.capabilities = Some(Arc::new(
-        CapabilityDisclosure::new(
-            CapabilityId::ALL.to_vec(),
-            CapabilityId::ALL.to_vec(),
-            vec![],
-        )
-        .unwrap(),
-    ));
-    h.engine.factory.memory_service = Some(memory_service_with_one_fact(h.dir.path()));
-    let mut s = spec(&h);
-    s.runtime.goal = "inspect old".into();
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::Completed);
-    // Clone out of the lock so no `MutexGuard` is held across the awaits below.
-    let requests = h.requests.lock().unwrap().clone();
-    let names = |index: usize| {
-        requests[index]
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
-    };
-    assert!(names(0).contains(&"capability"));
-    assert!(!names(0).contains(&"find_symbol"));
-    assert!(!names(1).contains(&"find_symbol"));
-    assert!(names(2).contains(&"find_symbol"));
-    assert!(names(3).contains(&"find_symbol"));
-    assert!(requests[3].messages.iter().flat_map(|message| &message.content).any(|part| matches!(part, ContentPart::ToolResult { result } if result.call_id.as_str() == "symbol" && !result.is_error && result.content.contains("src/lib.rs"))));
-    assert!(!names(0).contains(&"spawn_agent"));
-    assert!(!names(0).contains(&"save_agent"));
-    assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|part| matches!(part, ContentPart::ToolResult { result } if result.call_id.as_str() == "hidden" && result.is_error && result.content.contains("not exposed"))));
-    let segments = |index: usize| {
-        requests[index]
-            .control_context
-            .blocks
-            .iter()
-            .map(|block| block.name.as_str())
-            .collect::<Vec<_>>()
-    };
-    assert!(!segments(0).contains(&"memory_guidance"));
-    assert!(!segments(0).contains(&"skills_guidance"));
-    assert!(!segments(0).contains(&"agent_catalog"));
-    assert!(!segments(0).contains(&"multi_agent_guidance"));
-    assert!(segments(4).contains(&"memory_guidance"));
-    assert!(segments(4).contains(&"memory_catalog"));
-    let task = h
-        .engine
-        .engine
-        .task_for_session(&session)
-        .await
-        .unwrap()
-        .unwrap();
-    let goal = h.db.for_task(&task).await.unwrap().remove(0);
-    assert_eq!(
-        h.db.active_capabilities(&goal.id).await.unwrap(),
-        vec!["code_intelligence", "memory"]
-    );
-}
-
-#[tokio::test]
 async fn progressive_same_round_enable_does_not_authorize_unadvertised_calls() {
     use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
     let mut enable = tool_call(
         "enable",
         "capability",
-        serde_json::json!({"action":"enable","id":"memory"}),
+        serde_json::json!({"action":"enable","id":"skills"}),
     );
     enable.message.content.push(ContentPart::ToolCall {
         call: ToolCall {
             id: ToolCallId::new("hidden"),
-            name: "remember".into(),
+            name: "load_skill".into(),
             arguments: serde_json::json!({"content":"must not write"}),
         },
     });
@@ -3841,8 +3715,18 @@ async fn progressive_same_round_enable_does_not_authorize_unadvertised_calls() {
         .await
         .unwrap();
     let requests = h.requests.lock().unwrap();
-    assert!(!requests[0].tools.iter().any(|tool| tool.name == "remember"));
-    assert!(requests[1].tools.iter().any(|tool| tool.name == "remember"));
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "load_skill")
+    );
+    assert!(
+        requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "load_skill")
+    );
     assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|part| matches!(part, ContentPart::ToolResult { result } if result.call_id.as_str() == "hidden" && result.is_error && result.content.contains("not exposed"))));
 }
 
@@ -3853,7 +3737,7 @@ async fn progressive_resume_restores_pack_and_new_goal_starts_small() {
         tool_call(
             "enable",
             "capability",
-            serde_json::json!({"action":"enable","id":"memory"}),
+            serde_json::json!({"action":"enable","id":"skills"}),
         ),
         tool_call(
             "resume_done",
@@ -3901,9 +3785,24 @@ async fn progressive_resume_restores_pack_and_new_goal_starts_small() {
         .unwrap();
     let requests = h.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    assert!(!requests[0].tools.iter().any(|tool| tool.name == "memory"));
-    assert!(requests[1].tools.iter().any(|tool| tool.name == "memory"));
-    assert!(!requests[2].tools.iter().any(|tool| tool.name == "memory"));
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "load_skill")
+    );
+    assert!(
+        requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "load_skill")
+    );
+    assert!(
+        !requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "load_skill")
+    );
 }
 
 #[tokio::test]
@@ -3950,106 +3849,6 @@ async fn progressive_capability_control_rejects_malformed_arguments() {
                 .is_empty()
         );
     }
-}
-
-/// Each optional capability, once the model enables it, appears on the very
-/// next request with its own tools and its own guidance — and the membership
-/// is persisted for the goal. This is the demand protocol Memory, Skills and
-/// Multi-Agent run through; Browser and Code Intelligence have separate
-/// real-model receipts.
-#[tokio::test]
-async fn progressive_demand_exposes_memory_skills_and_delegation() {
-    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
-    let mut h = harness(vec![
-        tool_call(
-            "m",
-            "capability",
-            serde_json::json!({"action":"enable","id":"memory"}),
-        ),
-        tool_call(
-            "s",
-            "capability",
-            serde_json::json!({"action":"enable","id":"skills"}),
-        ),
-        tool_call(
-            "a",
-            "capability",
-            serde_json::json!({"action":"enable","id":"multi_agent"}),
-        ),
-        tool_call(
-            "done",
-            "update_goal",
-            serde_json::json!({"status":"complete","summary":"loaded what was needed"}),
-        ),
-    ])
-    .await;
-    h.engine.factory.capabilities = Some(Arc::new(
-        CapabilityDisclosure::new(
-            CapabilityId::ALL.to_vec(),
-            CapabilityId::ALL.to_vec(),
-            vec![],
-        )
-        .unwrap(),
-    ));
-    h.engine.factory.memory_service = Some(memory_service_with_one_fact(h.dir.path()));
-    let mut s = spec(&h);
-    s.runtime.goal = "load optional capabilities on demand".into();
-    let session = h.engine.create_task(&s).await.unwrap();
-    let report = h
-        .engine
-        .run(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(report.outcome, TaskOutcome::Completed);
-
-    // Clone out of the lock so no `MutexGuard` is held across the awaits below.
-    let requests = h.requests.lock().unwrap().clone();
-    let has = |index: usize, name: &str| requests[index].tools.iter().any(|t| t.name == name);
-    let segments = |index: usize| {
-        requests[index]
-            .control_context
-            .blocks
-            .iter()
-            .map(|block| block.name.as_str())
-            .collect::<Vec<_>>()
-    };
-
-    // The initial request offers the control, not any of the optional tools.
-    for absent in ["memory", "remember", "forget", "load_skill", "spawn_agent"] {
-        assert!(!has(0, absent), "{absent} exposed before the model asked");
-    }
-    assert!(!segments(0).contains(&"memory_guidance"));
-    assert!(!segments(0).contains(&"skills_guidance"));
-    assert!(!segments(0).contains(&"multi_agent_guidance"));
-
-    // Enable memory → next request carries the memory tools and guidance.
-    assert!(has(1, "remember") && has(1, "forget") && has(1, "memory"));
-    assert!(segments(1).contains(&"memory_guidance"));
-    assert!(!has(1, "load_skill"));
-    assert!(!has(1, "spawn_agent"));
-
-    // Enable skills → the loader appears, nothing else leaked in.
-    assert!(has(2, "load_skill"));
-    assert!(segments(2).contains(&"skills_guidance"));
-    assert!(!has(2, "spawn_agent"));
-
-    // Enable multi_agent → delegation appears with its guidance.
-    assert!(has(3, "spawn_agent"));
-    assert!(segments(3).contains(&"multi_agent_guidance"));
-    assert!(has(3, "load_skill") && has(3, "remember"));
-
-    let task = h
-        .engine
-        .engine
-        .task_for_session(&session)
-        .await
-        .unwrap()
-        .unwrap();
-    let goal = h.db.for_task(&task).await.unwrap().remove(0);
-    assert_eq!(
-        h.db.active_capabilities(&goal.id).await.unwrap(),
-        vec!["memory", "multi_agent", "skills"]
-    );
 }
 
 /// The completion gate is wired, not just a pure predicate: a `complete`
@@ -4894,9 +4693,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -4906,7 +4703,6 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

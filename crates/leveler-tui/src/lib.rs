@@ -38,7 +38,6 @@ pub mod i18n;
 mod issue;
 mod layout;
 pub mod markdown;
-pub mod memory;
 pub mod motion;
 pub mod multi_agent;
 mod observability;
@@ -50,6 +49,7 @@ mod perf_bench;
 mod plan_cell;
 mod presentation;
 pub mod profile;
+pub mod query_track;
 pub mod record;
 pub mod reducer;
 pub mod render;
@@ -58,6 +58,11 @@ mod secondary;
 mod selection;
 pub mod shell_mode;
 pub(crate) mod shell_render;
+
+/// Rows one user-shell output window shows before it scrolls. Public because it
+/// is the product's fixed window height: a client test asserting "the record
+/// stopped growing" must describe the same bound the renderer paints.
+pub use shell_render::SHELL_OUTPUT_WINDOW_ROWS;
 pub mod skills_view;
 mod splash;
 pub mod state;
@@ -75,6 +80,7 @@ pub mod transcript;
 pub mod unfinished_goals;
 pub mod update;
 mod url_link;
+pub mod usage;
 #[cfg(test)]
 mod ux_experiment;
 mod wait_status;
@@ -87,6 +93,7 @@ pub use action::{
     UrlOpener, WebLauncher,
 };
 pub use i18n::Locale;
+pub use observability::LIVE_REFRESH_INTERVAL;
 pub use run::{TuiError, TuiExit, run};
 pub use state::Boot;
 pub use theme::{Theme, ThemeId, preview_theme};

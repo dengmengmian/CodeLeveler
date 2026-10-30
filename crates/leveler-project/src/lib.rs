@@ -9,12 +9,9 @@ pub mod config;
 pub mod detect;
 pub mod hygiene;
 pub mod layout;
-pub mod legacy_memory_purge;
 
 pub use config::{
-    CommandSpec, IndependentReview, MemoryConfig, ProjectConfig, RulesConfig, RunLimitsConfig,
-    VerifySpec,
+    CommandSpec, IndependentReview, ProjectConfig, RulesConfig, RunLimitsConfig, VerifySpec,
 };
 pub use detect::{Language, detect_languages};
 pub use layout::{EphemeralHome, Layout, NoWorkspace};
-pub use legacy_memory_purge::{PurgeReport, StoreReport, StoreVerdict, purge};

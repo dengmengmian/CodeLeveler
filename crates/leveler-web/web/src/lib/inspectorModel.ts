@@ -97,7 +97,11 @@ export function planProgress(
   live: boolean,
 ): { done: number; total: number; live: boolean; active: string | null } | null {
   if (!plan || plan.steps.length === 0) return null;
-  const done = plan.steps.filter((s) => s.status === 'done' || s.status === 'skipped').length;
-  const running = live ? plan.steps.find((s) => s.status === 'running') : undefined;
-  return { done, total: plan.steps.length, live, active: running?.description ?? null };
+  // An abandoned step is replacement history, not current plan work: it is
+  // neither delivered nor owed, so it belongs in neither progress nor total.
+  const current = plan.steps.filter((s) => s.status !== 'abandoned');
+  if (current.length === 0) return null;
+  const done = current.filter((s) => s.status === 'done' || s.status === 'skipped').length;
+  const running = live ? current.find((s) => s.status === 'running') : undefined;
+  return { done, total: current.length, live, active: running?.description ?? null };
 }

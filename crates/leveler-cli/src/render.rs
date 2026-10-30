@@ -186,6 +186,12 @@ fn render_event_text(event: AgentEvent) {
                     leveler_agent::closeout::CloseoutReason::GoalUnresolved => {
                         "nudge: goal unresolved"
                     }
+                    leveler_agent::closeout::CloseoutReason::PlanUnresolved => {
+                        "nudge: plan still open"
+                    }
+                    leveler_agent::closeout::CloseoutReason::TaskUnregistered => {
+                        "nudge: refused task declaration, user request still open"
+                    }
                     leveler_agent::closeout::CloseoutReason::EmptyAnswer => "nudge: empty answer",
                 },
             };
@@ -206,20 +212,6 @@ fn render_event_text(event: AgentEvent) {
             println!("  {} finalizing: {phase}", console::style("⋯").yellow());
         }
         AgentEvent::FinalizationPhaseFinished { .. } => {}
-        AgentEvent::MemoryRecalled { count, .. } => {
-            println!("{} memory recalled {count}", console::style("●").cyan());
-        }
-        AgentEvent::MemoryChanged {
-            operation,
-            id,
-            title,
-            ..
-        } => {
-            println!(
-                "{} memory {operation} [{id}] {title}",
-                console::style("●").cyan()
-            );
-        }
         AgentEvent::RuntimeInjection {
             kind,
             role,
@@ -466,24 +458,6 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         }),
         AgentEvent::FinalizationPhaseFinished { phase, elapsed_ms } => serde_json::json!({
             "type": "finalization_phase_finished", "phase": phase, "elapsed_ms": elapsed_ms,
-        }),
-        AgentEvent::MemoryRecalled {
-            ids,
-            count,
-            experience,
-            ..
-        } => serde_json::json!({
-            "type": "memory_recalled", "count": count, "ids": ids,
-            "experience": experience,
-        }),
-        AgentEvent::MemoryChanged {
-            operation,
-            id,
-            title,
-            authority,
-        } => serde_json::json!({
-            "type": "memory_changed", "operation": operation, "id": id,
-            "title": title, "authority": authority,
         }),
     }
 }

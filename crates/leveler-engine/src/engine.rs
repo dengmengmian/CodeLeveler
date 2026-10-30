@@ -175,6 +175,11 @@ pub struct NewSession {
     /// Product-defined axes persisted opaquely with the session. The engine
     /// does not interpret either value.
     pub axes: Option<NewSessionAxes>,
+    /// Whether `model` is the user's explicit choice (`true`) or an inherited
+    /// default (`false`). The engine persists the fact; the product decides
+    /// what a later default change may do to each kind of session.
+    #[allow(clippy::struct_field_names)]
+    pub model_pinned: bool,
 }
 
 pub struct NewSessionAxes {
@@ -580,6 +585,7 @@ impl TaskEngine {
                 SessionRecord::without_workspace(session.goal.clone(), session.model.clone(), now)
             }
         };
+        record.model_pinned = session.model_pinned;
         if let Some(axes) = &session.axes {
             record = record.with_axes(&axes.collaboration, "single");
         }

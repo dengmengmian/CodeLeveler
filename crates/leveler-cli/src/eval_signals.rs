@@ -31,6 +31,25 @@ const LOOP_GUARD_MARKER: &str = "made no progress";
 /// The marker an authorization denial puts in a tool result.
 const DENIAL_MARKER: &str = "action not permitted";
 
+/// Tools that change the worktree. A successful result from one of these is the
+/// only thing that can make bytes already returned stale — and therefore the
+/// only thing that makes reading the same region again informative.
+const EDIT_TOOLS: &[&str] = &["apply_patch", "write_file", "replace"];
+
+/// FNV-1a over a tool result's returned text.
+///
+/// Only compared against other digests from the same run, so it carries no
+/// cross-version promise: it exists to answer "did the same bytes come back?"
+/// without keeping the text itself in the ledger.
+fn digest(bytes: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 pub(crate) struct SignalCollector {
     signals: TrajectorySignals,
     /// Case-relevant paths (the overlay's files): the harness's proxy for
@@ -62,6 +81,21 @@ pub(crate) struct SignalCollector {
     /// Tool-call ids of verification-class `run_command`s, to mark
     /// `verification_ran` when one succeeds.
     verify_calls: HashSet<String>,
+    /// Successful edit results so far — the window in which previously returned
+    /// bytes can be stale. A read that returns the same text at the same counter
+    /// returned nothing new.
+    successful_edits: u32,
+    /// Last read of a (path, requested range): the edit counter at that read and
+    /// a digest of the returned text.
+    last_read: HashMap<(String, String), (u32, u64)>,
+    /// Reads awaiting a result: tool-call id → (path, range key). Evidence is
+    /// what came back, so a read that errored teaches nothing about the file.
+    pending_reads: HashMap<String, (String, String)>,
+    /// Last verdict of each verification command signature: edit counter and
+    /// whether it reported an error.
+    last_verification: HashMap<String, (u32, bool)>,
+    /// Verification calls awaiting a result: tool-call id → command signature.
+    pending_verifications: HashMap<String, String>,
     /// (tool name, current consecutive-error count) for the arg-error streak.
     error_streak: Option<(String, u32)>,
     /// Case start for TTFF measurement.
@@ -134,6 +168,11 @@ impl SignalCollector {
             pending_coverage: HashMap::new(),
             verification_failed: false,
             verify_calls: HashSet::new(),
+            successful_edits: 0,
+            last_read: HashMap::new(),
+            pending_reads: HashMap::new(),
+            last_verification: HashMap::new(),
+            pending_verifications: HashMap::new(),
             error_streak: None,
             started: Instant::now(),
             first_feedback: None,
@@ -309,6 +348,16 @@ impl SignalCollector {
                         } else {
                             self.signals.broad_reads += 1;
                         }
+                        // Remember which region this call asked for; the
+                        // verdict waits for the result.
+                        if let Some(path) = tool_argument(arguments, "path") {
+                            let range = format!(
+                                "{}..{}",
+                                tool_argument(arguments, "start_line").unwrap_or_default(),
+                                tool_argument(arguments, "end_line").unwrap_or_default()
+                            );
+                            self.pending_reads.insert(id.clone(), (path, range));
+                        }
                     }
                     "grep" | "find_files" | "find_symbol" | "list_files" | "find_references"
                     | "locate_hint" => {
@@ -338,6 +387,9 @@ impl SignalCollector {
                 }
                 if name == "run_command" && is_verification_program(arguments) {
                     self.verify_calls.insert(id.clone());
+                    if let Some(signature) = verification_signature(arguments) {
+                        self.pending_verifications.insert(id.clone(), signature);
+                    }
                 }
             }
             AgentEvent::ToolResult {
@@ -352,6 +404,38 @@ impl SignalCollector {
                     if *is_error {
                         self.signals.edit_failures += 1;
                     }
+                }
+                // A landed edit is the only event that can make bytes the run
+                // already received stale. A failed edit changed nothing, so it
+                // does not open the window.
+                if !*is_error && EDIT_TOOLS.contains(&name.as_str()) {
+                    self.successful_edits = self.successful_edits.saturating_add(1);
+                }
+                // Repeated read: the SAME region of the SAME path returned the
+                // SAME bytes with no landed edit in between. The path was not
+                // re-derived, the file was not re-read after a change — nothing
+                // could have differed, so nothing new was learned.
+                if let Some((path, range)) = self.pending_reads.remove(id)
+                    && !*is_error
+                {
+                    let seen = (self.successful_edits, digest(preview));
+                    let key = (path, range);
+                    if self.last_read.get(&key) == Some(&seen) {
+                        self.signals.redundant_reads =
+                            self.signals.redundant_reads.saturating_add(1);
+                    }
+                    self.last_read.insert(key, seen);
+                }
+                // Repeated verification: the same check, with no landed edit
+                // since it last ran, answering the same way. Its inputs did not
+                // change, so the second answer was already known.
+                if let Some(signature) = self.pending_verifications.remove(id) {
+                    let seen = (self.successful_edits, *is_error);
+                    if self.last_verification.get(&signature) == Some(&seen) {
+                        self.signals.redundant_verification_calls =
+                            self.signals.redundant_verification_calls.saturating_add(1);
+                    }
+                    self.last_verification.insert(signature, seen);
                 }
                 if *is_error {
                     self.errored_rounds.insert(self.rounds_started.max(1));
@@ -552,6 +636,21 @@ fn is_verification_program(arguments: &str) -> bool {
     VERIFICATION_PROGRAMS.contains(&base)
 }
 
+/// The identity of a verification command: its program plus argument vector,
+/// serialized through a canonical JSON value so two spellings of the same call
+/// compare equal. `None` when the arguments are not an object carrying a
+/// program — such a call is not judged at all rather than judged wrongly.
+fn verification_signature(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let program = value.get("program")?.as_str()?;
+    let args = match value.get("args") {
+        Some(serde_json::Value::Array(items)) => serde_json::Value::Array(items.clone()),
+        Some(other) => other.clone(),
+        None => serde_json::Value::Array(Vec::new()),
+    };
+    Some(format!("{program}\u{1}{args}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +720,179 @@ mod tests {
         assert_eq!(s.tool_calls, 2);
         assert!(!s.touched_relevant_files);
         assert_eq!(classify_failure(&s), FailureCategory::Localization);
+    }
+
+    /// Reading the same path twice is not by itself waste: the file may have
+    /// changed under an edit. Only the same bytes coming back with no landed edit
+    /// in between is provably no new information, and that is all this counter
+    /// claims.
+    #[test]
+    fn a_re_read_is_redundant_only_when_the_same_bytes_come_back_unchanged() {
+        let mut c = SignalCollector::new(Vec::<String>::new());
+        let read = |c: &mut SignalCollector, id: &str, path: &str, range: serde_json::Value| {
+            let mut args = serde_json::json!({"path": path});
+            if let (Some(object), Some(range)) = (args.as_object_mut(), range.as_object()) {
+                object.extend(range.clone());
+            }
+            c.observe_agent(&read_call(id, "read_file", args));
+        };
+
+        // First read: nothing to compare against.
+        read(&mut c, "c1", "src/a.rs", serde_json::json!({}));
+        c.observe_agent(&result("c1", "read_file", false, "pub fn a() {}"));
+        // Same region, same bytes, no edit: redundant.
+        read(&mut c, "c2", "src/a.rs", serde_json::json!({}));
+        c.observe_agent(&result("c2", "read_file", false, "pub fn a() {}"));
+        // Same region, DIFFERENT bytes: the file changed, so this taught something.
+        read(&mut c, "c3", "src/a.rs", serde_json::json!({}));
+        c.observe_agent(&result(
+            "c3",
+            "read_file",
+            false,
+            "pub fn a() { /* new */ }",
+        ));
+        // A different region of the same file is a different question.
+        read(
+            &mut c,
+            "c4",
+            "src/a.rs",
+            serde_json::json!({"start_line": 2, "end_line": 4}),
+        );
+        c.observe_agent(&result("c4", "read_file", false, "pub fn a() {}"));
+        // A different file returning identical text is not a repeat either.
+        read(&mut c, "c5", "src/b.rs", serde_json::json!({}));
+        c.observe_agent(&result("c5", "read_file", false, "pub fn a() {}"));
+
+        let signals = c.finish(false);
+        assert_eq!(
+            signals.redundant_reads, 1,
+            "only the byte-identical second read of the same region counts"
+        );
+        // The coarser existing metric still sees every repeat it always saw, so
+        // the two numbers can be read together instead of replacing each other.
+        assert_eq!(signals.repeated_file_reads, 3);
+    }
+
+    /// A landed edit invalidates what was read before it: re-reading the same
+    /// region after a successful write is how a run checks its own change, not a
+    /// repeat. A FAILED edit changed nothing and opens no window.
+    #[test]
+    fn only_a_landed_edit_makes_a_re_read_informative() {
+        let mut c = SignalCollector::new(Vec::<String>::new());
+        c.observe_agent(&read_call(
+            "r1",
+            "read_file",
+            serde_json::json!({"path": "src/a.rs"}),
+        ));
+        c.observe_agent(&result("r1", "read_file", false, "old body"));
+
+        // A failed patch changes nothing.
+        c.observe_agent(&call(
+            "e1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Update File: src/a.rs"}),
+        ));
+        c.observe_agent(&result("e1", "apply_patch", true, "context mismatch"));
+        c.observe_agent(&read_call(
+            "r2",
+            "read_file",
+            serde_json::json!({"path": "src/a.rs"}),
+        ));
+        c.observe_agent(&result("r2", "read_file", false, "old body"));
+        assert_eq!(c.clone_signals().redundant_reads, 1);
+
+        // A landed patch makes the next read a check rather than a repeat.
+        c.observe_agent(&call(
+            "e2",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Update File: src/a.rs"}),
+        ));
+        c.observe_agent(&result("e2", "apply_patch", false, "applied"));
+        c.observe_agent(&read_call(
+            "r3",
+            "read_file",
+            serde_json::json!({"path": "src/a.rs"}),
+        ));
+        c.observe_agent(&result("r3", "read_file", false, "old body"));
+        assert_eq!(
+            c.clone_signals().redundant_reads,
+            1,
+            "a read after a landed edit is a verification, not a repeat"
+        );
+    }
+
+    /// An errored read returned no bytes, so it can neither be redundant itself
+    /// nor seed the ledger for a later comparison.
+    #[test]
+    fn an_errored_read_does_not_participate_in_the_redundancy_ledger() {
+        let mut c = SignalCollector::new(Vec::<String>::new());
+        c.observe_agent(&read_call(
+            "r1",
+            "read_file",
+            serde_json::json!({"path": "src/a.rs"}),
+        ));
+        c.observe_agent(&result("r1", "read_file", true, "no such file"));
+        c.observe_agent(&read_call(
+            "r2",
+            "read_file",
+            serde_json::json!({"path": "src/a.rs"}),
+        ));
+        c.observe_agent(&result("r2", "read_file", false, "no such file"));
+        assert_eq!(c.clone_signals().redundant_reads, 0);
+    }
+
+    /// Re-running the same check with no landed edit and the same verdict told
+    /// the run nothing it did not already know. A landed edit, a different
+    /// command, or a different verdict is ordinary work and is not counted.
+    #[test]
+    fn repeated_verification_is_counted_only_without_a_landed_edit() {
+        let mut c = SignalCollector::new(Vec::<String>::new());
+        let test_args = serde_json::json!({"program": "cargo", "args": ["test"]});
+        let other_args = serde_json::json!({"program": "cargo", "args": ["test", "--lib"]});
+
+        c.observe_agent(&call("v1", "run_command", test_args.clone()));
+        c.observe_agent(&result("v1", "run_command", true, "1 failing test"));
+        c.observe_agent(&call("v2", "run_command", test_args.clone()));
+        c.observe_agent(&result("v2", "run_command", true, "1 failing test"));
+        assert_eq!(c.clone_signals().redundant_verification_calls, 1);
+
+        // A different command is a different question.
+        c.observe_agent(&call("v3", "run_command", other_args));
+        c.observe_agent(&result("v3", "run_command", true, "1 failing test"));
+        assert_eq!(c.clone_signals().redundant_verification_calls, 1);
+
+        // A landed edit invalidates the previous answer.
+        c.observe_agent(&call(
+            "e1",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Update File: src/lib.rs"}),
+        ));
+        c.observe_agent(&result("e1", "apply_patch", false, "applied"));
+        c.observe_agent(&call("v4", "run_command", test_args.clone()));
+        c.observe_agent(&result("v4", "run_command", true, "1 failing test"));
+        assert_eq!(c.clone_signals().redundant_verification_calls, 1);
+
+        // Without another edit, the same verdict again is a retry loop.
+        c.observe_agent(&call("v5", "run_command", test_args.clone()));
+        c.observe_agent(&result("v5", "run_command", true, "1 failing test"));
+        assert_eq!(c.clone_signals().redundant_verification_calls, 2);
+
+        // A different verdict is new information.
+        c.observe_agent(&call("v6", "run_command", test_args));
+        c.observe_agent(&result("v6", "run_command", false, "test result: ok"));
+        assert_eq!(c.clone_signals().redundant_verification_calls, 2);
+        assert!(c.clone_signals().verification_ran);
+    }
+
+    #[test]
+    fn a_non_verification_command_never_enters_the_repeat_ledger() {
+        let mut c = SignalCollector::new(Vec::<String>::new());
+        let args = serde_json::json!({"program": "ls", "args": []});
+        for id in ["v1", "v2"] {
+            c.observe_agent(&call(id, "run_command", args.clone()));
+            c.observe_agent(&result(id, "run_command", false, "src"));
+        }
+        assert_eq!(c.clone_signals().redundant_verification_calls, 0);
     }
 
     /// Reading a relevant file and failing most edits is an editing failure.

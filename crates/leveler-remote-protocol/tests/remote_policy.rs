@@ -79,16 +79,6 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
-            // Same authority as run_goal: both start a task that may write
-            // code. The extra reading stages neither widen nor narrow it.
-            "run_develop",
-            ClientCommand::RunDevelop {
-                session_id: session(),
-                content: "goal".to_string(),
-            },
-            true,
-        ),
-        (
             // Same authority as submit_message: it continues the session's own
             // interrupted task or falls back to an ordinary message.
             "resume_task",
@@ -220,96 +210,6 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
-            "list_memory",
-            ClientCommand::ListMemory {
-                session_id: session(),
-                query_id: None,
-                include_archived: false,
-            },
-            false,
-        ),
-        (
-            "memory_status",
-            ClientCommand::MemoryStatus {
-                session_id: session(),
-                query_id: None,
-            },
-            false,
-        ),
-        (
-            "forget_memory",
-            ClientCommand::ForgetMemory {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                id: "m1".to_string(),
-            },
-            false,
-        ),
-        (
-            "accept_memory",
-            ClientCommand::AcceptMemory {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                id: "m1".to_string(),
-            },
-            false,
-        ),
-        // Withholding consent is consent handling too, and a direct write is
-        // the strongest memory mutation there is. Neither travels.
-        (
-            "reject_memory",
-            ClientCommand::RejectMemory {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                id: "cand-1".to_string(),
-            },
-            false,
-        ),
-        (
-            "remember_memory",
-            ClientCommand::RememberMemory {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                body: "keep it compact".to_string(),
-                kind: None,
-            },
-            false,
-        ),
-        // Editing, pinning and retiring a record are the user's own memory
-        // decisions; the same verdict the policy assigns them applies here.
-        (
-            "update_memory",
-            ClientCommand::UpdateMemory {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                id: "m1".to_string(),
-                revision: 1,
-                title: "subject".to_string(),
-                body: "keep it compact".to_string(),
-            },
-            false,
-        ),
-        (
-            "set_memory_pin",
-            ClientCommand::SetMemoryPin {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                id: "m1".to_string(),
-                pinned: true,
-            },
-            false,
-        ),
-        (
-            "deprecate_memory",
-            ClientCommand::DeprecateMemory {
-                session_id: session(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                id: "m1".to_string(),
-                revision: 1,
-            },
-            false,
-        ),
-        (
             "steer_current_turn",
             ClientCommand::SteerCurrentTurn {
                 session_id: session(),
@@ -362,8 +262,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
         ),
         (
             // Starting a fresh session creates and deletes nothing, so a
-            // paired phone may do it — unlike the memory and attachment
-            // commands below, which stay shut.
+            // paired phone may do it; attachment commands stay shut.
             "new_session_for",
             ClientCommand::NewSessionFor {
                 requester_session_id: session(),
@@ -575,6 +474,21 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
                 session_id: session(),
                 query_id: Some(leveler_client_protocol::CommandId::new("q1")),
             },
+            false,
+        ),
+        (
+            "query_usage",
+            ClientCommand::QueryUsage {
+                session_id: session(),
+                query_id: Some(leveler_client_protocol::CommandId::new("q1")),
+                scope: leveler_client_protocol::UiUsageScope::Session,
+                utc_offset_minutes: 480,
+            },
+            false,
+        ),
+        (
+            "reload_config",
+            ClientCommand::ReloadConfig { query_id: None },
             false,
         ),
         ("quit", ClientCommand::Quit, false),

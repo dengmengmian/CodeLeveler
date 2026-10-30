@@ -3,7 +3,6 @@ import {
   SLASH_COMMANDS,
   filterSlashCommands,
   groupSlashCommands,
-  slashTarget,
 } from './slashCommands';
 
 describe('slash commands', () => {
@@ -32,18 +31,5 @@ describe('slash commands', () => {
     ]);
   });
 
-  it('maps each command to a GUI interaction, not a CLI rewrite', () => {
-    expect(slashTarget('/model')).toEqual({ kind: 'selector', popup: 'model' });
-    expect(slashTarget('/work-mode')).toBeNull();
-    expect(slashTarget('/collab')).toEqual({ kind: 'selector', popup: 'collab' });
-    expect(slashTarget('/perm')).toEqual({ kind: 'selector', popup: 'perm' });
-    expect(slashTarget('/checkpoint')).toEqual({ kind: 'entity-picker', popup: 'checkpoint' });
-    expect(slashTarget('/btw')).toEqual({ kind: 'input-mode' });
-    expect(slashTarget('/diff')).toEqual({ kind: 'navigation', dest: 'diff' });
-    expect(slashTarget('/memory')).toEqual({ kind: 'navigation', dest: 'memory' });
-    expect(slashTarget('/compact')).toEqual({ kind: 'action', command: '/compact' });
-    expect(slashTarget('/clear')).toEqual({ kind: 'action', command: '/clear' });
-    expect(slashTarget('/cancel')).toEqual({ kind: 'action', command: '/cancel' });
-    expect(slashTarget('/unknown')).toBeNull();
-  });
+
 });

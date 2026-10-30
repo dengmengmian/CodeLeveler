@@ -93,63 +93,6 @@ fn default_true() -> bool {
     true
 }
 
-/// `memory:` — whether durable project memory is part of this project at all.
-///
-/// Default is ON. When disabled, loading memory is not permitted; existing
-/// durable entries remain stored. Tool exposure is controlled per goal.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct MemoryConfig {
-    /// When false: no turn is admitted to memory extraction, no background
-    /// provider request runs, no memory catalog/recall reaches the model, and
-    /// the memory tools are not exposed. Existing memory data is NOT deleted.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// User facts: preferences, decisions, notes, corrections and the
-    /// `remember` path. Only effective while `enabled` is also true.
-    #[serde(default = "default_true")]
-    pub user_enabled: bool,
-    /// Agent experience: automatic extraction and recall of evidence-bound
-    /// lessons. Only effective while `enabled` is also true. Disabling it
-    /// stops extraction and recall but never deletes existing experience.
-    /// OFF by default: an absent key, including in YAML written before this
-    /// lane existed, means experimental lessons stay closed until the project
-    /// opts in with an explicit `true`.
-    #[serde(default)]
-    pub experience_enabled: bool,
-    /// Removed `backend` selector (Memory 2.0 cutover).
-    ///
-    /// Markdown is the only implementation, so this key carries no authority.
-    /// It is still accepted — and reported by [`Self::deprecated_backend`] —
-    /// because an existing `config.yaml` that names `legacy` or `markdown`
-    /// must keep loading its other settings instead of silently losing them.
-    #[serde(default, rename = "backend")]
-    pub deprecated_backend: Option<String>,
-}
-
-impl MemoryConfig {
-    /// A notice for a config that still carries the removed `backend` key.
-    ///
-    /// Callers show this to the user; the value never selects a store, so an
-    /// old `legacy` line cannot reactivate the deleted backend.
-    pub fn deprecated_backend(&self) -> Option<String> {
-        let value = self.deprecated_backend.as_deref()?.trim();
-        Some(format!(
-            "memory.backend = \"{value}\" 已移除：Markdown Memory 2.0 是唯一实现。请从 .leveler/config.yaml 删除该字段。"
-        ))
-    }
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            user_enabled: true,
-            experience_enabled: false,
-            deprecated_backend: None,
-        }
-    }
-}
-
 /// `rules:` — deterministic delivery policy for project-rule documents.
 ///
 /// Rule documents are authority-bearing, so their DELIVERY is decided by the
@@ -190,9 +133,6 @@ pub struct ProjectConfig {
     /// Multi-agent delegation settings.
     #[serde(default)]
     pub agents: AgentsConfig,
-    /// Durable project memory. Absent = enabled (the historical behaviour).
-    #[serde(default)]
-    pub memory: MemoryConfig,
     /// Deterministic project-rule delivery policy.
     #[serde(default)]
     pub rules: RulesConfig,
@@ -346,89 +286,6 @@ ignore:
             always.agents.independent_review,
             IndependentReview::Required
         );
-    }
-
-    #[test]
-    fn memory_is_enabled_by_default_and_can_be_switched_off() {
-        // An absent block keeps the behaviour every existing session had.
-        let cfg: ProjectConfig = serde_yaml::from_str("{}").unwrap();
-        assert!(cfg.memory.enabled);
-        let default = ProjectConfig::default();
-        assert!(default.memory.enabled);
-
-        // An explicit block wins.
-        let off: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: false\n").unwrap();
-        assert!(!off.memory.enabled);
-        let on: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
-        assert!(on.memory.enabled);
-    }
-
-    #[test]
-    fn experience_is_off_by_default_and_user_facts_stay_on() {
-        // Automatic experience is an experimental lane. A project that never
-        // opted in keeps user facts and does not get lessons extracted behind
-        // its back; a missing key means closed, not "inherit a historical on".
-        let absent: ProjectConfig = serde_yaml::from_str("{}").unwrap();
-        assert!(absent.memory.enabled);
-        assert!(absent.memory.user_enabled);
-        assert!(!absent.memory.experience_enabled);
-        let default = ProjectConfig::default();
-        assert!(default.memory.user_enabled);
-        assert!(!default.memory.experience_enabled);
-
-        // Old YAML has only `enabled`; user facts keep the historical
-        // behaviour while experience stays closed until explicitly enabled.
-        let old: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
-        assert!(old.memory.user_enabled);
-        assert!(!old.memory.experience_enabled);
-
-        // An explicit opt-in still enables experience.
-        let opted_in: ProjectConfig =
-            serde_yaml::from_str("memory:\n  experience_enabled: true\n").unwrap();
-        assert!(opted_in.memory.user_enabled);
-        assert!(opted_in.memory.experience_enabled);
-
-        let no_experience: ProjectConfig =
-            serde_yaml::from_str("memory:\n  experience_enabled: false\n").unwrap();
-        assert!(no_experience.memory.user_enabled);
-        assert!(!no_experience.memory.experience_enabled);
-
-        let no_user: ProjectConfig =
-            serde_yaml::from_str("memory:\n  user_enabled: false\n").unwrap();
-        assert!(!no_user.memory.user_enabled);
-        assert!(!no_user.memory.experience_enabled);
-
-        // The total switch owns both lanes; a lane value cannot reopen it.
-        let total_off: ProjectConfig = serde_yaml::from_str(
-            "memory:\n  enabled: false\n  user_enabled: true\n  experience_enabled: true\n",
-        )
-        .unwrap();
-        assert!(!total_off.memory.enabled);
-        assert!(total_off.memory.user_enabled);
-        assert!(total_off.memory.experience_enabled);
-    }
-
-    #[test]
-    fn a_removed_backend_key_is_accepted_and_reported() {
-        // Markdown is the only implementation. A config written against the
-        // two-backend era must still load (so unrelated settings survive) and
-        // must say that the key no longer selects anything.
-        let legacy: ProjectConfig = serde_yaml::from_str(
-            "memory:\n  backend: legacy\n  enabled: true\n  experience_enabled: true\n",
-        )
-        .unwrap();
-        assert!(legacy.memory.enabled);
-        assert!(legacy.memory.experience_enabled);
-        let notice = legacy.memory.deprecated_backend().unwrap();
-        assert!(notice.contains("memory.backend"), "{notice}");
-        assert!(notice.contains("legacy"), "{notice}");
-        assert!(notice.contains("Markdown"), "{notice}");
-
-        // Nothing selects a store: there is no field left to read it from.
-        let modern: ProjectConfig = serde_yaml::from_str("memory:\n  backend: markdown\n").unwrap();
-        assert!(modern.memory.deprecated_backend().is_some());
-        let clean: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
-        assert!(clean.memory.deprecated_backend().is_none());
     }
 
     #[test]

@@ -96,8 +96,8 @@ impl Database {
         sqlx::query(
             "INSERT INTO sessions \
              (id, repository, goal, status, model, state, created_at, updated_at, \
-              collaboration, work_profile, mode, sandbox, kind) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              collaboration, work_profile, mode, sandbox, kind, model_pinned) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(&record.id)
         .bind(&record.repository)
@@ -112,6 +112,7 @@ impl Database {
         .bind(mode)
         .bind(sandbox)
         .bind(kind)
+        .bind(record.model_pinned)
         .execute(&mut *tx)
         .await?;
 

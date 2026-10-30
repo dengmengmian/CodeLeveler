@@ -489,6 +489,10 @@ pub enum RuntimeEvent {
     /// The assistant naturally finished its answer, without claiming that an
     /// external task was independently verified as complete.
     TurnAnswered,
+    /// The turn ended at the user's own pause boundary. The goal still owes
+    /// the work the user withheld authorization to continue; nothing failed
+    /// and nothing is complete. Only the user's own continuation releases it.
+    TurnPaused { reason: String },
     /// The turn stopped at an output limit even after bounded continuation.
     TurnTruncated { error: String },
     /// The executor stopped cleanly but did not reach a successful terminal
@@ -694,55 +698,6 @@ pub enum RuntimeEvent {
     BackgroundTasksReconciled {
         tasks: Vec<crate::UiActiveBackgroundTask>,
     },
-    /// Project memory listing (response to [`crate::ClientCommand::ListMemory`]).
-    MemoryList {
-        /// Echoes the requesting client's query id. A client must ignore an
-        /// absent or foreign id so another session subscriber cannot open UI.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        query_id: Option<CommandId>,
-        memory_dir: String,
-        active: Vec<UiMemoryEntry>,
-        archived: Vec<UiMemoryEntry>,
-        /// Candidates awaiting the user's consent (K36). Without these in the
-        /// listing the TUI cannot show that anything is waiting, and the only
-        /// way to adopt a memory is the CLI — the last mile of the feature.
-        #[serde(default)]
-        pending: Vec<UiMemoryCandidate>,
-    },
-    /// Project memory health: store counts, durable inbox counts, the last
-    /// extraction result and the oldest due retry. A query-shaped response to
-    /// [`crate::ClientCommand::MemoryStatus`].
-    MemoryStatus {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        query_id: Option<CommandId>,
-        status: UiMemoryStatus,
-    },
-    /// The runtime recalled durable project memory into this turn's model
-    /// context. Emitted ONLY when at least one memory was selected — a search
-    /// that found nothing is not a recall. Ids/count only, never bodies.
-    MemoryRecalled {
-        count: u32,
-        ids: Vec<String>,
-        /// How many of `ids` were evidence-bound agent experience.
-        #[serde(default)]
-        experience_count: u32,
-        /// The same records with the identity a person needs to find them
-        /// again: scope, bounded title and the mode they were injected in.
-        /// Titles only — a body never travels on this event. Additive: an
-        /// older runtime sends none, and the client then shows counts alone.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        injected: Vec<UiMemoryReference>,
-    },
-    /// A durable memory lifecycle change (created / superseded / expired /
-    /// merged). `operation` is an opaque stable key; `title` is a bounded
-    /// summary, never the body.
-    MemoryChanged {
-        operation: String,
-        id: String,
-        title: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        authority: Option<String>,
-    },
     /// Side-question (`/btw`) started; not persisted to session history.
     BtwStarted { question: String },
     /// Side-question answer chunk (often one full answer in MVP).
@@ -802,6 +757,46 @@ pub enum RuntimeEvent {
         query_id: Option<CommandId>,
         observation: crate::UiObservabilityLoaded,
     },
+    /// Result of [`crate::ClientCommand::QueryUsage`]. A projection of the
+    /// runtime's durable model-call ledger for one scope. Read-only: it
+    /// answers while a turn runs, and it never drives a provider request.
+    UsageLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        report: Box<crate::UiUsageReport>,
+    },
+    /// Result of [`crate::ClientCommand::ReloadConfig`], and the notification
+    /// of an automatically applied generation. `outcome` is one of
+    /// `applied` / `unchanged` / `failed`.
+    ///
+    /// `version` is the generation now in force — the PREVIOUS one on a
+    /// failure, because a failed reload keeps the last known good
+    /// configuration. `changed` names the dimensions that moved (never their
+    /// values, and never a credential). `deferred_to_next_turn` is true when a
+    /// turn was already running: it keeps the generation it started with, and
+    /// the next turn uses this one.
+    ConfigReloaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        outcome: String,
+        version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(default)]
+        changed: Vec<String>,
+        #[serde(default)]
+        deferred_to_next_turn: bool,
+        /// Settings this generation changed that only a restart of the named
+        /// component can apply. Empty means everything applied.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restart_required: Vec<String>,
+    },
     /// Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest
     /// turns in order. `omitted_turns` older turns were left out to bound the
     /// response; they are still in the session.
@@ -832,249 +827,6 @@ pub fn parse_runtime_event(json: &str) -> Result<Option<RuntimeEvent>, serde_jso
             }
         }
     }
-}
-
-/// The scope a memory row or decision belongs to.
-///
-/// `(scope, id)` is the record's identity: the same id in two scopes is two
-/// independent memories. An older runtime that sends no scope predates
-/// multi-scope listings and only ever served the project store.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum UiMemoryScope {
-    Global,
-    #[default]
-    Project,
-    Local,
-}
-
-impl UiMemoryScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Global => "global",
-            Self::Project => "project",
-            Self::Local => "local",
-        }
-    }
-}
-
-/// One record a turn's request actually carried.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryReference {
-    pub id: String,
-    /// Which store the record came from; `(scope, id)` is its identity.
-    #[serde(default)]
-    pub scope: UiMemoryScope,
-    /// A bounded summary. Redacted when the record looks like a credential.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// `standing`, `candidate` or `experience`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-}
-
-/// Compact durable-memory row for TUI list surfaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryEntry {
-    pub id: String,
-    /// Which store this row came from; part of the row's identity.
-    #[serde(default)]
-    pub scope: UiMemoryScope,
-    pub title: String,
-    /// The stored content. A title alone cannot answer "what do I actually
-    /// remember?", and the detail page must not guess it. Additive: absent on
-    /// older runtimes (empty string).
-    #[serde(default)]
-    pub body: String,
-    /// What this memory is, which decides how it reaches the model. Additive:
-    /// absent on older runtimes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<UiMemoryKind>,
-    /// Held back from every automatic path because it looks like a credential.
-    /// Kept in the listing so the user can find and archive it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub sensitive: bool,
-    /// The lifecycle state the store reports for this row (`active`,
-    /// `pending`, `superseded`, `deprecated`). Additive: absent on older
-    /// runtimes, and the page then says nothing it cannot prove.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    /// Who established this memory (`user_explicit`, `runtime_observed`, ...).
-    /// This is the store's own vocabulary, not a client guess.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority: Option<String>,
-    /// The revision this row was read at, so a detail page can name exactly
-    /// what it is showing instead of "the current one".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
-    /// When the store last changed this record (RFC 3339).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
-    /// Pinned by the person, not by a model hint.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pinned: bool,
-}
-
-/// What a durable memory IS. Strongly typed so no client invents its own
-/// strings for a field the domain has to interpret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum UiMemoryKind {
-    /// Injected into every turn while active.
-    Preference,
-    /// Reachable by query recall and the catalog, never auto-injected.
-    Decision,
-    /// Same reach as a decision.
-    Note,
-    /// Evidence-bound agent experience. Recalled only when relevant; never
-    /// injected as a standing rule and never listed in the catalog.
-    Experience,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Durable memory health for `/memory status`. Counts only: no entry text,
-/// no candidate body, no raw provider error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryStatus {
-    /// The project's effective switches. `*_enabled` is already the
-    /// conjunction with `total_enabled`; an old daemon that sends no switches
-    /// is read as the historical all-on state.
-    #[serde(default = "default_true")]
-    pub total_enabled: bool,
-    #[serde(default = "default_true")]
-    pub user_enabled: bool,
-    #[serde(default = "default_true")]
-    pub experience_enabled: bool,
-    /// Agent experience is still experimental.
-    #[serde(default = "default_true")]
-    pub experience_experimental: bool,
-    pub active: u32,
-    pub pending: u32,
-    pub archived: u32,
-    /// User-lane entries only, so a client can show the two lanes separately
-    /// and still account for every active/pending/archived row.
-    #[serde(default)]
-    pub user_active: u32,
-    #[serde(default)]
-    pub user_pending: u32,
-    #[serde(default)]
-    pub user_archived: u32,
-    pub sensitive: u32,
-    pub inbox_pending: u32,
-    pub inbox_processing: u32,
-    pub inbox_failed_retryable: u32,
-    pub inbox_processed: u32,
-    /// Due time of the oldest retry, when one is waiting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_retry_at: Option<String>,
-    /// Most recent retry attempt number, when one is waiting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_attempt: Option<u32>,
-    /// Sums over the retained processed window.
-    pub extraction_totals: UiMemoryExtractionTotals,
-    /// The most recent completed batch, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_extraction: Option<UiMemoryExtraction>,
-    /// Sanitized class of the oldest retry's error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    /// Active agent experiences, split by the evidence class the runtime
-    /// derived. An unverified experience is a parked hypothesis; it is never
-    /// counted as verified.
-    #[serde(default)]
-    pub experience_active: u32,
-    #[serde(default)]
-    pub experience_verified: u32,
-    #[serde(default)]
-    pub experience_unverified: u32,
-    /// Experience candidates awaiting a person.
-    #[serde(default)]
-    pub experience_pending: u32,
-    /// Experience rows retired by supersede/expiry/forget.
-    #[serde(default)]
-    pub experience_archived: u32,
-    /// The experience lane's durable queue, kept separate from the user-turn
-    /// inbox so "no lesson" and "not extracted yet" are distinguishable.
-    #[serde(default)]
-    pub experience_inbox_pending: u32,
-    #[serde(default)]
-    pub experience_inbox_processing: u32,
-    #[serde(default)]
-    pub experience_inbox_failed_retryable: u32,
-    #[serde(default)]
-    pub experience_inbox_processed: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub experience_next_retry_at: Option<String>,
-    /// The most recent settled experience extraction, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_experience: Option<UiMemoryExperience>,
-}
-
-/// The outcome of one experience extraction. Counts only; `reason` is a
-/// stable skip class, never entry text or provider output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryExperience {
-    pub at: String,
-    /// `extracted` | `skipped`
-    pub outcome: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    pub accepted: u32,
-    pub rejected: u32,
-    pub created: u32,
-    pub updated: u32,
-    pub pending: u32,
-    pub skipped: u32,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryExtractionTotals {
-    pub accepted: u32,
-    pub rejected: u32,
-    pub skipped: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryExtraction {
-    pub at: String,
-    pub accepted: u32,
-    pub rejected: u32,
-    pub skipped: u32,
-    /// True when the extractor produced no candidate at all, which is
-    /// different from candidates that were filtered or failed.
-    pub zero_candidates: bool,
-}
-
-/// A candidate awaiting consent, with enough to decide on.
-///
-/// Deliberately NOT [`UiMemoryEntry`]: approving something shown only as a
-/// title is not informed consent, so the body, kind and source ride along.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiMemoryCandidate {
-    pub id: String,
-    /// Which store is holding this pending record. Accept/reject must carry
-    /// it back so a decision can never land in another scope.
-    #[serde(default)]
-    pub scope: UiMemoryScope,
-    pub title: String,
-    /// The text that would be stored. Already length-bounded by the domain.
-    pub body: String,
-    /// Free-form label as stored (`preference`, `package_manager`, …).
-    pub kind: String,
-    /// Who proposed it (`user_explicit`, `system_propose`, …).
-    pub source: String,
 }
 
 #[cfg(test)]
@@ -1594,6 +1346,59 @@ mod tests {
     }
 
     #[test]
+    fn usage_loaded_roundtrips_with_its_report() {
+        let report = crate::UiUsageReport {
+            scope: crate::UiUsageScope::Today,
+            from: Some("2026-03-05T16:00:00+00:00".into()),
+            to: None,
+            generated_at: "2026-03-06T01:00:00+00:00".into(),
+            requests: 2,
+            unmeasured_requests: 1,
+            input_tokens: 1_000,
+            cached_input_tokens: Some(900),
+            output_tokens: 100,
+            reasoning_tokens: None,
+            cost_usd_micros: Some(4_200),
+            priced_requests: 1,
+            models: vec![crate::UiModelUsage {
+                provider: "deepseek".into(),
+                model: "deepseek-flash".into(),
+                requests: 2,
+                unmeasured_requests: 1,
+                input_tokens: 1_000,
+                cached_input_tokens: Some(900),
+                output_tokens: 100,
+                reasoning_tokens: None,
+                cost_usd_micros: Some(4_200),
+                priced_requests: 1,
+            }],
+        };
+        roundtrip(
+            RuntimeEvent::UsageLoaded {
+                query_id: Some(CommandId::new("q-usage")),
+                report: Box::new(report.clone()),
+            },
+            "usage_loaded",
+        );
+        // The absent reasoning figure survives as absence, not as zero.
+        let json = serde_json::to_string(&RuntimeEvent::UsageLoaded {
+            query_id: None,
+            report: Box::new(report),
+        })
+        .unwrap();
+        let back = parse_runtime_event(&json).unwrap().unwrap();
+        match back {
+            RuntimeEvent::UsageLoaded { report, query_id } => {
+                assert!(query_id.is_none());
+                assert_eq!(report.reasoning_tokens, None);
+                assert_eq!(report.total_tokens(), 1_100);
+                assert!(report.cost_is_partial());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn token_usage_roundtrips() {
         roundtrip(
             RuntimeEvent::TokenUsage {
@@ -1645,6 +1450,12 @@ mod tests {
     #[test]
     fn distinct_non_completion_end_states_roundtrip() {
         roundtrip(RuntimeEvent::TurnAnswered, "turn_answered");
+        roundtrip(
+            RuntimeEvent::TurnPaused {
+                reason: "waiting for your confirmation".to_string(),
+            },
+            "turn_paused",
+        );
         roundtrip(
             RuntimeEvent::TurnTruncated {
                 error: "token limit".to_string(),
@@ -1771,25 +1582,6 @@ mod tests {
             },
             "sub_agent_activity",
         );
-    }
-
-    /// An older daemon predates the lane switches. Its status must be read as
-    /// the historical all-on state instead of silently reporting memory off.
-    #[test]
-    fn a_pre_lane_memory_status_keeps_both_lanes_enabled() {
-        let old = r#"{
-            "active": 1, "pending": 0, "archived": 0, "sensitive": 0,
-            "inbox_pending": 0, "inbox_processing": 0,
-            "inbox_failed_retryable": 0, "inbox_processed": 0,
-            "extraction_totals": {"accepted": 0, "rejected": 0, "skipped": 0}
-        }"#;
-        let status: UiMemoryStatus = serde_json::from_str(old).unwrap();
-        assert!(status.total_enabled);
-        assert!(status.user_enabled);
-        assert!(status.experience_enabled);
-        assert!(status.experience_experimental);
-        assert_eq!(status.user_active, 0);
-        assert_eq!(status.active, 1);
     }
 
     #[test]

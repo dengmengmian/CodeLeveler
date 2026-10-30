@@ -54,7 +54,7 @@ pub(crate) async fn generate(
     };
 
     let style = app
-        .registry
+        .registry()
         .profile(&model)
         .await
         .map(|profile| profile.reasoning.style)
@@ -63,16 +63,15 @@ pub(crate) async fn generate(
     let max_chars = assist_char_limit(kind);
 
     let started = std::time::Instant::now();
-    let outcome =
-        tokio::time::timeout(ASSIST_TIMEOUT, app.registry.generate(request, cancellation))
-            .await
-            .map_err(|_| {
-                leveler_model::ModelError::new(
-                    leveler_model::ModelErrorKind::Timeout,
-                    "assist timed out",
-                )
-            })
-            .and_then(|result| result);
+    let outcome = tokio::time::timeout(
+        ASSIST_TIMEOUT,
+        app.registry().generate(request, cancellation),
+    )
+    .await
+    .map_err(|_| {
+        leveler_model::ModelError::new(leveler_model::ModelErrorKind::Timeout, "assist timed out")
+    })
+    .and_then(|result| result);
     let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let kind = match kind {
         AssistKind::PromptSuggestion => leveler_storage::ModelCallKind::PromptSuggestion,

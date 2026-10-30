@@ -266,63 +266,6 @@ async fn scoped_sources_survive_recovery_without_rule_bodies_in_history() {
 }
 
 #[tokio::test]
-async fn resume_reloads_selected_skill_and_honors_current_memory_exposure() {
-    let dir = tempfile::tempdir().unwrap();
-    let skill_dir = dir.path().join(".leveler/skills/demo");
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        "---\nname: demo\ndescription: Demo.\n---\nSKILL_A_SENTINEL",
-    )
-    .unwrap();
-    let first = Script::new(vec![answer("first reply")]);
-    let saved = Arc::new(Mutex::new(Vec::new()));
-    executor(dir.path(), first.clone(), PermissionProfile::Assisted, 3)
-        .with_memory_expose(true)
-        .run(
-            "use $demo to inspect",
-            &mut |_| {},
-            &mut Saved(saved.clone()),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        first.requests.lock().unwrap()[0]
-            .control_context
-            .text()
-            .contains("SKILL_A_SENTINEL")
-    );
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        "---\nname: demo\ndescription: Demo.\n---\nSKILL_B_SENTINEL",
-    )
-    .unwrap();
-    let second = Script::new(vec![answer("resumed")]);
-    let mut prior = saved.lock().unwrap().clone();
-    prior.push(Message::text(Role::User, "continue"));
-    executor(dir.path(), second.clone(), PermissionProfile::Assisted, 3)
-        .with_memory_expose(false)
-        .resume(prior, &mut |_| {}, &mut NoopSink, CancellationToken::new())
-        .await
-        .unwrap();
-    let requests = second.requests.lock().unwrap();
-    let control = requests[0].control_context.text();
-    assert!(
-        control.contains("SKILL_B_SENTINEL"),
-        "resume lost the active selected procedure"
-    );
-    assert!(!control.contains("SKILL_A_SENTINEL"));
-    assert!(
-        !requests[0]
-            .control_context
-            .blocks
-            .iter()
-            .any(|s| s.name == "memory_guidance")
-    );
-}
-
-#[tokio::test]
 async fn compaction_summarizes_history_and_preserves_current_control() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

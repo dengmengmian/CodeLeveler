@@ -184,9 +184,7 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -196,7 +194,6 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

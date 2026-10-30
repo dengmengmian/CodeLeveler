@@ -287,15 +287,6 @@ pub struct GoalRecapBlock {
     pub expanded: bool,
 }
 
-/// `/memory` listing: one durable summary row in the conversation, with the
-/// storage path and entries available on demand instead of flooding the turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryListBlock {
-    pub summary: String,
-    pub details: String,
-    pub expanded: bool,
-}
-
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
 /// from running → done in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -429,21 +420,34 @@ pub struct UserShellBlock {
     /// UI motion clock (milliseconds) at start. Signed so a reconnect can
     /// back-date a command that began before this client attached.
     pub started_motion_ms: i64,
-    /// Show full output inline (mouse / Ctrl+O / Enter). Pure display state.
-    pub expanded: bool,
-    /// The user chose the fold explicitly; a later terminal event must not
-    /// auto-expand over that choice.
-    pub expanded_pinned: bool,
+    /// Which slice of the retained output the record is showing. Pure display
+    /// state: it never changes what was captured, only what is painted.
+    pub view: ShellOutputView,
+}
+
+/// The reader's position inside one output window.
+///
+/// `follow` pins the window to the newest rows, so streaming output never moves
+/// the reader who is already at the bottom. Leaving the bottom turns it off and
+/// `scroll` (visual rows from the top) becomes the authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellOutputView {
+    pub scroll: usize,
+    pub follow: bool,
+}
+
+impl Default for ShellOutputView {
+    fn default() -> Self {
+        Self {
+            scroll: 0,
+            follow: true,
+        }
+    }
 }
 
 /// Bounded client-side output tail for a user shell block. Large enough for a
 /// real test run; the explicit truncation marker is never omitted.
 pub const USER_SHELL_OUTPUT_CAP: usize = 1024 * 1024;
-
-/// A finished, short user result opens in full; a long one stays folded so it
-/// cannot bury the conversation. Both remain fully reachable by expanding,
-/// and the complete capture is always available through `/output`.
-pub const USER_SHELL_AUTO_EXPAND_MAX_LINES: usize = 30;
 
 /// A result above either bound is browsed on the full-output page instead of
 /// being wrapped into the Conversation. The page renders only its viewport;
@@ -462,18 +466,11 @@ impl UserShellBlock {
             .is_some_and(|mark| mark.stderr)
     }
 
-    /// Final visible line count, honouring carriage-return overwrites only
-    /// approximately: this is a sizing decision, not the renderer.
-    fn display_line_count(&self) -> usize {
-        self.output.lines().count()
-    }
-
     /// Whether this finished result belongs on the full-output page.
     ///
     /// This is the ONE boundary: the reducer opens the page for it and the
-    /// inline renderer refuses to lay it out even if a running block was
-    /// pinned open. A capture is required; without one the retained text is
-    /// the only truth and the record stays inline.
+    /// inline renderer keeps its bounded window. A capture is required; without
+    /// one the retained text is the only truth and the record stays inline.
     pub fn needs_output_page(&self) -> bool {
         self.status.is_terminal()
             && self.full_output.is_some()
@@ -503,8 +500,6 @@ pub enum TranscriptItem {
     Failure(FailureBlock),
     /// Multi-line host note. Transcript-visible, not a 1-row status notification.
     Note(String),
-    /// Project-memory management output. Compact by default, click-expandable.
-    MemoryList(MemoryListBlock),
     /// Transient, model-generated recap shown after a post-turn idle window.
     /// Display-only: never persisted or replayed into model context.
     AwaySummary(String),
@@ -553,7 +548,6 @@ fn is_foldable_item(item: &TranscriptItem) -> bool {
             | TranscriptItem::SubAgent(_)
             | TranscriptItem::UserShell(_)
             | TranscriptItem::GoalRecap(_)
-            | TranscriptItem::MemoryList(_)
             | TranscriptItem::Failure(_)
     )
 }
@@ -655,21 +649,29 @@ impl TranscriptState {
         self.items.push(TranscriptItem::Failure(block));
     }
 
-    /// Durable multi-line host note (memory list, etc.). Survives status TTL.
     pub fn push_note(&mut self, text: String) {
         self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Note(text));
     }
 
-    pub fn push_memory_list(&mut self, summary: String, details: String) {
+    pub fn remove_item(&mut self, index: usize) -> bool {
+        if index >= self.items.len() {
+            return false;
+        }
+        self.items.remove(index);
         self.bump();
-        self.close_tool_group();
-        self.items.push(TranscriptItem::MemoryList(MemoryListBlock {
-            summary,
-            details,
-            expanded: false,
-        }));
+        true
+    }
+
+    pub fn move_item_to_tail(&mut self, index: usize) -> Option<usize> {
+        if index + 1 >= self.items.len() {
+            return (index < self.items.len()).then_some(index);
+        }
+        let item = self.items.remove(index);
+        self.items.push(item);
+        self.bump();
+        Some(self.items.len() - 1)
     }
 
     pub fn push_away_summary(&mut self, text: String) {
@@ -1182,7 +1184,10 @@ impl TranscriptState {
             exit_code: None,
             output: String::new(),
             output_truncated: false,
-            expanded: false,
+            // An edit's drawer IS its diff, and a diff is the result the user
+            // asked to read: it opens by default (Grok Build's default too).
+            // Every other tool keeps its drawer closed.
+            expanded: crate::tool_taxonomy::is_edit_tool(&name),
             stop: Default::default(),
             id,
             name,
@@ -1479,9 +1484,89 @@ impl TranscriptState {
             duration_ms: None,
             task_id: None,
             started_motion_ms,
-            expanded: false,
-            expanded_pinned: false,
+            view: ShellOutputView::default(),
         }));
+    }
+
+    /// Scroll one execution's output window by `delta` visual rows (negative =
+    /// up). `max_scroll` comes from the caller's projection, so this method never
+    /// invents a second layout. Returns whether the view changed.
+    ///
+    /// Scrolling up leaves follow (the reader is reading history); reaching the
+    /// bottom resumes it, which is what makes streaming output stick again.
+    pub fn scroll_user_shell_output(
+        &mut self,
+        id: &leveler_core::UserShellId,
+        delta: isize,
+        max_scroll: usize,
+    ) -> bool {
+        let Some(index) = self.user_shell_index(id) else {
+            return false;
+        };
+        let before = match &self.items[index] {
+            TranscriptItem::UserShell(shell) => shell.view,
+            _ => return false,
+        };
+        let view = {
+            let TranscriptItem::UserShell(shell) = &mut self.items[index] else {
+                return false;
+            };
+            let current = if shell.view.follow {
+                max_scroll
+            } else {
+                shell.view.scroll.min(max_scroll)
+            };
+            let next = if delta < 0 {
+                current.saturating_sub(delta.unsigned_abs())
+            } else {
+                current.saturating_add(delta as usize).min(max_scroll)
+            };
+            shell.view = ShellOutputView {
+                scroll: next,
+                follow: next >= max_scroll,
+            };
+            shell.view
+        };
+        if view == before {
+            return false;
+        }
+        self.bump();
+        true
+    }
+
+    /// Jump one execution's window to the first or last row.
+    pub fn send_user_shell_output_to(
+        &mut self,
+        id: &leveler_core::UserShellId,
+        top: bool,
+        max_scroll: usize,
+    ) -> bool {
+        let Some(index) = self.user_shell_index(id) else {
+            return false;
+        };
+        let before = match &self.items[index] {
+            TranscriptItem::UserShell(shell) => shell.view,
+            _ => return false,
+        };
+        let next = if top {
+            ShellOutputView {
+                scroll: 0,
+                follow: false,
+            }
+        } else {
+            ShellOutputView {
+                scroll: max_scroll,
+                follow: true,
+            }
+        };
+        if next == before {
+            return false;
+        }
+        if let TranscriptItem::UserShell(shell) = &mut self.items[index] {
+            shell.view = next;
+        }
+        self.bump();
+        true
     }
 
     /// Mark the same execution as running in the background. The process and
@@ -1633,14 +1718,19 @@ impl TranscriptState {
             shell.exit_code = exit_code;
             shell.duration_ms = Some(duration_ms);
             shell.status = status;
-            // A short finished result opens in full; a long one keeps the
-            // established fold (named in the record) and remains reachable by
-            // Ctrl+O, while `/output` reads the complete capture from disk.
-            if !shell.expanded_pinned {
-                shell.expanded = !shell.output_truncated
-                    && shell.display_line_count() <= USER_SHELL_AUTO_EXPAND_MAX_LINES;
-            }
+            // The output is a scroll window, not a fold: finishing changes
+            // nothing about what is reachable, and the reader's position — at
+            // the tail, or back in history — stays where they put it.
         }
+    }
+
+    /// The user shell block with `id`, if present.
+    pub fn user_shell(&self, id: &leveler_core::UserShellId) -> Option<&UserShellBlock> {
+        self.user_shell_index(id)
+            .and_then(|index| match &self.items[index] {
+                TranscriptItem::UserShell(shell) => Some(shell),
+                _ => None,
+            })
     }
 
     /// Index of the user shell block with `id`, if present.
@@ -1698,9 +1788,8 @@ impl TranscriptState {
             // These keep a two-state fold (no live body to preview); the
             // vocabulary is shared so no caller has to know that.
             TranscriptItem::SubAgent(block) => Some(two_state(block.expanded)),
-            TranscriptItem::UserShell(shell) => Some(two_state(shell.expanded)),
+            TranscriptItem::UserShell(shell) => Some(two_state(shell.view.follow)),
             TranscriptItem::GoalRecap(block) => Some(two_state(block.expanded)),
-            TranscriptItem::MemoryList(block) => Some(two_state(block.expanded)),
             TranscriptItem::Failure(block) => Some(block.display),
             _ => None,
         }
@@ -1741,16 +1830,10 @@ impl TranscriptState {
                 block.expanded = mode.is_expanded();
                 true
             }
-            Some(TranscriptItem::UserShell(shell)) => {
-                shell.expanded = mode.is_expanded();
-                shell.expanded_pinned = true;
-                true
-            }
+            // A user shell's output is a bounded scroll window, not a fold: it
+            // has no collapsed/expanded pair to write.
+            Some(TranscriptItem::UserShell(_)) => return false,
             Some(TranscriptItem::GoalRecap(block)) => {
-                block.expanded = mode.is_expanded();
-                true
-            }
-            Some(TranscriptItem::MemoryList(block)) => {
                 block.expanded = mode.is_expanded();
                 true
             }

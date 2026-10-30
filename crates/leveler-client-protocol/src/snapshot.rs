@@ -728,6 +728,12 @@ pub struct UiExecutionTask {
     /// window is running; the user can resume it.
     #[serde(default)]
     pub running: bool,
+    /// The user's own stop directive is still in force: the durable
+    /// `goals.user_paused_at` column, not a client-side reading of the
+    /// transcript. A paused goal owes work and withholds it at the same time,
+    /// which `running` alone cannot express while an unrelated turn runs.
+    #[serde(default)]
+    pub user_paused: bool,
 }
 
 /// How a model's thinking can be controlled.

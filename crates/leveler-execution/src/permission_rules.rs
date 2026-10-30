@@ -312,7 +312,7 @@ pub fn project_rules_path(repo_root: &Path) -> PathBuf {
 /// Returns empty when the call cannot be safely generalized (session-only):
 /// - shell-wrapper programs (`sh -c …`): a prefix would grant every script;
 /// - compound shell lines (`|`, `;`, `$…`) on `shell_command`;
-/// - memory-write tools (K36);
+/// - agent and skill definition writes;
 /// - other tools with no safe standing shape.
 pub fn always_rules_for(
     tool: &str,
@@ -674,8 +674,8 @@ rules:
     }
 
     #[test]
-    fn always_rules_memory_writes_never_get_standing_permission() {
-        for tool in ["remember", "forget", "save_agent", "delete_agent"] {
+    fn definition_writes_never_get_standing_permission() {
+        for tool in ["save_agent", "delete_agent"] {
             assert!(
                 always_rules_for(tool, None, &["notes.md".to_string()]).is_empty(),
                 "K36: {tool} must not derive durable rules"
@@ -962,14 +962,6 @@ mod mcp_always_tests {
             RuleDecision::NoMatch,
             "another server must still prompt"
         );
-    }
-
-    /// Memory writes stay session-only by design (K36): a durable rule would
-    /// hand the model standing permission to write long-term memory.
-    #[test]
-    fn memory_writes_still_derive_no_durable_rule() {
-        assert!(always_rules_for("remember", None, &[]).is_empty());
-        assert!(always_rules_for("forget", None, &[]).is_empty());
     }
 }
 

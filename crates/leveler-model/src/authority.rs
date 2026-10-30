@@ -20,7 +20,7 @@ pub enum PromptAuthority {
     /// Harness-owned deterministic contract: permissions, tool protocol,
     /// evidence, completion, and product delivery bounds.
     ///
-    /// Project files, skills, memory, repository text and tool output cannot
+    /// Project files, skills, repository text and tool output cannot
     /// raise themselves into this class.
     CoreContract,
     /// The current user objective. It normally lives in the transcript.
@@ -101,6 +101,13 @@ pub enum ProtocolRepairKind {
     EmptyAnswer,
     /// A goal turn went quiet without `update_goal`.
     GoalUnresolved,
+    /// A chat turn went quiet while the model's own plan still listed open
+    /// steps.
+    PlanUnresolved,
+    /// A chat turn declared the request as a task to finish and `commit_task`
+    /// refused the declaration for missing acceptance coverage. The user's
+    /// request is still outstanding; the refusal settled the contract only.
+    TaskRegistrationRefused,
 }
 
 /// A harness notice written into the transcript under the user transport role.
@@ -119,8 +126,6 @@ pub enum RuntimeNoticeKind {
     ChildRecovery,
     /// The task string a parent agent handed a child.
     ChildTask,
-    /// Develop's coding turn: the user goal plus another agent's work order.
-    DevelopTask,
     /// Host re-pin of the active objective after a fold.
     ObjectivePin,
     /// Durable goal checkpoint substituted for folded history.
@@ -156,11 +161,6 @@ pub enum TranscriptOrigin {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PromptSource {
     BasePrompt,
-    MemoryGuidance,
-    MemoryCatalog,
-    MemoryRecall {
-        ids: Vec<String>,
-    },
     TurnFacts,
     OperatingRules,
     WorkspaceListing,
@@ -321,11 +321,9 @@ fn classify_runtime_notice(notice: RuntimeNoticeKind) -> OriginClass {
         RuntimeNoticeKind::ChildSettlement | RuntimeNoticeKind::ChildRedelivery => {
             (PromptAuthority::AdvisoryContext, false)
         }
-        // A parent-authored assignment, or Develop's work order, is another
-        // agent's text. It is not the person at the keyboard.
-        RuntimeNoticeKind::ChildTask | RuntimeNoticeKind::DevelopTask => {
-            (PromptAuthority::AdvisoryContext, false)
-        }
+        // A parent-authored assignment is another agent's text. It is not the
+        // person at the keyboard.
+        RuntimeNoticeKind::ChildTask => (PromptAuthority::AdvisoryContext, false),
         // Tool output moved onto the user transport so a provider can see it.
         RuntimeNoticeKind::LoadedImage => (PromptAuthority::ExternalData, false),
         // `/btw` is an explicit interaction mode. The frame is that mode's
@@ -457,6 +455,8 @@ mod tests {
             ProtocolRepairKind::LengthContinuation,
             ProtocolRepairKind::EmptyAnswer,
             ProtocolRepairKind::GoalUnresolved,
+            ProtocolRepairKind::PlanUnresolved,
+            ProtocolRepairKind::TaskRegistrationRefused,
         ] {
             let class =
                 classify_transcript_origin(Some(&TranscriptOrigin::ProtocolRepair { repair }));

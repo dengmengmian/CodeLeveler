@@ -56,6 +56,10 @@ struct ActiveTurn {
     /// complexity, or log growth — a turn that is genuinely working keeps
     /// touching this, and one that never reaches its terminal does not.
     last_activity_at: Instant,
+    /// The model this turn actually sends requests to. A configuration reload
+    /// can change the session's NEXT model while this turn keeps running; the
+    /// UI must be able to name what the live turn is using.
+    run_model: Option<leveler_model::ModelRef>,
 }
 
 /// The outcome of an atomic retirement decision.
@@ -150,6 +154,7 @@ impl ActiveTurns {
                 task_cancel: task_cancel.clone(),
                 started_at: now,
                 last_activity_at: now,
+                run_model: None,
             },
         );
         Ok(TurnLease {
@@ -218,6 +223,29 @@ impl ActiveTurns {
         {
             turn.last_activity_at = Instant::now();
         }
+    }
+
+    /// Record which model this turn is actually using. A no-op after terminal
+    /// publication, so a late call cannot describe a newer turn.
+    pub(crate) fn note_model(&self, session_id: &SessionId, model: &leveler_model::ModelRef) {
+        if let Some(turn) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(session_id)
+        {
+            turn.run_model = Some(model.clone());
+        }
+    }
+
+    /// The model the RUNNING turn uses, when one is active. `None` means no
+    /// turn is running (the caller reads the session's next model instead).
+    pub(crate) fn run_model(&self, session_id: &SessionId) -> Option<leveler_model::ModelRef> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .and_then(|turn| turn.run_model.clone())
     }
 
     /// Read-only snapshots of every active turn, oldest first — the facts a

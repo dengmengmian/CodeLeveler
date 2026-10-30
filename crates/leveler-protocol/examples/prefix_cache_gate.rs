@@ -95,15 +95,6 @@ fn control_context(round: u32) -> ControlContext {
             SegmentLifecycle::SessionPrefix,
             "Root rule: keep the workspace clean.",
         ),
-        (
-            "memory_recall",
-            PromptSource::MemoryRecall {
-                ids: vec!["m1".into()],
-            },
-            PromptAuthority::AdvisoryContext,
-            SegmentLifecycle::Turn,
-            "Recalled note: the build uses `cargo check -p <package>`.",
-        ),
     ] {
         control.push(PromptSegment::control(
             name, source, authority, lifecycle, true, text,

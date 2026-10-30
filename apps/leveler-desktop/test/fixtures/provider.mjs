@@ -1,4 +1,4 @@
-// Test-only provider. Auxiliary memory extraction and agent turns are distinct.
+// Test-only provider. Auxiliary calls and agent turns are distinct.
 import {createServer} from 'node:http';
 export async function provider(){
  const requests=[],errors=[],held=new Set();
@@ -6,7 +6,7 @@ export async function provider(){
   try{
    let text='';for await(const part of request)text+=part;const body=JSON.parse(text);
    const names=(body.tools??[]).map(tool=>tool.function?.name);const userText=(body.messages??[]).filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:JSON.stringify(m.content)).join('\n');requests.push({names,roles:(body.messages??[]).map(m=>m.role),user_text:userText});
-   if(names.length===0){response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({id:'fixture-memory',object:'chat.completion',created:1,model:'fixture-model',choices:[{index:0,message:{role:'assistant',content:'{"candidates":[]}'},finish_reason:'stop'}]}));return;}
+   if(names.length===0){response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({id:'fixture-auxiliary',object:'chat.completion',created:1,model:'fixture-model',choices:[{index:0,message:{role:'assistant',content:'Fixture auxiliary response.'},finish_reason:'stop'}]}));return;}
    if(userText.includes('fixture-turn-hold')){
     response.writeHead(200,{'content-type':'text/event-stream'});
     const chunk=content=>({id:'fixture-turn',object:'chat.completion.chunk',created:1,model:'fixture-model',choices:[{index:0,delta:{role:'assistant',content},finish_reason:null}]});

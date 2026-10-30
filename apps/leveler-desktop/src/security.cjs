@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_memory','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','fork_session','compact_context','cancel_background_task']);
+const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','fork_session','compact_context','cancel_background_task']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -28,10 +28,9 @@ function validateEnvelope(envelope,authorizeAttachment){
   if(command.type==='approval_decision'&&(!string(command.request_id)||!decisions.has(command.decision)))throw new Error('Invalid approval decision');
   if(command.type==='answer_clarification'&&(!string(command.request_id)||typeof command.answer!=='string'||command.answer.length>100000))throw new Error('Invalid clarification');
   if(command.type==='query_session_history'&&command.session_id!==envelope.session_id)throw new Error('Invalid history query');
-  if(['list_memory','list_agents','get_agent','query_context','query_observability'].includes(command.type)){
-    const keys=['type','session_id','query_id',...(command.type==='list_memory'?['include_archived']:[]),...(command.type==='get_agent'?['name']:[]),...(command.type==='query_observability'?['center_seq','before','after']:[])];
+  if(['list_agents','get_agent','query_context','query_observability'].includes(command.type)){
+    const keys=['type','session_id','query_id',...(command.type==='get_agent'?['name']:[]),...(command.type==='query_observability'?['center_seq','before','after']:[])];
     if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.query_id))throw new Error('Invalid settings query');
-    if(command.type==='list_memory'&&typeof command.include_archived!=='boolean')throw new Error('Invalid memory query');
     if(command.type==='get_agent'&&(typeof command.name!=='string'||command.name.length>64||!/^[a-z](?:[a-z0-9-]*[a-z0-9])?$/.test(command.name)||/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(command.name)))throw new Error('Invalid agent name');
     if(command.type==='query_observability'&&(!(command.center_seq===null||(Number.isSafeInteger(command.center_seq)&&command.center_seq>=0))||![command.before,command.after].every(value=>Number.isInteger(value)&&value>=0&&value<=100)))throw new Error('Invalid observability window');
   }

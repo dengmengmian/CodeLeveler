@@ -7,7 +7,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     id: 's1', title: 'Fix auth', repository: '/repo', branch: 'main', status: 'idle',
     messages: [], tools: [], traces: [], agents: [], backgroundTasks: [],
     pendingApprovals: [], pendingClarifications: [], plan: null, diff: null,
-    checkpoints: [], completionReport: null, memory: null, turnActive: false,
+    checkpoints: [], completionReport: null, turnActive: false,
     activity: null, reasoning: '', reasoningSuperseded: false, thoughts: [], historyOmittedTurns: 0, turnStartedAt: null,
     lastTurn: null, model: null, availableModels: [], permission: 'assisted',
     collaboration: 'chat', reasoningEffort: null,

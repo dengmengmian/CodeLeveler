@@ -401,7 +401,7 @@ fn nearest_xterm_256(r: u8, g: u8, b: u8) -> u8 {
     nearest
 }
 
-fn xterm_256_rgb(index: u8) -> (u8, u8, u8) {
+pub(crate) fn xterm_256_rgb(index: u8) -> (u8, u8, u8) {
     if index >= 232 {
         let value = 8 + (index - 232) * 10;
         return (value, value, value);

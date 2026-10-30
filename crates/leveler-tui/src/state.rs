@@ -273,6 +273,10 @@ pub const RECONNECTED_NOTICE: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug)]
 pub struct AppState {
     pub running: bool,
+    /// Terminal-native welcome PNG cache; absent in offscreen and unsupported terminals.
+    pub(crate) welcome_image: Option<crate::splash::NativeMascot>,
+    /// Presentation-only tip chosen once per launch, stable across session switches.
+    pub(crate) welcome_tip: usize,
     /// False once the event subscription closes. Commands stay disabled until
     /// the user exits and reconnects, avoiding a write-only UI.
     pub runtime_connected: bool,
@@ -330,9 +334,18 @@ pub struct AppState {
     pub active_screen: Screen,
     pub tools_screen: ToolsScreenState,
     pub trace: crate::observability::TraceView,
-    /// `/context` inspector state: the latest runtime accounting snapshot and
-    /// presentation-only disclosure/selection.
+    /// Context section of the Context & Usage page: the latest runtime
+    /// accounting snapshot and presentation-only disclosure/selection.
     pub context: crate::context::ContextView,
+    /// Usage section of the same page: the runtime's aggregated ledger report
+    /// for one scope. Never derived from the context snapshot.
+    pub usage: crate::usage::UsageView,
+    /// Which section of the Context & Usage page the reader is working in.
+    /// `/context` and `/usage` position it; `Tab` moves it to Usage.
+    pub stats_section: crate::screen::StatsSection,
+    /// One-shot request for the page to reveal a section on its next paint
+    /// (the `/context` vs `/usage` entry point, or a scope switch).
+    pub stats_reveal: Option<crate::screen::StatsSection>,
     /// `/clean` page state: scan/cleanup stage, the plan, and the result.
     /// Presentation-only; the CLI host owns the scan and the deletion.
     pub clean: crate::clean::CleanState,
@@ -348,17 +361,6 @@ pub struct AppState {
     pub turn_diff_files: Option<usize>,
     /// The session-history query this client is waiting on, if any.
     pub history_query: Option<leveler_client_protocol::CommandId>,
-    /// The `/memory` query owned by this TUI. Foreign/legacy broadcast replies
-    /// are ignored so opening Web cannot inject a listing into the transcript.
-    pub memory_query: Option<leveler_client_protocol::CommandId>,
-    /// The `/memory status` query, kept separate from the listing query.
-    pub memory_status_query: Option<leveler_client_protocol::CommandId>,
-    /// The `/memory` management page: the last authoritative listing plus
-    /// presentation-only selection and in-flight decision state.
-    pub memory: crate::memory::MemoryPage,
-    /// The most recent recall count reported by the runtime, including zero.
-    /// `None` means no recall has been observed since this TUI connected.
-    pub last_memory_recall: Option<u32>,
     /// Agent-registry queries owned by this TUI. Responses traverse the
     /// shared session stream and must not render for another client.
     pub agents_list_query: Option<leveler_client_protocol::CommandId>,
@@ -380,6 +382,12 @@ pub struct AppState {
     /// turn. Unlike `goal_mode_active` it survives a turn end while the goal
     /// is still owed, so a paused task remains visible until it settles.
     pub execution_task_active: bool,
+    /// The durable goal the session still owes, as the runtime projects it.
+    /// This is the one source client-side goal presentation reads: the goal's
+    /// identity, whether a window is executing it, and whether the user's own
+    /// pause is in force. Not a second lifecycle — the reducer's `active_goal`
+    /// is the live clock and phase, this is the persisted fact behind it.
+    pub execution_goal: Option<leveler_client_protocol::UiExecutionTask>,
     /// Collaboration mode: chat | plan | goal.
     pub collaboration: String,
 
@@ -576,6 +584,12 @@ pub struct AppState {
     /// acting, so a finished or replayed row can never be stopped by a stale
     /// reference.
     pub command_selected: Option<CommandTarget>,
+    /// The user-shell output window the reader is scrolling with the keyboard.
+    ///
+    /// Presentation only: it names an existing record, and the scroll path
+    /// re-resolves it against the live transcript before acting. A mouse wheel
+    /// does not need it — it targets the record under the pointer.
+    pub shell_output_focus: Option<leveler_core::UserShellId>,
     /// Collapse the collaboration surface to its one-line compact row.
     /// View preference only — visibility itself is derived from team activity.
     pub collaboration_collapsed: bool,
@@ -692,6 +706,12 @@ impl AppState {
         let model_notice = boot.model_notice.clone();
         let mut state = Self {
             running: true,
+            welcome_image: None,
+            welcome_tip: crate::splash::tip_index(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64),
+            ),
             runtime_connected: true,
             snapshot_version: None,
             settled_turns: 0,
@@ -719,10 +739,6 @@ impl AppState {
             project_rule_sources: Vec::new(),
             turn_diff_files: None,
             history_query: None,
-            memory_query: None,
-            memory_status_query: None,
-            memory: crate::memory::MemoryPage::default(),
-            last_memory_recall: None,
             agents_list_query: None,
             agent_detail_query: None,
             child_contribution_query: None,
@@ -733,6 +749,7 @@ impl AppState {
             diff_selected: 0,
             goal_mode_active: false,
             execution_task_active: false,
+            execution_goal: None,
             collaboration: "chat".into(),
             pending_attachments: Vec::new(),
             vision: false,
@@ -797,6 +814,9 @@ impl AppState {
             detail_return: None,
             issue_selected_line: None,
             screen_rows: Vec::new(),
+            usage: crate::usage::UsageView::default(),
+            stats_section: crate::screen::StatsSection::default(),
+            stats_reveal: None,
             background_list_hits: Vec::new(),
             background_list_rect: None,
             background_output_rect: None,
@@ -806,6 +826,7 @@ impl AppState {
             plan_hit: None,
             goal_hit: None,
             command_selected: None,
+            shell_output_focus: None,
             collaboration_collapsed: false,
             tools_expanded: false,
             turn_nav: None,
@@ -971,17 +992,6 @@ impl AppState {
         // arbitrary filesystem path.
         let home = leveler_core::leveler_home_dir_from(|name| std::env::var_os(name))?;
         Some(home.join("state").join("projects"))
-    }
-
-    /// Where the memory page records which pending candidates the user has
-    /// already been told about. Same state dir as the composer draft; this is
-    /// notice bookkeeping, never memory content or memory authority.
-    pub fn memory_notice_path(&self) -> Option<std::path::PathBuf> {
-        self.boot
-            .draft_path
-            .as_ref()
-            .and_then(|path| path.parent())
-            .map(|dir| dir.join("memory-notice.json"))
     }
 
     /// The user shell id that should wear the Command focus marker, when the

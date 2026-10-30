@@ -29,7 +29,6 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "grep",
     "list_files",
     "load_skill",
-    "memory",
     "read_file",
     "read_project_rules",
     "read_symbol",
@@ -50,7 +49,6 @@ pub const MODEL_SURFACE_TOOLS: &[&str] = &[
     "find_files",
     "find_references",
     "find_symbol",
-    "forget",
     "get_task",
     "git_diff",
     "git_status",
@@ -58,11 +56,9 @@ pub const MODEL_SURFACE_TOOLS: &[&str] = &[
     "kill_task",
     "list_files",
     "load_skill",
-    "memory",
     "read_file",
     "read_project_rules",
     "read_symbol",
-    "remember",
     "run_command",
     "shell_command",
     "view_image",
@@ -450,8 +446,6 @@ pub struct CapabilityPacks {
     pub web_search: bool,
     /// Showing the model an image. Needs a model that accepts one.
     pub media: bool,
-    /// Durable project memory.
-    pub memory: bool,
     /// Skill loading.
     pub skills: bool,
     /// The browser. Needs a browser this machine can actually drive: the
@@ -467,7 +461,7 @@ impl CapabilityPacks {
         web_fetch: false,
         web_search: false,
         media: false,
-        memory: false,
+
         skills: false,
         browser: false,
     };
@@ -481,7 +475,7 @@ impl CapabilityPacks {
         web_fetch: true,
         web_search: true,
         media: true,
-        memory: true,
+
         skills: true,
         browser: true,
     };
@@ -499,7 +493,7 @@ impl CapabilityPacks {
             web_fetch: self.web_fetch && other.web_fetch,
             web_search: self.web_search && other.web_search,
             media: self.media && other.media,
-            memory: self.memory && other.memory,
+
             skills: self.skills && other.skills,
             browser: self.browser && other.browser,
         }
@@ -590,20 +584,6 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
     }
     if packs.media {
         registry.register(Arc::new(tools::ViewImageTool));
-    }
-    if packs.memory {
-        let root = tools::MemoryRoot::from_service(capabilities.memory.clone())
-            .with_lanes(capabilities.memory_lanes);
-        let lanes = capabilities.memory_lanes;
-        if lanes.any() {
-            registry.register(Arc::new(tools::MemoryTool::new(root.clone())));
-            registry.register(Arc::new(tools::ForgetTool::new(root.clone())));
-        }
-        // `remember` writes a user fact. An experience-only project must not
-        // expose a write path into the closed user lane.
-        if lanes.user {
-            registry.register(Arc::new(tools::RememberTool::new(root)));
-        }
     }
     if packs.skills {
         registry.register(Arc::new(tools::LoadSkillTool));
@@ -765,13 +745,6 @@ mod tests {
             ),
             (
                 CapabilityPacks {
-                    memory: true,
-                    ..CapabilityPacks::NONE
-                },
-                3,
-            ),
-            (
-                CapabilityPacks {
                     browser: true,
                     ..CapabilityPacks::NONE
                 },
@@ -798,51 +771,6 @@ mod tests {
                 "{packs:?}"
             );
         }
-    }
-
-    /// A memory pack only exposes the writes and reads its lanes allow.
-    /// Experience-only projects still need `memory` (to read lessons) and
-    /// `forget`, but never `remember` — that is the user lane's write path.
-    #[test]
-    fn memory_tools_follow_the_effective_lanes() {
-        let present = |lanes| {
-            let surface: Vec<String> = model_surface(
-                CapabilityPacks {
-                    memory: true,
-                    ..CapabilityPacks::NONE
-                },
-                &crate::tools::test_capabilities().with_memory_lanes(lanes),
-            )
-            .definitions()
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
-            (
-                surface.iter().any(|name| name == "memory"),
-                surface.iter().any(|name| name == "remember"),
-                surface.iter().any(|name| name == "forget"),
-            )
-        };
-
-        assert_eq!(
-            present(leveler_memory::MemoryLanes::ALL),
-            (true, true, true)
-        );
-        assert_eq!(
-            present(leveler_memory::MemoryLanes::USER_ONLY),
-            (true, true, true)
-        );
-        // Experience-only keeps the read and the forget path but never the
-        // user lane's write path.
-        assert_eq!(
-            present(leveler_memory::MemoryLanes::EXPERIENCE_ONLY),
-            (true, false, true)
-        );
-        assert_eq!(
-            present(leveler_memory::MemoryLanes::NONE),
-            (false, false, false),
-            "no effective lane composes no memory tools"
-        );
     }
 
     /// No optional packs composes exactly the initial primitives.
@@ -880,9 +808,6 @@ mod tests {
             "web_fetch",
             "web_search",
             "view_image",
-            "memory",
-            "remember",
-            "forget",
             "load_skill",
             "browser_tab",
             "browser_act",
@@ -890,12 +815,12 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
-        // core 12 + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
-        // + browser 3 = 29. The harness controls (`update_plan` and the
+        // core 12 + intel 5 + vcs 2 + web 2 + media 1 + skills 1
+        // + browser 3 = 26. The harness controls (`update_plan` and the
         // injected ones) are not in this count: they are not a capability the
         // host composes, so `leveler_agent::register_harness_controls` adds
         // them on top.
-        assert_eq!(names.len(), 29);
+        assert_eq!(names.len(), 26);
     }
 
     /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is
@@ -992,8 +917,6 @@ mod tests {
             // rollback and crash recovery.
             "create_checkpoint",
             "restore_checkpoint",
-            // Memory-subsystem maintenance, not a coding capability.
-            "consolidate_memory",
             // System customization: the user makes skills, the model loads them.
             "create_skill",
         ] {

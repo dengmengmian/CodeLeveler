@@ -61,12 +61,6 @@ test('existing settings reads require exact scoped correlated query fields',()=>
  for(const type of ['create_agent','update_agent','delete_agent','list_skills'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s1',query_id:'q'})));
 });
 
-test('existing memory list is a strict selected-session correlated read, not a mutation',()=>{
- for(const include_archived of [false,true])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'list_memory',session_id:'s1',query_id:'q',include_archived})));
- const command={type:'list_memory',session_id:'s1',query_id:'q',include_archived:false};
- for(const fields of [{session_id:'other'},{query_id:null},{query_id:''},{include_archived:null},{include_archived:'true'},{include_archived:undefined},{path:'/private'},{forget:true}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
- for(const type of ['accept_memory','reject_memory','forget_memory','remember_memory'])assert.throws(()=>security.validateEnvelope(envelope({...command,type})));
-});
 
 test('settings require a safe observed version while merge commands keep null',()=>{
  const rename={type:'rename_session',session_id:'s1',name:'observed'};

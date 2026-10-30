@@ -91,6 +91,15 @@ pub struct GoalRecord {
     /// Verbatim user turns that adjust the task scope after the objective.
     /// A waiver here is the only way a requirement leaves the effective set.
     pub amendments: Vec<String>,
+    /// When the user's own stage pause was reached, if the goal is waiting for
+    /// their continuation authorization. `None` = not paused.
+    ///
+    /// This is an authorization fact, not a verdict: `state` stays `running`
+    /// while a paused goal still owes the work the user withheld permission to
+    /// start. It is set only from a user directive whose boundary the model's
+    /// own plan reached, and cleared only by a user instruction that authorizes
+    /// continuing (or by settling).
+    pub user_paused_at: Option<Timestamp>,
 }
 
 /// Access to durable goals.
@@ -146,6 +155,19 @@ pub trait GoalStore: Send + Sync {
         token: &OwnershipToken,
         goal_id: &GoalId,
         now: Timestamp,
+    ) -> Result<(), OwnershipError>;
+
+    /// Record (or clear) the user's stage pause on this goal.
+    ///
+    /// `Some(now)` states that the user's own boundary was reached and the goal
+    /// is waiting for their authorization; `None` clears it because a later
+    /// user instruction authorized continuing (or the goal settled). Idempotent:
+    /// the same write twice is not an error.
+    async fn set_user_pause(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        paused_at: Option<Timestamp>,
     ) -> Result<(), OwnershipError>;
 
     /// Reopen this exact settled goal for an explicit continuation. This does
@@ -343,6 +365,35 @@ impl GoalStore for Database {
         goal_write_miss(self, token, goal_id, false).await
     }
 
+    async fn set_user_pause(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        paused_at: Option<Timestamp>,
+    ) -> Result<(), OwnershipError> {
+        // `paused_at = COALESCE(?, paused_at)` would make clearing impossible;
+        // the bind states the whole value, so a release really clears it.
+        let updated = sqlx::query(
+            "UPDATE goals SET user_paused_at = ?3 \
+             WHERE id = ?1 AND task_id = ?2 AND EXISTS (\
+                 SELECT 1 FROM tasks WHERE id = ?2 \
+                 AND owner_runtime_id = ?4 AND owner_epoch = ?5\
+             )",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(paused_at.map(|at| at.to_rfc3339()))
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() == 1 {
+            return Ok(());
+        }
+        goal_write_miss(self, token, goal_id, false).await
+    }
+
     async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
         if self.get(goal_id).await?.is_none() {
             return Err(StorageError::InvalidData(format!(
@@ -395,9 +446,10 @@ impl GoalStore for Database {
             i64,
             String,
             String,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
-             acceptance, amendments FROM goals WHERE id = ?1",
+             acceptance, amendments, user_paused_at FROM goals WHERE id = ?1",
         )
         .bind(goal_id.as_str())
         .fetch_optional(self.pool())
@@ -416,9 +468,11 @@ impl GoalStore for Database {
             i64,
             String,
             String,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
-             acceptance, amendments FROM goals WHERE state = 'running' ORDER BY opened_at DESC",
+             acceptance, amendments, user_paused_at FROM goals WHERE state = 'running' \
+             ORDER BY opened_at DESC",
         )
         .fetch_all(self.pool())
         .await?;
@@ -436,9 +490,11 @@ impl GoalStore for Database {
             i64,
             String,
             String,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
-             acceptance, amendments FROM goals WHERE task_id = ?1 ORDER BY opened_at DESC",
+             acceptance, amendments, user_paused_at FROM goals WHERE task_id = ?1 \
+             ORDER BY opened_at DESC",
         )
         .bind(task_id.as_str())
         .fetch_all(self.pool())
@@ -497,10 +553,21 @@ fn record_from_row(
         i64,
         String,
         String,
+        Option<String>,
     ),
 ) -> Result<GoalRecord, StorageError> {
-    let (id, task_id, objective, state, opened_at, settled_at, windows_run, acceptance, amendments) =
-        row;
+    let (
+        id,
+        task_id,
+        objective,
+        state,
+        opened_at,
+        settled_at,
+        windows_run,
+        acceptance,
+        amendments,
+        user_paused_at,
+    ) = row;
     Ok(GoalRecord {
         id: GoalId::new(id),
         task_id: TaskId::new(task_id),
@@ -512,6 +579,7 @@ fn record_from_row(
         windows_run: windows_run.max(0) as u32,
         acceptance: parse_list(&acceptance, "acceptance")?,
         amendments: parse_list(&amendments, "amendments")?,
+        user_paused_at: user_paused_at.as_deref().map(parse_ts).transpose()?,
     })
 }
 
@@ -587,6 +655,7 @@ impl GoalStore for MemoryGoalStore {
                 windows_run: 0,
                 acceptance: acceptance.to_vec(),
                 amendments: Vec::new(),
+                user_paused_at: None,
             });
         })?;
         Ok(id)
@@ -712,6 +781,35 @@ impl GoalStore for MemoryGoalStore {
                     })?;
                 goal.state = GoalState::Running;
                 goal.settled_at = None;
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
+    }
+
+    async fn set_user_pause(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        paused_at: Option<Timestamp>,
+    ) -> Result<(), OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let mut rows = self.rows.lock().unwrap();
+                let goal = rows
+                    .iter_mut()
+                    .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {goal_id} not found for task {}",
+                            token.task_id
+                        ))
+                    })?;
+                goal.user_paused_at = paused_at;
                 Ok::<_, StorageError>(())
             })?
             .map_err(OwnershipError::Storage)

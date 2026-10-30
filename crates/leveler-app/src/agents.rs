@@ -85,7 +85,7 @@ impl Application {
         for model in wanted {
             if configured.contains(&model)
                 && !profiles.contains_key(&model)
-                && let Ok(profile) = self.registry.profile(&model).await
+                && let Ok(profile) = self.registry().profile(&model).await
             {
                 profiles.insert(model, profile);
             }

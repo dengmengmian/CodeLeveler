@@ -1083,3 +1083,197 @@ async fn a_failed_verification_survives_into_the_retry() {
         "the remembered failure must refuse the evidence-free completion"
     );
 }
+
+/// A paused goal whose session is still Chat (the model committed the task from
+/// a Chat turn) must be re-entered by the user's own continuation instruction —
+/// not only by the literal word `继续`. The runtime routes it through the same
+/// resume path, so the goal identity, acceptance and evidence are reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
+    let staged = "完成两个阶段：创建 stage-1.txt 和 stage-2.txt；\
+                  阶段 1 完成后停下，等待我确认再执行阶段 2。";
+    let f = fixture(
+        vec![
+            // Turn 1: commit the full two-stage task, deliver stage 1, stop.
+            sse(vec![
+                tool_call_frame(
+                    "c-commit",
+                    "commit_task",
+                    serde_json::json!({
+                        "objective": staged,
+                        "acceptance": ["stage-1.txt 存在", "stage-2.txt 存在"]
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "c-plan-1",
+                    "update_plan",
+                    serde_json::json!({"plan": [
+                        {"step": "阶段 1：创建 stage-1.txt", "status": "in_progress"},
+                        {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                    ]}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "c-write-1",
+                    "write_file",
+                    serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "c-plan-2",
+                    "update_plan",
+                    serde_json::json!({"plan": [
+                        {"step": "阶段 1：创建 stage-1.txt", "status": "completed"},
+                        {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                    ]}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                serde_json::json!({"choices": [{"delta": {
+                    "content": "阶段 1 已完成并验证；阶段 2 等待你的确认。"
+                }}]})
+                .to_string(),
+                finish_frame("stop"),
+            ]),
+            // Turn 2: the user authorizes the rest. The model continues.
+            sse(vec![
+                tool_call_frame(
+                    "c-write-2",
+                    "write_file",
+                    serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "c-plan-3",
+                    "update_plan",
+                    serde_json::json!({"plan": [
+                        {"step": "阶段 1：创建 stage-1.txt", "status": "completed"},
+                        {"step": "阶段 2：创建 stage-2.txt", "status": "completed"}
+                    ]}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "c-goal",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "两个阶段都已交付",
+                        "verification": {"status": "not_applicable", "detail": "file deliverables"},
+                        "requirements": [
+                            {"requirement": "stage-1.txt", "status": "done",
+                             "evidence": "created stage-1.txt"},
+                            {"requirement": "stage-2.txt", "status": "done",
+                             "evidence": "created stage-2.txt"}
+                        ]
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+        ],
+        leveler_agent::CollaborationMode::Chat,
+    )
+    .await;
+    let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: staged.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 1).await;
+    wait_for_goals(&f.app, &f.session, |goals| {
+        goals.len() == 1 && goals[0].user_paused_at.is_some()
+    })
+    .await;
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    let goal_id = goals[0].id.clone();
+    assert_eq!(goals[0].state, GoalState::Running);
+    assert!(!f._tmp.path().join("stage-2.txt").exists());
+    drop(db);
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "确认，继续阶段 2，把剩余任务完成并验收。".to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+    wait_for_goals(&f.app, &f.session, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.id == goal_id && goal.state == GoalState::Settled)
+    })
+    .await;
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        1,
+        "one goal, re-entered by identity: {goals:?}"
+    );
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(
+        goals[0].objective, staged,
+        "the objective is never replaced"
+    );
+    assert_eq!(
+        goals[0].acceptance,
+        vec![
+            "stage-1.txt 存在".to_string(),
+            "stage-2.txt 存在".to_string()
+        ],
+        "the acceptance plan is reused, not re-declared"
+    );
+    assert!(goals[0].user_paused_at.is_none());
+    assert!(
+        goals[0]
+            .amendments
+            .iter()
+            .any(|amendment| amendment.contains("继续阶段 2")),
+        "the authorization is durable with its goal: {goals:?}"
+    );
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(
+        turns[1].kind, "user",
+        "the continuation enters the goal resume path, not a fresh chat turn"
+    );
+    assert!(f._tmp.path().join("stage-2.txt").exists());
+}

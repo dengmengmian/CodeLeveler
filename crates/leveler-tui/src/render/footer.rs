@@ -130,7 +130,16 @@ fn slash_popup_row(name: &str, desc: &str, content_w: usize, names: &[&str]) -> 
 
 fn slash_popup_geometry(transcript: Rect, composer: Rect, visible_rows: u16) -> (Rect, Rect, Rect) {
     let height = visible_rows.saturating_add(2);
-    let width = SLASH_POPUP_MAX_WIDTH.min(transcript.width).max(4);
+    // The popup is anchored at the composer's left edge, so its width is bounded
+    // by the room to the transcript's RIGHT edge — not by the transcript's own
+    // width. Clamping to `transcript.width` let the box start at `composer.x`
+    // and end past the buffer: on a 40-column terminal every `/command` panicked
+    // in the buffer while painting its own menu.
+    let available = transcript.right().saturating_sub(composer.x);
+    let width = SLASH_POPUP_MAX_WIDTH.min(available);
+    if width < 4 {
+        return (Rect::default(), Rect::default(), Rect::default());
+    }
     let y = composer.y.saturating_sub(height).max(transcript.y);
     let popup = Rect {
         x: composer.x,
@@ -1525,6 +1534,55 @@ mod slash_popup_layout_tests {
         (terminal.backend().buffer().clone(), popup, content)
     }
 
+    /// A narrow terminal must not paint the menu outside its own buffer. The
+    /// popup is anchored at the composer's left edge, so a 40-column terminal
+    /// leaves 38 cells for it — the box and its padding have to follow.
+    #[test]
+    fn the_popup_stays_inside_a_narrow_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for width in [40u16, 36, 30, 24] {
+            let mut state = popup_state();
+            state.composer.replace("/");
+            let transcript = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 16,
+            };
+            let composer = Rect {
+                x: 2,
+                y: 18,
+                width: width.saturating_sub(4),
+                height: 4,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| render_slash_popup(frame, transcript, composer, &state))
+                .expect("painting the menu must not run past the buffer");
+            let matches = slash_popup_match_rows(&state);
+            let rows = matches.len().min(8) as u16;
+            let (popup, inner, content) = slash_popup_geometry(transcript, composer, rows);
+            if popup.width == 0 {
+                continue;
+            }
+            assert!(
+                popup.x + popup.width <= width,
+                "width {width}: popup runs past the terminal: {popup:?}"
+            );
+            assert!(
+                content.x + content.width <= width,
+                "width {width}: content runs past the terminal: {content:?}"
+            );
+            assert_eq!(popup.x, composer.x, "width {width}: stays on the composer");
+            assert!(
+                inner.width >= content.width,
+                "width {width}: content is inside the border"
+            );
+        }
+    }
+
     fn row_text(buf: &ratatui::buffer::Buffer, y: u16, x0: u16, x1: u16) -> String {
         let mut out = String::new();
         let mut x = x0;
@@ -1564,8 +1622,8 @@ mod slash_popup_layout_tests {
     fn selection_keeps_command_and_stays_inside_content() {
         use crate::theme::Theme;
         let theme = Theme::dark();
-        // Index of `/btw` in the quick list; `/develop` sits above it.
-        let (buf, _popup, content) = paint_slash_over_cjk(5);
+        // Index of `/btw` in the quick list.
+        let (buf, _popup, content) = paint_slash_over_cjk(4);
         let mut found = None;
         for y in content.y..content.y + content.height {
             let text = row_text(&buf, y, content.x, content.x + content.width);

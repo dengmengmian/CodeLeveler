@@ -162,7 +162,6 @@ export function Composer() {
         setPopup(target.popup);
       } else if (target.kind === 'navigation') {
         if (target.dest === 'diff') bridge.openChanges();
-        if (target.dest === 'memory') bridge.openMemory();
       } else if (target.kind === 'input-mode') {
         setActiveCommand('btw');
       }

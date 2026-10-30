@@ -97,6 +97,11 @@ fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
 fn render_at(width: u16, height: u16, state: &mut AppState) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
+    // Two frames, like the real loop: the conversation publishes its content
+    // rect while painting, and the empty-state card sizes itself to THAT
+    // viewport. A one-frame harness would hand the card the whole terminal and
+    // assert a geometry no real frame ever has.
+    terminal.draw(|f| render(f, state)).unwrap();
     terminal.draw(|f| render(f, state)).unwrap();
     buffer_text(&terminal)
 }
@@ -249,10 +254,10 @@ fn empty_session_shows_splash_with_logo() {
         "empty session splash missing brand/logo: {text}"
     );
     assert!(
-        text.contains("让模型真正可靠地完成任务"),
+        text.contains("让每个模型发挥最大能力"),
         "zh mission missing: {text}"
     );
-    assert!(text.contains("/develop"), "{text}");
+    assert!(text.contains("历史会话"), "{text}");
     assert!(
         !text.contains("feature-dev"),
         "removed feature-dev entry leaked into splash: {text}"
@@ -271,18 +276,23 @@ fn splash_render_review_sizes() {
         assert!(z.contains("CodeLeveler"), "zh {w}x{h}: {z}");
         assert!(e.contains("CodeLeveler"), "en {w}x{h}: {e}");
         assert!(
-            z.contains("让模型真正可靠地完成任务"),
+            z.contains("让每个模型发挥最大能力"),
             "zh mission {w}x{h}: {z}"
         );
         assert!(
-            e.contains("Make models reliably complete tasks"),
+            e.contains("Let every model reach its full potential"),
             "en mission {w}x{h}: {e}"
         );
-        assert!(!z.contains("Make models reliably complete tasks"), "{z}");
-        assert!(!e.contains("让模型真正可靠地完成任务"), "{e}");
-        for cmd in ["/develop", "/model", "/help"] {
-            assert!(z.contains(cmd), "zh {w}x{h} {cmd}");
-            assert!(e.contains(cmd), "en {w}x{h} {cmd}");
+        assert!(
+            !z.contains("Let every model reach its full potential"),
+            "{z}"
+        );
+        assert!(!e.contains("让每个模型发挥最大能力"), "{e}");
+        for task in ["历史会话", "查看帮助", "选择模型"] {
+            assert!(z.contains(task), "zh {w}x{h} {task}: {z}");
+        }
+        for task in ["Session history", "View help", "Select model"] {
+            assert!(e.contains(task), "en {w}x{h} {task}: {e}");
         }
     }
     // 48×16 leaves only a few conversation rows after header + composer.
@@ -291,9 +301,9 @@ fn splash_render_review_sizes() {
     let tiny_e = render_at(48, 16, &mut en);
     assert!(tiny_z.contains("CodeLeveler"), "{tiny_z}");
     assert!(tiny_e.contains("CodeLeveler"), "{tiny_e}");
-    assert!(tiny_z.contains("让模型真正可靠地完成任务"), "{tiny_z}");
+    assert!(tiny_z.contains("让每个模型发挥最大能力"), "{tiny_z}");
     assert!(
-        tiny_e.contains("Make models reliably complete tasks"),
+        tiny_e.contains("Let every model reach its full potential"),
         "{tiny_e}"
     );
 }

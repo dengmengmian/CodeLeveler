@@ -2118,9 +2118,9 @@ fn interim_narration_does_not_satisfy_the_completion_footer() {
 /// A child the MODEL spawns proves the prose before it was not the answer —
 /// the model was still working. The harness's own reviewer proves the
 /// opposite: it only runs at closure, on an answer that already exists.
-/// Treating the two the same made a completed `/develop` turn — mechanically
-/// `completed` with `verification=passed` — render as "⚠ 执行已结束，但未提交
-/// 最终回答".
+/// Treating the two the same made a completed, harness-reviewed goal turn —
+/// mechanically `completed` with `verification=passed` — render as
+/// "⚠ 执行已结束，但未提交最终回答".
 #[test]
 fn a_harness_reviewer_does_not_demote_the_answer_it_reviews() {
     let mut s = opened();
@@ -2158,8 +2158,7 @@ fn a_harness_reviewer_does_not_demote_the_answer_it_reviews() {
 }
 
 /// The other half of the same rule: a child the MODEL asked for still proves
-/// the prose before it was interim. This is the behaviour `/develop` must not
-/// have changed.
+/// the prose before it was interim.
 #[test]
 fn a_model_spawned_child_still_demotes_the_prose_before_it() {
     let mut s = opened();
@@ -3459,6 +3458,17 @@ fn closed_commands_are_unknown_and_send_nothing() {
         "/tools",
         "/quit",
         "/q",
+        "/remember 终端输出保持紧凑",
+        "/memory",
+        "/memory list",
+        "/memory status",
+        "/memory review",
+        "/memory accept old-id",
+        "/memory reject old-id",
+        "/memory forget old-id",
+        "/memory remember note",
+        "/forget old-id",
+        "/consolidate_memory",
     ] {
         let mut s = opened();
         s.composer.replace(command);
@@ -5521,528 +5531,6 @@ fn session_completed_pushes_completion_block() {
 }
 
 #[test]
-fn slash_memory_list_sends_list_memory_with_archived() {
-    let mut s = opened();
-    typed(&mut s, "/memory");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Send(ClientCommand::ListMemory {
-                include_archived: true,
-                ..
-            })
-        )),
-        "effects={effects:?}"
-    );
-}
-
-#[test]
-fn slash_memory_status_is_a_query_and_renders_extraction_health() {
-    use leveler_client_protocol::{UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryStatus};
-    let mut s = opened();
-    typed(&mut s, "/memory status");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    let query_id = effects
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::Send(ClientCommand::MemoryStatus { query_id, .. }) => query_id.clone(),
-            _ => None,
-        })
-        .expect("status must send a query");
-    assert_eq!(s.memory_status_query.as_ref(), Some(&query_id));
-
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryRecalled {
-            count: 0,
-            ids: vec![],
-            experience_count: 0,
-            injected: Vec::new(),
-        }),
-    );
-    assert_eq!(
-        s.last_memory_recall,
-        Some(0),
-        "zero hits is a real recall result, not 'never recalled'"
-    );
-
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryStatus {
-            query_id: Some(query_id),
-            status: UiMemoryStatus {
-                total_enabled: true,
-                user_enabled: true,
-                experience_enabled: true,
-                experience_experimental: true,
-                active: 2,
-                pending: 1,
-                archived: 3,
-                user_active: 1,
-                user_pending: 0,
-                user_archived: 3,
-                sensitive: 1,
-                inbox_pending: 0,
-                inbox_processing: 0,
-                inbox_failed_retryable: 1,
-                inbox_processed: 4,
-                next_retry_at: Some("2026-10-21T00:00:05Z".into()),
-                retry_attempt: Some(2),
-                extraction_totals: UiMemoryExtractionTotals {
-                    accepted: 5,
-                    rejected: 2,
-                    skipped: 1,
-                },
-                last_extraction: Some(UiMemoryExtraction {
-                    at: "2026-10-21T00:00:01Z".into(),
-                    accepted: 1,
-                    rejected: 0,
-                    skipped: 0,
-                    zero_candidates: false,
-                }),
-                last_error: Some("provider unavailable".into()),
-                experience_active: 2,
-                experience_verified: 1,
-                experience_unverified: 1,
-                experience_pending: 1,
-                experience_archived: 0,
-                experience_inbox_pending: 0,
-                experience_inbox_processing: 0,
-                experience_inbox_failed_retryable: 0,
-                experience_inbox_processed: 2,
-                experience_next_retry_at: None,
-                last_experience: Some(leveler_client_protocol::UiMemoryExperience {
-                    at: "2026-10-21T00:00:02Z".into(),
-                    outcome: "extracted".into(),
-                    reason: None,
-                    accepted: 1,
-                    rejected: 0,
-                    created: 1,
-                    updated: 0,
-                    pending: 0,
-                    skipped: 0,
-                }),
-            },
-        }),
-    );
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            TranscriptItem::Note(text) => Some(text.clone()),
-            _ => None,
-        })
-        .expect("status must leave a note");
-    for expected in [
-        "记忆状态",
-        "记忆开关",
-        "自动经验 开（实验）",
-        "用户事实：活跃 1",
-        "待确认 1",
-        "retry=1",
-        "最近提取",
-        "最近错误",
-        "provider unavailable",
-        "下次重试",
-        "最近召回: 0",
-        "经验：生效 2",
-        "已验证 1",
-        "未验证 1",
-        "经验队列",
-        "最近经验沉淀",
-        "新增 1",
-    ] {
-        assert!(note.contains(expected), "missing {expected}: {note}");
-    }
-}
-
-/// The lane switches are product state: a closed lane must be visible as
-/// closed, must not advertise itself as experimental, and must not report
-/// user-fact counts it no longer serves.
-#[test]
-fn closed_memory_lanes_render_as_off_switches() {
-    use leveler_client_protocol::{CommandId, UiMemoryExtractionTotals, UiMemoryStatus};
-
-    fn open_status_query(s: &mut AppState) -> CommandId {
-        typed(s, "/memory status");
-        let effects = reduce(s, key(KeyCode::Enter));
-        effects
-            .iter()
-            .find_map(|effect| match effect {
-                Effect::Send(ClientCommand::MemoryStatus { query_id, .. }) => query_id.clone(),
-                _ => None,
-            })
-            .expect("status must send a query")
-    }
-
-    fn status(total: bool, user: bool, experience: bool) -> UiMemoryStatus {
-        UiMemoryStatus {
-            total_enabled: total,
-            user_enabled: user,
-            experience_enabled: experience,
-            experience_experimental: true,
-            active: 4,
-            pending: 1,
-            archived: 2,
-            user_active: 3,
-            user_pending: 1,
-            user_archived: 2,
-            sensitive: 0,
-            inbox_pending: 0,
-            inbox_processing: 0,
-            inbox_failed_retryable: 0,
-            inbox_processed: 1,
-            next_retry_at: None,
-            retry_attempt: None,
-            extraction_totals: UiMemoryExtractionTotals::default(),
-            last_extraction: None,
-            last_error: None,
-            experience_active: 1,
-            experience_verified: 1,
-            experience_unverified: 0,
-            experience_pending: 0,
-            experience_archived: 0,
-            experience_inbox_pending: 0,
-            experience_inbox_processing: 0,
-            experience_inbox_failed_retryable: 0,
-            experience_inbox_processed: 0,
-            experience_next_retry_at: None,
-            last_experience: None,
-        }
-    }
-
-    fn last_note(s: &AppState) -> String {
-        s.transcript
-            .items()
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                TranscriptItem::Note(text) => Some(text.clone()),
-                _ => None,
-            })
-            .expect("status must leave a note")
-    }
-
-    let mut s = opened();
-    let query_id = open_status_query(&mut s);
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryStatus {
-            query_id: Some(query_id),
-            status: status(true, false, true),
-        }),
-    );
-    let note = last_note(&s);
-    assert!(
-        note.contains("记忆开关：总开关 开 · 用户事实 关 · 自动经验 开（实验）"),
-        "closed user lane must render as off: {note}"
-    );
-    assert!(
-        !note.contains("用户事实：活跃"),
-        "a closed user lane must not report user-fact counts: {note}"
-    );
-    assert!(
-        note.contains("经验：生效 1"),
-        "the open experience lane keeps reporting: {note}"
-    );
-
-    let mut s = opened();
-    let query_id = open_status_query(&mut s);
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryStatus {
-            query_id: Some(query_id),
-            status: status(false, false, false),
-        }),
-    );
-    let note = last_note(&s);
-    assert!(
-        note.contains("记忆开关：总开关 关 · 用户事实 关 · 自动经验 关"),
-        "the total switch closes both lanes: {note}"
-    );
-    assert!(
-        !note.contains("（实验）"),
-        "a closed experience lane is not advertised as experimental: {note}"
-    );
-}
-
-/// Query responses are client-owned. Opening Web may issue `list_memory` on
-/// the same session, but that answer must not appear in this TUI transcript.
-#[test]
-fn an_unowned_memory_listing_does_not_leak_into_the_tui() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryList {
-            query_id: None,
-            memory_dir: "/web/memory".into(),
-            active: vec![],
-            archived: vec![],
-            pending: vec![],
-        }),
-    );
-    assert!(
-        !s.transcript
-            .items()
-            .iter()
-            .any(|item| matches!(item, TranscriptItem::MemoryList(_))),
-        "another client's query response leaked into the TUI"
-    );
-}
-
-#[test]
-fn slash_memory_forget_sends_forget_memory() {
-    let mut s = opened();
-    typed(&mut s, "/memory forget prefer-ws");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Send(ClientCommand::ForgetMemory { id, .. }) if id == "prefer-ws"
-        )),
-        "effects={effects:?}"
-    );
-}
-
-#[test]
-fn memory_list_event_pushes_multiline_transcript_note() {
-    let mut s = opened();
-    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
-    s.memory_query = Some(query_id.clone());
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryList {
-            query_id: Some(query_id),
-            memory_dir: "/proj/memory".into(),
-            active: vec![leveler_client_protocol::UiMemoryEntry {
-                id: "prefer-ws".into(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                title: "prefer workspace write".into(),
-                body: "prefer workspace write".into(),
-                kind: None,
-                sensitive: false,
-                status: None,
-                authority: None,
-                revision: None,
-                updated_at: None,
-                pinned: false,
-            }],
-            archived: vec![leveler_client_protocol::UiMemoryEntry {
-                id: "old-fact".into(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                title: "old".into(),
-                body: "old".into(),
-                kind: None,
-                sensitive: false,
-                status: None,
-                authority: None,
-                revision: None,
-                updated_at: None,
-                pinned: false,
-            }],
-            pending: vec![],
-        }),
-    );
-    let note = s.transcript.items().iter().find_map(|i| match i {
-        TranscriptItem::MemoryList(block) => Some(block.details.as_str()),
-        _ => None,
-    });
-    let note = note.expect("owned MemoryList must push a memory disclosure");
-    assert!(note.contains("memory_dir=/proj/memory"), "{note}");
-    assert!(note.contains("[prefer-ws]"), "{note}");
-    assert!(note.contains("prefer workspace write"), "{note}");
-    assert!(note.contains("[old-fact]"), "{note}");
-    assert!(
-        note.lines().count() >= 5,
-        "multi-line list expected, got {} lines: {note}",
-        note.lines().count()
-    );
-    // Status notification is a short one-liner only (not the full list).
-    let n = s.notification.as_ref().expect("short count toast");
-    assert!(
-        !n.message.contains("[prefer-ws]"),
-        "full list must not be status-line only: {}",
-        n.message
-    );
-    assert!(n.message.contains("active=1"), "{}", n.message);
-}
-
-#[test]
-fn memory_recalled_event_pushes_an_auditable_note_without_a_toast() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryRecalled {
-            count: 2,
-            ids: vec!["a".into(), "b".into()],
-            experience_count: 1,
-            injected: Vec::new(),
-        }),
-    );
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .find_map(|i| match i {
-            TranscriptItem::Note(t) => Some(t.clone()),
-            _ => None,
-        })
-        .expect("MemoryRecalled must push a note");
-    assert_eq!(note, "我想起了 2 条相关记忆（其中 1 条是经验）。");
-    assert!(
-        s.notification.is_none(),
-        "routine recall must not duplicate the transcript note as a toast"
-    );
-}
-
-#[test]
-fn an_experience_lifecycle_event_uses_the_experience_label() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryChanged {
-            operation: "experience_created".into(),
-            id: "k-demo".into(),
-            title: "检查失败源于 marker 缺失".into(),
-            authority: Some("tool_observation".into()),
-        }),
-    );
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .find_map(|item| match item {
-            TranscriptItem::Note(text) => Some(text.clone()),
-            _ => None,
-        })
-        .expect("a saved experience must leave a note");
-    assert_eq!(
-        note,
-        "我从这次任务里记下了一条经验：检查失败源于 marker 缺失"
-    );
-}
-
-#[test]
-fn memory_recalled_zero_is_silent() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryRecalled {
-            count: 0,
-            ids: vec![],
-            experience_count: 0,
-            injected: Vec::new(),
-        }),
-    );
-    assert!(
-        !s.transcript.items().iter().any(|i| matches!(
-            i,
-            TranscriptItem::Note(t) if t.contains("Memory")
-        )),
-        "a 0-hit search must not render as a recall"
-    );
-}
-
-#[test]
-fn memory_superseded_event_explains_the_conflict_and_update() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryChanged {
-            operation: "superseded".into(),
-            id: "k-probe".into(),
-            title: "发布探针代号：BLUE-4821".into(),
-            authority: Some("explicit_user".into()),
-        }),
-    );
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .find_map(|i| match i {
-            TranscriptItem::Note(t) => Some(t.clone()),
-            _ => None,
-        })
-        .expect("MemoryChanged must push a note");
-    assert_eq!(note, "我更新了之前记住的内容：发布探针代号：BLUE-4821");
-    assert!(note.contains("BLUE-4821"), "{note}");
-    assert!(
-        !note.contains("k-probe"),
-        "internal id stays in memory management: {note}"
-    );
-    assert!(
-        !note.contains("explicit_user"),
-        "internal authority stays in memory management: {note}"
-    );
-    assert!(!note.contains("updated · updated"), "{note}");
-    let toast = s
-        .notification
-        .as_ref()
-        .expect("persistent memory changes must remain visible as a toast");
-    assert_eq!(toast.message, note);
-}
-
-#[test]
-fn memory_superseded_event_explains_the_conflict_in_english() {
-    let mut s = opened();
-    s.locale = leveler_tui::Locale::En;
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryChanged {
-            operation: "superseded".into(),
-            id: "k-probe".into(),
-            title: "Release probe code: BLUE-4821".into(),
-            authority: Some("explicit_user".into()),
-        }),
-    );
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .find_map(|i| match i {
-            TranscriptItem::Note(t) => Some(t.clone()),
-            _ => None,
-        })
-        .expect("MemoryChanged must push a note");
-    assert_eq!(
-        note,
-        "I updated an earlier memory: Release probe code: BLUE-4821"
-    );
-    let toast = s
-        .notification
-        .as_ref()
-        .expect("persistent memory changes must remain visible as a toast");
-    assert_eq!(toast.message, note);
-}
-
-#[test]
-fn memory_updated_event_keeps_the_plain_updated_label() {
-    let mut s = opened();
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryChanged {
-            operation: "updated".into(),
-            id: "k-probe".into(),
-            title: "发布探针代号：BLUE-4821".into(),
-            authority: Some("explicit_user".into()),
-        }),
-    );
-    let note = s
-        .transcript
-        .items()
-        .iter()
-        .find_map(|i| match i {
-            TranscriptItem::Note(t) => Some(t.clone()),
-            _ => None,
-        })
-        .expect("MemoryChanged must push a note");
-    assert_eq!(note, "我更新了记忆：发布探针代号：BLUE-4821");
-}
-
-#[test]
 fn retired_work_mode_commands_do_not_change_session_axes_or_open_a_picker() {
     for command in ["/work-mode", "/work-mode economy", "/work_mode balanced"] {
         let mut s = opened();
@@ -6624,63 +6112,53 @@ fn slash_goal_requires_a_goal() {
 }
 
 #[test]
-fn slash_develop_runs_the_develop_workflow_on_the_bare_goal() {
+fn the_removed_develop_command_starts_nothing() {
     let mut s = opened();
     typed(&mut s, "/develop 修复 TUI 中计划进度没有实时更新的问题");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Submit { command: ClientCommand::RunDevelop { content, .. }, .. }]
-                if content == "修复 TUI 中计划进度没有实时更新的问题"
-        ),
-        "/develop must send the goal without the command word: {effects:?}"
-    );
-    assert!(s.composer.is_empty());
-}
-
-#[test]
-fn slash_develop_requires_a_task() {
-    let mut s = opened();
-    typed(&mut s, "/develop");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
         effects.is_empty(),
-        "an empty /develop must not start a task: {effects:?}"
+        "a removed command must not reach the runtime: {effects:?}"
     );
+    let notice = s
+        .notification
+        .as_ref()
+        .expect("an unknown command is named, not swallowed");
     assert!(
-        s.notification
-            .as_ref()
-            .is_some_and(|n| n.message.contains("用法: /develop")),
-        "the user gets a usage hint, not an empty workflow: {:?}",
-        s.notification
+        notice.message.contains("未知命令: /develop"),
+        "the user learns the command is gone: {:?}",
+        notice
+    );
+    assert!(!s.is_busy(), "no workflow, no goal, no chat turn starts");
+    assert_eq!(
+        s.composer.text(),
+        "/develop 修复 TUI 中计划进度没有实时更新的问题",
+        "the text is kept, never silently rewritten into a message"
     );
 }
 
 #[test]
-fn slash_develop_is_refused_while_a_turn_is_running() {
+fn the_removed_develop_command_is_never_queued_while_busy() {
     let mut s = opened();
-    typed(&mut s, "/develop 第一个任务");
+    typed(&mut s, "/goal 第一个任务");
     reduce(&mut s, key(KeyCode::Enter));
-    assert!(s.is_busy(), "the first /develop starts a turn");
+    assert!(s.is_busy(), "the goal turn is running");
 
     typed(&mut s, "/develop 第二个任务");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
         effects.is_empty(),
-        "a running workflow must not be steered into a second one: {effects:?}"
+        "a removed command is not a queued chat message either: {effects:?}"
     );
     assert!(
-        s.notification
-            .as_ref()
-            .is_some_and(|n| n.message.contains("develop")),
-        "the refusal names the command: {:?}",
-        s.notification
+        s.pending_inputs.is_empty(),
+        "nothing is held back for the next turn: {:?}",
+        s.pending_inputs
     );
 }
 
 #[test]
-fn an_ordinary_message_is_untouched_by_the_develop_command_existing() {
+fn an_ordinary_message_takes_the_ordinary_path() {
     let mut s = opened();
     typed(&mut s, "修复 TUI 的计划进度问题");
     let effects = reduce(&mut s, key(KeyCode::Enter));
@@ -8756,276 +8234,6 @@ fn a_task_cancelled_event_withdraws_resumability() {
     );
 }
 
-/// The consent gate (K36) is only usable if the UI it gates can act on it.
-/// Before this, pending candidates were invisible in the TUI and the only way
-/// to adopt one was `leveler memory accept` on the command line.
-#[test]
-fn slash_memory_accept_promotes_a_pending_candidate() {
-    let mut s = state();
-    s.composer.replace("/memory accept rust-anyhow");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        matches!(
-            &effects[..],
-            [
-                Effect::Send(ClientCommand::AcceptMemory { id, .. }),
-                Effect::Send(ClientCommand::ListMemory { query_id: Some(_), include_archived: false, .. })
-            ] if id == "rust-anyhow"
-        ),
-        "{effects:?}"
-    );
-}
-
-#[test]
-fn slash_memory_accept_without_an_id_explains_itself() {
-    let mut s = state();
-    s.composer.replace("/memory accept");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty(), "{effects:?}");
-    let note = s.notification.expect("must say what is missing");
-    assert!(note.message.contains("accept"), "{}", note.message);
-}
-
-/// A listing that hides what is waiting is why nobody ever accepted anything.
-#[test]
-fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
-    let mut s = state();
-    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
-    s.memory_query = Some(query_id.clone());
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryList {
-            query_id: Some(query_id),
-            memory_dir: "/tmp/mem".into(),
-            active: vec![],
-            archived: vec![],
-            pending: vec![leveler_client_protocol::UiMemoryCandidate {
-                id: "use-pnpm".into(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                title: "本仓库用 pnpm".into(),
-                body: "安装与脚本一律用 pnpm，不要默认 npm。".into(),
-                kind: "preference".into(),
-                source: "user_explicit".into(),
-            }],
-        }),
-    );
-    let collapsed = rendered(&mut s, 120, 30);
-    assert!(
-        collapsed.contains("项目记忆 · 0 条生效 · 1 条待确认"),
-        "collapsed listing needs a useful summary:\n{collapsed}"
-    );
-    assert!(
-        !collapsed.contains("memory_dir=/tmp/mem"),
-        "storage internals must stay out of the collapsed transcript:\n{collapsed}"
-    );
-    assert!(
-        !collapsed.contains("use-pnpm"),
-        "entry details belong behind disclosure:\n{collapsed}"
-    );
-    let last = s
-        .transcript
-        .last_foldable_index()
-        .expect("a foldable entry");
-    assert_eq!(
-        s.transcript
-            .toggle_item_display(last)
-            .map(|m| m.is_expanded()),
-        Some(true)
-    );
-    let expanded = rendered(&mut s, 120, 30);
-    assert!(expanded.contains("memory_dir=/tmp/mem"), "{expanded}");
-    assert!(expanded.contains("use-pnpm"), "{expanded}");
-    assert!(expanded.contains("不要默认 npm"), "{expanded}");
-
-    let text = format!("{:?}", s.transcript.items());
-    // The count and the id are what matter; the word beside them follows the
-    // locale (IA §12 Class A).
-    assert!(text.contains("待确认 (1)"), "{text}");
-    assert!(text.contains("use-pnpm"), "{text}");
-    assert!(
-        text.contains("/memory accept"),
-        "the way to adopt it must be shown: {text}"
-    );
-    assert!(
-        text.contains("/memory reject"),
-        "declining must be offered too, not only adopting: {text}"
-    );
-    assert!(
-        text.contains("不要默认 npm"),
-        "consent needs the body, not just the title: {text}"
-    );
-}
-
-/// `/remember` is the user's own write: one command out, no model request, no
-/// agent turn, and no pending candidate to approve afterwards.
-#[test]
-fn remember_slash_sends_one_direct_write_and_nothing_else() {
-    let mut s = state();
-    s.composer.replace("/remember 终端输出保持紧凑");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::RememberMemory {
-            session_id: SessionId::new("s1"),
-            scope: leveler_client_protocol::UiMemoryScope::Project,
-            body: "终端输出保持紧凑".to_string(),
-            kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
-        })],
-        "exactly one direct write, defaulting to a lasting preference"
-    );
-}
-
-/// A decision is stored but must NOT become standing context, so the kind has
-/// to survive the command rather than being inferred later.
-#[test]
-fn remember_slash_carries_an_explicit_kind() {
-    for (input, kind) in [
-        (
-            "/remember --kind decision 选用 SQLite",
-            leveler_client_protocol::UiMemoryKind::Decision,
-        ),
-        (
-            "/remember --kind note 顺手记一下",
-            leveler_client_protocol::UiMemoryKind::Note,
-        ),
-        (
-            "/remember --kind preference 保持紧凑",
-            leveler_client_protocol::UiMemoryKind::Preference,
-        ),
-    ] {
-        let mut s = state();
-        s.composer.replace(input);
-        let effects = reduce(&mut s, key(KeyCode::Enter));
-        match effects.as_slice() {
-            [
-                Effect::Send(ClientCommand::RememberMemory {
-                    kind: got, body, ..
-                }),
-            ] => {
-                assert_eq!(*got, Some(kind), "{input}");
-                assert!(
-                    !body.starts_with("--kind"),
-                    "the flag must be consumed: {body}"
-                );
-            }
-            other => panic!("{input}: {other:?}"),
-        }
-    }
-}
-
-/// Empty content is a usage error, not an empty memory.
-#[test]
-fn remember_slash_refuses_empty_content() {
-    let mut s = state();
-    s.composer.replace("/remember   ");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty(), "nothing is sent: {effects:?}");
-    assert!(s.notification.is_some(), "the user is told how to use it");
-}
-
-/// A direct write during a running turn must not become steering, and must
-/// not be sent to the model: it is a control-plane command, not a message.
-#[test]
-fn remember_while_busy_is_a_write_not_steering() {
-    let mut s = busy_state();
-    s.composer.replace("/remember 输出保持紧凑");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::RememberMemory {
-            session_id: SessionId::new("s1"),
-            scope: leveler_client_protocol::UiMemoryScope::Project,
-            body: "输出保持紧凑".to_string(),
-            kind: Some(leveler_client_protocol::UiMemoryKind::Preference),
-        })],
-        "a write, not SteerCurrentTurn and not SubmitMessage"
-    );
-    assert!(
-        !effects.iter().any(|e| matches!(
-            e,
-            Effect::Submit {
-                command: ClientCommand::SteerCurrentTurn { .. },
-                ..
-            } | Effect::Submit {
-                command: ClientCommand::SubmitMessage { .. },
-                ..
-            }
-        )),
-        "{effects:?}"
-    );
-}
-
-/// The listing must say what the model will never see, or "stored" reads as
-/// "in use".
-#[test]
-fn the_listing_marks_a_sensitive_entry_as_withheld() {
-    let mut s = state();
-    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
-    s.memory_query = Some(query_id.clone());
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryList {
-            query_id: Some(query_id),
-            memory_dir: "/tmp/mem".into(),
-            active: vec![leveler_client_protocol::UiMemoryEntry {
-                id: "legacy".into(),
-                scope: leveler_client_protocol::UiMemoryScope::Project,
-                title: "deploy token".into(),
-                body: "deploy token".into(),
-                kind: Some(leveler_client_protocol::UiMemoryKind::Note),
-                sensitive: true,
-                status: None,
-                authority: None,
-                revision: None,
-                updated_at: None,
-                pinned: false,
-            }],
-            archived: vec![],
-            pending: vec![],
-        }),
-    );
-    let text = format!("{:?}", s.transcript.items());
-    assert!(text.contains("敏感内容"), "{text}");
-    assert!(text.contains("笔记"), "the kind is shown too: {text}");
-}
-
-/// `/memory reject` must send reject, not forget. Sending a pending id to
-/// forget did nothing at all — the bug the Web button shipped with.
-#[test]
-fn memory_reject_sends_reject_not_forget() {
-    let mut s = state();
-    s.composer.replace("/memory reject cand-x");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        matches!(
-            &effects[..],
-            [
-                Effect::Send(ClientCommand::RejectMemory { id, .. }),
-                Effect::Send(ClientCommand::ListMemory { query_id: Some(_), include_archived: false, .. })
-            ] if id == "cand-x"
-        ),
-        "{effects:?}"
-    );
-}
-
-/// Forget still means archive-an-active-entry; the two stay distinct.
-#[test]
-fn memory_forget_still_targets_active_entries() {
-    let mut s = state();
-    s.composer.replace("/memory forget mem-1");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        matches!(
-            &effects[..],
-            [
-                Effect::Send(ClientCommand::ForgetMemory { id, .. }),
-                Effect::Send(ClientCommand::ListMemory { query_id: Some(_), include_archived: true, .. })
-            ] if id == "mem-1"
-        ),
-        "{effects:?}"
-    );
-}
-
 /// Enter while a turn runs holds the text in 待发送; it is not sent. Sending it
 /// (Tab to the list, Enter) steers the running turn: the text reaches the model
 /// at the next round, and the runtime falls back to an ordinary submission if
@@ -10015,7 +9223,7 @@ fn tab_reaches_a_running_user_shell_and_x_stops_it_inline() {
 }
 
 #[test]
-fn ctrl_o_toggles_the_latest_user_shell_in_place() {
+fn a_short_user_shell_result_is_painted_in_full() {
     let mut s = opened();
     shell_started(&mut s, "ush-o", "git diff");
     reduce(
@@ -10035,24 +9243,13 @@ fn ctrl_o_toggles_the_latest_user_shell_in_place() {
             status: "success".into(),
         }),
     );
-    let idx = s
-        .transcript
-        .user_shell_index(&leveler_core::UserShellId::new("ush-o"))
-        .unwrap();
-    // A short finished record opens in full; Ctrl+O is the user's fold, so
-    // the first press closes it and the second opens it again.
-    reduce(&mut s, ctrl('o'));
-    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
-        panic!("shell block expected");
-    };
-    assert!(!shell.expanded, "Ctrl+O closes the auto-opened record");
-    reduce(&mut s, ctrl('o'));
-    let TranscriptItem::UserShell(shell) = &s.transcript.items()[idx] else {
-        panic!("shell block expected");
-    };
-    assert!(shell.expanded, "Ctrl+O opens the latest execution again");
+    // Short output keeps its natural height: every row is painted, with no
+    // window hint to scroll for.
     let screen = rendered(&mut s, 100, 40);
-    assert!(screen.contains("diff-line-03"), "{screen}");
+    for n in 1..=3 {
+        assert!(screen.contains(&format!("diff-line-{n:02}")), "{screen}");
+    }
+    assert!(!screen.contains("上方还有"), "{screen}");
     assert_eq!(s.active_screen, Screen::Conversation);
 }
 
@@ -12051,44 +11248,6 @@ fn shift_up_walks_back_through_every_user_turn() {
     assert_eq!(s.turn_nav, Some(0), "and the third reaches the oldest");
 }
 
-/// The memory listing is the UI that gates what the model is allowed to
-/// remember. Its chrome was English in a Chinese session ("pending (0)",
-/// "hint:"), beside a Chinese sensitivity note — IA §12 Class A.
-#[test]
-fn the_memory_listing_speaks_the_sessions_language() {
-    let mut s = opened();
-    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
-    s.memory_query = Some(query_id.clone());
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::MemoryList {
-            query_id: Some(query_id),
-            memory_dir: "/repo/.leveler/memory".into(),
-            active: Vec::new(),
-            archived: Vec::new(),
-            pending: Vec::new(),
-        }),
-    );
-    let text = s
-        .transcript
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            leveler_tui::transcript::TranscriptItem::MemoryList(block) => {
-                Some(block.details.clone())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!text.contains("hint:"), "zh kept English chrome:\n{text}");
-    assert!(!text.contains("(none)"), "zh kept English chrome:\n{text}");
-    assert!(
-        text.contains("memory_dir=/repo/.leveler/memory"),
-        "the path and its key are data:\n{text}"
-    );
-}
-
 // ---- Pasting an image: the terminal hands us a path, the user means a picture
 
 /// Write a real 1×1 PNG so the paste path can be judged by what is on disk,
@@ -13216,7 +12375,7 @@ fn output_stream_order_and_carriage_returns_survive() {
 }
 
 #[test]
-fn a_short_shell_result_opens_and_a_long_one_keeps_the_named_fold() {
+fn a_short_shell_result_fits_and_a_long_one_scrolls_a_bounded_window() {
     let mut s = opened();
     shell_started(&mut s, "ush-short", "printf ok");
     reduce(
@@ -13240,7 +12399,10 @@ fn a_short_shell_result_opens_and_a_long_one_keeps_the_named_fold() {
         .transcript
         .user_shell_index(&leveler_core::UserShellId::new("ush-short"))
         .unwrap();
-    assert!(matches!(&s.transcript.items()[idx], TranscriptItem::UserShell(b) if b.expanded));
+    let TranscriptItem::UserShell(short) = &s.transcript.items()[idx] else {
+        panic!("shell block expected");
+    };
+    assert!(short.view.follow, "a fresh record follows its tail");
 
     shell_started(&mut s, "ush-long", "seq 1 500");
     let mut chunk = String::new();
@@ -13268,10 +12430,21 @@ fn a_short_shell_result_opens_and_a_long_one_keeps_the_named_fold() {
         .transcript
         .user_shell_index(&leveler_core::UserShellId::new("ush-long"))
         .unwrap();
+    let TranscriptItem::UserShell(long) = &s.transcript.items()[idx] else {
+        panic!("shell block expected");
+    };
     assert!(
-        matches!(&s.transcript.items()[idx], TranscriptItem::UserShell(b) if !b.expanded),
-        "a long result keeps the established fold instead of burying the conversation"
+        long.output.lines().count() == 500,
+        "the whole result is retained, never truncated for display"
     );
+    let screen = rendered(&mut s, 100, 40);
+    assert!(screen.contains("row-500"), "the newest row is on screen");
+    assert!(
+        !screen.contains("row-1\n"),
+        "the window does not lay out all 500 rows: {screen}"
+    );
+    assert!(screen.contains("上方还有 488 行"), "{screen}");
+    assert!(!screen.contains("已折叠"), "{screen}");
 }
 
 #[test]
@@ -13459,3 +12632,98 @@ fn a_backgrounded_shell_loses_the_live_row_and_the_foreground_stop() {
     assert!(screen.contains("Background (user)"), "{screen}");
     assert!(!screen.contains("sleep 30…"), "{screen}");
 }
+
+/// `/reload` is a control-plane command, not a message to the model.
+#[test]
+fn reload_is_sent_as_a_runtime_command() {
+    let mut s = opened();
+    typed(&mut s, "/reload");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::ReloadConfig { .. })]
+        ),
+        "expected ReloadConfig, got {effects:?}"
+    );
+    assert!(s.composer.is_empty());
+    assert!(!s.is_busy());
+}
+
+#[test]
+fn an_applied_reload_names_the_next_model_and_turn_boundary() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ConfigReloaded {
+            query_id: None,
+            outcome: "applied".into(),
+            version: 18,
+            error: None,
+            provider: Some("openai".into()),
+            model: Some("openai/gpt-6".into()),
+            thinking: Some("high".into()),
+            changed: vec!["default_model".into(), "models".into()],
+            deferred_to_next_turn: true,
+            restart_required: Vec::new(),
+        }),
+    );
+    let notice = s.notification.expect("a reload is announced");
+    assert!(notice.message.contains("v18"), "{}", notice.message);
+    assert!(
+        notice.message.contains("openai/gpt-6"),
+        "{}",
+        notice.message
+    );
+    assert!(notice.message.contains("下一轮"), "{}", notice.message);
+}
+
+#[test]
+fn a_failed_reload_says_the_previous_generation_is_still_in_force() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ConfigReloaded {
+            query_id: None,
+            outcome: "failed".into(),
+            version: 12,
+            error: Some("invalid model configuration".into()),
+            provider: None,
+            model: None,
+            thinking: None,
+            changed: Vec::new(),
+            deferred_to_next_turn: false,
+            restart_required: Vec::new(),
+        }),
+    );
+    let notice = s.notification.expect("a failure is announced");
+    assert!(notice.message.contains("invalid model configuration"));
+    assert!(notice.message.contains("v12"), "{}", notice.message);
+}
+
+/// A provider-only automatic reload is not news the user must read.
+#[test]
+fn a_quiet_provider_only_reload_stays_quiet() {
+    let mut s = opened();
+    s.notification = None;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ConfigReloaded {
+            query_id: None,
+            outcome: "applied".into(),
+            version: 4,
+            error: None,
+            provider: Some("openai".into()),
+            model: Some("openai/gpt-6".into()),
+            thinking: None,
+            changed: vec!["providers".into()],
+            deferred_to_next_turn: false,
+            restart_required: Vec::new(),
+        }),
+    );
+    assert!(s.notification.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Pending lifecycle: a person's decision settles the turn that proposed it.
+// ---------------------------------------------------------------------------

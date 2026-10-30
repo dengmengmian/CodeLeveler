@@ -125,7 +125,9 @@ pub fn screen_to_content(
     // bottom (the drag anchor must not move under the pointer).
     let scroll = effective_scroll(
         state.conv.scroll,
-        state.conv.auto_scroll && !state.conv.selection.dragging,
+        state.conv.auto_scroll
+            && !state.conv.selection.dragging
+            && !crate::splash::conversation_is_empty(state),
         total,
         height,
     );

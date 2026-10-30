@@ -382,10 +382,6 @@ impl Executor {
             {
                 AskOutcome::Allowed(evidence) => return Ok(pending.allowed(evidence)),
                 AskOutcome::DeniedByUser => return Err("denied by user".to_string()),
-                AskOutcome::DeniedUnattended(reason) if call.name == "remember" => {
-                    let _ = reason;
-                    return Err(self.park_unattended_denial(call));
-                }
                 AskOutcome::DeniedUnattended(reason) => return Err(reason),
                 AskOutcome::Cancelled => return Err("cancelled".to_string()),
                 // The profile changed while the question waited. Loop and let
@@ -572,16 +568,6 @@ impl Executor {
             ));
         }
 
-        let self_consent = program
-            .as_deref()
-            .is_some_and(|program| leveler_execution::is_self_consent_command(program, &args));
-        if self_consent {
-            if profile != leveler_execution::PermissionProfile::Assisted {
-                return deny("CodeLeveler's consent commands require direct human action under Restricted authority".into());
-            }
-            approval_reason.get_or_insert_with(|| "This exact command invokes CodeLeveler's human consent surface; a human must approve it".into());
-        }
-
         // An agent or skill definition changes what future sessions run, so a
         // human confirms each exact proposal under Auto and Restricted. Full
         // bypasses this consent gate with every other permission gate, at the
@@ -660,16 +646,14 @@ impl Executor {
             }
             // A standing rule is the user's consent; where the network cannot
             // be denied it is also consent to run the command open.
-            leveler_execution::RuleDecision::Allow if !self_consent => {
+            leveler_execution::RuleDecision::Allow => {
                 return PolicyResolution::Allow(ResolvedExecutionPolicy::new(
                     write,
                     network_scope.clone(),
                     AuthorizationEvidence::Rule,
                 ));
             }
-            leveler_execution::RuleDecision::Allow
-            | leveler_execution::RuleDecision::Ask
-            | leveler_execution::RuleDecision::NoMatch => {}
+            leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
         }
 
         // A destination hint can reduce the prompt only when the execution
@@ -1161,138 +1145,9 @@ impl Executor {
         result
     }
 
-    /// Explain a denial that came from a context with no human in it, and — for
-    /// a `remember` proposal — keep the content instead of discarding it.
-    ///
-    /// `pending/` exists for exactly this: consent deferred, not refused. The
-    /// candidate never becomes active without an explicit `leveler memory
-    /// accept`, so K36 still holds.
-    fn park_unattended_denial(&self, call: &ToolCall) -> String {
-        const UNATTENDED: &str =
-            "no approver was available in this non-interactive run (nobody declined it)";
-        if call.name != "remember" {
-            return format!("{UNATTENDED}; re-run with --permission full-access to allow it");
-        }
-        let Some(service) = self.memory.as_ref() else {
-            return format!("{UNATTENDED}; memory is not configured, so it could not be parked");
-        };
-        let title = call.arguments.get("title").and_then(|v| v.as_str());
-        let body = call.arguments.get("body").and_then(|v| v.as_str());
-        let (Some(title), Some(body)) = (title, body) else {
-            return format!("{UNATTENDED}; the proposal had no title/body to park");
-        };
-        let tags = call
-            .arguments
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|t| t.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let kind = match call.arguments.get("kind").and_then(|value| value.as_str()) {
-            Some("preference") => "preference",
-            Some("decision") => "decision",
-            _ => "note",
-        };
-        let subject = call
-            .arguments
-            .get("subject")
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let value = call
-            .arguments
-            .get("value")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let expires_at = call
-            .arguments
-            .get("expires_at")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        // The proposal keeps the scope it asked for. Parking it in the project
-        // queue would silently rewrite a global proposal into a project fact.
-        let scope = match call.arguments.get("scope").and_then(|value| value.as_str()) {
-            Some("global") => leveler_memory::ServiceScope::Global,
-            Some("local") => leveler_memory::ServiceScope::Local,
-            _ => leveler_memory::ServiceScope::Project,
-        };
-        let evidence = call
-            .arguments
-            .get("evidence")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        // Parking is a model proposal. The actor comes from the runtime's
-        // execution context, exactly as the memory tool's does.
-        let actor = match (
-            self.tool_context.session_scope.as_deref(),
-            self.tool_context.turn_scope.as_deref(),
-        ) {
-            (Some(session), Some(turn)) => leveler_memory::v2::Actor::Model {
-                session: leveler_core::SessionId::new(session),
-                turn: leveler_core::TurnId::new(turn),
-                // The proposal's own call, not the executor's base context:
-                // the pending record must point at the evidence a reader can
-                // find (the tool call that made it).
-                tool_call: call.id.clone(),
-            },
-            _ => {
-                return format!(
-                    "{UNATTENDED}; the proposal had no execution identity to park it under"
-                );
-            }
-        };
-        let request = leveler_memory::RememberRequest {
-            // The tool call is the idempotent operation identity. Provider
-            // ids are opaque, so derive a journal-safe spelling of the exact
-            // id instead of embedding it raw.
-            op_id: leveler_memory::v2::OpId::derived("park", call.id.as_str()),
-            scope,
-            title: title.to_string(),
-            body: body.to_string(),
-            kind: kind.to_string(),
-            subject,
-            value,
-            tags,
-            evidence,
-            expires_at,
-            replaces_id: None,
-        };
-        let parked = service.propose(&actor, request).map_err(|e| e.to_string());
-        match parked {
-            // Deliberately NOT "run `leveler memory accept <id>`": this text is
-            // a tool result the MODEL reads, and a real run followed that
-            // instruction — escalating the filesystem to adopt its own
-            // candidate. The gate in `resolve_policy` now refuses that command,
-            // and this message no longer suggests it either. Telling the USER
-            // how to adopt it belongs on a user-facing channel.
-            // Any pending reason keeps the content. A model proposal can wait
-            // for review (`awaiting_user_review`) or for the user to command a
-            // non-project scope; both are the person's decision, not this
-            // run's.
-            Ok(leveler_memory::WriteOutcome::Pending { id, .. }) => {
-                format!(
-                    "{UNATTENDED}; kept as a pending candidate [{id}] for the user to review. \
-                     Adopting a memory is their decision, not this run's — report that it is \
-                     waiting and move on."
-                )
-            }
-            // The store already had this operation (a replay or a suppressed
-            // fingerprint): nothing was lost either way.
-            Ok(leveler_memory::WriteOutcome::Skipped { .. }) => {
-                format!("{UNATTENDED}; this memory is already awaiting review")
-            }
-            Ok(_) => format!("{UNATTENDED}; the store did not keep a pending candidate"),
-            Err(error) => format!("{UNATTENDED}; parking it failed: {error}"),
-        }
-    }
-
     /// Persist an `ApproveAlways` decision as project permission rules and
     /// extend the live rule set. Calls that cannot be expressed as a safe
-    /// rule (shell scripts, memory writes, other tools) derive no rules and
+    /// rule (shell scripts and other tools) derive no rules and
     /// stay session-only; so does a missing rules path. Persistence failures
     /// are logged, never fatal — the user already approved this action.
     pub(crate) fn remember_always(&self, tool: &str, command_line: Option<&str>, paths: &[String]) {
@@ -1770,87 +1625,6 @@ mod authorize_tests {
         ));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn auto_self_consent_requires_real_human_then_executes_exact_call() {
-        struct AllowAll;
-        #[async_trait::async_trait]
-        impl leveler_execution::AutoReviewer for AllowAll {
-            async fn review(&self, _: &ApprovalRequest) -> ReviewVerdict {
-                ReviewVerdict::Allow
-            }
-        }
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let executable = dir.path().join("leveler");
-        let marker = dir.path().join("human-marker");
-        std::fs::write(&executable, "#!/bin/sh\nprintf approved > \"$3\"\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
-        let executor =
-            executor_for(dir.path(), approver.clone()).with_auto_reviewer(Arc::new(AllowAll));
-        let action = call(
-            "run_command",
-            serde_json::json!({"program":executable,"args":["memory","accept",marker]}),
-        );
-        assert!(matches!(
-            resolve(&executor, &action).await,
-            PolicyResolution::Ask(_)
-        ));
-        let mut sessions = HashSet::new();
-        let admitted = executor
-            .admit(
-                action.clone(),
-                executor.tool_context.clone(),
-                false,
-                &mut sessions,
-                &CancellationToken::new(),
-            )
-            .await
-            .ok()
-            .expect("human approval admits self-consent exact command");
-        assert!(matches!(
-            admitted.resolved().authorization,
-            AuthorizationEvidence::ApprovedOnce
-        ));
-        let (_, error, _) = executor
-            .dispatch_raw(&admitted, &CancellationToken::new(), None)
-            .await;
-        assert!(!error);
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), "approved");
-        assert_eq!(
-            approver.asks(),
-            1,
-            "auto reviewer must not approve self consent"
-        );
-        assert!(sessions.is_empty());
-        assert!(matches!(
-            resolve(&executor, &action).await,
-            PolicyResolution::Ask(_)
-        ));
-        let unattended = executor_for(
-            dir.path(),
-            Arc::new(FixedApprover::new(ApprovalDecision::Deny)),
-        )
-        .with_auto_reviewer(Arc::new(AllowAll))
-        .with_approver(Arc::new(leveler_execution::AutoApprove));
-        assert!(
-            unattended
-                .authorize(&action, &mut HashSet::new())
-                .await
-                .is_err()
-        );
-        executor
-            .tool_context
-            .policy
-            .permission_profile()
-            .set(PermissionProfile::RequestApproval);
-        assert!(matches!(
-            resolve(&executor, &action).await,
-            PolicyResolution::Deny(_)
-        ));
-    }
-
     #[tokio::test]
     async fn a_network_denied_run_refuses_an_mcp_tool_instead_of_pretending() {
         let dir = tempfile::tempdir().unwrap();
@@ -2314,300 +2088,6 @@ mod authorize_tests {
         }
     }
 
-    /// A headless approver that denies, standing in for `AutoApprove` in a
-    /// non-interactive run (`leveler run`, CI, eval).
-    struct HeadlessDeny;
-
-    #[async_trait::async_trait]
-    impl Approver for HeadlessDeny {
-        fn has_human(&self) -> bool {
-            false
-        }
-        async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
-            ApprovalDecision::Deny
-        }
-    }
-
-    fn remember_call() -> ToolCall {
-        ToolCall {
-            id: ToolCallId::new("m"),
-            name: "remember".to_string(),
-            arguments: serde_json::json!({
-                "title": "用 pnpm",
-                "body": "本仓库统一用 pnpm，不要用 npm。",
-                // A model proposal names the identity it is about; without a
-                // subject the store has nothing to park.
-                "subject": "package_manager",
-            }),
-        }
-    }
-
-    /// The model must not be told the user rejected something the user never
-    /// saw — it reads that as a standing preference against memory.
-    #[tokio::test]
-    async fn a_headless_denial_is_not_reported_as_the_user_refusing() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Workspace::new(dir.path()).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-        let executor = Executor::new(
-            Arc::new(StubRuntime),
-            Arc::new(default_registry()),
-            tool_context,
-            ModelRef::new("mock", "m"),
-            10,
-        )
-        .with_memory_service(Some(Arc::new(leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-                leveler_memory::v2::MemoryScope::Project,
-                dir.path().join("memory"),
-                dir.path().join("state"),
-            )),
-        ))))
-        .with_approver(Arc::new(HeadlessDeny));
-        let mut session = HashSet::new();
-
-        let err = executor
-            .authorize(&remember_call(), &mut session)
-            .await
-            .expect_err("assisted still gates memory writes");
-        assert!(
-            !err.contains("denied by user"),
-            "nobody was asked, so nobody denied it: {err}"
-        );
-    }
-
-    /// Discarding the proposal loses it for good. Parking it as a pending
-    /// candidate is what `pending/` is for — consent deferred, not refused.
-    #[tokio::test]
-    async fn a_headless_run_parks_the_memory_instead_of_dropping_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Workspace::new(dir.path()).unwrap();
-        let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-        // Parking is a model proposal; the runtime's own execution identity is
-        // what makes the actor trustworthy, so a real turn always carries it.
-        tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
-        tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
-        tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
-        let service = Arc::new(leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-                leveler_memory::v2::MemoryScope::Project,
-                dir.path().join("memory"),
-                dir.path().join("state"),
-            )),
-        ));
-        let executor = Executor::new(
-            Arc::new(StubRuntime),
-            Arc::new(default_registry()),
-            tool_context,
-            ModelRef::new("mock", "m"),
-            10,
-        )
-        .with_memory_service(Some(service.clone()))
-        .with_approver(Arc::new(HeadlessDeny));
-        let mut session = HashSet::new();
-
-        let err = executor
-            .authorize(&remember_call(), &mut session)
-            .await
-            .expect_err("the call itself still does not store active memory");
-        // The message must let the model TELL the user something is waiting —
-        // hence the candidate id — without handing it a command to adopt the
-        // memory itself. The previous wording spelled out
-        // `leveler memory accept <id>`, and a real run executed it.
-        let reviewer = leveler_memory::v2::Actor::User {
-            invocation: leveler_memory::v2::UserInvocationId::mint("host-test-reviewer"),
-        };
-        let candidate_id = service
-            .pending(&reviewer, leveler_memory::ServiceScope::Project)
-            .unwrap()[0]
-            .id
-            .clone();
-        assert!(
-            err.contains(&candidate_id),
-            "the message must name the waiting candidate: {err}"
-        );
-        assert!(
-            !err.contains("leveler memory"),
-            "the message must not hand the model a way to adopt it: {err}"
-        );
-
-        let pending = service
-            .pending(&reviewer, leveler_memory::ServiceScope::Project)
-            .unwrap();
-        assert_eq!(pending.len(), 1, "the proposal must survive as a candidate");
-        assert!(pending[0].title.contains("pnpm"));
-        assert_eq!(
-            pending[0].authority, "model_inferred",
-            "the parked fact came from the model, not from the user or a system guess"
-        );
-        assert!(
-            service
-                .listing_for_user(
-                    leveler_memory::ServiceScope::Project,
-                    leveler_memory::MemoryLanes::ALL
-                )
-                .unwrap()
-                .is_empty(),
-            "parking must never activate without consent (K36)"
-        );
-    }
-
-    /// Provider tool-call ids are opaque strings; operation ids are not. A call
-    /// id containing characters outside `[A-Za-z0-9_\-:.]` must still park the
-    /// proposal — the parked operation derives a safe spelling from the exact
-    /// id, and a retry of the same call stays one candidate.
-    #[tokio::test]
-    async fn an_opaque_provider_call_id_still_parks_the_proposal() {
-        let dir = tempfile::tempdir().unwrap();
-        let project_current = dir.path().join("memory");
-        let project_state = dir.path().join("state");
-        let global_current = dir.path().join("global-memory");
-        let global_state = dir.path().join("global-state");
-        let service = leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new()
-                .with_project(leveler_memory::v2::ScopeRoots::new(
-                    leveler_memory::v2::MemoryScope::Project,
-                    project_current,
-                    project_state.clone(),
-                ))
-                .with_global(leveler_memory::v2::ScopeRoots::new(
-                    leveler_memory::v2::MemoryScope::Global,
-                    global_current,
-                    global_state,
-                )),
-        );
-        let workspace = Workspace::new(dir.path()).unwrap();
-        let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-        tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
-        tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
-        tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
-        let executor = Executor::new(
-            Arc::new(StubRuntime),
-            Arc::new(default_registry()),
-            tool_context,
-            ModelRef::new("mock", "m"),
-            10,
-        )
-        .with_memory_service(Some(Arc::new(service)))
-        .with_approver(Arc::new(HeadlessDeny));
-        let mut session = HashSet::new();
-        let call = ToolCall {
-            id: ToolCallId::new("call|opaque/with spaces"),
-            name: "remember".to_string(),
-            arguments: serde_json::json!({
-                "title": "用 pnpm",
-                "body": "本仓库统一用 pnpm，不要用 npm。",
-                "subject": "package_manager",
-                "value": "pnpm",
-                "kind": "preference",
-            }),
-        };
-
-        for attempt in 0..2 {
-            let err = executor
-                .authorize(&call, &mut session)
-                .await
-                .expect_err("an unattended write still needs a person");
-            assert!(
-                err.contains("kept as a pending candidate")
-                    || err.contains("already awaiting review"),
-                "attempt {attempt} must keep the proposal, not lose it: {err}"
-            );
-            assert!(
-                !err.contains("invalid operation id"),
-                "attempt {attempt} must not fail on the opaque call id: {err}"
-            );
-        }
-
-        let pending: Vec<_> = std::fs::read_dir(project_state.join("pending"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(pending.len(), 1, "a retried call is one candidate");
-        let text = std::fs::read_to_string(&pending[0]).unwrap();
-        assert!(
-            text.contains("tool_call_id: call|opaque/with spaces"),
-            "the parked proposal must keep the exact call identity: {text}"
-        );
-    }
-
-    /// The Markdown store applies the request's own identity and scope. A
-    /// parked proposal is not a lesser fact: it keeps the value the model
-    /// supplied, and a global proposal waits in the global pending queue.
-    ///
-    /// The op id is built from the tool call, not the title: a title is
-    /// arbitrary Unicode, while `OpId` accepts only `[A-Za-z0-9_\-:.]`.
-    #[tokio::test]
-    async fn an_unattended_markdown_proposal_parks_with_its_scope_and_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let project_current = dir.path().join("memory");
-        let project_state = dir.path().join("state");
-        let global_current = dir.path().join("global-memory");
-        let global_state = dir.path().join("global-state");
-        let service = leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new()
-                .with_project(leveler_memory::v2::ScopeRoots::new(
-                    leveler_memory::v2::MemoryScope::Project,
-                    project_current,
-                    project_state,
-                ))
-                .with_global(leveler_memory::v2::ScopeRoots::new(
-                    leveler_memory::v2::MemoryScope::Global,
-                    global_current,
-                    global_state.clone(),
-                )),
-        );
-        let workspace = Workspace::new(dir.path()).unwrap();
-        let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-        tool_context.session_scope = Some(std::sync::Arc::from("test-session"));
-        tool_context.turn_scope = Some(std::sync::Arc::from("test-turn"));
-        tool_context.tool_call_scope = Some(std::sync::Arc::from("test-call"));
-        let executor = Executor::new(
-            Arc::new(StubRuntime),
-            Arc::new(default_registry()),
-            tool_context,
-            ModelRef::new("mock", "m"),
-            10,
-        )
-        .with_memory_service(Some(Arc::new(service)))
-        .with_approver(Arc::new(HeadlessDeny));
-        let mut session = HashSet::new();
-        let call = ToolCall {
-            id: ToolCallId::new("call-1"),
-            name: "remember".to_string(),
-            arguments: serde_json::json!({
-                "title": "全局语言偏好",
-                "body": "所有项目用中文。",
-                "subject": "dogfood.global_language",
-                "value": "zh",
-                "kind": "preference",
-                "scope": "global",
-            }),
-        };
-
-        let err = executor
-            .authorize(&call, &mut session)
-            .await
-            .expect_err("an unattended write still needs a person");
-        assert!(
-            err.contains("kept as a pending candidate"),
-            "the proposal must survive as a pending candidate: {err}"
-        );
-
-        let pending: Vec<_> = std::fs::read_dir(global_state.join("pending"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(pending.len(), 1, "the global proposal is parked globally");
-        let text = std::fs::read_to_string(&pending[0]).unwrap();
-        assert!(text.contains("scope: global"), "{text}");
-        assert!(text.contains("value: zh"), "{text}");
-        assert!(
-            text.contains("tool_call_id: call-1"),
-            "the parked proposal must name the tool call it came from: {text}"
-        );
-    }
-
     #[tokio::test]
     async fn approve_always_persists_rule_and_auto_allows_next_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -2764,30 +2244,6 @@ mod authorize_tests {
         };
         executor.authorize(&other, &mut fresh).await.unwrap();
         assert_eq!(approver.asks(), 2, "a variant must not ride the exact rule");
-    }
-
-    #[tokio::test]
-    async fn memory_consent_does_not_persist_standing_or_session_grants() {
-        let dir = tempfile::tempdir().unwrap();
-        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveAlways));
-        let executor = executor_for(dir.path(), approver.clone())
-            .with_permission_rules_path(Some(leveler_execution::project_rules_path(dir.path())));
-        let mut session = HashSet::new();
-
-        let remember = ToolCall {
-            id: ToolCallId::new("c"),
-            name: "remember".to_string(),
-            arguments: serde_json::json!({"title": "t", "content": "c"}),
-        };
-        executor.authorize(&remember, &mut session).await.unwrap();
-        assert_eq!(approver.asks(), 1, "K36: memory writes always ask");
-        executor.authorize(&remember, &mut session).await.unwrap();
-        assert_eq!(approver.asks(), 2, "human consent remains exact-call only");
-        assert!(session.is_empty());
-        assert!(
-            !leveler_execution::project_rules_path(dir.path()).exists(),
-            "K36: memory writes never get standing permission"
-        );
     }
 
     #[tokio::test]
@@ -2969,22 +2425,16 @@ mod authorize_tests {
         exec.tool_context.policy.read_only = true;
         exec.tool_context.policy.command_write_allowlist = Some(Arc::new(Vec::new()));
         *exec.permission_rules.write().unwrap() = PermissionRuleSet::from_rules(
-            [
-                "run_command",
-                "write_file",
-                "read_file",
-                "remember",
-                "save_agent",
-            ]
-            .iter()
-            .map(|name| PermissionRule {
-                match_: RuleMatch {
-                    tool: Some((*name).into()),
-                    ..Default::default()
-                },
-                effect: RuleEffect::Deny,
-            })
-            .collect(),
+            ["run_command", "write_file", "read_file", "save_agent"]
+                .iter()
+                .map(|name| PermissionRule {
+                    match_: RuleMatch {
+                        tool: Some((*name).into()),
+                        ..Default::default()
+                    },
+                    effect: RuleEffect::Deny,
+                })
+                .collect(),
         );
         let actions = [
             call(
@@ -3016,7 +2466,6 @@ mod authorize_tests {
                 "run_command",
                 serde_json::json!({"program":"git","args":["credential","fill"]}),
             ),
-            call("remember", serde_json::json!({"title":"x","body":"y"})),
             call("save_agent", serde_json::json!({})),
         ];
         for action in actions {

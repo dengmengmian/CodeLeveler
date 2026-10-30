@@ -21,6 +21,7 @@ mod paste_image;
 mod runtime_apply;
 mod screen_nav;
 mod shell;
+mod shell_output;
 mod submit;
 
 use overlay_keys::{handle_overlay_key, open_model_picker};
@@ -79,10 +80,6 @@ fn insert_file_references(state: &mut AppState, text: &str) -> bool {
 /// means no second path can observe the same ready state and submit the item
 /// again.
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
-    let idle_tick = match &action {
-        Action::IdleTick(now) => Some(*now),
-        _ => None,
-    };
     if state.update.is_some() {
         state.history_search = None;
     }
@@ -104,18 +101,6 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if grouped {
         state.composer.end_edit_group();
     }
-    // A lifecycle decision whose receipts never arrived must not leave the
-    // page stuck "confirming": at the deadline the proving refresh runs and
-    // the records are reported as unconfirmed, never as accepted.
-    if let Some(now) = idle_tick
-        && state.memory.check_timeout(now)
-        && let Some(effect) = crate::memory::query_list(state)
-    {
-        effects.push(effect);
-    }
-    // A notice discovered inside a running turn waits for the turn's end; the
-    // tick keeps trying after a competing notice expires.
-    crate::memory::flush_notice(state);
     if let Some(advance) = drain_pending_input(state) {
         effects.push(advance);
     }
@@ -142,20 +127,23 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
     }
     match action {
         Action::Runtime(event) => {
-            let refresh = state.active_screen == Screen::Trace
+            // A live read-only page re-asks the runtime when a fact it shows
+            // changed. The ask is COALESCED (see `query_track`): an event only
+            // marks the page dirty, and the follow-up query is issued when the
+            // answer in flight lands. That is what keeps a busy turn from
+            // turning into a stream of concurrent database queries — and what
+            // makes the answer the page is waiting for actually arrive.
+            let trace_dirty = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
+            let usage_dirty =
+                state.active_screen == Screen::Context && crate::usage::should_refresh(&event);
+            if trace_dirty {
+                state.trace.track.mark_dirty();
+            }
+            if usage_dirty {
+                state.usage.track.mark_dirty();
+            }
             let opened = matches!(event, RuntimeEvent::SessionOpened { .. });
-            let receipt = match &event {
-                RuntimeEvent::Notification { level, message } => Some((
-                    message.clone(),
-                    !matches!(
-                        level,
-                        leveler_client_protocol::NotificationLevel::Warning
-                            | leveler_client_protocol::NotificationLevel::Error
-                    ),
-                )),
-                _ => None,
-            };
             let session_updated = matches!(&event, RuntimeEvent::SessionUpdated { .. });
             let restored_history = matches!(
                 &event,
@@ -169,6 +157,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 RuntimeEvent::TurnCompleted
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
+                    | RuntimeEvent::TurnPaused { .. }
             );
             // Only semantic boundaries can auto-fold a Thought or regroup
             // exploration receipts. Deltas must not rebuild the projection.
@@ -181,6 +170,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::TurnCompleted
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
+                    | RuntimeEvent::TurnPaused { .. }
                     | RuntimeEvent::TurnTruncated { .. }
                     | RuntimeEvent::TurnIncomplete { .. }
                     | RuntimeEvent::TurnFailed { .. }
@@ -211,22 +201,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             // recomputes one.
             if opened || session_updated {
                 effects.push(Effect::Send(crate::context::issue_query(state)));
-            }
-            // Durable pending candidates outlive the process and the session
-            // that proposed them. Without this probe a candidate created while
-            // this client was away stays invisible until someone types
-            // `/memory`, which is exactly how a queue grows unseen.
-            if opened && let Some(effect) = crate::memory::probe_effect(state) {
-                effects.push(effect);
-            }
-            // One receipt settles one lifecycle command. When every command in
-            // the batch has answered, the listing refresh that proves what was
-            // durably applied is requested — never a local mutation.
-            if let Some((message, success)) = receipt
-                && state.memory.resolve_receipt(&message, success)
-                && let Some(effect) = crate::memory::query_list(state)
-            {
-                effects.push(effect);
             }
             // History owns the restored transcript; ask only after its matching
             // response, while the user has left this input window untouched.
@@ -264,24 +238,17 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             {
                 effects.push(effect);
             }
-            if refresh {
-                let session_id = state
-                    .trace
-                    .loaded
-                    .as_ref()
-                    .map(|l| l.session.session_id.clone())
-                    .unwrap_or_else(|| state.session_id.clone());
-                effects.push(Effect::Send(crate::observability::issue_query(
-                    &mut state.trace,
-                    session_id,
-                    None,
-                    0,
-                    80,
-                )));
-            }
+            // The tail query for an open page: only when nothing is in flight.
+            // A page that is not on screen owes nothing.
+            effects.extend(page_tail_queries(state));
             effects
         }
         Action::Resize(cols, rows) => {
+            // Ratatui clears the terminal on resize even if the bounded image
+            // slot keeps its dimensions. Kitty must retransmit after that clear.
+            if let Some(image) = &mut state.welcome_image {
+                image.reset();
+            }
             state.size = (cols, rows);
             if state.active_screen == Screen::Output {
                 request_output_index(state)
@@ -289,7 +256,20 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 Vec::new()
             }
         }
-        Action::IdleTick(_) => Vec::new(),
+        Action::IdleTick(now) => {
+            // A running turn appends durable rows that carry no client event —
+            // a long tool's progress ticks — so an open `/trace` asks again on a
+            // bounded cadence instead of keeping the rows it had when the tool
+            // started. Read-only, single-flight, and only while the page is on
+            // screen with a turn actually running.
+            if state.active_screen == Screen::Trace
+                && state.is_busy()
+                && state.trace.live_refresh_due(now)
+            {
+                state.trace.track.mark_dirty();
+            }
+            page_tail_queries(state)
+        }
         Action::FileCandidatesLoaded(files) => {
             state.file_candidates = files;
             Vec::new()
@@ -452,10 +432,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     path: image.path,
                     name: image.name,
                 })]
-            } else if crate::memory::editor_insert_text(state, &text) {
-                // A paste while the /memory editor is open is text for the
-                // buffer, not for the composer underneath.
-                Vec::new()
             } else if state
                 .overlay
                 .as_mut()
@@ -476,9 +452,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         Action::TextInput(text) => {
             state.disarm_ctrlc();
             clear_quit_confirm_notification(state);
-            if !text.is_empty() && crate::memory::editor_insert_text(state, &text) {
-                return Vec::new();
-            }
             if !text.is_empty()
                 && state
                     .overlay
@@ -1103,6 +1076,48 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         return Vec::new();
     }
 
+    // Welcome navigation reuses registered commands without consuming the draft.
+    // Resolve against the exact layout used by
+    // the conversation painter, including centering and scrolling.
+    if over_conv
+        && state.surface == SurfaceFocus::Main
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && crate::splash::conversation_is_empty(state)
+        && let Some(pos) =
+            crate::conversation::geometry::screen_to_content(state, mouse.column, mouse.row)
+        && let Some(index) = crate::splash::action_at(
+            state,
+            crate::conversation::geometry::content_width(state),
+            crate::conversation::geometry::viewport_height(state),
+            pos.row,
+            pos.col,
+        )
+    {
+        return activate_welcome_action(state, index);
+    }
+
+    // A wheel over a record whose output does not fit scrolls THAT window and
+    // stops there: the Conversation never moves underneath it, so the two
+    // scroll surfaces cannot fight over one gesture.
+    if over_conv
+        && matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        )
+    {
+        let delta = if mouse.kind == MouseEventKind::ScrollUp {
+            -3
+        } else {
+            3
+        };
+        if shell_output::scroll_at_pointer(state, mouse.row, delta) {
+            state.workbench_focus = WorkbenchFocus::Conversation;
+            interaction::clear_selection_drag(state);
+            state.conv.selection.clear();
+            return Vec::new();
+        }
+    }
+
     match mouse.kind {
         // Wheel scrolls Conversation (never over Input — keeps history focus).
         MouseEventKind::ScrollUp if over_conv || over_jump => {
@@ -1166,6 +1181,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 return Vec::new();
             }
             if over_input {
+                state.shell_output_focus = None;
                 state.workbench_focus = WorkbenchFocus::Input;
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
@@ -1243,20 +1259,30 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                                 execution_id,
                             })];
                         }
-                        // A large finished local command opens the windowed
-                        // full-output page; everything else folds inline.
+                        interaction::clear_selection_drag(state);
+                        state.conv.selection.clear();
+                        // A record whose complete capture lives on the
+                        // windowed full-output page opens that page: the
+                        // inline window is the bounded record, the page is the
+                        // whole stream.
                         if let Some(effects) = open_output_view(state, item) {
-                            interaction::clear_selection_drag(state);
-                            state.conv.selection.clear();
                             return effects;
                         }
-                        // Every other disclosure — tool group or user shell —
-                        // folds inline. One hit map, one interaction.
+                        // A local command's record gives its output window the
+                        // keyboard (↑/↓ scroll it, Esc releases). It has no
+                        // fold to toggle and no second surface to open.
+                        if matches!(
+                            state.transcript.items().get(item),
+                            Some(crate::transcript::TranscriptItem::UserShell(_))
+                        ) {
+                            shell_output::focus_item(state, item);
+                            return Vec::new();
+                        }
+                        // Every other disclosure — a tool group — folds inline.
+                        // One hit map, one interaction.
                         interaction::toggle_fold(state, item);
                         state.conv.plain.clear();
                         state.conv.plain_layout.clear();
-                        interaction::clear_selection_drag(state);
-                        state.conv.selection.clear();
                         return Vec::new();
                     }
                     Hit::Url { url, .. }
@@ -1267,6 +1293,8 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                         return open_url(state, &url);
                     }
                     Hit::Url { pos, .. } | Hit::Text(pos) => {
+                        // A plain conversation click leaves any output window.
+                        state.shell_output_focus = None;
                         state.conv.selection_last_mouse = Some((mouse.column, mouse.row));
                         interaction::update_selection_edge(state, mouse.column, mouse.row);
                         state.conv.selection.begin(pos);
@@ -1718,6 +1746,24 @@ fn point_in_rect(x: u16, y: u16, rect: Option<(u16, u16, u16, u16)>) -> bool {
     x >= rx && y >= ry && x < rx.saturating_add(rw) && y < ry.saturating_add(rh)
 }
 
+/// Welcome entries use the same busy/availability gate as typed commands.
+/// This path never takes, replaces, or submits the user's composer contents.
+fn activate_welcome_action(state: &mut AppState, index: usize) -> Vec<Effect> {
+    if state.active_screen != Screen::Conversation
+        || state.surface != SurfaceFocus::Main
+        || state.overlay.is_some()
+        || state.history_search.is_some()
+        || state.update.is_some()
+        || !crate::splash::conversation_is_empty(state)
+    {
+        return Vec::new();
+    }
+    let Some(command) = crate::splash::action_command(index) else {
+        return Vec::new();
+    };
+    submit::handle_slash(state, command)
+}
+
 fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // Only react to presses (Windows also emits Release/Repeat).
     if key.kind == KeyEventKind::Release {
@@ -1768,6 +1814,18 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let btw = state.surface == SurfaceFocus::Btw;
+
+    if !btw
+        && alt
+        && !ctrl
+        && state.active_screen == Screen::Conversation
+        && state.history_search.is_none()
+        && state.workbench_focus == WorkbenchFocus::Input
+        && crate::splash::conversation_is_empty(state)
+        && let KeyCode::Char(digit @ '1'..='3') = key.code
+    {
+        return activate_welcome_action(state, digit as usize - '1' as usize);
+    }
 
     if !btw && let Some(mut search) = state.history_search.take() {
         if is_ctrl_c(&key) {
@@ -1826,14 +1884,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         clear_quit_confirm_notification(state);
     }
 
-    // The `/memory` editor is a text surface: its keys must reach the buffers
-    // before the global screen toggles, the permission cycle, the completion
-    // menu and the popup bindings. Inside it, `d`/`f`/`p` are letters, not
-    // lifecycle actions on the record being typed into.
-    if state.surface == SurfaceFocus::Main && crate::memory::editing(state) {
-        return handle_screen_key(state, key);
-    }
-
     // `Ctrl+X Ctrl+E` opens $EDITOR on the draft (readline's binding, which
     // every other agent CLI inherited). The chord is spent by whatever key
     // follows, so a stray Ctrl+X never swallows the next keystroke's meaning.
@@ -1886,6 +1936,29 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // accepts (never sends the command), Shift+Tab steps back one row.
     if let Some(effects) = shell::handle_menu_key(state, key) {
         return effects;
+    }
+
+    // A focused output window owns its reading keys, exactly like the
+    // background console owns them on its page. Esc releases the window before
+    // anything else can read it. Typing, Tab and a click elsewhere release it
+    // too, so ordinary input is never captured by a stale focus.
+    if state.active_screen == Screen::Conversation && state.shell_output_focus.is_some() && !btw {
+        let consumed = match key.code {
+            KeyCode::Esc => {
+                shell_output::release(state);
+                true
+            }
+            KeyCode::Up => shell_output::scroll_focused(state, -1),
+            KeyCode::Down => shell_output::scroll_focused(state, 1),
+            KeyCode::PageUp => shell_output::page_focused(state, -1),
+            KeyCode::PageDown => shell_output::page_focused(state, 1),
+            KeyCode::Home => shell_output::edge_focused(state, true),
+            KeyCode::End => shell_output::edge_focused(state, false),
+            _ => false,
+        };
+        if consumed {
+            return Vec::new();
+        }
     }
 
     // Ctrl+B moves exactly the running foreground user shell to the background
@@ -2164,6 +2237,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // A live running command earns a stop right after the transcript's
         // scroll, so the contextual `x` is reachable without the mouse.
         KeyCode::Tab if !btw => {
+            // Tab moves the workbench focus; an output window's reading keys
+            // belong to the record and are released with it.
+            state.shell_output_focus = None;
             state.workbench_focus = match state.workbench_focus {
                 // 待发送 sits right above the composer, so it is the next stop.
                 WorkbenchFocus::Input if !state.pending_inputs.is_empty() => {
@@ -2549,6 +2625,15 @@ fn toggle_selected_command(state: &mut AppState) -> Vec<Effect> {
             if let Some(effects) = open_output_view(state, item) {
                 return effects;
             }
+            // Enter on a local command hands its output window the keys, the
+            // same gesture as clicking its row.
+            if matches!(
+                state.transcript.items().get(item),
+                Some(crate::transcript::TranscriptItem::UserShell(_))
+            ) {
+                shell_output::focus_item(state, item);
+                return Vec::new();
+            }
             interaction::toggle_fold(state, item);
         }
     }
@@ -2610,17 +2695,21 @@ fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
 
 /// Ctrl+O opens or closes the latest tool receipt and its member details.
 /// Reasoning is never projected into conversation history by this action.
+///
+/// An edit node's own drawer is its diff, so the same key folds the diff when
+/// the latest execution IS an edit; otherwise it opens the process receipt.
 fn toggle_current_expand(state: &mut AppState) {
-    if let Some(index) = crate::conversation::build::keyboard_expand_target(state)
-        && let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index)
-    {
-        state.tools_expanded = expanded;
-        for (item, call) in crate::conversation::build::keyboard_detail_calls(state, index) {
-            state.transcript.set_call_expanded(item, call, expanded);
+    if let Some(index) = crate::conversation::build::keyboard_expand_target(state) {
+        let reading = crate::conversation::interaction::reading_anchor(state);
+        if let Some(expanded) = crate::conversation::build::toggle_edit_fold(state, index) {
+            state.tools_expanded = expanded;
+            crate::conversation::interaction::restore_reading_anchor(state, reading);
+        } else if let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index) {
+            state.tools_expanded = expanded;
+            for (item, call) in crate::conversation::build::keyboard_detail_calls(state, index) {
+                state.transcript.set_call_expanded(item, call, expanded);
+            }
         }
-        state.conv.plain.clear();
-        state.conv.plain_layout.clear();
-        state.conv.plain_width = 0;
     }
     state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
     state.conv.plain.clear();
@@ -2941,6 +3030,38 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
     }
 }
 
+/// The queries an open read-only page still owes, in one place.
+///
+/// Both callers (a runtime fact that dirtied the page, and the live cadence on
+/// an idle tick) go through this so the trace and usage pages can never grow two
+/// refresh paths with different correlation or window arithmetic.
+fn page_tail_queries(state: &mut AppState) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if state.active_screen == Screen::Trace && state.trace.track.wants_refresh() {
+        let session_id = state
+            .trace
+            .loaded
+            .as_ref()
+            .map(|l| l.session.session_id.clone())
+            .unwrap_or_else(|| state.session_id.clone());
+        effects.push(Effect::Send(crate::observability::issue_query(
+            &mut state.trace,
+            session_id,
+            None,
+            0,
+            80,
+        )));
+    }
+    // The Context section's snapshot is also PUSHED by the runtime
+    // (`ContextUsage`), so it needs no query here. The Usage section is a ledger
+    // aggregate, and only a query refreshes it — for as long as the page is up,
+    // whichever section the reader is in, because both sections are on screen.
+    if state.active_screen == Screen::Context && state.usage.track.wants_refresh() {
+        effects.push(Effect::Send(crate::usage::query(state)));
+    }
+    effects
+}
+
 #[cfg(test)]
 mod child_identity_tests;
 #[cfg(test)]
@@ -2953,7 +3074,7 @@ mod history_replay_tests;
 mod input_recovery_tests;
 
 #[cfg(test)]
-mod memory_tests;
+mod goal_terminal_tests;
 
 #[cfg(test)]
 mod output_view_tests;
@@ -3237,7 +3358,7 @@ mod disclosure_tests {
     }
 
     #[test]
-    fn user_shell_row_click_toggles_its_output_in_place() {
+    fn user_shell_row_click_gives_its_output_window_the_keys() {
         let mut s = test_state();
         three_groups(&mut s);
         s.transcript.push_user_shell_started(
@@ -3258,37 +3379,30 @@ mod disclosure_tests {
             .unwrap();
         let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
         let (line, item) = *hits.iter().find(|(_, i)| *i == shell_idx).unwrap();
-        let before = match &s.transcript.items()[item] {
-            TranscriptItem::UserShell(shell) => shell.expanded,
-            _ => panic!("user shell item expected"),
-        };
         let row = screen_row_of(&s, line);
         click(&mut s, 3, row);
         assert_eq!(
             s.active_screen,
             crate::screen::Screen::Conversation,
-            "a user shell expands inline, never on a second surface"
+            "a user shell stays inline, never on a second surface"
         );
-        let TranscriptItem::UserShell(shell) = &s.transcript.items()[item] else {
-            panic!("user shell item expected");
-        };
-        assert_eq!(shell.expanded, !before, "the click toggled THAT execution");
-        assert!(shell.expanded_pinned, "a user click pins the fold");
-        let opened = shell.expanded;
+        assert_eq!(
+            s.shell_output_focus.as_ref().map(ToString::to_string),
+            Some("ush-9".to_string()),
+            "the click focuses THAT execution's window"
+        );
         assert!(
             expanded_flags(&s).iter().all(|(_, e)| !e),
             "no tool group was toggled by the shell click"
         );
 
-        // The same row now flips the fold back.
-        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
-        let (line, _) = *hits.iter().find(|(_, i)| *i == item).unwrap();
-        let row = screen_row_of(&s, line);
-        click(&mut s, 3, row);
-        let TranscriptItem::UserShell(shell) = &s.transcript.items()[item] else {
-            panic!("user shell item expected");
-        };
-        assert_eq!(shell.expanded, !opened, "the second click toggled the fold");
+        // Esc hands the keys back without touching the record.
+        reduce(
+            &mut s,
+            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+        );
+        assert!(s.shell_output_focus.is_none(), "Esc releases the window");
+        let _ = item;
     }
 
     #[test]
@@ -3328,7 +3442,10 @@ mod disclosure_tests {
         let TranscriptItem::UserShell(shell) = &s.transcript.items()[shell_idx] else {
             panic!("shell expected");
         };
-        assert!(!shell.expanded, "stop does not toggle the record");
+        assert!(
+            shell.status == crate::transcript::UserShellStatus::Running,
+            "stop does not touch the record"
+        );
     }
 
     #[test]

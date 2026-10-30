@@ -42,7 +42,9 @@ pub enum Screen {
     Doctor,
     /// Durable runtime observatory (`/trace`).
     Trace,
-    /// Context Inspector (`/context`): what the next model request is made of.
+    /// The Context & Usage page. `/context` and `/usage` are two entry points
+    /// into this one page; neither has a body of its own. See
+    /// [`Screen::context_section`] for which section a command reveals.
     Context,
     /// `/clean`: reclaim CodeLeveler-owned local storage. A page over the host's
     /// cleanup plan; scan and cleanup run off-thread.
@@ -51,10 +53,17 @@ pub enum Screen {
     /// the page paints only the visible rows, so a 50 MiB result costs the
     /// same per frame as a 1 KiB one.
     Output,
-    /// `/memory`: project memory's home, consent queue, entries and detail.
-    /// A projection of the runtime's listing; decisions go through the
-    /// lifecycle commands, never through a local edit.
-    Memory,
+}
+
+/// Which section of the Context & Usage page an entry point reveals.
+///
+/// The page is single: `/context` and `/usage` differ only in where it starts
+/// the reader, never in what it renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatsSection {
+    #[default]
+    Context,
+    Usage,
 }
 
 /// Help / popup grouping for slash commands.
@@ -64,7 +73,7 @@ pub enum SlashCategory {
     Agent,
     /// Screens and inspection.
     View,
-    /// History, export, memory, new.
+    /// History, export, new.
     Session,
     /// Attachments.
     Input,
@@ -158,17 +167,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
-    // The full development workflow. `IdleOnly` on purpose: it runs Analyze,
-    // Coding, Verify and Review under one work order, and a second goal
-    // dropped into the middle of that would invalidate the order the Coding
-    // agent is already executing. `/goal` can be steered; this cannot.
-    slash(
-        "/develop",
-        &[],
-        SlashCategory::Agent,
-        SlashVisibility::Quick,
-        BusyPolicy::IdleOnly,
-    ),
     slash(
         "/btw",
         &[],
@@ -225,8 +223,17 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // The same page as `/context`, positioned at its Usage section. Both are
+    // read-only, so both answer while a turn runs.
     slash(
         "/context",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/usage",
         &[],
         SlashCategory::View,
         SlashVisibility::Searchable,
@@ -240,22 +247,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::Always,
     ),
     // Session
-    slash(
-        "/memory",
-        &[],
-        SlashCategory::Session,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    // The user's own direct write. `BusyPolicy::Always` because it touches no
-    // turn state: it is a control-plane command, not a message to the model.
-    slash(
-        "/remember",
-        &[],
-        SlashCategory::Session,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
     // `/rewind` is what every other agent CLI calls this.
     slash(
         "/restore",
@@ -375,6 +366,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::IdleOnly,
     ),
+    // Re-read the configured sources into the RUNNING runtime. Allowed while
+    // a turn runs: that turn keeps its generation, the next one uses the new
+    // one. Never a message to the model.
+    slash(
+        "/reload",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
 ];
 
 /// All tokens (primary + aliases) that parse as local slash commands.
@@ -443,17 +444,15 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/thinking" => s.thinking,
         "/permission" | "/mode" => s.permission,
         "/goal" => s.goal,
-        "/develop" => s.develop,
         "/btw" => s.btw,
         "/recap" => s.recap,
         "/collab" => s.collab,
         "/agents" => s.agents,
         "/skills" => s.skills,
-        "/memory" => s.memory,
-        "/remember" => s.remember,
         "/diff" => s.diff,
         "/trace" => s.trace,
         "/context" => s.context,
+        "/usage" => s.usage,
         "/sessions" => s.sessions,
         "/restore" | "/checkpoint" | "/rewind" => s.restore,
         "/fork" => s.fork,
@@ -471,6 +470,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/doctor" => s.doctor,
         "/clean" => s.clean,
         "/update" | "/upgrade" => s.update,
+        "/reload" => s.reload,
         _ => "",
     }
 }
@@ -672,7 +672,6 @@ pub fn slash_arg_ghost(text: &str, t: &UiText) -> Option<&'static str> {
     let (bare, spaced) = match primary {
         "/btw" => (g.btw, g.btw_spaced),
         "/goal" => (g.goal, g.goal_spaced),
-        "/develop" => (g.develop, g.develop_spaced),
         "/attach" => (g.path, g.path_spaced),
         _ => return None,
     };
@@ -712,6 +711,45 @@ mod surface_tests {
     }
 
     #[test]
+    fn memory_is_absent_from_parse_completion_help_and_aliases() {
+        for token in ["/memory", "/remember", "/forget", "/consolidate_memory"] {
+            assert!(!all_slash_tokens().contains(&token));
+            assert!(!super::is_known_slash_token(token));
+            assert!(super::slash_primary(token).is_none());
+            assert!(super::slash_def(token).is_none());
+            for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
+                assert!(super::slash_matches(token, locale.text()).is_empty());
+                assert!(
+                    !super::slash_commands(locale.text())
+                        .iter()
+                        .any(|(name, _)| *name == token)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remember_is_absent_from_all_completion_tokens() {
+        assert!(!all_slash_tokens().contains(&"/remember"));
+    }
+
+    /// `/develop` was removed outright. It must not survive as a completion,
+    /// a help row, or an alias that quietly starts a workflow.
+    #[test]
+    fn develop_is_absent_from_every_command_surface() {
+        let tokens = all_slash_tokens();
+        for retired in ["/develop", "/dev", "develop"] {
+            assert!(
+                !tokens.contains(&retired),
+                "{retired} is still discoverable"
+            );
+        }
+        assert!(!super::is_known_slash_token("develop"));
+        assert!(super::slash_def("/develop").is_none());
+        assert!(super::slash_primary("/develop").is_none());
+    }
+
+    #[test]
     fn registry_is_the_closed_command_surface() {
         let names: Vec<_> = SLASH_DEFS.iter().map(|d| d.name).collect();
         assert_eq!(
@@ -721,7 +759,6 @@ mod surface_tests {
                 "/permission",
                 "/thinking",
                 "/goal",
-                "/develop",
                 "/btw",
                 "/recap",
                 "/collab",
@@ -730,9 +767,8 @@ mod surface_tests {
                 "/diff",
                 "/trace",
                 "/context",
+                "/usage",
                 "/sessions",
-                "/memory",
-                "/remember",
                 "/restore",
                 "/fork",
                 "/compact",
@@ -749,6 +785,7 @@ mod surface_tests {
                 "/doctor",
                 "/clean",
                 "/update",
+                "/reload",
             ]
         );
     }
@@ -922,7 +959,6 @@ mod ghost_tests {
                 "/permission",
                 "/thinking",
                 "/goal",
-                "/develop",
                 "/btw",
                 "/recap",
                 "/collab",
@@ -938,8 +974,6 @@ mod ghost_tests {
             "/skills",
             "/trace",
             "/sessions",
-            "/memory",
-            "/remember",
             "/restore",
             "/fork",
             "/export",
@@ -1258,9 +1292,8 @@ mod reachability_tests {
             Screen::Doctor => Some("`/doctor` — toggle_screen"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
-            Screen::Context => Some("`/context` — screen_nav::open_context"),
+            Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
             Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
-            Screen::Memory => Some("`/memory` or `/memory review` — reducer/submit.rs"),
         }
     }
 
@@ -1282,7 +1315,6 @@ mod reachability_tests {
             Screen::Trace,
             Screen::Context,
             Screen::Output,
-            Screen::Memory,
         ];
         for screen in all {
             assert!(

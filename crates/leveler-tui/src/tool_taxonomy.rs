@@ -36,7 +36,6 @@ pub enum ToolKind {
     Plan,
     WebSearch,
     Skill,
-    Memory,
     Checkpoint,
     Media,
     Goal,
@@ -320,44 +319,15 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         read_only_default: true,
         visibility: ActivityVisibility::Silent,
     },
-    ToolTaxonomyEntry {
-        name: "memory",
-        kind: ToolKind::Memory,
-        presentation_en: "Memory",
-        presentation_zh: "记忆检索",
-        read_only_default: true,
-        visibility: ActivityVisibility::Silent,
-    },
-    ToolTaxonomyEntry {
-        name: "remember",
-        kind: ToolKind::Memory,
-        presentation_en: "Remember",
-        presentation_zh: "记住",
-        read_only_default: false,
-        visibility: ActivityVisibility::Important,
-    },
-    ToolTaxonomyEntry {
-        name: "forget",
-        kind: ToolKind::Memory,
-        presentation_en: "Forget",
-        presentation_zh: "遗忘",
-        read_only_default: false,
-        visibility: ActivityVisibility::Important,
-    },
-    ToolTaxonomyEntry {
-        name: "consolidate_memory",
-        kind: ToolKind::Memory,
-        presentation_en: "Consolidate Memory",
-        presentation_zh: "整理记忆",
-        read_only_default: false,
-        visibility: ActivityVisibility::Silent,
-    },
     // Virtual / injected agent tools (not always in the tool registry).
+    // A goal declaration is not delegation: `commit_task` binds the running
+    // turn to a durable goal and never creates a sub-agent. The label names the
+    // goal, and the row's state names which of the three goal outcomes happened.
     ToolTaxonomyEntry {
         name: "commit_task",
         kind: ToolKind::Goal,
-        presentation_en: "Commit Task",
-        presentation_zh: "委托任务",
+        presentation_en: "Commit goal",
+        presentation_zh: "提交目标",
         read_only_default: true,
         // The user must see that a Chat turn acquired a task that will keep
         // running; this is the visible start of the execution contract.
@@ -399,12 +369,13 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
     },
     // An accepted spawn is represented by its child block; its own call cell
     // said the same thing twice. Silent still shows a refused spawn, which has
-    // no child block.
+    // no child block. This is the only tool that delegates: `commit_task` binds
+    // a goal, it does not spawn anything.
     ToolTaxonomyEntry {
         name: "spawn_agent",
         kind: ToolKind::Other,
-        presentation_en: "Subagent",
-        presentation_zh: "子 Agent",
+        presentation_en: "Delegation",
+        presentation_zh: "委托任务",
         read_only_default: false,
         visibility: ActivityVisibility::Silent,
     },
@@ -423,15 +394,29 @@ pub fn lookup(name: &str) -> Option<&'static ToolTaxonomyEntry> {
     BUILTIN_TAXONOMY.iter().find(|e| e.name == name)
 }
 
+/// Whether a tool name is a file edit — the surface whose RESULT is a diff.
+///
+/// One owner for the question: the transcript uses it to open an edit's diff
+/// by default, and the activity stream uses it to merge a file's consecutive
+/// edits. Both must agree about what counts as an edit.
+pub fn is_edit_tool(name: &str) -> bool {
+    name == "write_file"
+        || matches!(
+            lookup(name).map(|entry| entry.kind),
+            Some(ToolKind::Edit | ToolKind::Write)
+        )
+}
+
 /// How long what a call produced deserves the screen.
 ///
 /// Ephemeral execution collapses; durable results persist. A command's output,
 /// a search's hits and a read's contents are PROCESS: they matter while the
 /// call runs, and once it settles the row keeps only its outcome. An edit's
 /// diff, a written file and a user's answer are RESULTS the user is meant to
-/// read, so they stay on screen after the call settles — bounded by a preview,
-/// never folded away. Derived from the taxonomy's kind: the one rule both the
-/// live and the replayed transcript render from.
+/// read, so they stay on screen after the call settles — the edit opens its
+/// COMPLETE diff, and only the reader's own fold reduces it (to one stat row).
+/// Derived from the taxonomy's kind: the one rule both the live and the
+/// replayed transcript render from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultLifetime {
     Transient,

@@ -4,6 +4,8 @@ mod agent_spawn;
 pub mod closeout;
 mod dispatch;
 mod drive;
+/// The user's explicit requirements and the mechanical acceptance gate.
+pub(crate) mod goal_scope;
 pub(crate) mod goal_verification;
 mod handlers;
 pub use handlers::DelegatedChildResult;
@@ -35,10 +37,6 @@ use leveler_tools::{ToolContext, ToolRegistry};
 use self::dispatch::text_of;
 use crate::coding::PostEditThroughputMode;
 use crate::coding::policy::ResolvedContextPolicy;
-use crate::memory_context::{
-    MemoryContextAssembly, MemoryContextBuilder, MemoryInjectionBudget, MemoryInjectionReceipt,
-    MemoryOmission,
-};
 use crate::nudges::first_user_text;
 use crate::prompt::{PromptBuilder, TurnContext};
 use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOTAL_AGENTS};
@@ -55,114 +53,11 @@ pub trait CompactionCheckpoint: Send + Sync {
     ) -> Result<Option<String>, PortError>;
 }
 
-/// Secondary summarization/audit requests improve quality but must never make
-/// an otherwise finished turn look hung for minutes.
-///
-/// The outcome of one turn's recall: the block to inject (if anything was
-/// selected) and the ids that made it, so the caller can emit an event without
-/// re-deriving the selection.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct MemoryInjection {
-    pub block: Option<String>,
-    pub recalled: Vec<String>,
-    /// Recall actually ran against an open store. This distinguishes "zero
-    /// hits" from "memory was not exposed / not configured" for the status
-    /// surface; only the former is a recall result.
-    pub attempted: bool,
-    /// Selected entries that were agent experience.
-    pub experience: usize,
-    pub injections: Vec<MemoryInjectionReceipt>,
-    pub omitted: Vec<MemoryOmission>,
-    pub budget: MemoryInjectionBudget,
-    pub block_digest: Option<String>,
-    pub catalog_ids: Vec<String>,
-    pub catalog_digest: Option<String>,
-    pub catalog_version: Option<u64>,
-    pub catalog_delta_ids: Vec<String>,
-    pub catalog_delta_version: Option<u64>,
-    pub degraded: Option<String>,
-}
-
-fn memory_injection_from_assembly(
-    assembly: MemoryContextAssembly,
-    catalog_ids: Vec<String>,
-    catalog_digest: Option<String>,
-    catalog_version: Option<u64>,
-    degraded: Option<String>,
-) -> MemoryInjection {
-    let experience = assembly
-        .injections
-        .iter()
-        .filter(|injection| injection.mode == "experience")
-        .count();
-    let recalled = assembly
-        .injections
-        .iter()
-        .map(|injection| injection.id.clone())
-        .collect();
-    MemoryInjection {
-        block: assembly.block,
-        recalled,
-        attempted: true,
-        experience,
-        injections: assembly.injections,
-        omitted: assembly.omitted,
-        budget: assembly.budget,
-        block_digest: assembly.block_digest,
-        catalog_ids,
-        catalog_digest,
-        catalog_version,
-        catalog_delta_ids: Vec::new(),
-        catalog_delta_version: None,
-        degraded,
-    }
-}
-
 /// Skills the user named on this turn, plus the injection text.
 /// Names come from resolution, not from scanning the rendered body.
 struct SelectedSkills {
     names: Vec<String>,
     text: String,
-}
-
-/// The same client-facing event for a facade view (expiry returns views, not
-/// entries). Still bounded: title only, never the body.
-fn memory_change_event_from_view(operation: &str, view: &leveler_memory::MemoryView) -> AgentEvent {
-    AgentEvent::MemoryChanged {
-        operation: operation.to_string(),
-        id: view.id.clone(),
-        title: view.title.chars().take(80).collect(),
-        authority: Some(view.authority.clone()),
-    }
-}
-
-/// The event for a write that became current. A write that produced no
-/// current record (pending, skipped, rejected) yields no change event.
-///
-/// The authority is read back from the store rather than inferred here: the
-/// legacy and Markdown backends name the same decision differently
-/// (`explicit_user` / `user_explicit`), and the event must report the stored
-/// fact, not this module's guess.
-fn memory_change_event_from_write(
-    service: &leveler_memory::MemoryService,
-    actor: &leveler_memory::v2::Actor,
-    outcome: &leveler_memory::WriteOutcome,
-) -> Option<AgentEvent> {
-    let (id, operation) = match outcome {
-        leveler_memory::WriteOutcome::Applied { id, operation, .. } => (id, operation.as_str()),
-        _ => return None,
-    };
-    if !matches!(operation, "created" | "updated" | "merged" | "superseded") {
-        tracing::debug!(operation, id = %id, "unknown memory write operation");
-        return None;
-    }
-    match service.read(actor, leveler_memory::ServiceScope::Project, id) {
-        Ok(view) => Some(memory_change_event_from_view(operation, &view)),
-        Err(error) => {
-            tracing::debug!(error = %error, id = %id, "written memory could not be read back");
-            None
-        }
-    }
 }
 
 /// Events emitted as the loop progresses, for the CLI to render.
@@ -391,41 +286,7 @@ pub enum AgentEvent {
     FinalizationPhaseStarted { phase: String },
     /// A generic finalization phase settled.
     FinalizationPhaseFinished { phase: String, elapsed_ms: u64 },
-    /// The per-turn memory recall selected memories and injected them into the
-    /// model context. Emitted ONLY when at least one memory was selected — a
-    /// search that found nothing is not a recall. Carries ids/counts, never
-    /// bodies, so it is safe on every surface.
-    MemoryRecalled {
-        ids: Vec<String>,
-        count: usize,
-        /// How many of `ids` were agent experience.
-        experience: usize,
-        /// One receipt per rendered line: what the builder selected and
-        /// assembled into the request. This is not transport evidence.
-        injections: Vec<MemoryInjectionReceipt>,
-        omitted: Vec<MemoryOmission>,
-        budget: MemoryInjectionBudget,
-        block_digest: Option<String>,
-        /// The catalog rendered into this run's cache-stable prefix.
-        catalog_ids: Vec<String>,
-        catalog_digest: Option<String>,
-        catalog_version: Option<u64>,
-        /// Ids announced in this turn's tail delta; empty when unchanged.
-        catalog_delta_ids: Vec<String>,
-        /// Version the tail delta brought the model's view to, when a delta
-        /// was emitted. `catalog_version` stays the prefix's version.
-        catalog_delta_version: Option<u64>,
-        degraded: Option<String>,
-    },
-    /// A durable memory was created, superseded or expired by the runtime
-    /// lifecycle. `operation` is one of `created` / `superseded` / `expired` /
-    /// `merged`. Carries the short title, not the body.
-    MemoryChanged {
-        operation: String,
-        id: String,
-        title: String,
-        authority: Option<String>,
-    },
+
     /// The HARNESS wrote a message into the model-visible conversation.
     ///
     /// This is the mechanical half of round attribution: an extra model step
@@ -502,6 +363,12 @@ impl RuntimeInjectionKind {
             Self::CloseoutNudge(closeout::CloseoutReason::GoalUnresolved) => {
                 "closeout_goal_unresolved"
             }
+            Self::CloseoutNudge(closeout::CloseoutReason::PlanUnresolved) => {
+                "closeout_plan_unresolved"
+            }
+            Self::CloseoutNudge(closeout::CloseoutReason::TaskUnregistered) => {
+                "closeout_task_unregistered"
+            }
             Self::CloseoutNudge(closeout::CloseoutReason::EmptyAnswer) => "closeout_empty_answer",
             Self::ProtocolRepair => "protocol_repair",
             Self::LengthContinuation => "length_continuation",
@@ -559,6 +426,8 @@ impl AdvisoryKind {
             AdvisoryKind::ContextCompaction => "context_compaction",
             AdvisoryKind::CloseoutNudge(reason) => match reason {
                 closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
+                closeout::CloseoutReason::PlanUnresolved => "nudge_plan_unresolved",
+                closeout::CloseoutReason::TaskUnregistered => "nudge_task_unregistered",
                 closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
             },
         }
@@ -1487,29 +1356,6 @@ pub struct Executor {
     resumed_children: Vec<crate::sub_agent::ResumableChild>,
     /// Optional host-provided objective (overrides first-user fallback).
     seeded_objective: Option<ObjectiveAnchor>,
-    /// Short memory INDEX for cache-stable system injection (titles only).
-    /// Whether memory reaches the model at all (tools, index, recall, guidance).
-    memory_expose: bool,
-    /// The runtime's own memory handle: the per-turn recall reads, the direct
-    /// `remember:` command, expiry, and parking a proposal nobody could
-    /// approve. The same service the tools write through, so there is one
-    /// lifecycle rather than a second path the runtime owns. `None` = memory
-    /// unconfigured.
-    memory: Option<Arc<leveler_memory::MemoryService>>,
-    /// Which memory lanes this project has open. Reads and the deterministic
-    /// write path consult this; a closed lane is invisible even when the pack
-    /// is exposed for the other lane.
-    memory_lanes: leveler_memory::MemoryLanes,
-    /// The one memory injection owner for this run: catalog, recall, budget
-    /// and receipts. Initialized lazily so a Legacy run pays nothing.
-    memory_context: std::sync::OnceLock<MemoryContextBuilder>,
-    /// Optional semantic memory-candidate extractor. `None` = the deterministic
-    /// fast path is the only producer, which is the pre-existing behavior.
-    ///
-    /// The extractor only PROPOSES candidates; every one still passes the
-    /// deterministic gate and the memory commit decision before anything is
-    /// written. It is held here because only the runtime may decide when a
-    /// durable fact is allowed to exist.
     /// Hard per-run limits on commands / modified files / wall-clock time,
     /// checked before each tool call (spec §27).
     step_limits: StepLimits,
@@ -1640,10 +1486,7 @@ impl Executor {
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
             seeded_objective: None,
-            memory_expose: false,
-            memory: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
-            memory_context: std::sync::OnceLock::new(),
+
             step_limits: StepLimits::default(),
             task_model_limits: StepLimits::default(),
             background_tasks: None,
@@ -1769,9 +1612,6 @@ impl Executor {
         self
     }
 
-    /// Short INDEX lines injected into the system prompt (bodies never go here).
-    /// Whether memory is exposed to the model this turn. Gates the index, the
-    /// prompt guidance and automatic recall together with the tools.
     pub fn with_capabilities(
         mut self,
         capabilities: Option<Arc<crate::capability::CapabilityDisclosure>>,
@@ -1824,11 +1664,6 @@ impl Executor {
         })
     }
 
-    pub fn with_memory_expose(mut self, expose: bool) -> Self {
-        self.memory_expose = expose;
-        self
-    }
-
     /// Read declarative agent definitions from these roots instead of the
     /// workspace project and the installed home.
     pub fn with_agent_roots(mut self, roots: crate::agent_registry::AgentRoots) -> Self {
@@ -1836,31 +1671,6 @@ impl Executor {
         self
     }
 
-    /// Install the host's configured memory service. This is the only way a
-    /// run gets memory: there is one implementation, and an unconfigured run
-    /// has no memory rather than a fallback store.
-    pub fn with_memory_service(
-        mut self,
-        service: Option<Arc<leveler_memory::MemoryService>>,
-    ) -> Self {
-        self.memory = service;
-        self
-    }
-
-    /// Restrict memory reads and writes to the project's effective lanes.
-    pub fn with_memory_lanes(mut self, lanes: leveler_memory::MemoryLanes) -> Self {
-        self.memory_lanes = lanes;
-        self
-    }
-
-    /// Install the semantic memory-candidate extractor.
-    ///
-    /// With an extractor, a turn whose user message is not already handled by
-    /// the deterministic fast path runs one bounded extraction call
-    /// concurrently with the coding turn. Its candidates are validated by the
-    /// deterministic gate and committed through the same memory commit
-    /// decision as every other producer; a failure yields no candidates and
-    /// never affects the coding turn.
     /// Set hard per-run limits on commands, modified files, and duration.
     pub fn with_step_limits(mut self, limits: StepLimits) -> Self {
         self.step_limits = limits;
@@ -2187,17 +1997,9 @@ impl Executor {
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
             seeded_objective: None,
-            memory_expose: self.memory_expose,
-            // A child's "user message" is a delegation brief, not the user's
-            // own durable statement: a child never creates project memory.
-            // A child inherits the parent's memory location: recall and
-            // parking mean the same thing at any depth.
-            memory: self.memory.clone(),
-            memory_lanes: self.memory_lanes,
-            memory_context: std::sync::OnceLock::new(),
+
             background_tasks: self.background_tasks.clone(),
-            // A child spawned after the parent's `/goal` upgrade bills the
-            // goal, not the chat window the parent started in.
+            // A child upgraded into a goal shares its parent's budget scope.
             budget_scope: self.model_budget_scope(),
             task_model_limits: self.task_model_limits,
             step_limits: StepLimits {
@@ -2393,33 +2195,6 @@ impl Executor {
             .collect()
     }
 
-    /// The one memory injection owner for this run, when a service and an open
-    /// lane make it meaningful.
-    fn memory_context_builder(&self) -> Option<&MemoryContextBuilder> {
-        if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
-            return None;
-        }
-        let service = self.memory.as_ref()?;
-        if !self.memory_lanes.any() {
-            return None;
-        }
-        Some(
-            self.memory_context
-                .get_or_init(|| MemoryContextBuilder::new(service.clone(), self.memory_lanes)),
-        )
-    }
-
-    /// Catalog lines for the cache-stable prefix. A child gets no catalog: it
-    /// inherits scope and lanes for recall, not a second stable prefix.
-    fn memory_catalog_text(&self) -> String {
-        if self.depth > 0 {
-            return String::new();
-        }
-        self.memory_context_builder()
-            .map(MemoryContextBuilder::catalog_text)
-            .unwrap_or_default()
-    }
-
     fn system_segments(&self, request: &str) -> Vec<PromptSegment> {
         let root = self
             .tool_context
@@ -2478,37 +2253,30 @@ impl Executor {
             }
             None => Vec::new(),
         };
-        let mut segments =
-            PromptBuilder::new()
-                .optional_guidance(
-                    self.capability_exposed(crate::capability::CapabilityId::Skills, true),
-                    self.capability_exposed(
-                        crate::capability::CapabilityId::MultiAgent,
-                        self.policy.allow_delegation,
-                    ),
-                    self.capability_exposed(
-                        crate::capability::CapabilityId::HostInteraction,
-                        self.policy.allow_host_input,
-                    ),
-                )
-                .commit_co_author(self.commit_co_author)
-                .turn_context(TurnContext {
-                    model: self.model.clone(),
-                    mode: self.tool_context.policy.mode(),
-                    network_scope: self.tool_context.policy.network_scope(),
-                    cwd: root.map(std::path::Path::to_path_buf),
-                    project_rules,
-                    rule_diagnostics,
-                    user_language: crate::prompt::user_language(request),
-                    repo_map: root.map(workspace_listing).unwrap_or_default(),
-                })
-                .memory_catalog(self.memory_catalog_text())
-                .memory_expose(self.capability_exposed(
-                    crate::capability::CapabilityId::Memory,
-                    self.memory_expose,
-                ))
-                .memory_lanes(self.memory_lanes)
-                .segments();
+        let mut segments = PromptBuilder::new()
+            .optional_guidance(
+                self.capability_exposed(crate::capability::CapabilityId::Skills, true),
+                self.capability_exposed(
+                    crate::capability::CapabilityId::MultiAgent,
+                    self.policy.allow_delegation,
+                ),
+                self.capability_exposed(
+                    crate::capability::CapabilityId::HostInteraction,
+                    self.policy.allow_host_input,
+                ),
+            )
+            .commit_co_author(self.commit_co_author)
+            .turn_context(TurnContext {
+                model: self.model.clone(),
+                mode: self.tool_context.policy.mode(),
+                network_scope: self.tool_context.policy.network_scope(),
+                cwd: root.map(std::path::Path::to_path_buf),
+                project_rules,
+                rule_diagnostics,
+                user_language: crate::prompt::user_language(request),
+                repo_map: root.map(workspace_listing).unwrap_or_default(),
+            })
+            .segments();
         let mut prompt = String::new();
         match self.agent_role {
             AgentRole::Explorer => prompt.push_str(
@@ -2609,28 +2377,17 @@ impl Executor {
         request: &str,
         procedure_request: &str,
         continuing: bool,
-        observer: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> ControlContext {
-        self.turn_control_context_inner(request, procedure_request, continuing, true, observer)
+        self.turn_control_context_inner(request, procedure_request, continuing)
     }
 
-    /// The control context a request of this shape will carry, computed with
-    /// the memory-maintenance side effects suppressed.
-    ///
-    /// The engine measures a resumed context BEFORE the executor that will
-    /// drive it is built, so it needs the same fixed control cost the real
-    /// request will carry, without writing to memory twice. `maintain = false`
-    /// skips only the writes; the blocks themselves are the same owner
-    /// ([`Self::turn_control_context_inner`]), so a resume's pressure figure and
-    /// a normal round's are the same arithmetic over the same inputs.
     pub(crate) fn measurement_control_context(
         &self,
         request: &str,
         procedure_request: &str,
         continuing: bool,
     ) -> ControlContext {
-        let mut sink = |_: AgentEvent| {};
-        self.turn_control_context_inner(request, procedure_request, continuing, false, &mut sink)
+        self.turn_control_context_inner(request, procedure_request, continuing)
     }
 
     fn turn_control_context_inner(
@@ -2638,8 +2395,6 @@ impl Executor {
         request: &str,
         procedure_request: &str,
         continuing: bool,
-        maintain: bool,
-        observer: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> ControlContext {
         let mut blocks = self.system_segments(request);
         if let Some(selected) = self.skill_turn_injection(procedure_request) {
@@ -2672,69 +2427,6 @@ impl Executor {
                 SegmentLifecycle::Turn,
                 false,
                 text,
-            ));
-        }
-        if maintain {
-            for event in self.maintain_memory(request) {
-                observer(event);
-            }
-        }
-        // Catalog invalidation is announced once per turn, relative to the
-        // prefix the model already has. The prefix itself is never rewritten
-        // mid-run; the delta is a request-ephemeral tail block.
-        let catalog_delta = if maintain && self.depth == 0 {
-            self.memory_context_builder()
-                .and_then(|builder| builder.catalog_delta())
-        } else {
-            None
-        };
-        // A child receives no catalog in its prefix, so it must not report
-        // one in its receipt either. Recall itself is inherited at any depth.
-        let announce_catalog = maintain && self.depth == 0;
-        let mut injection = self.relevant_memory_injection(request, announce_catalog);
-        if let Some(delta) = &catalog_delta {
-            blocks.push(PromptSegment::control(
-                "catalog_delta",
-                PromptSource::MemoryCatalog,
-                PromptAuthority::AdvisoryContext,
-                SegmentLifecycle::RequestEphemeral,
-                false,
-                delta.text.clone(),
-            ));
-            injection.catalog_delta_ids = delta.ids.clone();
-            injection.catalog_delta_version = Some(delta.version);
-        }
-        let recall_ids = injection.recalled.clone();
-        if injection.attempted {
-            // Zero is a real result. Without this event a client could not
-            // tell "recalled nothing" from "memory was never consulted".
-            observer(AgentEvent::MemoryRecalled {
-                count: injection.recalled.len(),
-                ids: injection.recalled,
-                experience: injection.experience,
-                injections: injection.injections,
-                omitted: injection.omitted,
-                budget: injection.budget,
-                block_digest: injection.block_digest,
-                catalog_ids: injection.catalog_ids,
-                catalog_digest: injection.catalog_digest,
-                catalog_version: injection.catalog_version,
-                catalog_delta_ids: injection.catalog_delta_ids,
-                catalog_delta_version: injection.catalog_delta_version,
-                degraded: injection.degraded,
-            });
-        }
-        if let Some(recall) = injection.block {
-            // The recall block changes every turn; it belongs next to the
-            // current user message, not in the leading system message whose
-            // stability is what makes the provider prefix cache work.
-            blocks.push(PromptSegment::control(
-                "memory_recall",
-                PromptSource::MemoryRecall { ids: recall_ids },
-                PromptAuthority::AdvisoryContext,
-                SegmentLifecycle::RequestEphemeral,
-                false,
-                recall,
             ));
         }
         if continuing {
@@ -2980,7 +2672,7 @@ impl Executor {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, DriveAborted> {
         let request = text_of(&content);
-        let control = self.turn_control_context(&request, &request, false, observer);
+        let control = self.turn_control_context(&request, &request, false);
         // depth 0 is a person. A child task is the parent agent's text.
         let origin = if self.depth == 0 {
             TranscriptOrigin::UserInput
@@ -3075,134 +2767,6 @@ impl Executor {
         Some(SelectedSkills { names, text })
     }
 
-    /// The memory block for THIS turn, or `None` when memory is not exposed,
-    /// unconfigured, or nothing was selected.
-    ///
-    /// Owns the whole decision: capability gate, standing selection, query
-    /// recall, derived/sensitive exclusion, dedup, ordering, the byte ceiling
-    /// and the trace. Turn assembly carries the result in ControlContext,
-    /// independently of conversation persistence and history compaction.
-    fn relevant_memory_injection(&self, request: &str, announce_catalog: bool) -> MemoryInjection {
-        if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
-            tracing::debug!(memory_exposed = false, "memory recall skipped");
-            return MemoryInjection::default();
-        }
-        if self.memory.is_none() || !self.memory_lanes.any() {
-            return MemoryInjection::default();
-        }
-        // The context builder owns the one assembly path over the derived
-        // index and the current Markdown.
-        let Some(builder) = self.memory_context_builder() else {
-            return MemoryInjection::default();
-        };
-        let assembly = builder.recall(request, &self.policy.context_policy);
-        let assembly_degraded = assembly.degraded.clone();
-        let (catalog_ids, catalog_digest, catalog_version) = if announce_catalog {
-            builder
-                .catalog_metadata()
-                .map(|(ids, digest, version)| (ids, Some(digest), Some(version)))
-                .unwrap_or_default()
-        } else {
-            (Vec::new(), None, None)
-        };
-        let mut degraded = assembly_degraded;
-        if builder.catalog_degraded() && degraded.is_none() {
-            degraded = Some("index_unavailable".into());
-        }
-        memory_injection_from_assembly(
-            assembly,
-            catalog_ids,
-            catalog_digest,
-            catalog_version,
-            degraded,
-        )
-    }
-
-    /// Run the durable-memory lifecycle for this turn's user request, returning
-    /// the structured change events a client should see.
-    ///
-    /// Only a narrow `记住：…` / `remember: …` command writes directly: the
-    /// command itself is consent, and the body is stored verbatim as an
-    /// explicit-user note. No meaning is parsed from prose here; natural
-    /// language is interpreted by the model extractor in the durable
-    /// consolidator, which supplies structured subject, scope and relations.
-    ///
-    /// Failure is never fatal to the coding turn: a memory store that cannot be
-    /// written is reported at debug level and the turn proceeds.
-    fn maintain_memory(&self, request: &str) -> Vec<AgentEvent> {
-        if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
-            return Vec::new();
-        }
-        // This is the user lane's direct-write path and preference expiry.
-        // Closing that lane stops all of it.
-        if !self.memory_lanes.user {
-            return Vec::new();
-        }
-        let Some(service) = self.memory.as_ref() else {
-            return Vec::new();
-        };
-        let mut events = Vec::new();
-        match service.expire_due(leveler_memory::ServiceScope::Project, leveler_core::now()) {
-            Ok(expired) => {
-                for view in expired {
-                    events.push(memory_change_event_from_view("expired", &view));
-                }
-            }
-            Err(error) => tracing::debug!(error = %error, "memory expiry sweep failed"),
-        }
-        // Only the top-level request is the user's own message. A child's
-        // "request" is a delegation brief written by the parent model, and a
-        // brief is never a user command however it is worded.
-        if self.depth == 0
-            && let Some(body) = leveler_memory::parse_direct_memory_command(request)
-        {
-            let title = leveler_memory::title_from_body(&body);
-            // The invocation identity belongs to this trusted in-process user
-            // command. It is not derived from model output, and the tool path
-            // cannot mint it.
-            let invocation = leveler_memory::v2::UserInvocationId::mint(format!(
-                "direct:{}:{}:{}",
-                self.tool_context.session_scope(),
-                self.tool_context.turn_scope.as_deref().unwrap_or("turn"),
-                &leveler_memory::v2::sha256_hex_text(request)[..16]
-            ));
-            // The exact parsed span is the operation's provenance: the
-            // extractor can recognise that this text is already stored
-            // instead of creating a second fact for the same words.
-            let evidence_span = body.clone();
-            let write = leveler_memory::RememberRequest {
-                op_id: leveler_memory::v2::OpId::derived("direct", invocation.as_str()),
-                scope: leveler_memory::ServiceScope::Project,
-                title,
-                body,
-                kind: "preference".to_string(),
-                subject: None,
-                value: None,
-                tags: Vec::new(),
-                evidence: Some(evidence_span),
-                expires_at: None,
-                replaces_id: None,
-            };
-            let actor = leveler_memory::v2::Actor::User { invocation };
-            match service.remember(&actor, write) {
-                Ok(outcome) => {
-                    if let Some(event) = memory_change_event_from_write(service, &actor, &outcome) {
-                        events.push(event);
-                    } else {
-                        // The user asked for this write; a rejection it is not
-                        // visible feedback for still has to be diagnosable.
-                        tracing::warn!(
-                            outcome = ?outcome,
-                            "direct memory write did not become current"
-                        );
-                    }
-                }
-                Err(error) => tracing::warn!(error = %error, "direct memory write failed"),
-            }
-        }
-        events
-    }
-
     /// Continue a conversation: seed the model with the prior transcript plus a
     /// new user message, but persist only the new message (the prior is already
     /// stored). Makes turns share context so the agent remembers earlier turns.
@@ -3251,7 +2815,7 @@ impl Executor {
             .await
             .map_err(AgentError::from)?;
 
-        let control = self.turn_control_context(&request, &request, false, observer);
+        let control = self.turn_control_context(&request, &request, false);
         let mut seed = prior;
         seed.push(user);
         let mut facts = AbortedFacts::default();
@@ -3315,7 +2879,7 @@ impl Executor {
             .or_else(|| objective.amendments.last().map(String::as_str))
             .unwrap_or(&objective.text);
         let procedure_request = format!("{}\n{request}", objective.text);
-        let control = self.turn_control_context(request, &procedure_request, true, observer);
+        let control = self.turn_control_context(request, &procedure_request, true);
         self.drive(
             prior,
             control,
@@ -4055,213 +3619,6 @@ mod ownership_authority_tests {
             .expect("empty authority must refuse");
         assert!(msg.contains("no write scope"), "{msg}");
     }
-
-    /// The Phase 3 acceptance shape on the real failed prompt: one session
-    /// holds an explicit user constraint, an ordinary model note, a relevant
-    /// verified lesson and the archived previous lesson. Recall must keep the
-    /// user's constraint, admit the lesson, and never surface the archived
-    /// identity.
-    #[test]
-    fn recall_spends_the_block_on_authority_and_relevance_together() {
-        const PYBUILD_TASK: &str = r#"What layout value does the installed pybuild in this environment accept, and what must `pybuild.config` contain for `./verify.sh` to succeed? Answer from the current environment. Do not modify any files."#;
-        fn pybuild_lesson(key: &str) -> leveler_memory::MemoryCandidate {
-            let mut candidate = leveler_memory::MemoryCandidate::new(
-                "Match pybuild layout to repository shape",
-                "When `./verify.sh` exits 1 with `error: build layout rejected`, check the repository's `pybuild.config` layout/configuration against the actual tree shape rather than editing the verify script or pybuild itself. In the observed repository the accepted configuration produced exit 0 and the receipt `pybuild: build ok (layout=flat)`, and `pybuild.config` was the only modified project file, so the actionable fix is to set or correct the layout value in that config to the layout the project actually uses.",
-                leveler_memory::CandidateKind::Free,
-                Some(key.to_string()),
-                leveler_memory::CandidateSource::RuntimeObserved,
-                vec![
-                    "experience".to_string(),
-                    "category:fix".to_string(),
-                ],
-            )
-            .unwrap();
-            candidate.experience = Some(leveler_memory::ExperienceRecord {
-                category: leveler_memory::ExperienceCategory::Fix,
-                verification: leveler_memory::ExperienceVerification::Verified,
-                applies_when: "A pybuild-based verification command fails with `error: build layout rejected` and the project owns a `pybuild.config`.".to_string(),
-                invalid_if: Some("The repository no longer uses a flat layout.".to_string()),
-                evidence: vec![
-                    leveler_memory::ExperienceEvidence {
-                        kind: "failure".to_string(),
-                        reference: "step 2: ./verify.sh (exit 1)".to_string(),
-                    },
-                    leveler_memory::ExperienceEvidence {
-                        kind: "resolution".to_string(),
-                        reference: "step 6: ./verify.sh (exit 0)".to_string(),
-                    },
-                ],
-            });
-            candidate
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let service = Arc::new(leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-                leveler_memory::v2::MemoryScope::Project,
-                dir.path().join("current"),
-                dir.path().join("state"),
-            )),
-        ));
-        let user = leveler_memory::v2::Actor::User {
-            invocation: leveler_memory::v2::UserInvocationId::mint("recall-fixture"),
-        };
-        let runtime = leveler_memory::v2::Actor::Runtime {
-            task: leveler_core::TaskId::new("recall-fixture"),
-        };
-        let constraint = service
-            .remember(
-                &user,
-                leveler_memory::RememberRequest::new(
-                    leveler_memory::v2::OpId::derived("fixture", "constraint"),
-                    leveler_memory::ServiceScope::Project,
-                    "Answer without editing",
-                    "Do not modify any files; answer from the current environment.",
-                    "note",
-                ),
-            )
-            .unwrap()
-            .applied_id()
-            .expect("constraint applied")
-            .to_string();
-        let model = leveler_memory::v2::Actor::Model {
-            session: leveler_core::SessionId::new("recall-fixture"),
-            turn: leveler_core::TurnId::new("recall-fixture"),
-            tool_call: leveler_core::ToolCallId::new("recall-fixture"),
-        };
-        let note = service
-            .admit_candidate(
-                &model,
-                leveler_memory::ServiceScope::Project,
-                &{
-                    let mut candidate = leveler_memory::MemoryCandidate::new(
-                        "pybuild layout value is version-dependent (2.x wants flat, not src)",
-                        "The accepted `layout=` value in `pybuild.config` depends on the installed pybuild major version, so the fixed value from one task can be wrong in another. Observed in this environment: pybuild 2.x rejects `layout=src` with `error: build layout rejected` and accepts only `layout=flat`, printing `pybuild: build ok (layout=flat)`.",
-                        leveler_memory::CandidateKind::Free,
-                        Some("pybuild.layout".to_string()),
-                        leveler_memory::CandidateSource::AgentProposed,
-                        vec![
-                            "pybuild".to_string(),
-                            "build-layout".to_string(),
-                            "verify.sh".to_string(),
-                        ],
-                    )
-                    .unwrap();
-                    candidate.operation = leveler_memory::CandidateOperation::Create;
-                    candidate
-                },
-                "recall-fixture-note",
-            )
-            .unwrap()
-            .applied_id()
-            .expect("note applied")
-            .to_string();
-        let archived = service
-            .admit_candidate(
-                &runtime,
-                leveler_memory::ServiceScope::Project,
-                &pybuild_lesson("experience.pybuild.layout.retired"),
-                "recall-fixture-retired",
-            )
-            .unwrap()
-            .applied_id()
-            .expect("retired lesson applied")
-            .to_string();
-        service
-            .forget(&user, leveler_memory::ServiceScope::Project, &archived)
-            .unwrap();
-        let lesson = service
-            .admit_candidate(
-                &runtime,
-                leveler_memory::ServiceScope::Project,
-                &pybuild_lesson("experience.pybuild.layout"),
-                "recall-fixture-lesson",
-            )
-            .unwrap()
-            .applied_id()
-            .expect("current lesson applied")
-            .to_string();
-        assert_ne!(lesson, archived, "the fixture needs a fresh identity");
-
-        let exec = executor()
-            .with_memory_service(Some(service))
-            .with_memory_expose(true);
-        let mut recalled = None;
-        let _ = exec.turn_control_context_inner(
-            PYBUILD_TASK,
-            PYBUILD_TASK,
-            false,
-            false,
-            &mut |event| {
-                if let AgentEvent::MemoryRecalled {
-                    ids,
-                    count,
-                    experience,
-                    ..
-                } = event
-                {
-                    recalled = Some((ids, count, experience));
-                }
-            },
-        );
-        let (ids, count, experience) = recalled.expect("recall ran");
-        assert_eq!(count, ids.len());
-        assert!(
-            ids.contains(&constraint),
-            "the user's constraint was dropped: {ids:?}"
-        );
-        assert!(
-            ids.contains(&lesson),
-            "the matching verified lesson was crowded out: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&archived),
-            "an archived lesson was recalled: {ids:?}"
-        );
-        assert_eq!(
-            experience, 1,
-            "only the current lesson is experience: {ids:?}"
-        );
-        let _ = note;
-    }
-
-    /// Zero hits is a recall result, not silence. The status surface needs it
-    /// to distinguish "nothing matched" from "memory was never consulted".
-    #[test]
-    fn a_zero_hit_recall_is_reported_as_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = Arc::new(leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-                leveler_memory::v2::MemoryScope::Project,
-                dir.path().join("current"),
-                dir.path().join("state"),
-            )),
-        ));
-        let exec = executor()
-            .with_memory_service(Some(service))
-            .with_memory_expose(true);
-        let mut recalled = Vec::new();
-        let _ = exec.turn_control_context_inner(
-            "nothing in the store matches this",
-            "nothing in the store matches this",
-            false,
-            false,
-            &mut |event| recalled.push(event),
-        );
-        assert!(
-            recalled.iter().any(|event| matches!(
-                event,
-                AgentEvent::MemoryRecalled {
-                    count: 0,
-                    ids,
-                    experience: 0,
-                    ..
-                } if ids.is_empty()
-            )),
-            "expected a zero-hit MemoryRecalled, got {recalled:?}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -4559,9 +3916,8 @@ mod request_pressure_accounting_tests {
         );
 
         // The read-only measurement path carries exactly the blocks the real
-        // turn path will (no memory store configured, so maintenance adds none).
-        let mut no_events = |_: AgentEvent| {};
-        let real = executor.turn_control_context(request, request, true, &mut no_events);
+        // turn path will.
+        let real = executor.turn_control_context(request, request, true);
         assert_eq!(
             real.blocks.len(),
             control.blocks.len(),

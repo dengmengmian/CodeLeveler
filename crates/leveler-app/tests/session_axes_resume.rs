@@ -155,10 +155,9 @@ async fn legacy_profiles_do_not_change_resume_collaboration() {
     }
 }
 
-/// A disabled project does not register memory at all, so no profile can
-/// enable it; other capability packs still start unexposed and load on demand.
+/// Available capability packs start unexposed and load on demand.
 #[tokio::test]
-async fn disabled_memory_is_not_registered_and_other_packs_enable_normally() {
+async fn capability_packs_enable_on_demand() {
     use leveler_agent::AutoClarify;
     use leveler_agent::capability::CapabilityId;
     use leveler_execution::{AutoApprove, PermissionProfile};
@@ -166,11 +165,7 @@ async fn disabled_memory_is_not_registered_and_other_packs_enable_normally() {
     isolate_global_config();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join(".leveler")).unwrap();
-    std::fs::write(
-        tmp.path().join(".leveler/config.yaml"),
-        "memory:\n  enabled: false\n",
-    )
-    .unwrap();
+    std::fs::write(tmp.path().join(".leveler/config.yaml"), "").unwrap();
     let app = Application::assemble(layout(&tmp)).unwrap();
     let engine = app
         .engine_for_session(
@@ -186,19 +181,11 @@ async fn disabled_memory_is_not_registered_and_other_packs_enable_normally() {
         .unwrap();
     assert!(
         engine.factory.registry.get("memory").is_none(),
-        "a disabled project must not register the memory tools"
+        "retired tools are absent"
     );
     assert!(engine.factory.registry.get("find_symbol").is_some());
     let state = engine.factory.capabilities.as_ref().unwrap();
     assert!(state.active().is_empty());
-    assert!(
-        state
-            .enable(CapabilityId::Memory)
-            .await
-            .unwrap_err()
-            .contains("unavailable"),
-        "disabled memory is unavailable, not merely unpermitted"
-    );
     assert!(state.enable(CapabilityId::CodeIntelligence).await.unwrap());
     assert!(state.permits_tool("find_symbol"));
     assert!(!state.permits_tool("save_agent"));

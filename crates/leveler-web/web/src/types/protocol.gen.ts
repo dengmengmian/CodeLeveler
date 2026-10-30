@@ -254,7 +254,10 @@ export type ObservationClass = 'model' | 'read' | 'search' | 'edit' | 'shell' | 
 export type PermissionProfile = 'request_approval' | 'assisted' | 'full_access';
 
 /** The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`). */
-export type PlanStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+export type PlanStepStatus =
+  | 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  /** The model removed this step from its own plan while it was still open. Not delivered (so it never counts toward a completed plan) and not open work the runtime should keep driving. Keeping it distinct from `Skipped` is what stops a removed step from being projected as a legitimate completion. */
+  | 'abandoned';
 
 /** How the route requires retained reasoning to be preserved. Orthogonal to representation: a route may never carry reasoning, carry it as an editable field, or carry it as an opaque block — and separately it either accepts a harness decision to fold/drop a retained turn, or it does not. This is the dimension the context lifecycle consults when it asks "may I cut this boundary?": it never asks "is this model DeepSeek?". */
 export type ReasoningIntegrity =
@@ -438,6 +441,8 @@ export type RuntimeEvent =
   | { type: 'turn_completed_with_warnings'; reason: string }
   /** The assistant naturally finished its answer, without claiming that an external task was independently verified as complete. */
   | { type: 'turn_answered' }
+  /** The turn ended at the user's own pause boundary. The goal still owes the work the user withheld authorization to continue; nothing failed and nothing is complete. Only the user's own continuation releases it. */
+  | { type: 'turn_paused'; reason: string }
   /** The turn stopped at an output limit even after bounded continuation. */
   | { type: 'turn_truncated'; error: string }
   /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
@@ -480,14 +485,6 @@ export type RuntimeEvent =
   | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; output?: string; stopped?: boolean; task_id: string }
   /** Authoritative replacement of a session's active background projection. Emitted after a lifecycle broadcast lag; history is unaffected. */
   | { type: 'background_tasks_reconciled'; tasks: UiActiveBackgroundTask[] }
-  /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
-  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[]; query_id?: CommandId | null }
-  /** Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`]. */
-  | { type: 'memory_status'; query_id?: CommandId | null; status: UiMemoryStatus }
-  /** The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies. */
-  | { type: 'memory_recalled'; count: number; experience_count?: number; ids: string[]; injected?: UiMemoryReference[] }
-  /** A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body. */
-  | { type: 'memory_changed'; authority?: string | null; id: string; operation: string; title: string }
   /** Side-question (`/btw`) started; not persisted to session history. */
   | { type: 'btw_started'; question: string }
   /** Side-question answer chunk (often one full answer in MVP). */
@@ -508,6 +505,10 @@ export type RuntimeEvent =
   | { type: 'context_loaded'; accounting?: ContextAccounting | null; query_id?: CommandId | null }
   /** Result of [`crate::ClientCommand::QueryObservability`]. Read-only projection of durable facts for the current or a historical session. Echoes the command's `query_id` when the peer sent one. Absent on protocol 1.5 peers — a current client must not treat that as ownership. */
   | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null }
+  /** Result of [`crate::ClientCommand::QueryUsage`]. A projection of the runtime's durable model-call ledger for one scope. Read-only: it answers while a turn runs, and it never drives a provider request. */
+  | { type: 'usage_loaded'; query_id?: CommandId | null; report: UiUsageReport }
+  /** Result of [`crate::ClientCommand::ReloadConfig`], and the notification of an automatically applied generation. `outcome` is one of `applied` / `unchanged` / `failed`. `version` is the generation now in force — the PREVIOUS one on a failure, because a failed reload keeps the last known good configuration. `changed` names the dimensions that moved (never their values, and never a credential). `deferred_to_next_turn` is true when a turn was already running: it keeps the generation it started with, and the next turn uses this one. */
+  | { type: 'config_reloaded'; changed?: string[]; deferred_to_next_turn?: boolean; error?: string | null; model?: string | null; outcome: string; provider?: string | null; query_id?: CommandId | null; restart_required?: string[]; thinking?: string | null; version: number }
   /** Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest turns in order. `omitted_turns` older turns were left out to bound the response; they are still in the session. */
   | { type: 'session_history_loaded'; entries: UiHistoryEntry[]; omitted_turns?: number; query_id?: CommandId | null; session_id: SessionId };
 
@@ -822,6 +823,8 @@ export interface UiExecutionTask {
   objective: string;
   /** A live turn is executing it. False means the work is owed but no window is running; the user can resume it. */
   running?: boolean;
+  /** The user's own stop directive is still in force: the durable `goals.user_paused_at` column, not a client-side reading of the transcript. A paused goal owes work and withholds it at the same time, which `running` alone cannot express while an unrelated turn runs. */
+  user_paused?: boolean;
 }
 
 /** A structured product failure attached to a terminal turn failure. `detail` is the raw diagnostic and belongs on disclosure only; every other field is machine semantics suitable for choosing an icon, a title, and an action without reading the message. */
@@ -934,146 +937,6 @@ export interface UiLaneAccounting {
   requests: number;
 }
 
-/** A candidate awaiting consent, with enough to decide on. Deliberately NOT [`UiMemoryEntry`]: approving something shown only as a title is not informed consent, so the body, kind and source ride along. */
-export interface UiMemoryCandidate {
-  /** The text that would be stored. Already length-bounded by the domain. */
-  body: string;
-  id: string;
-  /** Free-form label as stored (`preference`, `package_manager`, …). */
-  kind: string;
-  /** Which store is holding this pending record. Accept/reject must carry it back so a decision can never land in another scope. */
-  scope?: UiMemoryScope;
-  /** Who proposed it (`user_explicit`, `system_propose`, …). */
-  source: string;
-  title: string;
-}
-
-/** Compact durable-memory row for TUI list surfaces. */
-export interface UiMemoryEntry {
-  /** Who established this memory (`user_explicit`, `runtime_observed`, ...). This is the store's own vocabulary, not a client guess. */
-  authority?: string | null;
-  /** The stored content. A title alone cannot answer "what do I actually remember?", and the detail page must not guess it. Additive: absent on older runtimes (empty string). */
-  body?: string;
-  id: string;
-  /** What this memory is, which decides how it reaches the model. Additive: absent on older runtimes. */
-  kind?: UiMemoryKind | null;
-  /** Pinned by the person, not by a model hint. */
-  pinned?: boolean;
-  /** The revision this row was read at, so a detail page can name exactly what it is showing instead of "the current one". */
-  revision?: number | null;
-  /** Which store this row came from; part of the row's identity. */
-  scope?: UiMemoryScope;
-  /** Held back from every automatic path because it looks like a credential. Kept in the listing so the user can find and archive it. */
-  sensitive?: boolean;
-  /** The lifecycle state the store reports for this row (`active`, `pending`, `superseded`, `deprecated`). Additive: absent on older runtimes, and the page then says nothing it cannot prove. */
-  status?: string | null;
-  title: string;
-  /** When the store last changed this record (RFC 3339). */
-  updated_at?: string | null;
-}
-
-/** The outcome of one experience extraction. Counts only; `reason` is a stable skip class, never entry text or provider output. */
-export interface UiMemoryExperience {
-  accepted: number;
-  at: string;
-  created: number;
-  /** `extracted` | `skipped` */
-  outcome: string;
-  pending: number;
-  reason?: string | null;
-  rejected: number;
-  skipped: number;
-  updated: number;
-}
-
-export interface UiMemoryExtraction {
-  accepted: number;
-  at: string;
-  rejected: number;
-  skipped: number;
-  /** True when the extractor produced no candidate at all, which is different from candidates that were filtered or failed. */
-  zero_candidates: boolean;
-}
-
-export interface UiMemoryExtractionTotals {
-  accepted: number;
-  rejected: number;
-  skipped: number;
-}
-
-/** What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret. */
-export type UiMemoryKind =
-  /** Injected into every turn while active. */
-  | 'preference'
-  /** Reachable by query recall and the catalog, never auto-injected. */
-  | 'decision'
-  /** Same reach as a decision. */
-  | 'note'
-  /** Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog. */
-  | 'experience';
-
-/** One record a turn's request actually carried. */
-export interface UiMemoryReference {
-  id: string;
-  /** `standing`, `candidate` or `experience`. */
-  mode?: string | null;
-  /** Which store the record came from; `(scope, id)` is its identity. */
-  scope?: UiMemoryScope;
-  /** A bounded summary. Redacted when the record looks like a credential. */
-  title?: string | null;
-}
-
-/** The scope a memory row or decision belongs to. `(scope, id)` is the record's identity: the same id in two scopes is two independent memories. An older runtime that sends no scope predates multi-scope listings and only ever served the project store. */
-export type UiMemoryScope = 'global' | 'project' | 'local';
-
-/** Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error. */
-export interface UiMemoryStatus {
-  active: number;
-  archived: number;
-  /** Active agent experiences, split by the evidence class the runtime derived. An unverified experience is a parked hypothesis; it is never counted as verified. */
-  experience_active?: number;
-  /** Experience rows retired by supersede/expiry/forget. */
-  experience_archived?: number;
-  experience_enabled?: boolean;
-  /** Agent experience is still experimental. */
-  experience_experimental?: boolean;
-  experience_inbox_failed_retryable?: number;
-  /** The experience lane's durable queue, kept separate from the user-turn inbox so "no lesson" and "not extracted yet" are distinguishable. */
-  experience_inbox_pending?: number;
-  experience_inbox_processed?: number;
-  experience_inbox_processing?: number;
-  experience_next_retry_at?: string | null;
-  /** Experience candidates awaiting a person. */
-  experience_pending?: number;
-  experience_unverified?: number;
-  experience_verified?: number;
-  /** Sums over the retained processed window. */
-  extraction_totals: UiMemoryExtractionTotals;
-  inbox_failed_retryable: number;
-  inbox_pending: number;
-  inbox_processed: number;
-  inbox_processing: number;
-  /** Sanitized class of the oldest retry's error. */
-  last_error?: string | null;
-  /** The most recent settled experience extraction, if any. */
-  last_experience?: UiMemoryExperience | null;
-  /** The most recent completed batch, if any. */
-  last_extraction?: UiMemoryExtraction | null;
-  /** Due time of the oldest retry, when one is waiting. */
-  next_retry_at?: string | null;
-  pending: number;
-  /** Most recent retry attempt number, when one is waiting. */
-  retry_attempt?: number | null;
-  sensitive: number;
-  /** The project's effective switches. `*_enabled` is already the conjunction with `total_enabled`; an old daemon that sends no switches is read as the historical all-on state. */
-  total_enabled?: boolean;
-  /** User-lane entries only, so a client can show the two lanes separately and still account for every active/pending/archived row. */
-  user_active?: number;
-  user_archived?: number;
-  user_enabled?: boolean;
-  user_pending?: number;
-}
-
 /** A rendered message in the transcript. */
 export interface UiMessage {
   id: MessageId;
@@ -1091,6 +954,26 @@ export interface UiMessage {
 export type UiMessageKind =
   /** Written by the runtime into the model's context as a user-role turn — a child's settlement, a lost or resumed delegation — not typed by the user. Render it as a runtime notice, never as user input. */
   | 'runtime_notice';
+
+/** One provider/model's share of a report. Requests are grouped by the provider key and the model id actually sent on the wire, so switching models mid-session splits here instead of blending. */
+export interface UiModelUsage {
+  /** Subset of `input_tokens`; `None` when no row in the group recorded it. */
+  cached_input_tokens?: number | null;
+  /** Sum over the group's priced rows; `None` when none of them had a price. */
+  cost_usd_micros?: number | null;
+  input_tokens: number;
+  model: string;
+  output_tokens: number;
+  /** Rows in the group that carried a price. */
+  priced_requests: number;
+  provider: string;
+  /** Subset of `output_tokens`; `None` when no row in the group recorded it. */
+  reasoning_tokens?: number | null;
+  /** Provider calls in this group, retries included — each is a billed call. */
+  requests: number;
+  /** Calls in this group whose provider reported no usage at all. */
+  unmeasured_requests: number;
+}
 
 /** Bounded event window + related observation slices. Current and historical sessions use this same payload. */
 export interface UiObservabilityLoaded {
@@ -1384,6 +1267,48 @@ export interface UiUnfinishedGoal {
   windows_run: number;
 }
 
+/** What one scope spent, with the range the runtime resolved it to. */
+export interface UiUsageReport {
+  /** Subset of `input_tokens`, summed over rows that recorded a cache figure. `None` when no row in scope recorded one. */
+  cached_input_tokens?: number | null;
+  /** Sum over rows that carried a price. `None` when none did — the honest answer, never `$0.00`. */
+  cost_usd_micros?: number | null;
+  /** Resolved lower bound (inclusive), RFC 3339. `None` = unbounded below. */
+  from?: string | null;
+  /** When the runtime computed this report (RFC 3339). */
+  generated_at: string;
+  input_tokens: number;
+  /** Per provider/model breakdown, largest spender first. */
+  models?: UiModelUsage[];
+  output_tokens: number;
+  /** Rows whose cost is part of `cost_usd_micros`. */
+  priced_requests: number;
+  /** Subset of `output_tokens`, summed over rows that reported a breakdown. `None` when no row in scope did. */
+  reasoning_tokens?: number | null;
+  /** Calls in scope, retries included. */
+  requests: number;
+  scope: UiUsageScope;
+  /** Resolved upper bound (exclusive), RFC 3339. `None` = the report covers everything up to the moment it was generated. */
+  to?: string | null;
+  /** Calls in scope whose provider reported no usage. They are counted as requests but contribute no tokens: an absence of measurement. */
+  unmeasured_requests: number;
+}
+
+/** The window a usage report covers. The runtime — not the client — resolves a scope into an explicit `[from, to)` range and echoes it in the report, so two surfaces showing the same scope can never disagree about its boundary. */
+export type UiUsageScope =
+  /** The session's latest turn (the running one, else the last one). */
+  | 'turn'
+  /** Everything the current session ever spent. */
+  | 'session'
+  /** The caller's local calendar day. */
+  | 'today'
+  /** The caller's local day six days ago through now. */
+  | 'last7_days'
+  /** The caller's local day twenty-nine days ago through now. */
+  | 'last30_days'
+  /** Every durable call this runtime's ledger holds. */
+  | 'all';
+
 /** One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log). */
 export interface UiUserShell {
   command: string;
@@ -1420,8 +1345,6 @@ export type ClientCommand =
   | { type: 'steer_current_turn'; content: string; session_id: SessionId }
   /** Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop. */
   | { type: 'run_goal'; content: string; session_id: SessionId }
-  /** Run the Develop workflow on an explicit goal: `Analyze → Coding → Verify → Review`. Distinct from [`Self::RunGoal`] because it is a different product promise, not a different phrasing of the same one: the user is asking for the change to be investigated before it is written and read back after it is verified. An ordinary message never becomes one of these. */
-  | { type: 'run_develop'; content: string; session_id: SessionId }
   /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. The client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it. */
   | { type: 'resume_task'; content: string; session_id: SessionId }
   /** Import a file as an attachment; the runtime processes and stores it. `name` overrides the display name that would otherwise come from the file name. A terminal that answers Cmd+V on an image by writing a scratch file and pasting its path knows the file name is its own bookkeeping (`clipboard-2026-09-16-215212-CE7C9522.png`) and not something the user chose — only the client that made the gesture knows that, so only it can say so. */
@@ -1434,6 +1357,8 @@ export type ClientCommand =
   | { type: 'shutdown_when_idle'; reason: RestartReason }
   /** End this runtime NOW for a generation handover, cancelling the main turns it still owns instead of waiting for them to reach a terminal. The explicit, user-chosen escape from a handover whose drain cannot finish — a turn that will never terminate on its own. Distinct from `Quit`: this is a version handover, not a user shutdown, so it never kills background work. The caller must have settled those first; the runtime keeps waiting for them if any remain. */
   | { type: 'force_retire'; reason: RestartReason }
+  /** Re-read every configured source and apply what can be applied without a restart (the `/reload` command). Session-less by design: configuration is runtime-wide, and the answer belongs to the requester, not to one conversation. The runtime keeps executing turns on the generation they started with; only later turns see the new one. */
+  | { type: 'reload_config'; query_id?: CommandId | null }
   /** Cooperatively cancel the running turn (graceful; resumable). This is the only turn cancel the protocol offers: it asks the runtime to stop the current work window and settle the turn as resumable `interrupted`. Older 1.x clients may still put `force_cancel_current_turn` on the wire; that payload is accepted as this same command and produces the same terminal. There is no separate force-cancel capability to escalate to, so the protocol must not imply one. */
   | { type: 'cancel_current_turn'; session_id: SessionId }
   /** Cancel the logical task, not just the running turn. Distinct from [`Self::CancelCurrentTurn`]: that interrupts the current work window and leaves the task resumable, while this is the user saying the task itself is over. The runtime commits a terminal `cancelled` outcome, settles the goal, and refuses a later continuation — a `继续` must not silently reopen it. */
@@ -1458,24 +1383,6 @@ export type ClientCommand =
   | { type: 'set_product_axes'; collaboration: string; session_id: SessionId; work_profile: string }
   /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). */
   | { type: 'confirm_plan_to_goal'; content: string; session_id: SessionId }
-  /** List project durable memory (active; optional archived) for TUI/CLI. */
-  | { type: 'list_memory'; include_archived?: boolean; query_id?: CommandId | null; session_id: SessionId }
-  /** Project memory health (store counts + durable extraction queue). */
-  | { type: 'memory_status'; query_id?: CommandId | null; session_id: SessionId }
-  /** Pin or unpin one active memory. A user pin is a standing constraint: it is recalled first and is never crowded out by a weak candidate. A model pin is only a ranking hint, which is why this command exists only on the user's surface. */
-  | { type: 'set_memory_pin'; id: string; pinned: boolean; scope?: UiMemoryScope; session_id: SessionId }
-  /** Retire one active memory as no longer true (`deprecated`), keeping its history. Distinct from [`Self::ForgetMemory`], which removes the record from every read path. */
-  | { type: 'deprecate_memory'; id: string; revision: number; scope?: UiMemoryScope; session_id: SessionId }
-  /** Rewrite the title and body of one active memory the user is looking at. `revision` is the revision the page opened: a mismatch is a conflict the user has to resolve, never a silent overwrite of a newer record. The user's own edit IS the authority, so this command is minted by a client surface; the model edits through `memory.update` and its own admission path instead. */
-  | { type: 'update_memory'; body: string; id: string; revision: number; scope?: UiMemoryScope; session_id: SessionId; title: string }
-  /** Archive (forget) one active memory id — user-authoritative (no model). */
-  | { type: 'forget_memory'; id: string; scope?: UiMemoryScope; session_id: SessionId }
-  /** Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable. */
-  | { type: 'accept_memory'; id: string; scope?: UiMemoryScope; session_id: SessionId }
-  /** Decline one pending candidate and suppress the same signal from being re-proposed. Distinct from [`Self::ForgetMemory`], which archives an ACTIVE entry: sending a pending id to forget did nothing at all, which is what the Web "忽略" button was doing. */
-  | { type: 'reject_memory'; id: string; scope?: UiMemoryScope; session_id: SessionId }
-  /** Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose. */
-  | { type: 'remember_memory'; body: string; kind?: UiMemoryKind | null; scope?: UiMemoryScope; session_id: SessionId }
   /** Recompute and return the working-tree diff. */
   | { type: 'request_diff'; query_id?: CommandId | null; session_id: SessionId }
   /** Summarize and compact the conversation history (spec §28, §53). */
@@ -1519,6 +1426,8 @@ export type ClientCommand =
   | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
   /** Read-only context-accounting query. Does not mutate the runtime or the conversation. Answers with [`crate::RuntimeEvent::ContextLoaded`]. */
   | { type: 'query_context'; query_id?: CommandId | null; session_id: SessionId }
+  /** Read-only usage query over the runtime's durable model-call ledger. Read-only in the strictest sense: it opens no turn, sends no provider request, and mutates nothing. Answers with [`crate::RuntimeEvent::UsageLoaded`]. A client may issue it while a turn runs; the numbers come from rows that already settled. */
+  | { type: 'query_usage'; query_id?: CommandId | null; scope: UiUsageScope; session_id: SessionId; utc_offset_minutes: number }
   /** Load one child's findings for the Contribution Inspector. A query, not a subscription: findings live in the ledger, and pushing them through the event stream would duplicate the record and re-grow the payloads the event pipeline was trimmed of. The client asks when the user opens a detail view. */
   | { type: 'query_child_contribution'; child_id: string; query_id?: CommandId | null; session_id: SessionId }
   /** Cut a durable goal checkpoint for the session's current goal and surface it as a Recap (long-goal P3, `/recap`). This is NOT "summarize the visible transcript": the runtime projects authoritative facts (event log, evidence ledger, goal row) into a persisted GoalCheckpoint and answers with [`crate::RuntimeEvent::GoalRecapCreated`]. Idempotent at the same event boundary — a transport retry returns the same checkpoint. */

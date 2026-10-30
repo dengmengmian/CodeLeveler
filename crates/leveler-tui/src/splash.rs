@@ -1,33 +1,17 @@
-//! Conversation empty-state: a terminal-native brand hero card.
-//!
-//! Shown only while Conversation has no real work. First real message hides
-//! it. Copy comes from [`UiText`]; the Level Mark comes from [`crate::brand`].
+//! Conversation welcome card. Rendering and menu hit-testing share one layout.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::brand::{BrandMarkSize, BrandStyles, level_mark, level_mark_width, paint_mark_row};
-use crate::i18n::UiText;
+use crate::i18n::{Locale, UiText};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::transcript::TranscriptItem;
 
-/// First-run entries only. Not a catalog — `/` and `$` still list the rest.
-const TIP_COMMANDS: &[&str] = &["/develop", "/model", "/help"];
-
-const CTA_CARET: &str = "› ";
-const WORDMARK: &str = "CodeLeveler";
-
-const PREFERRED_BOX_W: usize = 80;
-const PREFERRED_BOX_H: usize = 16;
-const MIN_BOX_W: usize = 56;
-const MAX_BOX_W: usize = 86;
-const WIDE_H_MARGIN: usize = 4;
-const NARROW_H_MARGIN: usize = 2;
-const INNER_PAD_X: usize = 2;
-const WIDE_GAP: usize = 5;
-const WIDE_CONTENT_W: usize = 42;
+mod native;
+pub(crate) use native::NativeMascot;
 
 /// Whether Conversation is still empty of real turns (welcome/btw ignored).
 pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
@@ -41,7 +25,6 @@ pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
                 | TranscriptItem::Completion(_)
                 | TranscriptItem::Error(_)
                 | TranscriptItem::Note(_)
-                | TranscriptItem::MemoryList(_)
                 | TranscriptItem::AwaySummary(_)
                 | TranscriptItem::TurnEnd(_)
                 | TranscriptItem::UserShell(_)
@@ -54,7 +37,55 @@ pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
     })
 }
 
-/// Splash lines for the empty Conversation viewport.
+const TIP_COMMANDS: [&str; 4] = ["/goal", "/diff", "/context", "/theme"];
+
+pub(crate) fn tip_index(seed: u64) -> usize {
+    (seed % TIP_COMMANDS.len() as u64) as usize
+}
+
+fn tip(state: &AppState) -> (&'static str, &'static str) {
+    let index = state.welcome_tip % TIP_COMMANDS.len();
+    let descriptions = match state.locale {
+        Locale::Zh => [
+            "围绕一个目标，让执行与验收可追溯。",
+            "查看当前项目的代码差异。",
+            "查看上下文占用与用量统计。",
+            "切换适合当前终端的配色。",
+        ],
+        Locale::En => [
+            "Drive one explicit goal to a verifiable finish.",
+            "Review code changes in this project.",
+            "Inspect context usage and token statistics.",
+            "Switch the terminal's color theme.",
+        ],
+    };
+    (TIP_COMMANDS[index], descriptions[index])
+}
+
+pub(crate) fn action_command(index: usize) -> Option<&'static str> {
+    ["sessions", "help", "model"].get(index).copied()
+}
+
+fn action_label(locale: Locale, index: usize) -> &'static str {
+    match locale {
+        Locale::Zh => ["历史会话", "查看帮助", "选择模型"][index],
+        Locale::En => ["Session history", "View help", "Select model"][index],
+    }
+}
+
+struct MenuHit {
+    row: usize,
+    start: usize,
+    end: usize,
+    index: usize,
+}
+
+struct WelcomeLayout {
+    lines: Vec<Line<'static>>,
+    actions: Vec<MenuHit>,
+    image: Option<ratatui::layout::Rect>,
+}
+
 pub(crate) fn splash_lines(
     state: &AppState,
     width: usize,
@@ -62,441 +93,430 @@ pub(crate) fn splash_lines(
     theme: &Theme,
     t: &UiText,
 ) -> Vec<Line<'static>> {
-    let width = width.max(16);
-    let height = height.max(1);
-    let sty = SplashStyle::from_theme(theme);
+    layout(state, width, height, theme, t).lines
+}
 
-    let version_s = state.version();
-    let brand_text = format!("{WORDMARK}  v{version_s}");
-    let name_col = command_name_col();
-    let extras = untrusted_extras(state, t);
-    let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
-    let right_needed = content_width(t, &brand_text, name_col, &extra_refs);
-
-    let mode = layout_mode(width, height);
-    if matches!(mode, Mode::Stack) {
-        return fallback_stack(&brand_text, t, name_col, width, &sty);
+/// Coordinates are absolute conversation coordinates from the shared viewport mapper.
+pub(crate) fn action_at(
+    state: &AppState,
+    width: usize,
+    height: usize,
+    row: usize,
+    col: usize,
+) -> Option<usize> {
+    if !conversation_is_empty(state) {
+        return None;
     }
+    layout(state, width, height, &state.theme, state.t())
+        .actions
+        .iter()
+        .find(|hit| hit.row == row && (hit.start..hit.end).contains(&col))
+        .map(|hit| hit.index)
+}
 
-    let h_margin = match mode {
-        Mode::Wide => WIDE_H_MARGIN,
-        Mode::Medium | Mode::Narrow | Mode::Stack => NARROW_H_MARGIN,
+fn layout(
+    state: &AppState,
+    width: usize,
+    height: usize,
+    theme: &Theme,
+    t: &UiText,
+) -> WelcomeLayout {
+    let width = width.max(1);
+    let bordered = width >= 40 && height >= 12;
+    let card_w = width.saturating_sub(if bordered { 2 } else { 0 }).min(86);
+    let left = (width - card_w) / 2;
+    let inset = if bordered { 3 } else { 0 };
+    let inner = card_w.saturating_sub(inset * 2).max(1);
+    let style = Style::default().fg(theme.text.primary);
+    let muted = Style::default().fg(theme.text.muted);
+    let accent = Style::default().fg(theme.accent.primary);
+    let strong = accent.add_modifier(Modifier::BOLD);
+    let zh = state.locale == Locale::Zh;
+    let tagline = if zh {
+        "让每个模型发挥最大能力"
+    } else {
+        "Let every model reach its full potential"
     };
-    let gap = match mode {
-        Mode::Wide => WIDE_GAP,
-        Mode::Medium => 2,
-        Mode::Narrow | Mode::Stack => 2,
+    let ready = if zh {
+        "准备就绪，描述你的目标即可开始"
+    } else {
+        "Ready. Describe your goal to get started."
     };
-    let mark_size = match mode {
-        Mode::Wide => Some(BrandMarkSize::Master),
-        Mode::Medium => Some(BrandMarkSize::Compact),
-        Mode::Narrow => Some(BrandMarkSize::Micro),
-        Mode::Stack => None,
+    let mut body = Vec::<Vec<Span<'static>>>::new();
+    let mut menu_rows = Vec::new();
+    let columns = inner >= 66;
+    let right_w = if columns { 34.min(inner / 2) } else { inner };
+    let left_w = if columns { inner - right_w - 2 } else { inner };
+    let menu_x = if columns { left_w + 2 } else { 0 };
+    let lower_rows = if columns {
+        3
+    } else if height >= 16 {
+        6
+    } else {
+        5
     };
 
-    let chrome = 2 + INNER_PAD_X * 2;
-    let mut box_w = PREFERRED_BOX_W
-        .min(width.saturating_sub(h_margin))
-        .clamp(MIN_BOX_W.min(width.saturating_sub(h_margin)), MAX_BOX_W);
-    box_w = box_w.min(width.saturating_sub(h_margin));
-    if box_w < 20 {
-        return fallback_stack(&brand_text, t, name_col, width, &sty);
+    // Keep navigation available before spending vertical space on illustration.
+    let hero_h = if bordered {
+        height.saturating_sub(10).clamp(3, 14)
+    } else {
+        0
+    };
+    let mascot_w = (hero_h * 20 / 7).min(22).min(inner.saturating_sub(34));
+    let mascot_h = (mascot_w * 7 / 20).min(hero_h);
+    let use_mascot = state.welcome_image.is_some()
+        && !theme.monochrome
+        && state.surface == crate::btw::SurfaceFocus::Main
+        && state.history_search.is_none()
+        && state.update.is_none()
+        && state.overlay.is_none()
+        && height >= 16
+        && mascot_h >= 5
+        && mascot_w >= 16;
+    let mark_size = if inner >= 58 {
+        BrandMarkSize::Master
+    } else if inner >= 46 {
+        BrandMarkSize::Compact
+    } else {
+        BrandMarkSize::Micro
+    };
+    let mark_rows = level_mark(mark_size);
+    let mark_w = level_mark_width(mark_size);
+
+    let mut show_mark = !use_mascot && bordered && inner >= mark_w + 28;
+    let hero_for = |show_mark: bool| {
+        if use_mascot {
+            mascot_h
+        } else if show_mark {
+            mark_rows.len().max(5)
+        } else if height < 12 {
+            3
+        } else {
+            4
+        }
+    };
+    // Vertical budget. The card is sized to the viewport the caller published
+    // (the conversation's content rect), and it must fit it: printing more rows
+    // than that pushes the card's own notice below the fold, where a first
+    // frame never shows it. Spacing is presentation, so it goes first;
+    // the navigation and the untrusted-repository block
+    // are content and are never dropped.
+    let mut spacer_after_hero = bordered && height >= 16;
+    let mut untrusted_blank = !state.untrusted_config.is_empty();
+    let untrusted_content = if state.untrusted_config.is_empty() {
+        0
+    } else {
+        1 + state.untrusted_config.len() + 1
+    };
+    let planned_rows = |hero_rows: usize, spacer: bool, blank: bool| {
+        hero_rows
+            + usize::from(spacer)
+            + 1 // rule
+            + lower_rows
+            + untrusted_content
+            + usize::from(blank)
+            + usize::from(bordered) * 2
+    };
+    while planned_rows(hero_for(show_mark), spacer_after_hero, untrusted_blank) > height {
+        if spacer_after_hero {
+            spacer_after_hero = false;
+        } else if untrusted_blank {
+            untrusted_blank = false;
+        } else if show_mark {
+            // The illustration is decoration; the notice is not.
+            show_mark = false;
+        } else {
+            // Nothing droppable is left: the content genuinely needs more room
+            // than the viewport offers, and the reader scrolls.
+            break;
+        }
     }
-
-    let inner = box_w.saturating_sub(2);
-    let content_budget = inner.saturating_sub(INNER_PAD_X * 2);
-
-    // Wordmark always beats the graphic. Hide the mark when it would clip copy.
-    let mark_size = mark_size.filter(|size| {
-        let mark_w = level_mark_width(*size);
-        mark_w + gap + right_needed <= content_budget
-    });
-    let (mark_rows, mark_w) = match mark_size {
-        Some(size) => (level_mark(size), level_mark_width(size)),
-        None => (&[] as &[_], 0),
+    let art_w = if use_mascot {
+        mascot_w
+    } else if show_mark {
+        mark_w
+    } else {
+        0
     };
-
-    let inner_needed = mark_w.saturating_add(gap).saturating_add(right_needed);
-    box_w = box_w.max((inner_needed + chrome).min(MAX_BOX_W));
-    box_w = box_w.min(width.saturating_sub(h_margin));
-    if box_w < 20 {
-        return fallback_stack(&brand_text, t, name_col, width, &sty);
+    let gap = if art_w > 0 { 4 } else { 0 };
+    let text_w = inner.saturating_sub(art_w + gap);
+    let hero_rows = hero_for(show_mark);
+    let text_top = hero_rows.saturating_sub(5) / 2;
+    for row in 0..hero_rows {
+        let mut spans = if show_mark {
+            mark_rows
+                .get(row)
+                .map(|r| paint_mark_row(r, BrandStyles::from_theme(theme)))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let used: usize = spans.iter().map(|s| disp_w(s.content.as_ref())).sum();
+        if art_w > 0 {
+            spans.push(Span::raw(" ".repeat(art_w.saturating_sub(used) + gap)));
+        }
+        let text_row = row.checked_sub(text_top);
+        let text = match text_row {
+            Some(0) => vec![
+                Span::styled(truncate_w("CodeLeveler", text_w), strong),
+                Span::styled(
+                    truncate_w(
+                        &format!("  v{}", state.version()),
+                        text_w.saturating_sub(11),
+                    ),
+                    muted,
+                ),
+            ],
+            Some(1) => vec![Span::styled(truncate_w(tagline, text_w), style)],
+            Some(2) if hero_rows == 3 => vec![Span::styled(truncate_w(ready, text_w), muted)],
+            Some(3) => vec![Span::styled(truncate_w(ready, text_w), muted)],
+            _ => Vec::new(),
+        };
+        spans.extend(text);
+        body.push(spans);
     }
-
-    let inner = box_w.saturating_sub(2);
-    let content_budget = inner.saturating_sub(INNER_PAD_X * 2);
-    let content_w = hero_content_width(mode, right_needed, content_budget, mark_w, gap);
-    let group_w = mark_w + if mark_w > 0 { gap } else { 0 } + content_w;
-    let group_left = content_budget.saturating_sub(group_w) / 2;
-    let box_left_pad = width.saturating_sub(box_w) / 2;
-    let show_section_gap = height >= 14;
-
-    let mut right: Vec<Vec<Span<'static>>> = Vec::new();
-    right.push(vec![
-        Span::styled(WORDMARK.to_string(), sty.brand),
-        Span::styled(format!("  v{version_s}"), sty.version),
-    ]);
-    right.push(vec![Span::styled(
-        truncate_w(t.splash_tagline, content_w),
-        sty.tagline,
+    if spacer_after_hero {
+        body.push(Vec::new());
+    }
+    body.push(vec![Span::styled(
+        "─".repeat(inner),
+        Style::default().fg(theme.border.subtle),
     )]);
-    if show_section_gap {
-        right.push(Vec::new());
+    let (command, description) = tip(state);
+    let tip_title = format!("{} {command}", if zh { "试试" } else { "Try" });
+    let menu_spans = |index: usize| {
+        let suffix = if right_w >= 20 {
+            format!("Alt+{}", index + 1)
+        } else {
+            String::new()
+        };
+        let prefix = truncate_w("› ", right_w);
+        let label_w = right_w.saturating_sub(disp_w(&suffix) + disp_w(&prefix));
+        vec![
+            Span::styled(prefix, accent),
+            Span::styled(
+                crate::render::pad_to_width(
+                    &truncate_w(action_label(state.locale, index), label_w),
+                    label_w,
+                ),
+                style,
+            ),
+            Span::styled(suffix, muted),
+        ]
+    };
+    if columns {
+        for row in 0..3 {
+            let mut spans = match row {
+                0 => vec![Span::styled(
+                    truncate_w(&tip_title, left_w),
+                    Style::default()
+                        .fg(theme.status.warning)
+                        .add_modifier(Modifier::BOLD),
+                )],
+                1 => vec![Span::styled(truncate_w(description, left_w), muted)],
+                _ => Vec::new(),
+            };
+            let used: usize = spans.iter().map(|span| disp_w(&span.content)).sum();
+            spans.push(Span::raw(" ".repeat(left_w.saturating_sub(used) + 2)));
+            menu_rows.push((body.len(), row));
+            spans.extend(menu_spans(row));
+            body.push(spans);
+        }
+    } else {
+        body.push(vec![Span::styled(
+            truncate_w(&tip_title, left_w),
+            Style::default()
+                .fg(theme.status.warning)
+                .add_modifier(Modifier::BOLD),
+        )]);
+        body.push(vec![Span::styled(truncate_w(description, left_w), muted)]);
+        if height >= 16 {
+            body.push(Vec::new());
+        }
+        for index in 0..3 {
+            menu_rows.push((body.len(), index));
+            body.push(menu_spans(index));
+        }
     }
-    right.push(cta_spans(t, content_w, &sty));
-    if show_section_gap {
-        right.push(Vec::new());
-    }
-    for name in TIP_COMMANDS {
-        let label = tip_label(name, t);
-        let label = truncate_w(label, content_w.saturating_sub(name_col));
-        right.push(vec![
-            Span::styled(pad_to(name, name_col), sty.cmd),
-            Span::styled(label, sty.desc),
-        ]);
-    }
-    if show_section_gap {
-        right.push(Vec::new());
-    }
-    right.push(more_spans(t.splash_more_commands, content_w, &sty));
-
     if !state.untrusted_config.is_empty() {
-        let warn = Style::default().fg(theme.status.warning);
-        right.push(Vec::new());
-        right.push(vec![Span::styled(
-            truncate_w(&format!("⚠ {}", t.untrusted_config_title), content_w),
-            warn,
+        if untrusted_blank {
+            body.push(Vec::new());
+        }
+        body.push(vec![Span::styled(
+            truncate_w(&format!("⚠ {}", t.untrusted_config_title), inner),
+            Style::default().fg(theme.status.warning),
         )]);
         for path in &state.untrusted_config {
-            right.push(vec![Span::styled(
-                truncate_w(&format!("  {path}"), content_w),
-                sty.muted,
-            )]);
+            body.push(vec![Span::styled(truncate_w(path, inner), muted)]);
         }
-        right.push(vec![Span::styled(
-            truncate_w(t.untrusted_config_hint, content_w),
-            sty.muted,
+        body.push(vec![Span::styled(
+            truncate_w(t.untrusted_config_hint, inner),
+            muted,
         )]);
     }
-
-    let body_rows = right.len().max(mark_rows.len());
-    while right.len() < body_rows {
-        right.push(Vec::new());
-    }
-
-    let mut body = Vec::new();
-    for (i, right_spans) in right.into_iter().enumerate() {
-        let mark_spans = mark_rows
-            .get(i)
-            .map(|row| paint_mark_row(row, sty.mark))
-            .unwrap_or_default();
-        body.push(hero_row(
-            mark_spans,
-            mark_w,
-            gap,
-            right_spans,
-            content_w,
-            group_left,
-            box_left_pad,
-            box_w,
-            &sty,
-        ));
-    }
-
-    let min_h = body.len() + 2;
-    let box_h = PREFERRED_BOX_H.min(height.max(min_h)).max(min_h);
-    let extra = box_h.saturating_sub(2).saturating_sub(body.len());
-    let vpad_top = extra / 2;
-    let vpad_bot = extra - vpad_top;
-
-    let mut out = Vec::new();
-    out.push(border_line("╭", "╮", box_w, box_left_pad, sty.border));
-    for _ in 0..vpad_top {
-        out.push(blank_row(box_w, box_left_pad, sty.border));
-    }
-    out.extend(body);
-    for _ in 0..vpad_bot {
-        out.push(blank_row(box_w, box_left_pad, sty.border));
-    }
-    out.push(border_line("╰", "╯", box_w, box_left_pad, sty.border));
-    out
-}
-
-fn hero_content_width(
-    mode: Mode,
-    needed: usize,
-    budget: usize,
-    mark_w: usize,
-    gap: usize,
-) -> usize {
-    let reserved = mark_w + if mark_w > 0 { gap } else { 0 };
-    let max_fit = budget.saturating_sub(reserved);
-    if max_fit == 0 {
-        return 0;
-    }
-    match mode {
-        Mode::Wide => WIDE_CONTENT_W.min(max_fit),
-        Mode::Medium | Mode::Narrow | Mode::Stack => needed.min(max_fit),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Mode {
-    Wide,
-    Medium,
-    Narrow,
-    Stack,
-}
-
-fn layout_mode(width: usize, height: usize) -> Mode {
-    if height < 10 || width < 40 {
-        Mode::Stack
-    } else if width >= 72 && height >= 14 {
-        Mode::Wide
-    } else if width >= 56 {
-        Mode::Medium
-    } else {
-        Mode::Narrow
-    }
-}
-
-fn cta_spans(t: &UiText, right_w: usize, sty: &SplashStyle) -> Vec<Span<'static>> {
-    let caret_w = disp_w(CTA_CARET);
-    let text = truncate_w(t.splash_start_task, right_w.saturating_sub(caret_w));
-    vec![
-        Span::styled(CTA_CARET.to_string(), sty.caret),
-        Span::styled(text, sty.cta),
-    ]
-}
-
-fn more_spans(text: &str, right_w: usize, sty: &SplashStyle) -> Vec<Span<'static>> {
-    let clipped = truncate_w(text, right_w);
-    if let Some(i) = clipped.find('/') {
-        vec![
-            Span::styled(clipped[..i].to_string(), sty.muted),
-            Span::styled("/".to_string(), sty.caret),
-            Span::styled(clipped[i + 1..].to_string(), sty.muted),
-        ]
-    } else {
-        vec![Span::styled(clipped, sty.muted)]
-    }
-}
-
-fn untrusted_extras(state: &AppState, t: &UiText) -> Vec<String> {
-    if state.untrusted_config.is_empty() {
-        return Vec::new();
-    }
-    let mut extras = vec![format!("⚠ {}", t.untrusted_config_title)];
-    extras.extend(state.untrusted_config.iter().map(|p| format!("  {p}")));
-    extras.push(t.untrusted_config_hint.to_string());
-    extras
-}
-
-struct SplashStyle {
-    brand: Style,
-    version: Style,
-    tagline: Style,
-    caret: Style,
-    cta: Style,
-    muted: Style,
-    cmd: Style,
-    desc: Style,
-    border: Style,
-    mark: BrandStyles,
-}
-
-impl SplashStyle {
-    fn from_theme(theme: &Theme) -> Self {
-        Self {
-            brand: Style::default()
-                .fg(theme.accent.primary)
-                .add_modifier(Modifier::BOLD),
-            version: Style::default().fg(theme.text.muted),
-            tagline: Style::default().fg(theme.text.secondary),
-            caret: Style::default().fg(theme.accent.primary),
-            cta: Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD),
-            muted: Style::default().fg(theme.text.muted),
-            cmd: Style::default().fg(theme.accent.primary),
-            desc: Style::default().fg(theme.text.secondary),
-            border: Style::default().fg(theme.border.subtle),
-            mark: BrandStyles::from_theme(theme),
-        }
-    }
-}
-
-fn tip_label(name: &str, t: &UiText) -> &'static str {
-    crate::screen::slash_popup_label(name, t)
-}
-
-fn command_name_col() -> usize {
-    TIP_COMMANDS
-        .iter()
-        .map(|n| disp_w(n))
-        .max()
-        .unwrap_or(0)
-        .saturating_add(3)
-}
-
-fn content_width(t: &UiText, brand_text: &str, name_col: usize, extras: &[&str]) -> usize {
-    let mut w = disp_w(brand_text);
-    w = w.max(disp_w(t.splash_tagline));
-    w = w.max(disp_w(CTA_CARET) + disp_w(t.splash_start_task));
-    w = w.max(disp_w(t.splash_more_commands));
-    for name in TIP_COMMANDS {
-        let label = tip_label(name, t);
-        w = w.max(name_col + disp_w(label));
-    }
-    for extra in extras {
-        w = w.max(disp_w(extra));
-    }
-    w
-}
-
-fn hero_row(
-    mark: Vec<Span<'static>>,
-    mark_w: usize,
-    gap: usize,
-    content_spans: Vec<Span<'static>>,
-    content_w: usize,
-    group_left: usize,
-    box_left_pad: usize,
-    box_w: usize,
-    sty: &SplashStyle,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    if box_left_pad > 0 {
-        spans.push(Span::raw(" ".repeat(box_left_pad)));
-    }
-    spans.push(Span::styled("│".to_string(), sty.border));
-    spans.push(Span::raw(" ".repeat(INNER_PAD_X)));
-    if group_left > 0 {
-        spans.push(Span::raw(" ".repeat(group_left)));
-    }
-
-    let mut used_m = 0usize;
-    for s in mark {
-        used_m += disp_w(s.content.as_ref());
-        spans.push(s);
-    }
-    if mark_w > used_m {
-        spans.push(Span::raw(" ".repeat(mark_w - used_m)));
-    }
-    if mark_w > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-    }
-
-    let mut used = 0usize;
-    for s in content_spans {
-        used += disp_w(s.content.as_ref());
-        spans.push(s);
-    }
-    if content_w > used {
-        spans.push(Span::raw(" ".repeat(content_w - used)));
-    }
-
-    let used_inner = INNER_PAD_X
-        + group_left
-        + mark_w
-        + if mark_w > 0 { gap } else { 0 }
-        + content_w
-        + INNER_PAD_X;
-    let inner = box_w.saturating_sub(2);
-    if inner > used_inner {
-        spans.push(Span::raw(" ".repeat(inner - used_inner)));
-    }
-    spans.push(Span::raw(" ".repeat(INNER_PAD_X)));
-    spans.push(Span::styled("│".to_string(), sty.border));
-    Line::from(spans)
-}
-
-fn blank_row(box_w: usize, left_pad: usize, border: Style) -> Line<'static> {
-    let inner = box_w.saturating_sub(2);
-    let mut spans = Vec::new();
-    if left_pad > 0 {
-        spans.push(Span::raw(" ".repeat(left_pad)));
-    }
-    spans.push(Span::styled("│".to_string(), border));
-    spans.push(Span::raw(" ".repeat(inner)));
-    spans.push(Span::styled("│".to_string(), border));
-    Line::from(spans)
-}
-
-fn border_line(
-    left: &str,
-    right: &str,
-    box_w: usize,
-    left_pad: usize,
-    border: Style,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    if left_pad > 0 {
-        spans.push(Span::raw(" ".repeat(left_pad)));
-    }
-    let bar = format!("{left}{}{right}", "─".repeat(box_w.saturating_sub(2)));
-    spans.push(Span::styled(bar, border));
-    Line::from(spans)
-}
-
-fn fallback_stack(
-    brand_text: &str,
-    t: &UiText,
-    name_col: usize,
-    width: usize,
-    sty: &SplashStyle,
-) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    out.push(Line::from(Span::styled(
-        truncate_w(brand_text, width),
-        sty.brand,
-    )));
-    out.push(Line::from(Span::styled(
-        truncate_w(t.splash_tagline, width),
-        sty.tagline,
-    )));
-    out.push(Line::from(cta_spans(t, width, sty)));
-    for name in TIP_COMMANDS {
-        let label = tip_label(name, t);
-        let label = truncate_w(label, width.saturating_sub(name_col));
-        out.push(Line::from(vec![
-            Span::styled(pad_to(name, name_col.min(width)), sty.cmd),
-            Span::styled(label, sty.desc),
+    let mut lines = Vec::new();
+    let mut actions = Vec::new();
+    if bordered {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(left)),
+            Span::styled(
+                format!("╭{}╮", "─".repeat(card_w - 2)),
+                Style::default().fg(theme.border.subtle),
+            ),
         ]));
     }
-    out.push(Line::from(more_spans(t.splash_more_commands, width, sty)));
-    out
+    let offset = lines.len();
+    for (row, content) in body.into_iter().enumerate() {
+        let used: usize = content.iter().map(|s| disp_w(s.content.as_ref())).sum();
+        let mut spans = vec![Span::raw(" ".repeat(left))];
+        if bordered {
+            spans.push(Span::styled("│", Style::default().fg(theme.border.subtle)));
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(content);
+        if bordered {
+            spans.push(Span::raw(" ".repeat(inner.saturating_sub(used) + 2)));
+            spans.push(Span::styled("│", Style::default().fg(theme.border.subtle)));
+        }
+        lines.push(Line::from(spans));
+        if let Some((_, index)) = menu_rows.iter().find(|(menu_row, _)| *menu_row == row) {
+            actions.push(MenuHit {
+                row: row + offset,
+                start: left + inset + menu_x,
+                end: left + inset + menu_x + right_w,
+                index: *index,
+            });
+        }
+    }
+    if bordered {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(left)),
+            Span::styled(
+                format!("╰{}╯", "─".repeat(card_w - 2)),
+                Style::default().fg(theme.border.subtle),
+            ),
+        ]));
+    }
+    let image = use_mascot.then_some(ratatui::layout::Rect::new(
+        (left + inset) as u16,
+        offset as u16,
+        mascot_w as u16,
+        mascot_h as u16,
+    ));
+    WelcomeLayout {
+        lines,
+        actions,
+        image,
+    }
+}
+
+/// The exact PNG slot in viewport coordinates, shared with the native widget and preview.
+pub(crate) fn native_image_rect(
+    state: &AppState,
+    content: ratatui::layout::Rect,
+    scroll: usize,
+) -> Option<ratatui::layout::Rect> {
+    if !conversation_is_empty(state) {
+        return None;
+    }
+    let layout = layout(
+        state,
+        content.width as usize,
+        content.height as usize,
+        &state.theme,
+        state.t(),
+    );
+    let image = layout.image?;
+    let pad = crate::conversation::geometry::painted_top_padding(
+        state,
+        layout.lines.len(),
+        content.height as usize,
+    );
+    let top = usize::from(image.y) + pad;
+    if top < scroll || top - scroll + usize::from(image.height) > usize::from(content.height) {
+        return None;
+    }
+    Some(ratatui::layout::Rect::new(
+        content.x + image.x,
+        content.y + (top - scroll) as u16,
+        image.width,
+        image.height,
+    ))
+}
+
+pub(crate) fn render_native_image(
+    frame: &mut ratatui::Frame,
+    state: &mut AppState,
+    content: ratatui::layout::Rect,
+    scroll: usize,
+) {
+    let Some(rect) = native_image_rect(state, content, scroll) else {
+        return;
+    };
+    let Some(image) = &mut state.welcome_image else {
+        return;
+    };
+    frame.render_stateful_widget(
+        ratatui_image::StatefulImage::default().resize(ratatui_image::Resize::Fit(Some(
+            image::imageops::FilterType::Lanczos3,
+        ))),
+        rect,
+        &mut image.protocol,
+    );
+    if let Some(Err(error)) = image.protocol.last_encoding_result() {
+        tracing::warn!(%error,"welcome PNG encoding failed; using terminal logo");
+        state.welcome_image = None;
+        // Clear skipped protocol cells as well as symbols, then immediately
+        // render the logo fallback in the same frame.
+        frame.render_widget(ratatui::widgets::Clear, content);
+        let mut lines = splash_lines(
+            state,
+            content.width as usize,
+            content.height as usize,
+            &state.theme,
+            state.t(),
+        );
+        let pad = crate::conversation::geometry::painted_top_padding(
+            state,
+            lines.len(),
+            content.height as usize,
+        );
+        let mut padded = vec![Line::from(""); pad];
+        padded.append(&mut lines);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(padded).style(
+                Style::default()
+                    .bg(state.theme.surface.canvas)
+                    .fg(state.theme.text.primary),
+            ),
+            content,
+        );
+    }
 }
 
 fn disp_w(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
-
-fn pad_to(s: &str, target: usize) -> String {
-    crate::render::pad_to_width(s, target)
-}
-
-fn truncate_w(s: &str, max: usize) -> String {
-    crate::render::truncate_display(s, max)
+fn truncate_w(s: &str, width: usize) -> String {
+    if width == 0 {
+        String::new()
+    } else {
+        crate::render::truncate_display(s, width)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brand::{candidate_plain, mark_plain};
-    use crate::i18n::Locale;
     use crate::state::Boot;
-    use crate::theme::ThemeId;
     use leveler_client_protocol::SessionId;
-    use ratatui::style::Color;
-
     fn state(locale: Locale) -> AppState {
         AppState::new(
             Theme::no_color(),
             Boot {
                 session_id: SessionId::new("s1"),
                 user: "u".into(),
-                version: "0.1.4".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
                 show_welcome: true,
                 draft_path: None,
                 history_path: None,
@@ -524,627 +544,423 @@ mod tests {
         joined(&splash_lines(s, width, height, &s.theme, s.t()))
     }
 
-    fn box_width(text: &str) -> usize {
-        text.lines()
-            .filter_map(|l| {
-                let t = l.trim_end();
-                (t.contains('╭') || t.contains('╰') || t.ends_with('│')).then(|| disp_w(t.trim()))
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn box_height(text: &str) -> usize {
-        text.lines()
-            .filter(|l| {
-                let t = l.trim_end();
-                t.contains('╭') || t.contains('╰') || t.ends_with('│')
-            })
-            .count()
-    }
-
     #[test]
-    fn zh_tagline_not_english() {
-        let text = paint(&state(Locale::Zh), 80, 24);
-        assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
-        assert!(
-            !text.contains("Make models reliably complete tasks"),
-            "{text}"
-        );
-        assert!(!text.contains("AI Coding Agent"), "{text}");
-    }
-
-    #[test]
-    fn en_tagline_not_chinese() {
-        let text = paint(&state(Locale::En), 80, 24);
-        assert!(
-            text.contains("Make models reliably complete tasks"),
-            "{text}"
-        );
-        assert!(!text.contains("让模型真正可靠地完成任务"), "{text}");
-        assert!(!text.contains("AI Coding Agent"), "{text}");
-    }
-
-    #[test]
-    fn zh_cta_and_more() {
-        let text = paint(&state(Locale::Zh), 80, 24);
-        assert!(text.contains("输入任务，直接开始"), "{text}");
-        assert!(text.contains('›'), "cta caret missing: {text}");
-        assert!(text.contains("输入 / 查看更多命令"), "{text}");
-    }
-
-    #[test]
-    fn en_cta_and_more() {
-        let text = paint(&state(Locale::En), 80, 24);
-        assert!(text.contains("Start by entering a task"), "{text}");
-        assert!(text.contains('›'), "{text}");
-        assert!(text.contains("Type / for more commands"), "{text}");
-    }
-
-    #[test]
-    fn both_locales_list_the_three_commands() {
-        for locale in [Locale::Zh, Locale::En] {
-            let text = paint(&state(locale), 80, 24);
-            for cmd in ["/develop", "/model", "/help"] {
-                assert!(text.contains(cmd), "{locale:?} missing {cmd}: {text}");
-            }
-            assert!(!text.contains("feature-dev"), "{locale:?}: {text}");
-        }
-    }
-
-    #[test]
-    fn splash_does_not_list_advanced_commands() {
-        for locale in [Locale::Zh, Locale::En] {
-            let text = paint(&state(locale), 80, 24);
-            for cmd in ["/plan", "/goal", "/skill", "/permission", "/feature-dev"] {
-                assert!(!text.contains(cmd), "{locale:?} leaked {cmd}: {text}");
-            }
-        }
-    }
-
-    #[test]
-    fn slash_registry_still_has_commands_removed_from_splash() {
-        for locale in [Locale::Zh, Locale::En] {
-            let listed = crate::screen::slash_commands(locale.text());
-            for cmd in ["/goal", "/collab", "/permission"] {
-                assert!(
-                    listed.iter().any(|(n, _)| *n == cmd),
-                    "{locale:?} registry lost {cmd}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn zh_command_descriptions() {
-        let text = paint(&state(Locale::Zh), 80, 24);
-        assert!(text.contains("完整开发"), "{text}");
-        assert!(text.contains("切换模型"), "{text}");
-        assert!(text.contains("查看帮助"), "{text}");
-    }
-
-    #[test]
-    fn en_command_descriptions() {
-        let text = paint(&state(Locale::En), 80, 24);
-        assert!(text.contains("full development"), "{text}");
-        assert!(text.contains("Switch model"), "{text}");
-        assert!(text.contains("View help"), "{text}");
-    }
-
-    #[test]
-    fn empty_conversation_is_splash() {
-        assert!(conversation_is_empty(&state(Locale::Zh)));
-    }
-
-    #[test]
-    fn first_user_message_hides_splash() {
+    fn welcome_menu_opens_existing_views_without_replacing_draft() {
+        use crate::{action::Action, reducer::reduce, screen::Screen};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut s = state(Locale::Zh);
-        s.transcript.push_user("hello".into());
-        assert!(!conversation_is_empty(&s));
-    }
-
-    #[test]
-    fn wide_card_is_a_hero_not_a_hint() {
-        let text = paint(&state(Locale::Zh), 120, 36);
-        let w = box_width(&text);
-        let h = box_height(&text);
-        assert!(
-            (76..=86).contains(&w),
-            "120-col card should be 76–86, got {w}:\n{text}"
+        s.composer.replace("unfinished draft");
+        let effects = reduce(
+            &mut s,
+            Action::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)),
         );
-        assert!(
-            (15..=18).contains(&h),
-            "tall viewport card should be ~16 rows, got {h}:\n{text}"
-        );
-        assert!(
-            text.contains("██      █████"),
-            "master pier+runway missing:\n{text}"
-        );
-        assert!(!text.contains('◆'), "ghost core leaked:\n{text}");
-        assert!(!text.contains('▿'), "ghost mouth leaked:\n{text}");
+        assert_eq!(s.active_screen, Screen::Sessions);
+        assert_eq!(s.composer.canonical_text(), "unfinished draft");
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::action::Effect::Send(
+                leveler_client_protocol::ClientCommand::RequestSessionListFor { .. }
+            )
+        )));
     }
 
     #[test]
-    fn medium_uses_compact_mark() {
-        let text = paint(&state(Locale::Zh), 64, 20);
-        assert!(
-            text.contains("██  ████"),
-            "compact pier+runway missing:\n{text}"
-        );
-        assert!(
-            !text.contains("    ██████"),
-            "master mark leaked into medium:\n{text}"
-        );
-        assert!(text.contains("CodeLeveler"), "{text}");
-    }
-
-    #[test]
-    fn narrow_uses_micro_or_hides_mark() {
-        let wide = paint(&state(Locale::Zh), 80, 24);
-        assert!(wide.contains("    ██████"), "master on wide:\n{wide}");
-        let narrow = paint(&state(Locale::Zh), 48, 16);
-        assert!(narrow.contains("CodeLeveler"), "{narrow}");
-        assert!(narrow.contains("/develop"), "{narrow}");
-        assert!(
-            !narrow.contains("    ██████"),
-            "master leaked into narrow:\n{narrow}"
-        );
-        assert!(!narrow.contains('◆'), "{narrow}");
-    }
-
-    #[test]
-    fn very_narrow_keeps_wordmark_over_mark() {
-        let s = state(Locale::Zh);
-        let text = paint(&s, 40, 16);
-        assert!(text.contains("CodeLeveler"), "{text}");
-        assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
-        assert!(text.contains("/develop"), "{text}");
-        assert!(
-            !text.contains("    ██████"),
-            "master leaked into 40-col:\n{text}"
-        );
-    }
-
-    #[test]
-    fn wordmark_is_codeleveler_not_screaming() {
-        let text = paint(&state(Locale::Zh), 80, 24);
-        assert!(text.contains("CodeLeveler"), "{text}");
-        assert!(!text.contains("CODELEVELER"), "{text}");
-        assert!(!text.contains("Code Leveler"), "{text}");
-    }
-
-    #[test]
-    fn width_matrix_does_not_overflow_or_overlap() {
-        let name_col = command_name_col();
-        for locale in [Locale::Zh, Locale::En] {
-            let s = state(locale);
-            for width in [120, 100, 80, 72, 64, 56, 48, 40] {
-                let lines = splash_lines(&s, width, 24, &s.theme, s.t());
-                let text = joined(&lines);
-                for cmd in TIP_COMMANDS {
-                    assert!(text.contains(cmd), "{locale:?} {width}: missing {cmd}");
-                }
-                for line in &lines {
-                    let plain = line_plain(line);
-                    let w = disp_w(plain.trim_end());
-                    assert!(w <= width, "{locale:?} w={width} overflow {w}: {plain:?}");
-                    if let Some(pos) = plain.find("/develop") {
-                        let after = &plain[pos + "/develop".len()..];
-                        let pad = after.chars().take_while(|c| *c == ' ').count();
-                        let start = "/develop".len() + pad;
-                        assert!(
-                            start >= name_col || after.trim_start().is_empty(),
-                            "{locale:?} w={width} desc overlaps name: {plain:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn height_matrix_does_not_panic() {
-        for locale in [Locale::Zh, Locale::En] {
-            let s = state(locale);
-            for height in [36, 24, 20, 16, 12] {
-                let text = paint(&s, 80, height);
-                assert!(text.contains("CodeLeveler"), "{locale:?} h={height}");
-                assert!(text.contains("/develop"), "{locale:?} h={height}");
-            }
-        }
-    }
-
-    #[test]
-    fn themes_use_only_semantic_tokens() {
-        for id in ThemeId::FIXED {
-            let theme = Theme::named(id);
-            let mut s = state(Locale::Zh);
-            s.theme = theme.clone();
-            let lines = splash_lines(&s, 80, 24, &s.theme, s.t());
-            let allowed = [
-                theme.accent.primary,
-                theme.text.primary,
-                theme.text.secondary,
-                theme.text.muted,
-                theme.border.subtle,
-                theme.border.normal,
-                theme.status.warning,
-                theme.brand.foundation,
-                theme.brand.primary,
-                theme.brand.highlight,
-            ];
-            for line in &lines {
-                for span in &line.spans {
-                    if let Some(fg) = span.style.fg {
-                        assert!(
-                            allowed.contains(&fg) || fg == Color::Reset,
-                            "{id:?} unexpected fg {fg:?} on {:?}",
-                            span.content
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn splash_warns_about_ignored_in_repo_config() {
-        let mut s = state(Locale::Zh);
-        let clean = paint(&s, 80, 24);
-        assert!(!clean.contains('⚠'), "clean repo shows no warning: {clean}");
-
-        s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
-        let text = paint(&s, 80, 24);
-        assert!(text.contains('⚠'), "{text}");
-        assert!(text.contains("hooks.yaml"), "name the file: {text}");
-        assert!(text.contains("leveler trust"), "name the fix: {text}");
-    }
-
-    #[test]
-    fn warning_rows_keep_the_box_aligned() {
-        let mut s = state(Locale::Zh);
-        s.untrusted_config = vec![
-            ".leveler/hooks.yaml".to_string(),
-            ".leveler/permissions.yaml".to_string(),
-        ];
-        assert_box_aligned(&splash_lines(&s, 80, 24, &s.theme, s.t()));
-    }
-
-    #[test]
-    fn box_rows_are_width_aligned() {
-        let s = state(Locale::Zh);
-        assert_box_aligned(&splash_lines(&s, 80, 24, &s.theme, s.t()));
-        let s = state(Locale::En);
-        assert_box_aligned(&splash_lines(&s, 80, 24, &s.theme, s.t()));
-    }
-
-    fn assert_box_aligned(lines: &[Line<'static>]) {
-        let edges: Vec<usize> = lines
-            .iter()
-            .filter_map(|l| {
-                let plain = line_plain(l);
-                let trimmed = plain.trim_end();
-                (trimmed.ends_with('│') || trimmed.ends_with('╮') || trimmed.ends_with('╯'))
-                    .then(|| disp_w(trimmed))
-            })
-            .collect();
-        assert!(edges.len() >= 5, "{edges:?}");
-        assert!(
-            edges.iter().all(|w| *w == edges[0]),
-            "right borders misaligned: {edges:?}"
-        );
-    }
-
-    #[test]
-    fn narrow_terminal_keeps_copy_without_panic() {
-        let s = state(Locale::Zh);
-        let text = paint(&s, 40, 16);
-        assert!(text.contains("CodeLeveler"), "{text}");
-        assert!(text.contains("让模型真正可靠地完成任务"), "{text}");
-        assert!(text.contains("/develop"), "{text}");
-    }
-
-    fn col_of(line: &str, needle: &str) -> Option<usize> {
-        let i = line.find(needle)?;
-        Some(disp_w(&line[..i]))
-    }
-
-    fn first_pipe(line: &str) -> Option<usize> {
-        col_of(line, "│")
-    }
-
-    fn last_pipe(line: &str) -> Option<usize> {
-        let i = line.rfind('│')?;
-        Some(disp_w(&line[..i]))
-    }
-
-    /// Horizontal geometry of the hero group inside the card.
-    fn hero_group_metrics(text: &str) -> Option<(usize, usize, usize, usize, usize)> {
-        let runway = text.lines().find(|l| l.contains("██      █████"))?;
-        let brand = text.lines().find(|l| l.contains("CodeLeveler"))?;
-        let mark_left = col_of(runway, "██      █████")?;
-        let content_x = col_of(brand, "CodeLeveler")?;
-        let inner_left = first_pipe(brand)? + 1 + INNER_PAD_X;
-        let inner_right = last_pipe(brand)?.saturating_sub(INNER_PAD_X);
-        Some((
-            mark_left,
-            content_x,
-            inner_left,
-            inner_right,
-            level_mark_width(BrandMarkSize::Master),
-        ))
-    }
-
-    fn blank_inner(line: &str) -> bool {
-        let Some(l) = first_pipe(line) else {
-            return false;
-        };
-        let Some(r) = last_pipe(line) else {
-            return false;
-        };
-        if r <= l + 1 {
-            return true;
-        }
-        let inner_start = line.find('│').unwrap() + '│'.len_utf8();
-        let inner_end = line.rfind('│').unwrap();
-        line[inner_start..inner_end].chars().all(|c| c == ' ')
-    }
-
-    #[test]
-    fn hero_group_is_centered_in_the_card() {
-        for locale in [Locale::Zh, Locale::En] {
-            for (w, h) in [(120usize, 36usize), (100, 30), (80, 24)] {
-                let text = paint(&state(locale), w, h);
-                let (mark_left, content_x, inner_left, inner_right, mark_w) =
-                    hero_group_metrics(&text)
-                        .unwrap_or_else(|| panic!("{locale:?} {w}x{h}:\n{text}"));
-                let gap = content_x.saturating_sub(mark_left + mark_w);
-                assert!(
-                    (4..=5).contains(&gap),
-                    "{locale:?} {w}x{h} gap {gap} (mark_left={mark_left} content_x={content_x}):\n{text}"
-                );
-                let content_w = 42; // wide content column
-                let group_w = mark_w + gap + content_w;
-                assert!(
-                    (58..=64).contains(&group_w),
-                    "{locale:?} {w}x{h} group_w {group_w}:\n{text}"
-                );
-                let left_slack = mark_left.saturating_sub(inner_left);
-                let right_slack = inner_right.saturating_sub(mark_left + group_w);
-                let drift = left_slack as i32 - right_slack as i32;
-                assert!(
-                    drift.abs() <= 1,
-                    "{locale:?} {w}x{h} group not centered (left_slack={left_slack} right_slack={right_slack} drift={drift}):\n{text}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn main_content_shares_one_left_edge() {
+    fn menu_copy_and_tip_are_supported_and_stable() {
         for locale in [Locale::Zh, Locale::En] {
             let mut s = state(locale);
-            s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
-            let text = paint(&s, 120, 36);
-            let brand_x = col_of(
-                text.lines().find(|l| l.contains("CodeLeveler")).unwrap(),
-                "CodeLeveler",
-            )
+            s.welcome_tip = 0;
+            let text = paint(&s, 100, 30);
+            for index in 0..3 {
+                assert!(text.contains(action_label(locale, index)), "{text}");
+                assert!(crate::screen::is_known_slash_token(
+                    action_command(index).unwrap()
+                ));
+            }
+            for seed in 0..16 {
+                s.welcome_tip = tip_index(seed);
+                let chosen = tip(&s);
+                assert!(crate::screen::is_known_slash_token(
+                    chosen.0.trim_start_matches('/')
+                ));
+                for (w, h) in [(100, 30), (80, 24), (40, 12)] {
+                    let _ = paint(&s, w, h);
+                    assert_eq!(tip(&s), chosen);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_real_content_hides_splash() {
+        let mut s = state(Locale::Zh);
+        assert!(conversation_is_empty(&s));
+        s.transcript.push_user("hello".into());
+        assert!(!conversation_is_empty(&s));
+        assert!(action_at(&s, 80, 24, 0, 0).is_none());
+    }
+
+    #[test]
+    fn layouts_stay_in_width_and_task_hits_follow_the_painted_rows() {
+        for locale in [Locale::Zh, Locale::En] {
+            for theme in [
+                Theme::dark(),
+                Theme::light(),
+                Theme::high_contrast(),
+                Theme::no_color(),
+            ] {
+                for native in [false, true] {
+                    let mut s = state(locale);
+                    s.theme = theme.clone();
+                    if native {
+                        s.welcome_image = Some(
+                            NativeMascot::new(
+                                ratatui_image::picker::ProtocolType::Iterm2,
+                                (10, 20),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    for (w, h) in [
+                        (120, 36),
+                        (100, 30),
+                        (80, 24),
+                        (72, 20),
+                        (64, 16),
+                        (48, 12),
+                        (40, 10),
+                        (20, 8),
+                        (8, 4),
+                        (1, 1),
+                    ] {
+                        let layout = layout(&s, w, h, &s.theme, s.t());
+                        for line in &layout.lines {
+                            assert!(
+                                line.width() <= w,
+                                "{locale:?} {w}x{h} native={native}: {:?}",
+                                line_plain(line)
+                            );
+                        }
+                        assert_eq!(layout.actions.len(), 3);
+                        for hit in layout.actions {
+                            assert_eq!(action_at(&s, w, h, hit.row, hit.start), Some(hit.index));
+                            assert_eq!(action_at(&s, w, h, hit.row, hit.end), None);
+                        }
+                        if let Some(image) = layout.image {
+                            assert!(usize::from(image.right()) <= w);
+                            assert!(usize::from(image.bottom()) <= h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_png_uses_image_widget_and_unsupported_uses_terminal_logo() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use ratatui_image::picker::ProtocolType;
+        let mut s = state(Locale::Zh);
+        s.theme = Theme::dark();
+        s.size = (110, 40);
+        s.welcome_image = Some(NativeMascot::new(ProtocolType::Iterm2, (10, 20)).unwrap());
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|f| crate::render::render(f, &mut s)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|c| c.symbol().contains("1337;File=inline=1"))
+        );
+        assert!(!paint(&s, 100, 30).contains('▀'));
+        s.welcome_image = None;
+        let text = paint(&s, 100, 30);
+        assert!(text.contains('█'));
+        assert!(!text.contains('▀'));
+        s.welcome_image = Some(NativeMascot::new(ProtocolType::Iterm2, (10, 20)).unwrap());
+        s.theme = Theme::no_color();
+        assert!(layout(&s, 100, 30, &s.theme, s.t()).image.is_none());
+    }
+
+    #[test]
+    fn native_graphics_reset_after_resize_and_hide_under_other_surfaces() {
+        use crate::action::Action;
+        use ratatui::{Terminal, backend::TestBackend};
+        use ratatui_image::picker::ProtocolType;
+        let mut s = state(Locale::Zh);
+        s.theme = Theme::dark();
+        s.size = (110, 40);
+        s.welcome_image = Some(NativeMascot::new(ProtocolType::Kitty, (10, 20)).unwrap());
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        let transmits = |buffer: &ratatui::buffer::Buffer| {
+            buffer.content.iter().any(|c| c.symbol().contains("\x1b_G"))
+        };
+        assert!(transmits(
+            terminal
+                .draw(|f| crate::render::render(f, &mut s))
+                .unwrap()
+                .buffer
+        ));
+        assert!(!transmits(
+            terminal
+                .draw(|f| crate::render::render(f, &mut s))
+                .unwrap()
+                .buffer
+        ));
+        crate::reducer::reduce(&mut s, Action::Resize(120, 40));
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 120, 40))
             .unwrap();
-            let cta_x = col_of(text.lines().find(|l| l.contains('›')).unwrap(), "›").unwrap();
-            let cmd_x = col_of(
-                text.lines().find(|l| l.contains("/develop")).unwrap(),
-                "/develop",
+        assert!(transmits(
+            terminal
+                .draw(|f| crate::render::render(f, &mut s))
+                .unwrap()
+                .buffer
+        ));
+        s.welcome_image.as_mut().unwrap().reset();
+        assert!(transmits(
+            terminal
+                .draw(|f| crate::render::render(f, &mut s))
+                .unwrap()
+                .buffer
+        ));
+        s.history_search = Some(crate::history_search::HistorySearch::default());
+        let content = s.conv.rect.unwrap();
+        assert!(
+            native_image_rect(
+                &s,
+                ratatui::layout::Rect::new(content.0, content.1, content.2, content.3),
+                0
             )
-            .unwrap();
-            let more_x = text
-                .lines()
-                .find_map(|l| col_of(l, "输入 /").or_else(|| col_of(l, "Type /")))
+            .is_none()
+        );
+        assert!(!transmits(
+            terminal
+                .draw(|f| crate::render::render(f, &mut s))
+                .unwrap()
+                .buffer
+        ));
+        s.history_search = None;
+        s.overlay = Some(crate::overlay::Overlay::ModelPicker(Box::new(
+            crate::overlay::SelectionModel::new("Models", Vec::new(), false),
+        )));
+        assert!(layout(&s, 100, 30, &s.theme, s.t()).image.is_none());
+        s.overlay = None;
+        s.transcript.push_user("hello".into());
+        let rendered = terminal.draw(|f| crate::render::render(f, &mut s)).unwrap();
+        assert!(
+            rendered
+                .buffer
+                .content
+                .iter()
+                .all(|c| !c.symbol().contains('\u{1b}'))
+        );
+        assert!(rendered.buffer.content.iter().all(|c| !c.skip));
+    }
+
+    #[test]
+    fn ignored_repo_warning_remains_available_in_compact_layout() {
+        let mut s = state(Locale::Zh);
+        s.untrusted_config = vec![".leveler/hooks.yaml".into()];
+        for (w, h) in [(80, 24), (40, 8)] {
+            let text = paint(&s, w, h);
+            assert!(text.contains("hooks.yaml"), "{text}");
+            assert!(text.contains("leveler trust"), "{text}");
+        }
+    }
+
+    #[test]
+    fn mouse_and_alt_shortcuts_open_existing_views_and_preserve_input() {
+        use crate::{
+            action::{Action, Effect},
+            overlay::Overlay,
+            reducer::reduce,
+            screen::Screen,
+        };
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        use leveler_client_protocol::{AttachmentId, AttachmentKind, AttachmentRef, ClientCommand};
+        for keyboard in [false, true] {
+            for (w, h) in [(100, 30), (80, 20), (48, 14)] {
+                for index in 0..3 {
+                    let mut s = state(Locale::Zh);
+                    s.size = (w + 4, h + 8);
+                    s.conv.rect = Some((2, 3, w, h));
+                    s.composer.replace("my draft");
+                    s.available_models =
+                        vec![leveler_client_protocol::ModelRef::parse("openai/gpt-test").unwrap()];
+                    s.pending_attachments.push(AttachmentRef {
+                        id: AttachmentId::new("draft"),
+                        kind: AttachmentKind::Image,
+                        name: "draft.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: 1,
+                        sha256: "hash".into(),
+                        width: Some(1),
+                        height: Some(1),
+                    });
+                    s.composer.insert_image_token();
+                    let draft = s.composer.canonical_text();
+                    let attachment = s.pending_attachments.clone();
+                    let layout = layout(&s, w as usize, h as usize, &s.theme, s.t());
+                    let hit = &layout.actions[index];
+                    let pad = crate::conversation::geometry::painted_top_padding(
+                        &s,
+                        layout.lines.len(),
+                        h as usize,
+                    );
+                    let action = if keyboard {
+                        Action::Key(KeyEvent::new(
+                            KeyCode::Char(char::from(b'1' + index as u8)),
+                            KeyModifiers::ALT,
+                        ))
+                    } else {
+                        Action::Mouse(MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: 2 + hit.start as u16,
+                            row: 3 + (pad + hit.row) as u16,
+                            modifiers: KeyModifiers::NONE,
+                        })
+                    };
+                    let effects = reduce(&mut s, action);
+                    assert_eq!(s.composer.canonical_text(), draft);
+                    assert_eq!(s.pending_attachments, attachment);
+                    assert!(conversation_is_empty(&s));
+                    match index {
+                        0 => {
+                            assert_eq!(s.active_screen, Screen::Sessions);
+                            assert!(effects.iter().any(|effect| matches!(
+                                effect,
+                                Effect::Send(ClientCommand::RequestSessionListFor { .. })
+                            )));
+                        }
+                        1 => {
+                            assert_eq!(s.active_screen, Screen::Help);
+                            assert!(effects.is_empty());
+                        }
+                        2 => {
+                            assert!(matches!(s.overlay, Some(Overlay::ModelPicker(_))));
+                            assert!(effects.is_empty());
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn left_tip_and_side_surfaces_never_open_menu_actions() {
+        use crate::{action::Action, reducer::reduce, screen::Screen};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        for side in [false, true] {
+            let mut s = state(Locale::Zh);
+            s.size = (104, 38);
+            s.conv.rect = Some((2, 3, 100, 30));
+            if side {
+                s.surface = crate::btw::SurfaceFocus::Btw;
+            }
+            let layout = layout(&s, 100, 30, &s.theme, s.t());
+            let hit = &layout.actions[0];
+            let pad =
+                crate::conversation::geometry::painted_top_padding(&s, layout.lines.len(), 30);
+            let col = if side { hit.start } else { hit.start - 2 };
+            reduce(
+                &mut s,
+                Action::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 2 + col as u16,
+                    row: 3 + (pad + hit.row) as u16,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+            assert_eq!(s.active_screen, Screen::Conversation);
+            assert!(s.overlay.is_none());
+            assert!(s.composer.is_empty());
+        }
+    }
+
+    #[test]
+    fn overflowing_welcome_hits_start_at_the_visible_top() {
+        let mut s = state(Locale::Zh);
+        s.conv.rect = Some((0, 0, 80, 8));
+        s.conv.auto_scroll = true;
+        s.untrusted_config = vec![".leveler/hooks.yaml".into()];
+        let pos = crate::conversation::geometry::screen_to_content(&s, 0, 0).unwrap();
+        assert_eq!(pos.row, 0);
+    }
+
+    #[test]
+    #[ignore = "manual rendered welcome preview"]
+    fn dump_welcome_preview() {
+        use ratatui::style::Color;
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+        let mut previews = Vec::new();
+        for (name, theme, w, h) in [
+            ("dark", Theme::dark(), 110, 36),
+            ("light", Theme::light(), 110, 36),
+            ("narrow", Theme::dark(), 48, 20),
+            ("no-color", Theme::no_color(), 80, 24),
+            ("full-native", Theme::dark(), 110, 40),
+            ("full-dark", Theme::dark(), 110, 40),
+            ("full-narrow", Theme::dark(), 60, 24),
+        ] {
+            let mut s = state(Locale::Zh);
+            s.theme = theme;
+            s.welcome_tip = 0;
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let lines = splash_lines(&s, w as usize, h as usize, &s.theme, s.t());
+            s.size = (w, h);
+            if name == "full-native" {
+                s.welcome_image = Some(
+                    NativeMascot::new(ratatui_image::picker::ProtocolType::Iterm2, (12, 26))
+                        .unwrap(),
+                );
+            }
+            terminal
+                .draw(|frame| {
+                    if name.starts_with("full-") {
+                        crate::render::render(frame, &mut s);
+                        return;
+                    }
+                    frame.render_widget(
+                        ratatui::widgets::Block::default().style(
+                            Style::default()
+                                .bg(s.theme.surface.canvas)
+                                .fg(s.theme.text.primary),
+                        ),
+                        frame.area(),
+                    );
+                    let pad = (h as usize).saturating_sub(lines.len()) / 2;
+                    let rect =
+                        ratatui::layout::Rect::new(0, pad as u16, w, h.saturating_sub(pad as u16));
+                    frame.render_widget(Paragraph::new(lines.clone()), rect);
+                })
                 .unwrap();
-            let warn_x = col_of(text.lines().find(|l| l.contains('⚠')).unwrap(), "⚠").unwrap();
-            assert_eq!(brand_x, cta_x, "cta drifted:\n{text}");
-            assert_eq!(brand_x, cmd_x, "commands drifted:\n{text}");
-            assert_eq!(brand_x, more_x, "more hint drifted:\n{text}");
-            assert_eq!(brand_x, warn_x, "warning drifted:\n{text}");
-        }
-    }
-
-    #[test]
-    fn warning_is_its_own_section_and_does_not_leave_a_hole() {
-        let mut s = state(Locale::Zh);
-        let off = paint(&s, 120, 36);
-        s.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
-        let on = paint(&s, 120, 36);
-
-        assert!(!off.contains('⚠'), "{off}");
-        assert!(on.contains('⚠'), "{on}");
-
-        let more_idx = on
-            .lines()
-            .position(|l| l.contains("输入 /") || l.contains("Type /"))
-            .unwrap();
-        let warn_idx = on.lines().position(|l| l.contains('⚠')).unwrap();
-        assert!(
-            warn_idx >= more_idx + 2,
-            "need a blank row between more and warning:\n{on}"
-        );
-        assert!(
-            on.lines().nth(more_idx + 1).is_some_and(blank_inner),
-            "row after more should be blank:\n{on}"
-        );
-
-        let off_body = off
-            .lines()
-            .filter(|l| !blank_inner(l) && l.contains('│'))
-            .count();
-        let on_body = on
-            .lines()
-            .filter(|l| !blank_inner(l) && l.contains('│'))
-            .count();
-        assert!(
-            on_body > off_body,
-            "warning should add real rows, not fill a reserved hole (off={off_body} on={on_body})\nOFF:\n{off}\nON:\n{on}"
-        );
-
-        // No warning-sized hole when hidden: last non-blank inner row is the more hint.
-        let off_lines: Vec<&str> = off.lines().collect();
-        let last_content = off_lines
-            .iter()
-            .rposition(|l| l.contains('│') && !blank_inner(l))
-            .unwrap();
-        assert!(
-            off_lines[last_content].contains("输入 /")
-                || off_lines[last_content].contains("Type /"),
-            "hidden warning left a hole after more:\n{off}"
-        );
-    }
-
-    #[test]
-    fn card_stays_hero_sized_when_group_is_centered() {
-        for (w, h) in [(120usize, 36usize), (100, 30), (80, 24)] {
-            let text = paint(&state(Locale::Zh), w, h);
-            let bw = box_width(&text);
-            let bh = box_height(&text);
-            assert!(
-                (76..=86).contains(&bw),
-                "{w}x{h} card width {bw} shrank:\n{text}"
-            );
-            assert!(
-                (15..=18).contains(&bh),
-                "{w}x{h} card height {bh} is not a hero:\n{text}"
-            );
-        }
-    }
-
-    #[test]
-    fn more_commands_slash_uses_accent_token() {
-        let theme = Theme::dark();
-        let mut s = state(Locale::Zh);
-        s.theme = theme.clone();
-        let lines = splash_lines(&s, 80, 24, &s.theme, s.t());
-        let mut saw_slash = false;
-        for line in &lines {
-            for span in &line.spans {
-                if span.content.as_ref() == "/" {
-                    saw_slash = true;
-                    assert_eq!(span.style.fg, Some(theme.accent.primary));
+            let color = |c: Color| match c {
+                Color::Rgb(r, g, b) => serde_json::json!([r, g, b]),
+                Color::Indexed(i) => {
+                    let (r, g, b) = crate::theme::xterm_256_rgb(i);
+                    serde_json::json!([r, g, b])
                 }
-            }
+                _ => serde_json::Value::Null,
+            };
+            let cells:Vec<_>=terminal.backend().buffer().content.iter().map(|cell|serde_json::json!({"symbol":if cell.symbol().contains('\u{1b}') { " " } else { cell.symbol() },"fg":color(cell.fg),"bg":color(cell.bg),"bold":cell.modifier.contains(Modifier::BOLD)})).collect();
+            let native_rect = s
+                .conv
+                .rect
+                .and_then(|(x, y, w, h)| {
+                    native_image_rect(&s, ratatui::layout::Rect::new(x, y, w, h), 0)
+                })
+                .map(|r| serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height}));
+            previews.push(serde_json::json!({"name":name,"width":w,"height":h,"cells":cells,"image_rect":native_rect}));
         }
-        assert!(saw_slash, "more-commands slash missing");
-    }
-
-    fn ansi_fg(color: Color, bold: bool, text: &str) -> String {
-        let reset = "\x1b[0m";
-        let bold_s = if bold { "\x1b[1m" } else { "" };
-        match color {
-            Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m{bold_s}{text}{reset}"),
-            Color::Reset => format!("{bold_s}{text}{reset}"),
-            _ => text.to_string(),
-        }
-    }
-
-    fn line_ansi(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|sp| {
-                let fg = sp.style.fg.unwrap_or(Color::Reset);
-                let bold = sp.style.add_modifier.contains(Modifier::BOLD);
-                ansi_fg(fg, bold, sp.content.as_ref())
-            })
-            .collect()
-    }
-
-    fn paint_ansi(s: &AppState, width: usize, height: usize) -> String {
-        splash_lines(s, width, height, &s.theme, s.t())
-            .iter()
-            .map(line_ansi)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Manual board: candidates, then the selected mark on real splash layouts.
-    #[test]
-    #[ignore = "manual splash preview; run with --ignored --nocapture"]
-    fn dump_hero_splash() {
-        eprintln!("\n======== LEVEL MARK CANDIDATES ========");
-        for (id, name, note) in [
-            (
-                'A',
-                "Cantilever (SELECTED)",
-                "notch + left pier + forward runway; 13×5",
-            ),
-            (
-                'B',
-                "Spine Rise",
-                "tighter notch, heavier right spine; 11×5",
-            ),
-            (
-                'C',
-                "Tall Wedge",
-                "six-row progression; closer to stairs; 14×6",
-            ),
-        ] {
-            eprintln!("\n──────── {id}  {name} ────────");
-            eprintln!("{note}");
-            eprintln!("{}", candidate_plain(id));
-        }
-
-        eprintln!("\n======== SELECTED SIZES ========");
-        for size in [
-            BrandMarkSize::Master,
-            BrandMarkSize::Compact,
-            BrandMarkSize::Micro,
-        ] {
-            eprintln!("\n── {size:?} ──");
-            eprintln!("{}", mark_plain(size));
-        }
-
-        for (label, mut theme) in [
-            ("DARK", Theme::dark()),
-            ("LIGHT", Theme::light()),
-            ("HIGH CONTRAST", Theme::high_contrast()),
-            ("NO_COLOR", Theme::no_color()),
-        ] {
-            let mut zh = state(Locale::Zh);
-            zh.theme = theme.clone();
-            eprintln!("\n======== {label} ZH 80x24 ========");
-            eprintln!("{}", paint_ansi(&zh, 80, 24));
-            if label == "DARK" {
-                theme = Theme::dark();
-                zh.theme = theme.clone();
-                for (w, h) in [(120u16, 36u16), (100, 30), (80, 24)] {
-                    eprintln!("\n-------- DARK ZH {w}x{h} warning OFF --------");
-                    eprintln!("{}", paint_ansi(&zh, w as usize, h as usize));
-                    zh.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
-                    eprintln!("\n-------- DARK ZH {w}x{h} warning ON --------");
-                    eprintln!("{}", paint_ansi(&zh, w as usize, h as usize));
-                    zh.untrusted_config.clear();
-                }
-                let mut en = state(Locale::En);
-                en.theme = theme;
-                for (w, h) in [(120u16, 36u16), (80, 24)] {
-                    eprintln!("\n-------- DARK EN {w}x{h} warning OFF --------");
-                    eprintln!("{}", paint_ansi(&en, w as usize, h as usize));
-                    en.untrusted_config = vec![".leveler/hooks.yaml".to_string()];
-                    eprintln!("\n-------- DARK EN {w}x{h} warning ON --------");
-                    eprintln!("{}", paint_ansi(&en, w as usize, h as usize));
-                    en.untrusted_config.clear();
-                }
-                let mut mid = state(Locale::Zh);
-                mid.theme = Theme::dark();
-                eprintln!("\n-------- DARK ZH 64x20 medium --------");
-                eprintln!("{}", paint_ansi(&mid, 64, 20));
-                eprintln!("\n-------- DARK ZH 48x16 narrow --------");
-                eprintln!("{}", paint_ansi(&mid, 48, 16));
-                eprintln!("\n-------- DARK ZH 40x16 very narrow --------");
-                eprintln!("{}", paint_ansi(&mid, 40, 16));
-            }
-        }
-
-        let mut en = state(Locale::En);
-        en.theme = Theme::dark();
-        eprintln!("\n======== DARK EN 80x24 ========");
-        eprintln!("{}", paint_ansi(&en, 80, 24));
+        std::fs::write(
+            "/tmp/codeleveler-welcome-preview.json",
+            serde_json::to_vec(&previews).unwrap(),
+        )
+        .unwrap();
     }
 }

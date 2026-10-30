@@ -35,6 +35,13 @@ pub enum PlanStepStatus {
     Done,
     Failed,
     Skipped,
+    /// The model removed this step from its own plan while it was still open.
+    ///
+    /// Not delivered (so it never counts toward a completed plan) and not
+    /// open work the runtime should keep driving. Keeping it distinct from
+    /// `Skipped` is what stops a removed step from being projected as a
+    /// legitimate completion.
+    Abandoned,
 }
 
 /// One step in the execution plan.

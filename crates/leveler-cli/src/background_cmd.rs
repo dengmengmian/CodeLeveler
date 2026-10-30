@@ -47,7 +47,7 @@ pub async fn cmd_background(
 async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::process::ExitCode> {
     use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
     use leveler_execution::BackgroundTaskStatus;
-    use leveler_execution::execution_host::ExecutionHostClient;
+    use leveler_execution::execution_host::{ExecutionHostClient, HostRecords};
 
     // The journal is the runtime's own durable state, not the host's: it must be
     // readable while nothing else is running, which is exactly when it matters.
@@ -101,12 +101,29 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
         }
         _ => {}
     }
-    let host = ExecutionHostClient::probe(&leveler_app::execution_host_config(&layout)?)
+    let config = leveler_app::execution_host_config(&layout)?;
+    let probed = ExecutionHostClient::probe(&config)
         .await
         .map_err(anyhow::Error::msg)?;
-    let hosted = match host.as_ref() {
+    if let Some(recovery) = probed.recovery.as_ref()
+        && !recovery.is_empty()
+    {
+        eprintln!(
+            "recovered {} background task(s) and {} unresolved spawn intent(s) from a lost \
+             execution host; see `leveler background list` and `leveler background journal list`",
+            recovery.tasks.len(),
+            recovery.unresolved_intents.len()
+        );
+    }
+    // With no live host the archive is still the durable inventory: recovery
+    // made those records terminal, and hiding them would tell the user their
+    // lost task never existed.
+    let hosted = match probed.client.as_ref() {
         Some(host) => host.list().await.map_err(anyhow::Error::msg)?,
-        None => Vec::new(),
+        None => HostRecords::read(&config.state_dir)
+            .map_err(anyhow::Error::msg)?
+            .tasks()
+            .to_vec(),
     };
 
     match command {
@@ -164,38 +181,64 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
         }
         BackgroundCommand::Logs { task_id } => {
             if let Some(task) = hosted.iter().find(|task| task.snapshot.id == task_id) {
-                let owner = task
-                    .snapshot
-                    .owner_scope
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("hosted task has no session owner"))?;
-                let snapshot = host
-                    .as_ref()
-                    .expect("hosted inventory requires a host")
-                    .get_owned(&task_id, owner)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                print_log(&task_id, &snapshot.log);
+                let log = match probed.client.as_ref() {
+                    Some(host) => {
+                        let owner =
+                            task.snapshot.owner_scope.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("hosted task has no session owner")
+                            })?;
+                        host.get_owned(&task_id, owner)
+                            .await
+                            .map_err(anyhow::Error::msg)?
+                            .log
+                    }
+                    // The host is gone; its durable record keeps the retained
+                    // output, which is the only copy left.
+                    None => task.snapshot.log.clone(),
+                };
+                print_log(&task_id, &log);
                 return Ok(std::process::ExitCode::SUCCESS);
             }
-            anyhow::bail!("no live background task `{task_id}`");
+            anyhow::bail!("no background task `{task_id}`");
         }
         BackgroundCommand::Stop { task_id } => {
             if let Some(task) = hosted.iter().find(|task| task.snapshot.id == task_id) {
+                if !task.is_live() {
+                    // Terminal means the process is over or control was lost.
+                    // Saying "stop requested" here would fake a signal.
+                    println!(
+                        "{task_id} is already {}; nothing to stop",
+                        match task.snapshot.status {
+                            BackgroundTaskStatus::Exited => "exited",
+                            BackgroundTaskStatus::Killed => "killed",
+                            BackgroundTaskStatus::Unknown => "unobserved (control lost)",
+                            BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing => {
+                                unreachable!("a live task is not terminal")
+                            }
+                        }
+                    );
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
                 let owner = task
                     .snapshot
                     .owner_scope
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("hosted task has no session owner"))?;
-                host.as_ref()
-                    .expect("hosted inventory requires a host")
+                probed
+                    .client
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no execution host is running; `{task_id}` cannot be signalled from here"
+                        )
+                    })?
                     .kill_owned(&task_id, owner)
                     .await
                     .map_err(anyhow::Error::msg)?;
                 println!("stop requested for {task_id}");
                 return Ok(std::process::ExitCode::SUCCESS);
             }
-            anyhow::bail!("no live background task `{task_id}`");
+            anyhow::bail!("no background task `{task_id}`");
         }
         BackgroundCommand::Journal { .. } => {
             unreachable!("the journal is read before runtime discovery")
@@ -221,6 +264,16 @@ fn release_blocker(
     task_id: &str,
 ) -> Option<String> {
     match host {
+        HostLiveness::Live
+            if records
+                .task(task_id)
+                .is_some_and(|task| task.process_may_still_exist()) =>
+        {
+            Some(
+                "the host that admitted this task was lost and its process may still be running"
+                    .into(),
+            )
+        }
         HostLiveness::Live => {
             Some("a live execution host owns this task; its exit settles it".into())
         }
@@ -228,7 +281,18 @@ fn release_blocker(
             Some(format!("the execution host's state is unknown: {error}"))
         }
         HostLiveness::Absent => {
-            if records.intents_outstanding() {
+            if records.has_unresolved_intent(task_id) {
+                Some(
+                    "the host recorded a spawn intent for this task and never proved whether it \
+                     launched"
+                        .into(),
+                )
+            } else if records
+                .task(task_id)
+                .is_some_and(|task| task.process_may_still_exist())
+            {
+                Some("the host was lost and this task's process may still be running".into())
+            } else if records.intents_outstanding() {
                 Some("a spawn intent is unresolved: this task may have been launched".into())
             } else if records.has_task(task_id) {
                 Some("the host admitted this task and never reported its exit".into())
@@ -248,12 +312,14 @@ async fn journal_command(
 
     let config = leveler_app::execution_host_config(layout)?;
     let journal = SettlementJournal::open(&config.semantic_dir()).map_err(anyhow::Error::msg)?;
-    let records = HostRecords::read(&config.state_dir).map_err(anyhow::Error::msg)?;
     let host = match ExecutionHostClient::probe(&config).await {
-        Ok(Some(_)) => HostLiveness::Live,
-        Ok(None) => HostLiveness::Absent,
+        Ok(probed) if probed.client.is_some() => HostLiveness::Live,
+        Ok(_) => HostLiveness::Absent,
         Err(error) => HostLiveness::Unknown(error),
     };
+    // Read after the probe: recovery may have archived an intent or converged a
+    // task, and this report must describe the records a decision would use.
+    let records = HostRecords::read(&config.state_dir).map_err(anyhow::Error::msg)?;
     let pending = journal.pending().map_err(anyhow::Error::msg)?;
 
     match command {

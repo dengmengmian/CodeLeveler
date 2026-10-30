@@ -137,8 +137,8 @@ fn the_registry_enforces_no_authorization_policy() {
 ///
 /// It carries the execution substrate this call is anchored to, the per-call
 /// authority, and the session identity. It used to carry a `ToolServices`
-/// facet holding the language-server pool, the browser runtime, the memory
-/// root, the artifact store and the background task registry — so `read_file`
+/// facet holding the language-server pool, the browser runtime,
+/// the artifact store and the background task registry — so `read_file`
 /// was handed the browser and `grep` could start a language server. Every tool
 /// is constructed with the handles it uses instead.
 #[test]
@@ -147,7 +147,6 @@ fn the_tool_context_carries_no_capability_handles() {
         "ToolServices",
         "lsp_sessions",
         "lsp_start_locks",
-        "memory_root",
         "background_tasks",
         "artifact_store",
         "browser:",

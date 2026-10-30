@@ -32,6 +32,37 @@ pub(crate) enum RequirementKind {
     Named,
     /// The user explicitly required the test suite to pass.
     Tests,
+    /// The user forbade something (`禁止实现支付功能`, `不要新增第三方登录`).
+    ///
+    /// A prohibition is a constraint on HOW the work is done, never a
+    /// deliverable: it has no artifact to produce and no mechanical check that
+    /// could prove it, so it can neither be covered by an acceptance check nor
+    /// be accounted as `done`. It stays in the requirement set because the user
+    /// said it and the model must still see it, and it is surfaced to the model
+    /// as a constraint rather than as work.
+    Forbidden,
+}
+
+impl RequirementKind {
+    /// Whether this kind is a deliverable the runtime can hold the model to.
+    ///
+    /// Only `false` for [`Self::Forbidden`]: everything else names something
+    /// the user asked to exist, run, or pass.
+    pub(crate) fn is_deliverable(self) -> bool {
+        !matches!(self, Self::Forbidden)
+    }
+
+    /// Human-readable class for tool results and diagnostics.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Artifact { removed: false } => "artifact",
+            Self::Artifact { removed: true } => "absent-artifact",
+            Self::Command => "command",
+            Self::Named => "deliverable",
+            Self::Tests => "tests",
+            Self::Forbidden => "forbidden",
+        }
+    }
 }
 
 /// Where the requirement came from. The text is the user's own words.
@@ -331,7 +362,29 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
 
     let mut tests_demanded = test_demanded(objective);
     for amendment in amendments {
-        let segments = split_segments(amendment);
+        // A question is not a scope instruction by itself. "测试通过了吗？" asks
+        // about the work; reading it as a NEW test demand would let a status
+        // question change the acceptance the paused goal must still satisfy.
+        // But a request keeps its authority in question form ("能不能顺便把
+        // X 也补上？"), so the message is read clause by clause: the query part
+        // adds nothing, the request part still does. A waiver is only read
+        // from a message that does not ask — "阶段 2 可以先不做吗？" is not a
+        // waiver until the user says so, and dropping a requirement on a
+        // question would weaken acceptance without the user's authority. The
+        // objective itself is always a request, so only later amendments are
+        // split here.
+        let segments: Vec<String> = split_segments(amendment)
+            .into_iter()
+            .filter(|segment| !question_form(segment))
+            .collect();
+        let asked: Vec<String> = split_segments(amendment)
+            .into_iter()
+            .filter(|segment| question_form(segment))
+            .flat_map(|segment| request_clauses(&segment))
+            .collect();
+        if segments.is_empty() && asked.is_empty() {
+            continue;
+        }
         // The user's waiver is authority: it removes a requirement before the
         // amendment's own deliverables are extracted. Scope the waiver to its
         // own clause: "B、C 暂时不做，这次只交付 A" must not waive A.
@@ -361,6 +414,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
                     .collect::<Vec<_>>()
                     .join(", ")
             })
+            .chain(asked)
             .collect::<Vec<_>>()
             .join("\n");
         if test_demanded(&kept) {
@@ -417,6 +471,117 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
     requirements
 }
 
+/// Whether recording `text` as one more user amendment changes the goal's
+/// effective requirement set.
+///
+/// This is the runtime's ONE reading of "does this message name work?", and it
+/// is the same [`extract`] the acceptance gate uses. A status question, a
+/// consultation, a bare `继续` and a restatement all leave the set identical.
+/// A new deliverable, a prohibition, or an explicit waiver changes it.
+///
+/// It decides scope only. It never authorizes execution, never releases a
+/// pause, and never judges completion.
+pub(crate) fn changes_scope(objective: &str, amendments: &[String], text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let mut extended = amendments.to_vec();
+    extended.push(text.to_string());
+    requirement_set(&extract(objective, amendments))
+        != requirement_set(&extract(objective, &extended))
+}
+
+/// Whether one user message must join the goal's durable instruction
+/// sequence, as the instruction of a GOAL window.
+///
+/// That sequence is the user's own words, and the runtime reads two different
+/// facts from it:
+///
+/// - SCOPE ([`changes_scope`]): the requirements the acceptance gate holds the
+///   model to, including a prohibition the user stated while addressing the
+///   goal;
+/// - AUTHORIZATION ([`leveler_lifecycle::latest_authorization_signal`]): the
+///   user's newest pause or continuation, which is the only thing that
+///   releases a pause the user set.
+///
+/// A status question is neither, so it is not recorded and cannot pollute
+/// either reading.
+pub(crate) fn is_goal_instruction(objective: &str, amendments: &[String], text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    changes_scope(objective, amendments, text) || changes_authorization(objective, amendments, text)
+}
+
+/// Whether one CHAT message joins the durable instruction sequence of the goal
+/// this task still owes.
+///
+/// A Chat turn is not the goal's window. The user can ask a side question, or
+/// state a constraint for that one request (`只回答，不要改任何文件`), without
+/// binding the goal to it forever — a prohibition remembered as the goal's own
+/// would later stop the goal's authorized work. So a Chat message joins the
+/// goal only when it changes the DELIVERABLE set: work added, or work the user
+/// explicitly waived. Anything else still reaches the model inside that turn,
+/// and the model records it by committing the work (`commit_task`), which goes
+/// through the goal-window reading above.
+pub(crate) fn is_chat_goal_instruction(objective: &str, amendments: &[String], text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    changes_work(objective, amendments, text) || changes_authorization(objective, amendments, text)
+}
+
+/// Whether the newest pause/continuation directive changed.
+fn changes_authorization(objective: &str, amendments: &[String], text: &str) -> bool {
+    let signal = |extra: Option<&str>| {
+        leveler_lifecycle::latest_authorization_signal(
+            std::iter::once(objective)
+                .chain(amendments.iter().map(String::as_str))
+                .chain(extra),
+        )
+    };
+    signal(None) != signal(Some(text))
+}
+
+/// Whether the DELIVERABLE part of the requirement set changed. A prohibition
+/// alone does not count: it constrains how work is done, not what is owed.
+pub(crate) fn changes_work(objective: &str, amendments: &[String], text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let mut extended = amendments.to_vec();
+    extended.push(text.to_string());
+    deliverable_set(&extract(objective, amendments))
+        != deliverable_set(&extract(objective, &extended))
+}
+
+/// The identity of a requirement set, ignoring the positional `R<n>` ids that
+/// [`extract`] assigns.
+fn requirement_set(requirements: &[Requirement]) -> Vec<(String, &'static str)> {
+    let mut set: Vec<(String, &'static str)> = requirements
+        .iter()
+        .map(|requirement| (normalize(&requirement.text), requirement.kind.label()))
+        .collect();
+    set.sort();
+    set
+}
+
+/// The deliverables of a requirement set, ignoring positional ids and
+/// prohibitions.
+fn deliverable_set(requirements: &[Requirement]) -> Vec<(String, &'static str)> {
+    let mut set: Vec<(String, &'static str)> = requirements
+        .iter()
+        .filter(|requirement| requirement.kind.is_deliverable())
+        .map(|requirement| (normalize(&requirement.text), requirement.kind.label()))
+        .collect();
+    set.sort();
+    set
+}
+
 /// Acceptance checks the model's `commit_task` declaration is missing.
 ///
 /// Matching is token containment over the user's own wording: the model is
@@ -427,7 +592,13 @@ pub(crate) fn uncovered(requirements: &[Requirement], acceptance: &[String]) -> 
     requirements
         .iter()
         .filter(|requirement| match requirement.kind {
+            // A prohibition has no deliverable to name; requiring a check for
+            // it would ask the model to "prove" a negative and made
+            // `commit_task` refuse honest contracts for things the user asked
+            // NOT to be built.
+            RequirementKind::Forbidden => false,
             RequirementKind::Tests => !checks.iter().any(|check| mentions_tests(check)),
+            RequirementKind::Named => !covers_named(&checks, &requirement.text),
             _ => {
                 let need = normalize(&requirement.text);
                 !checks.iter().any(|check| covers(check, &need))
@@ -437,9 +608,21 @@ pub(crate) fn uncovered(requirements: &[Requirement], acceptance: &[String]) -> 
         .collect()
 }
 
+/// The most accounting entries one `update_goal` call may carry.
+///
+/// It is a bound on the tool payload, not a statement about how much work a
+/// user may ask for: the caller passes `max(requirement count, this floor)`,
+/// so a legitimate long task can always account for every requirement it has.
+pub(crate) const MIN_ACCOUNTING_ENTRIES: usize = 20;
+
 /// Parse the optional `requirements` accounting array from `update_goal`.
+///
+/// `limit` exists so the cap can follow the requirement set: a fixed 20 made a
+/// goal with 21 extracted requirements impossible to complete, because every
+/// requirement needs its own account and the array could not hold them.
 pub(crate) fn parse_accounting(
     arguments: &serde_json::Value,
+    limit: usize,
 ) -> Result<Option<Vec<RequirementAccount>>, String> {
     let Some(value) = arguments.get("requirements") else {
         return Ok(None);
@@ -450,8 +633,11 @@ pub(crate) fn parse_accounting(
                 .to_string(),
         );
     };
-    if items.len() > 20 {
-        return Err("`requirements` may list at most 20 entries".to_string());
+    let limit = limit.max(MIN_ACCOUNTING_ENTRIES);
+    if items.len() > limit {
+        return Err(format!(
+            "`requirements` may list at most {limit} entries; group related checks or account              for the requirements the user actually stated"
+        ));
     }
     let mut accounts = Vec::with_capacity(items.len());
     for item in items {
@@ -509,6 +695,11 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
 
     for requirement in facts.requirements {
         match requirement.kind {
+            // Nothing is owed for a prohibition: it constrains how the work is
+            // done and is enforced by the tool/authority boundary, not by a
+            // completion account. It cannot be "done" and must not be reported
+            // as an unaccounted deliverable either.
+            RequirementKind::Forbidden => {}
             RequirementKind::Tests => {
                 let Some(fresh) =
                     facts.runs.iter().rev().find(|run| {
@@ -605,25 +796,41 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
                 }
             }
             RequirementKind::Named => {
-                let Some(account) = find_account(accounting, requirement) else {
+                // Symmetric with the commit gate: a phrase the user listed as
+                // several deliverables can be accounted by one entry naming
+                // it or by one entry per part. Reading it only as the literal
+                // joined phrase refused an account the same model was told to
+                // write at commit time.
+                let Some(accounts) = covering_accounts(accounting, &requirement.text) else {
                     refusals.push(unaccounted(requirement));
                     continue;
                 };
-                match account.status {
-                    AccountStatus::NotDone => refusals.push(format!(
+                // An admitted gap outranks an unverified claim, which outranks
+                // a plain done claim; one part is not done, so the phrase is
+                // not done.
+                if let Some(not_done) = accounts
+                    .iter()
+                    .find(|account| account.status == AccountStatus::NotDone)
+                {
+                    refusals.push(format!(
                         "`{}` is accounted not_done ({})",
-                        requirement.text, account.evidence
-                    )),
-                    AccountStatus::Unverifiable => warnings.push(format!(
+                        requirement.text, not_done.evidence
+                    ));
+                } else if let Some(unverifiable) = accounts
+                    .iter()
+                    .find(|account| account.status == AccountStatus::Unverifiable)
+                {
+                    warnings.push(format!(
                         "requirement `{}` is explicitly unverifiable ({}); the completion carries \
                          an unverified boundary",
-                        requirement.text, account.evidence
-                    )),
-                    AccountStatus::Done => warnings.push(format!(
+                        requirement.text, unverifiable.evidence
+                    ));
+                } else {
+                    warnings.push(format!(
                         "requirement `{}` is reported done but has no mechanical check; the \
                          completion rests on the model's account, not runtime evidence",
                         requirement.text
-                    )),
+                    ));
                 }
             }
         }
@@ -682,7 +889,11 @@ fn find_account<'a>(
             // and without it the requirement could never be accounted for.
             return accounted == need;
         }
-        covers(&accounted, &need) || covers(&normalize(&account.evidence), &need)
+        covers(&accounted, &need)
+            || covers(&normalize(&account.evidence), &need)
+            || strip_counted_summary(&need).is_some_and(|stem| {
+                covers(&accounted, stem) || covers(&normalize(&account.evidence), stem)
+            })
     })
 }
 
@@ -691,6 +902,195 @@ fn find_account<'a>(
 /// user's deliverable.
 fn covers(check: &str, requirement: &str) -> bool {
     requirement.chars().count() >= 2 && check.contains(requirement)
+}
+
+/// Generic category nouns a user appends after a counted list
+/// (`…、内容权限校验三个功能`). The count and the category describe the list; they
+/// are not part of the last deliverable's name, and a check that names the
+/// deliverable does cover it.
+const COUNTED_CATEGORY_NOUNS: &[&str] = &[
+    "功能", "能力", "模块", "需求", "任务", "页面", "接口", "业务", "流程", "系统",
+];
+
+/// Classifiers that turn a number into a counted phrase (`三个`, `2项`, `三种`).
+const COUNT_CLASSIFIERS: &[&str] = &["个", "项", "条", "种", "类", "块"];
+
+const CJK_NUMERALS: &[char] = &[
+    '一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '百', '千', '万', '两', '零',
+];
+
+/// The deliverable with a trailing counted summary removed.
+///
+/// `内容权限校验三个功能` names `内容权限校验`: the trailing `三个功能` counts the list
+/// it ends, and a check (`内容权限校验覆盖作者与管理员`) that names the deliverable
+/// must not be refused because it does not repeat the count. The rule is
+/// structural — a trailing generic category noun, prefixed by a numeral and a
+/// classifier — and it only ever REMOVES a suffix, so it can only add ways to
+/// cover a requirement, never weaken the requirement the user stated.
+///
+/// A short stem is refused: `支持三种登录方式` keeps its text because `方式` is not
+/// a counted category noun, and because a two-character stem (`支持`) would let
+/// any check containing the verb stand in for the deliverable.
+fn strip_counted_summary(text: &str) -> Option<&str> {
+    let text = text.trim();
+    for noun in COUNTED_CATEGORY_NOUNS {
+        let Some(head) = text.strip_suffix(noun) else {
+            continue;
+        };
+        let head = head.trim_end();
+        let Some((classifier_at, classifier)) = head.char_indices().next_back() else {
+            continue;
+        };
+        if !COUNT_CLASSIFIERS
+            .iter()
+            .any(|candidate| *candidate == classifier.to_string())
+        {
+            continue;
+        }
+        let before_classifier = &head[..classifier_at];
+        let digits_len: usize = before_classifier
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || CJK_NUMERALS.contains(c))
+            .map(char::len_utf8)
+            .sum();
+        if digits_len == 0 {
+            continue;
+        }
+        let stem = &before_classifier[..before_classifier.len() - digits_len];
+        let stem =
+            stem.trim_end_matches(|c: char| c.is_whitespace() || "，,、。；;：:".contains(c));
+        if stem.chars().count() >= 4 {
+            return Some(stem);
+        }
+    }
+    None
+}
+
+/// The parts a user's deliverable phrase can be named by separately.
+///
+/// One extracted item can carry the rest of a list ("文章、讨论和评论界面"
+/// extracts `文章` and `讨论和评论界面`). A model that names each part has
+/// covered the phrase; demanding the literal concatenation refused honest
+/// contracts.
+///
+/// The reading is structural, and it can only ADD a way to cover the phrase:
+/// the literal phrase is always accepted too, and every part is a substring of
+/// it, so a check that names the phrase also names every part. What the split
+/// must not do is invent parts inside one word:
+///
+/// - explicit list punctuation (`、` `，` `,` `；` `;`) always separates;
+/// - a conjunction (`和` `与` `及`) separates only in coordinator position —
+///   between two parts that already have at least two characters on each side,
+///   so `和平协议`, `及时通知` and `总和与均值` keep their first character;
+/// - `/` and `+` never separate: inside a user-named deliverable they are a
+///   technical token (`CI/CD`, `TCP/IP`, `HTTP/2`), and splitting them made
+///   `ci` and `cd` into requirements that any unrelated check could satisfy.
+fn named_parts(need: &str) -> Vec<String> {
+    let chars: Vec<char> = need.chars().collect();
+    let separator = |index: usize| {
+        let ch = chars[index];
+        if matches!(ch, '、' | '，' | ',' | '；' | ';') {
+            return true;
+        }
+        if !matches!(ch, '和' | '与' | '及') {
+            return false;
+        }
+        // Coordinator position: at least two characters of a part on each
+        // side since the previous separator. A conjunction that opens a word
+        // (`和平`), follows a single character (`总和`), or ends the phrase is
+        // part of that word, not a list.
+        let left = chars[..index]
+            .iter()
+            .rev()
+            .take_while(|c| !matches!(**c, '、' | '，' | ',' | '；' | ';'))
+            .count();
+        let right = chars[index + 1..]
+            .iter()
+            .take_while(|c| !matches!(**c, '、' | '，' | ',' | '；' | ';'))
+            .count();
+        left >= 2 && right >= 2
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (index, ch) in chars.iter().enumerate() {
+        if separator(index) {
+            parts.push(std::mem::take(&mut current));
+            continue;
+        }
+        current.push(*ch);
+    }
+    parts.push(current);
+    parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| part.chars().count() >= 2)
+        .collect()
+}
+
+/// Whether checks cover a named deliverable: the phrase itself, or each of
+/// its parts.
+fn covers_named(checks: &[String], requirement: &str) -> bool {
+    let need = normalize(requirement);
+    let names = |wanted: &str| {
+        checks.iter().any(|check| {
+            covers(check, wanted)
+                || strip_counted_summary(wanted).is_some_and(|stem| covers(check, stem))
+        })
+    };
+    if names(&need) {
+        return true;
+    }
+    let parts = named_parts(&need);
+    parts.len() >= 2 && parts.iter().all(|part| names(part))
+}
+
+/// The completion accounts that cover one named deliverable, or `None` when
+/// some part of the phrase was never accounted for.
+///
+/// This is the completion-side twin of [`covers_named`]: the runtime cannot
+/// accept per-part acceptance checks at `commit_task` and then demand a single
+/// joined accounting entry at `update_goal(complete)`.
+fn covering_accounts<'a>(
+    accounts: &'a [RequirementAccount],
+    requirement: &str,
+) -> Option<Vec<&'a RequirementAccount>> {
+    let need = normalize(requirement);
+    let names = |account: &RequirementAccount, wanted: &str| {
+        // Containment cannot match a one-character requirement: every account
+        // contains it. Exact identity is the only honest match.
+        if wanted.chars().count() < 2 {
+            return normalize(&account.requirement) == wanted;
+        }
+        covers(&normalize(&account.requirement), wanted)
+            || covers(&normalize(&account.evidence), wanted)
+            || strip_counted_summary(wanted).is_some_and(|stem| {
+                covers(&normalize(&account.requirement), stem)
+                    || covers(&normalize(&account.evidence), stem)
+            })
+    };
+    let direct: Vec<&RequirementAccount> = accounts
+        .iter()
+        .filter(|account| names(account, &need))
+        .collect();
+    if !direct.is_empty() {
+        return Some(direct);
+    }
+    let parts = named_parts(&need);
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut covering: Vec<&RequirementAccount> = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let account = accounts.iter().find(|account| names(account, part))?;
+        if !covering
+            .iter()
+            .any(|existing| std::ptr::eq(*existing, account))
+        {
+            covering.push(account);
+        }
+    }
+    Some(covering)
 }
 
 fn mentions_tests(text: &str) -> bool {
@@ -715,7 +1115,86 @@ fn collect_segments(
             continue;
         }
         collect_segment(segment, source, out);
+        collect_constraint_clauses(segment, source, out);
     }
+}
+
+/// Prohibitions written as a standalone constraint clause, not as a bullet
+/// under a heading.
+///
+/// A user may state `约束：禁止新增第三方依赖，禁止修改 … 以外的文件` in one
+/// prose sentence. The requirement extractor only enumerated list items, so
+/// those constraints were visible in the objective but absent from the
+/// structured scope the model is shown at `commit_task`. They stay
+/// `Forbidden` (no deliverable, no acceptance check, no completion account):
+/// this records the constraint, never a gate over it.
+fn collect_constraint_clauses(
+    text: &str,
+    source: &RequirementSource,
+    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+) {
+    for sentence in text.split(['\n', '。', '；', ';']) {
+        let sentence = sentence.trim();
+        let sentence = strip_constraint_label(sentence);
+        if !starts_with_prohibition(sentence) {
+            continue;
+        }
+        // A comma inside a constraint clause separates independent
+        // prohibitions. Splitting only when the next part ALSO opens with a
+        // prohibition keeps `禁止修改 a 和 b` whole instead of manufacturing a
+        // second requirement out of its object.
+        for part in sentence.split(['，', ',']) {
+            let part = part.trim();
+            if !starts_with_prohibition(part) {
+                continue;
+            }
+            let Some(text) = clean_item(part) else {
+                continue;
+            };
+            out.push((text, RequirementKind::Forbidden, source.clone()));
+        }
+    }
+}
+
+fn strip_constraint_label(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    for label in [
+        "约束：",
+        "约束:",
+        "禁止事项：",
+        "禁止事项:",
+        "Constraints:",
+        "Constraints：",
+        "Constraint:",
+        "Constraint：",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(label) {
+            return rest.trim_start();
+        }
+    }
+    trimmed
+}
+
+fn starts_with_prohibition(text: &str) -> bool {
+    let text = strip_list_marker(text);
+    let text = strip_constraint_label(&text);
+    let lower = text.to_lowercase();
+    [
+        "禁止",
+        "严禁",
+        "不得",
+        "不允许",
+        "不要",
+        "不能",
+        "别",
+        "must not",
+        "may not",
+        "do not",
+        "don't",
+        "never",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 fn split_segments(text: &str) -> Vec<String> {
@@ -765,7 +1244,25 @@ fn collect_segment(
     let segment = strip_fenced_blocks(segment);
     collect_backticks(&segment, source, out);
     collect_paths(&segment, source, out);
-    collect_enumerations(&segment, source, out);
+    // An ATX heading (`## 一、项目目标`) is document structure. Its title names
+    // a section, not a deliverable the user enumerated. Splitting it at `、`
+    // produced requirements like `## 一`, which no honest acceptance list can
+    // cover. Paths and inline-code tokens above still count when a heading
+    // names a real artifact.
+    if !is_markdown_heading(&segment) {
+        collect_enumerations(&segment, source, out);
+    }
+}
+
+/// An ATX Markdown heading: one to six `#` followed by whitespace.
+fn is_markdown_heading(segment: &str) -> bool {
+    let trimmed = segment.trim_start();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    (1..=6).contains(&hashes)
+        && trimmed[hashes..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
 }
 
 /// Fenced code is quoted material, not the user's instruction.
@@ -900,12 +1397,28 @@ fn collect_enumerations(
         Some((head, tail)) if has_any(head, DELIVERY_VERBS) => tail,
         _ => segment,
     };
-    let ideographic: Vec<&str> = enumerated.split('、').collect();
-    if ideographic.len() >= 2 {
+    // An ideographic-comma list is an enumeration only when the clause that
+    // holds it is itself a delivery instruction. Splitting every `、` turned
+    // descriptive phrases into requirements: `把文章、讨论、评论三条业务链路做成
+    // 闭环` yielded the fragments `文章`, `讨论`, and `评论三条业务链路做成闭环`,
+    // none of which the user asked for as separate deliverables — and the
+    // fragments could never be covered, so `commit_task` refused an honest
+    // contract. The gate is STRUCTURAL (does this clause start with an
+    // instruction to deliver?) not a word list about what the list "means".
+    let mut enumerated_ideographically = false;
+    for clause in enumerated.split([',', '，']) {
+        if !starts_with_delivery_instruction(clause) {
+            continue;
+        }
+        let ideographic: Vec<&str> = clause.split('、').collect();
+        if ideographic.len() < 2 {
+            continue;
+        }
+        enumerated_ideographically = true;
         items.extend(ideographic.iter().map(|item| (*item).to_string()));
     }
     if let Some((head, tail)) = segment.rsplit_once(['：', ':'])
-        && ideographic.len() < 2
+        && !enumerated_ideographically
         && has_any(head, DELIVERY_VERBS)
     {
         // Chinese lists use `、`, not commas. A Chinese comma after a colon
@@ -928,6 +1441,10 @@ fn collect_enumerations(
     }
 
     for item in items {
+        // A prohibition is a constraint the user stated, not work to deliver.
+        // It keeps its own kind so neither `commit_task` coverage nor the
+        // completion account can ever treat it as a finished deliverable.
+        let forbidden = is_prohibition(&item);
         let Some(text) = clean_item(&item) else {
             continue;
         };
@@ -940,8 +1457,58 @@ fn collect_enumerations(
         {
             continue;
         }
-        out.push((text, RequirementKind::Named, source.clone()));
+        let kind = if forbidden {
+            RequirementKind::Forbidden
+        } else {
+            RequirementKind::Named
+        };
+        out.push((text, kind, source.clone()));
     }
+}
+
+/// Whether a clause opens with an instruction to produce something.
+///
+/// The clause may start with a list marker (`1.`, `-`), then an obligation
+/// word (`必须`), then the delivery verb. Anything else — a background clause,
+/// a permission clause, a continuation such as `包括…` — is not an
+/// enumeration of deliverables.
+fn starts_with_delivery_instruction(clause: &str) -> bool {
+    let text = strip_list_marker(clause);
+    let after_obligation = strip_obligation_prefix(&text);
+    DELIVERY_VERBS
+        .iter()
+        .any(|verb| after_obligation.starts_with(verb))
+}
+
+/// Remove one leading obligation word (`必须`, `需要`, `must`) if present.
+fn strip_obligation_prefix(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    for marker in OBLIGATION_CJK.iter().chain(OBLIGATION_ASCII) {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return rest.trim_start_matches(|c: char| c.is_whitespace() || c == '：' || c == ':');
+        }
+    }
+    trimmed
+}
+
+/// Remove a leading list marker (`-`, `*`, `1.`, `(1)`, `一、`) from a clause.
+fn strip_list_marker(clause: &str) -> String {
+    bullet_item(clause).unwrap_or_else(|| clause.trim_start().to_string())
+}
+
+/// Whether the user is forbidding something rather than asking for it.
+///
+/// Reuses the same negation vocabulary that already guards test demands and
+/// path removal, plus the explicit prohibition words that have no other
+/// reading. A reminder (`不要忘记…`) is a demand and is excluded first.
+fn is_prohibition(text: &str) -> bool {
+    if has_any(text, WAIVER_GUARDS) {
+        return false;
+    }
+    has_any(
+        text,
+        &["不得", "严禁", "不允许", "must not", "may not", "mustn't"],
+    ) || segment_is_negated(text)
 }
 
 /// Distinguishes `Artifact { removed: true }` from `Artifact { removed: false }`;
@@ -953,6 +1520,7 @@ fn kind_key(kind: RequirementKind) -> u8 {
         RequirementKind::Command => 2,
         RequirementKind::Named => 3,
         RequirementKind::Tests => 4,
+        RequirementKind::Forbidden => 5,
     }
 }
 
@@ -1172,6 +1740,208 @@ fn is_waiver(segment: &str) -> bool {
         return false;
     }
     has_any(segment, WAIVER_MARKERS)
+}
+
+/// Whether the clause asks something rather than instructs.
+///
+/// A question mark is one form; Chinese and English also ask without one
+/// ("测试通过了吗", "刚才改了哪些文件", "What changed?"). This is a *shape*
+/// test only: it says the clause needs its intent read, not that it is
+/// irrelevant.
+fn question_form(segment: &str) -> bool {
+    let trimmed = trim_trailing_punctuation(segment);
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.ends_with('?')
+        || trimmed.ends_with('？')
+        || trimmed.ends_with('吗')
+        || trimmed.ends_with('么')
+        || trimmed.ends_with('呢')
+        || has_any(trimmed, QUESTION_WORDS_CJK)
+        || QUESTION_WORDS_ASCII
+            .iter()
+            .any(|word| lower.starts_with(word) || lower.contains(&format!(" {word}")))
+}
+
+fn trim_trailing_punctuation(text: &str) -> &str {
+    text.trim()
+        .trim_end_matches(['"', '\'', '”', '’', '）', ')', ']', '】'])
+        .trim_end()
+}
+
+/// Question form, minus the words that state the question's kind.
+const QUESTION_WORDS_CJK: &[&str] = &[
+    "是否",
+    "有没有",
+    "为什么",
+    "怎么",
+    "哪些",
+    "哪个",
+    "哪里",
+    "哪儿",
+    "多少",
+    "什么",
+];
+
+const QUESTION_WORDS_ASCII: &[&str] = &[
+    "what", "which", "who", "where", "when", "why", "how", "did", "does", "do ", "have", "has",
+    "was", "were", "is ", "are ", "can ", "could ", "should ", "would ", "will ",
+];
+
+/// Phrases that ask for advice about work instead of asking for the work.
+const CONSULTATION_CJK: &[&str] = &[
+    "如果",
+    "假如",
+    "假设",
+    "要是",
+    "若是",
+    "万一",
+    "有什么影响",
+    "有何影响",
+    "会有什么后果",
+    "有什么风险",
+    "有什么问题",
+    "是否值得",
+    "值不值得",
+    "有没有必要",
+    "是否有必要",
+    "需不需要",
+    "要不要",
+    "该不该",
+    "是否应该",
+];
+
+const CONSULTATION_ASCII: &[&str] = &[
+    "what if",
+    "what would happen",
+    "would it",
+    "is it necessary",
+    "is it worth",
+    "do we need",
+    "should we",
+    "how would",
+    "could we instead",
+    "what are the risks",
+    "any impact",
+];
+
+/// Phrases that ask about the state of work that already exists.
+const STATUS_CJK: &[&str] = &[
+    "了吗",
+    "了么",
+    "了没",
+    "过吗",
+    "好了没",
+    "做完没",
+    "哪些",
+    "哪里",
+    "哪儿",
+    "怎么样",
+    "进度",
+    "情况如何",
+    "什么情况",
+    "当前状态",
+    "现状",
+    "跑过",
+    "测试过",
+    "是否已经",
+    "是否已",
+    "有没有完成",
+    "有没有通过",
+    "有没有跑",
+    "是否完成",
+    "是否通过",
+];
+
+const STATUS_ASCII: &[&str] = &[
+    "passed",
+    "failed so far",
+    "changed",
+    "modified",
+    "done yet",
+    "finished yet",
+    "so far",
+    "status",
+    "progress",
+    "test result",
+    "did the tests",
+    "tests pass",
+    "tests passed",
+    "test pass",
+    "all tests pass",
+    "did you",
+    "have you",
+];
+
+/// Whether the clause is one the user wants work done for.
+///
+/// The default for an unclassified question is `true`: dropping a clause only
+/// because of its punctuation is the mistake this guards. A clause is skipped
+/// only when it demonstrably asks for information, discusses a hypothetical,
+/// or changes the execution authorization — and an authorization change is the
+/// lifecycle's fact, not a deliverable.
+fn carries_scope(clause: &str) -> bool {
+    let clause = clause.trim();
+    if clause.is_empty() {
+        return false;
+    }
+    if is_execution_authorization(clause) {
+        return false;
+    }
+    let lower = clause.to_ascii_lowercase();
+    if has_any(clause, CONSULTATION_CJK)
+        || CONSULTATION_ASCII.iter().any(|word| lower.contains(word))
+    {
+        return false;
+    }
+    !is_status_query(clause)
+}
+
+fn is_status_query(clause: &str) -> bool {
+    let lower = clause.to_ascii_lowercase();
+    has_any(clause, STATUS_CJK) || STATUS_ASCII.iter().any(|word| lower.contains(word))
+}
+
+/// A clause that changes the user's execution authorization instead of naming
+/// work: pausing, releasing, or waiving a stage. Those are read by
+/// [`leveler_lifecycle`], never as acceptance scope.
+fn is_execution_authorization(clause: &str) -> bool {
+    leveler_lifecycle::extract_user_pause(clause).is_some()
+        || leveler_lifecycle::authorizes_continuation(clause)
+        || (is_waiver(clause)
+            && has_any(
+                clause,
+                &["阶段", "步骤", "stage", "phase", "step", "继续", "continue"],
+            ))
+}
+
+/// The parts of a question-form message that ask for work.
+///
+/// Splitting follows the clauses the person wrote (commas, sentence ends, and
+/// question marks) so a mixed message keeps both halves: "测试通过了吗？能不能
+/// 顺便把 X 也补上？" contains a status query and a request, and only the
+/// request names work.
+fn request_clauses(question: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let mut current = String::new();
+    for c in question.chars() {
+        if matches!(
+            c,
+            '，' | ',' | '。' | '；' | ';' | '？' | '?' | '！' | '!' | '\n'
+        ) {
+            let clause = current.trim();
+            if carries_scope(clause) {
+                clauses.push(clause.to_string());
+            }
+            current.clear();
+            continue;
+        }
+        current.push(c);
+    }
+    let clause = current.trim();
+    if carries_scope(clause) {
+        clauses.push(clause.to_string());
+    }
+    clauses
 }
 
 fn test_demanded(text: &str) -> bool {
@@ -1487,14 +2257,36 @@ fn bullet_item(segment: &str) -> Option<String> {
 }
 
 fn clean_item(raw: &str) -> Option<String> {
+    // A list marker is presentation, not part of the deliverable. An item that
+    // kept its `1.` prefix and also appeared without it would be extracted
+    // twice, and the numbered spelling could never be covered.
+    let raw = strip_list_marker(raw);
+    let raw = raw.as_str();
     // Keep only the leading clause of an item: a following comma usually
     // starts a new instruction, not part of the deliverable's name.
     let head = raw
-        .split(['，', ',', '。', '；', ';', '：', ':'])
+        .split(['，', ',', '。', '；', ';'])
         .next()
         .unwrap_or(raw);
-    let head = match head.rsplit_once(['：', ':']) {
-        Some((before, after)) if has_any(before, DELIVERY_VERBS) => after.trim(),
+    // A colon is NOT a clause boundary when it separates a short label from the
+    // instruction that follows it: `阶段 2：在 app.py 增加 articles_by_author`
+    // names the stage, and the deliverable is what the stage asks for. Splitting
+    // first kept only the label (`阶段 2`) and demanded an acceptance check for a
+    // section title that no honest list contains.
+    let head = match head.split_once(['：', ':']) {
+        // A short label in front of the instruction is a section name
+        // (`阶段 2：在 app.py 增加 …`); the deliverable is what follows.
+        Some((label, rest))
+            if label.chars().count() <= 24
+                && !has_any(label, DELIVERY_VERBS)
+                && has_any(rest, DELIVERY_VERBS) =>
+        {
+            rest.trim()
+        }
+        // Otherwise a colon after a delivery verb introduces the details of the
+        // deliverable itself (`实现内容权限校验：作者可编辑，管理员可下架`): the
+        // deliverable is the part before the details.
+        Some((before, _)) if has_any(before, DELIVERY_VERBS) => before.trim(),
         _ => head.trim(),
     };
     let mut text = head.trim_matches(|c: char| {
@@ -1578,7 +2370,120 @@ mod tests {
         }
     }
 
-    /// The exact DF-22 shape: three named stage files plus a named command.
+    /// The one reading that decides whether a user message joins the goal's
+    /// durable instruction sequence. Scope and authorization are two separate
+    /// facts read from the same words, and neither is a keyword match.
+    #[test]
+    fn only_an_instruction_joins_the_goal_sequence() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。\
+             阶段 1 完成后停下，等待我确认再执行阶段 2。";
+        let recorded: Vec<String> = Vec::new();
+
+        // Scope: a real deliverable, in statement or in question form.
+        for text in [
+            "顺便把 src/permissions.rs 的评论权限校验也补上。",
+            "能不能顺便把 src/comment_acl.rs 也补上？",
+        ] {
+            assert!(
+                changes_scope(objective, &recorded, text),
+                "a new deliverable is a scope change: {text}"
+            );
+            assert!(is_goal_instruction(objective, &recorded, text));
+        }
+        // A waiver is the user's authority to shrink scope.
+        assert!(changes_scope(
+            objective,
+            &recorded,
+            "stage-2.txt 暂时不做。"
+        ));
+        // Authorization: neither adds or removes a requirement, but the
+        // newest directive is what releases (or re-sets) the pause.
+        // The sequence is read as a SIGNAL, so a repeat of the pause the
+        // objective already states adds nothing, while a new directive on an
+        // otherwise un-paused goal does.
+        let open = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        for text in ["确认，继续阶段 2。", "先停在这里，等我确认。"] {
+            assert!(
+                is_goal_instruction(open, &recorded, text),
+                "an authorization change is durable with its goal: {text}"
+            );
+        }
+        assert!(
+            !is_goal_instruction(objective, &recorded, "先停在这里，等我确认。"),
+            "a repeated pause changes no authorization fact"
+        );
+        // Nothing at all: a status question, a consultation, a restatement.
+        for text in [
+            "刚才修改了哪些文件？测试通过了吗？现在进度怎么样？",
+            "如果增加 src/permissions.rs 的校验，会有什么影响？",
+            "阶段 2 可以先不做吗？",
+            "创建 stage-1.txt，最后运行 sh ./verify.sh。阶段 1 完成后停下，等待我确认再执行阶段 2。",
+        ] {
+            assert!(
+                !changes_scope(objective, &recorded, text),
+                "no requirement changed: {text}"
+            );
+            assert!(
+                !is_goal_instruction(objective, &recorded, text),
+                "a query or a restatement is not recorded: {text}"
+            );
+        }
+        // A repeated continuation carries no new authorization signal.
+        assert!(!is_goal_instruction(
+            objective,
+            &["确认，继续阶段 2。".to_string()],
+            "继续。"
+        ));
+    }
+
+    /// A Chat message joins an owed goal only when it changes the WORK.
+    ///
+    /// The reported hazard: a side request that merely says "only answer, do
+    /// not change any file" would otherwise be remembered as the GOAL's own
+    /// prohibition, and later stop the work the user authorized.
+    #[test]
+    fn a_chat_message_joins_a_goal_only_when_it_changes_the_work() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。\
+             阶段 1 完成后停下，等待我确认再执行阶段 2。";
+        let recorded: Vec<String> = Vec::new();
+
+        // Work added, in statement or question form, and work waived.
+        for text in [
+            "顺便把 stage-extra.txt 也补上，内容为一行 extra。",
+            "能不能顺便把 src/comment_acl.rs 也补上？",
+            "stage-2.txt 暂时不做。",
+        ] {
+            assert!(
+                is_chat_goal_instruction(objective, &recorded, text),
+                "a change to the work joins the goal: {text}"
+            );
+        }
+        // A constraint about a side request is NOT the goal's own.
+        for text in [
+            "另外帮我看一下 README 有没有过时的说明，只回答，不要改任何文件。",
+            "解释一下这个模块，不要改代码。",
+            "刚才修改了哪些文件？测试通过了吗？",
+        ] {
+            assert!(
+                !is_chat_goal_instruction(objective, &recorded, text),
+                "a side request adds no work, so it stays out of the goal: {text}"
+            );
+        }
+        // The same words ARE the goal's own when the user is addressing the
+        // goal's window: a prohibition there binds the work.
+        assert!(is_goal_instruction(
+            objective,
+            &recorded,
+            "不要修改 src/payments.rs。"
+        ));
+        // Authorization is a separate fact and travels on both readings.
+        assert!(is_chat_goal_instruction(
+            objective,
+            &recorded,
+            "确认，继续阶段 2。"
+        ));
+    }
+
     #[test]
     fn three_stage_prompt_yields_each_deliverable() {
         let requirements = extract(
@@ -1636,6 +2541,38 @@ mod tests {
         );
     }
 
+    /// A Chinese conjunction inside one enumerated item names its parts. An
+    /// acceptance that checks both parts separately has not dropped either.
+    #[test]
+    fn a_conjoined_deliverable_is_covered_by_checks_for_each_part() {
+        let requirements = extract("实现文章、讨论和评论界面。", &[]);
+        let joined = requirements
+            .iter()
+            .find(|requirement| requirement.text == "讨论和评论界面")
+            .expect("the conjoined phrase is one named deliverable");
+        let left = uncovered(
+            std::slice::from_ref(joined),
+            &[
+                "文章列表与详情界面可访问".to_string(),
+                "讨论与评论界面可访问".to_string(),
+            ],
+        );
+        assert!(
+            left.is_empty(),
+            "each part is named by a concrete check: {left:?}"
+        );
+
+        let narrowed = uncovered(
+            std::slice::from_ref(joined),
+            &["文章列表与详情界面可访问".to_string()],
+        );
+        assert_eq!(
+            narrowed,
+            vec!["讨论和评论界面".to_string()],
+            "a check that omits the comment thread still leaves the deliverable uncovered"
+        );
+    }
+
     /// The T8 shape: the user enumerates an acceptance criterion ending with a
     /// sentence period, and the model quotes the criterion back without the
     /// period. That is the same requirement accounted for, not a missing one.
@@ -1683,6 +2620,233 @@ mod tests {
         assert!(
             extract("帮我检查一下登录流程，看看有没有风险。", &[]).is_empty(),
             "open-ended investigation is not an enumerated deliverable"
+        );
+    }
+
+    /// A request keeps its authority in question form.
+    ///
+    /// `能不能顺便把 X 也补上？` asks for work; dropping every `?`-terminated
+    /// clause silently erased a delivery the user asked for, so the goal was
+    /// accepted without the thing they had just requested.
+    #[test]
+    fn a_request_in_question_form_is_scope_authority() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        let base = extract(objective, &[]);
+        for (request, expected) in [
+            (
+                "能不能顺便把 src/permissions.rs 的评论权限校验也补上？",
+                "src/permissions.rs",
+            ),
+            (
+                "请再加一个 src/comments_delete.rs 接口，可以吗？",
+                "src/comments_delete.rs",
+            ),
+            (
+                "Can you also add src/comment_acl.rs and run the tests?",
+                "src/comment_acl.rs",
+            ),
+            ("顺便把 docs/comment_acl.md 也补上？", "docs/comment_acl.md"),
+        ] {
+            let amended = extract(objective, &[request.to_string()]);
+            let found = texts(&amended);
+            assert!(
+                found.len() > base.len(),
+                "a question-form request still adds scope: {request} -> {found:?}"
+            );
+            assert!(
+                found.contains(&expected),
+                "the asked-for deliverable is in scope: {request} -> {found:?}"
+            );
+        }
+    }
+
+    /// A mixed message keeps its request and drops its status query.
+    #[test]
+    fn a_mixed_message_keeps_only_its_request() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        let amended = extract(
+            objective,
+            &["测试通过了吗？能不能顺便把 src/permissions.rs 也补上？".to_string()],
+        );
+        let found = texts(&amended);
+        assert!(
+            found.contains(&"src/permissions.rs"),
+            "the request half is scope authority: {found:?}"
+        );
+        assert!(
+            !amended
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "the query half must not become a test demand: {amended:?}"
+        );
+    }
+
+    /// Questions that only discuss the work carry no scope authority.
+    #[test]
+    fn a_consultation_or_status_question_adds_nothing() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        let base = extract(objective, &[]);
+        for question in [
+            "如果增加 src/permissions.rs 的校验，会有什么影响？",
+            "阶段 2 可以先不做吗？",
+            "是否有必要重构 src/permissions.rs？",
+            "What if we add src/permissions.rs?",
+            "Is it necessary to refactor src/permissions.rs?",
+            "评论权限校验做好了吗？",
+            "刚才修改了哪些文件？",
+            "测试通过了吗？",
+            "现在进度怎么样？",
+            "Which files changed?",
+            "Did the tests pass?",
+        ] {
+            let asked = extract(objective, &[question.to_string()]);
+            assert_eq!(
+                texts(&asked),
+                texts(&base),
+                "a question about the work changes no requirement: {question}"
+            );
+        }
+    }
+
+    /// A prohibition stated as a question is still a constraint, and an
+    /// authorization change is neither a constraint nor a deliverable.
+    #[test]
+    fn a_question_form_constraint_and_authorization_are_told_apart() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        let forbidden = extract(
+            objective,
+            &["不要修改 src/payments.rs，可以吗？".to_string()],
+        );
+        assert!(
+            forbidden.iter().any(|requirement| {
+                requirement.kind == RequirementKind::Forbidden
+                    && requirement.text.contains("src/payments.rs")
+            }),
+            "a question-form prohibition stays a constraint: {forbidden:?}"
+        );
+        assert!(
+            !forbidden.iter().any(|requirement| {
+                requirement.kind == RequirementKind::Artifact { removed: false }
+                    && requirement.text.contains("src/payments.rs")
+            }),
+            "a prohibition is not a deliverable: {forbidden:?}"
+        );
+        let feature = extract(objective, &["不要实现支付功能，可以吗？".to_string()]);
+        assert!(
+            feature
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Forbidden),
+            "a forbidden feature survives the question mark: {feature:?}"
+        );
+        for authorization in [
+            "能不能先不要执行阶段 2？",
+            "确认，继续阶段 2，可以吗？",
+            "阶段 2 可以先不做吗？",
+        ] {
+            let amended = extract(objective, &[authorization.to_string()]);
+            assert_eq!(
+                texts(&amended),
+                texts(&base_requirements(objective)),
+                "an authorization change is not a scope item: {authorization}"
+            );
+        }
+    }
+
+    /// A clause that only *sounds* past-tense is still an instruction. The
+    /// status vocabulary is deliberately about the work's state, not about
+    /// every word that can appear in a question.
+    #[test]
+    fn an_instruction_phrased_as_a_question_is_still_an_instruction() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        for (request, expected) in [
+            (
+                "刚才的写法也要补到 src/legacy.rs，可以吗？",
+                "src/legacy.rs",
+            ),
+            ("上一次的导出能不能也接到 src/export.rs？", "src/export.rs"),
+        ] {
+            let amended = extract(objective, &[request.to_string()]);
+            let found = texts(&amended);
+            assert!(
+                found.contains(&expected),
+                "the request keeps its authority: {request} -> {found:?}"
+            );
+        }
+        let asked = extract(
+            objective,
+            &["顺便问一句，能不能把测试也跑一遍？".to_string()],
+        );
+        assert!(
+            asked
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "a test run asked as a question is still demanded: {asked:?}"
+        );
+        // A result query that names a test run still adds no test demand.
+        for query in [
+            "上次的改动有没有通过测试？",
+            "测试有没有跑过？",
+            "Have you finished the export work?",
+        ] {
+            let asked = extract(objective, &[query.to_string()]);
+            assert!(
+                !asked
+                    .iter()
+                    .any(|requirement| requirement.kind == RequirementKind::Tests),
+                "a result query is not a test demand: {query} -> {asked:?}"
+            );
+        }
+    }
+
+    /// A question-form requirement is a real gate: the acceptance list has to
+    /// cover it and the completion account cannot claim it done.
+    #[test]
+    fn a_question_form_requirement_is_accepted_and_gated_like_any_other() {
+        let objective = "创建 stage-1.txt，最后运行 sh ./verify.sh。";
+        let requirements = extract(
+            objective,
+            &["能不能顺便把 src/permissions.rs 也补上？".to_string()],
+        );
+        let missing = uncovered(&requirements, &["stage-1.txt exists".to_string()]);
+        assert!(
+            missing.iter().any(|text| text == "src/permissions.rs"),
+            "a question-form ask must be covered by acceptance: {missing:?}"
+        );
+    }
+
+    fn base_requirements(objective: &str) -> Vec<Requirement> {
+        extract(objective, &[])
+    }
+
+    /// A status question in a paused goal is not a new requirement. Reading
+    /// `测试通过了吗？` as a demand would change the acceptance the goal must
+    /// still satisfy, which is exactly what a question must not do.
+    #[test]
+    fn a_status_question_amendment_changes_no_requirement() {
+        let objective = "创建 stage-1.txt 和 stage-2.txt，最后运行 sh ./verify.sh。";
+        let base = extract(objective, &[]);
+        let asked = extract(
+            objective,
+            &[
+                "刚才阶段 1 修改了哪些文件？测试通过了吗？".to_string(),
+                "现在进度怎么样？".to_string(),
+            ],
+        );
+        assert_eq!(base.len(), asked.len(), "the set is unchanged: {asked:?}");
+        assert!(
+            asked
+                .iter()
+                .all(|requirement| requirement.kind != RequirementKind::Tests),
+            "a question does not create a tests demand: {asked:?}"
+        );
+        // An IMPERATIVE amendment still adds scope.
+        let instructed = extract(objective, &["再创建 stage-3.txt。".to_string()]);
+        assert!(
+            instructed.len() > base.len()
+                || instructed
+                    .iter()
+                    .any(|requirement| requirement.text.contains("stage-3.txt")),
+            "a real instruction is still scope authority: {instructed:?}"
         );
     }
 
@@ -1936,6 +3100,44 @@ mod tests {
         }
     }
 
+    /// Markdown section numbering is document structure, not a deliverable.
+    /// Before this, `## 一、项目目标` was split at `、` into the requirements
+    /// `## 一` and `项目目标`, so no honest acceptance list could ever cover the
+    /// user's request and `commit_task` was refused for a normal spec.
+    #[test]
+    fn markdown_section_headings_are_not_deliverables() {
+        let text = "# Phase 3C 开发任务\n\n\
+                    ## 一、项目目标\n\n在现有项目中实现内容社区功能。\n\n\
+                    ## 二、后端实现\n\n使用 Go + PostgreSQL 完成业务接口。\n\n\
+                    ## 三、前端实现\n\n实现文章、讨论和评论界面。\n\n\
+                    ## 四、验收\n\n运行测试，验证功能完整性。\n\n\
+                    请自主规划并执行。\n允许根据任务需要拆分并委托子任务。";
+        let requirements = extract(text, &[]);
+        let found = texts(&requirements);
+        assert!(
+            !found.iter().any(|text| text.contains('#')),
+            "a heading marker is not a requirement: {found:?}"
+        );
+        for heading in ["项目目标", "后端实现", "前端实现", "验收"] {
+            assert!(
+                !found.contains(&heading),
+                "a section title is not a deliverable: {found:?}"
+            );
+        }
+        for deliverable in ["文章", "讨论和评论界面"] {
+            assert!(
+                found.contains(&deliverable),
+                "the enumerated deliverable must survive: {found:?}"
+            );
+        }
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "the explicit test demand must survive: {requirements:?}"
+        );
+    }
+
     /// The exact DF-24 prompt: three numbered deliverables, their contents, a
     /// named script, and an explicit "do not stop to ask" clause. The runtime
     /// must owe exactly the three paths and the command — no invented
@@ -2150,6 +3352,28 @@ mod tests {
     }
 
     #[test]
+    fn a_broad_acceptance_sentence_cannot_cover_specific_deliverables() {
+        let requirements = extract(
+            "1. 在 app.py 增加 archive_article。\n2. 在 tests/test_app.py 补两个用例。\n3. 实现全部接口并通过测试。\n4. 运行 sh ./verify.sh。",
+            &[],
+        );
+        let missing = uncovered(&requirements, &["完成全部功能并且测试通过".to_string()]);
+        assert!(
+            !missing.is_empty(),
+            "a blanket claim must not satisfy named deliverables: {requirements:?}"
+        );
+        assert!(missing.contains(&"app.py".to_string()), "{missing:?}");
+        assert!(
+            missing.contains(&"tests/test_app.py".to_string()),
+            "{missing:?}"
+        );
+        assert!(
+            missing.contains(&"./verify.sh".to_string()),
+            "a broad claim does not cover the named command: {missing:?}"
+        );
+    }
+
+    #[test]
     fn extra_acceptance_checks_do_not_remove_a_user_requirement() {
         let requirements = extract("创建 a.txt、b.txt。", &[]);
         let missing = uncovered(
@@ -2165,13 +3389,16 @@ mod tests {
 
     #[test]
     fn accounting_parses_only_the_three_honest_states() {
-        let parsed = parse_accounting(&serde_json::json!({
-            "requirements": [
-                {"requirement": "stage-1.txt", "status": "done", "evidence": "created it"},
-                {"requirement": "stage-2.txt", "status": "not_done", "evidence": "not reached"},
-                {"requirement": "quality", "status": "unverifiable", "evidence": "semantic"}
-            ]
-        }))
+        let parsed = parse_accounting(
+            &serde_json::json!({
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created it"},
+                    {"requirement": "stage-2.txt", "status": "not_done", "evidence": "not reached"},
+                    {"requirement": "quality", "status": "unverifiable", "evidence": "semantic"}
+                ]
+            }),
+            20,
+        )
         .unwrap()
         .unwrap();
         assert_eq!(parsed.len(), 3);
@@ -2179,17 +3406,27 @@ mod tests {
         assert_eq!(parsed[1].status, AccountStatus::NotDone);
         assert_eq!(parsed[2].status, AccountStatus::Unverifiable);
 
-        assert!(parse_accounting(&serde_json::json!({})).unwrap().is_none());
         assert!(
-            parse_accounting(&serde_json::json!({
-                "requirements": [{"requirement": "x", "status": "skipped", "evidence": "no"}]
-            }))
+            parse_accounting(&serde_json::json!({}), 20)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_accounting(
+                &serde_json::json!({
+                    "requirements": [{"requirement": "x", "status": "skipped", "evidence": "no"}]
+                }),
+                20
+            )
             .is_err()
         );
         assert!(
-            parse_accounting(&serde_json::json!({
-                "requirements": [{"requirement": "x", "status": "done", "evidence": "  "}]
-            }))
+            parse_accounting(
+                &serde_json::json!({
+                    "requirements": [{"requirement": "x", "status": "done", "evidence": "  "}]
+                }),
+                20
+            )
             .is_err(),
             "a claim without evidence is malformed"
         );
@@ -2577,5 +3814,611 @@ mod tests {
             matches!(refuse, ScopeDecision::Refuse(_)),
             "a longer account must not stand in for the exact requirement: {refuse:?}"
         );
+    }
+
+    /// A prohibition the user stated is a constraint, not a deliverable. It
+    /// must never be extracted as work, never need an `acceptance` check, and
+    /// never be accounted as `done` — "禁止实现支付功能" cannot be "delivered".
+    #[test]
+    fn a_prohibition_is_a_constraint_and_never_a_deliverable() {
+        let requirements = extract(
+            "## 三、禁止事项\n\n- 禁止实现支付功能。\n- 不要新增第三方登录。\n\
+             - 不得修改线上配置。\n",
+            &[],
+        );
+        assert!(
+            !requirements.is_empty()
+                && requirements
+                    .iter()
+                    .all(|requirement| requirement.kind == RequirementKind::Forbidden),
+            "every item under a prohibition heading is forbidden, not a deliverable: {requirements:?}"
+        );
+        assert!(
+            uncovered(&requirements, &[]).is_empty(),
+            "a prohibition never needs an acceptance check"
+        );
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: None,
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        assert!(
+            matches!(decision, ScopeDecision::Accept { .. }),
+            "a prohibition must not block completion: {decision:?}"
+        );
+    }
+
+    /// A constraint clause can state its prohibitions without a heading or a
+    /// bullet list. They still belong to the contract as constraints: the
+    /// model must see them, but neither `commit_task` coverage nor the
+    /// completion account may turn them into delivered work. Their presence
+    /// must not manufacture an uncoverable deliverable either.
+    #[test]
+    fn a_standalone_constraint_clause_keeps_its_prohibitions_structured() {
+        let requirements = extract(
+            "在 app.py 增加 word_count(text)；在 tests/test_app.py 增加一个用例；             运行 sh ./verify.sh。约束：禁止新增第三方依赖，禁止修改 app.py 和              tests/test_app.py 以外的文件。",
+            &[],
+        );
+        let forbidden: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind == RequirementKind::Forbidden)
+            .map(|requirement| requirement.text.as_str())
+            .collect();
+        assert!(
+            forbidden.iter().any(|text| text.contains("第三方依赖")),
+            "the dependency prohibition stays structured: {requirements:?}"
+        );
+        assert!(
+            forbidden.iter().any(|text| text.contains("以外的文件")),
+            "the scope prohibition stays structured: {requirements:?}"
+        );
+        let missing = uncovered(&requirements, &[]);
+        assert!(
+            !missing
+                .iter()
+                .any(|text| forbidden.contains(&text.as_str())),
+            "a prohibition never needs an acceptance check: {missing:?}"
+        );
+    }
+
+    /// The user described a pipeline with an ideographic-comma list inside a
+    /// comma clause. Those are not three enumerated deliverables; splitting
+    /// them produced fragments no acceptance list could ever cover.
+    #[test]
+    fn a_descriptive_ideographic_list_is_not_an_enumeration() {
+        let requirements = extract(
+            "在现有 Phase 3B 基础上，把文章、讨论、评论三条社区业务链路做成真实可用的闭环，\
+             允许真实用户发布、回复与浏览。",
+            &[],
+        );
+        assert!(
+            requirements.is_empty(),
+            "a describing clause enumerates nothing: {requirements:?}"
+        );
+    }
+
+    /// The instruction clause is still an enumeration: only the structural
+    /// gate changed, not the extraction of real deliverable lists.
+    #[test]
+    fn an_instruction_clause_still_enumerates_its_deliverables() {
+        let requirements = extract("实现文章发布、讨论区浏览、评论回复。", &[]);
+        let found = texts(&requirements);
+        for expected in ["文章发布", "讨论区浏览", "评论回复"] {
+            assert!(found.contains(&expected), "missing {expected}: {found:?}");
+        }
+    }
+
+    /// A numbered deliverable used to be extracted twice — once with its `1.`
+    /// marker (which no acceptance check can cover) and once without.
+    #[test]
+    fn a_numbered_item_is_extracted_once_without_its_marker() {
+        let requirements = extract("1. 实现文章发布与编辑，包括草稿、发布、下架三种状态。", &[]);
+        let found = texts(&requirements);
+        assert_eq!(
+            found,
+            vec!["文章发布与编辑"],
+            "one numbered deliverable, no marker, no fragment list: {requirements:?}"
+        );
+        assert!(
+            uncovered(&requirements, &["文章发布与编辑可访问".to_string()],).is_empty(),
+            "the deliverable is coverable: {requirements:?}"
+        );
+    }
+
+    /// The reconstructed Phase 3C sample: a real complex Chinese Markdown
+    /// objective. Every deliverable survives, prose fragments and prohibitions
+    /// do not become deliverables, and the whole contract is coverable.
+    #[test]
+    fn a_complex_chinese_markdown_objective_extracts_only_its_deliverables() {
+        let objective =
+            include_str!("../../../../testdata/regression/phase3c_requirement.zh-CN.md");
+        let requirements = extract(objective, &[]);
+        let deliverables: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind.is_deliverable())
+            .map(|requirement| requirement.text.as_str())
+            .collect();
+        for expected in [
+            "文章发布与编辑",
+            "讨论区主题创建与分页浏览",
+            "评论回复",
+            "内容权限校验",
+            "真实浏览器 E2E",
+            "接口层单元测试",
+        ] {
+            assert!(
+                deliverables.contains(&expected),
+                "missing deliverable {expected}: {deliverables:?}"
+            );
+        }
+        for fragment in ["讨论", "回复", "浏览", "发布", "在现有 Phase 3B 基础上"] {
+            assert!(
+                !deliverables.contains(&fragment),
+                "a prose fragment became a deliverable: {fragment} in {deliverables:?}"
+            );
+        }
+        let forbidden: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind == RequirementKind::Forbidden)
+            .map(|requirement| requirement.text.as_str())
+            .collect();
+        for expected in ["禁止实现支付功能", "不要新增第三方登录"] {
+            assert!(
+                forbidden.contains(&expected),
+                "missing prohibition {expected}: {forbidden:?}"
+            );
+        }
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "the explicit test demand survives: {requirements:?}"
+        );
+        assert!(
+            deliverables.len() <= 12,
+            "a complex but legible objective must not explode into fragments: {deliverables:?}"
+        );
+
+        // One accounting vocabulary for the report: named deliverables and a
+        // test demand are both deliverable-class requirements; prohibitions
+        // are the negative constraints and are never part of that count.
+        let named = requirements
+            .iter()
+            .filter(|requirement| requirement.kind == RequirementKind::Named)
+            .count();
+        let tests = requirements
+            .iter()
+            .filter(|requirement| requirement.kind == RequirementKind::Tests)
+            .count();
+        let forbidden_count = forbidden.len();
+        assert_eq!((named, tests, forbidden_count), (6, 1, 3));
+        assert_eq!(deliverables.len(), named + tests);
+        assert_eq!(requirements.len(), named + tests + forbidden_count);
+    }
+
+    /// The accounting cap follows the requirement set. A fixed 20 made a goal
+    /// with more requirements structurally impossible to complete.
+    #[test]
+    fn a_long_goal_can_account_for_every_requirement_it_has() {
+        let items: Vec<serde_json::Value> = (1..=30)
+            .map(|index| {
+                serde_json::json!({
+                    "requirement": format!("item-{index}"),
+                    "status": "done",
+                    "evidence": "shipped",
+                })
+            })
+            .collect();
+        let arguments = serde_json::json!({ "requirements": items });
+        assert!(
+            parse_accounting(&arguments, 30).is_ok(),
+            "30 requirements must be accountable"
+        );
+        assert!(
+            parse_accounting(&arguments, 10).is_err(),
+            "a smaller goal keeps a bound"
+        );
+        // The floor is a payload bound, not a scope statement.
+        let twenty = serde_json::json!({
+            "requirements": (1..=20)
+                .map(|index| serde_json::json!({
+                    "requirement": format!("item-{index}"),
+                    "status": "done",
+                    "evidence": "shipped",
+                }))
+                .collect::<Vec<_>>(),
+        });
+        assert!(parse_accounting(&twenty, 1).is_ok());
+    }
+
+    // ---- Chinese deliverable boundaries -----------------------------------
+    //
+    // One owner decided the boundary between "the user listed several
+    // deliverables" and "the user named one thing": the extractor, plus the
+    // structural part reading in `named_parts`. Every case below asserts both
+    // the parse and the verdict, because a parser that only avoids panicking
+    // can still refuse an honest contract or pass a partial one.
+
+    fn uncovered_for(objective: &str, acceptance: &[&str]) -> Vec<String> {
+        let requirements = extract(objective, &[]);
+        let checks: Vec<String> = acceptance
+            .iter()
+            .map(|check| (*check).to_string())
+            .collect();
+        uncovered(&requirements, &checks)
+    }
+
+    /// The whole list, with one concrete check per part. This is what the tool
+    /// schema asks for and what the nail-down of DF-01 expects to pass.
+    #[test]
+    fn an_acceptance_that_names_each_part_of_a_joined_list_is_accepted() {
+        let left = uncovered_for(
+            "## 三、前端实现\n\n实现文章、讨论和评论界面。\n",
+            &["文章列表可访问", "讨论区可访问", "评论界面可访问"],
+        );
+        assert!(left.is_empty(), "each part is named: {left:?}");
+    }
+
+    /// The same list with the middle deliverable dropped must still be refused.
+    /// Accepting the per-part reading above is only honest if it keeps this.
+    #[test]
+    fn dropping_a_part_of_a_joined_list_is_refused() {
+        let left = uncovered_for(
+            "## 三、前端实现\n\n实现文章、讨论和评论界面。\n",
+            &["文章列表可访问", "评论界面可访问"],
+        );
+        assert_eq!(
+            left,
+            vec!["讨论和评论界面".to_string()],
+            "the undelivered part is what the refusal names: {left:?}"
+        );
+    }
+
+    /// DF-02 shape: two bullet deliverables, an acceptance list that covers
+    /// only one. The refusal names the deliverable the user stated.
+    #[test]
+    fn a_two_item_bullet_list_refuses_a_partial_acceptance() {
+        let objective = "## 二、必须交付\n\n- 订单管理接口\n- 支付接口\n";
+        let partial = uncovered_for(objective, &["订单管理接口可访问"]);
+        assert_eq!(
+            partial,
+            vec!["支付接口".to_string()],
+            "the uncovered deliverable is named exactly: {partial:?}"
+        );
+        let complete = uncovered_for(objective, &["订单管理接口可访问", "支付接口可访问"]);
+        assert!(complete.is_empty(), "{complete:?}");
+    }
+
+    /// `研发与交付平台` is one business name. The literal phrase must stay
+    /// acceptable, and a check that only names one half must not certify the
+    /// whole.
+    #[test]
+    fn a_conjunction_inside_a_business_name_is_not_a_deliverable_list() {
+        let objective = "- 研发与交付平台\n";
+        assert!(
+            uncovered_for(objective, &["研发与交付平台已上线"]).is_empty(),
+            "the user's own phrase is always an acceptable check"
+        );
+        assert_eq!(
+            uncovered_for(objective, &["研发流水线通过"]),
+            vec!["研发与交付平台".to_string()],
+            "half of one name does not certify it"
+        );
+    }
+
+    /// `CI/CD` is a technical token, not a two-item list. Splitting it on the
+    /// slash made `ci` and `cd` into requirements that unrelated checks
+    /// satisfied — a false acceptance path, not a false rejection one.
+    #[test]
+    fn a_technical_slash_is_not_a_deliverable_list() {
+        let objective = "- CI/CD 流水线\n";
+        assert_eq!(
+            named_parts("ci/cd 流水线"),
+            vec!["ci/cd 流水线".to_string()]
+        );
+        assert!(
+            uncovered_for(objective, &["CI/CD 流水线通过"]).is_empty(),
+            "the token itself is the check"
+        );
+        assert_eq!(
+            uncovered_for(objective, &["CI 流水线通过"]),
+            vec!["CI/CD 流水线".to_string()],
+            "`ci` alone does not name the pipeline"
+        );
+    }
+
+    /// A conjunction that opens a word is part of the word. `和平协议` and
+    /// `及时通知` are one deliverable each, and a check naming the remainder
+    /// does not cover them.
+    #[test]
+    fn a_conjunction_that_opens_a_word_is_not_a_list() {
+        let objective = "- 和平协议文档\n- 及时通知能力\n";
+        assert_eq!(
+            named_parts("和平协议文档"),
+            vec!["和平协议文档".to_string()],
+            "a leading 和 is not a coordinator"
+        );
+        assert_eq!(
+            named_parts("及时通知能力"),
+            vec!["及时通知能力".to_string()],
+            "a leading 及 is not a coordinator"
+        );
+        assert_eq!(
+            uncovered_for(objective, &["协议文档已归档", "通知能力已实现"]),
+            vec!["和平协议文档".to_string(), "及时通知能力".to_string()],
+            "neither word is covered by its remainder"
+        );
+        assert!(
+            uncovered_for(objective, &["和平协议文档已归档", "及时通知能力已实现"]).is_empty(),
+            "the words themselves are accepted"
+        );
+    }
+
+    /// A genuine list of two inside one bullet: each part is owed.
+    #[test]
+    fn a_conjoined_list_of_two_is_owed_part_by_part() {
+        let objective = "- 订单和支付模块\n";
+        assert!(
+            uncovered_for(objective, &["订单和支付模块可用"]).is_empty(),
+            "the literal phrase covers both parts"
+        );
+        assert!(uncovered_for(objective, &["订单模块可访问", "支付模块可访问"]).is_empty());
+        assert_eq!(
+            uncovered_for(objective, &["订单模块可访问"]),
+            vec!["订单和支付模块".to_string()],
+            "one module is not the pair"
+        );
+    }
+
+    /// Mixed Chinese and English deliverables, with the prose around them
+    /// carrying no requirement at all.
+    #[test]
+    fn a_mixed_language_list_yields_each_deliverable() {
+        let objective = "1. 实现 Go 服务的 user API，并提供 swagger 文档。\n\
+                         2. 实现 admin 后台，使用 React。\n";
+        let requirements = extract(objective, &[]);
+        assert_eq!(
+            texts(&requirements),
+            vec!["Go 服务的 user API", "admin 后台"],
+            "two deliverables, no fragments: {requirements:?}"
+        );
+        assert!(
+            uncovered(
+                &requirements,
+                &[
+                    "Go 服务的 user API 提供 swagger 文档".to_string(),
+                    "admin 后台使用 React 实现".to_string(),
+                ],
+            )
+            .is_empty(),
+            "checks quoting each deliverable cover them"
+        );
+        assert_eq!(
+            uncovered(&requirements, &["admin 后台使用 React 实现".to_string()]),
+            vec!["Go 服务的 user API".to_string()]
+        );
+    }
+
+    /// A nested markdown list must not turn list markers, headings or the
+    /// parent item into extra deliverables.
+    #[test]
+    fn a_nested_markdown_list_does_not_invent_deliverables() {
+        let objective = "## 一、交付\n\n1. 用户管理\n   - 创建用户\n   - 删除用户\n\
+                         2. 文章管理\n\n## 二、验收\n\n运行 `go test ./...`。\n";
+        let requirements = extract(objective, &[]);
+        let found = texts(&requirements);
+        assert!(
+            !found
+                .iter()
+                .any(|text| text.contains('#') || text.contains("交付") || text.contains("验收")),
+            "document structure is not a deliverable: {found:?}"
+        );
+        for expected in ["用户管理", "文章管理"] {
+            assert!(found.contains(&expected), "missing {expected}: {found:?}");
+        }
+        assert!(
+            uncovered(
+                &requirements,
+                &[
+                    "用户管理可访问（创建与删除）".to_string(),
+                    "文章管理可访问".to_string(),
+                    "go test ./... 通过".to_string(),
+                ],
+            )
+            .is_empty(),
+            "{requirements:?}"
+        );
+    }
+
+    /// Background prose — a historical note about what an earlier phase
+    /// already shipped — is not a deliverable, and the acceptance list is
+    /// judged only against what the user asked for now.
+    #[test]
+    fn background_prose_is_not_judged_as_a_deliverable() {
+        let objective = "## 背景\n\nPhase 3B 已完成用户体系与内容模型，本阶段只扩展社区交互。\n\n\
+                         ## 交付\n\n- 实现评论服务\n";
+        let requirements = extract(objective, &[]);
+        let found = texts(&requirements);
+        assert_eq!(
+            found,
+            vec!["评论服务"],
+            "only the stated deliverable is owed: {requirements:?}"
+        );
+        assert!(
+            uncovered_for(objective, &["评论服务可访问"]).is_empty(),
+            "the background does not add a check the model must satisfy"
+        );
+    }
+
+    /// The completion gate must read a joined phrase the same way the commit
+    /// gate does. Before this, per-part checks were accepted at commit and a
+    /// per-part account was then refused as "not accounted for".
+    #[test]
+    fn per_part_accounts_satisfy_a_joined_deliverable_at_completion() {
+        let requirements = extract("实现文章、讨论和评论界面。", &[]);
+        let accept = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&[
+                account("文章", AccountStatus::Done, "文章列表与详情页已上线"),
+                account("讨论", AccountStatus::Done, "讨论区已上线"),
+                account("评论界面", AccountStatus::Done, "评论界面已上线"),
+            ]),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        assert!(
+            matches!(accept, ScopeDecision::Accept { .. }),
+            "the account mirrors the accepted checks: {accept:?}"
+        );
+
+        let refuse = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&[
+                account("文章", AccountStatus::Done, "文章列表与详情页已上线"),
+                account("讨论", AccountStatus::Done, "讨论区已上线"),
+                account("评论界面", AccountStatus::NotDone, "评论界面未做"),
+            ]),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        match refuse {
+            ScopeDecision::Refuse(message) => assert!(
+                message.contains("讨论和评论界面") && message.contains("not_done"),
+                "{message}"
+            ),
+            other => panic!("a part marked not_done must refuse: {other:?}"),
+        }
+
+        let missing = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&[
+                account("文章", AccountStatus::Done, "文章列表与详情页已上线"),
+                account("讨论", AccountStatus::Done, "讨论区已上线"),
+            ]),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        assert!(
+            matches!(missing, ScopeDecision::Refuse(_)),
+            "an unaccounted part still refuses: {missing:?}"
+        );
+    }
+
+    /// The reconstructed Phase 3C objective, judged against a real acceptance
+    /// list and against one that silently drops a deliverable.
+    #[test]
+    fn the_phase3c_acceptance_is_judged_against_its_own_deliverables() {
+        let objective =
+            include_str!("../../../../testdata/regression/phase3c_requirement.zh-CN.md");
+        let complete = [
+            "文章发布与编辑（草稿/发布/下架）端到端可用",
+            "讨论区主题创建与分页浏览可用",
+            "评论回复支持二级回复与删除",
+            "内容权限校验：作者可编辑、管理员可下架、普通用户只读",
+            "真实浏览器 E2E 覆盖发布、回复、权限拒绝",
+            "接口层单元测试通过且覆盖率不低于 70%",
+        ];
+        let left = uncovered_for(objective, &complete);
+        assert!(
+            left.is_empty(),
+            "a complete acceptance is accepted: {left:?}"
+        );
+
+        let dropped = &complete[..5];
+        let left = uncovered_for(objective, dropped);
+        assert!(
+            !left.is_empty(),
+            "dropping the test deliverable must be refused: {left:?}"
+        );
+    }
+
+    /// A counted summary after a list describes the list. It is not part of the
+    /// last deliverable's name, and a check that names the deliverable covers
+    /// it — while a check that names only the verb still does not.
+    #[test]
+    fn a_counted_summary_is_not_part_of_the_last_deliverable() {
+        let requirements = extract(
+            "完成文章发布、评论回复、内容权限校验三个功能，完成后通过测试",
+            &[],
+        );
+        let found = texts(&requirements);
+        assert!(found.contains(&"内容权限校验三个功能"), "{found:?}");
+        let missing = uncovered(
+            &requirements,
+            &[
+                "文章发布可访问".to_string(),
+                "评论回复可提交且可见".to_string(),
+                "内容权限校验覆盖作者与管理员".to_string(),
+                "sh run-tests.sh 通过".to_string(),
+            ],
+        );
+        assert!(
+            missing.is_empty(),
+            "the named deliverable is covered: {missing:?}"
+        );
+
+        // The stem may never shrink to a verb.
+        assert_eq!(strip_counted_summary("支持三种登录方式"), None);
+        assert_eq!(
+            strip_counted_summary("内容权限校验三个功能"),
+            Some("内容权限校验")
+        );
+        let weak = uncovered(
+            &requirements,
+            &[
+                "文章发布可访问".to_string(),
+                "评论回复可提交且可见".to_string(),
+                "支持内容".to_string(),
+                "sh run-tests.sh 通过".to_string(),
+            ],
+        );
+        assert_eq!(weak, vec!["内容权限校验三个功能".to_string()]);
+    }
+
+    /// A labelled bullet names the deliverable AFTER its label.
+    /// `阶段 2：在 app.py 增加 articles_by_author` used to extract `阶段 2`, a
+    /// section title no acceptance list can honestly contain — and the live
+    /// DeepSeek run refused its first `commit_task` over exactly that label.
+    #[test]
+    fn a_labelled_bullet_states_its_deliverable_not_its_label() {
+        let requirements = extract(
+            "4. 阶段 2：在 app.py 增加 articles_by_author(author)，并在 tests/test_app.py 补一个用例。",
+            &[],
+        );
+        let found = texts(&requirements);
+        assert!(
+            !found.contains(&"阶段 2"),
+            "a stage label is not a deliverable: {found:?}"
+        );
+        assert!(
+            found.contains(&"tests/test_app.py"),
+            "the real artifact is still extracted: {found:?}"
+        );
+    }
+
+    /// The part reading is strictly additional. A check that names the joined
+    /// phrase always covers it, whatever the split would produce.
+    #[test]
+    fn the_literal_phrase_is_never_less_acceptable_than_its_parts() {
+        for phrase in [
+            "讨论和评论界面",
+            "研发与交付平台",
+            "CI/CD 流水线",
+            "和平协议文档",
+            "及时通知能力",
+            "订单和支付模块",
+        ] {
+            let requirement = req(phrase, RequirementKind::Named);
+            let checks = vec![format!("完成{phrase}")];
+            assert!(
+                uncovered(std::slice::from_ref(&requirement), &checks).is_empty(),
+                "the user's own phrase must always be an acceptable check: {phrase}"
+            );
+        }
     }
 }

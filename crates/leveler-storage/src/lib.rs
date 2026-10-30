@@ -13,10 +13,8 @@ mod database;
 mod engine_stores;
 mod event_repo;
 mod event_store;
-mod experience_inbox_repo;
 mod goal_checkpoint_store;
 mod goal_store;
-mod memory_inbox_repo;
 mod message_repo;
 mod message_store;
 mod model_request_repo;
@@ -38,25 +36,17 @@ pub use database::{Database, StorageError, peek_repository};
 pub use engine_stores::EngineStores;
 pub use event_repo::{EVENT_SCHEMA_VERSION, EventHeader, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
-pub use experience_inbox_repo::{
-    ExperienceInboxCounts, ExperienceInboxFailure, ExperienceInboxItem, ExperienceInboxProcessed,
-    ExperienceInboxReadyState, ExperienceInboxRepository,
-};
 pub use goal_checkpoint_store::{
     GoalCheckpointRecord, GoalCheckpointStore, MemoryGoalCheckpointStore, NewGoalCheckpoint,
 };
 pub use goal_store::{GoalRecord, GoalState, GoalStore, MemoryGoalStore};
-pub use memory_inbox_repo::{
-    MemoryInboxCounts, MemoryInboxFailure, MemoryInboxItem, MemoryInboxProcessed,
-    MemoryInboxReadyState, MemoryInboxRepository,
-};
 pub use message_repo::{MessageRepository, TimedMessage};
 pub use message_store::{
     MemoryMessageStore, MemoryModelRequestStore, MessageStore, ModelRequestStore,
 };
 pub use model_request_repo::{
-    ModelCallKind, ModelRequestRecord, ModelRequestRepository, SessionUsageReconciliation,
-    SessionUsageTotals,
+    ModelCallKind, ModelRequestRecord, ModelRequestRepository, ScopedModelRequest,
+    SessionUsageReconciliation, SessionUsageTotals,
 };
 pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,

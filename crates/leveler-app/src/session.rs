@@ -136,74 +136,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             max_attempts,
             delay_ms,
         },
-        EngineEvent::MemoryRecalled {
-            count,
-            ids,
-            experience,
-            injections,
-            omitted,
-            budget,
-            block_digest,
-            catalog_ids,
-            catalog_digest,
-            catalog_version,
-            catalog_delta_ids,
-            catalog_delta_version,
-            degraded,
-        } => AgentEvent::MemoryRecalled {
-            count: count as usize,
-            ids,
-            experience: experience as usize,
-            injections: injections
-                .into_iter()
-                .map(|injection| leveler_agent::MemoryInjectionReceipt {
-                    id: injection.id,
-                    revision: injection.revision,
-                    scope: injection.scope,
-                    kind: injection.kind,
-                    mode: injection.mode,
-                    tokens: injection.tokens,
-                    title: injection.title,
-                    digest: injection.digest,
-                })
-                .collect(),
-            omitted: omitted
-                .into_iter()
-                .map(|omission| leveler_agent::MemoryOmission {
-                    reason: omission.reason,
-                    count: omission.count,
-                })
-                .collect(),
-            budget: leveler_agent::MemoryInjectionBudget {
-                total_tokens: budget.total_tokens,
-                used_tokens: budget.used_tokens,
-                standing_tokens: budget.standing_tokens,
-                candidate_tokens: budget.candidate_tokens,
-                experience_tokens: budget.experience_tokens,
-            },
-            block_digest: if block_digest.is_empty() {
-                None
-            } else {
-                Some(block_digest)
-            },
-            catalog_ids,
-            catalog_digest,
-            catalog_version,
-            catalog_delta_ids,
-            catalog_delta_version,
-            degraded,
-        },
-        EngineEvent::MemoryChanged {
-            operation,
-            id,
-            title,
-            authority,
-        } => AgentEvent::MemoryChanged {
-            operation,
-            id,
-            title,
-            authority,
-        },
+
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }
@@ -481,17 +414,9 @@ async fn run_collaboration_turn(
     session_id: &leveler_core::SessionId,
     spec: &TaskSpec,
     content: Vec<ContentPart>,
-    // `/develop` is its own workflow command; it keeps its own harness and is
-    // not a collaboration axis.
-    develop: bool,
     observer: &mut (dyn FnMut(EngineEvent) + Send),
     cancellation: CancellationToken,
 ) -> Result<TaskReport, EngineError> {
-    if develop {
-        return engine
-            .run_develop(session_id, spec, observer, cancellation)
-            .await;
-    }
     if execution.runs_goal_lifecycle() {
         engine
             .run_with_content(session_id, spec, content, observer, cancellation)
@@ -559,7 +484,12 @@ impl Application {
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
         self.reap_zombie_turns(&db, None).await?;
-        self.insert_session(&db, model, goal, mode, collaboration)
+        // A model handed straight to this API is the caller's decision (a CLI
+        // flag, a headless run, an eval fixture). The UI's DEFAULT path is the
+        // transport's `create_session`, which states `model_pinned: false`;
+        // an explicit `/model` pins through `SessionEdit::Model`; a resume
+        // keeps the row's stored model.
+        self.insert_session(&db, model, goal, mode, collaboration, true)
             .await
     }
 
@@ -626,9 +556,10 @@ impl Application {
         goal: &str,
         mode: PermissionProfile,
         collaboration: leveler_lifecycle::CollaborationMode,
+        model_pinned: bool,
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
-        self.insert_session(&db, model, goal, mode, collaboration)
+        self.insert_session(&db, model, goal, mode, collaboration, model_pinned)
             .await
     }
 
@@ -639,6 +570,7 @@ impl Application {
         goal: &str,
         mode: PermissionProfile,
         collaboration: leveler_lifecycle::CollaborationMode,
+        model_pinned: bool,
     ) -> Result<leveler_core::SessionId, AppError> {
         self.task_engine(db)?
             .create_task(&leveler_engine::NewSession {
@@ -654,6 +586,7 @@ impl Application {
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: collaboration.as_str().to_string(),
                 }),
+                model_pinned,
             })
             .await
             .map_err(app_error_from_engine)
@@ -769,7 +702,6 @@ impl Application {
             // carries the mechanical safety ceiling.
             leveler_agent::ContinuationPolicy::UntilTerminal,
             unattended_limits(self.top_level_limits()),
-            false,
         )
         .await
     }
@@ -808,44 +740,6 @@ impl Application {
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
             self.top_level_limits(),
-            false,
-        )
-        .await
-    }
-
-    /// Run one goal through the Develop workflow instead of straight to
-    /// Coding. Same session, same axes, same terminal authority as
-    /// [`Self::run_in_session_with_clarifier`]; only the harness differs.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_develop_in_session(
-        &self,
-        session_id: &leveler_core::SessionId,
-        model: &ModelRef,
-        mode: PermissionProfile,
-        goal: &str,
-        approver: Arc<dyn Approver>,
-        clarifier: Arc<dyn Clarifier>,
-        sandbox: bool,
-        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
-        task_cancel: Arc<AtomicBool>,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: CancellationToken,
-    ) -> Result<AgentOutcome, AppError> {
-        self.run_in_session_with_policy(
-            session_id,
-            model,
-            mode,
-            goal,
-            approver,
-            clarifier,
-            sandbox,
-            steering,
-            task_cancel,
-            observer,
-            cancellation,
-            leveler_agent::ContinuationPolicy::UntilTerminal,
-            self.top_level_limits(),
-            true,
         )
         .await
     }
@@ -885,7 +779,6 @@ impl Application {
             cancellation,
             leveler_agent::ContinuationPolicy::bounded(max_rounds),
             leveler_agent::StepLimits::default(),
-            false,
         )
         .await
     }
@@ -921,13 +814,9 @@ impl Application {
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
         limits: leveler_agent::StepLimits,
-        // `/develop` only. An ordinary turn passes false and reaches exactly
-        // the code it reached before this flag existed.
-        develop: bool,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
-        self.ensure_memory_consolidator(&db)?;
-        self.sync_session_memory_policy(&db, session_id).await;
+
         let repo = SessionRepository::new(&db);
         // Product axes SoT is the session row (SetProductAxes / create defaults).
         let collaboration = self.turn_axes(&repo, session_id).await?;
@@ -964,12 +853,11 @@ impl Application {
             vec![ContentPart::Text {
                 text: goal.to_string(),
             }],
-            develop,
             observer,
             cancellation,
         )
         .await;
-        self.notify_memory_consolidator();
+
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -997,8 +885,7 @@ impl Application {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
-        self.ensure_memory_consolidator(&db)?;
-        self.sync_session_memory_policy(&db, session_id).await;
+
         let repo = SessionRepository::new(&db);
         let collaboration = self.turn_axes(&repo, session_id).await?;
         let execution = CollaborationExecution::of(collaboration);
@@ -1026,13 +913,11 @@ impl Application {
             session_id,
             &spec,
             content,
-            // `/develop` is its own workflow command, not a collaboration axis.
-            false,
             observer,
             cancellation,
         )
         .await;
-        self.notify_memory_consolidator();
+
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -1197,7 +1082,7 @@ impl Application {
                 cancellation,
             )
             .await;
-        self.notify_memory_consolidator();
+
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -1229,7 +1114,7 @@ impl Application {
         let result = engine
             .resume_with_instruction(session_id, &spec, instruction, observer, cancellation)
             .await;
-        self.notify_memory_consolidator();
+
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -1246,11 +1131,7 @@ impl Application {
         task_cancel: Arc<AtomicBool>,
     ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec), AppError> {
         let db = self.open_database().await?;
-        // Resume inserts a continuation turn and therefore needs the same
-        // memory worker and admission snapshot as a fresh turn. Without this,
-        // a resumed headless run would never consolidate its work.
-        self.ensure_memory_consolidator(&db)?;
-        self.sync_session_memory_policy(&db, session_id).await;
+
         let repo = SessionRepository::new(&db);
         let record = repo
             .get(session_id)

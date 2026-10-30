@@ -937,6 +937,13 @@ async fn run_eval_case(
         model_time_before_first_edit_ms: None,
         reasoning_tokens_before_first_edit: None,
         peak_input_tokens: 0,
+        cached_input_tokens: None,
+        auxiliary_requests: None,
+        auxiliary_input_tokens: None,
+        auxiliary_output_tokens: None,
+        compactions: None,
+        redundant_reads: None,
+        redundant_verification_calls: None,
     };
 
     // Materialize the workspace. Two modes:
@@ -1166,6 +1173,15 @@ async fn run_eval_case(
         peak_input_tokens: u64,
         model_time_before_first_edit_ms: Option<u64>,
         reasoning_tokens_before_first_edit: Option<u64>,
+        /// Prefix-cache hits summed over every call of the case. `None` unless
+        /// every row reported one: a partial sum silently inflates uncached cost.
+        cached_input_tokens: Option<u64>,
+        /// Calls that were not main-loop rounds (compaction summaries
+        /// and advisory calls) and their token totals.
+        /// `None` when there was no ledger to read at all.
+        auxiliary_requests: Option<u32>,
+        auxiliary_input_tokens: Option<u64>,
+        auxiliary_output_tokens: Option<u64>,
     }
 
     let (input_tokens, output_tokens, reasoning_tokens, observed_rounds, ledger) =
@@ -1211,6 +1227,20 @@ async fn run_eval_case(
                             .map(|r| r.input_tokens)
                             .max()
                             .unwrap_or(0);
+                        // Cost the task paid outside the rounds the model drove.
+                        // A prompt change that trades a round for an extraction
+                        // request has not saved anything unless this is read.
+                        let auxiliary: Vec<&leveler_storage::ModelRequestRecord> = records
+                            .iter()
+                            .filter(|r| r.kind != leveler_storage::ModelCallKind::Round)
+                            .collect();
+                        let (auxiliary_input, auxiliary_output) =
+                            auxiliary.iter().fold((0u64, 0u64), |total, record| {
+                                (
+                                    total.0.saturating_add(record.input_tokens),
+                                    total.1.saturating_add(record.output_tokens),
+                                )
+                            });
                         let before = collector.first_edit_round().map(|first| {
                             let upto = (first as usize).min(main_rounds.len());
                             let window = &main_rounds[..upto];
@@ -1234,6 +1264,15 @@ async fn run_eval_case(
                             peak_input_tokens,
                             model_time_before_first_edit_ms: before.map(|(time, _)| time),
                             reasoning_tokens_before_first_edit: before.and_then(|(_, rt)| rt),
+                            cached_input_tokens: records
+                                .iter()
+                                .map(|record| record.cached_input_tokens)
+                                .try_fold(0u64, |total, value| {
+                                    value.map(|value| total.saturating_add(value))
+                                }),
+                            auxiliary_requests: Some(auxiliary.len() as u32),
+                            auxiliary_input_tokens: Some(auxiliary_input),
+                            auxiliary_output_tokens: Some(auxiliary_output),
                         };
                         (input, output, reasoning, requests, ledger)
                     })
@@ -1247,7 +1286,7 @@ async fn run_eval_case(
     let rounds = if rounds > 0 { rounds } else { observed_rounds };
 
     // Cost only when the model profile carries auditable pricing — never invented.
-    let cost_usd_micros = match app.registry.profile(model).await {
+    let cost_usd_micros = match app.registry().profile(model).await {
         Ok(profile) => profile
             .pricing
             .map(|p| p.cost_usd_micros(input_tokens, output_tokens)),
@@ -1378,6 +1417,13 @@ async fn run_eval_case(
         model_time_before_first_edit_ms: ledger.model_time_before_first_edit_ms,
         reasoning_tokens_before_first_edit: ledger.reasoning_tokens_before_first_edit,
         peak_input_tokens: ledger.peak_input_tokens,
+        cached_input_tokens: ledger.cached_input_tokens,
+        auxiliary_requests: ledger.auxiliary_requests,
+        auxiliary_input_tokens: ledger.auxiliary_input_tokens,
+        auxiliary_output_tokens: ledger.auxiliary_output_tokens,
+        compactions: Some(signals.compactions),
+        redundant_reads: Some(signals.redundant_reads),
+        redundant_verification_calls: Some(signals.redundant_verification_calls),
     }
 }
 

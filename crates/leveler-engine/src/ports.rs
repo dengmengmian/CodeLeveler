@@ -48,6 +48,13 @@ pub struct GoalScope {
     pub objective: String,
     pub acceptance: Vec<String>,
     pub amendments: Vec<String>,
+    /// When the user's own stage pause was reached and the goal is waiting for
+    /// their continuation authorization. `None` = not paused.
+    ///
+    /// A harness that reads the scope to decide whether to drive another round
+    /// must honor it: the goal still owes work, but the user withheld the
+    /// authorization to continue it.
+    pub user_paused_at: Option<leveler_core::Timestamp>,
 }
 
 /// Durable goal identity for a turn that was not started as a Goal turn.
@@ -319,10 +326,6 @@ pub enum ModelCallKind {
     Round,
     /// The summarization behind a compaction fold.
     Compaction,
-    /// Semantic memory-candidate extraction from the user's own turns.
-    MemoryExtraction,
-    /// Evidence-bound agent-experience extraction after a completed task.
-    ExperienceExtraction,
     /// The idle "what would the user type next" prompt suggestion.
     PromptSuggestion,
     /// The one-line recap shown after a successful turn.
@@ -344,8 +347,6 @@ impl ModelCallKind {
         match self {
             Self::Round => "round",
             Self::Compaction => "compaction",
-            Self::MemoryExtraction => "memory_extraction",
-            Self::ExperienceExtraction => "experience_extraction",
             Self::PromptSuggestion => "prompt_suggestion",
             Self::AwaySummary => "away_summary",
             Self::SemanticRecap => "semantic_recap",
@@ -371,9 +372,7 @@ impl ModelCallKind {
         match self {
             Self::Round | Self::SideQuestion | Self::Advisory => None,
             Self::Compaction => Some(ReasoningEffort::Medium),
-            Self::MemoryExtraction
-            | Self::ExperienceExtraction
-            | Self::PromptSuggestion
+            Self::PromptSuggestion
             | Self::AwaySummary
             | Self::SemanticRecap
             | Self::ProviderProbe => Some(ReasoningEffort::Low),
@@ -462,8 +461,6 @@ mod call_kind_policy_tests {
     #[test]
     fn auxiliary_kinds_never_implicitly_ask_for_max() {
         for kind in [
-            ModelCallKind::MemoryExtraction,
-            ModelCallKind::ExperienceExtraction,
             ModelCallKind::PromptSuggestion,
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
@@ -480,8 +477,6 @@ mod call_kind_policy_tests {
     #[test]
     fn mechanical_auxiliary_tasks_ask_for_low() {
         for kind in [
-            ModelCallKind::MemoryExtraction,
-            ModelCallKind::ExperienceExtraction,
             ModelCallKind::PromptSuggestion,
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
@@ -518,8 +513,6 @@ mod call_kind_policy_tests {
         for kind in [
             ModelCallKind::Round,
             ModelCallKind::Compaction,
-            ModelCallKind::MemoryExtraction,
-            ModelCallKind::ExperienceExtraction,
             ModelCallKind::PromptSuggestion,
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
@@ -532,12 +525,6 @@ mod call_kind_policy_tests {
                 match kind {
                     ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
                     ModelCallKind::Compaction => leveler_storage::ModelCallKind::Compaction,
-                    ModelCallKind::MemoryExtraction => {
-                        leveler_storage::ModelCallKind::MemoryExtraction
-                    }
-                    ModelCallKind::ExperienceExtraction => {
-                        leveler_storage::ModelCallKind::ExperienceExtraction
-                    }
                     ModelCallKind::PromptSuggestion => {
                         leveler_storage::ModelCallKind::PromptSuggestion
                     }

@@ -4850,6 +4850,7 @@ async fn goal_completion_is_refused_while_children_are_outstanding() {
         CHILD_MARKER,
         Duration::from_millis(200),
     ));
+    let requests_handle = runtime.clone();
     let executor = Executor::new(
         runtime,
         registry,
@@ -4900,6 +4901,23 @@ async fn goal_completion_is_refused_while_children_are_outstanding() {
         outcome.stop_reason,
         leveler_agent::StopReason::Completed
     ));
+
+    // Every request the parent sent kept the provider-bound tool exchange:
+    // an assistant tool_calls message is answered by the message right after
+    // it. Draining the child settlements mid-batch put a USER notice there
+    // instead, and a real resumed run died with "assistant tool call … has no
+    // tool result" — the whole turn lost after the work was already done.
+    let requests = requests_handle.parent_requests.lock().unwrap();
+    assert!(
+        requests.len() >= 3,
+        "the parent must have been asked at least three times: {}",
+        requests.len()
+    );
+    for (index, messages) in requests.iter().enumerate() {
+        leveler_model::validate_tool_exchange(messages).unwrap_or_else(|violation| {
+            panic!("parent request {index} broke the tool exchange: {violation}")
+        });
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -7984,4 +8002,112 @@ async fn an_older_background_writer_cannot_spend_after_a_later_sibling_exhausts_
         2,
         "the refusal must not invent a paid provider attempt"
     );
+}
+
+/// A spawn call is announced before it is admitted, refused or accepted.
+///
+/// Before this, `spawn_agent` deferred to the child batch and emitted only a
+/// result: a refused spawn reached a client as a synthesized tool block with no
+/// arguments (so the row could not say what had been requested), and the durable
+/// log carried a delegation result with no delegation request behind it.
+#[tokio::test]
+async fn a_spawn_call_is_recorded_before_its_child_exists() {
+    let dir = tmp("spawn_events", 91);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(SleepyRuntime::new(
+        vec![
+            assistant_with(
+                vec![
+                    spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "task one", "role": "bogus"}),
+                    ),
+                    spawn_call(
+                        "s2",
+                        serde_json::json!({"task": "task two", "title": "两次"}),
+                    ),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            assistant_text("child done"),
+            assistant_text("Parent wrap-up."),
+        ],
+        Duration::from_millis(0),
+    ));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_agents(4, 2);
+    let mut events = Vec::new();
+    executor
+        .run(
+            "spawn two",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let position = |wanted: &str, is_start: bool| -> Option<usize> {
+        events.iter().position(|event| match event {
+            AgentEvent::ToolCall { name, .. } if is_start => name == wanted,
+            AgentEvent::ToolResult { name, .. } if !is_start => name == wanted,
+            _ => false,
+        })
+    };
+    let start = position("spawn_agent", true).expect("the spawn call is announced");
+    let result = position("spawn_agent", false).expect("the spawn call settles");
+    assert!(
+        start < result,
+        "a call is announced before its result: {events:?}"
+    );
+    let arguments = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolCall {
+                name, arguments, ..
+            } if name == "spawn_agent" => Some(arguments.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        arguments.contains("task one") && arguments.contains("bogus"),
+        "the announcement carries the request that was refused: {arguments}"
+    );
+    // The refused call never produced a child; the accepted one did.
+    let refused_child = events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::SubAgentStarted { task, .. } if task.contains("task one")));
+    assert!(!refused_child, "a refused spawn creates no child");
+
+    // Every spawn call settles. A foreground spawn must not stay `running`
+    // after the child it waited for has ended: the call's own result is what
+    // closes the row.
+    let settled: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult { id, name, .. } if name == "spawn_agent" => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let announced: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCall { id, name, .. } if name == "spawn_agent" => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        announced.len(),
+        settled.len(),
+        "each announced delegation settles exactly once: {announced:?} vs {settled:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

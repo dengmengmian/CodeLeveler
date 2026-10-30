@@ -51,10 +51,18 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         } if !name.is_empty()
             && name.len() <= 1024
             && data_base64.len() <= (20 * 1024 * 1024_usize).div_ceil(3) * 4 => {}
-        ClientCommand::ListMemory { query_id, .. }
-        | ClientCommand::ListAgents { query_id, .. }
+        ClientCommand::ListAgents { query_id, .. }
         | ClientCommand::QueryContext { query_id, .. }
             if valid_desktop_query_id(query_id) => {}
+        // The same usage command and DTO the terminal page reads, so the two
+        // surfaces cannot compute different numbers. Read-only, session-scoped,
+        // and the calendar-day offset is bounded exactly as the runtime bounds
+        // it.
+        ClientCommand::QueryUsage {
+            query_id,
+            utc_offset_minutes,
+            ..
+        } if valid_desktop_query_id(query_id) && (-1440..=1440).contains(utc_offset_minutes) => {}
         ClientCommand::GetAgent { query_id, name, .. }
             if valid_desktop_query_id(query_id)
                 && leveler_agent::agent_registry::validate_agent_name(name).is_ok() => {}
@@ -650,44 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn desktop_memory_listing_is_scoped_correlated_and_not_mutating() {
-        let session = SessionId::new("desktop-memory");
-        for include_archived in [false, true] {
-            let command = ClientCommand::ListMemory {
-                session_id: session.clone(),
-                query_id: Some("query".into()),
-                include_archived,
-            };
-            assert!(validate_command(&session, &command).is_ok());
-            assert!(validate_command(&SessionId::new("other"), &command).is_err());
-        }
-        for query_id in [None, Some(" ".into()), Some("a".repeat(257).into())] {
-            assert!(
-                validate_command(
-                    &session,
-                    &ClientCommand::ListMemory {
-                        session_id: session.clone(),
-                        query_id,
-                        include_archived: false
-                    }
-                )
-                .is_err()
-            );
-        }
-        assert!(
-            validate_command(
-                &session,
-                &ClientCommand::ForgetMemory {
-                    session_id: session.clone(),
-                    scope: leveler_client_protocol::UiMemoryScope::Project,
-                    id: "memory".into()
-                }
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn desktop_settings_reads_keep_selected_session_and_bounded_query_scope() {
         let session = SessionId::new("desktop-settings");
         let id = Some("query-1".into());
@@ -711,6 +681,12 @@ mod tests {
                 center_seq: None,
                 before: 0,
                 after: 100,
+            },
+            ClientCommand::QueryUsage {
+                session_id: session.clone(),
+                query_id: id.clone(),
+                scope: leveler_client_protocol::UiUsageScope::Session,
+                utc_offset_minutes: 480,
             },
         ];
         for command in commands {

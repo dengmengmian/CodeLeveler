@@ -166,7 +166,7 @@ fn packs(minimal_baseline: bool) -> CapabilityPacks {
             web_fetch: true,
             web_search: false,
             media: false,
-            memory: true,
+
             skills: true,
             browser: false,
         }
@@ -214,7 +214,6 @@ fn executor_with_mode(
         4,
     )
     .with_delegation(true)
-    .with_memory_expose(!minimal_baseline)
     .with_goal_mode(goal)
 }
 
@@ -236,13 +235,8 @@ fn column(source: &PromptSource) -> &'static str {
         PromptSource::SkillCatalog | PromptSource::AgentCatalog | PromptSource::Skill { .. } => {
             "catalog"
         }
-        PromptSource::TurnFacts
-        | PromptSource::ExecutionState
-        | PromptSource::Resume
-        | PromptSource::MemoryRecall { .. }
-        | PromptSource::MemoryCatalog => "runtime",
+        PromptSource::TurnFacts | PromptSource::ExecutionState | PromptSource::Resume => "runtime",
         PromptSource::BasePrompt
-        | PromptSource::MemoryGuidance
         | PromptSource::OperatingRules
         | PromptSource::FinalDelivery
         | PromptSource::GoalProtocol
@@ -471,7 +465,6 @@ async fn current_prompt_surface_inventory() {
             "Judge the comment change.".into(),
             vec!["crates/leveler-agent/src/lib.rs".into()],
             std::time::Duration::ZERO,
-            None,
             &mut |_| {},
             CancellationToken::new(),
         )
@@ -486,23 +479,18 @@ async fn current_prompt_surface_inventory() {
 
     let mut report_text = String::from(
         "CURRENT_PROMPT_SURFACE\n\
-         pin: minimal_baseline=no optional packs; full_baseline=code_intelligence+vcs+web_fetch+memory+skills; \
+         pin: minimal_baseline=no optional packs; full_baseline=code_intelligence+vcs+web_fetch+skills; \
          web_search/browser/media off (no key, no browser handle, non-vision)\n\
          home: empty, so user-level skills and agents are not in these numbers\n\
          fixed = control + tools; messages are the turn input, not history growth\n\n",
     );
     let cases = [
-        // Raised when the unified Memory 2.0 tool surface landed: `memory`
-        // gained update/deprecate/pin/unpin and the memory schemas carry
-        // scope, value, expiry and revision. `minimal_baseline` (memory off)
-        // is unchanged, so the growth is the memory pack itself.
         ("chat", &chat, 23_961_u64),
         ("minimal_baseline", &minimal_baseline, 19_715),
         ("full_baseline", &full_baseline, 23_961),
         // Preserve the existing maximum while using public fixture rules.
         ("goal", &goal, 24_484),
         ("explorer", &explorer, 13_820),
-        // Same Memory 2.0 pack as chat; the worker surface carries it too.
         ("worker", &worker, 19_762),
         ("reviewer", &reviewer, 13_850),
     ];
@@ -558,6 +546,186 @@ async fn current_prompt_surface_inventory() {
     let path = std::env::temp_dir().join("prompt-surface-current.txt");
     std::fs::write(&path, &report_text).unwrap();
     eprintln!("{report_text}\nWROTE {}", path.display());
+
+    // The same measurement, machine-readable. This is the artifact a prompt
+    // audit and a prompt A/B read: every block the model actually received with
+    // its provenance, plus the tool surface beside it. Written only when asked
+    // for, so an ordinary test run leaves nothing behind.
+    let inventory = surface_inventory(
+        &[
+            ("chat", &chat),
+            ("minimal_baseline", &minimal_baseline),
+            ("full_baseline", &full_baseline),
+            ("goal", &goal),
+            ("explorer", &explorer),
+            ("worker", &worker),
+            ("reviewer", &reviewer),
+        ],
+        &root,
+    );
+    // A block with no recorded source, authority class, or lifecycle is a hole
+    // in the audit trail: nothing later can say what it was or whether it was
+    // allowed to be there. Production assembly must not produce one.
+    let variants = inventory["variants"].as_array().expect("variants");
+    assert!(!variants.is_empty());
+    for variant in variants {
+        let id = variant["id"].as_str().expect("variant id");
+        let segments = variant["segments"].as_array().expect("segments");
+        assert!(!segments.is_empty(), "{id} has no control blocks");
+        assert!(
+            segments.iter().any(|s| s["name"] == "base"),
+            "{id} does not carry the base contract"
+        );
+        for segment in segments {
+            let name = segment["name"].as_str().expect("segment name");
+            assert_ne!(segment["source"], "unspecified", "{id}/{name} source");
+            assert_ne!(
+                segment["authority"], "unclassified",
+                "{id}/{name} authority"
+            );
+            assert_ne!(segment["lifecycle"], "unknown", "{id}/{name} lifecycle");
+            assert!(
+                !segment["text"].as_str().expect("text").trim().is_empty(),
+                "{id}/{name} is empty"
+            );
+        }
+    }
+    let digest = inventory["prompt_digest"].as_str().expect("digest");
+    eprintln!("PROMPT_SURFACE_DIGEST {digest}");
+    if let Some(out) = std::env::var_os("LEVELER_PROMPT_SURFACE_OUT") {
+        let out = std::path::PathBuf::from(out);
+        std::fs::write(
+            &out,
+            serde_json::to_string_pretty(&inventory).expect("inventory serializes"),
+        )
+        .expect("write prompt surface inventory");
+        eprintln!("WROTE_SURFACE {}", out.display());
+    }
+}
+
+/// Lowercase hex SHA-256 of a block of text.
+fn sha256(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The text an identity digest is computed over.
+///
+/// The fixture assembles each turn in a fresh temporary directory, so the same
+/// prompt reaches the model with a different `cwd` line every run. A digest that
+/// moved with the temporary directory would report "the prompt changed" on every
+/// capture and mean nothing. Only the workspace path is normalized; every
+/// sentence the model reads is hashed as delivered.
+fn identity_text(text: &str, workspace: &std::path::Path) -> String {
+    let raw = workspace.display().to_string();
+    let canonical = std::fs::canonicalize(workspace)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| raw.clone());
+    let mut out = text.replace(&canonical, "<workspace>");
+    if canonical != raw {
+        out = out.replace(&raw, "<workspace>");
+    }
+    out
+}
+
+/// Machine-readable inventory of the effective instruction environment.
+///
+/// Semantic identity, not byte identity: a segment's digest covers its text, a
+/// tool's digest covers its description and input schema. The overall
+/// `prompt_digest` therefore changes when the prompt changes and stays put when
+/// an unrelated estimator constant does — an A/B that rebuilt a number must not
+/// look like a prompt edit.
+fn surface_inventory(
+    variants: &[(&str, &ModelRequest)],
+    workspace: &std::path::Path,
+) -> serde_json::Value {
+    let mut known_tools: Vec<String> = Vec::new();
+    let mut out_variants = Vec::new();
+    for (id, request) in variants {
+        let mut identity = String::new();
+        let mut segment_tokens = 0u64;
+        let mut segments = Vec::new();
+        for segment in &request.control_context.blocks {
+            let text_sha = sha256(&segment.text);
+            let identity_sha = sha256(&identity_text(&segment.text, workspace));
+            segment_tokens = segment_tokens.saturating_add(segment.token_estimate);
+            identity.push_str(&format!(
+                "seg\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{2}",
+                segment.name,
+                serde_json::to_string(&segment.source).expect("source"),
+                serde_json::to_string(&segment.authority).expect("authority"),
+                serde_json::to_string(&segment.lifecycle).expect("lifecycle"),
+                identity_sha
+            ));
+            segments.push(serde_json::json!({
+                "name": segment.name,
+                "source": serde_json::to_value(&segment.source).expect("source"),
+                "authority": serde_json::to_value(segment.authority).expect("authority"),
+                "lifecycle": serde_json::to_value(segment.lifecycle).expect("lifecycle"),
+                "stable": segment.stable,
+                "authority_mismatch": segment.authority_mismatch,
+                "tokens": segment.token_estimate,
+                "chars": segment.text.chars().count(),
+                "sha256": text_sha,
+                "identity_sha256": identity_sha,
+                "text": segment.text,
+            }));
+        }
+        let mut tools = Vec::new();
+        for tool in &request.tools {
+            let schema_sha = sha256(&tool.input_schema.to_string());
+            let description_sha = sha256(&tool.description);
+            let mut estimate = TokenEstimate::new();
+            estimate.add_tool_definition(tool);
+            identity.push_str(&format!(
+                "tool\u{1}{}\u{1}{}\u{1}{}\u{2}",
+                tool.name, description_sha, schema_sha
+            ));
+            if !known_tools.iter().any(|name| name == &tool.name) {
+                known_tools.push(tool.name.clone());
+            }
+            tools.push(serde_json::json!({
+                "name": tool.name,
+                "tokens": estimate.tokens(),
+                "description_chars": tool.description.chars().count(),
+                "description_sha256": description_sha,
+                "schema_sha256": schema_sha,
+                "description": tool.description,
+            }));
+        }
+        let fixed_tokens = estimate_text(&request.control_context.text())
+            + estimate_tool_definitions(&request.tools);
+        out_variants.push(serde_json::json!({
+            "id": id,
+            "segment_tokens": segment_tokens,
+            "tool_tokens": estimate_tool_definitions(&request.tools),
+            "fixed_tokens": fixed_tokens,
+            "variant_digest": sha256(&identity),
+            "segments": segments,
+            "tools": tools,
+        }));
+    }
+    // The digest covers every variant's segment and tool identity, in delivery
+    // order. It answers "is this the same prompt surface?" without carrying the
+    // prose itself.
+    let mut identity = String::new();
+    for variant in &out_variants {
+        identity.push_str(variant["id"].as_str().expect("id"));
+        identity.push('\u{1}');
+        identity.push_str(variant["variant_digest"].as_str().expect("digest"));
+        identity.push('\u{2}');
+    }
+    serde_json::json!({
+        "schema": "leveler.prompt_surface/1",
+        "captured_from": "Executor::run with a scripted model: the real assembly path, no network",
+        "prompt_digest": sha256(&identity),
+        // Union across variants: the tools this build can register. A segment
+        // that names a tool outside this list names something that does not
+        // exist at all.
+        "known_tools": known_tools,
+        "variants": out_variants,
+    })
 }
 
 /// Internal primitive baseline used to compare schema costs with the progressive
@@ -663,7 +831,6 @@ async fn initial_baseline_inventory() {
         "save_skill",
         "spawn_agent",
         "request_user_input",
-        "remember",
         "browser_act",
         "web_fetch",
         "find_symbol",
@@ -717,7 +884,7 @@ async fn progressive_initial_surface_inventory() {
     let root = fixture.path().to_path_buf();
     let home = tempfile::tempdir().unwrap();
     let available = vec![
-        CapabilityId::Memory,
+        CapabilityId::Skills,
         CapabilityId::MultiAgent,
         CapabilityId::Skills,
         CapabilityId::CodeIntelligence,
@@ -790,9 +957,6 @@ async fn progressive_initial_surface_inventory() {
         "web_fetch",
         "web_search",
         "view_image",
-        "memory",
-        "remember",
-        "forget",
         "load_skill",
         "browser_tab",
         "browser_act",
@@ -855,7 +1019,7 @@ async fn full_access_uses_the_progressive_initial_surface() {
     let root = fixture.path().to_path_buf();
     let home = tempfile::tempdir().unwrap();
     let available = vec![
-        CapabilityId::Memory,
+        CapabilityId::Skills,
         CapabilityId::MultiAgent,
         CapabilityId::Skills,
         CapabilityId::CodeIntelligence,
@@ -910,9 +1074,6 @@ async fn full_access_uses_the_progressive_initial_surface() {
         "diagnostics",
         "blast_radius",
         "web_fetch",
-        "memory",
-        "remember",
-        "forget",
         "load_skill",
         "spawn_agent",
         "list_agents",

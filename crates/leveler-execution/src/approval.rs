@@ -38,14 +38,9 @@ pub struct ApprovalRequest {
 }
 
 impl ApprovalRequest {
-    /// Reuse the command effect parser for commands invoking the human consent
-    /// surface. A reviewer or headless approver must not sign that consent.
+    /// Definition writes require confirmation from a person.
     pub fn requires_human_consent(&self) -> bool {
         needs_human_consent(&self.tool)
-            || self.command.as_ref().is_some_and(|command| {
-                let (program, args) = crate::shell_invocation(command);
-                is_self_consent_command(&program, &args)
-            })
     }
 
     /// Resource-bound requests can reuse only the explicitly offered scopes.
@@ -152,9 +147,7 @@ pub trait Approver: Send + Sync {
 }
 
 /// Always approves ordinary tools (non-interactive contexts, tests).
-///
-/// Memory writes (`remember` / `forget`) are never auto-approved (K36): wrong
-/// durable memories are worse than no memory; the user must confirm.
+/// Definition writes require human confirmation.
 pub struct AutoApprove;
 
 #[async_trait]
@@ -211,61 +204,8 @@ impl Approver for EvalApprove {
     }
 }
 
-/// Tools that write durable project memory and always need human confirmation.
-///
-/// Pending-candidate **accept** is deliberately **not** an agent tool: durable
-/// promotion goes through a user-authoritative surface (the TUI/desktop review
-/// action) that mints a user actor. AutoApprove therefore cannot silently
-/// activate candidates.
-/// Whether this command would invoke CodeLeveler's OWN user-consent surface.
-///
-/// `leveler memory accept|reject|remember|forget` IS the user's consent that
-/// K36 requires — it is the human acting, not a capability the agent holds. A
-/// model able to run it signs its own approval, which defeats the whole point
-/// of gating the `remember` tool.
-///
-/// This is not hypothetical. In a real assisted run the gate worked: `remember`
-/// was refused and parked as a pending candidate. The model then ran
-/// `leveler memory accept <id>` through `run_command`, was denied by the
-/// sandbox, retried the same command with `escalate.filesystem =
-/// unrestricted`, and adopted its own candidate.
-///
-/// Shell wrappers are unwrapped first (`sh -c "leveler memory accept x"` and a
-/// `&&` chain both count), because a gate a wrapper can launder is not a gate.
-pub fn is_self_consent_command(program: &str, args: &[String]) -> bool {
-    const CONSENT_VERBS: [&str; 4] = ["accept", "reject", "remember", "forget"];
-    crate::shell_ast::proven_executed_commands(program, args)
-        .iter()
-        .any(|words| {
-            let Some((cmd, rest)) = words.split_first() else {
-                return false;
-            };
-            let base = basename(cmd).to_ascii_lowercase();
-            if base != "leveler" && base != "leveler.exe" {
-                return false;
-            }
-            // The verb must be the SUBCOMMAND of `memory`, not merely present:
-            // `memory search accept` searches for the word "accept" and is an
-            // ordinary read. Options may precede `memory` (`--repo X memory
-            // accept id`), so skip flags rather than fixing positions.
-            let words: Vec<String> = rest.iter().map(|w| w.to_ascii_lowercase()).collect();
-            let Some(at) = words.iter().position(|w| w == "memory") else {
-                return false;
-            };
-            words
-                .iter()
-                .skip(at + 1)
-                .find(|w| !w.starts_with('-'))
-                .is_some_and(|verb| CONSENT_VERBS.contains(&verb.as_str()))
-        })
-}
-
-pub fn is_memory_write_tool(tool: &str) -> bool {
-    matches!(tool, "remember" | "forget")
-}
-
 /// Tools that write an agent or skill definition (`save_agent`, `delete_agent`,
-/// `save_skill`, `delete_skill`). Like a memory write, a definition changes what
+/// `save_skill`, `delete_skill`). A definition changes what
 /// future sessions do. Auto and Restricted require a human confirmation;
 /// Full bypasses this consent gate along with all other permission gates.
 pub fn is_agent_definition_write_tool(tool: &str) -> bool {
@@ -277,7 +217,7 @@ pub fn is_agent_definition_write_tool(tool: &str) -> bool {
 
 /// Tools requiring human confirmation under Auto and Restricted.
 pub fn needs_human_consent(tool: &str) -> bool {
-    is_memory_write_tool(tool) || is_agent_definition_write_tool(tool)
+    is_agent_definition_write_tool(tool)
 }
 
 /// Always denies.
@@ -1156,62 +1096,13 @@ mod tests {
             );
         }
     }
-    /// The agent must not be able to sign its own memory consent, however it
-    /// dresses up the call.
+    /// Definition writes cannot become standing permission rules.
     #[test]
-    fn self_consent_commands_are_recognised_through_any_wrapper() {
-        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for (program, args) in [
-            ("leveler", words(&["memory", "accept", "cand-x"])),
-            ("leveler", words(&["memory", "reject", "cand-x"])),
-            ("leveler", words(&["memory", "remember", "t", "b"])),
-            ("leveler", words(&["memory", "forget", "id"])),
-            ("/usr/local/bin/leveler", words(&["memory", "accept", "x"])),
-            (
-                "leveler",
-                words(&["--repo", "/tmp/p", "memory", "accept", "x"]),
-            ),
-            ("sh", words(&["-c", "leveler memory accept cand-x"])),
-            (
-                "bash",
-                words(&["-c", "cd /tmp && leveler memory accept cand-x"]),
-            ),
-        ] {
-            assert!(
-                super::is_self_consent_command(program, &args),
-                "must be caught: {program} {args:?}"
-            );
-        }
-    }
-
-    /// "Approve always" must not turn a memory write into a standing rule:
-    /// the next write would then skip the human entirely.
-    #[test]
-    fn approve_always_derives_no_rule_for_a_memory_write() {
-        for tool in ["remember", "forget", "save_agent", "delete_agent"] {
+    fn approve_always_derives_no_rule_for_a_definition_write() {
+        for tool in ["save_agent", "delete_agent"] {
             assert!(
                 crate::permission_rules::always_rules_for(tool, None, &[]).is_empty(),
                 "{tool} must not become a standing allow"
-            );
-        }
-    }
-
-    /// Reading memory is not consent, and neither is anything else the agent
-    /// legitimately runs. Over-blocking would break ordinary work.
-    #[test]
-    fn ordinary_commands_are_not_self_consent() {
-        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for (program, args) in [
-            ("leveler", words(&["memory", "list"])),
-            ("leveler", words(&["memory", "search", "accept"])),
-            ("leveler", words(&["doctor"])),
-            ("git", words(&["accept"])),
-            ("npm", words(&["run", "memory:accept"])),
-            ("cargo", words(&["test", "-p", "leveler-memory"])),
-        ] {
-            assert!(
-                !super::is_self_consent_command(program, &args),
-                "must not be caught: {program} {args:?}"
             );
         }
     }
@@ -1384,7 +1275,7 @@ mod tests {
 
     /// Full includes current and future tools; Auto/Restricted retain consent.
     #[test]
-    fn memory_writes_need_consent_except_in_full() {
+    fn definition_writes_need_consent_except_in_full() {
         let policy = ApprovalPolicy {
             network_allowed: true,
         };
@@ -1392,7 +1283,7 @@ mod tests {
             PermissionProfile::Assisted,
             PermissionProfile::RequestApproval,
         ] {
-            for tool in ["remember", "forget", "save_agent", "delete_agent"] {
+            for tool in ["save_agent", "delete_agent"] {
                 assert_eq!(
                     policy.evaluate(profile, tool, RiskLevel::WorkspaceWrite, None),
                     Requirement::NeedApproval,
@@ -1400,13 +1291,7 @@ mod tests {
                 );
             }
         }
-        for tool in [
-            "remember",
-            "forget",
-            "save_agent",
-            "delete_agent",
-            "future_capability",
-        ] {
+        for tool in ["save_agent", "delete_agent", "future_capability"] {
             assert_eq!(
                 policy.evaluate(
                     PermissionProfile::FullAccess,
@@ -1427,24 +1312,24 @@ mod tests {
             ),
             Requirement::Auto
         );
-        // Assisted / request-approval still confirm memory writes (K36).
+        // Assisted / request-approval still confirm definition writes.
         assert_eq!(
             policy.evaluate(
                 PermissionProfile::Assisted,
-                "forget",
+                "save_agent",
                 RiskLevel::WorkspaceWrite,
                 None
             ),
             Requirement::NeedApproval
         );
         assert_eq!(
-            policy.evaluate(PermissionProfile::Assisted, "memory", RiskLevel::Safe, None),
+            policy.evaluate(PermissionProfile::Assisted, "read", RiskLevel::Safe, None),
             Requirement::Auto
         );
     }
 
     #[tokio::test]
-    async fn auto_approve_denies_memory_writes() {
+    async fn auto_approve_denies_definition_writes() {
         let req = ApprovalRequest {
             grant: None,
             id: leveler_core::ApprovalId::generate(),
@@ -1452,7 +1337,7 @@ mod tests {
             call_id: "c1".into(),
             agent_id: None,
             action_fingerprint: "fp".into(),
-            tool: "remember".into(),
+            tool: "save_agent".into(),
             risk: RiskLevel::WorkspaceWrite,
             description: "test".into(),
             command: None,
@@ -1460,14 +1345,14 @@ mod tests {
         };
         assert_eq!(AutoApprove.decide(&req).await, ApprovalDecision::Deny);
 
-        let forget = ApprovalRequest {
-            tool: "forget".into(),
+        let delete = ApprovalRequest {
+            tool: "delete_agent".into(),
             ..req
         };
         assert_eq!(
-            AutoApprove.decide(&forget).await,
+            AutoApprove.decide(&delete).await,
             ApprovalDecision::Deny,
-            "K36: --auto-approve must not persist memory writes"
+            "--auto-approve must not change agent definitions"
         );
     }
 

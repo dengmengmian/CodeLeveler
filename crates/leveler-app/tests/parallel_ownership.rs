@@ -31,6 +31,7 @@ async fn create_parallel_parent(engine: &TaskEngine) -> leveler_core::SessionId 
             sandbox: false,
             kind: ExecutionKind::Parallel,
             axes: None,
+            model_pinned: true,
         })
         .await
         .unwrap()

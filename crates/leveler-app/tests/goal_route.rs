@@ -647,3 +647,383 @@ fn unavailable_with_immediate_retry() -> MockResponse {
         headers: vec![("Retry-After".to_string(), "0".to_string())],
     }
 }
+
+// ---------------------------------------------------------------------------
+// A supplement stated to an existing Goal.
+//
+// The user's message, the scope it extends, the authorization to execute it
+// and the completion of the goal are four separate facts. A Goal-route session
+// whose window ended at the user's own pause keeps serving that goal, so a
+// supplement typed next is scope for it — recorded, never executed, and never a
+// release of the pause.
+// ---------------------------------------------------------------------------
+
+const PAUSED_OBJECTIVE: &str = "完成两个阶段：阶段 1 在仓库根目录创建 stage-1.txt，\
+     然后运行 sh -c 'cat stage-1.txt' 确认；阶段 1 完成后停下，等待我确认再执行阶段 2；\
+     阶段 2 创建 stage-2.txt，然后运行 sh -c 'cat stage-2.txt' 确认。";
+
+/// Stage 1 delivered and the model's own plan reached the user's boundary.
+fn paused_after_stage_one() -> Vec<MockResponse> {
+    vec![
+        sse(vec![
+            tool_call_frame(
+                "p1",
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "in_progress"},
+                    {"step": "阶段 1 完成后停下，等待我确认", "status": "pending"},
+                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                ]}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "p2",
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "completed"},
+                    {"step": "阶段 1 完成后停下，等待我确认", "status": "completed"},
+                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                ]}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        plain_answer("阶段 1 已完成。按你的要求，阶段 2 等你的确认。"),
+    ]
+}
+
+/// A supplement that names a new deliverable and contains no `继续`.
+const SUPPLEMENT: &str = "顺便把 stage-extra.txt 也补上，内容为一行 extra，\
+     然后运行 sh -c 'cat stage-extra.txt' 确认。";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supplement_to_a_paused_goal_is_scope_and_keeps_the_pause() {
+    let mut responses = paused_after_stage_one();
+    responses.push(plain_answer("补充要求已记下；阶段 2 仍等你的确认。"));
+    let f = fixture(responses, leveler_agent::CollaborationMode::Goal).await;
+    run_goal_turn(&f, PAUSED_OBJECTIVE).await;
+
+    let paused = goals(&f).await;
+    assert_eq!(paused.len(), 1, "{paused:?}");
+    let goal_id = paused[0].id.clone();
+    assert!(
+        paused[0].user_paused_at.is_some(),
+        "the user's boundary is durable: {paused:?}"
+    );
+    assert!(paused[0].amendments.is_empty(), "{paused:?}");
+
+    client(&f)
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: SUPPLEMENT.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f, 2).await;
+
+    let goals = goals(&f).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "a supplement opens no second goal: {goals:?}"
+    );
+    assert_eq!(goals[0].id, goal_id, "identity is the goal, not the text");
+    assert!(
+        goals[0].amendments.iter().any(|a| a.trim() == SUPPLEMENT),
+        "the user's own words are durable scope without a resume keyword: {goals:?}"
+    );
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "adding a requirement is not an authorization to continue: {goals:?}"
+    );
+    assert_eq!(goals[0].state, GoalState::Running);
+    assert!(
+        !f._tmp.path().join("stage-extra.txt").exists(),
+        "the supplement is recorded, not executed"
+    );
+    assert!(
+        !f._tmp.path().join("stage-2.txt").exists(),
+        "the withheld stage stays withheld"
+    );
+    // The original contract is untouched by the supplement: the objective is
+    // the user's own words, and the acceptance the model committed to stays as
+    // it was declared.
+    assert_eq!(goals[0].objective, PAUSED_OBJECTIVE);
+    assert_eq!(
+        goals[0].acceptance, paused[0].acceptance,
+        "a supplement does not rewrite the stored acceptance: {goals:?}"
+    );
+}
+
+/// A status question is answered and changes nothing: no amendment, no new
+/// goal, no release of the pause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_question_inside_a_paused_goal_adds_no_scope() {
+    let mut responses = paused_after_stage_one();
+    responses.push(plain_answer("阶段 1 创建了 stage-1.txt；没有跑测试。"));
+    let f = fixture(responses, leveler_agent::CollaborationMode::Goal).await;
+    run_goal_turn(&f, PAUSED_OBJECTIVE).await;
+
+    client(&f)
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "刚才修改了哪些文件？测试通过了吗？现在进度怎么样？".to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f, 2).await;
+
+    let goals = goals(&f).await;
+    assert_eq!(goals.len(), 1, "{goals:?}");
+    assert_eq!(
+        goals[0].amendments,
+        Vec::<String>::new(),
+        "a question about the work is not scope: {goals:?}"
+    );
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "the question does not release the pause: {goals:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two goals owed at once: an earlier one the user paused, and the one this
+// session is executing.
+//
+// The projection must show the goal the LIVE turn serves. "The first running
+// row" would present goal A's pause while goal B runs, which is exactly the
+// state the user cannot act on.
+// ---------------------------------------------------------------------------
+
+/// Chat-sourced goal A: committed, stage 1 delivered, stopped at the user's
+/// own boundary.
+fn committed_pause_turn() -> Vec<MockResponse> {
+    vec![
+        sse(vec![
+            tool_call_frame(
+                "c-commit",
+                "commit_task",
+                serde_json::json!({
+                    "objective": PAUSED_OBJECTIVE,
+                    "acceptance": ["stage-1.txt 存在", "stage-2.txt 存在"]
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "p1",
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "in_progress"},
+                    {"step": "阶段 1 完成后停下，等待我确认", "status": "pending"},
+                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                ]}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "p2",
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "completed"},
+                    {"step": "阶段 1 完成后停下，等待我确认", "status": "completed"},
+                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                ]}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        plain_answer("阶段 1 已完成。按你的要求，阶段 2 等你的确认。"),
+    ]
+}
+
+const SECOND_OBJECTIVE: &str = "创建 export-b1.txt，然后运行 sh ./verify.sh 验收。\
+     一次做完，中间不要停下来等我确认。";
+
+/// A goal B turn whose FIRST model call is slow, so the test can observe the
+/// session while goal B is genuinely executing. The slow response is a plain
+/// answer: the goal contract then drives the next round, which does the work.
+fn running_second_goal() -> Vec<MockResponse> {
+    vec![
+        MockResponse::SilentThenJson {
+            silent_ms: 600,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "开始执行。"},
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        },
+        sse(vec![
+            tool_call_frame(
+                "b-w1",
+                "write_file",
+                serde_json::json!({"path": "export-b1.txt", "content": "b1\n"}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "b-run",
+                "run_command",
+                serde_json::json!({"program": "sh", "args": ["./verify.sh"], "reason": "run the acceptance check"}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
+                "b-done",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "export-b1.txt 已创建并验收",
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "requirements": [
+                        {"requirement": "export-b1.txt", "status": "done",
+                         "evidence": "created export-b1.txt"}
+                    ]
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
+    let mut responses = committed_pause_turn();
+    responses.extend(running_second_goal());
+    let f = fixture(responses, leveler_agent::CollaborationMode::Chat).await;
+    let verifier = f._tmp.path().join("verify.sh");
+    std::fs::write(&verifier, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // ONE client: `active` (which window is running) lives on the client, so a
+    // snapshot must come from the same runtime that admitted the turn.
+    let runtime = client(&f);
+
+    // ── goal A: committed, paused at the user's own boundary ───────────────
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: PAUSED_OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f, 1).await;
+    let after_pause = goals(&f).await;
+    assert_eq!(after_pause.len(), 1, "{after_pause:?}");
+    let goal_a = after_pause[0].id.clone();
+    assert!(
+        after_pause[0].user_paused_at.is_some(),
+        "A is paused: {after_pause:?}"
+    );
+    let a_projection = runtime
+        .snapshot(&f.session)
+        .await
+        .unwrap()
+        .execution_task
+        .expect("A is owed");
+    assert_eq!(a_projection.goal_id, goal_a.as_str());
+    assert!(a_projection.user_paused);
+    assert!(!a_projection.running);
+
+    // ── goal B starts while A is still owed and paused ─────────────────────
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: format!("/goal {SECOND_OBJECTIVE}"),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let mut live = None;
+    for _ in 0..200 {
+        let snapshot = runtime.snapshot(&f.session).await.unwrap();
+        if let Some(task) = snapshot.execution_task
+            && task.running
+            && task.goal_id != goal_a.as_str()
+        {
+            live = Some(task);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let live = live.expect("goal B must be projected while it executes");
+    let goals_now = goals(&f).await;
+    let goal_b = goals_now
+        .iter()
+        .find(|goal| goal.id != goal_a)
+        .expect("goal B exists")
+        .id
+        .clone();
+    assert_eq!(live.goal_id, goal_b.as_str(), "the live turn serves B");
+    assert!(!live.user_paused, "B never inherits A's pause");
+    assert_eq!(live.objective, SECOND_OBJECTIVE);
+    assert!(
+        goals_now
+            .iter()
+            .any(|goal| goal.id == goal_a && goal.user_paused_at.is_some()),
+        "A's own pause is durable while B runs: {goals_now:?}"
+    );
+
+    // ── B finishes; nothing is left owed, and A is unchanged ───────────────
+    wait_for_goals(&f, |goals| {
+        goals
+            .iter()
+            .any(|goal| goal.id == goal_b && goal.state == GoalState::Settled)
+    })
+    .await;
+    let final_state = goals(&f).await;
+    assert_eq!(final_state.len(), 2, "{final_state:?}");
+    let a_now = final_state
+        .iter()
+        .find(|goal| goal.id == goal_a)
+        .expect("A still exists");
+    assert_eq!(a_now.state, GoalState::Running);
+    assert!(a_now.user_paused_at.is_some(), "A's history is intact");
+    assert_eq!(a_now.objective, PAUSED_OBJECTIVE);
+    let b_now = final_state
+        .iter()
+        .find(|goal| goal.id == goal_b)
+        .expect("B exists");
+    assert!(b_now.user_paused_at.is_none());
+    let after_b = runtime.snapshot(&f.session).await.unwrap();
+    assert_eq!(
+        after_b.execution_task.map(|task| task.goal_id),
+        Some(goal_a.to_string()),
+        "with B settled, the still-owed goal is A again"
+    );
+    assert!(f._tmp.path().join("export-b1.txt").exists(), "B delivered");
+    assert!(
+        !f._tmp.path().join("stage-2.txt").exists(),
+        "B never executed A's withheld stage"
+    );
+}

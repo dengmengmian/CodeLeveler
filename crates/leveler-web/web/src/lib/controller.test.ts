@@ -1,6 +1,6 @@
 // 控制面契约测试：web 发出的命令必须是真实协议变体
-// （set_product_axes / accept_memory / forget_memory），事件层不再丢弃
-// memory / sub-agent / progress 事件。
+// （set_product_axes 等），事件层不再丢弃
+// sub-agent / progress 事件。
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { Action, AppState } from '../state/store';
@@ -331,45 +331,6 @@ describe('project switch isolation', () => {
   });
 });
 
-describe('memory commands', () => {
-  it('accept/forget send the user-authoritative variants then refresh the list', () => {
-    const { bridge, sent } = harness();
-    bridge.acceptMemory('p1');
-    bridge.forgetMemory('a1');
-    expect(sent.map((c) => c.type)).toEqual([
-      'accept_memory',
-      'list_memory',
-      'forget_memory',
-      'list_memory',
-    ]);
-  });
-
-  // 拒绝候选和归档已生效记忆是两件事。这个面板原来两个按钮都调 forgetMemory，
-  // 而 forget 只处理 active/archive —— 点“忽略”实际什么也没发生。
-  it('rejecting a pending candidate sends reject_memory, never forget_memory', () => {
-    const { bridge, sent } = harness();
-    bridge.rejectMemory('cand-1');
-    expect(sent.map((c) => c.type)).toEqual(['reject_memory', 'list_memory']);
-    expect(sent.some((c) => c.type === 'forget_memory')).toBe(false);
-  });
-
-  it('a direct write sends remember_memory with the chosen kind', () => {
-    const { bridge, sent } = harness();
-    bridge.rememberMemory('  终端输出保持紧凑  ', 'preference');
-    expect(sent[0]).toMatchObject({
-      type: 'remember_memory',
-      body: '终端输出保持紧凑',
-      kind: 'preference',
-    });
-    expect(sent.map((c) => c.type)).toEqual(['remember_memory', 'list_memory']);
-  });
-
-  it('a blank direct write sends nothing', () => {
-    const { bridge, sent } = harness();
-    bridge.rememberMemory('   ', 'note');
-    expect(sent).toEqual([]);
-  });
-});
 
 describe('agent registry commands', () => {
   const draft = {
@@ -492,15 +453,6 @@ describe('interaction commands', () => {
     expect(state.current?.diff).toEqual({ files: [] });
   });
 
-  it('openMemory lists memory and opens Inspector More', () => {
-    const { bridge, sent, state } = harness();
-    reducer(state, { type: 'set_inspector', open: false });
-    expect(state.inspectorOpen).toBe(false);
-    bridge.openMemory();
-    expect(sent[0]).toMatchObject({ type: 'list_memory', session_id: 's1', include_archived: true });
-    expect(state.inspectorOpen).toBe(true);
-    expect(state.inspectorMore).toBe(true);
-  });
 });
 
 describe('session_updated vs session_opened', () => {
@@ -620,32 +572,9 @@ describe('query observability', () => {
 });
 
 describe('event closure', () => {
-  it('an unowned memory_list does not overwrite this client state', () => {
-    const { apply, state } = harness();
-    apply({
-      type: 'memory_list',
-      memory_dir: '/m',
-      active: [{ id: 'a', title: 't' }],
-      archived: [],
-      pending: [{ id: 'p', title: 'q', body: '正文', kind: 'preference', source: 'user_explicit' }],
-    });
-    expect(state.current?.memory).toBeNull();
-  });
 
-  it('the matching memory_list reaches the requesting client', () => {
-    const { bridge, apply, state } = harness();
-    const queryId = bridge.listMemory();
-    expect(queryId).toBeTruthy();
-    apply({
-      type: 'memory_list',
-      query_id: queryId,
-      memory_dir: '/m',
-      active: [{ id: 'a', title: 't' }],
-      archived: [],
-      pending: [],
-    });
-    expect(state.current?.memory?.active).toHaveLength(1);
-  });
+
+
 
   it('sub_agent events reach state', () => {
     const { apply, state } = harness();

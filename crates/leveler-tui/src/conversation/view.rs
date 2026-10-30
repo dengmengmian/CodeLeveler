@@ -99,6 +99,11 @@ pub struct UnitEnv {
     pub monochrome: bool,
     pub locale: crate::i18n::Locale,
     pub tools_expanded: bool,
+    /// Whether the session owes a goal the user paused. An archived plan's
+    /// label is read from the durable goal projection, not from the item, so a
+    /// pause that is set or released must re-wrap it — otherwise a released
+    /// pause keeps claiming the user is still holding the work back.
+    pub plan_waiting: bool,
 }
 
 /// A command row in unit-relative coordinates (resolved against the assembled

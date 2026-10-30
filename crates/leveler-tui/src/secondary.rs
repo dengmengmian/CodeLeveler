@@ -80,11 +80,6 @@ pub(crate) struct SecondaryLayout {
     pub footer: Rect,
 }
 
-/// The display columns a page's footer can use at terminal `width`.
-pub(crate) fn footer_width(width: u16) -> usize {
-    width.saturating_sub(2 * padding_x(width)) as usize
-}
-
 /// Split `area` into the shared Secondary Surface slots, with one footer row.
 ///
 /// The vertical split happens first, then the safe margin is applied once, to
@@ -228,66 +223,6 @@ fn paint_header(
     })
 }
 
-/// The separator the product uses between interaction hints.
-pub(crate) const HINT_SEPARATOR: &str = " · ";
-
-/// Pack interaction hints into rows of at most `width` display columns.
-///
-/// A footer must never hide a binding: whole segments (`↑↓ 移动`, `A 接受`)
-/// move to the next row instead of being ellipsized. Only when one segment is
-/// wider than the terminal — far below the supported minimum — is it split by
-/// display width, so even then no key disappears.
-pub(crate) fn wrap_hint<'a>(
-    segments: impl IntoIterator<Item = &'a str>,
-    width: usize,
-) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
-    let mut row_width = 0usize;
-    for segment in segments {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        let segment_width = UnicodeWidthStr::width(segment);
-        let separator_width = if row.is_empty() {
-            0
-        } else {
-            UnicodeWidthStr::width(HINT_SEPARATOR)
-        };
-        if !row.is_empty() && row_width + separator_width + segment_width > width {
-            rows.push(std::mem::take(&mut row));
-            row_width = 0;
-        }
-        if segment_width > width {
-            let mut rest = segment;
-            loop {
-                let (piece, tail) = crate::render::text::take_display_prefix(rest, width);
-                let piece_width = UnicodeWidthStr::width(piece.as_str());
-                if tail.is_empty() {
-                    row = piece;
-                    row_width = piece_width;
-                    break;
-                }
-                rows.push(piece);
-                rest = tail;
-            }
-            continue;
-        }
-        if !row.is_empty() {
-            row.push_str(HINT_SEPARATOR);
-            row_width += UnicodeWidthStr::width(HINT_SEPARATOR);
-        }
-        row.push_str(segment);
-        row_width += segment_width;
-    }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    rows
-}
-
 /// Draw the rule above the footer and the interaction hint below it.
 ///
 /// `page.hint` may carry one row per line; the footer rect must be tall
@@ -403,65 +338,6 @@ pub(crate) fn main_status_spans(state: &AppState, width: usize) -> Vec<Span<'sta
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const REVIEW_HINTS: [&str; 6] = [
-        "↑↓ 移动",
-        "空格 选择",
-        "Enter 查看",
-        "A 接受",
-        "R 拒绝",
-        "Esc 返回",
-    ];
-
-    fn width_of(row: &str) -> usize {
-        UnicodeWidthStr::width(row)
-    }
-
-    /// Whole actions move to the next row; none is cut or dropped.
-    #[test]
-    fn hint_rows_move_whole_actions_to_the_next_row() {
-        let rows = wrap_hint(REVIEW_HINTS, 24);
-        assert!(
-            rows.len() > 1,
-            "24 columns cannot hold the full hint: {rows:?}"
-        );
-        for row in &rows {
-            assert!(width_of(row) <= 24, "row too wide: {row:?}");
-        }
-        for action in REVIEW_HINTS {
-            assert!(
-                rows.iter().any(|row| row.contains(action)),
-                "{action:?} was dropped: {rows:?}"
-            );
-        }
-    }
-
-    /// CJK labels are measured in cells, not characters.
-    #[test]
-    fn hint_rows_measure_display_width() {
-        let rows = wrap_hint(REVIEW_HINTS, 20);
-        for row in &rows {
-            assert!(width_of(row) <= 20, "row too wide: {row:?}");
-        }
-        let joined = rows.join(" · ");
-        for action in REVIEW_HINTS {
-            assert!(joined.contains(action), "{action:?} was dropped: {joined}");
-        }
-    }
-
-    /// Below the width of a single action, splitting keeps every glyph rather
-    /// than replacing the tail with an ellipsis.
-    #[test]
-    fn an_oversized_hint_action_is_split_not_dropped() {
-        let rows = wrap_hint(["Esc 返回", "A 接受"], 4);
-        for row in &rows {
-            assert!(width_of(row) <= 4, "row too wide: {row:?}");
-        }
-        let joined: String = rows.concat();
-        for glyph in ['返', '回', '接', '受'] {
-            assert!(joined.contains(glyph), "{glyph:?} was dropped: {rows:?}");
-        }
-    }
 
     /// A taller footer takes its rows from the content, not from the rules.
     #[test]

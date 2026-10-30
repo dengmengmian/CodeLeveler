@@ -374,6 +374,48 @@ pub struct CaseResult {
     /// into one turn raises this before it raises anything else.
     #[serde(default)]
     pub peak_input_tokens: u64,
+
+    // ── Resource facts: cache, auxiliary calls, redundant work ──────────────
+    //
+    // `Option`, not a defaulted number: an artifact written before a fact was
+    // recorded cannot be read as "zero of it happened". The distinction is the
+    // same one `reasoning_tokens` makes above.
+    /// Prompt tokens the provider served from its own prefix cache, summed over
+    /// this case's model calls. A SUBSET of [`Self::input_tokens`], never an
+    /// addition. `None` when any call reported no cache figure (or the artifact
+    /// predates the field), because a partial sum would overstate uncached cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Model calls that were NOT main-loop rounds — compaction summaries,
+    /// advisory calls — with their token totals. The
+    /// cost a task pays beyond the rounds the model drove; a prompt change that
+    /// trades rounds for auxiliary calls has not saved anything unless this is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_output_tokens: Option<u64>,
+    /// Auto-compactions observed in the run — events, not model calls: a fold
+    /// that needed no summarization is still a fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<u32>,
+    /// A read whose returned text was byte-identical to an earlier read of the
+    /// same path and range, with no successful edit in between: the same bytes
+    /// came back, so it bought no new information.
+    ///
+    /// Conservative on purpose: any successful edit clears the window, and any
+    /// difference in the returned preview is not counted. A lower bound on
+    /// redundant re-reads — never a claim about why the model re-read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundant_reads: Option<u32>,
+    /// A verification-class command re-run with no successful edit since its
+    /// previous run and the same verdict: the workspace had nothing new to say.
+    /// A repeat after a FAILED check with no change is a retry loop; a repeat
+    /// after a pass is confirmation of what was already known. Diagnostic, not
+    /// a penalty — verification itself is never waste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundant_verification_calls: Option<u32>,
 }
 
 const fn default_repetition() -> u32 {
@@ -1395,6 +1437,15 @@ pub struct TrajectorySignals {
     /// `update_goal` resolutions the runtime refused, by stable reason key
     /// (`plan_unreconciled`, `outstanding_children`, `invalid_status`).
     pub goal_interceptions: Vec<String>,
+    /// Reads that returned bytes the run had already seen for the same path and
+    /// range, with no successful edit since. See
+    /// [`CaseResult::redundant_reads`] for why this is a lower bound.
+    pub redundant_reads: u32,
+    /// Verification-class commands repeated with no successful edit since their
+    /// previous run and the same verdict — the observable shape of re-running a
+    /// check whose inputs did not change. See
+    /// [`CaseResult::redundant_verification_calls`].
+    pub redundant_verification_calls: u32,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1646,6 +1697,13 @@ mod tests {
             model_time_before_first_edit_ms: None,
             reasoning_tokens_before_first_edit: None,
             peak_input_tokens: 0,
+            cached_input_tokens: None,
+            auxiliary_requests: None,
+            auxiliary_input_tokens: None,
+            auxiliary_output_tokens: None,
+            compactions: None,
+            redundant_reads: None,
+            redundant_verification_calls: None,
         }
     }
 
@@ -1672,6 +1730,38 @@ mod tests {
         };
         assert!(empty.avg_ttff_ms().is_none());
         assert!(empty.max_silent_duration_ms().is_none());
+    }
+
+    /// An artifact written before the cache/auxiliary/redundancy facts existed
+    /// must load with those facts ABSENT, never zero: "we did not measure it"
+    /// and "it did not happen" are different claims, and a prompt evaluation
+    /// that conflated them would report an unmeasured saving as a real one.
+    #[test]
+    fn legacy_artifacts_report_absent_resource_facts_instead_of_zero() {
+        let legacy = r#"{
+            "id": "t8", "repetition": 1, "completed": true, "expect_passed": true,
+            "rounds": 7, "latency_ms": 1000, "input_tokens": 900, "output_tokens": 40,
+            "note": "", "tool_calls": 4
+        }"#;
+        let case: CaseResult = serde_json::from_str(legacy).expect("legacy case loads");
+        assert!(case.cached_input_tokens.is_none());
+        assert!(case.auxiliary_requests.is_none());
+        assert!(case.auxiliary_input_tokens.is_none());
+        assert!(case.auxiliary_output_tokens.is_none());
+        assert!(case.compactions.is_none());
+        assert!(case.redundant_reads.is_none());
+        assert!(case.redundant_verification_calls.is_none());
+
+        // A recorded zero is a measurement and survives the round trip.
+        let mut measured = case.clone();
+        measured.cached_input_tokens = Some(0);
+        measured.redundant_reads = Some(0);
+        let json = serde_json::to_string(&measured).unwrap();
+        assert!(json.contains("\"cached_input_tokens\":0"), "{json}");
+        assert!(json.contains("\"redundant_reads\":0"), "{json}");
+        let back: CaseResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cached_input_tokens, Some(0));
+        assert_eq!(back.redundant_reads, Some(0));
     }
 
     #[test]
@@ -2347,6 +2437,13 @@ mod tests {
             model_time_before_first_edit_ms: None,
             reasoning_tokens_before_first_edit: None,
             peak_input_tokens: 0,
+            cached_input_tokens: None,
+            auxiliary_requests: None,
+            auxiliary_input_tokens: None,
+            auxiliary_output_tokens: None,
+            compactions: None,
+            redundant_reads: None,
+            redundant_verification_calls: None,
         }
     }
 
@@ -2692,6 +2789,13 @@ expect: { program: cargo, args: [test] }
                 model_time_before_first_edit_ms: None,
                 reasoning_tokens_before_first_edit: None,
                 peak_input_tokens: 0,
+                cached_input_tokens: None,
+                auxiliary_requests: None,
+                auxiliary_input_tokens: None,
+                auxiliary_output_tokens: None,
+                compactions: None,
+                redundant_reads: None,
+                redundant_verification_calls: None,
             }
             .passed()
         );
@@ -2756,6 +2860,13 @@ expect: { program: cargo, args: [test] }
                 model_time_before_first_edit_ms: None,
                 reasoning_tokens_before_first_edit: None,
                 peak_input_tokens: 0,
+                cached_input_tokens: None,
+                auxiliary_requests: None,
+                auxiliary_input_tokens: None,
+                auxiliary_output_tokens: None,
+                compactions: None,
+                redundant_reads: None,
+                redundant_verification_calls: None,
             }
             .passed()
         );

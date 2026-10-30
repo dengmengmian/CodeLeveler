@@ -58,6 +58,27 @@ impl ObjectiveAnchor {
         self.text.trim().is_empty()
     }
 
+    /// The latest user-authored instruction in this boundary.
+    ///
+    /// Continuation amendments are whole user messages; the newest one is the
+    /// current authority. The primary message is the fallback for legacy rows
+    /// that predate `primary`, and `text` is the final compatibility fallback.
+    ///
+    /// This is a scope selector, not a summary: a pause stated in an older
+    /// message is not carried forward by the amendment that authorizes the
+    /// next stage.
+    pub fn latest_instruction(&self) -> &str {
+        self.amendments
+            .last()
+            .map(String::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .or(self
+                .primary
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()))
+            .unwrap_or(self.text.as_str())
+    }
+
     /// Add one durable user amendment. The effective `text` remains the
     /// compatibility view consumed by existing contracts and prompts.
     pub fn amend(&mut self, amendment: impl Into<String>) {

@@ -217,7 +217,7 @@ pub fn decode_turn_continuation(payload: &str) -> Result<TurnContinuation, Engin
 
 /// Decode the authoritative initiating user message stored in `turns.payload`.
 ///
-/// Consumers such as the asynchronous memory consolidator must use this
+/// Asynchronous consumers must use this
 /// boundary instead of duplicating the versioned wire format.
 pub fn decode_turn_initiating_message(payload: &str) -> Result<Message, EngineError> {
     TurnInitiationPayload::decode(payload)
@@ -643,6 +643,7 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             objective: record.objective,
             acceptance: record.acceptance,
             amendments: record.amendments,
+            user_paused_at: record.user_paused_at,
         }))
     }
 

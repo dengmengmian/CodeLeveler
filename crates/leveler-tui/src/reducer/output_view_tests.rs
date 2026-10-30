@@ -103,8 +103,8 @@ fn a_large_finished_shell_opens_the_windowed_page() {
         _ => panic!("shell"),
     };
     assert!(
-        !shell.expanded,
-        "the conversation keeps the bounded record, not the full result"
+        !shell.view.follow || shell.view.scroll == 0,
+        "the conversation keeps a bounded window, never the full result"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

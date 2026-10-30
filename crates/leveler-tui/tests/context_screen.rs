@@ -118,7 +118,13 @@ fn the_pane_holds_at_every_width() {
         let mut s = opened(snapshot());
         let text = screen_text(&mut s, w, h);
         assert!(text.contains("Breakdown"), "width {w}: missing breakdown");
-        assert!(text.contains("Free"), "width {w}: missing free");
+        // No `Free` detail row: remaining capacity is the map's empty cells and
+        // the header's own ratio. The Usage section follows under its own rule.
+        assert!(
+            !text.contains("Free") && !text.contains("○ 可用"),
+            "width {w}: the Free detail row is gone:\n{text}"
+        );
+        assert!(text.contains("Usage"), "width {w}: missing usage section");
         assert!(text.contains("●"), "width {w}: missing map");
         // No line may carry more cells than the pane (the renderer clips, so a
         // silent overflow would be invisible without counting pre-render).
@@ -164,6 +170,115 @@ fn drill_down_shows_the_tool_result_leaves() {
     assert!(text.contains("Tool calls"), "{text}");
 }
 
+/// The header figure and the rows under it are ONE snapshot's arithmetic.
+///
+/// The report behind this test was a screen whose top figure (4.1K) was smaller
+/// than a row printed below it (Tool definitions 9.3K). Two numbers can only
+/// disagree like that when they come from different measurements, so the
+/// invariant pinned here is stated on the RENDERED screen: the header's used
+/// figure equals the sum of the top-level rows, and no row exceeds it.
+#[test]
+fn the_header_figure_is_the_sum_of_the_rows_it_prints() {
+    // Multiples of 100 so the one-decimal rendering is exact: parsing the
+    // printed figures back cannot agree by rounding accident.
+    let messages = cat(
+        "messages",
+        "Messages",
+        4_000,
+        vec![
+            cat("user", "User", 1_000, vec![]),
+            cat("assistant", "Assistant", 3_000, vec![]),
+        ],
+    );
+    // Deliberately larger than every other row: this is the shape of the report.
+    let categories = vec![
+        cat("tool_definitions", "Tool definitions", 9_300, vec![]),
+        cat("system", "System", 2_000, vec![]),
+        messages,
+    ];
+    let used: u64 = categories.iter().map(|c| c.tokens).sum();
+    let acc = ContextAccounting {
+        model: ModelRef::new("deepseek", "deepseek-chat"),
+        context_window_tokens: Some(128_000),
+        compact_at_tokens: Some(64_000),
+        output_reservation_tokens: Some(32_000),
+        headroom_tokens: Some(0),
+        input_capacity_tokens: Some(96_000),
+        fold_state: FoldRequirement::None,
+        used_tokens: used,
+        free_tokens: Some(128_000 - used),
+        token_count_kind: TokenCountKind::Estimated,
+        pressure: ContextPressure::Normal,
+        categories,
+        reasoning_projection: None,
+        last_compaction: None,
+    };
+    assert_eq!(used, 15_300);
+
+    let mut s = opened(acc);
+    let text = screen_text(&mut s, 120, 40);
+    let lines: Vec<&str> = text.lines().collect();
+    let header = lines
+        .iter()
+        .find(|line| line.contains("96k"))
+        .unwrap_or_else(|| panic!("the capacity header is missing:\n{text}"));
+    let header_used =
+        printed_figure(header).unwrap_or_else(|| panic!("the header prints no figure: {header:?}"));
+    assert_eq!(
+        header_used, used,
+        "the header must print the snapshot's used figure: {header:?}"
+    );
+
+    // Every top-level row, found by the label it prints. On a wide pane the
+    // map shares the row, so the line also carries `○` cells.
+    let mut row_sum = 0u64;
+    for (label, expected) in [
+        ("Tool definitions", 9_300u64),
+        ("System", 2_000),
+        ("Messages", 4_000),
+    ] {
+        let row = lines
+            .iter()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("the {label} row is missing:\n{text}"));
+        let figure = printed_figure(row).unwrap_or_else(|| panic!("row prints no figure: {row:?}"));
+        assert_eq!(figure, expected, "{label}: {row:?}");
+        assert!(
+            figure <= header_used,
+            "a row is larger than the total it belongs to ({figure} > {header_used}): {row:?}"
+        );
+        row_sum += figure;
+    }
+    assert_eq!(
+        row_sum, header_used,
+        "the printed rows must sum to the printed total:\n{text}"
+    );
+}
+
+/// The first token figure a breakdown/header line prints, in tokens.
+///
+/// Percentages carry their own `%` suffix, so a ratio can never be mistaken for
+/// a token count here.
+fn printed_figure(line: &str) -> Option<u64> {
+    line.split_whitespace().find_map(|word| {
+        if word.ends_with('%') {
+            return None;
+        }
+        let (num, scale) = match word.strip_suffix('k') {
+            Some(num) => (num, 1_000.0),
+            None => match word.strip_suffix('M') {
+                Some(num) => (num, 1_000_000.0),
+                None => (word, 1.0),
+            },
+        };
+        num.parse::<f64>()
+            .ok()
+            .map(|value| (value * scale).round() as u64)
+    })
+}
+
+/// Manual visual harness:
+///   cargo test -p leveler-tui --test context_screen -- --ignored --nocapture
 /// Manual visual harness:
 ///   cargo test -p leveler-tui --test context_screen -- --ignored --nocapture
 #[test]
@@ -173,6 +288,71 @@ fn visual_context_screen() {
         let mut s = opened(snapshot());
         s.context.expanded.insert("messages".to_string());
         println!("\n══════════ /context {w}x{h} ══════════");
+        print!("{}", screen_text(&mut s, w, h));
+    }
+}
+
+/// Manual visual harness for the whole unified page, with a real usage report:
+///   cargo test -p leveler-tui --test context_screen -- --ignored --nocapture
+#[test]
+#[ignore = "manual visual harness; run with --ignored --nocapture"]
+fn visual_stats_page() {
+    use leveler_client_protocol::{UiModelUsage, UiUsageReport, UiUsageScope};
+    for (w, h) in [
+        (120u16, 40u16),
+        (80, 40),
+        (60, 30),
+        (60, 40),
+        (40, 30),
+        (40, 40),
+    ] {
+        let mut s = opened(snapshot());
+        s.context.expanded.insert("messages".to_string());
+        s.stats_section = leveler_tui::screen::StatsSection::Usage;
+        // Exactly what `/usage` does on the next paint.
+        s.stats_reveal = Some(leveler_tui::screen::StatsSection::Usage);
+        s.usage.scope = UiUsageScope::Session;
+        s.usage.loaded = Some(UiUsageReport {
+            scope: UiUsageScope::Session,
+            from: None,
+            to: None,
+            generated_at: "2026-03-06T01:00:00+00:00".into(),
+            requests: 12,
+            unmeasured_requests: 1,
+            input_tokens: 431_200,
+            cached_input_tokens: Some(388_800),
+            output_tokens: 9_400,
+            reasoning_tokens: Some(4_100),
+            cost_usd_micros: Some(210_400),
+            priced_requests: 11,
+            models: vec![
+                UiModelUsage {
+                    provider: "deepseek".into(),
+                    model: "deepseek-flash".into(),
+                    requests: 10,
+                    unmeasured_requests: 0,
+                    input_tokens: 391_200,
+                    cached_input_tokens: Some(388_800),
+                    output_tokens: 9_000,
+                    reasoning_tokens: Some(4_100),
+                    cost_usd_micros: Some(210_400),
+                    priced_requests: 10,
+                },
+                UiModelUsage {
+                    provider: "bigmodel".into(),
+                    model: "glm-5.3".into(),
+                    requests: 2,
+                    unmeasured_requests: 1,
+                    input_tokens: 40_000,
+                    cached_input_tokens: None,
+                    output_tokens: 400,
+                    reasoning_tokens: None,
+                    cost_usd_micros: None,
+                    priced_requests: 0,
+                },
+            ],
+        });
+        println!("\n══════════ /usage {w}x{h} ══════════");
         print!("{}", screen_text(&mut s, w, h));
     }
 }

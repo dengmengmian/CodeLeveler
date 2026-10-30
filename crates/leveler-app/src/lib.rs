@@ -11,6 +11,7 @@ pub mod agents;
 mod checkpoints;
 mod children;
 mod collaboration;
+pub mod config_manager;
 pub mod contribution_query;
 pub mod doctor;
 /// Engine events -> client events. Public so a recorded session can be replayed
@@ -24,8 +25,6 @@ mod goal_recap;
 mod interactive;
 mod live_view;
 pub mod mcp_config;
-pub mod memory_consolidator;
-pub mod memory_status;
 pub mod observability;
 mod parallel;
 mod prompt_assist;
@@ -37,11 +36,15 @@ pub mod session_history;
 pub mod session_projection;
 mod side_question;
 pub mod skills;
+pub mod usage;
 mod user_shell;
 mod vcs;
 mod workspace_view;
 
 pub use collaboration::CollaborationExecution;
+pub use config_manager::{
+    ConfigApplied, ConfigChange, ConfigManager, ConfigSnapshot, ReloadOrigin, ReloadOutcome,
+};
 pub use global_config::{GlobalConfig, GlobalConfigError, WebSearchSettings};
 pub use interactive::InProcessRuntimeClient;
 pub use interactive::ui_thinking_state;
@@ -57,8 +60,7 @@ use leveler_execution::{PermissionProfile, Workspace};
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::{Layout, layout::yaml_files};
 use leveler_provider::{
-    ModelConfigFile, ProviderConfig, ProviderRegistry, RegistryInputs, load_model_config,
-    load_provider_config, resolve_api_key,
+    ModelConfigFile, ProviderConfig, ProviderRegistry, load_model_config, load_provider_config,
 };
 use leveler_storage::{Database, SessionRepository};
 use leveler_tools::search::{
@@ -152,7 +154,7 @@ pub enum AppError {
 }
 
 /// The loaded configuration bundle (kept around for `config show` / `doctor`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoadedConfig {
     pub providers: Vec<ProviderConfig>,
     pub models: Vec<ModelConfigFile>,
@@ -160,9 +162,6 @@ pub struct LoadedConfig {
     pub default_model: Option<String>,
     /// TUI language from global config (`zh` / `en`), if set.
     pub lang: Option<String>,
-    /// `[develop].model`, verbatim. Resolved (and refused) only by `/develop`
-    /// itself, so a bad value cannot break a turn that never asked for it.
-    pub develop_model: Option<String>,
     /// Whether CodeLeveler-authored commits include a model-aware co-author trailer.
     pub vcs_co_author: bool,
     /// External MCP servers to expose to the model.
@@ -199,96 +198,6 @@ impl LoadedConfig {
             .map(|(_, percent)| *percent)
             .or(self.context_soft_percent)
     }
-}
-
-/// The ONE decision about whether durable project memory is part of this
-/// project at all.
-///
-/// Independent project permission for durable memory. Capability disclosure
-/// controls model exposure; this policy controls whether loading is permitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryPolicy {
-    enabled: bool,
-    user_enabled: bool,
-    experience_enabled: bool,
-}
-
-impl MemoryPolicy {
-    /// Resolve from the project's `.leveler/config.yaml`.
-    pub fn from_project(config: &leveler_project::ProjectConfig) -> Self {
-        Self {
-            enabled: config.memory.enabled,
-            user_enabled: config.memory.user_enabled,
-            experience_enabled: config.memory.experience_enabled,
-        }
-    }
-
-    /// Whether the user wants memory enabled for this project.
-    pub fn enabled(self) -> bool {
-        self.enabled
-    }
-
-    /// Whether user facts are effective. The total switch owns both lanes.
-    pub fn user_enabled(self) -> bool {
-        self.enabled && self.user_enabled
-    }
-
-    /// Whether agent experience is effective. The total switch owns both
-    /// lanes: `enabled = false` closes experience even if its own bit is true.
-    pub fn experience_enabled(self) -> bool {
-        self.enabled && self.experience_enabled
-    }
-
-    /// Whether any lane can reach the model or the background worker.
-    pub fn any_lane(self) -> bool {
-        self.user_enabled() || self.experience_enabled()
-    }
-
-    /// The lane value every read, tool and worker uses.
-    pub fn lanes(self) -> leveler_memory::MemoryLanes {
-        leveler_memory::MemoryLanes {
-            user: self.user_enabled(),
-            experience: self.experience_enabled(),
-        }
-    }
-}
-
-/// The one memory service this runtime hands to tools and background work.
-///
-/// The Markdown roots are configured lazily: nothing opens (or creates) a
-/// scope until an operation addresses it, so a project run that never touches
-/// global memory never creates the user's home store.
-pub fn memory_service(layout: &leveler_project::Layout) -> leveler_memory::MemoryService {
-    use leveler_memory::v2::{MemoryScope, ScopeRoots};
-    let mut roots = leveler_memory::MemoryRoots::new();
-    if let Some(current) = layout.markdown_memory_dir() {
-        let mut scopes = ScopeRoots::new(
-            MemoryScope::Project,
-            current,
-            layout.memory_v2_state_dir("project"),
-        );
-        if let Some(repo) = layout.repo_root.clone() {
-            scopes = scopes.with_repo_root(repo);
-        }
-        roots = roots.with_project(scopes);
-    }
-    if let Some(current) = layout.local_memory_dir() {
-        let mut scopes = ScopeRoots::new(
-            MemoryScope::Local,
-            current,
-            layout.memory_v2_state_dir("local"),
-        );
-        if let Some(repo) = layout.repo_root.clone() {
-            scopes = scopes.with_repo_root(repo);
-        }
-        roots = roots.with_local(scopes);
-    }
-    roots = roots.with_global(ScopeRoots::new(
-        MemoryScope::Global,
-        layout.global_memory_dir(),
-        layout.memory_v2_state_dir("global"),
-    ));
-    leveler_memory::MemoryService::new(roots)
 }
 
 /// Stable digest of the configuration sources a repository runtime loads.
@@ -345,97 +254,6 @@ pub fn runtime_config_fingerprint(layout: &Layout) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
-mod memory_policy_tests {
-    use super::MemoryPolicy;
-    use leveler_project::{MemoryConfig, ProjectConfig};
-
-    #[test]
-    fn a_disabled_project_never_exposes_memory() {
-        let policy = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig {
-                enabled: false,
-                user_enabled: true,
-                experience_enabled: true,
-                deprecated_backend: None,
-            },
-            ..ProjectConfig::default()
-        });
-        assert!(!policy.enabled());
-        assert!(!policy.user_enabled());
-        assert!(!policy.experience_enabled());
-        assert!(!policy.any_lane());
-    }
-
-    #[test]
-    fn an_enabled_project_permits_memory() {
-        let policy = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig {
-                enabled: true,
-                user_enabled: true,
-                experience_enabled: true,
-                deprecated_backend: None,
-            },
-            ..ProjectConfig::default()
-        });
-        assert!(policy.enabled());
-        assert!(policy.user_enabled());
-        assert!(policy.experience_enabled());
-        assert!(policy.any_lane());
-    }
-
-    /// The built-in policy is "user facts on, automatic experience off". An
-    /// absent `memory:` block must still give the user a working lane.
-    #[test]
-    fn an_unconfigured_project_opens_only_the_user_lane() {
-        let policy = MemoryPolicy::from_project(&ProjectConfig::default());
-        assert!(policy.enabled());
-        assert!(policy.user_enabled());
-        assert!(!policy.experience_enabled());
-        assert!(policy.any_lane());
-    }
-
-    #[test]
-    fn each_lane_can_be_closed_without_closing_the_other() {
-        let user_only = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig {
-                enabled: true,
-                user_enabled: true,
-                experience_enabled: false,
-                deprecated_backend: None,
-            },
-            ..ProjectConfig::default()
-        });
-        assert!(user_only.user_enabled());
-        assert!(!user_only.experience_enabled());
-        assert!(user_only.any_lane());
-
-        let experience_only = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig {
-                enabled: true,
-                user_enabled: false,
-                experience_enabled: true,
-                deprecated_backend: None,
-            },
-            ..ProjectConfig::default()
-        });
-        assert!(!experience_only.user_enabled());
-        assert!(experience_only.experience_enabled());
-        assert!(experience_only.any_lane());
-
-        let none = MemoryPolicy::from_project(&ProjectConfig {
-            memory: MemoryConfig {
-                enabled: true,
-                user_enabled: false,
-                experience_enabled: false,
-                deprecated_backend: None,
-            },
-            ..ProjectConfig::default()
-        });
-        assert!(!none.any_lane());
-    }
-}
-
-#[cfg(test)]
 mod runtime_config_fingerprint_tests {
     use super::runtime_config_fingerprint;
     use leveler_project::Layout;
@@ -481,6 +299,59 @@ mod runtime_config_fingerprint_tests {
     }
 }
 
+/// Load every configured source into one effective bundle.
+///
+/// This is the ONLY assembly of a configuration generation: startup, the
+/// watcher and `/reload` all call it, so they cannot disagree about precedence
+/// (global `~/.leveler/config.toml` underneath the repository bundle) or about
+/// validation.
+pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
+    let mut providers = Vec::new();
+    for path in yaml_files(&layout.providers_dir()) {
+        providers.push(load_provider_config(&path)?);
+    }
+    let mut models = Vec::new();
+    for path in yaml_files(&layout.models_dir()) {
+        models.push(load_model_config(&path)?);
+    }
+    // Merge the global config (`~/.leveler/config.toml`) underneath the repo
+    // bundle: the repo wins on any id collision, but global entries fill in
+    // so `leveler` works without a per-repo `configs/` directory.
+    let global_config =
+        global_config::GlobalConfig::load().map_err(|e| AppError::GlobalConfig(e.to_string()))?;
+    for model in &mut models {
+        if model.profile.thinking.is_none() {
+            model.profile.thinking = Some(global_config.thinking_level_for(&model.profile.id));
+        }
+    }
+    let global = global_config.into_bundle();
+    merge_providers(&mut providers, global.providers);
+    for model in global.models {
+        let exists = models.iter().any(|m| {
+            m.profile.id == model.profile.id && m.profile.provider == model.profile.provider
+        });
+        if !exists {
+            models.push(model);
+        }
+    }
+    Ok(LoadedConfig {
+        providers,
+        models,
+        default_model: global.default_model,
+        lang: global.lang,
+        vcs_co_author: global.vcs_co_author,
+        mcp_servers: global.mcp_servers,
+        agents_delegation: global.agents_delegation,
+        agents_independent_review: global.agents_independent_review,
+        browser_default: global.browser_default,
+        assist_prompt_suggestions: global.assist_prompt_suggestions,
+        assist_away_summary: global.assist_away_summary,
+        context_soft_percent: global.context_soft_percent,
+        model_context_soft_percent: global.model_soft_percent,
+        web_search: global.web_search,
+    })
+}
+
 impl Default for LoadedConfig {
     fn default() -> Self {
         Self {
@@ -488,7 +359,6 @@ impl Default for LoadedConfig {
             models: Vec::new(),
             default_model: None,
             lang: None,
-            develop_model: None,
             vcs_co_author: true,
             mcp_servers: Vec::new(),
             agents_delegation: true,
@@ -518,32 +388,26 @@ fn combine_independent_review(
 
 struct McpToolCache {
     unrestricted: bool,
+    /// Per-server input digest. An unchanged server keeps its live connection;
+    /// only a changed/added server is reconnected.
+    servers: std::collections::BTreeMap<String, String>,
     tools: Vec<Arc<dyn leveler_tools::tool::Tool>>,
 }
 
 /// A fully-assembled application.
 pub struct Application {
     pub layout: Layout,
-    pub config: LoadedConfig,
-    pub registry: Arc<ProviderRegistry>,
-    /// Configuration generation loaded by this process. Immutable for the
-    /// process lifetime; a changed generation gets a replacement daemon.
-    config_fingerprint: String,
+    /// The ONE owner of the effective configuration. Consumers capture a
+    /// snapshot per turn; nothing caches a second copy of provider or model
+    /// state for the process lifetime.
+    config: Arc<ConfigManager>,
     /// MCP tools cached under the credential inheritance authority of their launch.
     mcp_tools: Arc<tokio::sync::Mutex<Option<McpToolCache>>>,
     /// The session database pool, opened once per process.
     database: Arc<tokio::sync::Mutex<Option<Database>>>,
-    /// One project-scoped durable memory worker. Runtime composition roots
-    /// start it explicitly; every client of this application then shares it.
-    memory_consolidator: OnceLock<Arc<memory_consolidator::MemoryConsolidator>>,
-    memory_events: tokio::sync::broadcast::Sender<memory_consolidator::MemoryConsolidationEvent>,
     /// When set, overrides the resolved execution policy on every execution
     /// path (single-knob ablation runs). `None` = resolver defaults.
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
-    /// Whether durable project memory is part of this project. Resolved once at
-    /// assembly from `.leveler/config.yaml`; a config change is a new process
-    /// generation, so the value is immutable for this Application's lifetime.
-    memory: MemoryPolicy,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
     /// Model-step safety ceiling for this application's top-level runs, from
@@ -590,6 +454,18 @@ pub struct Application {
     permission_profiles: std::sync::Mutex<
         std::collections::HashMap<String, leveler_execution::SharedPermissionProfile>,
     >,
+    /// The activated capability packs of each session, keyed by session scope.
+    ///
+    /// Same owner pattern as `permission_profiles`, and for the same reason:
+    /// every turn builds its own engine, so the engine cannot own the answer
+    /// to "which packs did the model enable". `capability(enable)` promises the
+    /// tools on the following request, and that request may belong to a later
+    /// turn or to a session reopened with `--session` in this same process.
+    /// Availability and permission are NOT here: they are recomputed from the
+    /// current host facts on every turn, so a narrowed profile still gates.
+    capability_activations: std::sync::Mutex<
+        std::collections::HashMap<String, leveler_agent::capability::SharedCapabilityActivation>,
+    >,
     /// A startup fact this process learned while resolving the default model and
     /// that the next created session's client must be told: today, the persisted
     /// default was not resolvable here and a configured model was used instead.
@@ -600,33 +476,7 @@ pub struct Application {
     default_model_notice: std::sync::Mutex<Option<String>>,
 }
 
-impl Drop for Application {
-    fn drop(&mut self) {
-        if let Some(worker) = self.memory_consolidator.get() {
-            worker.cancel();
-        }
-    }
-}
-
 impl Application {
-    /// A handle on the memory store. The service is stateless beyond its
-    /// roots; constructing it per command keeps the layout the only input, so
-    /// every caller reaches the same Markdown scopes.
-    pub fn memory_service(&self) -> leveler_memory::MemoryService {
-        memory_service(&self.layout)
-    }
-
-    /// A notice for a config that still carries the removed `memory.backend`
-    /// key. `None` when the config never named a backend.
-    pub fn deprecated_memory_backend(&self) -> Option<String> {
-        self.project_config().memory.deprecated_backend()
-    }
-
-    /// The lanes this project has open. Reads and writes both honor them.
-    pub fn memory_lanes(&self) -> leveler_memory::MemoryLanes {
-        self.memory.lanes()
-    }
-
     /// The live permission profile for a session, SEEDED once from `mode` (the
     /// caller's authority — the session row or its cached runtime config) and
     /// reused by every later turn of that session.
@@ -638,6 +488,26 @@ impl Application {
     /// the older profile — the UI chip says `full` while the turn keeps
     /// authorizing under `auto` and asks for approval. Live changes go through
     /// [`Self::set_live_permission_profile`] only.
+    /// The activated capability packs of a session, seeded empty on first use
+    /// and shared by every turn of that session.
+    ///
+    /// No session scope (eval, one-shot CLI) means nobody can send the session
+    /// a second request, so a private cell is the whole truth.
+    fn capability_activation_for(
+        &self,
+        scope: Option<&str>,
+    ) -> leveler_agent::capability::SharedCapabilityActivation {
+        use leveler_agent::capability::SharedCapabilityActivation;
+        let Some(scope) = scope else {
+            return SharedCapabilityActivation::default();
+        };
+        let mut map = self
+            .capability_activations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(scope.to_string()).or_default().clone()
+    }
+
     fn permission_profile_for(
         &self,
         scope: Option<&str>,
@@ -697,52 +567,11 @@ impl Application {
     }
 
     /// Load all config bundles from the layout's config directory.
+    ///
+    /// Prefer [`Self::config_snapshot`] in a long-lived process: this reads the
+    /// files and is the primitive the config manager owns, not a cache.
     pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
-        let mut providers = Vec::new();
-        for path in yaml_files(&layout.providers_dir()) {
-            providers.push(load_provider_config(&path)?);
-        }
-        let mut models = Vec::new();
-        for path in yaml_files(&layout.models_dir()) {
-            models.push(load_model_config(&path)?);
-        }
-        // Merge the global config (`~/.leveler/config.toml`) underneath the repo
-        // bundle: the repo wins on any id collision, but global entries fill in
-        // so `leveler` works without a per-repo `configs/` directory.
-        let global_config = global_config::GlobalConfig::load()
-            .map_err(|e| AppError::GlobalConfig(e.to_string()))?;
-        for model in &mut models {
-            if model.profile.thinking.is_none() {
-                model.profile.thinking = Some(global_config.thinking_level_for(&model.profile.id));
-            }
-        }
-        let global = global_config.into_bundle();
-        merge_providers(&mut providers, global.providers);
-        for model in global.models {
-            let exists = models.iter().any(|m| {
-                m.profile.id == model.profile.id && m.profile.provider == model.profile.provider
-            });
-            if !exists {
-                models.push(model);
-            }
-        }
-        Ok(LoadedConfig {
-            providers,
-            models,
-            default_model: global.default_model,
-            lang: global.lang,
-            vcs_co_author: global.vcs_co_author,
-            develop_model: global.develop_model,
-            mcp_servers: global.mcp_servers,
-            agents_delegation: global.agents_delegation,
-            agents_independent_review: global.agents_independent_review,
-            browser_default: global.browser_default,
-            assist_prompt_suggestions: global.assist_prompt_suggestions,
-            assist_away_summary: global.assist_away_summary,
-            context_soft_percent: global.context_soft_percent,
-            model_context_soft_percent: global.model_soft_percent,
-            web_search: global.web_search,
-        })
+        load_config(layout)
     }
 
     /// Assemble the application: load config and build the registry.
@@ -779,41 +608,8 @@ impl Application {
             );
         }
 
-        let fingerprint_before = runtime_config_fingerprint(&layout)
-            .map_err(|error| AppError::ConfigFingerprint(error.to_string()))?;
-        let config = Self::load_config(&layout)?;
-        let config_fingerprint = runtime_config_fingerprint(&layout)
-            .map_err(|error| AppError::ConfigFingerprint(error.to_string()))?;
-        if fingerprint_before != config_fingerprint {
-            return Err(AppError::ConfigFingerprint(
-                "configuration changed while the runtime was loading it; retry startup".into(),
-            ));
-        }
-
-        let providers = config
-            .providers
-            .iter()
-            .map(|cfg| {
-                let key = match resolve_api_key(cfg) {
-                    Ok(key) => key,
-                    Err(error) => {
-                        // Keep assembling: `doctor` reports the gap for every
-                        // provider, and a run refuses before its first request
-                        // with a message naming the variable and the fix. This
-                        // fires for providers the user is not even using, so it
-                        // is a diagnostic, not a warning to put above that.
-                        tracing::debug!("provider `{}` has no usable API key: {error}", cfg.id);
-                        None
-                    }
-                };
-                (cfg.clone(), key)
-            })
-            .collect();
-
-        let registry = ProviderRegistry::build(RegistryInputs {
-            providers,
-            models: config.models.clone(),
-        })?;
+        let config = ConfigManager::load(layout.clone())?;
+        let snapshot = config.snapshot();
 
         // Project config + env (composition root may read env — AGENTS.md).
         let background_tasks =
@@ -827,26 +623,15 @@ impl Application {
         let browser = Arc::new(leveler_browser::Browser::new(
             (*environment).clone(),
             layout.browser_profile_dir(),
-            config.browser_default,
+            snapshot.loaded.browser_default,
         ));
-        let (memory_events, _) = tokio::sync::broadcast::channel(128);
-        let memory = MemoryPolicy::from_project(
-            &layout
-                .primary_workspace()
-                .and_then(leveler_project::ProjectConfig::load)
-                .unwrap_or_default(),
-        );
         Ok(Self {
             layout,
             config,
-            registry: Arc::new(registry),
-            config_fingerprint,
             mcp_tools: Arc::new(tokio::sync::Mutex::new(None)),
             database: Arc::new(tokio::sync::Mutex::new(None)),
-            memory_consolidator: OnceLock::new(),
-            memory_events,
+
             execution_overrides: None,
-            memory,
             // One product default for a new Coding Session: Goal. Callers
             // that resolved an explicit axis (`--collaboration`, the transport
             // request) override it via `with_collaboration` or the create path.
@@ -860,7 +645,52 @@ impl Application {
             in_flight_commands: Default::default(),
             default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capability_activations: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// The configuration generation in force right now.
+    ///
+    /// Every turn captures this once and keeps the `Arc` for its whole life;
+    /// that is the execution-isolation boundary between a running turn and a
+    /// later reload.
+    pub fn config_snapshot(&self) -> Arc<ConfigSnapshot> {
+        self.config.snapshot()
+    }
+
+    /// The effective bundle of the current generation.
+    pub fn effective_config(&self) -> Arc<LoadedConfig> {
+        Arc::new(self.config.snapshot().loaded.clone())
+    }
+
+    /// The provider registry of the current generation. Long-lived consumers
+    /// that need a stable generation (a turn) must capture
+    /// [`Self::config_snapshot`] instead of calling this per request.
+    pub fn registry(&self) -> Arc<ProviderRegistry> {
+        self.config.snapshot().registry.clone()
+    }
+
+    /// The config manager itself (watcher lifecycle, `/reload`, subscribers).
+    pub fn config_manager(&self) -> &Arc<ConfigManager> {
+        &self.config
+    }
+
+    /// Re-read the configured sources and publish the result. The caller owns
+    /// the user-facing report; this returns the mechanical outcome.
+    pub async fn reload_config(&self, origin: ReloadOrigin, force: bool) -> ReloadOutcome {
+        self.config.reload(origin, force).await
+    }
+
+    /// Start watching the configuration sources for this process.
+    pub fn start_config_watcher(&self) {
+        ConfigManager::start_watcher(&self.config);
+    }
+
+    /// The explicitly configured default model in the CURRENT generation, when
+    /// this environment can resolve it. `None` means no configured default;
+    /// callers must keep the model they already have.
+    pub fn configured_default_model(&self) -> Option<ModelRef> {
+        self.config.configured_default_model()
     }
 
     /// This runtime's durable identity: read from the state directory, minted
@@ -874,9 +704,15 @@ impl Application {
         Ok(self.runtime_id.get_or_init(|| id).clone())
     }
 
-    /// The immutable configuration generation loaded by this application.
-    pub fn config_fingerprint(&self) -> &str {
-        &self.config_fingerprint
+    /// The configuration generation loaded by this application (and any later
+    /// reload).
+    pub fn config_fingerprint(&self) -> String {
+        self.config.snapshot().fingerprint.clone()
+    }
+
+    /// The effective-configuration version in force.
+    pub fn config_version(&self) -> u64 {
+        self.config.snapshot().version
     }
 
     /// This process's boot id, starting the boot on first use. Concurrent
@@ -983,110 +819,18 @@ impl Application {
 
     /// Recover hosted process settlements at an explicit runtime startup
     /// boundary. Merely reading the session database never performs this work.
-    pub async fn reconcile_execution_services(&self) -> Result<(), AppError> {
+    pub async fn reconcile_execution_services(
+        &self,
+    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
         self.background_tasks
             .reconcile_hosted()
             .await
             .map_err(AppError::ExecutionHost)
     }
 
-    /// Start this runtime's project memory worker explicitly. Database-only
-    /// commands must not acquire provider-side effects merely by opening the
-    /// store; runtime composition roots call this after startup recovery.
-    pub async fn start_memory_consolidator(&self) -> Result<(), AppError> {
-        let db = self.open_database().await?;
-        self.ensure_memory_consolidator(&db)
-    }
-
-    fn ensure_memory_consolidator(&self, db: &Database) -> Result<(), AppError> {
-        // A project with both lanes closed runs no memory worker at all: no
-        // inbox admission (the SQL trigger reads the session snapshot), no
-        // claim, no provider request. Existing memory data is untouched and
-        // becomes usable again when the user re-enables a lane (which restarts
-        // the process).
-        if !self.memory.any_lane() {
-            return Ok(());
-        }
-        if self.memory_consolidator.get().is_some() {
-            return Ok(());
-        }
-        let events = self.memory_events.clone();
-        let worker = memory_consolidator::MemoryConsolidator::new(
-            db.clone(),
-            self.boot_id()?,
-            self.layout.state_dir.clone(),
-            memory_service(&self.layout),
-            self.registry.clone(),
-            Arc::new(move |event| {
-                let _ = events.send(event);
-            }),
-        )
-        .with_lanes(self.memory.lanes())
-        .with_memory_service(memory_service(&self.layout));
-        if self.memory_consolidator.set(worker.clone()).is_ok() {
-            drop(worker.spawn());
-        }
-        Ok(())
-    }
-
-    /// Signal that a terminal turn may have admitted new memory work. The
-    /// signal is non-durable and lossy by design; startup/max-age polling and
-    /// the SQLite inbox are the durable truth.
-    pub fn notify_memory_consolidator(&self) {
-        if let Some(worker) = self.memory_consolidator.get() {
-            worker.notify_turn_terminal();
-        }
-    }
-
-    /// Drain ready memory work before a headless process exits.
-    ///
-    /// A long-lived host leaves consolidation to the worker's idle cadence.
-    /// A one-shot process must flush explicitly or its last turn is only
-    /// consumed by the next launch. Returns `None` when this runtime has no
-    /// memory worker (both lanes closed).
-    pub async fn flush_memory_for_headless(
-        &self,
-    ) -> Option<memory_consolidator::MemoryFlushOutcome> {
-        let worker = self.memory_consolidator.get()?.clone();
-        Some(worker.flush().await)
-    }
-
-    /// Stamp this session's memory-admission flag from the project policy.
-    ///
-    /// Must run before the turn row is inserted: admission is a SQL trigger on
-    /// that insert, so the column has to be current by then. A no-op when the
-    /// value already matches.
-    async fn sync_session_memory_policy(
-        &self,
-        db: &Database,
-        session_id: &leveler_core::SessionId,
-    ) {
-        if let Err(error) = SessionRepository::new(db)
-            .set_memory_lanes(
-                session_id,
-                self.memory.enabled(),
-                self.memory.lanes().user,
-                self.memory.lanes().experience,
-            )
-            .await
-        {
-            // Admission fails closed only when the write fails: the column
-            // keeps its previous value, which is the last policy actually
-            // recorded for this session. Surfacing the error is a diagnostic,
-            // not a reason to abort the turn.
-            tracing::warn!(%error, "could not persist the session memory policy");
-        }
-    }
-
-    pub fn subscribe_memory_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<memory_consolidator::MemoryConsolidationEvent> {
-        self.memory_events.subscribe()
-    }
-
     /// All configured model references.
     pub fn model_refs(&self) -> Vec<ModelRef> {
-        self.registry.model_refs()
+        self.config.snapshot().registry.model_refs()
     }
 
     /// Record a startup fact for the next created session's client. Set by the
@@ -1156,6 +900,8 @@ impl Application {
         configured.sort_by_key(|reference| reference.to_string());
         if let Some(preferred) = self
             .config
+            .snapshot()
+            .loaded
             .default_model
             .as_deref()
             .and_then(ModelRef::parse)
@@ -1190,18 +936,14 @@ impl Application {
             .unwrap_or_default()
     }
 
-    /// The single memory-capability decision for this project.
-    pub fn memory_policy(&self) -> MemoryPolicy {
-        self.memory
-    }
-
     /// Whether an idle assist affordance is switched on.
     pub(crate) fn assist_enabled(&self, kind: crate::prompt_assist::AssistKind) -> bool {
+        let snapshot = self.config.snapshot();
         match kind {
             crate::prompt_assist::AssistKind::PromptSuggestion => {
-                self.config.assist_prompt_suggestions
+                snapshot.loaded.assist_prompt_suggestions
             }
-            crate::prompt_assist::AssistKind::AwaySummary => self.config.assist_away_summary,
+            crate::prompt_assist::AssistKind::AwaySummary => snapshot.loaded.assist_away_summary,
         }
     }
 
@@ -1216,24 +958,65 @@ impl Application {
 
     /// Connect to the configured MCP servers once and cache their tools, so
     /// every turn reuses the same connections instead of respawning processes.
-    async fn mcp_tools(&self, mode: PermissionProfile) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
-        if self.layout.primary_workspace().is_none() || self.config.mcp_servers.is_empty() {
+    ///
+    /// A reload diffs the server set: unchanged servers keep their live
+    /// connection, only a changed/added server is connected again, and a
+    /// removed server's tools simply drop out (its child is reaped with them).
+    async fn mcp_tools(
+        &self,
+        snapshot: &ConfigSnapshot,
+        mode: PermissionProfile,
+    ) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
+        if self.layout.primary_workspace().is_none() || snapshot.loaded.mcp_servers.is_empty() {
+            // A generation that removed every server ends the connections the
+            // previous generation held; an unused connection is not a cache.
+            self.mcp_tools.lock().await.take();
             return Vec::new();
         }
         let unrestricted = mode == PermissionProfile::FullAccess;
+        let desired: std::collections::BTreeMap<String, String> = snapshot
+            .loaded
+            .mcp_servers
+            .iter()
+            .map(|server| (server.name.clone(), mcp_server_digest(server)))
+            .collect();
         let mut guard = self.mcp_tools.lock().await;
-        if guard
+        let rebuild = guard
             .as_ref()
-            .is_none_or(|cache| cache.unrestricted != unrestricted)
-        {
-            let tools = leveler_tools::mcp::connect_all_with_authority(
-                &self.config.mcp_servers,
-                &self.environment,
-                unrestricted,
-            )
-            .await;
+            .is_none_or(|cache| cache.unrestricted != unrestricted || cache.servers != desired);
+        if rebuild {
+            let previous = guard.take();
+            let (kept, previous_servers) = match previous {
+                Some(cache) => (cache.tools, cache.servers),
+                None => (Vec::new(), Default::default()),
+            };
+            // Keep every tool whose server is unchanged: its connection, its
+            // child process and its handshake stay exactly as they were.
+            let mut tools: Vec<Arc<dyn leveler_tools::tool::Tool>> = kept
+                .into_iter()
+                .filter(|tool| {
+                    previous_servers.iter().any(|(server, digest)| {
+                        desired.get(server) == Some(digest)
+                            && tool.name().starts_with(&format!("mcp__{server}__"))
+                    })
+                })
+                .collect();
+            for server in &snapshot.loaded.mcp_servers {
+                if previous_servers.get(&server.name) == desired.get(&server.name) {
+                    continue;
+                }
+                tools.extend(
+                    leveler_tools::mcp::connect_all_with_authority(
+                        std::slice::from_ref(server),
+                        &self.environment,
+                        unrestricted,
+                    )
+                    .await,
+                );
+            }
             *guard = Some(McpToolCache {
                 unrestricted,
+                servers: desired,
                 tools,
             });
         }
@@ -1255,6 +1038,7 @@ impl Application {
     #[allow(clippy::too_many_arguments)]
     async fn compose_tool_surface(
         &self,
+        snapshot: &ConfigSnapshot,
         model: &ModelRef,
         mode: PermissionProfile,
         sandbox: bool,
@@ -1281,22 +1065,14 @@ impl Application {
         // turn's engine went out of scope, and its KillOnDrop killed every
         // background process (and the next turn's registry no longer knew the
         // task id) — the "服务活不过一个回合" bug.
-        let mut capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
+        let capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
             .with_background_tasks(self.background_tasks.clone())
             .with_artifact_store(artifact_store)
             .with_browser(self.browser.clone())
             .with_search_provider(resolve_search_provider(
-                self.config.web_search.as_ref(),
+                snapshot.loaded.web_search.as_ref(),
                 self.environment.as_ref(),
             ));
-        // The handle follows the same project lanes as the pack. A project
-        // with both lanes closed has no store to hand a tool even if a caller
-        // later asks for one.
-        if self.memory.any_lane() {
-            capabilities = capabilities
-                .with_memory_service(memory_service(&self.layout))
-                .with_memory_lanes(self.memory.lanes());
-        }
         let tool_context = match workspace {
             Some(workspace) => {
                 ToolContext::with_environment(workspace, mode, self.environment.clone())
@@ -1306,8 +1082,8 @@ impl Application {
         .with_policy_limits(max_files)
         .with_sandbox(sandbox)
         .with_deny_env(provider_secret_env_names(
-            &self.config.providers,
-            self.config.web_search.as_ref(),
+            &snapshot.loaded.providers,
+            snapshot.loaded.web_search.as_ref(),
         ))
         .with_read_only(read_only);
         // The permission profile this turn authorizes under is the SESSION's
@@ -1322,7 +1098,7 @@ impl Application {
         };
         // Build all mechanically available tools. The executor discloses them
         // progressively, independently of this registry's construction.
-        let available_packs = self.capability_availability(model).await;
+        let available_packs = self.capability_availability(snapshot, model).await;
         let registry = model_surface(available_packs, &capabilities);
         let registry = if self.layout.primary_workspace().is_none() {
             registry.workspace_independent_subset()
@@ -1352,8 +1128,9 @@ impl Application {
         sandbox: bool,
         session_scope: Option<&str>,
     ) -> Result<(leveler_tools::ToolRegistry, ToolContext), AppError> {
+        let snapshot = self.config.snapshot();
         let (_available, tool_context, registry) = self
-            .compose_tool_surface(model, mode, sandbox, true, session_scope)
+            .compose_tool_surface(&snapshot, model, mode, sandbox, true, session_scope)
             .await?;
         // A bounded side question has no goal or capability loading protocol.
         // It may inspect base primitives without implicitly exposing packs.
@@ -1394,7 +1171,11 @@ impl Application {
     /// the model's ability: a surface that grew because a task looked hard, or
     /// shrank because a model looked weak, would be the harness deciding for
     /// the model (`docs/ARCHITECTURE.md` §1.1).
-    async fn capability_availability(&self, model: &leveler_model::ModelRef) -> CapabilityPacks {
+    async fn capability_availability(
+        &self,
+        snapshot: &ConfigSnapshot,
+        model: &leveler_model::ModelRef,
+    ) -> CapabilityPacks {
         let environment = self.environment.as_ref();
         CapabilityPacks {
             // The symbol tools ask a language server when one is installed and
@@ -1410,23 +1191,17 @@ impl Application {
             // call that can only fail. The backend is chosen by configuration,
             // never by the conversation model.
             web_search: resolve_search_provider(
-                self.config.web_search.as_ref(),
+                snapshot.loaded.web_search.as_ref(),
                 self.environment.as_ref(),
             )
             .is_some(),
             // An image is useless to a model that cannot read one.
-            media: self
+            media: snapshot
                 .registry
                 .profile(model)
                 .await
                 .map(|profile| profile.capabilities.vision)
                 .unwrap_or(false),
-            // Memory is a project switch, not a default capability: a
-            // project with both lanes closed does not register the tools at
-            // all, so Full Access has nothing to expose and no permission mode
-            // can override the user's explicit disable. One open lane is
-            // enough for the pack: the tools themselves follow the lanes.
-            memory: self.memory.any_lane(),
             skills: self.layout.primary_workspace().is_some(),
             // Not "is a browser installed": is the browser this host would
             // SELECT — the call's, then `[browser].default`, then the system
@@ -1451,7 +1226,7 @@ impl Application {
         // product default (`None`), so the resolution chain stays one ladder:
         // explicit override → model entry → global default → product default.
         if let Some(model) = model
-            && let Some(percent) = self.config.soft_percent_for(model)
+            && let Some(percent) = self.config.snapshot().loaded.soft_percent_for(model)
         {
             overrides
                 .get_or_insert_with(Default::default)
@@ -1487,8 +1262,12 @@ impl Application {
         session_scope: Option<&str>,
     ) -> Result<leveler_agent::coding::CodingRuntime, AppError> {
         self.reconcile_execution_services().await?;
+        // One generation for the whole turn: provider clients, models, MCP
+        // servers and tool policy all come from this snapshot, so a reload in
+        // the middle of the turn cannot mix two configurations.
+        let snapshot = self.config.snapshot();
         let (available_packs, tool_context, mut registry) = self
-            .compose_tool_surface(model, mode, sandbox, read_only, session_scope)
+            .compose_tool_surface(&snapshot, model, mode, sandbox, read_only, session_scope)
             .await?;
         let unrestricted = tool_context.policy.unrestricted_execution();
         // Register available controls; exposure is owned by CapabilityDisclosure.
@@ -1497,7 +1276,7 @@ impl Application {
             leveler_agent::HarnessControls::ALL,
         );
         // Attach external MCP tools (connect once, cached across turns).
-        for tool in self.mcp_tools(tool_context.policy.mode()).await {
+        for tool in self.mcp_tools(&snapshot, tool_context.policy.mode()).await {
             registry.register(tool);
         }
         use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
@@ -1508,7 +1287,6 @@ impl Application {
         ];
         for (present, id) in [
             (available_packs.browser, CapabilityId::Browser),
-            (available_packs.memory, CapabilityId::Memory),
             (available_packs.skills, CapabilityId::Skills),
             (
                 available_packs.code_intelligence,
@@ -1537,27 +1315,23 @@ impl Application {
             .filter(|id| {
                 unrestricted
                     || match id {
-                        CapabilityId::Memory => self.memory.any_lane(),
                         CapabilityId::MultiAgent => {
-                            self.project_config().agents.delegation && self.config.agents_delegation
+                            self.project_config().agents.delegation
+                                && snapshot.loaded.agents_delegation
                         }
                         CapabilityId::Authoring => !read_only,
                         _ => true,
                     }
             })
             .collect();
-        // Memory is part of the first-round surface when the project enables
-        // it and the host can provide it. It stays a default EXPOSURE: no
-        // grant is persisted, and tool approval rules are unchanged.
-        let default_active = if available_packs.memory && self.memory.any_lane() {
-            vec![CapabilityId::Memory]
-        } else {
-            Vec::new()
-        };
         let capabilities = Arc::new(
-            CapabilityDisclosure::new(available, permitted, vec![])
-                .and_then(|state| state.with_default_active(default_active))
-                .map_err(AppError::Engine)?,
+            CapabilityDisclosure::for_session(
+                available,
+                permitted,
+                self.capability_activation_for(session_scope),
+            )
+            .with_default_active(Vec::new())
+            .map_err(AppError::Engine)?,
         );
         // The global home root (never a cwd-relative `.leveler`, which would
         // read/write user config inside whatever directory we launched from).
@@ -1580,7 +1354,7 @@ impl Application {
             Some(root) => leveler_execution::HookRunner::load(&leveler_home, root),
             None => leveler_execution::HookRunner::empty(self.layout.state_dir.clone()),
         };
-        let runtime: Arc<dyn ModelRuntime> = self.registry.clone();
+        let runtime: Arc<dyn ModelRuntime> = snapshot.registry.clone();
         let db = self.open_database().await?;
         Ok(leveler_agent::coding::CodingRuntime {
             // The composition root chooses the adapter: every engine port is
@@ -1591,19 +1365,11 @@ impl Application {
                 registry: Arc::new(registry),
                 tool_context,
                 model: model.clone(),
-                commit_co_author: self.config.vcs_co_author,
+                commit_co_author: snapshot.loaded.vcs_co_author,
                 overrides: self
                     .execution_overrides_for_session(session_scope, Some(model))
                     .await?,
                 capabilities: Some(capabilities),
-                memory_expose: available_packs.memory,
-                // One service for tools, recall and the background worker: a
-                // run has no second store to fall back to.
-                memory_service: self
-                    .memory
-                    .any_lane()
-                    .then(|| Arc::new(memory_service(&self.layout))),
-                memory_lanes: self.memory.lanes(),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,
                 resource_grants: Arc::new(db.clone()),
@@ -1614,15 +1380,13 @@ impl Application {
                 steering: None,
                 // Project config wins over global when set; both default true.
                 allow_delegation: unrestricted
-                    || (self.project_config().agents.delegation && self.config.agents_delegation),
+                    || (self.project_config().agents.delegation
+                        && snapshot.loaded.agents_delegation),
                 allow_host_input: true,
                 independent_review: combine_independent_review(
-                    self.config.agents_independent_review,
+                    snapshot.loaded.agents_independent_review,
                     self.project_config().agents.independent_review,
                 ),
-                // Carried, not resolved: `/develop` refuses a bad value where
-                // the user can see which command it belongs to.
-                develop_model: self.config.develop_model.clone(),
             },
             approver,
             clarifier,
@@ -1657,11 +1421,6 @@ pub(crate) fn axes_from_session_record(
 pub(crate) fn canonical_work_profile(_raw: &str) -> String {
     "single".to_string()
 }
-
-// Turn-time candidate extraction lives in the durable consolidator: the SQL
-// inbox trigger records the turn, and the background worker calls the model
-// extractor. A synchronous, rule-based second extractor here would be a
-// competing policy owner and a second source of truth.
 
 fn top_level_limits_from_config(
     config: &leveler_project::RunLimitsConfig,
@@ -1704,11 +1463,14 @@ impl Application {
             .map_err(|error| AppError::NotFound(error.to_string()))?
             .to_path_buf();
         let (program, args) = leveler_execution::shell_invocation(command);
+        let snapshot = self.config.snapshot();
         let mut request = leveler_execution::ProcessRequest::new(program, args, cwd.clone());
         request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
         request.deny_network = sandbox;
-        request.deny_env =
-            provider_secret_env_names(&self.config.providers, self.config.web_search.as_ref());
+        request.deny_env = provider_secret_env_names(
+            &snapshot.loaded.providers,
+            snapshot.loaded.web_search.as_ref(),
+        );
         request.write_scope = mode.write_scope(&cwd);
         let runner = leveler_execution::CommandRunner::with_environment(self.environment.clone());
         Ok((runner, request, cwd))
@@ -1726,6 +1488,7 @@ impl Application {
         &self,
         shell: String,
     ) -> Result<leveler_execution::ProcessRequest, AppError> {
+        let snapshot = self.config.snapshot();
         let cwd = self
             .layout
             .require_workspace()
@@ -1735,8 +1498,10 @@ impl Application {
         request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
         request.deny_network = false;
         request.write_scope = leveler_execution::WriteScope::Unrestricted;
-        request.deny_env =
-            provider_secret_env_names(&self.config.providers, self.config.web_search.as_ref());
+        request.deny_env = provider_secret_env_names(
+            &snapshot.loaded.providers,
+            snapshot.loaded.web_search.as_ref(),
+        );
         // The persistent Execution Host rebuilds the child environment from its
         // own snapshot; no app-side CommandRunner is involved in this path.
         Ok(request)
@@ -1794,6 +1559,27 @@ fn resolve_search_provider(
             None
         }
     }
+}
+
+/// Stable digest of one MCP server's launch configuration. Two generations
+/// with the same digest keep the SAME live connection; a changed command, args
+/// or env reconnects only that server.
+fn mcp_server_digest(server: &leveler_tools::mcp::McpServerConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(server.command.as_bytes());
+    for arg in &server.args {
+        hasher.update(b"\0");
+        hasher.update(arg.as_bytes());
+    }
+    for (key, value) in &server.env {
+        hasher.update(b"\0");
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        // The value is a resolved credential; hash it so the digest itself
+        // can never be printed as a secret.
+        hasher.update(Sha256::digest(value.as_bytes()));
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 pub(crate) fn provider_secret_env_names(

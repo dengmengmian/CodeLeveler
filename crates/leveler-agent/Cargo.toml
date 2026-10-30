@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "The CodeLeveler coding harness: prompt, repository context, memory, skills, ToolHost admission, write ownership and sub-agents, driven by the leveler-agent-core kernel."
+description = "The CodeLeveler coding harness: prompt, repository context, skills, ToolHost admission, write ownership and sub-agents, driven by the leveler-agent-core kernel."
 
 [features]
 default = []
@@ -19,7 +19,6 @@ leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-model = { workspace = true }
 leveler-tools = { workspace = true }
-leveler-memory = { workspace = true }
 leveler-agent-core = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-engine = { workspace = true }

@@ -443,13 +443,6 @@ impl Executor {
         // starts. The review is a tail of the task, not a fresh task: it gets
         // the residual minus the settlement reserve, like any other child.
         parent_elapsed: std::time::Duration,
-        // A pinned `provider/model` for this child. `None` runs it on the
-        // parent's model, which is what the closure reviewer does. The
-        // Develop workflow's reading stages pass one so Analyze and Review
-        // can be a different model from the one writing the code — the same
-        // per-child pin `spawn_agent` and agent definitions already use, not
-        // a second model-selection mechanism.
-        model: Option<String>,
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> DelegatedChildResult {
@@ -469,7 +462,6 @@ impl Executor {
             leveler_lifecycle::ChildSpawnSpec {
                 files,
                 max_rounds: reviewer_rounds,
-                model,
                 ..Default::default()
             },
             None,

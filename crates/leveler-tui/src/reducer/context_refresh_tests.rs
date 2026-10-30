@@ -103,8 +103,8 @@ fn queries(effects: &[Effect]) -> usize {
 fn answer_context(s: &mut AppState, accounting: Option<ContextAccounting>) {
     let query_id = s
         .context
-        .pending_query_id
-        .clone()
+        .track
+        .in_flight_id()
         .expect("opening a session must leave a query this view owns");
     reduce(
         s,
@@ -128,7 +128,7 @@ fn opening_a_session_asks_the_runtime_for_the_context() {
     );
     assert_eq!(queries(&effects), 1, "{effects:?}");
     assert!(
-        s.context.pending_query_id.is_some(),
+        s.context.track.in_flight(),
         "the query must be owned so a foreign answer is ignored"
     );
 }
@@ -253,7 +253,7 @@ fn a_delayed_answer_to_a_superseded_query_is_ignored() {
             session: snapshot("deepseek/v3"),
         }),
     );
-    let first = s.context.pending_query_id.clone().expect("first query");
+    let first = s.context.track.in_flight_id().expect("first query");
     // A second open supersedes the first before its answer arrives.
     reduce(
         &mut s,
@@ -261,7 +261,7 @@ fn a_delayed_answer_to_a_superseded_query_is_ignored() {
             session: snapshot("deepseek/v3"),
         }),
     );
-    let second = s.context.pending_query_id.clone().expect("second query");
+    let second = s.context.track.in_flight_id().expect("second query");
     assert_ne!(first, second);
 
     reduce(

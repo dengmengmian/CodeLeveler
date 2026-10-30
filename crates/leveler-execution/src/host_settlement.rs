@@ -153,6 +153,30 @@ impl SettlementJournal {
     /// A concurrent runtime gets a retryable lock error; it never runs a second
     /// simultaneous diff. Subsequent calls return the committed result.
     pub async fn reconcile(&self, task_id: &str) -> Result<BackgroundSettlement, String> {
+        self.settle(task_id, None).await
+    }
+
+    /// Settle a task whose exit recovery proved, not the host.
+    ///
+    /// The admitted namespace still diffed against the pinned baseline, so the
+    /// change set is kept, but it was not observed at process exit: the note says
+    /// so, and a reader must not mistake it for an exit-time observation.
+    pub async fn reconcile_lost(&self, task_id: &str) -> Result<BackgroundSettlement, String> {
+        self.settle(
+            task_id,
+            Some(
+                "The owning execution host was lost before this task's exit was observed; this \
+                 change set was computed during recovery and may include later edits",
+            ),
+        )
+        .await
+    }
+
+    async fn settle(
+        &self,
+        task_id: &str,
+        loss_note: Option<&str>,
+    ) -> Result<BackgroundSettlement, String> {
         let _lock = self.lock(task_id)?;
         let mut record = self.read(task_id)?;
         if let Some(settlement) = record.settlement {
@@ -170,17 +194,26 @@ impl SettlementJournal {
                     format!("settlement pending for {task_id}: cannot diff baseline: {e}")
                 })?,
                 violation: None,
-                note: None,
+                note: loss_note.map(str::to_string),
                 snapshot: (!matches!(baseline.write_scope, WriteScope::ScopedWorkspace { .. }))
                     .then(|| baseline.snapshot.clone()),
             },
             None => BackgroundSettlement {
                 modified: Vec::new(),
                 violation: None,
-                note: Some(
-                    "No workspace baseline was available at admission; file changes are unknown"
-                        .into(),
-                ),
+                note: Some(loss_note.map_or_else(
+                    || {
+                        "No workspace baseline was available at admission; file changes are \
+                         unknown"
+                            .to_string()
+                    },
+                    |note| {
+                        format!(
+                            "{note}; no workspace baseline was available at admission, so file \
+                             changes are unknown"
+                        )
+                    },
+                )),
                 snapshot: None,
             },
         };
@@ -334,6 +367,34 @@ mod tests {
         std::fs::write(repo.path().join("later.txt"), "unrelated later write").unwrap();
         let again = journal.reconcile("host-offline").await.unwrap();
         assert_eq!(again.modified, first.modified);
+        assert!(journal.pending().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_exit_keeps_the_change_set_and_says_it_was_not_observed_at_exit() {
+        let repo = repository();
+        let state = tempfile::tempdir().unwrap();
+        let baseline = MutationBaseline {
+            snapshot: WorkspaceSnapshot::capture(repo.path())
+                .await
+                .unwrap()
+                .unwrap(),
+            workspace_root: repo.path().to_path_buf(),
+            write_scope: WriteScope::Workspace {
+                root: repo.path().to_path_buf(),
+            },
+        };
+        let journal = SettlementJournal::open(state.path()).unwrap();
+        journal
+            .prepare("host-lost", "session", "writer", Some(baseline))
+            .await
+            .unwrap();
+        std::fs::write(repo.path().join("file.txt"), "changed").unwrap();
+        let settlement = journal.reconcile_lost("host-lost").await.unwrap();
+        assert_eq!(settlement.modified, vec!["file.txt"]);
+        let note = settlement.note.unwrap_or_default();
+        assert!(note.contains("lost"), "{note}");
+        assert!(note.contains("recovery"), "{note}");
         assert!(journal.pending().unwrap().is_empty());
     }
 

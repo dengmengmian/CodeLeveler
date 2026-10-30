@@ -435,6 +435,11 @@ async fn update_plan_tool_call_emits_a_plan_updated_event() {
                 ]
             }),
         ),
+        // The plan this call publishes is left open, so the turn buys the
+        // bounded plan continuation (asserted in its own test); this one only
+        // cares about the projection.
+        assistant_text("done"),
+        assistant_text("done"),
         assistant_text("done"),
     ]));
 
@@ -618,6 +623,10 @@ async fn a_later_step_may_be_completed_while_an_earlier_one_is_still_open() {
                 ]
             }),
         ),
+        // The earlier step stays open, so this turn buys the bounded plan
+        // continuation; the declaration below must stay exactly as sent.
+        assistant_text("done"),
+        assistant_text("done"),
         assistant_text("done"),
     ]));
 
@@ -2527,12 +2536,16 @@ async fn readonly_work_no_longer_forces_a_terminal_plan() {
         "p2",
         &[("build", "completed"), ("verify", "pending")],
     ));
+    // Freshness buys nothing; the OPEN step is a different fact and buys the
+    // bounded plan continuation instead.
+    script.push(assistant_text("done; verification remains pending"));
+    script.push(assistant_text("done; verification remains pending"));
     script.push(assistant_text("done; verification remains pending"));
     let runtime = run_plan_script(&dir, script).await;
     assert_eq!(
         runtime.recorded_requests().len(),
-        14,
-        "the quiet answer ends the turn; no terminal-plan round is bought"
+        18,
+        "no freshness round is bought; only the open-plan continuation"
     );
     let requests = runtime.recorded_requests();
     assert!(
@@ -2559,6 +2572,10 @@ async fn the_reminder_never_changes_a_single_plan_status() {
         "p2",
         &[("build", "completed"), ("verify", "pending")],
     ));
+    // `verify` is still open, so the turn continues; the point of this test is
+    // that the harness never edits a status while it does.
+    script.push(assistant_text("done"));
+    script.push(assistant_text("done"));
     script.push(assistant_text("done"));
 
     let workspace = Workspace::new(&dir).unwrap();
@@ -2618,9 +2635,11 @@ async fn a_resumed_turn_reactivates_the_persisted_plan_and_invents_no_other() {
             },
         ],
     };
-    let runtime = Arc::new(MockRuntime::new(vec![assistant_text(
-        "picked up where I left off",
-    )]));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text("picked up where I left off"),
+        assistant_text("picked up where I left off"),
+        assistant_text("picked up where I left off"),
+    ]));
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
@@ -4871,12 +4890,13 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A plan update is a declaration, not an execution inference. With the Plan
-/// closeout gate removed, a chat turn that did real work after its latest
-/// declaration simply answers: the runtime does not spend a round demanding a
-/// final table, and it never rewrites the plan itself.
+/// A plan update is a declaration, not an execution inference — but a plan the
+/// model left OPEN is its own durable record contradicting its answer. A chat
+/// turn therefore gets ONE continuation round that states the open steps and
+/// the three honest exits; the runtime still never rewrites the plan, never
+/// demands a table, and never requires the plan to reach 100%.
 #[tokio::test]
-async fn chat_does_not_spend_a_round_on_plan_reconciliation() {
+async fn chat_continues_when_its_own_plan_is_still_open() {
     let dir = plan_freshness_dir("final-reconcile-chat", 41);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -4887,8 +4907,118 @@ async fn chat_does_not_spend_a_round_on_plan_reconciliation() {
         ),
         edit_call("e1", 0),
         assistant_text("implementation is done; publishing was not requested"),
-        plan_call("p2", &[("implement", "completed"), ("publish", "pending")]),
-        assistant_text("implementation is done; publishing remains pending"),
+        edit_call("e2", 1),
+        plan_call(
+            "p2",
+            &[("implement", "completed"), ("publish", "completed")],
+        ),
+        assistant_text("both steps are done and verified"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "implement but do not publish",
+            &mut |e| events.push(e),
+            &mut RecordingSink(saved.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    let requests = runtime.recorded_requests();
+    assert_eq!(
+        requests.len(),
+        6,
+        "one plan continuation is bought; the resumed work then closes normally"
+    );
+    // The continuation states the model's own record — the steps it left open —
+    // and offers every honest exit without naming the work to do.
+    let nudge = requests[3]
+        .messages
+        .iter()
+        .map(|message| message.text_content())
+        .find(|text| text.contains("Your declared plan is still open"))
+        .expect("the continuation carries the open-plan fact");
+    assert!(nudge.contains("- implement"), "{nudge}");
+    assert!(nudge.contains("- publish"), "{nudge}");
+    assert!(nudge.contains("publish an updated plan"), "{nudge}");
+    assert!(
+        !nudge.contains("update_goal"),
+        "a chat turn is not silently turned into a goal: {nudge}"
+    );
+    // The quiet-round answer and the nudge are BOTH durable, so a resumed
+    // drive reloads exactly the conversation the model had.
+    let saved = saved.lock().unwrap();
+    assert!(
+        saved.iter().any(|message| message
+            .text_content()
+            .contains("Your declared plan is still open")),
+        "the nudge must be persisted for resume/compaction"
+    );
+    assert!(
+        saved.iter().any(|message| message
+            .text_content()
+            .contains("publishing was not requested")),
+        "the quiet-round answer it answers must be persisted beside it"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::AdvisoryStarted {
+                kind: leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::PlanUnresolved
+                )
+            }
+        )),
+        "the extra round is attributed to the plan closeout, not to a bare retry"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RuntimeInjection { kind, forces_continuation: true, .. }
+                if kind == "closeout_plan_unresolved"
+        )),
+        "the injection is machine-classifiable: {events:?}"
+    );
+    // The runtime never touches the plan: the final table is the one the model
+    // sent, open step included.
+    let final_plan = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            _ => None,
+        })
+        .expect("the plan the model declared is preserved");
+    assert!(final_plan.iter().all(|step| step.status == "completed"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A step that is no longer needed is resolved by rewording the plan, not by
+/// pretending it happened: the continuation must let the model drop it and end.
+#[tokio::test]
+async fn chat_ends_when_the_model_adjusts_its_plan_instead_of_doing_the_step() {
+    let dir = plan_freshness_dir("plan-adjusted", 42);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[("implement", "in_progress"), ("publish", "pending")],
+        ),
+        edit_call("e1", 0),
+        assistant_text("implementation is done; publishing was not requested"),
+        plan_call("p2", &[("implement", "completed")]),
+        assistant_text("done — publishing was not part of this request"),
     ]));
     let executor = Executor::new(
         runtime.clone(),
@@ -4900,7 +5030,7 @@ async fn chat_does_not_spend_a_round_on_plan_reconciliation() {
     let mut events = Vec::new();
     let outcome = executor
         .run(
-            "implement but do not publish",
+            "implement only; publishing is not requested this time",
             &mut |e| events.push(e),
             &mut NoopSink,
             CancellationToken::new(),
@@ -4910,20 +5040,653 @@ async fn chat_does_not_spend_a_round_on_plan_reconciliation() {
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     assert_eq!(
-        runtime.requests.lock().unwrap().len(),
-        3,
-        "the quiet answer ends the turn; no plan-closeout round is bought"
+        runtime.recorded_requests().len(),
+        5,
+        "a reworded plan ends the turn on the next quiet round"
     );
     let final_plan = events
         .iter()
         .rev()
         .find_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps),
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
             _ => None,
         })
-        .expect("the plan the model declared is preserved");
-    assert_eq!(final_plan[0].status, "in_progress");
-    assert_eq!(final_plan[1].status, "pending");
+        .unwrap();
+    // The model may drop a step, and the turn ends. What the record must not do
+    // is claim the dropped step happened: it stays beside the completed one
+    // with `abandoned`, which is neither open work nor a delivery.
+    let abandoned: Vec<&leveler_agent::PlanStep> = final_plan
+        .iter()
+        .filter(|step| step.status == "abandoned")
+        .collect();
+    assert_eq!(abandoned.len(), 1, "{final_plan:?}");
+    assert_eq!(abandoned[0].step, "publish");
+    assert_eq!(final_plan[0].status, "completed");
+    let state = leveler_agent::PlanState {
+        steps: final_plan.clone(),
+    };
+    assert!(
+        state.open_steps().is_empty(),
+        "a replaced step is not owed work to resume"
+    );
+    assert!(
+        !state.is_fully_completed(),
+        "a plan with a replaced step is not 100% delivered"
+    );
+    // The model is told what the record kept, so the adjustment is visible to
+    // the same model that made it.
+    let notice = runtime
+        .recorded_requests()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result.content.clone()),
+            _ => None,
+        })
+        .find(|content| content.contains("[plan]"))
+        .expect("the plan update reports the replaced step to the model");
+    assert!(notice.contains("publish"), "{notice}");
+    assert!(notice.contains("abandoned"), "{notice}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The user's explicit stage boundary is authority, not a model claim. The
+/// model finishes the authorized stage and goes quiet; the open stage 2 stays
+/// pending on the record, and the harness buys NO plan continuation.
+#[tokio::test]
+async fn a_user_stage_pause_ends_the_turn_without_a_plan_nudge() {
+    let dir = plan_freshness_dir("user-pause", 46);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[
+                ("阶段 1：实现 normalize_space", "in_progress"),
+                ("阶段 2：补测试并运行 verify.sh", "pending"),
+            ],
+        ),
+        edit_call("e1", 0),
+        plan_call(
+            "p2",
+            &[
+                ("阶段 1：实现 normalize_space", "completed"),
+                ("阶段 2：补测试并运行 verify.sh", "pending"),
+            ],
+        ),
+        assistant_text("阶段 1 已完成并验证；阶段 2 按你的要求保持未开始，等待确认。"),
+        // Before the fix these responses were consumed by plan continuations.
+        assistant_text("阶段 2 仍未开始，等待你的确认。"),
+        assistant_text("阶段 2 仍未开始，等待你的确认。"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "阶段 1 完成后停下，等待我确认再执行阶段 2。",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        4,
+        "the reachable boundary ends the turn without buying another round"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::AdvisoryStarted {
+                kind: leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::PlanUnresolved
+                )
+            }
+        )),
+        "a user pause is not an unresolved plan to pressure: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RuntimeInjection { kind, .. } if kind == "closeout_plan_unresolved"
+        )),
+        "no plan continuation was injected: {events:?}"
+    );
+    let final_plan = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            _ => None,
+        })
+        .expect("the plan is preserved");
+    assert_eq!(final_plan[0].status, "completed");
+    assert_eq!(
+        final_plan[1].status, "pending",
+        "the withheld stage stays recorded as open, not done or failed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A pause that has not been reached is not a pause yet: with stage 1 still in
+/// progress, the normal continuation keeps stage 1 moving. Only after the
+/// authorized stage is completed does the quiet round end without pressure.
+#[tokio::test]
+async fn a_user_pause_waits_for_the_authorized_stage_to_finish() {
+    let dir = plan_freshness_dir("user-pause-unfinished", 47);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[
+                ("阶段 1：实现接口", "in_progress"),
+                ("阶段 2：补测试", "pending"),
+            ],
+        ),
+        assistant_text("我先暂停在这里。"),
+        // The continuation is legitimate: stage 1 is not finished.
+        edit_call("e1", 0),
+        plan_call(
+            "p2",
+            &[
+                ("阶段 1：实现接口", "completed"),
+                ("阶段 2：补测试", "pending"),
+            ],
+        ),
+        assistant_text("阶段 1 现在完成了，阶段 2 等你确认。"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "阶段 1 完成后停下，等待我确认再执行阶段 2。",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        5,
+        "one continuation finishes stage 1; the second quiet round respects the pause"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::AdvisoryStarted {
+                    kind: leveler_agent::AdvisoryKind::CloseoutNudge(
+                        leveler_agent::closeout::CloseoutReason::PlanUnresolved
+                    )
+                }
+            ))
+            .count(),
+        1,
+        "only the unfinished-stage round is continued"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The other half: when the user did NOT pause ("do it all, do not stop"), a
+/// model that claims it needs confirmation is still held to its own open plan.
+#[tokio::test]
+async fn a_model_claimed_confirmation_does_not_stop_an_authorized_task() {
+    let dir = plan_freshness_dir("model-claimed-pause", 48);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[
+                ("阶段 1：实现接口", "in_progress"),
+                ("阶段 2：补测试并运行 verify.sh", "pending"),
+            ],
+        ),
+        edit_call("e1", 0),
+        plan_call(
+            "p2",
+            &[
+                ("阶段 1：实现接口", "completed"),
+                ("阶段 2：补测试并运行 verify.sh", "pending"),
+            ],
+        ),
+        assistant_text("阶段 1 完成了。下一步需要你确认后才能继续阶段 2。"),
+        // The harness rejects the self-declared boundary and the model resumes
+        // with real work.
+        edit_call("e2", 1),
+        plan_call(
+            "p3",
+            &[
+                ("阶段 1：实现接口", "completed"),
+                ("阶段 2：补测试并运行 verify.sh", "completed"),
+            ],
+        ),
+        assistant_text("两个阶段都已完成并验证。"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "请一次做完两个阶段，中间不要停下来等我确认。",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        7,
+        "the model's own confirmation claim buys no stop"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::AdvisoryStarted {
+                kind: leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::PlanUnresolved
+                )
+            }
+        )),
+        "the open plan still drives one honest continuation: {events:?}"
+    );
+    let final_plan = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            _ => None,
+        })
+        .expect("the plan is preserved");
+    assert!(final_plan.iter().all(|step| step.status == "completed"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ignoring the continuation is bounded: the no-progress guard ends the turn as
+/// `Answered` (never as a success, never as a loop).
+#[tokio::test]
+async fn an_open_plan_cannot_keep_a_chat_turn_alive_forever() {
+    let dir = plan_freshness_dir("plan-loop", 44);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[("implement", "in_progress"), ("publish", "pending")],
+        ),
+        assistant_text("implemented"),
+        assistant_text("implemented"),
+        assistant_text("implemented"),
+        assistant_text("implemented"),
+        assistant_text("implemented"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        12,
+    );
+    let outcome = executor
+        .run(
+            "implement and publish",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    let requests = runtime.recorded_requests().len();
+    assert!(
+        (2..=4).contains(&requests),
+        "the continuation is bounded by the no-progress guard, got {requests} rounds"
+    );
+    assert_eq!(
+        runtime
+            .recorded_requests()
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|message| message
+                .text_content()
+                .contains("Your declared plan is still open"))
+            .count(),
+        2,
+        "exactly the no-progress bound, then the turn ends"
+    );
+    let reminders = runtime
+        .recorded_requests()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .text_content()
+                .contains("Your declared plan is still open")
+        })
+        .count();
+    assert!(
+        reminders <= 2,
+        "the turn ends instead of re-issuing the same reminder: {reminders}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A plan the model already completed buys no continuation: 100% is the normal
+/// quiet end, exactly as before.
+#[tokio::test]
+async fn a_completed_plan_adds_no_closeout_round() {
+    let dir = plan_freshness_dir("plan-complete", 45);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call("p1", &[("implement", "completed")]),
+        edit_call("e1", 0),
+        assistant_text("implemented"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let outcome = executor
+        .run(
+            "implement it",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "a fully completed plan needs no continuation"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An ordinary question carries no plan, so nothing about closeout changes.
+#[tokio::test]
+async fn an_ordinary_chat_turn_still_ends_on_its_answer() {
+    let dir = plan_freshness_dir("plan-absent", 46);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_text(
+        "it is a text editor",
+    )]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let outcome = executor
+        .run(
+            "what is vi",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(runtime.recorded_requests().len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A plan may grow mid-turn: the closeout reads the LAST declaration, so a step
+/// added after the first table is exactly as binding as the original ones.
+#[tokio::test]
+async fn a_step_added_mid_turn_is_what_the_closeout_reads() {
+    let dir = plan_freshness_dir("plan-grow", 50);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call("p1", &[("implement", "in_progress")]),
+        edit_call("e1", 0),
+        plan_call(
+            "p2",
+            &[
+                ("implement", "completed"),
+                ("add a regression test", "pending"),
+            ],
+        ),
+        assistant_text("implemented"),
+        plan_call(
+            "p3",
+            &[
+                ("implement", "completed"),
+                ("add a regression test", "completed"),
+            ],
+        ),
+        assistant_text("implemented and covered"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let outcome = executor
+        .run(
+            "implement it and cover it",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    let requests = runtime.recorded_requests();
+    assert_eq!(
+        requests.len(),
+        6,
+        "the added step is honoured: one continuation, then the closed plan"
+    );
+    let nudge = requests[4]
+        .messages
+        .iter()
+        .map(|message| message.text_content())
+        .find(|text| text.contains("Your declared plan is still open"))
+        .expect("the added step is the one named");
+    assert!(nudge.contains("- add a regression test"), "{nudge}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The host-implicit single step is the harness's shell, not a promise the
+/// model made: it can never buy a continuation.
+#[tokio::test]
+async fn a_host_implicit_plan_never_buys_a_continuation() {
+    let dir = plan_freshness_dir("plan-implicit", 47);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_text("answered")]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_seeded_plan(leveler_lifecycle::PlanState::host_implicit_single_step(
+        "do the thing",
+    ));
+    let outcome = executor
+        .run(
+            "do the thing",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        1,
+        "the host shell is not the model's declaration"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Resume and compaction carry the same fact: the plan a resumed turn seeds
+/// from is the model's declaration, so a resumed turn that goes quiet with it
+/// still open gets the same ONE continuation — not a silent end.
+#[tokio::test]
+async fn a_resumed_turn_with_an_open_seeded_plan_gets_the_same_continuation() {
+    let dir = plan_freshness_dir("plan-resume", 49);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let seeded = leveler_agent::PlanState::from_model_explicit(vec![leveler_agent::PlanStep {
+        step: "verify".into(),
+        status: "in_progress".into(),
+        id: None,
+        origin: leveler_agent::PlanOrigin::ModelExplicit,
+    }])
+    .unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text("picked up where I left off"),
+        plan_call("p1", &[("verify", "completed")]),
+        assistant_text("verification finished"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_seeded_plan(seeded);
+    let outcome = executor
+        .run(
+            "continue",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    let requests = runtime.recorded_requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the resumed quiet round is answered with the plan fact, not ended"
+    );
+    assert!(requests[1].messages.iter().any(|message| {
+        let text = message.text_content();
+        text.contains("Your declared plan is still open") && text.contains("- verify")
+    }));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A Goal outranks the plan list: the turn is bound to a lifecycle it must
+/// resolve, so the injected fact is the goal one, not a second plan reminder.
+#[tokio::test]
+async fn goal_mode_keeps_the_goal_continuation_and_not_a_plan_one() {
+    let dir = plan_freshness_dir("plan-goal", 48);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[("implement", "in_progress"), ("publish", "pending")],
+        ),
+        assistant_text("implemented"),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": {"passed": {"commands": [], "summary": ""}, "not_applicable": {"reason": "no executable check"}}
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+    let outcome = executor
+        .run(
+            "implement and publish",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(outcome.stop_reason, StopReason::Answered);
+    let requests = runtime.recorded_requests();
+    let injections: Vec<String> = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(|message| message.text_content())
+        .filter(|text| text.contains("Goal remains active"))
+        .collect();
+    assert!(
+        !injections.is_empty(),
+        "the goal continuation is what a goal turn gets"
+    );
+    assert!(
+        !requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .any(|message| message
+                .text_content()
+                .contains("Your declared plan is still open")),
+        "the plan list adds no second reminder inside a goal turn"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -5071,15 +5834,16 @@ async fn a_stale_plan_does_not_refuse_a_goal_completion() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// In a non-goal turn, a stale plan never buys an extra reconciliation round.
-/// The model's terminal declaration is whatever it last declared.
+/// Freshness is still not an obligation: work done AFTER the plan was declared
+/// buys no reconciliation round. (What the plan *declares* is another matter —
+/// see `chat_continues_when_its_own_plan_is_still_open`.)
 #[tokio::test]
 async fn a_stale_plan_does_not_force_a_chat_closeout_round() {
     let dir = plan_freshness_dir("gate-off-chat", 53);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(MockRuntime::new(vec![
-        plan_call("p1", &[("implement", "in_progress")]),
+        plan_call("p1", &[("implement", "completed")]),
         edit_call("e1", 0),
         assistant_text("done"),
     ]));
@@ -5105,7 +5869,7 @@ async fn a_stale_plan_does_not_force_a_chat_closeout_round() {
     assert_eq!(
         runtime.requests.lock().unwrap().len(),
         3,
-        "no plan-closeout round is bought"
+        "no plan-closeout round is bought for staleness alone"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -5539,6 +6303,8 @@ async fn complex_task_allows_readonly_explore_before_plan() {
             }),
         ),
         assistant_text("done"),
+        assistant_text("done"),
+        assistant_text("done"),
     ]));
     let executor = Executor::new(
         runtime,
@@ -5601,9 +6367,11 @@ async fn a_long_explore_keeps_the_whole_surface_and_earns_no_plan_advisory() {
                     {"step": "inspect", "status": "completed"},
                     {"step": "edit", "status": "in_progress"},
                     {"step": "verify", "status": "pending"}
-                ]
+                ],
             }),
         ),
+        assistant_text("done"),
+        assistant_text("done"),
         assistant_text("done"),
     ]));
     let executor = Executor::new(
@@ -5733,94 +6501,6 @@ async fn text_only_after_explore_does_not_force_plan_repair() {
         );
     }
 
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// K36: AutoApprove must not persist a durable memory write.
-///
-/// Guarded at the EXECUTOR, not only in the approval policy: the policy's own
-/// test proves `AutoApprove` denies the request, and this proves the loop
-/// honours that denial, tells the model the truth about why, and leaves
-/// `active/` empty.
-#[tokio::test]
-async fn auto_approve_blocks_a_durable_memory_write() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-agent-k36-remember-{}",
-        std::process::id() as u64 * 31 + 50
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let memory_current = dir.join("memory");
-    let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call(
-            "c1",
-            "remember",
-            serde_json::json!({
-                "title": "Prefer workspace-write",
-                "body": "Always use WorkspaceWrite for edits.",
-                "subject": "editing.permission_profile"
-            }),
-        ),
-        assistant_text("done"),
-    ]));
-    let service = Arc::new(leveler_memory::MemoryService::new(
-        leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-            leveler_memory::v2::MemoryScope::Project,
-            memory_current.clone(),
-            dir.join("state"),
-        )),
-    ));
-    let executor = Executor::new(
-        runtime,
-        Arc::new(default_registry()),
-        tool_context,
-        ModelRef::new("mock", "m"),
-        6,
-    )
-    .with_memory_service(Some(service))
-    .with_approver(Arc::new(leveler_execution::AutoApprove));
-    let mut events = Vec::new();
-    let _ = executor
-        .run(
-            "remember my prefs",
-            &mut |e| events.push(e),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult {
-                name,
-                is_error: true,
-                preview,
-                ..
-            } if name == "remember"
-                // Blocked, and the reason names the real cause: AutoApprove is
-                // a headless context, so nobody was asked. It must NOT claim
-                // the user refused (see `park_unattended_denial`).
-                && preview.contains("nobody declined it")
-                && !preview.contains("denied by user")
-        )),
-        "expected an honest headless denial: {events:?}"
-    );
-    // No durable write under AutoApprove. The proposal may be PARKED as a
-    // pending candidate — that is consent deferred, and `accept` is a separate
-    // user-authoritative step. Nothing becomes current Markdown.
-    let active = std::fs::read_dir(&memory_current)
-        .map(|dir| {
-            dir.filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
-                .count()
-        })
-        .unwrap_or(0);
-    assert_eq!(
-        active, 0,
-        "current memory must stay empty under AutoApprove"
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -6347,7 +7027,10 @@ async fn execution_context_bounds_large_declared_plans() {
     let dir =
         std::env::temp_dir().join(format!("leveler-context-large-plan-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let runtime = Arc::new(MockRuntime::new(vec![assistant_text("No change needed.")]));
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text("No change needed."),
+        assistant_text("No change needed."),
+    ]));
     let plan = leveler_lifecycle::PlanState {
         steps: (0..100)
             .map(|_| leveler_lifecycle::PlanStep {

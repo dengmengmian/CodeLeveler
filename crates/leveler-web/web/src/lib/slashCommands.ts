@@ -19,7 +19,6 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { command: '/diff', description: '查看 Changes', kind: 'navigation', group: 'workspace', groupLabel: 'WORKSPACE' },
   { command: '/checkpoint', description: '回滚到检查点', kind: 'entity-picker', group: 'workspace', groupLabel: 'WORKSPACE' },
   { command: '/compact', description: '压缩上下文', kind: 'action', group: 'context', groupLabel: 'CONTEXT' },
-  { command: '/memory', description: '打开项目记忆', kind: 'navigation', group: 'context', groupLabel: 'CONTEXT' },
 ];
 
 export function filterSlashCommands(query: string): SlashCommand[] {
@@ -54,7 +53,7 @@ export type SlashTarget =
   | { kind: 'selector'; popup: Exclude<SlashPopup, 'checkpoint'> }
   | { kind: 'entity-picker'; popup: 'checkpoint' }
   | { kind: 'input-mode' }
-  | { kind: 'navigation'; dest: 'diff' | 'memory' };
+  | { kind: 'navigation'; dest: 'diff' };
 
 const SELECTOR_POPUP: Record<string, Exclude<SlashPopup, 'checkpoint'>> = {
   '/model': 'model',
@@ -74,6 +73,5 @@ export function slashTarget(command: string): SlashTarget | null {
   if (def.kind === 'entity-picker') return { kind: 'entity-picker', popup: 'checkpoint' };
   if (def.kind === 'input-mode') return { kind: 'input-mode' };
   if (command === '/diff') return { kind: 'navigation', dest: 'diff' };
-  if (command === '/memory') return { kind: 'navigation', dest: 'memory' };
   return null;
 }

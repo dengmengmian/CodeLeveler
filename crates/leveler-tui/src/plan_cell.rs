@@ -9,5 +9,6 @@ pub(crate) fn plan_glyph(status: PlanStepStatus) -> &'static str {
         PlanStepStatus::Done => "✓",
         PlanStepStatus::Failed => "✗",
         PlanStepStatus::Skipped => "–",
+        PlanStepStatus::Abandoned => "⊘",
     }
 }

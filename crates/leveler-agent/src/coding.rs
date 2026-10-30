@@ -10,7 +10,6 @@
 
 pub mod checkpoint;
 mod child_session;
-pub mod develop;
 mod event;
 pub mod factory;
 pub mod policy;

@@ -1062,13 +1062,24 @@
     },
     "PlanStepStatus": {
       "description": "The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`).",
-      "type": "string",
-      "enum": [
-        "pending",
-        "running",
-        "done",
-        "failed",
-        "skipped"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "pending",
+            "running",
+            "done",
+            "failed",
+            "skipped"
+          ]
+        },
+        {
+          "description": "The model removed this step from its own plan while it was still open.\n\nNot delivered (so it never counts toward a completed plan) and not open work the runtime should keep driving. Keeping it distinct from `Skipped` is what stops a removed step from being projected as a legitimate completion.",
+          "type": "string",
+          "enum": [
+            "abandoned"
+          ]
+        }
       ]
     },
     "ReasoningIntegrity": {
@@ -2511,6 +2522,25 @@
           }
         },
         {
+          "description": "The turn ended at the user's own pause boundary. The goal still owes the work the user withheld authorization to continue; nothing failed and nothing is complete. Only the user's own continuation releases it.",
+          "type": "object",
+          "required": [
+            "reason",
+            "type"
+          ],
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_paused"
+              ]
+            }
+          }
+        },
+        {
           "description": "The turn stopped at an output limit even after bounded continuation.",
           "type": "object",
           "required": [
@@ -3237,162 +3267,6 @@
           }
         },
         {
-          "description": "Project memory listing (response to [`crate::ClientCommand::ListMemory`]).",
-          "type": "object",
-          "required": [
-            "active",
-            "archived",
-            "memory_dir",
-            "type"
-          ],
-          "properties": {
-            "active": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/UiMemoryEntry"
-              }
-            },
-            "archived": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/UiMemoryEntry"
-              }
-            },
-            "memory_dir": {
-              "type": "string"
-            },
-            "pending": {
-              "description": "Candidates awaiting the user's consent (K36). Without these in the listing the TUI cannot show that anything is waiting, and the only way to adopt a memory is the CLI — the last mile of the feature.",
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/UiMemoryCandidate"
-              }
-            },
-            "query_id": {
-              "description": "Echoes the requesting client's query id. A client must ignore an absent or foreign id so another session subscriber cannot open UI.",
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/CommandId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "memory_list"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Project memory health: store counts, durable inbox counts, the last extraction result and the oldest due retry. A query-shaped response to [`crate::ClientCommand::MemoryStatus`].",
-          "type": "object",
-          "required": [
-            "status",
-            "type"
-          ],
-          "properties": {
-            "query_id": {
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/CommandId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "status": {
-              "$ref": "#/definitions/UiMemoryStatus"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "memory_status"
-              ]
-            }
-          }
-        },
-        {
-          "description": "The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies.",
-          "type": "object",
-          "required": [
-            "count",
-            "ids",
-            "type"
-          ],
-          "properties": {
-            "count": {
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 0.0
-            },
-            "experience_count": {
-              "description": "How many of `ids` were evidence-bound agent experience.",
-              "default": 0,
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 0.0
-            },
-            "ids": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "injected": {
-              "description": "The same records with the identity a person needs to find them again: scope, bounded title and the mode they were injected in. Titles only — a body never travels on this event. Additive: an older runtime sends none, and the client then shows counts alone.",
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/UiMemoryReference"
-              }
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "memory_recalled"
-              ]
-            }
-          }
-        },
-        {
-          "description": "A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body.",
-          "type": "object",
-          "required": [
-            "id",
-            "operation",
-            "title",
-            "type"
-          ],
-          "properties": {
-            "authority": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "id": {
-              "type": "string"
-            },
-            "operation": {
-              "type": "string"
-            },
-            "title": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "memory_changed"
-              ]
-            }
-          }
-        },
-        {
           "description": "Side-question (`/btw`) started; not persisted to session history.",
           "type": "object",
           "required": [
@@ -3626,6 +3500,112 @@
               "enum": [
                 "observability_loaded"
               ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::QueryUsage`]. A projection of the runtime's durable model-call ledger for one scope. Read-only: it answers while a turn runs, and it never drives a provider request.",
+          "type": "object",
+          "required": [
+            "report",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "report": {
+              "$ref": "#/definitions/UiUsageReport"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "usage_loaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::ReloadConfig`], and the notification of an automatically applied generation. `outcome` is one of `applied` / `unchanged` / `failed`.\n\n`version` is the generation now in force — the PREVIOUS one on a failure, because a failed reload keeps the last known good configuration. `changed` names the dimensions that moved (never their values, and never a credential). `deferred_to_next_turn` is true when a turn was already running: it keeps the generation it started with, and the next turn uses this one.",
+          "type": "object",
+          "required": [
+            "outcome",
+            "type",
+            "version"
+          ],
+          "properties": {
+            "changed": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deferred_to_next_turn": {
+              "default": false,
+              "type": "boolean"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "restart_required": {
+              "description": "Settings this generation changed that only a restart of the named component can apply. Empty means everything applied.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "thinking": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "config_reloaded"
+              ]
+            },
+            "version": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
             }
           }
         },
@@ -4642,6 +4622,11 @@
           "description": "A live turn is executing it. False means the work is owed but no window is running; the user can resume it.",
           "default": false,
           "type": "boolean"
+        },
+        "user_paused": {
+          "description": "The user's own stop directive is still in force: the durable `goals.user_paused_at` column, not a client-side reading of the transcript. A paused goal owes work and withholds it at the same time, which `running` alone cannot express while an unrelated turn runs.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },
@@ -5050,531 +5035,6 @@
         }
       }
     },
-    "UiMemoryCandidate": {
-      "description": "A candidate awaiting consent, with enough to decide on.\n\nDeliberately NOT [`UiMemoryEntry`]: approving something shown only as a title is not informed consent, so the body, kind and source ride along.",
-      "type": "object",
-      "required": [
-        "body",
-        "id",
-        "kind",
-        "source",
-        "title"
-      ],
-      "properties": {
-        "body": {
-          "description": "The text that would be stored. Already length-bounded by the domain.",
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "kind": {
-          "description": "Free-form label as stored (`preference`, `package_manager`, …).",
-          "type": "string"
-        },
-        "scope": {
-          "description": "Which store is holding this pending record. Accept/reject must carry it back so a decision can never land in another scope.",
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "source": {
-          "description": "Who proposed it (`user_explicit`, `system_propose`, …).",
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        }
-      }
-    },
-    "UiMemoryEntry": {
-      "description": "Compact durable-memory row for TUI list surfaces.",
-      "type": "object",
-      "required": [
-        "id",
-        "title"
-      ],
-      "properties": {
-        "authority": {
-          "description": "Who established this memory (`user_explicit`, `runtime_observed`, ...). This is the store's own vocabulary, not a client guess.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "body": {
-          "description": "The stored content. A title alone cannot answer \"what do I actually remember?\", and the detail page must not guess it. Additive: absent on older runtimes (empty string).",
-          "default": "",
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "kind": {
-          "description": "What this memory is, which decides how it reaches the model. Additive: absent on older runtimes.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/UiMemoryKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "pinned": {
-          "description": "Pinned by the person, not by a model hint.",
-          "type": "boolean"
-        },
-        "revision": {
-          "description": "The revision this row was read at, so a detail page can name exactly what it is showing instead of \"the current one\".",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "scope": {
-          "description": "Which store this row came from; part of the row's identity.",
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "sensitive": {
-          "description": "Held back from every automatic path because it looks like a credential. Kept in the listing so the user can find and archive it.",
-          "type": "boolean"
-        },
-        "status": {
-          "description": "The lifecycle state the store reports for this row (`active`, `pending`, `superseded`, `deprecated`). Additive: absent on older runtimes, and the page then says nothing it cannot prove.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "title": {
-          "type": "string"
-        },
-        "updated_at": {
-          "description": "When the store last changed this record (RFC 3339).",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "UiMemoryExperience": {
-      "description": "The outcome of one experience extraction. Counts only; `reason` is a stable skip class, never entry text or provider output.",
-      "type": "object",
-      "required": [
-        "accepted",
-        "at",
-        "created",
-        "outcome",
-        "pending",
-        "rejected",
-        "skipped",
-        "updated"
-      ],
-      "properties": {
-        "accepted": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "at": {
-          "type": "string"
-        },
-        "created": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "outcome": {
-          "description": "`extracted` | `skipped`",
-          "type": "string"
-        },
-        "pending": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "reason": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "rejected": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "skipped": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "updated": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      }
-    },
-    "UiMemoryExtraction": {
-      "type": "object",
-      "required": [
-        "accepted",
-        "at",
-        "rejected",
-        "skipped",
-        "zero_candidates"
-      ],
-      "properties": {
-        "accepted": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "at": {
-          "type": "string"
-        },
-        "rejected": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "skipped": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "zero_candidates": {
-          "description": "True when the extractor produced no candidate at all, which is different from candidates that were filtered or failed.",
-          "type": "boolean"
-        }
-      }
-    },
-    "UiMemoryExtractionTotals": {
-      "type": "object",
-      "required": [
-        "accepted",
-        "rejected",
-        "skipped"
-      ],
-      "properties": {
-        "accepted": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "rejected": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "skipped": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      }
-    },
-    "UiMemoryKind": {
-      "description": "What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret.",
-      "oneOf": [
-        {
-          "description": "Injected into every turn while active.",
-          "type": "string",
-          "enum": [
-            "preference"
-          ]
-        },
-        {
-          "description": "Reachable by query recall and the catalog, never auto-injected.",
-          "type": "string",
-          "enum": [
-            "decision"
-          ]
-        },
-        {
-          "description": "Same reach as a decision.",
-          "type": "string",
-          "enum": [
-            "note"
-          ]
-        },
-        {
-          "description": "Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog.",
-          "type": "string",
-          "enum": [
-            "experience"
-          ]
-        }
-      ]
-    },
-    "UiMemoryReference": {
-      "description": "One record a turn's request actually carried.",
-      "type": "object",
-      "required": [
-        "id"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "mode": {
-          "description": "`standing`, `candidate` or `experience`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "scope": {
-          "description": "Which store the record came from; `(scope, id)` is its identity.",
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "title": {
-          "description": "A bounded summary. Redacted when the record looks like a credential.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "UiMemoryScope": {
-      "description": "The scope a memory row or decision belongs to.\n\n`(scope, id)` is the record's identity: the same id in two scopes is two independent memories. An older runtime that sends no scope predates multi-scope listings and only ever served the project store.",
-      "type": "string",
-      "enum": [
-        "global",
-        "project",
-        "local"
-      ]
-    },
-    "UiMemoryStatus": {
-      "description": "Durable memory health for `/memory status`. Counts only: no entry text, no candidate body, no raw provider error.",
-      "type": "object",
-      "required": [
-        "active",
-        "archived",
-        "extraction_totals",
-        "inbox_failed_retryable",
-        "inbox_pending",
-        "inbox_processed",
-        "inbox_processing",
-        "pending",
-        "sensitive"
-      ],
-      "properties": {
-        "active": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "archived": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_active": {
-          "description": "Active agent experiences, split by the evidence class the runtime derived. An unverified experience is a parked hypothesis; it is never counted as verified.",
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_archived": {
-          "description": "Experience rows retired by supersede/expiry/forget.",
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_enabled": {
-          "default": true,
-          "type": "boolean"
-        },
-        "experience_experimental": {
-          "description": "Agent experience is still experimental.",
-          "default": true,
-          "type": "boolean"
-        },
-        "experience_inbox_failed_retryable": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_inbox_pending": {
-          "description": "The experience lane's durable queue, kept separate from the user-turn inbox so \"no lesson\" and \"not extracted yet\" are distinguishable.",
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_inbox_processed": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_inbox_processing": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_next_retry_at": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "experience_pending": {
-          "description": "Experience candidates awaiting a person.",
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_unverified": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "experience_verified": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "extraction_totals": {
-          "description": "Sums over the retained processed window.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryExtractionTotals"
-            }
-          ]
-        },
-        "inbox_failed_retryable": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "inbox_pending": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "inbox_processed": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "inbox_processing": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "last_error": {
-          "description": "Sanitized class of the oldest retry's error.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "last_experience": {
-          "description": "The most recent settled experience extraction, if any.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/UiMemoryExperience"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "last_extraction": {
-          "description": "The most recent completed batch, if any.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/UiMemoryExtraction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "next_retry_at": {
-          "description": "Due time of the oldest retry, when one is waiting.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pending": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "retry_attempt": {
-          "description": "Most recent retry attempt number, when one is waiting.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "sensitive": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "total_enabled": {
-          "description": "The project's effective switches. `*_enabled` is already the conjunction with `total_enabled`; an old daemon that sends no switches is read as the historical all-on state.",
-          "default": true,
-          "type": "boolean"
-        },
-        "user_active": {
-          "description": "User-lane entries only, so a client can show the two lanes separately and still account for every active/pending/archived row.",
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "user_archived": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "user_enabled": {
-          "default": true,
-          "type": "boolean"
-        },
-        "user_pending": {
-          "default": 0,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      }
-    },
     "UiMessage": {
       "description": "A rendered message in the transcript.",
       "type": "object",
@@ -5632,6 +5092,82 @@
           ]
         }
       ]
+    },
+    "UiModelUsage": {
+      "description": "One provider/model's share of a report. Requests are grouped by the provider key and the model id actually sent on the wire, so switching models mid-session splits here instead of blending.",
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "model",
+        "output_tokens",
+        "priced_requests",
+        "provider",
+        "requests",
+        "unmeasured_requests"
+      ],
+      "properties": {
+        "cached_input_tokens": {
+          "description": "Subset of `input_tokens`; `None` when no row in the group recorded it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cost_usd_micros": {
+          "description": "Sum over the group's priced rows; `None` when none of them had a price.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "priced_requests": {
+          "description": "Rows in the group that carried a price.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reasoning_tokens": {
+          "description": "Subset of `output_tokens`; `None` when no row in the group recorded it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "description": "Provider calls in this group, retries included — each is a billed call.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "unmeasured_requests": {
+          "description": "Calls in this group whose provider reported no usage at all.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
     },
     "UiObservabilityLoaded": {
       "description": "Bounded event window + related observation slices. Current and historical sessions use this same payload.",
@@ -6831,6 +6367,151 @@
           "minimum": 0.0
         }
       }
+    },
+    "UiUsageReport": {
+      "description": "What one scope spent, with the range the runtime resolved it to.",
+      "type": "object",
+      "required": [
+        "generated_at",
+        "input_tokens",
+        "output_tokens",
+        "priced_requests",
+        "requests",
+        "scope",
+        "unmeasured_requests"
+      ],
+      "properties": {
+        "cached_input_tokens": {
+          "description": "Subset of `input_tokens`, summed over rows that recorded a cache figure. `None` when no row in scope recorded one.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cost_usd_micros": {
+          "description": "Sum over rows that carried a price. `None` when none did — the honest answer, never `$0.00`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "from": {
+          "description": "Resolved lower bound (inclusive), RFC 3339. `None` = unbounded below.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "description": "When the runtime computed this report (RFC 3339).",
+          "type": "string"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "models": {
+          "description": "Per provider/model breakdown, largest spender first.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiModelUsage"
+          }
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "priced_requests": {
+          "description": "Rows whose cost is part of `cost_usd_micros`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reasoning_tokens": {
+          "description": "Subset of `output_tokens`, summed over rows that reported a breakdown. `None` when no row in scope did.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "description": "Calls in scope, retries included.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "scope": {
+          "$ref": "#/definitions/UiUsageScope"
+        },
+        "to": {
+          "description": "Resolved upper bound (exclusive), RFC 3339. `None` = the report covers everything up to the moment it was generated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unmeasured_requests": {
+          "description": "Calls in scope whose provider reported no usage. They are counted as requests but contribute no tokens: an absence of measurement.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiUsageScope": {
+      "description": "The window a usage report covers.\n\nThe runtime — not the client — resolves a scope into an explicit `[from, to)` range and echoes it in the report, so two surfaces showing the same scope can never disagree about its boundary.",
+      "oneOf": [
+        {
+          "description": "The session's latest turn (the running one, else the last one).",
+          "type": "string",
+          "enum": [
+            "turn"
+          ]
+        },
+        {
+          "description": "Everything the current session ever spent.",
+          "type": "string",
+          "enum": [
+            "session"
+          ]
+        },
+        {
+          "description": "The caller's local calendar day.",
+          "type": "string",
+          "enum": [
+            "today"
+          ]
+        },
+        {
+          "description": "The caller's local day six days ago through now.",
+          "type": "string",
+          "enum": [
+            "last7_days"
+          ]
+        },
+        {
+          "description": "The caller's local day twenty-nine days ago through now.",
+          "type": "string",
+          "enum": [
+            "last30_days"
+          ]
+        },
+        {
+          "description": "Every durable call this runtime's ledger holds.",
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        }
+      ]
     },
     "UiUserShell": {
       "description": "One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log).",

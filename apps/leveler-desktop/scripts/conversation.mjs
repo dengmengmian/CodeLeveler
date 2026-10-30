@@ -20,7 +20,7 @@ const server=createServer(async(request,response)=>{
   if(request.url==='/docs'){documentRequests++;response.writeHead(200,{'content-type':'text/html'});response.end('<!doctype html><title>Conversation linked page</title><h1>Actual manual browser page</h1>');return;}
   if(request.method!=='POST'){response.writeHead(404);response.end();return;}
   let text='';for await(const chunk of request)text+=chunk;const body=JSON.parse(text);
-  if(!(body.tools??[]).length){response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({id:'memory',choices:[{index:0,message:{role:'assistant',content:'{"candidates":[]}'},finish_reason:'stop'}]}));return;}
+  if(!(body.tools??[]).length){response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({id:'auxiliary',choices:[{index:0,message:{role:'assistant',content:'Fixture auxiliary response.'},finish_reason:'stop'}]}));return;}
   providerCalls++;const users=body.messages.filter(m=>m.role==='user');const long=String(users.at(-1)?.content).includes('conversation-long');
   const answer=long?'# Long streaming response\n\n'+Array.from({length:180},(_,i)=>`第 ${i+1} 段：**真实流式测试**，用于验证会话滚动和 Composer 并发输入。\n\n`).join('')+'\nLONG_STREAM_COMPLETE':rich;
   response.writeHead(200,{'content-type':'text/event-stream'});

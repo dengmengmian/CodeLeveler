@@ -1953,6 +1953,9 @@ fn conversation_corpus_projects_the_frozen_tree() {
                                     leveler_client_protocol::PlanStepStatus::Done => "done",
                                     leveler_client_protocol::PlanStepStatus::Failed => "failed",
                                     leveler_client_protocol::PlanStepStatus::Skipped => "skipped",
+                                    leveler_client_protocol::PlanStepStatus::Abandoned => {
+                                        "abandoned"
+                                    }
                                 },
                             })
                         })

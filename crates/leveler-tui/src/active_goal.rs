@@ -274,6 +274,18 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
     {
         return;
     }
+    // A plain question in a Chat session that owes a PAUSED goal is not a new
+    // task. The runtime answers it without touching the goal, so the goal keeps
+    // its identity and its pause on screen; only the user's own continuation
+    // resumes it, and only a committed task replaces it. A Goal session is
+    // different: there every message belongs to the goal, and `/goal <task>`
+    // declares a new one.
+    if !staged.continuation
+        && !state.collaboration.eq_ignore_ascii_case("goal")
+        && goal.phase() == GoalPhase::Paused
+    {
+        return;
+    }
     let same_goal = staged.continuation
         && matches!(
             goal.phase(),
@@ -294,11 +306,30 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
     }
 }
 
+/// Whether the session owes a goal the user paused.
+///
+/// The durable projection answers when the runtime has published one; the live
+/// phase covers a pause this client witnessed before the projection arrived.
+/// Both are readings of the same pause, never a second one.
+pub fn paused_owed(state: &AppState) -> bool {
+    state
+        .execution_goal
+        .as_ref()
+        .is_some_and(|goal| goal.user_paused)
+        || state
+            .active_goal
+            .as_ref()
+            .is_some_and(|goal| goal.phase() == GoalPhase::Paused)
+}
+
 /// The compact task-execution badge. An ordinary chat turn never occupies this
 /// surface; an explicitly delegated task does, even though the session stays a
 /// Chat session. The full objective remains available through the detail page.
 pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
-    if !state.collaboration.eq_ignore_ascii_case("goal") && !state.execution_task_active {
+    if !state.collaboration.eq_ignore_ascii_case("goal")
+        && !state.execution_task_active
+        && state.execution_goal.is_none()
+    {
         return Vec::new();
     }
     let now = Instant::now();
@@ -357,7 +388,9 @@ pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
 }
 
 pub fn has_visible_goal(state: &AppState) -> bool {
-    (state.collaboration.eq_ignore_ascii_case("goal") || state.execution_task_active)
+    (state.collaboration.eq_ignore_ascii_case("goal")
+        || state.execution_task_active
+        || state.execution_goal.is_some())
         && state
             .active_goal
             .as_ref()

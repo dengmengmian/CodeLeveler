@@ -18,10 +18,6 @@ pub enum ModelCallKind {
     Round,
     /// The summarization behind a compaction fold.
     Compaction,
-    /// Semantic memory-candidate extraction from the user's own turns.
-    MemoryExtraction,
-    /// Evidence-bound agent-experience extraction after a completed task.
-    ExperienceExtraction,
     /// An idle prompt suggestion.
     PromptSuggestion,
     /// A one-line recap of where the conversation reached.
@@ -43,8 +39,6 @@ impl ModelCallKind {
         match self {
             Self::Round => "round",
             Self::Compaction => "compaction",
-            Self::MemoryExtraction => "memory_extraction",
-            Self::ExperienceExtraction => "experience_extraction",
             Self::PromptSuggestion => "prompt_suggestion",
             Self::AwaySummary => "away_summary",
             Self::SemanticRecap => "semantic_recap",
@@ -60,8 +54,8 @@ impl ModelCallKind {
     pub fn from_stored(value: &str) -> Self {
         match value {
             "compaction" => Self::Compaction,
-            "memory_extraction" => Self::MemoryExtraction,
-            "experience_extraction" => Self::ExperienceExtraction,
+            "memory_extraction" => Self::Advisory,
+            "experience_extraction" => Self::Advisory,
             "prompt_suggestion" => Self::PromptSuggestion,
             "away_summary" => Self::AwaySummary,
             "semantic_recap" => Self::SemanticRecap,
@@ -221,6 +215,83 @@ struct ModelRequestRow {
     error_detail: Option<String>,
 }
 
+/// One `model_requests` row plus the session that owns it, as the window
+/// loader reads it.
+#[derive(sqlx::FromRow)]
+struct ScopedModelRequestRow {
+    session_id: String,
+    #[sqlx(flatten)]
+    record: ModelRequestRow,
+}
+
+/// Map one stored row into its record. The ONE place a row's stored shape is
+/// normalized (clamping signed storage, parsing the timestamp), so the
+/// session loader and the window loader cannot disagree about a row.
+fn record_from_row(
+    row: ModelRequestRow,
+    session_id: SessionId,
+) -> Result<ModelRequestRecord, StorageError> {
+    let ModelRequestRow {
+        budget_scope,
+        estimated_tokens,
+        id,
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        finish_reason,
+        error_kind,
+        latency_ms,
+        attempt_ms,
+        connect_ms,
+        ttft_ms,
+        max_event_gap_ms,
+        retry_count,
+        created_at,
+        kind,
+        provider_request_id,
+        cached_input_tokens,
+        cost_usd_micros,
+        agent_id,
+        reasoning_effort,
+        reasoning_tokens,
+        projected_input_tokens,
+        projected_reasoning_tokens,
+        error_detail,
+    } = row;
+    Ok(ModelRequestRecord {
+        budget_scope,
+        estimated_tokens: estimated_tokens.map(|value| value.max(0) as u64),
+        id,
+        session_id,
+        provider,
+        model,
+        input_tokens: input_tokens.max(0) as u64,
+        output_tokens: output_tokens.max(0) as u64,
+        finish_reason,
+        error_kind,
+        latency_ms: latency_ms.map(|value| value.max(0) as u64),
+        attempt_ms: attempt_ms.map(|value| value.max(0) as u64),
+        connect_ms: connect_ms.map(|value| value.max(0) as u64),
+        ttft_ms: ttft_ms.map(|value| value.max(0) as u64),
+        max_event_gap_ms: max_event_gap_ms.map(|value| value.max(0) as u64),
+        retry_count: retry_count.clamp(0, i64::from(u32::MAX)) as u32,
+        kind: ModelCallKind::from_stored(&kind),
+        provider_request_id,
+        cached_input_tokens: cached_input_tokens.map(|value| value.max(0) as u64),
+        cost_usd_micros: cost_usd_micros.map(|value| value.max(0) as u64),
+        agent_id,
+        created_at: created_at.parse::<Timestamp>().map_err(|error| {
+            StorageError::InvalidData(format!("model request timestamp: {error}"))
+        })?,
+        reasoning_effort,
+        reasoning_tokens: reasoning_tokens.map(|value| value.max(0) as u64),
+        projected_input_tokens: projected_input_tokens.map(|value| value.max(0) as u64),
+        projected_reasoning_tokens: projected_reasoning_tokens.map(|value| value.max(0) as u64),
+        error_detail,
+    })
+}
+
 /// Read/write access to the `model_requests` table, borrowed from a [`Database`].
 pub struct ModelRequestRepository<'a> {
     db: &'a Database,
@@ -348,84 +419,60 @@ impl<'a> ModelRequestRepository<'a> {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ModelRequestRecord>, StorageError> {
-        let rows = sqlx::query_as::<_, ModelRequestRow>(
-            "SELECT id, provider, model, input_tokens, output_tokens, finish_reason, error_kind, \
-                    latency_ms, retry_count, created_at, kind, provider_request_id, \
+        Ok(self
+            .load_window(Some(session_id), None, None)
+            .await?
+            .into_iter()
+            .map(|scoped| scoped.record)
+            .collect())
+    }
+
+    /// Recorded calls in a window, for usage reporting.
+    ///
+    /// `session` restricts to one session; `from` is an inclusive lower bound
+    /// and `to` an exclusive upper bound. Bounds compare against the stored
+    /// RFC 3339 text, which this repository writes with the same
+    /// [`Timestamp::to_rfc3339`] formatting the bound is serialized with, so
+    /// the comparison uses the ledger's own ordering rather than a second
+    /// timestamp dialect.
+    ///
+    /// Ordering is oldest first (ties by insertion), the order the ledger was
+    /// written in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidData`] if a stored timestamp does not
+    /// parse; the whole load fails rather than skipping the bad row.
+    pub async fn load_window(
+        &self,
+        session: Option<&SessionId>,
+        from: Option<Timestamp>,
+        to: Option<Timestamp>,
+    ) -> Result<Vec<ScopedModelRequest>, StorageError> {
+        let rows = sqlx::query_as::<_, ScopedModelRequestRow>(
+            "SELECT session_id, id, provider, model, input_tokens, output_tokens, finish_reason, \
+                    error_kind, latency_ms, retry_count, created_at, kind, provider_request_id, \
                     cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort, \
                     reasoning_tokens, attempt_ms, connect_ms, ttft_ms, max_event_gap_ms, \
                     projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, \
                     error_detail \
-             FROM model_requests WHERE session_id = ?1 ORDER BY created_at, rowid",
+             FROM model_requests \
+             WHERE (?1 IS NULL OR session_id = ?1) \
+               AND (?2 IS NULL OR created_at >= ?2) \
+               AND (?3 IS NULL OR created_at < ?3) \
+             ORDER BY created_at, rowid",
         )
-        .bind(session_id.as_str())
+        .bind(session.map(SessionId::as_str))
+        .bind(from.map(|at| at.to_rfc3339()))
+        .bind(to.map(|at| at.to_rfc3339()))
         .fetch_all(self.db.pool())
         .await?;
 
         rows.into_iter()
             .map(|row| {
-                let ModelRequestRow {
-                    budget_scope,
-                    estimated_tokens,
-                    id,
-                    provider,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    finish_reason,
-                    error_kind,
-                    latency_ms,
-                    attempt_ms,
-                    connect_ms,
-                    ttft_ms,
-                    max_event_gap_ms,
-                    retry_count,
-                    created_at,
-                    kind,
-                    provider_request_id,
-                    cached_input_tokens,
-                    cost_usd_micros,
-                    agent_id,
-                    reasoning_effort,
-                    reasoning_tokens,
-                    projected_input_tokens,
-                    projected_reasoning_tokens,
-                    error_detail,
-                } = row;
-                {
-                    Ok(ModelRequestRecord {
-                        budget_scope,
-                        estimated_tokens: estimated_tokens.map(|value| value.max(0) as u64),
-                        id,
-                        session_id: session_id.clone(),
-                        provider,
-                        model,
-                        input_tokens: input_tokens.max(0) as u64,
-                        output_tokens: output_tokens.max(0) as u64,
-                        finish_reason,
-                        error_kind,
-                        latency_ms: latency_ms.map(|value| value.max(0) as u64),
-                        attempt_ms: attempt_ms.map(|value| value.max(0) as u64),
-                        connect_ms: connect_ms.map(|value| value.max(0) as u64),
-                        ttft_ms: ttft_ms.map(|value| value.max(0) as u64),
-                        max_event_gap_ms: max_event_gap_ms.map(|value| value.max(0) as u64),
-                        retry_count: retry_count.clamp(0, i64::from(u32::MAX)) as u32,
-                        kind: ModelCallKind::from_stored(&kind),
-                        provider_request_id,
-                        cached_input_tokens: cached_input_tokens.map(|value| value.max(0) as u64),
-                        cost_usd_micros: cost_usd_micros.map(|value| value.max(0) as u64),
-                        agent_id,
-                        created_at: created_at.parse::<Timestamp>().map_err(|error| {
-                            StorageError::InvalidData(format!("model request timestamp: {error}"))
-                        })?,
-                        reasoning_effort,
-                        reasoning_tokens: reasoning_tokens.map(|value| value.max(0) as u64),
-                        projected_input_tokens: projected_input_tokens
-                            .map(|value| value.max(0) as u64),
-                        projected_reasoning_tokens: projected_reasoning_tokens
-                            .map(|value| value.max(0) as u64),
-                        error_detail,
-                    })
-                }
+                let session_id = SessionId::new(row.session_id.clone());
+                let record = record_from_row(row.record, session_id.clone())?;
+                Ok(ScopedModelRequest { session_id, record })
             })
             .collect()
     }
@@ -534,6 +581,18 @@ impl SessionUsageTotals {
     pub fn is_complete(&self) -> bool {
         self.rows_without_cached_usage == 0 && self.rows_without_cost == 0
     }
+}
+
+/// One recorded call together with the session that owns it.
+///
+/// A cross-session report has to attribute each row, so the session id travels
+/// with it instead of being filled in by the query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedModelRequest {
+    /// The session that owns the row.
+    pub session_id: SessionId,
+    /// The recorded attempt.
+    pub record: ModelRequestRecord,
 }
 
 /// A session's usage, separated into the root's own calls and each sub-agent's.
@@ -1132,6 +1191,97 @@ mod tests {
                 .iter()
                 .all(|r| r.provider_request_id.as_deref() == Some("the-same-upstream-id")),
             "and the provider's id survives as the diagnostic it is"
+        );
+    }
+
+    /// The window loader is what usage reporting reads: it must include a row AT
+    /// the lower bound, exclude one at the upper bound, keep strict time order
+    /// across sessions, and attribute every row to its own session.
+    #[tokio::test]
+    async fn a_window_is_half_open_and_spans_sessions() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let mut sessions = Vec::new();
+        for goal in ["a", "b"] {
+            let session = SessionRecord::new("/r", goal, "provider/model", leveler_core::now());
+            SessionRepository::new(&db).create(&session).await.unwrap();
+            sessions.push(SessionId::new(session.id));
+        }
+        let repo = ModelRequestRepository::new(&db);
+        let base = chrono::DateTime::parse_from_rfc3339("2026-03-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // One row exactly on the bound, one just before, one just after.
+        for (id, session, offset_ms) in [
+            ("before", &sessions[0], -1_000),
+            ("on-bound", &sessions[1], 0),
+            ("after", &sessions[0], 1_000),
+        ] {
+            repo.insert(&ModelRequestRecord {
+                budget_scope: None,
+                estimated_tokens: None,
+                id: id.to_string(),
+                provider_request_id: None,
+                session_id: session.clone(),
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 10,
+                output_tokens: 2,
+                finish_reason: Some("stop".to_string()),
+                error_kind: None,
+                error_detail: None,
+                latency_ms: None,
+                attempt_ms: None,
+                connect_ms: None,
+                ttft_ms: None,
+                max_event_gap_ms: None,
+                retry_count: 0,
+                kind: ModelCallKind::Round,
+                cached_input_tokens: None,
+                projected_input_tokens: None,
+                projected_reasoning_tokens: None,
+                cost_usd_micros: None,
+                agent_id: None,
+                created_at: base + chrono::Duration::milliseconds(offset_ms),
+                reasoning_effort: None,
+                reasoning_tokens: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let all = repo.load_window(None, None, None).await.unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|scoped| scoped.record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "on-bound", "after"],
+            "oldest first, across sessions"
+        );
+        assert_eq!(all[1].session_id, sessions[1], "each row keeps its owner");
+
+        let window = repo
+            .load_window(None, Some(base), Some(base + chrono::Duration::seconds(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            window
+                .iter()
+                .map(|scoped| scoped.record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["on-bound"],
+            "the lower bound is inclusive and the upper bound exclusive"
+        );
+
+        let one_session = repo
+            .load_window(Some(&sessions[0]), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            one_session
+                .iter()
+                .map(|scoped| scoped.record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "after"]
         );
     }
 

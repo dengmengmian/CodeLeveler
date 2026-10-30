@@ -14,7 +14,6 @@ mod git;
 mod grep;
 mod list_files;
 mod locate_hint;
-mod memory;
 pub mod patch;
 mod read_file;
 mod read_symbol;
@@ -41,7 +40,6 @@ pub use find_symbol::FindSymbolTool;
 pub use git::{GitDiffTool, GitStatusTool};
 pub use grep::GrepTool;
 pub use list_files::ListFilesTool;
-pub use memory::{ForgetTool, MemoryRoot, MemoryTool, RememberTool};
 pub use read_file::ReadFileTool;
 pub use read_symbol::ReadSymbolTool;
 pub use rules::ReadProjectRulesTool;
@@ -264,7 +262,7 @@ pub(crate) fn test_ctx(
 }
 
 /// In-process capability handles for tool tests: a fresh language-server pool
-/// and background registry, no store, no memory root, no browser.
+/// and background registry, no store, no browser.
 #[cfg(test)]
 pub(crate) fn test_capabilities() -> crate::capabilities::Capabilities {
     crate::capabilities::Capabilities::in_process(std::sync::Arc::new(

@@ -252,9 +252,7 @@ async fn fixture(schedule: Vec<Option<&str>>, script: Vec<Scripted>, declare: bo
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: Default::default(),
             permission_rules_path: None,
@@ -264,7 +262,6 @@ async fn fixture(schedule: Vec<Option<&str>>, script: Vec<Scripted>, declare: bo
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

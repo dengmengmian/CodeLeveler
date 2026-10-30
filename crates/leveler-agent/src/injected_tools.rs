@@ -219,9 +219,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
 
 /// The name of the injected task-commitment tool (Chat turns only).
 ///
-/// This is the structured delegation entry: the model declares that the
-/// user's request is work to be carried to completion, and the running turn
-/// binds itself to a durable goal. It is not inferred from the user's words.
+/// This is the goal-commitment entry, not a delegation entry: the model
+/// declares that the user's request is work to be carried to completion, and
+/// the running turn binds itself to a durable goal. No sub-agent is created —
+/// `spawn_agent` is the only tool that delegates. It is not inferred from the
+/// user's words.
 pub(crate) const COMMIT_TASK_TOOL: &str = "commit_task";
 
 /// Commit the current Chat turn to the Goal lifecycle.
@@ -275,11 +277,16 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     }
 }
 
-/// The Chat delegation rule. It is a product contract, not a classifier:
+/// The Chat commitment rule. It is a product contract, not a classifier:
 /// the model declares the commitment with `commit_task`, and every behavior
 /// change follows that durable fact. Kept as a constant so its prompt cost is
 /// measured, not guessed.
-pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK DELEGATION: if the user asked you to carry out work to \
+///
+/// It is named COMMITMENT, not delegation, because the two are different
+/// actions: committing keeps this turn working toward a goal, while delegation
+/// (`spawn_agent`) starts another agent. One word for both made the model's own
+/// summary of its work claim it had delegated a task it had only committed.
+pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK COMMITMENT: if the user asked you to carry out work to \
      completion and the request states a concrete deliverable that needs several steps, tracking or \
      acceptance (or the user said to finish everything before stopping), call `commit_task` before the \
      first edit — even if you expect to finish this turn; the commitment keeps the turn alive if the \

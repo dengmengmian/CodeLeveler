@@ -95,12 +95,51 @@ impl TextSelection {
 /// * `prefix` — the semantic marker the renderer replaced with a visual glyph
 ///   (heading `#`, list `- `/`1. `, quote `> `). Emitted only when the
 ///   selection starts at the marker.
+/// * `break_line` — a `skip` row that still ENDS the previous copied line.
+///   A diff separator or hunk header paints chrome between two runs of real
+///   code, and those runs are separate source lines: skipping the row without
+///   a break would glue hunk A's last line onto hunk B's first one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PlainRow {
     pub indent: u16,
     pub skip: bool,
     pub joiner: Option<Box<str>>,
     pub prefix: Option<Box<str>>,
+    pub break_line: bool,
+}
+
+/// One painted row a renderer declares copyable, addressed relative to the
+/// lines that same renderer returned.
+///
+/// The activity stream paints a tool group as one block of lines, so a copy
+/// policy that describes only its diff body has to name the rows it owns. The
+/// renderer that painted them is the only thing that knows the gutter width,
+/// the wrap points and the marker columns — nothing here is inferred from the
+/// painted text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyRow {
+    pub row: usize,
+    pub policy: PlainRow,
+}
+
+impl CopyRow {
+    pub(crate) fn new(row: usize, policy: PlainRow) -> Self {
+        Self { row, policy }
+    }
+}
+
+/// Apply renderer-declared copy rows to the span that was painted as
+/// display-only. `copy` starts at the block's first line, exactly like the
+/// indices the renderer reported.
+///
+/// An index past the end is ignored: the block shrank between painting and
+/// here, and a stale override must never rewrite a different row's policy.
+pub(crate) fn apply_copy_rows(copy: &mut [PlainRow], rows: &[CopyRow]) {
+    for row in rows {
+        if let Some(slot) = copy.get_mut(row.row) {
+            *slot = row.policy.clone();
+        }
+    }
 }
 
 /// Extract plain text for a selection from absolute content lines, honoring
@@ -123,8 +162,12 @@ pub fn extract_selected_text_with_layout(
     let mut wrote_row = false;
     for row in start_row..=end_row {
         let row_layout = layout.get(row).cloned().unwrap_or_default();
-        // A display-only row neither copies nor contributes a line break.
+        // A display-only row copies no text. It only breaks the preceding
+        // copied line when the renderer said the row sits between two of them.
         if row_layout.skip {
+            if row_layout.break_line && wrote_row {
+                out.push('\n');
+            }
             continue;
         }
         let line = plain_lines.get(row).map(String::as_str).unwrap_or("");

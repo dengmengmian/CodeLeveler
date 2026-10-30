@@ -56,6 +56,9 @@ pub(super) fn insert_text(state: &mut AppState, text: &str, paste: bool) -> Vec<
 }
 
 fn insert_raw(state: &mut AppState, text: &str, paste: bool) {
+    // Typing belongs to the composer: a record's output window never keeps the
+    // keyboard while the user is writing a command.
+    state.shell_output_focus = None;
     let shell = state.input_mode == InputMode::Shell;
     if !shell && super::insert_file_references(state, text) {
         super::submit::touch_slash_filter(state);
@@ -137,6 +140,15 @@ pub(super) fn request_tab(state: &mut AppState, tab_armed: bool) -> Vec<Effect> 
         .as_ref()
         .is_some_and(|r| r.text == text && r.cursor == cursor)
     {
+        // A Tab that lands while this exact draft's scan is still in flight is
+        // not a duplicate request: it is the user asking to open/extend the
+        // menu. Re-arm the pending fetch so its result runs the Tab decision
+        // instead of being filed away as a warm cache. Without this, an
+        // accept-then-Tab drill (Enter on `docs/`, Tab again) silently does
+        // nothing whenever the refetch has not landed yet.
+        if tab_armed {
+            state.completion.tab_armed = true;
+        }
         return Vec::new();
     }
     let Some(cwd) = state.repository.clone() else {

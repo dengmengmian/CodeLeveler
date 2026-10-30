@@ -77,8 +77,6 @@ fn summarize_usage_by_kind(requests: &[leveler_storage::ModelRequestRecord]) -> 
         let kind = match r.kind {
             ModelCallKind::Round => "round",
             ModelCallKind::Compaction => "compaction",
-            ModelCallKind::MemoryExtraction => "memory_extraction",
-            ModelCallKind::ExperienceExtraction => "experience_extraction",
             ModelCallKind::PromptSuggestion => "prompt_suggestion",
             ModelCallKind::AwaySummary => "away_summary",
             ModelCallKind::SemanticRecap => "semantic_recap",
@@ -428,17 +426,17 @@ mod usage_tests {
         let mut compaction = req("deepseek/v4", 200, 30);
         compaction.kind = leveler_storage::ModelCallKind::Compaction;
         compaction.latency_ms = Some(2_000);
-        let mut memory = req("deepseek/v4", 50, 10);
-        memory.kind = leveler_storage::ModelCallKind::MemoryExtraction;
-        memory.latency_ms = Some(300);
-        let lanes = summarize_usage_by_kind(&[round, compaction, memory]);
+        let mut advisory = req("deepseek/v4", 50, 10);
+        advisory.kind = leveler_storage::ModelCallKind::Advisory;
+        advisory.latency_ms = Some(300);
+        let lanes = summarize_usage_by_kind(&[round, compaction, advisory]);
         let by_name: std::collections::HashMap<_, _> =
             lanes.iter().map(|l| (l.kind.as_str(), l)).collect();
         assert_eq!(by_name["round"].calls, 1);
         assert_eq!(by_name["compaction"].calls, 1);
-        assert_eq!(by_name["memory_extraction"].calls, 1);
-        assert_eq!(by_name["memory_extraction"].input_tokens, 50);
-        assert_eq!(by_name["memory_extraction"].latency_ms, 300);
+        assert_eq!(by_name["advisory"].calls, 1);
+        assert_eq!(by_name["advisory"].input_tokens, 50);
+        assert_eq!(by_name["advisory"].latency_ms, 300);
         // A lane with any unpriced call reports no cost rather than a partial
         // sum: `None` is "unknown", not "free".
         assert_eq!(by_name["round"].cost_usd_micros, None);

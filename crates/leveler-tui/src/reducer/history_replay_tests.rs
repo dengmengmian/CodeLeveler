@@ -1378,3 +1378,79 @@ fn background_completion_updates_the_starter_without_a_duplicate_transcript_noti
         "an outcome with no starter must remain visible"
     );
 }
+
+/// A replayed session must describe a goal declaration the same way the live
+/// turn did, and must not call it a delegation. The label comes from the tool
+/// identity plus the runtime's own refusal tag, never from the prose of a
+/// recorded message — a record that lacks the tag degrades to the generic
+/// "commit failed" instead of being guessed into a scope refusal.
+#[test]
+fn a_replayed_goal_declaration_reads_the_same_as_the_live_one() {
+    let events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "实现 Phase 3C 内容社区"),
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("c1"),
+            name: "commit_task".into(),
+            arguments: r#"{"objective":"Phase 3C 内容社区","acceptance":["文章发布可访问"]}"#
+                .into(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("c1"),
+            ok: false,
+            preview: "commit_task refused [acceptance_missing_deliverables]: 1 of 2 \
+                      explicit user deliverables have no covering `acceptance` check."
+                .into(),
+            duration_ms: 200,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+    ];
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(
+        &mut replayed,
+        vec![message(UiRole::User, "实现 Phase 3C 内容社区")],
+    );
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let rows = |s: &AppState| conversation_rows(s);
+    let live_rows = rows(&live);
+    assert_eq!(
+        live_rows,
+        rows(&replayed),
+        "a restored session must not describe the same fact differently"
+    );
+    assert!(
+        live_rows.iter().any(|row| row.contains("目标未提交")),
+        "{live_rows:#?}"
+    );
+    assert!(
+        !live_rows.iter().any(|row| row.contains("委托")),
+        "committing a goal is never delegation: {live_rows:#?}"
+    );
+}

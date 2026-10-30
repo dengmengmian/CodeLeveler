@@ -1,0 +1,16 @@
+-- The user's own stage pause, as a durable fact about the goal it bounds.
+--
+-- A goal that stopped at a user-stated boundary ("finish stage 1, then wait for
+-- my confirmation") still owes the remaining work; what it lacks is
+-- AUTHORIZATION to continue. That is not a completion verdict (`state` stays
+-- `running`) and not a model claim: it is set only when the runtime observed an
+-- explicit user pause whose boundary the model's own plan reached, and it is
+-- cleared only by a later user instruction that authorizes continuing.
+--
+-- It has to be durable because the pause outlives the work window that reached
+-- it: a later ordinary question in the same session must not silently release
+-- a boundary the user set in an earlier turn.
+--
+-- Existing rows are not paused: they predate the boundary fact, and inferring a
+-- pause for them would invent an authorization the user never gave.
+ALTER TABLE goals ADD COLUMN user_paused_at TEXT;

@@ -125,7 +125,6 @@ pub async fn prepare_daemon(
             "reaped zombie turns before daemon startup"
         );
     }
-    app.start_memory_consolidator().await?;
     if let Some(path) = ready_path {
         let ready = ready_json(socket_path, bound.tcp.as_ref(), runtime_id.as_str())?;
         std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;

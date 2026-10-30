@@ -112,9 +112,6 @@ pub struct GlobalConfig {
     /// Multi-agent product settings.
     #[serde(default)]
     agents: GlobalAgents,
-    /// The `/develop` workflow's settings.
-    #[serde(default)]
-    develop: GlobalDevelop,
     /// Idle UI affordances that spend a model call on the user's behalf.
     #[serde(default)]
     assist: GlobalAssist,
@@ -239,21 +236,6 @@ impl Default for GlobalAssist {
             away_summary: true,
         }
     }
-}
-
-/// `[develop]`. One key: which model reads the code.
-///
-/// Analyze and Review deliberately share it. Two keys would let a user
-/// configure a workflow whose investigation and whose acceptance disagree
-/// about what the code is, and there is no question that setup answers.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GlobalDevelop {
-    /// `provider/model` for Analyze and Review. Unset = the session's model,
-    /// which is what makes `/develop` a workflow rather than a second-model
-    /// requirement.
-    #[serde(default)]
-    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,10 +513,6 @@ pub struct GlobalBundle {
     /// TUI theme id from `[ui].theme`, if set.
     pub theme: Option<String>,
     pub vcs_co_author: bool,
-    /// `[develop].model`, exactly as written. Carried as a raw string because
-    /// `/develop` owns the refusal: a model reference the runtime cannot
-    /// resolve must not stop an ordinary turn that never asked for it.
-    pub develop_model: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
     /// Multi-agent: advertise `spawn_agent` when true (default).
     pub agents_delegation: bool,
@@ -616,8 +594,15 @@ impl GlobalConfig {
                 .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", path.display())))?
         };
         doc["default_model"] = value(model.to_string());
-        std::fs::write(path, doc.to_string())
-            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", path.display())))
+        // Write a sibling file and rename it over the target: the watcher (and
+        // any other reader) must never observe a half-written configuration.
+        let staged = path.with_extension("toml.tmp");
+        std::fs::write(&staged, doc.to_string())
+            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
+        std::fs::rename(&staged, path).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            GlobalConfigError::Write(format!("{}: {e}", path.display()))
+        })
     }
 
     /// Load the global config, or an empty one if the file is absent. A present
@@ -1356,7 +1341,6 @@ impl GlobalConfig {
             lang: self.lang,
             theme: self.ui.theme,
             vcs_co_author: self.vcs.co_author,
-            develop_model: self.develop.model,
             mcp_servers,
             agents_delegation: self.agents.delegation,
             agents_independent_review: self.agents.independent_review,
@@ -2409,44 +2393,6 @@ completion_judge_timeout_seconds = 180
             .expect("vcs.co_author must be a valid setting");
         assert!(!config.into_bundle().vcs_co_author);
         assert!(GlobalConfig::default().into_bundle().vcs_co_author);
-    }
-
-    #[test]
-    fn develop_model_is_read_from_config() {
-        let config = GlobalConfig::from_toml_str("[develop]\nmodel = \"openai/gpt-5.6\"\n")
-            .expect("develop.model must be a valid setting");
-        assert_eq!(
-            config.into_bundle().develop_model.as_deref(),
-            Some("openai/gpt-5.6")
-        );
-    }
-
-    #[test]
-    fn develop_model_is_optional() {
-        // `/develop` is a workflow, not a demand for a second model. A config
-        // that never mentions it must still be able to run one.
-        assert_eq!(GlobalConfig::default().into_bundle().develop_model, None);
-        let config = GlobalConfig::from_toml_str("default_model = \"deepseek/deepseek-v4-pro\"\n")
-            .expect("a config without a develop section is valid");
-        assert_eq!(config.into_bundle().develop_model, None);
-    }
-
-    #[test]
-    fn develop_config_is_carried_verbatim_not_validated_at_load() {
-        // Load must not reject it: a broken develop.model may not break every
-        // ordinary turn. `/develop` itself refuses it, where the user can see
-        // which command the refusal belongs to.
-        let config = GlobalConfig::from_toml_str("[develop]\nmodel = \"gpt-5.6\"\n")
-            .expect("an invalid develop.model must not fail the whole config");
-        assert_eq!(
-            config.into_bundle().develop_model.as_deref(),
-            Some("gpt-5.6")
-        );
-    }
-
-    #[test]
-    fn a_typo_in_the_develop_section_is_rejected() {
-        assert!(GlobalConfig::from_toml_str("[develop]\nmdoel = \"a/b\"\n").is_err());
     }
 
     #[test]

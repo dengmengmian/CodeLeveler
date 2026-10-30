@@ -29,6 +29,50 @@ pub fn title_from_first_message(content: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+/// The goal the session's RUNNING turn was opened for, from its durable
+/// write-ahead payload.
+///
+/// Two goals can be owed at the same time: an earlier one the user paused, and
+/// a new one this session is executing. Which one a client must show is the
+/// goal the live turn serves — never "the first running row", which would
+/// present the paused goal's wait while the other one runs. `None` when no turn
+/// is running, or when the running turn carries no binding (an ordinary Chat
+/// turn).
+pub fn running_turn_goal(turns: &[leveler_storage::TurnRecord]) -> Option<leveler_core::GoalId> {
+    turns.iter().rev().find_map(|turn| {
+        let payload = turn.payload.as_deref()?;
+        leveler_engine::decode_turn_continuation(payload)
+            .ok()
+            .and_then(|lineage| lineage.goal_id)
+    })
+}
+
+/// Choose the goal a snapshot projects as the session's execution task.
+///
+/// The live turn's own binding outranks the row order: an executing goal is a
+/// fact about THIS window, while an older running row is only work that is
+/// still owed. With no bound goal the first owed goal stands (that is the
+/// single-goal case, and the one a reconnecting client restores).
+pub fn project_execution_goal<'a>(
+    goals: &'a [leveler_storage::GoalRecord],
+    executing: Option<&leveler_core::GoalId>,
+) -> Option<&'a leveler_storage::GoalRecord> {
+    let mut owed = goals
+        .iter()
+        .filter(|goal| goal.state == leveler_storage::GoalState::Running);
+    let first = owed.next()?;
+    let Some(executing) = executing else {
+        return Some(first);
+    };
+    if &first.id == executing {
+        return Some(first);
+    }
+    goals
+        .iter()
+        .find(|goal| goal.state == leveler_storage::GoalState::Running && &goal.id == executing)
+        .or(Some(first))
+}
+
 /// Project only durable task evidence or the current runtime's actual waiter.
 /// A boot's existence cannot prove a pending approval; only `waiting` may do so.
 pub fn project_task(
@@ -173,6 +217,59 @@ pub fn project_task(
 mod tests {
     use super::*;
     use leveler_lifecycle::{StopReason, TaskOutcome};
+
+    fn goal(
+        id: &str,
+        state: leveler_storage::GoalState,
+        paused: bool,
+    ) -> leveler_storage::GoalRecord {
+        leveler_storage::GoalRecord {
+            id: leveler_core::GoalId::new(id),
+            task_id: leveler_core::TaskId::new("task"),
+            objective: format!("objective {id}"),
+            state,
+            opened_at: leveler_core::now(),
+            settled_at: None,
+            windows_run: 1,
+            acceptance: Vec::new(),
+            amendments: Vec::new(),
+            user_paused_at: paused.then(leveler_core::now),
+        }
+    }
+
+    /// The goal a client shows is the one the LIVE turn serves.
+    ///
+    /// Row order is not a fact about execution: a newer running goal may be
+    /// the one waiting for the user while an older one executes.
+    #[test]
+    fn the_executing_goal_outranks_row_order() {
+        let goals = vec![
+            goal("newer-paused", leveler_storage::GoalState::Running, true),
+            goal("older-running", leveler_storage::GoalState::Running, false),
+        ];
+        let picked =
+            project_execution_goal(&goals, Some(&leveler_core::GoalId::new("older-running")))
+                .expect("a goal is owed");
+        assert_eq!(picked.id.as_str(), "older-running");
+
+        // Nothing bound (no live turn): the newest owed goal is what a client
+        // restores, exactly as before.
+        let picked = project_execution_goal(&goals, None).expect("a goal is owed");
+        assert_eq!(picked.id.as_str(), "newer-paused");
+
+        // A binding that names a settled goal is not a running goal.
+        let goals = vec![
+            goal("settled", leveler_storage::GoalState::Settled, false),
+            goal("owed", leveler_storage::GoalState::Running, true),
+        ];
+        let picked = project_execution_goal(&goals, Some(&leveler_core::GoalId::new("settled")))
+            .expect("a goal is owed");
+        assert_eq!(picked.id.as_str(), "owed");
+
+        // Nothing owed at all.
+        let settled = vec![goal("settled", leveler_storage::GoalState::Settled, false)];
+        assert!(project_execution_goal(&settled, None).is_none());
+    }
     struct Probe(BootLiveness);
     impl BootLivenessProbe for Probe {
         fn liveness(&self, _: &BootId) -> BootLiveness {

@@ -4,7 +4,7 @@
 //! The model proposes; it is not the authority. Every proposal is validated
 //! before anyone is asked (a contradiction never reaches the user as a
 //! question), and every write needs a human's yes in every permission profile,
-//! full access included — like a durable memory, an agent definition changes
+//! full access included — an agent definition changes
 //! what future sessions will do. The approval prompt shows what is being
 //! granted: scope, capability, write bounds, tools, model, skills and the
 //! instructions. The write itself goes through [`AgentStore`].

@@ -516,33 +516,52 @@ impl BackgroundTaskRegistry {
         crate::execution_host::ExecutionHostClient::connect(config).await
     }
 
-    /// Reconcile process facts without launching a new host. Unknown owner
-    /// state remains an error and retains every outstanding write reservation.
-    pub async fn reconcile_hosted(&self) -> Result<(), String> {
+    /// Reconcile process facts without launching a new host.
+    ///
+    /// A terminal record is settled only when its exit is proven: either the
+    /// host observed it, or recovery proved the process identity gone. A record
+    /// whose workload may still exist keeps its write reservation and is never
+    /// signalled or replayed. Unknown owner state remains an error. A converged
+    /// lost host is returned so the caller can tell the user.
+    pub async fn reconcile_hosted(&self) -> Result<Option<crate::HostRecovery>, String> {
         let Some(config) = &self.execution_host else {
-            return Ok(());
+            return Ok(None);
         };
-        let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await? else {
-            return self.reconcile_absent_host(config).await;
+        let probe = crate::execution_host::ExecutionHostClient::probe(config).await?;
+        let Some(client) = probe.client else {
+            self.reconcile_absent_host(config).await?;
+            return Ok(probe.recovery);
         };
         let journal = self.journal()?;
         for task in client.list().await? {
-            if task.snapshot.status.is_terminal() {
-                journal.reconcile(&task.snapshot.id).await?;
-                client
-                    .acknowledge(
-                        &task.snapshot.id,
-                        task.snapshot
-                            .owner_scope
-                            .as_deref()
-                            .ok_or("missing hosted owner")?,
-                    )
-                    .await?;
-            } else {
+            if task.is_live() {
                 self.monitor_hosted(task.snapshot)?;
+                continue;
             }
+            if !task.settlement_proven() {
+                tracing::warn!(
+                    task = %task.snapshot.id,
+                    "this task has no proven exit (and its process may still exist); write reservation retained"
+                );
+                continue;
+            }
+            let settled = if task.loss.is_some() {
+                journal.reconcile_lost(&task.snapshot.id).await
+            } else {
+                journal.reconcile(&task.snapshot.id).await
+            };
+            settled?;
+            client
+                .acknowledge(
+                    &task.snapshot.id,
+                    task.snapshot
+                        .owner_scope
+                        .as_deref()
+                        .ok_or("missing hosted owner")?,
+                )
+                .await?;
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The host is gone. A reservation whose spawn the host never admitted owns
@@ -551,9 +570,13 @@ impl BackgroundTaskRegistry {
     /// reservation loses nothing — while keeping it blocks every future start
     /// forever, since no host will ever report that task's exit.
     ///
-    /// Every other case keeps its reservation, exactly as before: an unresolved
-    /// spawn intent, a fact the host did admit, or records that cannot be read as
-    /// truth are all ownership this code refuses to guess about.
+    /// A reservation whose task the archive records as finished, with the
+    /// process identity proven gone, is settled here: the diff is the same one
+    /// the runtime would have run on the host's exit report, so no change set is
+    /// lost. Everything else — an unresolved spawn intent, or a workload that
+    /// may still exist — keeps its reservation. That reservation is scoped to the
+    /// owning session, so it never blocks an unrelated session from starting, and
+    /// this pass reports it instead of failing the whole runtime.
     async fn reconcile_absent_host(
         &self,
         config: &crate::execution_host::ExecutionHostConfig,
@@ -564,24 +587,50 @@ impl BackgroundTaskRegistry {
             return Ok(());
         }
         let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
-        if records.has_unmanaged_process() || records.intents_outstanding() {
-            return Err("Execution Host is absent with outstanding semantic reservations".into());
-        }
-        let mut retained = Vec::new();
         for record in &pending {
-            if records.has_task(&record.task_id) {
-                retained.push(record.task_id.clone());
-            } else {
-                journal.abandon_prepared(&record.task_id)?;
+            match records.task(&record.task_id) {
+                None if records.has_active_intent(&record.task_id) => {
+                    tracing::warn!(
+                        task = %record.task_id,
+                        "this task's spawn may have been launched and was never recorded; write reservation retained"
+                    );
+                }
+                None if records.has_unresolved_intent(&record.task_id) => {
+                    tracing::warn!(
+                        task = %record.task_id,
+                        "a spawn intent may have launched this task and was never proven; write reservation retained"
+                    );
+                }
+                None => journal.abandon_prepared(&record.task_id)?,
+                Some(task) if task.settlement_proven() => {
+                    // A task whose exit the host reported settles as before; one
+                    // whose exit recovery proved keeps the same diff with a note
+                    // saying it was not observed at exit. Retrying a failed diff
+                    // on the next start is the recovery path; the reservation
+                    // stays valid until it commits.
+                    let settled = if task.loss.is_some() {
+                        journal.reconcile_lost(&record.task_id).await
+                    } else {
+                        journal.reconcile(&record.task_id).await
+                    };
+                    if let Err(error) = settled {
+                        tracing::warn!(
+                            task = %record.task_id,
+                            %error,
+                            "could not settle a finished hosted task; write reservation retained"
+                        );
+                    }
+                }
+                Some(task) => {
+                    tracing::warn!(
+                        task = %record.task_id,
+                        process = ?task.loss.as_ref().map(|loss| loss.process),
+                        "a lost host never proved this task's exit; write reservation retained"
+                    );
+                }
             }
         }
-        if retained.is_empty() {
-            return Ok(());
-        }
-        Err(format!(
-            "Execution Host is absent with outstanding semantic reservations: {}",
-            retained.join(", ")
-        ))
+        Ok(())
     }
 
     pub async fn try_all_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
@@ -590,9 +639,10 @@ impl BackgroundTaskRegistry {
             st.tasks.values().map(snapshot).collect::<Vec<_>>()
         };
         if let Some(config) = &self.execution_host {
-            if let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await? {
+            let probe = crate::execution_host::ExecutionHostClient::probe(config).await?;
+            if let Some(client) = probe.client {
                 for task in client.list().await? {
-                    if task.snapshot.status.is_terminal() {
+                    if task.settlement_proven() {
                         self.journal()?.reconcile(&task.snapshot.id).await?;
                         client
                             .acknowledge(
@@ -606,10 +656,17 @@ impl BackgroundTaskRegistry {
                     }
                     snapshots.push(task.snapshot);
                 }
-            } else if !self.journal()?.pending()?.is_empty() {
-                return Err(
-                    "Execution Host is absent; outstanding service states are unknown".into(),
-                );
+            } else {
+                // Retained reservations are scoped to the session that admitted
+                // them and never idle proof for this runtime: an unrelated
+                // session must still be able to open its own state.
+                for record in self.journal()?.pending()? {
+                    tracing::warn!(
+                        task = %record.task_id,
+                        owner = %record.owner,
+                        "write reservation retained after Execution Host loss"
+                    );
+                }
             }
         }
         Ok(snapshots)
@@ -649,7 +706,9 @@ impl BackgroundTaskRegistry {
             self.kill_owned(&id, owner).await?;
         }
         if let Some(config) = &self.execution_host
-            && let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await?
+            && let Some(client) = crate::execution_host::ExecutionHostClient::probe(config)
+                .await?
+                .client
         {
             let ids = client
                 .list()
@@ -4658,75 +4717,226 @@ mod unified_runner_tests {
         );
     }
 
-    /// Everything that could still own a process keeps its reservation, exactly
-    /// as before: an unresolved spawn intent, a task fact the host did admit, and
-    /// an archive that still lists live work.
+    /// A reservation is settled once its task is finished and its process is
+    /// proven gone; every case that may still own a process keeps it. Retaining
+    /// one is a report, not a startup failure: the reservation is scoped to the
+    /// session that admitted it.
     #[tokio::test]
-    async fn reconcile_keeps_reservations_that_may_still_own_something() {
-        for case in ["intent", "admitted", "live-task"] {
+    async fn reconcile_settles_finished_tasks_and_keeps_unprovable_ones() {
+        for case in [
+            "finished",
+            "gone-unobserved",
+            "unknown-without-evidence",
+            "live-group",
+            "unresolved-intent",
+        ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let repo = dir.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
             let config = crate::execution_host::ExecutionHostConfig {
                 state_dir: dir.path().join("host"),
-                repo_root: repo,
+                repo_root: repo.clone(),
                 executable: PathBuf::from("unused-test-executable"),
             };
             std::fs::create_dir_all(&config.state_dir).unwrap();
+            secure_test_state_dir(&config);
             let journal = crate::host_settlement::SettlementJournal::open(&config.semantic_dir())
                 .expect("journal");
             journal
-                .prepare("host-pending", "owner", "parent", None)
+                .prepare("host-case", "owner", "parent", None)
                 .await
                 .expect("admission");
+            let mut live_group = None;
             match case {
-                "intent" => std::fs::write(
-                    config.state_dir.join("intents.json"),
-                    br#"[{"id":"host-pending","owner":"owner","program":"sh","args":[],"cwd":"/tmp","started_at_ms":0}]"#,
-                )
-                .unwrap(),
-                "admitted" => std::fs::write(
+                "finished" => std::fs::write(
                     config.state_dir.join("tasks.json"),
-                    task_archive("host-pending", "Exited", &config.repo_root),
+                    task_archive("host-case", "Exited", &config.repo_root),
                 )
                 .unwrap(),
-                "live-task" => std::fs::write(
+                "gone-unobserved" => std::fs::write(
                     config.state_dir.join("tasks.json"),
-                    task_archive("host-other", "Running", &config.repo_root),
+                    lossy_task_archive("host-case", "Unknown", &config.repo_root, "Gone", 4242),
                 )
                 .unwrap(),
+                // `Unknown` with no recovery evidence means the owner lost
+                // observation of a process it could not prove dead.
+                "unknown-without-evidence" => std::fs::write(
+                    config.state_dir.join("tasks.json"),
+                    task_archive("host-case", "Unknown", &config.repo_root),
+                )
+                .unwrap(),
+                "live-group" => {
+                    let pid = spawn_live_group();
+                    std::fs::write(
+                        config.state_dir.join("tasks.json"),
+                        lossy_task_archive(
+                            "host-case",
+                            "Unknown",
+                            &config.repo_root,
+                            "Present",
+                            pid,
+                        ),
+                    )
+                    .unwrap();
+                    live_group = Some(pid);
+                }
+                "unresolved-intent" => {
+                    std::fs::write(config.state_dir.join("intents.json"), b"[]").unwrap();
+                    std::fs::write(
+                        config.state_dir.join("intents.unresolved.json"),
+                        br#"[{"intent":{"id":"host-case","owner":"owner","program":"sh","args":[],"cwd":"/tmp","started_at_ms":0},"observed_at_ms":0}]"#,
+                    )
+                    .unwrap();
+                }
                 other => panic!("unknown case {other}"),
             }
             let registry = host_registry().with_execution_host(config.clone());
             registry
                 .reconcile_hosted()
                 .await
-                .expect_err("an unprovable reservation must stay reserved");
-            assert_eq!(
-                journal.pending().unwrap().len(),
-                1,
-                "case {case} must retain its write reservation"
-            );
+                .expect("retaining a reservation must not fail the runtime");
+            let pending = journal.pending().unwrap().len();
+            match case {
+                "finished" | "gone-unobserved" => {
+                    assert_eq!(pending, 0, "case {case} is proven finished")
+                }
+                _ => assert_eq!(pending, 1, "case {case} may still own a process"),
+            }
+            if let Some(pid) = live_group {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
     }
 
+    /// The reported failure: a host died while its archive still said `Running`.
+    /// Recovery converges that fact from OS evidence and settles the write
+    /// reservation, so the next start is not blocked forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_converges_a_running_task_left_by_a_dead_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = crate::execution_host::ExecutionHostConfig {
+            state_dir: dir.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        std::fs::create_dir_all(&config.state_dir).unwrap();
+        secure_test_state_dir(&config);
+        std::fs::write(
+            config.state_dir.join("tasks.json"),
+            task_archive_with_pid("host-lost", "Running", &repo, exited_group_leader()),
+        )
+        .unwrap();
+        let journal = crate::host_settlement::SettlementJournal::open(&config.semantic_dir())
+            .expect("journal");
+        journal
+            .prepare("host-lost", "owner", "parent", None)
+            .await
+            .expect("admission");
+
+        let registry = host_registry().with_execution_host(config.clone());
+        registry
+            .reconcile_hosted()
+            .await
+            .expect("a dead host's finished task must not block the runtime");
+        assert!(
+            journal.pending().unwrap().is_empty(),
+            "the settled task no longer reserves its namespace"
+        );
+        let records = crate::execution_host::HostRecords::read(&config.state_dir).unwrap();
+        let task = records.task("host-lost").expect("the record is kept");
+        assert_eq!(task.snapshot.status, BackgroundTaskStatus::Unknown);
+        assert_eq!(
+            task.loss.as_ref().map(|loss| loss.process),
+            Some(crate::execution_host::ProcessPresence::Gone)
+        );
+    }
+
+    /// The host state dir is owner-only in production; recovery validates that
+    /// before it writes, so a fixture must be too.
+    fn secure_test_state_dir(config: &crate::execution_host::ExecutionHostConfig) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config.state_dir, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn exited_group_leader() -> u32 {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn group leader");
+        let pid = child.id();
+        child.wait().expect("reap group leader");
+        pid
+    }
+
+    #[cfg(unix)]
+    fn spawn_live_group() -> u32 {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live group")
+            .id()
+    }
+
     fn task_archive(id: &str, status: &str, root: &std::path::Path) -> Vec<u8> {
+        task_archive_with_pid(id, status, root, 4242)
+    }
+
+    fn task_archive_with_pid(id: &str, status: &str, root: &std::path::Path, pid: u32) -> Vec<u8> {
         let task = serde_json::json!({
             "snapshot": {
                 "id": id, "program": "sleep", "args": ["30"],
                 "cwd": root, "status": status, "exit_code": null,
-                "log": "", "duration_ms": 0, "pid": 4242, "owner_scope": "owner"
+                "log": "", "duration_ms": 0, "pid": pid, "owner_scope": "owner"
             },
             "lifetime": "Persistent",
             "writer_scope": "parent",
             "write_scope": "Unrestricted",
-            "process_id": 4242,
+            "process_id": pid,
             "started_at_ms": 0,
             "finished_at_ms": null,
             "log_end": 0,
             "log_prefix_len": 0
         });
         serde_json::to_vec(&vec![task]).unwrap()
+    }
+
+    /// A record as recovery writes it: terminal `Unknown` with the evidence that
+    /// says whether a workload may still exist.
+    fn lossy_task_archive(
+        id: &str,
+        status: &str,
+        root: &std::path::Path,
+        presence: &str,
+        pid: u32,
+    ) -> Vec<u8> {
+        let bytes = task_archive_with_pid(id, status, root, pid);
+        let mut tasks: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        tasks[0]["loss"] = serde_json::json!({
+            "observed_at_ms": 0,
+            "previous": "Running",
+            "process": presence,
+        });
+        serde_json::to_vec(&tasks).unwrap()
     }
 }
 

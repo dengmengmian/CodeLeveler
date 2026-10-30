@@ -735,8 +735,6 @@ mod tests {
             ("write_file", None, &["src/lib.rs"][..], false),
             ("save_agent", None, &[][..], false),
             ("delete_agent", None, &[][..], false),
-            ("remember", None, &[][..], false),
-            ("forget", None, &[][..], false),
         ] {
             assert_eq!(
                 ui_approval_request(&request(tool, command, paths)).always_persists,

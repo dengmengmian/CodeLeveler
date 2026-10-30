@@ -141,7 +141,7 @@ fn parallel_parent_routes_post_start_errors_through_terminal_epilogue() {
         .find("EngineEvent::TaskStarted")
         .expect("parent start is announced");
     let cancellation = source
-        .find("let result = honor_parent_cancellation(result, &cancellation)")
+        .find("honor_parent_cancellation(result, &cancellation)")
         .expect("parent cancellation is restored after child result folding");
     let classification = source
         .find("let terminal = match &result")

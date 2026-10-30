@@ -51,7 +51,7 @@ Start with a clean Git working tree so changes are easy to review. Run `leveler 
 
 `leveler run --parallel 2` preserves the selected permission profile, network restriction and model-step ceiling, and supports `--output jsonl`. Parallel runs reject shipping flags (`--commit`, `--push`, `--pr`, `--branch`, `--pr-base`) before starting; ship the reviewed integration separately. For single-task runs, shipping works with either output format and shipping failures return a non-zero exit code. Candidate setup, execution or commit errors fail the run with their original cause before integration; the run still records candidate completion and cleans up its worktrees. Parallel candidates inherit the parent state home. Cleanup failures retain their paths in warnings and the persisted terminal record; they do not undo integration or replace the primary task error.
 
-In the terminal, `/develop <goal>` walks through analysis, coding, verification, and review. Use `/help` for commands and shortcuts, and `/thinking` to adjust reasoning intensity.
+In the terminal, `/goal <task>` runs an explicit goal to completion, with the completion gate deciding when it is done. Use `/help` for commands and shortcuts, and `/thinking` to adjust reasoning intensity.
 
 Tool execution summaries append elapsed time from actual admitted dispatch, update once per second, and freeze at the final execution boundary. Reconnects restore the runtime clock. Old history and detached process lifetimes without reliable execution timing keep their original summaries; unrelated clocks are never combined. Approval dialogs initially select **Allow once**; Esc still denies.
 
@@ -79,7 +79,6 @@ leveler update
 
 - [Everyday use](docs/USAGE.md)
 - [Custom agents](docs/AGENT_EXTENSIBILITY.md)
-- [Durable memory](docs/MEMORY.md)
 - [Latest release](docs/RELEASE.md)
 - [Version history](CHANGELOG.md)
 

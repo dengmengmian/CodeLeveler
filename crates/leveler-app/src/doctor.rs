@@ -62,19 +62,8 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Run all diagnostics against the loaded config.
-///
-/// When a memory service is provided (from [`crate::memory_service`]), report
-/// each configured scope's current-record count and blocking issues.
+/// Run diagnostics against the loaded configuration.
 pub fn run(config: &LoadedConfig) -> Vec<CheckResult> {
-    run_with_memory(config, None)
-}
-
-/// Like [`run`], optionally including a memory diagnostic line.
-pub fn run_with_memory(
-    config: &LoadedConfig,
-    memory: Option<&leveler_memory::MemoryService>,
-) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
     // Required tooling.
@@ -127,10 +116,6 @@ pub fn run_with_memory(
         detail: sand,
     });
 
-    if let Some(service) = memory {
-        results.push(memory_check(service));
-    }
-
     results
 }
 
@@ -174,58 +159,6 @@ pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> CheckR
     }
     detail.push_str(" (see `leveler agents list`)");
     CheckResult::warn("agents", detail)
-}
-
-/// Report current-record counts per configured scope from the one service.
-///
-/// A scope that cannot be opened is a warning, not a failure: a brand-new
-/// project has no store yet, and a broken one must be visible without making
-/// every other check fail.
-fn memory_check(service: &leveler_memory::MemoryService) -> CheckResult {
-    use leveler_memory::{MemoryLanes, ServiceScope};
-    let scope_name = |scope: ServiceScope| match scope {
-        ServiceScope::Project => "project",
-        ServiceScope::Local => "local",
-        ServiceScope::Global => "global",
-    };
-    let mut parts = Vec::new();
-    let mut blocking = 0usize;
-    let mut errors = Vec::new();
-    for scope in service.configured_scopes() {
-        match service.listing_for_user(scope, MemoryLanes::ALL) {
-            Ok(views) => {
-                let mut part = format!("{}=active {}", scope_name(scope), views.len());
-                match service.diagnose(scope) {
-                    Ok(report) => {
-                        blocking += report
-                            .issues
-                            .iter()
-                            .filter(|issue| {
-                                issue.severity == leveler_memory::v2::DiagnosticSeverity::Blocking
-                            })
-                            .count();
-                        if !report.issues.is_empty() {
-                            part.push_str(&format!(" issues={}", report.issues.len()));
-                        }
-                    }
-                    Err(error) => {
-                        errors.push(format!("{}: {error}", scope_name(scope)));
-                    }
-                }
-                parts.push(part);
-            }
-            Err(error) => errors.push(format!("{}: {error}", scope_name(scope))),
-        }
-    }
-    if !errors.is_empty() {
-        return CheckResult::warn("memory", errors.join("; "));
-    }
-    let detail = parts.join("; ").to_string();
-    if blocking > 0 {
-        CheckResult::warn("memory", format!("{detail}; {blocking} blocking issue(s)"))
-    } else {
-        CheckResult::ok("memory", detail)
-    }
 }
 
 /// Check that at least one provider and model exist, and every model points at
@@ -797,42 +730,6 @@ mod tests {
         };
         let result = check_api_key(&provider);
         assert_eq!(result.status, CheckStatus::Fail);
-    }
-
-    #[test]
-    fn memory_check_reports_current_counts_per_scope() {
-        let root = std::env::temp_dir().join(format!("leveler-doctor-mem-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let service = leveler_memory::MemoryService::new(
-            leveler_memory::MemoryRoots::new().with_project(leveler_memory::v2::ScopeRoots::new(
-                leveler_memory::v2::MemoryScope::Project,
-                root.join("current"),
-                root.join("state"),
-            )),
-        );
-        service
-            .remember(
-                &leveler_memory::v2::Actor::User {
-                    invocation: leveler_memory::v2::UserInvocationId::mint("doctor-test"),
-                },
-                leveler_memory::RememberRequest::new(
-                    leveler_memory::v2::OpId::derived("doctor", "t"),
-                    leveler_memory::ServiceScope::Project,
-                    "t",
-                    "body with unique token xyzzy",
-                    "note",
-                ),
-            )
-            .unwrap();
-        let line = memory_check(&service);
-        assert_eq!(line.status, CheckStatus::Ok, "{}", line.detail);
-        assert!(line.detail.contains("project=active 1"), "{}", line.detail);
-        assert!(
-            !line.detail.to_lowercase().contains("sandbox=yes"),
-            "{}",
-            line.detail
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

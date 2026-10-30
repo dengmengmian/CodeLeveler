@@ -100,7 +100,6 @@ fn the_removed_and_demoted_tools_stay_off_the_surface() {
         "replace",
         "create_checkpoint",
         "restore_checkpoint",
-        "consolidate_memory",
         "create_skill",
         // The twelve narrow browser tools. They did not shrink because a model
         // looked weak: browser_tab, browser_act and browser_inspect cover every

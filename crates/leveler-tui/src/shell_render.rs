@@ -124,19 +124,98 @@ pub fn read_complete_capture(directory: &std::path::Path) -> Result<String, Stri
     Ok(copy_text(&String::from_utf8_lossy(&bytes)))
 }
 
-/// A bounded suffix of output suitable for a live/collapsed preview. Starts at
-/// a line boundary so a multibyte character is never split.
-pub fn tail_source(output: &str, max_bytes: usize) -> &str {
-    if output.len() <= max_bytes {
-        return output;
+/// Rows one user-shell output window shows before it starts scrolling. The
+/// window is a viewport, never a limit: nothing below is dropped.
+pub const SHELL_OUTPUT_WINDOW_ROWS: usize = 12;
+
+/// One visual (already wrapped) row of a terminal output window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutputRow {
+    pub text: String,
+    pub stderr: bool,
+    /// This row continues the previous logical line (a screen wrap), so a copy
+    /// rejoins it with nothing instead of inventing a newline.
+    pub continued: bool,
+}
+
+/// The authoritative projection of a user shell's retained output: every logical
+/// line resolved (carriage-return overwrites applied), sanitized and hard-wrapped
+/// to `width` cells. The renderer and the scroll owner both read THIS, so the
+/// painted rows and the scroll clamp can never describe different layouts.
+pub fn output_rows(output: &str, marks: &[OutputMark], width: usize) -> Vec<ShellOutputRow> {
+    let room = width.max(1);
+    // The live stream is sanitized as it is appended, but a restored snapshot
+    // is the runtime's own tail and may still carry style sequences. Sanitizing
+    // in the projection means no cell ever paints an escape, whichever path
+    // produced the text. Already-clean text passes through unchanged, so the
+    // stream marks (byte offsets) keep pointing at the same bytes.
+    let clean = sanitize_shell_output(output);
+    let mut rows = Vec::new();
+    for line in render_output(&clean, marks) {
+        let text = crate::render::sanitize_terminal_line(&line.text);
+        for (index, wrapped) in wrap_terminal_line(&text, room).into_iter().enumerate() {
+            rows.push(ShellOutputRow {
+                text: wrapped,
+                stderr: line.stderr,
+                continued: index > 0,
+            });
+        }
     }
-    let mut cut = output.len() - max_bytes;
-    while cut < output.len() && !output.is_char_boundary(cut) {
-        cut += 1;
-    }
-    match output[cut..].find('\n') {
-        Some(rel) => &output[cut + rel + 1..],
-        None => &output[cut..],
+    rows
+}
+
+/// The slice of a bounded output window that is actually painted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutputWindow {
+    pub rows: Vec<ShellOutputRow>,
+    /// All visual rows the retained output has at this width.
+    pub total_rows: usize,
+    /// Index of the first painted row.
+    pub start: usize,
+    pub hidden_above: usize,
+    pub hidden_below: usize,
+}
+
+/// Painted height for `total` rows: short output keeps its natural height and
+/// long output stops growing at [`SHELL_OUTPUT_WINDOW_ROWS`].
+pub fn output_window_height(total: usize) -> usize {
+    total.min(SHELL_OUTPUT_WINDOW_ROWS)
+}
+
+/// Largest scroll offset (in visual rows from the top) for `total` rows.
+pub fn output_max_scroll(total: usize) -> usize {
+    total.saturating_sub(output_window_height(total))
+}
+
+/// Project the window a reader is looking at. `follow` pins the window to the
+/// newest rows; otherwise `scroll` is an offset in visual rows from the top,
+/// clamped so the window can never leave the content.
+pub fn output_window(
+    output: &str,
+    marks: &[OutputMark],
+    width: usize,
+    scroll: usize,
+    follow: bool,
+) -> ShellOutputWindow {
+    let rows = output_rows(output, marks, width);
+    let total_rows = rows.len();
+    let height = output_window_height(total_rows);
+    let max_scroll = total_rows.saturating_sub(height);
+    let start = if follow {
+        max_scroll
+    } else {
+        scroll.min(max_scroll)
+    };
+    let end = (start + height).min(total_rows);
+    let mut window_rows = rows;
+    window_rows.truncate(end);
+    window_rows.drain(..start);
+    ShellOutputWindow {
+        hidden_above: start,
+        hidden_below: total_rows.saturating_sub(end),
+        rows: window_rows,
+        total_rows,
+        start,
     }
 }
 
@@ -219,12 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn tail_source_starts_on_a_line_boundary() {
-        let text = "aaa\nbbb\nccc\n";
-        assert_eq!(tail_source(text, 8), "ccc\n");
-    }
-
-    #[test]
     fn copy_text_keeps_source_glyphs_and_strips_only_style() {
         let raw = "\u{1b}[32m│ name │ value │\u{1b}[0m\n\
                    \tSELECT s.id,\n\
@@ -236,6 +309,80 @@ mod tests {
             "the visual/content glyphs are source text; only ANSI is removed"
         );
         assert!(!copied.contains('\u{1b}'));
+    }
+
+    /// A short result has no window at all: its natural height is the window.
+    #[test]
+    fn a_short_result_is_its_own_window() {
+        let output: String = (1..=4).map(|n| format!("row-{n}\n")).collect();
+        let window = output_window(&output, &[], 78, 0, true);
+        assert_eq!(window.total_rows, 4);
+        assert_eq!(window.rows.len(), 4);
+        assert_eq!(window.hidden_above, 0);
+        assert_eq!(window.hidden_below, 0);
+        assert_eq!(output_max_scroll(window.total_rows), 0, "nothing to scroll");
+    }
+
+    /// A long result is clamped to the fixed window height, and the hidden rows
+    /// are counted on both sides rather than dropped.
+    #[test]
+    fn a_long_result_is_a_clamped_window_with_counted_edges() {
+        let output: String = (1..=100).map(|n| format!("row-{n:03}\n")).collect();
+        let tail = output_window(&output, &[], 78, 0, true);
+        assert_eq!(tail.rows.len(), SHELL_OUTPUT_WINDOW_ROWS);
+        assert_eq!(tail.start, 100 - SHELL_OUTPUT_WINDOW_ROWS);
+        assert_eq!(tail.hidden_above, 88);
+        assert_eq!(tail.hidden_below, 0);
+        assert_eq!(tail.rows.last().unwrap().text, "row-100");
+
+        let head = output_window(&output, &[], 78, 0, false);
+        assert_eq!(head.start, 0);
+        assert_eq!(head.rows[0].text, "row-001");
+        assert_eq!(head.hidden_below, 88);
+
+        // A scroll past the end clamps to the newest page instead of blanking.
+        let clamped = output_window(&output, &[], 78, 10_000, false);
+        assert_eq!(clamped.start, 88);
+        assert_eq!(clamped.rows.last().unwrap().text, "row-100");
+    }
+
+    /// Wrapping is part of the projection, so a copy can rejoin a wrapped row
+    /// with nothing while a real newline stays a newline.
+    #[test]
+    fn wrapped_rows_are_marked_as_continuations() {
+        let rows = output_rows("aaaaaaaaaa\nb\n", &[], 4);
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["aaaa", "aaaa", "aa", "b"]);
+        let continued: Vec<bool> = rows.iter().map(|row| row.continued).collect();
+        assert_eq!(continued, vec![false, true, true, false]);
+    }
+
+    /// Stream provenance survives the projection, so a window keeps the
+    /// stdout/stderr distinction.
+    #[test]
+    fn projected_rows_keep_their_stream() {
+        let marks = vec![
+            OutputMark {
+                offset: 0,
+                stderr: false,
+            },
+            OutputMark {
+                offset: 4,
+                stderr: true,
+            },
+        ];
+        let rows = output_rows("out\nerr\n", &marks, 40);
+        assert!(!rows[0].stderr);
+        assert!(rows[1].stderr);
+    }
+
+    /// ANSI style is removed before wrapping, so a wide glyph's wrap points are
+    /// measured on what is actually painted.
+    #[test]
+    fn ansi_is_stripped_before_wrapping() {
+        let rows = output_rows("\u{1b}[31mabcd\u{1b}[0m", &[], 2);
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["ab", "cd"]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 // Contextual Inspector: waiting > running > terminal > idle.
-// Sections appear only when they have content. Checkpoints / Memory live under More.
+// Sections appear only when they have content. Checkpoints live under More.
 
 import { ArrowUp, CircleHelp, ShieldAlert } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
@@ -23,7 +23,6 @@ import { presentTurnEnd } from '../lib/turn';
 import { useBridge } from '../state/bridge';
 import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
 import type { UiApprovalRequest, UiClarificationRequest,
-  UiMemoryKind,
 } from '../types/protocol';
 
 export function Inspector() {
@@ -437,7 +436,6 @@ function RuntimeSection() {
 }
 
 function MoreSection({ current }: { current: SessionView }) {
-  const pending = current.memory?.pending.length ?? 0;
   const moreOpen = useAppState().inspectorMore;
   const dispatch = useAppDispatch();
   return (
@@ -448,7 +446,6 @@ function MoreSection({ current }: { current: SessionView }) {
     >
       <summary>
         More
-        {pending > 0 && <i className="insp-dot" title="有待采纳的记忆" />}
       </summary>
       <div className="insp-sec">Checkpoints</div>
       {current.checkpoints.length > 0 ? (
@@ -458,8 +455,6 @@ function MoreSection({ current }: { current: SessionView }) {
       ) : (
         <div className="insp-empty">暂无检查点。</div>
       )}
-      <div className="insp-sec">Memory</div>
-      <MemoryTab current={current} />
     </details>
   );
 }
@@ -475,143 +470,5 @@ function CheckpointRow({ id, ordinal, label }: { id: string; ordinal: number; la
         回滚
       </button>
     </div>
-  );
-}
-
-function MemoryTab({ current }: { current: SessionView }) {
-  const bridge = useBridge();
-  const memory = current.memory ?? null;
-  const sessionId = current.id;
-
-  useEffect(() => {
-    if (sessionId) bridge.listMemory();
-  }, [sessionId, bridge]);
-
-/** 记忆类型的中文标签：说明这条记忆怎样到达模型，而不是让读者自己记规则。 */
-const MEMORY_KIND_LABEL: Record<string, string> = {
-  preference: '长期偏好',
-  decision: '决策',
-  note: '笔记',
-};
-
-/** 用户自己直写一条记忆。不经过模型，也不产生待确认候选 —— 命令本身就是授权。 */
-function MemoryComposer(): ReactNode {
-  const bridge = useBridge();
-  const [body, setBody] = useState('');
-  const [kind, setKind] = useState<UiMemoryKind>('preference');
-  const save = (): void => {
-    if (!body.trim()) return;
-    bridge.rememberMemory(body, kind);
-    setBody('');
-  };
-  return (
-    <div className="mem-compose">
-      <div className="insp-sec">直接保存一条记忆</div>
-      <textarea
-        className="mem-input"
-        rows={2}
-        placeholder="例如：终端输出保持紧凑，不要展示冗长过程"
-        value={body}
-        onChange={(e) => setBody(e.target.value)}
-      />
-      <div className="mem-ops">
-        <select
-          className="mem-kind"
-          value={kind}
-          onChange={(e) => setKind(e.target.value as UiMemoryKind)}
-        >
-          <option value="preference">长期偏好（每轮注入）</option>
-          <option value="decision">决策（按需召回）</option>
-          <option value="note">笔记（按需召回）</option>
-        </select>
-        <button className="mem-btn" disabled={!body.trim()} onClick={save}>
-          保存
-        </button>
-      </div>
-    </div>
-  );
-}
-
-  if (!memory) return <div className="insp-empty">读取项目记忆中…</div>;
-
-  return (
-    <>
-      <dl className="kv">
-        <dt>Active</dt>
-        <dd>{memory.active.length}</dd>
-        <dt>Pending</dt>
-        <dd>{memory.pending.length}</dd>
-        <dt>Archived</dt>
-        <dd>{memory.archived.length}</dd>
-      </dl>
-
-      <MemoryComposer />
-
-      {memory.pending.length > 0 && (
-        <>
-          <div className="insp-sec">待采纳（需要你的同意）</div>
-          {memory.pending.map((m) => (
-            <div className="mem-row pending" key={m.id}>
-              <span className="mem-title">○ {m.title}</span>
-              {/* 正文必须可见：只看标题就点“接受”不算知情同意。 */}
-              <div className="mem-body">{m.body}</div>
-              <div className="mem-meta">
-                kind={m.kind} · 来源={m.source}
-              </div>
-              <span className="mem-ops">
-                <button className="mem-btn" onClick={() => bridge.acceptMemory(m.id)}>
-                  接受
-                </button>
-                {/* reject，不是 forget：forget 只处理 active/archive，
-                    把 pending 的 id 发给它什么也不会发生。 */}
-                <button className="mem-btn ghost" onClick={() => bridge.rejectMemory(m.id)}>
-                  忽略
-                </button>
-              </span>
-            </div>
-          ))}
-        </>
-      )}
-
-      <div className="insp-sec">已生效</div>
-      {memory.active.length > 0 ? (
-        memory.active.map((m) => (
-          <div className="mem-row" key={m.id}>
-            <span className="mem-title">
-              ✓ {m.title}
-              {m.kind ? <span className="mem-meta"> · {MEMORY_KIND_LABEL[m.kind]}</span> : null}
-              {m.sensitive ? (
-                <span className="mem-meta" title="内容疑似凭据，已保留但不提供给模型">
-                  {' '}
-                  · 敏感，不提供给模型
-                </span>
-              ) : null}
-            </span>
-            <span className="mem-ops">
-              <button
-                className="mem-btn ghost"
-                title="归档这条记忆（可从 archived 追溯）"
-                onClick={() => bridge.forgetMemory(m.id)}
-              >
-                遗忘
-              </button>
-            </span>
-          </div>
-        ))
-      ) : (
-        <div className="insp-empty">暂无生效记忆。</div>
-      )}
-
-      {memory.archived.length > 0 && (
-        <>
-          <div className="insp-sec">已归档</div>
-          {memory.archived.map((m) => (
-            <div className="mem-row archived" key={m.id}>
-              <span className="mem-title">· {m.title}</span>
-            </div>
-          ))}
-        </>
-      )}
-    </>
   );
 }

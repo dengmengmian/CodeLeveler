@@ -23,17 +23,9 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
             .unwrap_or_else(|| "No Workspace".to_string())
     );
     println!("  config:  {}", layout.config_dir.display());
-    println!(
-        "  memory:  {}",
-        layout
-            .markdown_memory_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "(no workspace memory)".to_string())
-    );
     println!();
 
-    let mut results =
-        leveler_app::doctor::run_with_memory(&config, Some(&leveler_app::memory_service(&layout)));
+    let mut results = leveler_app::doctor::run(&config);
     if let Some(root) = layout.primary_workspace() {
         results.push(leveler_app::doctor::agents_check(
             &leveler_agent::agent_registry::AgentRoots::for_project(root),
@@ -153,7 +145,7 @@ pub(crate) async fn cmd_models_show(
 ) -> anyhow::Result<std::process::ExitCode> {
     let app = Application::assemble(layout)?;
     let model_ref = parse_model_ref(model)?;
-    let profile = app.registry.profile(&model_ref).await?;
+    let profile = app.registry().profile(&model_ref).await?;
     println!("{}", Line::heading(&format!("{model_ref}")));
     println!("  provider:  {}", profile.provider);
     println!("  model_id:  {}", profile.model_id);
@@ -213,7 +205,7 @@ pub(crate) async fn cmd_model_probe(
 
     println!("{}", Line::heading(&format!("Probing {model_ref}")));
     let cancellation = CancellationToken::new();
-    let report = probe_basic(app.registry.as_ref(), &model_ref, cancellation).await;
+    let report = probe_basic(app.registry().as_ref(), &model_ref, cancellation).await;
 
     print_bool("text response", report.text_ok);
     print_bool("streaming", report.stream_ok);

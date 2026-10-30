@@ -553,6 +553,44 @@ fn the_projection_falls_only_after_a_fold_over_the_threshold() {
     );
 }
 
+/// The active objective is the task's own contract. A fold must keep the
+/// current execution instruction and the user's prohibitions with it: those
+/// facts are deliberately not standing memory, so compaction is the one place
+/// a long task could otherwise lose them.
+#[test]
+fn a_fold_pins_the_task_instruction_and_prohibitions_with_the_objective() {
+    let objective = "这是一个多阶段任务，请一次做完，中间不要停下来等我确认。\
+                     约束：禁止新增第三方依赖。";
+    let messages = transcript(10, 400, 100);
+    let folded = compact_messages(&messages, 3, 0, Some("briefing"), Some(objective));
+    let pins: Vec<&Message> = folded
+        .iter()
+        .filter(|message| {
+            message
+                .text_content()
+                .contains(leveler_context::ACTIVE_OBJECTIVE_MARKER)
+        })
+        .collect();
+    assert_eq!(pins.len(), 1, "exactly one active objective pin: {pins:?}");
+    assert!(pins[0].text_content().contains("一次做完"), "{pins:?}");
+    assert!(
+        pins[0].text_content().contains("禁止新增第三方依赖"),
+        "the prohibition survives with the objective: {pins:?}"
+    );
+
+    let twice = compact_messages(&folded, 3, 0, Some("second briefing"), Some(objective));
+    assert_eq!(
+        twice
+            .iter()
+            .filter(|message| message
+                .text_content()
+                .contains(leveler_context::ACTIVE_OBJECTIVE_MARKER))
+            .count(),
+        1,
+        "a later fold does not stack a second objective"
+    );
+}
+
 /// Contract-1: on a raw-replay route, a retained assistant turn's reasoning
 /// cannot be stripped, truncated or rewritten by the requested retention arm.
 #[test]

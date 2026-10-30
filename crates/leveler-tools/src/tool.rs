@@ -26,7 +26,7 @@ use leveler_execution::{
 ///
 /// It carries NO capability handles. There used to be a third facet,
 /// `ToolServices`, holding the language-server pool, the browser runtime, the
-/// memory root, the artifact store and the background task registry — so
+/// artifact store and the background task registry — so
 /// `read_file` was handed the browser and `grep` could start a language
 /// server. Every tool is now CONSTRUCTED with the handles it uses
 /// ([`crate::Capabilities`]), and a tool that has no business with a
@@ -44,9 +44,6 @@ pub struct ToolContext {
     /// per-session capability state (e.g. browser pages/refs — §18). `None` for
     /// non-session contexts (eval, one-shot CLI); those share a default scope.
     pub session_scope: Option<Arc<str>>,
-    /// The model turn this context belongs to, when the engine provides it.
-    /// Memory tools use it as provenance identity; it never grants authority.
-    pub turn_scope: Option<Arc<str>>,
     /// The tool call being dispatched. The host stamps this per call, so a
     /// tool can attribute a write to the exact call that requested it.
     pub tool_call_scope: Option<Arc<str>>,
@@ -400,7 +397,6 @@ impl ToolContext {
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
             },
             session_scope: None,
-            turn_scope: None,
             tool_call_scope: None,
             writer_scope: None,
             command_lease: None,
@@ -479,12 +475,6 @@ impl ToolContext {
     /// Bind this context to a session identity (browser page/ref isolation).
     pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
         self.session_scope = Some(scope.into());
-        self
-    }
-
-    /// Bind this context to one model turn.
-    pub fn with_turn_scope(mut self, turn: impl Into<Arc<str>>) -> Self {
-        self.turn_scope = Some(turn.into());
         self
     }
 

@@ -164,9 +164,6 @@ impl RemotePolicy {
             // session's own interrupted task or falls back to an ordinary
             // message. It starts nothing a message could not.
             | ClientCommand::ResumeTask { .. }
-            // Same authority as RunGoal: it starts a task that may write code.
-            // The extra reading stages narrow nothing and widen nothing.
-            | ClientCommand::RunDevelop { .. }
             | ClientCommand::CancelCurrentTurn { .. }
             // Cancelling the logical task is a strictly stronger stop than
             // cancelling its turn, which is already allowed.
@@ -225,24 +222,11 @@ impl RemotePolicy {
                 reason: "the persisted default model is host-local",
             },
 
-            // Memory is durable, cross-session and unreviewable from a phone.
-            // `AcceptMemory` especially: it IS the consent K36 requires, and a
-            // phone is the wrong place to give it.
-            ClientCommand::ListMemory { .. }
-            | ClientCommand::MemoryStatus { .. }
-            | ClientCommand::ForgetMemory { .. }
-            | ClientCommand::AcceptMemory { .. }
-            // Same reasoning, more so: rejecting a candidate is consent
-            // withheld, and `RememberMemory` writes durable memory outright.
-            | ClientCommand::RejectMemory { .. }
-            | ClientCommand::RememberMemory { .. }
-            // Pin is a standing constraint and Deprecate changes what the model
-            // may rely on: both are user decisions, made where the user is.
-            | ClientCommand::SetMemoryPin { .. }
-            | ClientCommand::UpdateMemory { .. }
-            | ClientCommand::DeprecateMemory { .. } => RemoteVerdict::Deny {
+            // Reading host configuration files is a local operator action; a
+            // paired device cannot make the host reload a file it cannot see.
+            ClientCommand::ReloadConfig { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
-                reason: "memory is not reachable remotely",
+                reason: "runtime configuration is host-local",
             },
 
             // Destructive or history-rewriting, with no remote confirmation UX
@@ -274,6 +258,14 @@ impl RemotePolicy {
             ClientCommand::QueryObservability { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
                 reason: "runtime observatory is local-only",
+            },
+
+            // Same class as the context accounting: which models a session
+            // used and what it spent is local machine metadata a remote client
+            // has no business enumerating.
+            ClientCommand::QueryUsage { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "usage reporting is local-only",
             },
 
             // Same class: the context accounting reveals which tools ate the

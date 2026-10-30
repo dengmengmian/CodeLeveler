@@ -58,6 +58,7 @@ pub(crate) fn render_group(
         &mut rows,
         None,
         question_card_open,
+        &mut Vec::new(),
     )
 }
 
@@ -89,6 +90,10 @@ pub(crate) fn render_group_rows(
     rows: &mut Vec<CommandRow>,
     folds: Option<&std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
     question_card_open: bool,
+    // Receives the rows this group painted as COPYABLE source, addressed
+    // relative to the returned lines. Everything else in a tool group is
+    // evidence UI: it stays out of the clipboard policy by omission.
+    copy: &mut Vec<crate::selection::CopyRow>,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let index_of = |call: &ToolCallBlock| {
@@ -175,6 +180,7 @@ pub(crate) fn render_group_rows(
                     round: group.round,
                 };
                 let mut child_rows = Vec::new();
+                let mut child_copy = Vec::new();
                 let at = out.len();
                 out.extend(render_group_rows(
                     &child,
@@ -188,12 +194,17 @@ pub(crate) fn render_group_rows(
                     &mut child_rows,
                     folds,
                     question_card_open,
+                    &mut child_copy,
                 ));
                 rows.extend(child_rows.into_iter().map(|row| CommandRow {
                     disclosure: row.disclosure,
                     line: at + row.line,
                     call: index_of(first),
                     stoppable: row.stoppable,
+                }));
+                copy.extend(child_copy.into_iter().map(|mut row| {
+                    row.row += at;
+                    row
                 }));
                 cursor += 1;
             }
@@ -542,7 +553,13 @@ pub(crate) fn render_group_rows(
             }
             StreamUnit::EditMerge(calls) => {
                 let at = out.len();
-                let (lines, foldable) = edit_unit_lines(&calls, theme, width, locale, t);
+                let (lines, foldable, body_copy) = edit_unit_lines(&calls, theme, width, locale, t);
+                // The edit node paints its own lines from index 0, so its copy
+                // rows become group-relative at the offset it starts on.
+                copy.extend(body_copy.into_iter().map(|mut row| {
+                    row.row += at;
+                    row
+                }));
                 if foldable {
                     rows.push(CommandRow {
                         disclosure: false,
@@ -550,7 +567,9 @@ pub(crate) fn render_group_rows(
                         call: index_of(calls[0]),
                         stoppable: false,
                     });
-                    if !calls[0].expanded {
+                    // A folded node is ONE row, so its head already owns the
+                    // click; only an expanded body adds a bottom target.
+                    if !calls[0].expanded && lines.len() > 1 {
                         rows.push(CommandRow {
                             disclosure: false,
                             line: at + lines.len() - 1,
@@ -831,7 +850,9 @@ fn process_receipt_line(
     }
     let work = members
         .iter()
-        .filter(|c| disclosure_class(&c.name) == DisclosureClass::Work)
+        .filter(|c| {
+            disclosure_class(&c.name) == DisclosureClass::Work && c.status == ToolStatus::Ok
+        })
         .count();
     if work > 0 {
         parts.push(t.disclosure_tools_many.replace("{}", &work.to_string()));
@@ -1748,17 +1769,18 @@ fn unit_lines(
     let guard_denial = call.status == ToolStatus::Failed
         && matches!(call.name.as_str(), "update_plan" | "update_goal");
     let unanswered = unanswered_question_note(call, t).is_some();
-    let (glyph, glyph_color) = if guard_denial || awaiting_approval || unanswered {
+    let (glyph, glyph_color) = if awaiting_approval || unanswered {
         ("⚠", theme.status.warning)
     } else {
-        status_glyph(call, theme)
+        // One owner for the status mark: the Tools screen and the conversation
+        // cannot disagree about what a refusal, a guard denial or a blocked
+        // goal looks like.
+        crate::tool_cell::call_status_mark(call, theme)
     };
     let action = if exploration_row {
         exploration_verb(&call.name, t).to_string()
-    } else if call.name == "task" {
-        t.unsupported_task_action.to_string()
     } else {
-        crate::tool_cell::tool_call_label(&call.name, &call.arguments, locale)
+        crate::tool_cell::call_state_label(call, locale, t)
     };
 
     // Trailing status marker: a running call shows its live elapsed time so a
@@ -1997,8 +2019,9 @@ fn push_run(
     // on the row that names it.
     head.extend(run_attention_suffix(calls, theme, t));
     out.push(Line::from(head));
-    let last = calls.len() - 1;
-    for (i, call) in calls.iter().enumerate() {
+    let display_calls = calls;
+    let last = display_calls.len().saturating_sub(1);
+    for (i, call) in display_calls.iter().enumerate() {
         let branch = if i == last {
             "  \u{2514}\u{2500} "
         } else {
@@ -2711,24 +2734,7 @@ fn body_ink(status: ToolStatus, theme: &Theme) -> ratatui::style::Color {
 /// the mark meaningless, so exploration gets a quiet dot and the success mark
 /// stays scarce.
 fn status_glyph(call: &ToolCallBlock, theme: &Theme) -> (&'static str, ratatui::style::Color) {
-    match call.status {
-        ToolStatus::Running => ("\u{25cc}", theme.accent.primary),
-        ToolStatus::Failed => ("\u{2717}", theme.status.error),
-        ToolStatus::Cancelled => ("\u{2298}", theme.text.muted),
-        ToolStatus::Unknown => ("?", theme.status.warning),
-        // A goal update that reports `blocked` is a call that RAN and an
-        // outcome that did not. Ok is the runtime fact; ✓ would be a claim the
-        // row's own text contradicts. Read from the taxonomy, not a second
-        // tool-name table.
-        ToolStatus::Ok
-            if call.name == "update_goal"
-                && crate::tool_taxonomy::update_goal_is_blocked(&call.arguments) =>
-        {
-            ("\u{26a0}", theme.status.warning)
-        }
-        ToolStatus::Ok if is_exploratory(call) => ("\u{b7}", theme.text.muted),
-        ToolStatus::Ok => ("\u{2713}", theme.status.success),
-    }
+    crate::tool_cell::call_status_mark(call, theme)
 }
 
 /// The `└ …` result row: first error line for failures (with a fold hint for
@@ -2931,9 +2937,9 @@ fn edit_unit_lines(
     width: usize,
     locale: Locale,
     t: &UiText,
-) -> (Vec<Line<'static>>, bool) {
+) -> (Vec<Line<'static>>, bool, Vec<crate::selection::CopyRow>) {
     let Some(first) = calls.first() else {
-        return (Vec::new(), false);
+        return (Vec::new(), false, Vec::new());
     };
     let (glyph, glyph_color) = status_glyph(first, theme);
     // The node's own tool names it: every member shares it (merge identity).
@@ -2949,6 +2955,35 @@ fn edit_unit_lines(
             }
         }
     };
+
+    // Stats are counted over the SAME applied patch text the diff rows below
+    // are drawn from. Counting the request instead put a `+3 −0` header above
+    // two changed lines, and an edit whose diff the runtime never reported has
+    // no line counts to state at all.
+    let mut hunks = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut has_diff = false;
+    for call in calls {
+        let Some(patch) = crate::tool_cell::edit_patch_for(call) else {
+            continue;
+        };
+        has_diff = true;
+        let stats = crate::tool_cell::patch_stats_from_text(&patch);
+        hunks += stats.hunks;
+        added += stats.added;
+        removed += stats.removed;
+    }
+
+    // The fold is the BLOCK's, never a line count: expanded paints every hunk,
+    // collapsed paints this one row. A collapsed row carries the `+A/-R`
+    // stat, and nothing else.
+    let expanded = first.expanded;
+    let stats = has_diff.then_some((added, removed)).filter(|_| !expanded);
+    let stats_width = stats.map_or(0, |(added, removed)| {
+        UnicodeWidthStr::width(format!(" +{added}/-{removed}").as_str())
+    });
+
     let mut head = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
         Span::styled(
@@ -2956,16 +2991,24 @@ fn edit_unit_lines(
             Style::default().fg(body_ink(first.status, theme)),
         ),
     ];
-    // The touched file(s) ride inline on the head row.
+    // The touched file(s) ride inline on the head row; the stat and duration
+    // suffixes are reserved first so a long path can never push them off.
     let files = edit_target_files(first).replace('\u{1}', ", ");
     if !files.is_empty() {
-        let used = 2 + UnicodeWidthStr::width(action.as_str()) + 2;
-        let avail = width
-            .saturating_sub(used + UnicodeWidthStr::width(tail.as_str()) + 8)
-            .max(8);
+        // Prefer eight columns of path plus a gap; on a narrow terminal the
+        // path yields first, because the stat is the reason the row exists.
+        let reserved = 2
+            + UnicodeWidthStr::width(action.as_str())
+            + 2
+            + UnicodeWidthStr::width(tail.as_str())
+            + stats_width;
+        let room = width
+            .saturating_sub(reserved + 8)
+            .max(8)
+            .min(width.saturating_sub(reserved).max(1));
         head.push(Span::raw("  "));
         head.push(Span::styled(
-            truncate_display(&files, avail),
+            truncate_display(&files, room),
             Style::default().fg(body_ink(first.status, theme)),
         ));
     }
@@ -2975,38 +3018,59 @@ fn edit_unit_lines(
             Style::default().fg(theme.ink(Ink::Meta)),
         ));
     }
-    let mut out = vec![Line::from(head)];
-
-    // Line 2: `└ N 处修改 · +A −R`, counted over the SAME patch text the diff
-    // rows below are drawn from. Counting the request instead put a `+3 −0`
-    // header above two changed lines.
-    let mut hunks = 0usize;
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    for call in calls {
-        let stats = crate::tool_cell::edit_patch_for(call)
-            .map(|p| crate::tool_cell::patch_stats_from_text(&p))
-            .unwrap_or_default();
-        hunks += stats.hunks;
-        added += stats.added;
-        removed += stats.removed;
+    if let Some((added, removed)) = stats {
+        head.push(Span::styled(
+            format!(" +{added}"),
+            Style::default().fg(theme.diff.added),
+        ));
+        head.push(Span::styled("/", Style::default().fg(theme.ink(Ink::Meta))));
+        head.push(Span::styled(
+            format!("-{removed}"),
+            Style::default().fg(theme.diff.removed),
+        ));
     }
-    let edits = if hunks == 0 { calls.len() } else { hunks };
-    let (pre, post) = split_placeholder(t.edit_merge_summary);
-    out.push(Line::from(vec![
-        Span::styled("  └ ", Style::default().fg(theme.ink(Ink::Subtle))),
-        Span::styled(pre.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
-        Span::styled(edits.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
-        Span::styled(post.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
-        Span::styled(" · ".to_string(), Style::default().fg(theme.ink(Ink::Meta))),
-        Span::styled(
-            format!("+{added} −{removed}"),
-            Style::default().fg(theme.ink(Ink::Meta)),
-        ),
-    ]));
+    if stats.is_some() {
+        // Folded: one summary row and no code, so nothing here is copyable as
+        // source. The patch itself has its own entry (`/copy diff`).
+        return (vec![Line::from(head)], has_diff, Vec::new());
+    }
 
-    crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out, first.expanded, t);
-    (out, false)
+    let mut out = vec![Line::from(head)];
+    if !has_diff {
+        // Honest absence: the runtime applied an edit but reported no diff
+        // (a no-change write, or a pre-contract session). The request is never
+        // re-drawn here — it would claim lines nothing wrote.
+        out.push(Line::from(vec![
+            Span::styled("  └ ", Style::default().fg(theme.ink(Ink::Subtle))),
+            Span::styled(
+                t.diff_unavailable.to_string(),
+                Style::default().fg(theme.ink(Ink::Meta)),
+            ),
+        ]));
+        return (out, false, Vec::new());
+    }
+
+    // A merged node stacks several applied diffs of one file; the summary row
+    // says how many, and its totals match the rows below it.
+    if calls.len() > 1 {
+        let edits = if hunks == 0 { calls.len() } else { hunks };
+        let (pre, post) = split_placeholder(t.edit_merge_summary);
+        out.push(Line::from(vec![
+            Span::styled("  └ ", Style::default().fg(theme.ink(Ink::Subtle))),
+            Span::styled(pre.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+            Span::styled(edits.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+            Span::styled(post.to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+            Span::styled(" · ".to_string(), Style::default().fg(theme.ink(Ink::Meta))),
+            Span::styled(
+                format!("+{added} −{removed}"),
+                Style::default().fg(theme.ink(Ink::Meta)),
+            ),
+        ]));
+    }
+
+    let mut copy = Vec::new();
+    crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out, t, &mut copy);
+    (out, true, copy)
 }
 
 /// Split a "{} …" i18n template around its placeholder.
@@ -3197,6 +3261,11 @@ fn call_timed_out(call: &ToolCallBlock) -> bool {
 
 /// First non-empty preview line for a failed tool (honest one-line error).
 fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
+    // A refused goal declaration says what class of refusal it is before the
+    // runtime's own text, so the row never reads as a failed delegation.
+    if crate::tool_cell::is_goal_scope_refusal(call) {
+        return Some(t.goal_refused_acceptance.to_string());
+    }
     // Unknown `task` tool: show the actionable spawn_agent hint, not raw JSON.
     if call.name == "task" {
         let preview = call.preview.as_deref().unwrap_or("");
@@ -3379,6 +3448,7 @@ pub(crate) fn render_activity(
     rows: &mut Vec<CommandRow>,
     folds: Option<&std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
     question_card_open: bool,
+    copy: &mut Vec<crate::selection::CopyRow>,
 ) -> Vec<Line<'static>> {
     let mut group_rows = Vec::new();
     let lines = render_group_rows(
@@ -3393,6 +3463,7 @@ pub(crate) fn render_activity(
         &mut group_rows,
         folds,
         question_card_open,
+        copy,
     );
     rows.extend(group_rows);
     lines
@@ -3642,7 +3713,8 @@ mod tests {
             exit_code: None,
             output: String::new(),
             output_truncated: false,
-            expanded: false,
+            // Production materializes an edit with its diff drawer open.
+            expanded: crate::tool_taxonomy::is_edit_tool(name),
             stop: Default::default(),
             id: ToolCallId::new(format!("{name}-{}", args.len())),
             name: name.into(),
@@ -4017,8 +4089,10 @@ mod tests {
         );
         let text = render_group_text(&group(vec![c]), 100, Locale::Zh).join("\n");
         assert!(text.contains("lightSem chan"), "{text}");
-        assert!(text.contains("处修改"), "{text}");
-        assert!(text.contains("+1"), "{text}");
+        assert!(
+            !text.contains("+1") && !text.contains("处修改"),
+            "an expanded node states its rows, not a stat: {text}"
+        );
     }
 
     /// A new file is an edit: its contents are the change, and a `write_file`
@@ -4056,9 +4130,10 @@ mod tests {
         // Execution located one of the three requested lines.
         c.applied_diff =
             Some("--- a/src/w.rs\n+++ b/src/w.rs\n@@ -1,1 +1,2 @@\n keep\n+a\n".into());
+        c.expanded = false;
         let text = render_group_text(&group(vec![c]), 100, Locale::Zh).join("\n");
         assert!(
-            text.contains("+1"),
+            text.contains("+1/-0"),
             "stats must match the applied diff: {text}"
         );
         assert!(
@@ -4426,6 +4501,142 @@ mod tests {
             lines[0].contains("2.9s"),
             "the stage's whole wall clock: {lines:?}"
         );
+    }
+
+    /// The conversation row (not just the Tools screen) must name a refused
+    /// goal declaration as a goal state, not a red failed action and not a
+    /// delegation. Both surfaces share one label owner, so they cannot drift.
+    #[test]
+    fn a_refused_commit_task_row_is_a_goal_warning_not_a_delegation() {
+        let mut block = call(
+            "commit_task",
+            r#"{"objective":"创建 a.txt 与 b.txt","acceptance":["a.txt 存在"]}"#,
+            ToolStatus::Failed,
+        );
+        block.preview = Some(
+            "commit_task refused [acceptance_missing_deliverables]: 1 of 2 explicit user \
+             deliverables have no covering `acceptance` check.\n- R2 [deliverable] b.txt"
+                .into(),
+        );
+        let t = Locale::Zh.text();
+        let lines = unit_lines(
+            &block,
+            &Theme::no_color(),
+            120,
+            Locale::Zh,
+            t,
+            false,
+            1,
+            None,
+            0,
+            None,
+            false,
+            true,
+            false,
+            false,
+        );
+        let head = lines[0].to_string();
+        assert!(
+            head.contains('⚠') && head.contains("目标未提交") && head.contains("a.txt 与 b.txt"),
+            "a refused declaration is a goal state that names the goal: {head}"
+        );
+        assert!(
+            !head.contains('✗') && !head.contains("委托"),
+            "committing a goal is never delegation: {head}"
+        );
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(
+            text.iter().any(|line| line.contains("验收范围不完整")),
+            "the row says what class of refusal it is: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("+1 行")),
+            "the fold says the refusal detail is one row away: {text:?}"
+        );
+        // Expanding the group restores the runtime's own words, ids included.
+        let mut expanded = group(vec![block]);
+        expanded.display = crate::fold::DisplayMode::Expanded;
+        let expanded: Vec<String> = render_group_text(&expanded, 120, Locale::Zh)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.contains("acceptance_missing_deliverables"))
+                && expanded.iter().any(|line| line.contains("b.txt")),
+            "the raw refusal stays reachable for audit: {expanded:?}"
+        );
+    }
+
+    /// A `commit_task` failure that is NOT a scope refusal is a real tool
+    /// failure and keeps the red mark.
+    #[test]
+    fn a_goal_commit_tool_failure_stays_red() {
+        let mut block = call(
+            "commit_task",
+            r#"{"objective":"创建 a.txt","acceptance":["a.txt 存在"]}"#,
+            ToolStatus::Failed,
+        );
+        block.preview = Some(
+            "commit_task is unavailable here: this execution has no durable goal store".into(),
+        );
+        let lines = unit_lines(
+            &block,
+            &Theme::no_color(),
+            120,
+            Locale::Zh,
+            Locale::Zh.text(),
+            false,
+            1,
+            None,
+            0,
+            None,
+            false,
+            true,
+            false,
+            false,
+        );
+        let head = lines[0].to_string();
+        assert!(
+            head.contains('✗') && head.contains("目标提交失败"),
+            "a real tool failure is not softened into a scope warning: {head}"
+        );
+    }
+
+    /// The only tool that delegates. A refused spawn — the one case the
+    /// taxonomy still renders — says so in the delegation vocabulary and never
+    /// claims a goal.
+    #[test]
+    fn a_failed_spawn_row_is_a_failed_delegation() {
+        let mut block = call(
+            "spawn_agent",
+            r#"{"task":"实现文章 API","title":"文章 API"}"#,
+            ToolStatus::Failed,
+        );
+        block.preview = Some("Unknown role `explorr`.".into());
+        let lines = unit_lines(
+            &block,
+            &Theme::no_color(),
+            120,
+            Locale::Zh,
+            Locale::Zh.text(),
+            false,
+            1,
+            None,
+            0,
+            None,
+            false,
+            true,
+            false,
+            false,
+        );
+        let head = lines[0].to_string();
+        assert!(
+            head.contains('✗') && head.contains("委托失败") && head.contains("文章 API"),
+            "a spawn that produced no child is a failed delegation: {head}"
+        );
+        assert!(!head.contains("目标"), "a spawn is not a goal: {head}");
     }
 
     /// A failure keeps its count on the parent and its reason under its own
@@ -5545,6 +5756,7 @@ mod tests {
             &mut Vec::new(),
             None,
             false,
+            &mut Vec::new(),
         );
         let text: Vec<String> = lines
             .iter()
@@ -6065,8 +6277,10 @@ mod tests {
         c
     }
 
+    /// An applied patch, as the runtime reports it: the arguments carry the
+    /// request, `applied_diff` carries the located result the UI renders.
     fn patch_call(file: &str, old: &str, new: &str) -> ToolCallBlock {
-        call(
+        let mut c = call(
             "apply_patch",
             &serde_json::json!({
                 "patch": format!(
@@ -6075,7 +6289,11 @@ mod tests {
             })
             .to_string(),
             ToolStatus::Ok,
-        )
+        );
+        c.applied_diff = Some(format!(
+            "--- a/{file}\n+++ b/{file}\n@@ -1,1 +1,1 @@\n-{old}\n+{new}\n"
+        ));
+        c
     }
 
     #[test]
@@ -6861,10 +7079,12 @@ mod tests {
         );
     }
 
+    /// A single edit opens as head + every applied row. Collapsing it is the
+    /// user's choice, and it lands on ONE line that states `+A/-R`.
     #[test]
-    fn single_patch_shows_stats_and_folded_diff_rows() {
-        let g = group(vec![patch_call("src/a.rs", "old", "new")]);
-        let lines = render_group_text(&g, 100, Locale::Zh);
+    fn single_patch_opens_every_row_and_folds_to_one_line() {
+        let mut call = patch_call("src/a.rs", "old", "new");
+        let lines = render_group_text(&group(vec![call.clone()]), 100, Locale::Zh);
         assert!(
             lines[0].starts_with('✓')
                 && lines[0].contains("编辑文件")
@@ -6872,16 +7092,22 @@ mod tests {
             "head carries glyph + action + inline file: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  └ ")
-                && lines[1].contains("1 处修改")
-                && lines[1].contains("+1 −1"),
-            "{lines:?}"
+            !lines[0].contains("+1"),
+            "an expanded head stays bare, like Grok's: {lines:?}"
         );
         assert!(
             lines.iter().any(|l| l.contains("new") && l.contains('+'))
                 && lines.iter().any(|l| l.contains("old") && l.contains('-')),
             "diff rows visible by default: {lines:?}"
         );
+
+        call.expanded = false;
+        let folded = render_group_text(&group(vec![call]), 100, Locale::Zh);
+        assert_eq!(folded.len(), 1, "the folded node is one row: {folded:?}");
+        assert!(folded[0].starts_with('✓'), "{folded:?}");
+        assert!(folded[0].contains("src/a.rs"), "{folded:?}");
+        assert!(folded[0].contains("+1/-1"), "{folded:?}");
+        assert!(!folded[0].contains("1 处修改"), "{folded:?}");
     }
 
     #[test]
@@ -7631,6 +7857,8 @@ mod compact_command_tests {
 
     // ── Durable results persist, bounded ────────────────────────────────────
 
+    /// A confirmed edit as production materializes it: its diff drawer is
+    /// OPEN by default (Grok Build's default), so every row is painted.
     fn edit(lines: usize) -> ToolCallBlock {
         let mut patch = String::from("--- a/src/theme.rs\n+++ b/src/theme.rs\n@@ -1,1 +1,{n} @@\n");
         patch = patch.replace("{n}", &lines.to_string());
@@ -7641,6 +7869,7 @@ mod compact_command_tests {
         c.name = "apply_patch".into();
         c.applied_diff = Some(patch);
         c.duration_ms = Some(30);
+        c.expanded = true;
         c
     }
 
@@ -7650,31 +7879,11 @@ mod compact_command_tests {
         assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
     }
 
-    /// A long patch is summarized: its ends and a count of what is hidden.
-    /// `an_opened_long_edit_restores_the_complete_diff` pins the other half —
-    /// Ctrl+O prints every row, so nothing is ever out of reach.
+    /// A long patch is painted in full by default. No line-count fold, no
+    /// first/last-three clip: 200 changed lines are 200 rows.
     #[test]
-    fn a_long_edit_is_summarized_in_the_conversation() {
+    fn a_long_edit_is_complete_by_default() {
         let rows = rows(edit(200));
-        assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("+ line 199")), "{rows:?}");
-        assert!(
-            rows.iter().any(|r| r.contains("还有")),
-            "a summarized diff says how many rows it hides: {rows:?}"
-        );
-        assert!(
-            rows.len() < 200,
-            "a three-hundred-line patch must not flood the turn: {}",
-            rows.len()
-        );
-    }
-
-    #[test]
-    fn an_opened_long_edit_restores_the_complete_diff() {
-        let mut call = edit(200);
-        call.expanded = true;
-        let rows = rows(call);
         for i in 0..200 {
             assert!(
                 rows.iter().any(|r| r.contains(&format!("+ line {i}"))),
@@ -7744,13 +7953,59 @@ mod compact_command_tests {
         }
     }
 
+    /// On a narrow terminal the stats are what a folded row exists for, so the
+    /// path yields to them instead of pushing them off the row.
+    #[test]
+    fn a_collapsed_edit_keeps_its_stats_at_every_width() {
+        for width in [24usize, 40, 80, 120] {
+            let mut call = edit(103);
+            call.expanded = false;
+            call.arguments = serde_json::json!({
+                "path": "backend/internal/httpapi/cookies_test.go",
+                "old": "",
+                "new": "x"
+            })
+            .to_string();
+            call.applied_diff = Some(
+                "--- a/backend/internal/httpapi/cookies_test.go\n\
++++ b/backend/internal/httpapi/cookies_test.go\n\
+@@ -0,0 +1,103 @@\n"
+                    .to_string()
+                    + &(0..103).map(|i| format!("+line {i}\n")).collect::<String>(),
+            );
+            let lines = lines_at(call, &Theme::no_color(), width, 0);
+            let rows = body(text(&lines));
+            assert_eq!(rows.len(), 1, "width {width}: {rows:?}");
+            assert!(
+                UnicodeWidthStr::width(rows[0].as_str()) <= width,
+                "width {width} overflowed: {rows:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_collapsed_edit_keeps_stats_and_both_ends() {
-        let rows = body(text(&lines_at(edit(120), &Theme::no_color(), 100, 0)));
-        assert!(rows.iter().any(|r| r.contains("+120 −0")), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("+ line 119")), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("还有")), "{rows:?}");
+        let theme = Theme::dark();
+        let mut call = edit(120);
+        call.expanded = false;
+        let lines = lines_at(call, &theme, 100, 0);
+        let rows = body(text(&lines));
+        assert_eq!(rows.len(), 1, "a collapsed edit is one row: {rows:?}");
+        assert!(rows[0].contains("+120/-0"), "{rows:?}");
+        assert!(!rows[0].contains("line 0"), "{rows:?}");
+        // Direction ink on the counts, so the folded row still reads as a diff.
+        let added = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|sp| sp.content.contains("+120"))
+            .expect("the added count");
+        assert_eq!(added.style.fg, Some(theme.diff.added));
+        let removed = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|sp| sp.content.contains("-0"))
+            .expect("the removed count");
+        assert_eq!(removed.style.fg, Some(theme.diff.removed));
     }
 
     /// DIFF-7: an edit is never an exploration participant, so an eager

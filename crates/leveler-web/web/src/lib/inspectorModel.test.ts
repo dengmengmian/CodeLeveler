@@ -30,7 +30,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     diff: null,
     checkpoints: [],
     completionReport: null,
-    memory: null,
+
     turnActive: false,
     activity: null,
     reasoning: '',

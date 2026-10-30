@@ -183,7 +183,6 @@ fn paint_user_prompt_decoration(
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let content = crate::conversation::geometry::content_rect(area);
     let width = content.width as usize;
     let height = content.height as usize;
@@ -193,9 +192,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
+    // A width change re-wraps every line, so the row a reader was looking at
+    // would silently become a different one. Capture it under the OLD width,
+    // publish the new viewport, then put the same transcript row back on top.
+    // Only a real reflow pays for this; same-width frames skip the extra build.
+    let reflowed = state
+        .conv
+        .rect
+        .is_some_and(|(_, _, previous, _)| previous != content.width);
+    let reading = reflowed
+        .then(|| crate::conversation::interaction::reading_anchor(state))
+        .flatten();
     // Publish before building lines so the empty-state card can size to this
     // viewport (splash is not cached on transcript version).
     state.conv.rect = Some((content.x, content.y, content.width, content.height));
+    if let Some(anchor) = reading {
+        crate::conversation::interaction::restore_reading_anchor(state, Some(anchor));
+    }
+    let theme = &state.theme;
 
     let (all, _hits, _commands, _anchor, item_spans, _sources, copy) =
         state.conversation_build(width);
@@ -309,6 +323,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     } else {
         state.conv.scroll_bottom_rect = None;
     }
+    crate::splash::render_native_image(frame, state, content, scroll);
 }
 
 #[cfg(test)]

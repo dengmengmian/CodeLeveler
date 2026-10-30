@@ -755,7 +755,6 @@ class SessionState extends ChangeNotifier {
     'session_list',
     'background_task_started',
     'background_task_exited',
-    'memory_list',
     'btw_started',
     'btw_text_delta',
     'btw_completed',

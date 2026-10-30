@@ -670,7 +670,14 @@ fn expected_change_rows(state: &AppState, width: usize) -> usize {
         })
         .collect();
     let mut out = Vec::new();
-    crate::tool_cell::merged_diff_rows(&calls, &state.theme, width, &mut out, true, state.t());
+    crate::tool_cell::merged_diff_rows(
+        &calls,
+        &state.theme,
+        width,
+        &mut out,
+        state.t(),
+        &mut Vec::new(),
+    );
     out.iter()
         .map(line_plain)
         .filter(|t| is_diff_change_row(t))
@@ -1218,7 +1225,7 @@ fn context_window_footer_and_inspector_frames() {
     write_dump("context-window-footer-100x24", &frame);
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     terminal
-        .draw(|frame| crate::context::render_context_screen(frame, frame.area(), &mut state))
+        .draw(|frame| crate::context::render_stats_screen(frame, frame.area(), &mut state))
         .unwrap();
     let mut detail = String::new();
     for y in 0..24 {

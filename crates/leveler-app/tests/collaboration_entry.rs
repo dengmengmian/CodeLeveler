@@ -529,18 +529,7 @@ impl leveler_execution::Approver for DenyAll {
 #[tokio::test]
 async fn headless_chat_runs_the_chat_profile() {
     let (tmp, server, _app, _client) = harness(vec![text("hi there")]).await;
-    // This fixture measures Chat rounds, not the independent memory worker.
-    std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
-    std::fs::write(
-        tmp.path().join(".leveler/config.yaml"),
-        "memory:\n  enabled: false\n",
-    )
-    .unwrap();
     let app = headless_app(&tmp, leveler_agent::CollaborationMode::Chat);
-    assert!(
-        !app.memory_policy().enabled(),
-        "this Chat-axis fixture isolates the agent round from auxiliary memory calls"
-    );
     let outcome = run_headless(&app, leveler_agent::CollaborationMode::Chat, "just chat").await;
 
     assert_eq!(

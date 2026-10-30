@@ -1,8 +1,6 @@
 //! Presentation state for `/trace`. The payload is a protocol query result.
 
-use leveler_client_protocol::{
-    CommandId, ObservationClass, UiObservabilityLoaded, UiObservationRow,
-};
+use leveler_client_protocol::{ObservationClass, UiObservabilityLoaded, UiObservationRow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TraceTab {
@@ -121,16 +119,31 @@ impl TraceFilter {
 #[derive(Debug, Clone, Default)]
 pub struct TraceView {
     pub loaded: Option<UiObservabilityLoaded>,
-    /// Query this `/trace` view currently owns. Foreign / stale
-    /// `ObservabilityLoaded` events are ignored.
-    pub pending_query_id: Option<CommandId>,
+    /// Correlation/refresh discipline for the queries this `/trace` view owns.
+    /// Foreign, replayed and superseded `ObservabilityLoaded` answers are
+    /// ignored; refreshes coalesce to one query in flight.
+    pub track: crate::query_track::QueryTrack,
     pub tab: TraceTab,
     pub filter: TraceFilter,
     pub selected: usize,
     pub inspect: bool,
+    /// When the newest query went out. Only the live cadence reads it, so a
+    /// page that is closed or idle owes nothing on the clock.
+    pub last_query_at: Option<std::time::Instant>,
 }
 
 impl TraceView {
+    /// Whether a page on screen should ask again purely because time passed.
+    ///
+    /// The runtime appends rows no client event reports (a long tool's progress
+    /// ticks), so a live page cannot rely on fact events alone. The gate keeps
+    /// it to one outstanding query at this cadence.
+    pub fn live_refresh_due(&self, now: std::time::Instant) -> bool {
+        self.track.in_flight_id().is_none()
+            && self
+                .last_query_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= super::LIVE_REFRESH_INTERVAL)
+    }
     pub fn filtered(&self) -> Vec<&UiObservationRow> {
         self.loaded
             .as_ref()

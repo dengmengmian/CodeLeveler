@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use leveler_client_protocol::{ClientCommand, CommandId};
+use leveler_client_protocol::ClientCommand;
 use leveler_model::{
     ContextAccounting, ContextCategory, ContextPressure, FoldRequirement, TokenCountKind,
 };
@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span};
 
 use crate::context_grid::{self, GridShape};
 use crate::i18n::UiText;
-use crate::render::{pad_display, pad_line_to_width, render_scrolled, truncate_display};
+use crate::render::{pad_display, pad_line_to_width, truncate_display};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -30,8 +30,9 @@ use crate::theme::Theme;
 pub struct ContextView {
     /// The latest accounting snapshot the runtime published.
     pub loaded: Option<ContextAccounting>,
-    /// Query this view owns; foreign/stale `ContextLoaded` events are ignored.
-    pub pending_query_id: Option<CommandId>,
+    /// Correlation/refresh discipline for the query this view owns. Foreign or
+    /// superseded `ContextLoaded` answers are ignored.
+    pub track: crate::query_track::QueryTrack,
     /// Disclosure state for categories that have children. Presentation only.
     pub expanded: HashSet<String>,
     /// Selected row index over the visible (flattened) rows.
@@ -40,8 +41,7 @@ pub struct ContextView {
 
 /// Issue the `QueryContext` this view owns.
 pub fn issue_query(state: &mut AppState) -> ClientCommand {
-    let query_id = CommandId::generate();
-    state.context.pending_query_id = Some(query_id.clone());
+    let query_id = state.context.track.issue();
     ClientCommand::QueryContext {
         session_id: state.session_id.clone(),
         query_id: Some(query_id),
@@ -135,9 +135,6 @@ struct ContextScreen {
     /// The composed line each selectable row was painted on, in the same order
     /// as the visible rows — so a click resolves against the frame on screen.
     row_lines: Vec<usize>,
-    /// Columns in from the body's left edge that the rows start at: the
-    /// breakdown is a pane of its own when the map shares the row.
-    row_offset_x: usize,
 }
 
 /// The map colour for each top-level category, in the snapshot's own display
@@ -159,65 +156,104 @@ fn top_colors(acc: &ContextAccounting, theme: &Theme) -> HashMap<String, Color> 
         .collect()
 }
 
-pub fn render_context_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+/// The Context & Usage page: ONE page, two sections.
+///
+/// `/context` and `/usage` are two entry points into this renderer; neither has
+/// a body of its own. The Context section keeps its original layout (header,
+/// modelled map, breakdown, compaction axis) and the Usage section follows
+/// under a rule. The two sections stay semantically separate: the map answers
+/// "what is in the next request", the usage section answers "what did the
+/// session spend", and they never borrow each other's numbers.
+pub fn render_stats_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
 
     // Shared Secondary Surface chrome: identity + parent status on top, hints
     // at the bottom, padded content in between. This page owns only its body.
     let page = crate::secondary::SecondaryPage {
-        title: t.context_title,
+        title: t.stats_title,
         status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint: t.context_footer_hint,
+        hint: t.stats_footer_hint,
     };
     let layout = crate::secondary::layout(area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
     crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let theme = &state.theme;
     let body = layout.content;
+    let width = body.width as usize;
 
-    let Some(acc) = state.context.loaded.as_ref() else {
-        let msg = if state.context.pending_query_id.is_some() {
-            t.context_loading
-        } else {
-            t.context_empty
-        };
-        let lines = vec![Line::from(Span::styled(
-            msg,
-            Style::default().fg(theme.text.secondary),
-        ))];
-        render_scrolled(frame, body, state, lines);
-        return;
-    };
-
-    let screen = context_screen(acc, &state.context, body.width as usize, theme, t);
-    match screen.focus {
-        Some(focus) => {
-            let pane_x = body.x.saturating_add(screen.row_offset_x as u16);
-            let pane_w = body.width.saturating_sub(screen.row_offset_x as u16);
-            let rows: Vec<(usize, String)> = screen
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Where the Context section's selectable rows landed, in page lines.
+    let mut focus_line = None;
+    let mut context_rows: Vec<(usize, String)> = Vec::new();
+    match state.context.loaded.as_ref() {
+        Some(acc) => {
+            let screen = context_screen(acc, &state.context, width, theme, t);
+            let offset = lines.len();
+            context_rows = screen
                 .row_lines
                 .iter()
                 .enumerate()
-                .map(|(i, line)| (*line, i.to_string()))
+                .map(|(i, line)| (offset + *line, i.to_string()))
                 .collect();
-            let mut hits = Vec::new();
-            crate::render::render_list_rows(
-                frame,
-                Rect {
-                    x: pane_x,
-                    width: pane_w,
-                    ..body
-                },
-                screen.lines,
-                &rows,
-                focus,
-                theme,
-                &mut hits,
-            );
-            state.screen_rows = hits;
+            focus_line = screen.focus.map(|focus| offset + focus);
+            lines.extend(screen.lines);
         }
-        None => render_scrolled(frame, body, state, screen.lines),
+        None => {
+            // No assembled request yet. The runtime's own query is the only
+            // source of an accounting; until one exists this is the empty
+            // state, and a query still in flight is a different thing.
+            let msg = if state.context.track.in_flight() {
+                t.context_loading
+            } else {
+                t.context_empty
+            };
+            lines.push(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width.max(1)),
+        Style::default().fg(theme.text.muted),
+    )));
+    lines.push(Line::from(""));
+    let usage_start = lines.len();
+    let usage_lines = crate::usage::section_lines(state, width, theme);
+    lines.extend(usage_lines);
+
+    // Scroll discipline. The page is one document: the user's scroll offset
+    // wins, but a selection below the fold is brought into view, and an entry
+    // point that asked for the Usage section gets it once.
+    let max_scroll = lines.len().saturating_sub(body.height as usize);
+    // The reveal is spent here, not in the reducer, because this is the only
+    // layer that knows which LINE a section starts on. It is a one-shot scroll
+    // request from the entry point (`/usage` → its section), never a mode.
+    let reveal = state.stats_reveal.take();
+    if let Some(section) = reveal {
+        state.screen_scroll = match section {
+            crate::screen::StatsSection::Context => 0,
+            crate::screen::StatsSection::Usage => usage_start,
+        };
+    }
+    let keep_visible = focus_line
+        .map(|focus| crate::render::list_scroll_offset(lines.len(), body.height as usize, focus))
+        .unwrap_or(0);
+    state.screen_scroll = state.screen_scroll.max(keep_visible).min(max_scroll);
+
+    let mut hits = Vec::new();
+    crate::render::render_rows_at_offset(
+        frame,
+        body,
+        lines,
+        &context_rows,
+        state.screen_scroll,
+        theme,
+        &mut hits,
+    );
+    state.screen_rows = hits;
 }
 
 /// Build the inspector body. `width` is the pane's full column count; the map
@@ -247,13 +283,13 @@ fn context_screen(
     // Header: the model, the real numbers, the runtime-derived pressure and the
     // fold state the harness ACTUALLY decided (never a rounded percentage).
     let used = fmt_tokens(acc.used_tokens);
-    let mut head = vec![Span::styled(
+    let model_span = Span::styled(
         acc.model.to_string(),
         Style::default()
             .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
-    )];
-    match total {
+    );
+    let (figures, width_hint) = match total {
         Some(total) => {
             let pct = acc.used_tokens as f64 * 100.0 / total as f64;
             let axis = if capacity.is_some() {
@@ -261,21 +297,58 @@ fn context_screen(
             } else {
                 t.context_window_axis
             };
-            head.push(Span::styled(
+            (
                 format!(" · {axis} {used} / {} · {pct:.1}%", fmt_tokens(total)),
-                Style::default().fg(theme.text.primary),
-            ));
+                format!("{used} / {} · {pct:.1}%", fmt_tokens(total)),
+            )
         }
-        None => {
-            head.push(Span::styled(
-                format!(" · {used} {}", t.context_estimated),
-                Style::default().fg(theme.text.primary),
-            ));
+        None => (
+            format!(" · {used} {}", t.context_estimated),
+            format!("{used} {}", t.context_estimated),
+        ),
+    };
+    let figures = Span::styled(figures, Style::default().fg(theme.text.primary));
+    let pressure = pressure_span(acc.pressure, t, theme);
+    let head_width: usize = [&model_span, &figures]
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>()
+        + 3
+        + unicode_width::UnicodeWidthStr::width(pressure.content.as_ref());
+    if head_width <= width {
+        lines.push(Line::from(vec![
+            model_span,
+            figures,
+            Span::styled(" · ", secondary),
+            pressure,
+        ]));
+    } else {
+        // Narrow pane: the model keeps its own line and the figures follow, so
+        // a capacity number is never clipped into a different one. When even the
+        // axis name cannot fit beside the figures, the axis-less form is used
+        // (`width_hint`) rather than half a number.
+        lines.push(Line::from(model_span));
+        let full = figures.content.trim_start_matches(" · ").to_string();
+        let text = if unicode_width::UnicodeWidthStr::width(full.as_str()) <= width {
+            full
+        } else {
+            width_hint
+        };
+        let text_span = Span::styled(text, Style::default().fg(theme.text.primary));
+        let line_width = unicode_width::UnicodeWidthStr::width(text_span.content.as_ref())
+            + 3
+            + unicode_width::UnicodeWidthStr::width(pressure.content.as_ref());
+        if line_width <= width {
+            lines.push(Line::from(vec![
+                text_span,
+                Span::styled(" · ", secondary),
+                pressure,
+            ]));
+        } else {
+            lines.push(Line::from(text_span));
+            lines.push(Line::from(pressure));
         }
     }
-    head.push(Span::styled(" · ", secondary));
-    head.push(pressure_span(acc.pressure, t, theme));
-    lines.push(Line::from(head));
 
     // The model-window axis, only when it is not already the total above.
     if let (Some(cap), Some(w)) = (capacity, window)
@@ -305,16 +378,6 @@ fn context_screen(
     }
     if !budget.is_empty() {
         lines.push(Line::from(Span::styled(budget.join(" · "), dim)));
-    }
-    // Without a resolved capacity the window is the only total, so keep the
-    // absolute free figure instead of a ratio against nothing.
-    if capacity.is_none()
-        && let Some(free) = acc.free_tokens
-    {
-        lines.push(Line::from(Span::styled(
-            format!("{} {}", t.context_free, fmt_tokens(free)),
-            dim,
-        )));
     }
     lines.push(Line::from(""));
 
@@ -357,12 +420,11 @@ fn context_screen(
 
     // One denominator for the whole screen: the same total the map and the
     // thresholds use, so no percentage here is a share of a different number.
-    let breakdown = breakdown_lines(acc, view, &rows, &colors, total, right_w, theme, t);
+    let breakdown = breakdown_lines(view, &rows, &colors, total, right_w, theme, t);
 
     let header = lines.len();
     let composed = compose_body(grid, breakdown, side_by_side, left_w, header, view.selected);
     let row_lines = composed.row_lines;
-    let row_offset_x = composed.row_offset_x;
     let focus = composed.focus;
     lines.extend(composed.lines);
 
@@ -395,7 +457,6 @@ fn context_screen(
         dim,
     )));
     lines.push(Line::from(Span::styled(compaction_line(acc, t), dim)));
-    lines.push(Line::from(Span::styled(t.context_hint.to_string(), dim)));
 
     let lines = lines
         .into_iter()
@@ -405,7 +466,6 @@ fn context_screen(
         lines,
         focus,
         row_lines,
-        row_offset_x,
     }
 }
 
@@ -415,7 +475,6 @@ struct ComposedBody {
     lines: Vec<Line<'static>>,
     focus: Option<usize>,
     row_lines: Vec<usize>,
-    row_offset_x: usize,
 }
 
 /// Compose the map and the breakdown. `side_by_side` is decided by the caller
@@ -467,7 +526,6 @@ fn compose_body(
             lines: body,
             focus: Some(header + 1 + selected),
             row_lines: row_lines(0),
-            row_offset_x: left_w + GAP,
         };
     }
 
@@ -487,7 +545,6 @@ fn compose_body(
         lines: body,
         focus: Some(focus),
         row_lines,
-        row_offset_x: 0,
     }
 }
 
@@ -525,7 +582,6 @@ fn grid_lines(
 }
 
 fn breakdown_lines(
-    acc: &ContextAccounting,
     view: &ContextView,
     rows: &[Row],
     colors: &HashMap<String, Color>,
@@ -552,14 +608,9 @@ fn breakdown_lines(
             theme,
         ));
     }
-    // Use the selected display axis, without rewriting the snapshot's
-    // authoritative free_tokens (which always belongs to the model window).
-    let free = acc
-        .free_tokens
-        .map(|free| window.map_or(free, |total| total.saturating_sub(acc.used_tokens)));
-    if let Some(free) = free {
-        lines.push(free_line(free, window, theme, t));
-    }
+    // No `Free` row. The remaining capacity is already the map's empty cells and
+    // the header's ratio; a separate line for it was a fourth way to say the
+    // same number, and it made a category list look like one more category.
     lines
 }
 
@@ -610,30 +661,6 @@ fn row_line(
         spans.push(Span::styled(
             format!("  {pct:>6}"),
             Style::default().fg(theme.text.secondary),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn free_line(free: u64, window: Option<u64>, theme: &Theme, t: &UiText) -> Line<'static> {
-    let (tokens, pct) = token_pct(free, window);
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::raw("  "),
-        Span::styled("○ ", Style::default().fg(theme.text.disabled)),
-        Span::styled(
-            format!("{} ", t.context_free),
-            Style::default().fg(theme.text.muted),
-        ),
-        Span::styled(
-            format!("{tokens:>8}"),
-            Style::default().fg(theme.text.muted),
-        ),
-    ];
-    if !pct.is_empty() {
-        spans.push(Span::styled(
-            format!("  {pct:>6}"),
-            Style::default().fg(theme.text.muted),
         ));
     }
     Line::from(spans)
@@ -824,8 +851,11 @@ mod tests {
         assert!(text.contains("Output reservation"), "{text}");
     }
 
+    /// The page no longer prints a `Free` detail row: remaining capacity is
+    /// the map's empty cells and the header ratio, not a fourth category. The
+    /// map still measures the used share against the INPUT CAPACITY axis.
     #[test]
-    fn inspector_free_and_map_share_the_input_capacity_axis() {
+    fn inspector_shows_no_free_row_and_maps_the_input_capacity_axis() {
         let projection = leveler_model::RequestProjection::project(
             &[leveler_model::Message::text(
                 leveler_model::Role::User,
@@ -854,15 +884,19 @@ mod tests {
             ..ContextView::default()
         };
         let lines = render(&acc, &view, 120);
-        let free_row = lines
+        let text = lines
             .iter()
             .map(ToString::to_string)
-            .find(|line| line.contains("○ Free"))
-            .unwrap();
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            free_row.contains("131.1k") && free_row.contains("20.0%"),
-            "{free_row}"
+            !text.contains("○ Free") && !text.contains("可用"),
+            "the Free detail row is gone: {text}"
         );
+        // The remaining capacity is still stated once, in the header's own
+        // ratio, against the same axis the map uses.
+        assert!(text.contains("524.3k / 655.4k"), "{text}");
+        assert!(text.contains("80.0%"), "{text}");
         let cells = GridShape::for_width(120).cells();
         assert!(
             glyph_count(&lines, "●") >= cells * 79 / 100,

@@ -632,14 +632,6 @@ mod tests {
                 PromptAuthority::RuntimeFact,
                 "cwd: /repo",
             ),
-            (
-                "memory_recall",
-                PromptSource::MemoryRecall {
-                    ids: vec!["mem-1".into()],
-                },
-                PromptAuthority::AdvisoryContext,
-                "recalled note",
-            ),
         ];
         for (name, source, authority, text) in classes {
             req.control_context
@@ -675,7 +667,6 @@ mod tests {
             "Project rules:\nuse the project style",
             "follow the demo procedure",
             "cwd: /repo",
-            "recalled note",
         ] {
             let at = wire.find(text).expect(text);
             assert!(wire.find("core contract").unwrap() <= at);
@@ -690,7 +681,6 @@ mod tests {
                 PromptAuthority::ProjectInstruction,
                 PromptAuthority::UserSelectedProcedure,
                 PromptAuthority::RuntimeFact,
-                PromptAuthority::AdvisoryContext,
             ]
         );
     }

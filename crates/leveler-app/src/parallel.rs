@@ -118,6 +118,7 @@ impl Application {
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: self.collaboration().as_str().to_string(),
                 }),
+                model_pinned: true,
             })
             .await
             .map_err(crate::session::app_error_from_engine)?;
@@ -207,7 +208,6 @@ impl Application {
                             )
                             .await;
                         // Settle admitted work even when its turn failed.
-                        app.flush_memory_for_headless().await;
                         let outcome = outcome?;
                         let verified = matches!(
                             outcome.stop_reason,
@@ -419,11 +419,7 @@ mod tests {
         use leveler_test_support::git::{run, scratch_repo};
         let repo = scratch_repo();
         std::fs::create_dir_all(repo.path().join(".leveler")).unwrap();
-        std::fs::write(
-            repo.path().join(".leveler/config.yaml"),
-            "memory:\n  enabled: false\n",
-        )
-        .unwrap();
+        std::fs::write(repo.path().join(".leveler/config.yaml"), "").unwrap();
         run(repo.path(), &["add", "."]);
         run(repo.path(), &["commit", "-qm", "seed"]);
         let tmp = tempfile::tempdir().unwrap();

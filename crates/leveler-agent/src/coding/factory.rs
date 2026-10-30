@@ -73,20 +73,7 @@ pub struct ExecutorFactory {
     pub model: ModelRef,
     pub commit_co_author: bool,
     pub overrides: Option<ExecutionOverrides>,
-    /// Whether the memory capability reaches the model at all this turn.
-    ///
-    /// ONE answer for tools, index, recall root and prompt guidance. Without
-    /// it an unexposed memory pack still carried the index, the recall bodies and the
-    /// guidance while the tools were unregistered — telling the model to call
-    /// a `remember` it did not have.
-    pub memory_expose: bool,
-    /// The host's configured memory service. It is the one store this run
-    /// reads and writes; `None` means memory is unconfigured, never "use a
-    /// fallback location".
-    pub memory_service: Option<Arc<leveler_memory::MemoryService>>,
-    /// Which memory lanes are open for this project. `memory_expose` says the
-    /// pack exists; this says which of its two lanes may read or write.
-    pub memory_lanes: leveler_memory::MemoryLanes,
+
     /// The process-lived background task registry, so terminal settlement can
     /// reap this session's detached processes. Held here rather than fished
     /// out of the tool context: reaping is the engine's job, not a tool's.
@@ -111,13 +98,6 @@ pub struct ExecutorFactory {
     /// Whether the harness launches an independent reviewer at closure.
     /// Default `Off`; only explicit configuration turns it on.
     pub independent_review: crate::coding::policy::IndependentReviewPolicy,
-    /// `develop.model` as the user wrote it, for the `/develop` workflow's
-    /// Analyze and Review stages. `None` runs them on [`Self::model`].
-    ///
-    /// Deliberately still a raw string here. Resolving it is `/develop`'s job,
-    /// so a value this runtime cannot use fails the command that asked for it
-    /// instead of every turn that did not.
-    pub develop_model: Option<String>,
 }
 
 impl ExecutorFactory {
@@ -128,7 +108,6 @@ impl ExecutorFactory {
         &self,
         profile: TurnProfile,
         _task: Option<&str>,
-        turn_id: Option<leveler_core::TurnId>,
     ) -> Result<Executor, EngineError> {
         let model_profile = self
             .runtime
@@ -164,9 +143,6 @@ impl ExecutorFactory {
         // Per-model tool-result budget rides the turn's tool context.
         let mut tool_context = self.tool_context.clone();
         tool_context.policy.tool_output_budget = resolved.max_tool_output_bytes;
-        if let Some(turn_id) = turn_id {
-            tool_context = tool_context.with_turn_scope(turn_id.as_str());
-        }
         let mut executor = Executor::new(
             self.runtime.clone(),
             self.registry.clone(),
@@ -199,11 +175,6 @@ impl ExecutorFactory {
         .with_host_input(self.allow_host_input)
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
-
-        executor = executor
-            .with_memory_expose(self.memory_expose)
-            .with_memory_lanes(self.memory_lanes);
-        executor = executor.with_memory_service(self.memory_service.clone());
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

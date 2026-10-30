@@ -712,6 +712,21 @@ fn wrap_code_line(
     avail: usize,
     theme: &Theme,
 ) -> Vec<Vec<Span<'static>>> {
+    wrap_code_runs(segments, avail, |rgb| {
+        crate::code_block::tone_code_rgb(rgb, theme)
+    })
+}
+
+/// Hard-wrap one run of syntax-colored text at `avail` display cells.
+///
+/// `style_of` decides what a syntect RGB becomes, so a caller that owns its
+/// own ink family (a diff's added/removed direction) shares the wrapping and
+/// grapheme-width rules instead of re-implementing them.
+pub(crate) fn wrap_code_runs(
+    segments: &[((u8, u8, u8), String)],
+    avail: usize,
+    style_of: impl Fn((u8, u8, u8)) -> Style,
+) -> Vec<Vec<Span<'static>>> {
     let avail = avail.max(1);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
@@ -722,10 +737,7 @@ fn wrap_code_line(
         if text.is_empty() {
             return;
         }
-        row.push(Span::styled(
-            std::mem::take(text),
-            crate::code_block::tone_code_rgb(color, theme),
-        ));
+        row.push(Span::styled(std::mem::take(text), style_of(color)));
     };
     for (color, text) in segments {
         for g in text.graphemes(true) {
@@ -1328,8 +1340,8 @@ fn theme_set() -> &'static ThemeSet {
 }
 
 /// Per-line syntax-highlighted runs: `(rgb, text)` per segment.
-type HighlightedLine = Arc<Vec<((u8, u8, u8), String)>>;
-type HighlightedLines = Vec<HighlightedLine>;
+pub(crate) type HighlightedLine = Arc<Vec<((u8, u8, u8), String)>>;
+pub(crate) type HighlightedLines = Vec<HighlightedLine>;
 
 /// Upper bounds for the memoized highlight cache. The cache is derived data:
 /// the same `(lang, code)` always maps to the same highlighted runs, and the
@@ -1588,11 +1600,24 @@ fn highlight_cache_snapshot_inner(
     })
 }
 
+/// The syntect language name to highlight `path` as, when the file extension
+/// is one the bundled syntax set knows.
+///
+/// A diff viewer asks this once per file section; an unknown or extension-less
+/// path returns `None` and the rows render without syntax colors instead of
+/// being guessed at.
+pub(crate) fn syntax_name_for_path(path: &str) -> Option<String> {
+    let extension = std::path::Path::new(path).extension()?.to_str()?;
+    syntax_set()
+        .find_syntax_by_extension(extension)
+        .map(|syntax| syntax.name.clone())
+}
+
 /// Memoized [`highlight_code`]. While a message streams, every painted frame
 /// re-parses the whole message; completed fenced blocks inside it are byte-for-
 /// byte identical between frames, so this turns their repeated syntect work into
 /// a cache hit. Only the still-growing tail block can miss.
-fn highlight_code_cached(code: &str, lang: Option<&str>) -> Arc<HighlightedLines> {
+pub(crate) fn highlight_code_cached(code: &str, lang: Option<&str>) -> Arc<HighlightedLines> {
     #[cfg(test)]
     if HIGHLIGHT_TEST_COLD.with(|cold| cold.get()) {
         return Arc::new(highlight_code(code, lang));

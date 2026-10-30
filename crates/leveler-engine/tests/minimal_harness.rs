@@ -118,6 +118,7 @@ async fn open_session(db: &Database) -> SessionId {
             sandbox: false,
             kind: ExecutionKind::Direct,
             axes: None,
+            model_pinned: true,
         })
         .await
         .expect("the engine creates a session for any harness")

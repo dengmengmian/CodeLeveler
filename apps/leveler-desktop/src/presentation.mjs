@@ -17,7 +17,6 @@ const toolNames={
  get_task:'查看任务',kill_task:'停止任务',wait_task:'等待任务',read_project_rules:'读取项目规则',
  find_references:'查找引用',find_symbol:'查找符号',read_symbol:'查看符号',view_image:'查看图片',
  git_diff:'查看变更',git_status:'查看状态',diagnostics:'运行诊断',blast_radius:'分析影响面',
- memory:'读取记忆',remember:'记住',forget:'忘记',
 };
 /** @param {ToolProjection} tool @returns {string} */
 export function toolLabel(tool){return toolNames[tool.name??'']??(tool.name?.startsWith('browser_')?'浏览器操作':'工具调用');}

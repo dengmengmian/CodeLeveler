@@ -505,7 +505,7 @@ pub struct ModelProfile {
     /// `None` means the user expressed no level — `auto` — so the provider's own
     /// reasoning behaviour applies. This is deliberately NOT
     /// `reasoning.default_effort`: that is the level CodeLeveler sends when it
-    /// makes a call by itself (compaction, memory extraction), and letting it
+    /// makes a call by itself (compaction, recaps), and letting it
     /// answer for `auto` would override the user's provider-default request with
     /// CodeLeveler's tuning.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -32,6 +32,7 @@ use super::{
     Executor, ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
+use crate::executor::goal_scope;
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, COMMIT_TASK_TOOL, GrantScope, PermissionRequestOutcome,
     REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
@@ -42,9 +43,7 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::goal_continuation_nudge;
-#[path = "goal_scope.rs"]
-mod goal_scope;
+use crate::nudges::{goal_continuation_nudge, plan_unresolved_nudge, task_unregistered_nudge};
 
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
@@ -84,6 +83,20 @@ struct BackgroundChild {
 /// A dropped future cannot prove its background processes are gone. Scope
 /// release belongs to the explicit asynchronous settlement path.
 #[derive(Default)]
+/// One refused `commit_task` declaration, kept only to answer a repetition.
+///
+/// Identity is the pair the model sent (objective text plus acceptance list);
+/// a changed declaration is a different attempt and resets the counter. The
+/// uncovered count is stored because the closeout quotes it back when the model
+/// goes quiet after the refusal — the user's request never became a goal, and
+/// the turn must not end as if the refusal had settled it.
+struct CommitRefusal {
+    objective: String,
+    acceptance: Vec<String>,
+    repeats: u32,
+    uncovered: usize,
+}
+
 struct BackgroundChildren {
     children: Vec<BackgroundChild>,
 }
@@ -229,6 +242,16 @@ pub(crate) struct Drive<'a> {
     /// returned unchanged. Set to the gate's own message when the bound is
     /// reached, so the round can stop after its results are durable.
     repeated_gate_refusal: Option<(String, u32)>,
+    /// The last `commit_task` scope refusal. A deterministic refusal changes
+    /// nothing when retried with the same objective and acceptance, so the
+    /// model is told it is repeating itself instead of being left to guess.
+    commit_refusal: Option<CommitRefusal>,
+    /// How many of the user's deliverables the LAST refused declaration left
+    /// uncovered, remembered past the closeout that answers it. A Chat turn
+    /// that ends after such a refusal did not deliver a verified task: the
+    /// report says so instead of letting an `Answered` turn be read as a
+    /// completed user request.
+    registration_refused: Option<usize>,
     /// Facts the terminal must carry even though the Goal resolved: accepted
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
@@ -567,14 +590,28 @@ impl Executor {
         // In-process children did not survive a restart: tell the model
         // truthfully which delegations were lost, release their scopes, and
         // clear the durable record.
-        if self.depth == 0 && !progress.outstanding_children.is_empty() {
+        //
+        // A child this window RESUMES is not lost, whatever the crashed
+        // window's durable ledger still says: the engine's resume decision is
+        // the newer fact. Emitting both notices for one child made a real run
+        // read them as a contradiction and spend rounds deciding which held.
+        let resumed_ids: Vec<&str> = self
+            .resumed_children
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect();
+        let lost =
+            crate::sub_agent::lost_children_among(&progress.outstanding_children, &resumed_ids);
+        if self.depth == 0 && !lost.is_empty() {
             let note = Message::user(
-                lost_children_note(&progress.outstanding_children),
+                lost_children_note(&lost),
                 TranscriptOrigin::RuntimeNotice {
                     notice: RuntimeNoticeKind::ChildLost,
                 },
             );
-            progress.outstanding_children.clear();
+            progress
+                .outstanding_children
+                .retain(|entry| !lost.contains(entry));
             observer(AgentEvent::ProgressUpdated {
                 ledger: progress.clone(),
             });
@@ -642,6 +679,8 @@ impl Executor {
             verification_runs: self.seeded_verification_runs.clone(),
             goal_gate_recovery_rounds: 0,
             repeated_gate_refusal: None,
+            commit_refusal: None,
+            registration_refused: None,
             completion_warnings: Vec::new(),
             decode_retries: 0,
             length_continuations: 0,
@@ -1356,20 +1395,16 @@ impl Drive<'_> {
         optional.retain(|segment| {
             matches!(
                 segment.name.as_str(),
-                "memory_guidance"
-                    | "memory_catalog"
-                    | "skills_guidance"
-                    | "multi_agent_guidance"
-                    | "host_interaction_guidance"
+                "skills_guidance" | "multi_agent_guidance" | "host_interaction_guidance"
             )
         });
-        let extra =
-            self.executor
-                .turn_control_context_inner(request, request, false, false, self.observer);
+        let extra = self
+            .executor
+            .turn_control_context_inner(request, request, false);
         optional.extend(extra.blocks.into_iter().filter(|segment| {
             matches!(
                 segment.name.as_str(),
-                "selected_skills" | "skill_index" | "agent_catalog" | "memory_recall"
+                "selected_skills" | "skill_index" | "agent_catalog"
             )
         }));
         for segment in optional {
@@ -1589,6 +1624,62 @@ impl Drive<'_> {
     }
 }
 
+/// The user's pause authorization for the bound goal, in the two forms the
+/// harness needs.
+///
+/// `goal_paused` is the DURABLE fact recorded when an earlier window reached
+/// the boundary; `reached` is the same boundary re-proved by THIS window's
+/// plan. Both read the user's own instruction sequence (the objective plus
+/// every durable amendment), never the model's prose, and an instruction that
+/// is neither a pause nor a continuation leaves the previous boundary in force.
+async fn user_pause_state(
+    executor: &Executor,
+    objective: &leveler_lifecycle::ObjectiveAnchor,
+    plan: &PlanState,
+) -> Result<(bool, bool), AgentError> {
+    if !executor.goal_mode() {
+        // A Chat turn with no goal has only this turn's objective anchor.
+        let boundary = leveler_lifecycle::effective_user_pause(anchor_user_texts(objective));
+        let reached = plan.is_model_explicit()
+            && boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.reached(plan));
+        return Ok((false, reached));
+    }
+    let scope = match executor.goal_binder() {
+        Some(binder) => binder
+            .scope()
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?,
+        None => None,
+    };
+    let mut texts: Vec<&str> = anchor_user_texts(objective);
+    if let Some(scope) = scope.as_ref() {
+        texts.extend(scope.amendments.iter().map(String::as_str));
+    }
+    // The durable column says an earlier window reached the user's boundary.
+    // The user's own NEWEST directive decides whether it is still in force:
+    // the column is cleared only at a window's end, so during the window they
+    // just authorized it still reads as paused. Only an explicit continuation
+    // releases it; a status question or a supplement leaves it in force.
+    let goal_paused = scope.as_ref().is_some_and(|scope| {
+        leveler_lifecycle::pause_in_force(scope.user_paused_at.is_some(), texts.iter().copied())
+    });
+    let boundary = leveler_lifecycle::effective_user_pause(texts);
+    let reached = plan.is_model_explicit()
+        && boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.reached(plan));
+    Ok((goal_paused, reached))
+}
+
+/// The user-authored texts of an objective anchor, in recorded order.
+fn anchor_user_texts(anchor: &leveler_lifecycle::ObjectiveAnchor) -> Vec<&str> {
+    let mut texts: Vec<&str> = vec![anchor.primary.as_deref().unwrap_or(anchor.text.as_str())];
+    texts.extend(anchor.amendments.iter().map(String::as_str));
+    texts
+}
+
 #[async_trait]
 impl AgentHarness for Drive<'_> {
     type Stop = AgentOutcome;
@@ -1693,7 +1784,10 @@ impl AgentHarness for Drive<'_> {
             "modified_paths_observed": projected_epoch_file_count(&self.progress, &self.modified_files),
             "finalization_requested": rt.finalization_requested(),
             "declared_plan": {
-                "total": self.plan_state.steps.len(),
+                // Replaced steps are history: they are neither current work nor
+                // completed delivery, so the model's own progress context does
+                // not include them in its denominator.
+                "total": self.plan_state.steps.iter().filter(|s| s.status != leveler_lifecycle::ABANDONED).count(),
                 "completed": self.plan_state.steps.iter().filter(|s| s.status == "completed").count(),
                 "active": active,
                 "active_omitted": self.plan_state.steps.iter().filter(|s| s.status == "in_progress").count().saturating_sub(3)
@@ -1701,15 +1795,12 @@ impl AgentHarness for Drive<'_> {
         });
         let mut context = self.control_context.clone();
         let optional_names = [
-            "memory_guidance",
-            "memory_catalog",
             "skills_guidance",
             "multi_agent_guidance",
             "host_interaction_guidance",
             "selected_skills",
             "skill_index",
             "agent_catalog",
-            "memory_recall",
             "multi_agent_hint",
         ];
         let mut optional: Vec<_> = context
@@ -2164,6 +2255,40 @@ impl AgentHarness for Drive<'_> {
             // re-emits a premature summary exhausts it. Past the bound the goal
             // ends `Stalled` — never as a success.
             let has_final_text = !self.last_text.trim().is_empty();
+            // The model's OWN latest plan, and only when it declared one: a
+            // host-implicit single step is the harness's shell, not a promise
+            // the model made, so it can never buy a continuation.
+            let open_plan_steps: Vec<String> = if self.plan_state.is_model_explicit() {
+                self.plan_state
+                    .open_steps()
+                    .into_iter()
+                    .map(|step| step.step.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let refused_registration_gaps = if self.executor.goal_mode() {
+                // A goal turn is bound to the goal lifecycle; the refused
+                // declaration is already answered by the goal closeout.
+                0
+            } else {
+                self.commit_refusal
+                    .as_ref()
+                    .map(|refusal| refusal.uncovered)
+                    .unwrap_or(0)
+            };
+            // The user's own authorization sequence for this goal, in recorded
+            // order. In Goal mode the durable scope contributes the cross-turn
+            // user turns; the goal's own objective is already the anchor's
+            // primary, so it is not read a second time.
+            //
+            // Reading the sequence — not the newest message alone — is what lets
+            // a status question leave the pause in force while an explicit
+            // "继续阶段 2" releases it.
+            let (goal_user_paused, user_pause_reached) =
+                user_pause_state(self.executor, &self.objective, &self.plan_state).await?;
+            let pause_finish =
+                self.executor.goal_mode() && (user_pause_reached || goal_user_paused);
             let action = decide(&CloseoutInput {
                 goal_mode: self.executor.goal_mode(),
                 has_final_text,
@@ -2171,9 +2296,13 @@ impl AgentHarness for Drive<'_> {
                 can_continue: has_next_model_step,
                 budget_remaining: self.closeout_budget.remaining(),
                 human_boundary_seen: self.progress.human_boundary_seen(),
-                goal_continuations_exhausted: self
+                continuations_exhausted: self
                     .progress
                     .should_hard_stop_no_progress(self.progress_caps),
+                open_plan_steps: open_plan_steps.len(),
+                refused_registration_gaps,
+                user_pause_reached,
+                goal_user_paused,
             });
             // Whether the harness accepted the quiet round or bought itself
             // another model call is the difference between "the model is
@@ -2185,6 +2314,9 @@ impl AgentHarness for Drive<'_> {
                 has_final_text,
                 budget_remaining = self.closeout_budget.remaining(),
                 no_progress_streak = self.progress.no_progress_streak,
+                open_plan_steps = open_plan_steps.len(),
+                user_pause_reached,
+                goal_user_paused,
                 "closeout decided"
             );
             // A Goal continuation is a lifecycle drive, not a protocol repair:
@@ -2219,6 +2351,76 @@ impl AgentHarness for Drive<'_> {
                 ));
                 return Ok(Flow::NextRound);
             }
+            if let CloseoutAction::ContinuePlan = action {
+                // Same lifecycle shape as the goal drive, one level down: the
+                // plan is still open, so the harness states its own record and
+                // ticks the no-progress bound. It never spends the one-shot
+                // protocol-repair budget, and it never names a step as "next".
+                self.progress.note_no_progress_round(model_steps);
+                (self.observer)(AgentEvent::ProgressUpdated {
+                    ledger: self.progress.clone(),
+                });
+                (self.observer)(AgentEvent::AdvisoryStarted {
+                    kind: AdvisoryKind::CloseoutNudge(CloseoutReason::PlanUnresolved),
+                });
+                let nudge = Message::user(
+                    plan_unresolved_nudge(&open_plan_steps),
+                    TranscriptOrigin::ProtocolRepair {
+                        repair: ProtocolRepairKind::PlanUnresolved,
+                    },
+                );
+                // Persist BOTH the quiet-round assistant text and the nudge: a
+                // resume reloads the transcript from the sink, and any gap here
+                // makes the resumed model see a different conversation than the
+                // one it actually had.
+                self.sink.append(&[assistant, nudge.clone()]).await?;
+                messages.push(nudge);
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::CloseoutNudge(
+                        CloseoutReason::PlanUnresolved,
+                    ),
+                    model_steps.saturating_add(1),
+                ));
+                return Ok(Flow::NextRound);
+            }
+            if let CloseoutAction::ContinueTask = action {
+                // The model declared this request as work to finish and the
+                // harness refused the declaration for missing acceptance
+                // coverage. That refusal settled the CONTRACT, not the user's
+                // request: the turn may not end as though the work were done.
+                self.progress.note_no_progress_round(model_steps);
+                (self.observer)(AgentEvent::ProgressUpdated {
+                    ledger: self.progress.clone(),
+                });
+                (self.observer)(AgentEvent::AdvisoryStarted {
+                    kind: AdvisoryKind::CloseoutNudge(CloseoutReason::TaskUnregistered),
+                });
+                let uncovered = self
+                    .commit_refusal
+                    .as_ref()
+                    .map(|refusal| refusal.uncovered)
+                    .unwrap_or(0);
+                // State it ONCE. The harness has said the only thing it knows;
+                // repeating it on the next quiet round is pressure, not
+                // information, and the model's next declaration is a fresh
+                // attempt that needs its own comparison.
+                self.commit_refusal = None;
+                let nudge = Message::user(
+                    task_unregistered_nudge(uncovered),
+                    TranscriptOrigin::ProtocolRepair {
+                        repair: ProtocolRepairKind::TaskRegistrationRefused,
+                    },
+                );
+                self.sink.append(&[assistant, nudge.clone()]).await?;
+                messages.push(nudge);
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::CloseoutNudge(
+                        CloseoutReason::TaskUnregistered,
+                    ),
+                    model_steps.saturating_add(1),
+                ));
+                return Ok(Flow::NextRound);
+            }
             if let CloseoutAction::NudgeOnce(reason) = action {
                 self.closeout_budget.consume();
                 // Surface the injection: without this the user sees a
@@ -2231,6 +2433,26 @@ impl AgentHarness for Drive<'_> {
                         goal_continuation_nudge(),
                         TranscriptOrigin::ProtocolRepair {
                             repair: ProtocolRepairKind::GoalUnresolved,
+                        },
+                    ),
+                    CloseoutReason::PlanUnresolved => Message::user(
+                        plan_unresolved_nudge(&open_plan_steps),
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::PlanUnresolved,
+                        },
+                    ),
+                    // TaskUnregistered is a continuation, not a one-shot
+                    // repair, so this arm is unreachable through `decide`.
+                    // The text is the same fact the continuation states.
+                    CloseoutReason::TaskUnregistered => Message::user(
+                        task_unregistered_nudge(
+                            self.commit_refusal
+                                .as_ref()
+                                .map(|refusal| refusal.uncovered)
+                                .unwrap_or(0),
+                        ),
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::TaskRegistrationRefused,
                         },
                     ),
                     CloseoutReason::EmptyAnswer => Message::user(
@@ -2274,6 +2496,18 @@ impl AgentHarness for Drive<'_> {
                         StopReason::Blocked,
                         Some("user denied a required permission; goal left unresolved".to_string()),
                     )
+                } else if self.executor.goal_mode() && pause_finish {
+                    // The user's own pause ended the authorized range. Nothing
+                    // failed and nothing is resolved: the goal keeps owing the
+                    // withheld work and stays recoverable. The stop is the
+                    // ordinary `Answered` (the model answered inside the
+                    // range) with a durable detail that says WHY the round
+                    // ended, so the UI can show a pause instead of a completed
+                    // goal and a replay can reach the same state.
+                    (
+                        StopReason::Answered,
+                        Some(super::closeout::user_pause_detail()),
+                    )
                 } else if self.executor.goal_mode() {
                     // One no-progress tick per stalled drive so Engine
                     // continue_active_goal cannot open unbounded turns.
@@ -2310,7 +2544,7 @@ impl AgentHarness for Drive<'_> {
             self.flush_epoch(rt);
 
             self.settle_finalization_dependencies(rt, messages).await?;
-            return Ok(Flow::Stop(AgentOutcome::drive_result(
+            let mut outcome = AgentOutcome::drive_result(
                 self.last_text.clone(),
                 model_steps,
                 self.modified_files.clone(),
@@ -2318,7 +2552,24 @@ impl AgentHarness for Drive<'_> {
                 stop_detail,
                 &self.progress,
                 &self.objective,
-            )));
+            );
+            // A Chat turn that ends after its own declaration was refused did
+            // not deliver a verified task. The stop reason stays `Answered`
+            // (the model did answer, and there is no goal to verify), but the
+            // terminal must carry the fact so the answer is not read as
+            // acceptance of the user's request.
+            if !self.executor.goal_mode()
+                && self.registration_refused.is_some()
+                && matches!(outcome.stop_reason, StopReason::Answered)
+            {
+                outcome.completion_warnings.push(format!(
+                    "no execution task was registered: a commit_task declaration was refused \
+                     because {} of the user's explicitly named deliverables had no acceptance \
+                     check. This turn ended with an answer, not with a verified delivery.",
+                    self.registration_refused.unwrap_or(0)
+                ));
+            }
+            return Ok(Flow::Stop(outcome));
         }
     }
 
@@ -2375,6 +2626,13 @@ impl AgentHarness for Drive<'_> {
         // round is still committed (results + spend) before Cancelled
         // surfaces — completed tools' side effects are already on disk.
         let mut cancelled_mid_batch = false;
+        // A goal resolution refused because delegated children were still
+        // running must wait for their settlements, but a settlement notice is a
+        // USER-role message: appending it here would land between this round's
+        // assistant tool calls and their results, which providers reject
+        // ("assistant tool call … has no tool result"). The drain therefore
+        // runs after the results are paired.
+        let mut drain_before_next_round = false;
         // Ids/names survive the consuming loop below so calls the cancel
         // cut short can still be refused in place (transcript pairing).
         let call_snapshot: Vec<ToolCall> = calls.clone();
@@ -2657,18 +2915,76 @@ impl AgentHarness for Drive<'_> {
                         goal_scope::extract(&goal_objective, &self.objective.amendments);
                     let uncovered = goal_scope::uncovered(&requirements, &acceptance);
                     if !uncovered.is_empty() {
-                        let detail = format!(
-                            "commit_task was refused: the user's request explicitly names {}, but \
-                             `acceptance` does not cover all of them. Every enumerated \
-                             deliverable needs its own concrete check; do not narrow the user's \
-                             scope to what you plan to do. Add the missing checks and call \
-                             commit_task again.",
-                            uncovered
-                                .iter()
-                                .map(|item| format!("`{item}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                        let repeats = match &self.commit_refusal {
+                            Some(previous)
+                                if previous.objective == goal_objective
+                                    && previous.acceptance == acceptance =>
+                            {
+                                previous.repeats.saturating_add(1)
+                            }
+                            _ => 1,
+                        };
+                        self.registration_refused = Some(uncovered.len());
+                        self.commit_refusal = Some(CommitRefusal {
+                            objective: goal_objective.clone(),
+                            acceptance: acceptance.clone(),
+                            repeats,
+                            uncovered: uncovered.len(),
+                        });
+                        // Structured refusal: the model needs to know WHAT is
+                        // uncovered and HOW to fix it, not a multi-kilobyte
+                        // dump it cannot act on. The full requirement set stays
+                        // in the goal row and is readable through the model's
+                        // own objective; this lists a bounded, stable sample
+                        // with the source ids the runtime itself assigned.
+                        const REFUSAL_SAMPLE: usize = 8;
+                        let deliverables = requirements
+                            .iter()
+                            .filter(|requirement| requirement.kind.is_deliverable())
+                            .count();
+                        let mut detail = format!(
+                            "commit_task refused [acceptance_missing_deliverables]: {} of {} \
+                             explicit user deliverables have no covering `acceptance` check.\n",
+                            uncovered.len(),
+                            deliverables
                         );
+                        for text in uncovered.iter().take(REFUSAL_SAMPLE) {
+                            match requirements
+                                .iter()
+                                .find(|requirement| requirement.text == *text)
+                            {
+                                Some(requirement) => detail.push_str(&format!(
+                                    "- {} [{}] {}\n",
+                                    requirement.id,
+                                    requirement.kind.label(),
+                                    requirement.text
+                                )),
+                                None => detail.push_str(&format!("- {text}\n")),
+                            }
+                        }
+                        if uncovered.len() > REFUSAL_SAMPLE {
+                            detail.push_str(&format!(
+                                "- …and {} more (the complete list is the user's own request in \
+                                 this session)\n",
+                                uncovered.len() - REFUSAL_SAMPLE
+                            ));
+                        }
+                        detail.push_str(
+                            "Fix: add one concrete `acceptance` check per item above, quoting \
+                             the deliverable's own words. One check may name several related \
+                             deliverables. Do not drop or reword the user's deliverables to make \
+                             them match the checks you already have — the refusal conditions are \
+                             the user's text, not the plan. Prohibitions (`forbidden`) never need \
+                             an acceptance check.",
+                        );
+                        if repeats > 1 {
+                            detail.push_str(&format!(
+                                "\nThis is refusal #{repeats} for the identical objective and \
+                                 acceptance: the conditions have not changed, so repeating the \
+                                 same call cannot succeed. Either add the missing checks or \
+                                 continue the work without committing."
+                            ));
+                        }
                         (self.observer)(AgentEvent::GoalIntercepted {
                             kind: "acceptance_narrowed".to_string(),
                             detail: detail.clone(),
@@ -2679,6 +2995,8 @@ impl AgentHarness for Drive<'_> {
                             Some(binder) => {
                                 match binder.bind(&goal_objective, &acceptance).await {
                                     Ok(goal) => {
+                                        self.commit_refusal = None;
+                                        self.registration_refused = None;
                                         // The committed window carries the goal
                                         // contract from the next request on.
                                         self.tools = self.executor.request_tool_definitions();
@@ -2717,21 +3035,32 @@ impl AgentHarness for Drive<'_> {
                                                  Objective: {bound_objective}\n"
                                             )
                                         };
-                                        let scope = if requirements.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(
+                                        let deliverables: Vec<String> = requirements
+                                            .iter()
+                                            .filter(|requirement| requirement.kind.is_deliverable())
+                                            .map(|requirement| format!("- {}", requirement.text))
+                                            .collect();
+                                        let constraints: Vec<String> = requirements
+                                            .iter()
+                                            .filter(|requirement| {
+                                                !requirement.kind.is_deliverable()
+                                            })
+                                            .map(|requirement| format!("- {}", requirement.text))
+                                            .collect();
+                                        let mut scope = String::new();
+                                        if !deliverables.is_empty() {
+                                            scope.push_str(&format!(
                                                 "User requirements (explicit deliverables):\n{}\n",
-                                                requirements
-                                                    .iter()
-                                                    .map(|requirement| format!(
-                                                        "- {}",
-                                                        requirement.text
-                                                    ))
-                                                    .collect::<Vec<_>>()
-                                                    .join("\n")
-                                            )
-                                        };
+                                                deliverables.join("\n")
+                                            ));
+                                        }
+                                        if !constraints.is_empty() {
+                                            scope.push_str(&format!(
+                                                "User constraints (prohibitions: honour them, do \
+                                                 not report them as delivered work):\n{}\n",
+                                                constraints.join("\n")
+                                            ));
+                                        }
                                         (
                                             true,
                                             format!(
@@ -2830,11 +3159,12 @@ impl AgentHarness for Drive<'_> {
                         self.commands_run,
                         &self.modified_files,
                     );
-                    self.drain_background_children(rt, messages).await?;
+                    drain_before_next_round = true;
                     let feedback = format!(
                         "update_goal(complete) was not accepted: delegated sub-agent(s) {} \
-                             were still running. They have now settled. Their notices are above. \
-                             A Goal is still resolved only through update_goal(complete|blocked).",
+                             were still running. The runtime settles them before your next \
+                             step, so their notices follow this result. A Goal is still \
+                             resolved only through update_goal(complete|blocked).",
                         waiting.join(", ")
                     );
                     (self.observer)(AgentEvent::GoalIntercepted {
@@ -2900,6 +3230,51 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
+                // The user's pause is not the model's obstruction. A model
+                // that reaches the authorized boundary truthfully reports
+                // "waiting for the user", and `blocked` is the only terminal
+                // that phrase resembles — but a block would hide the pause,
+                // end the session's goal route and leave the goal resumable
+                // only by a literal `继续`. State the fact and let the round
+                // end normally; the closeout records the pause.
+                if reason == StopReason::Blocked {
+                    let (goal_paused, reached) =
+                        user_pause_state(self.executor, &self.objective, &self.plan_state).await?;
+                    if self.executor.goal_mode() && (goal_paused || reached) {
+                        denied_calls_this_round += 1;
+                        let message = "update_goal(blocked) is not the resolution for this \
+                                       round: the user paused the goal at the boundary they \
+                                       stated, and the model's own plan reached it. Nothing is \
+                                       obstructed — the remaining work is withheld pending the \
+                                       user's authorization. End the round normally; the user's \
+                                       own continuation releases the pause, and \
+                                       update_goal(complete) is still the terminal once every \
+                                       stage is done."
+                            .to_string();
+                        (self.observer)(AgentEvent::GoalIntercepted {
+                            kind: "user_pause_boundary".to_string(),
+                            detail: message.clone(),
+                        });
+                        (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
+                            execution_status: None,
+                            id: call.id.as_str().to_string(),
+                            name: UPDATE_GOAL_TOOL.to_string(),
+                            is_error: true,
+                            preview: preview(&message),
+                            applied_diff: None,
+                        });
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id.clone(),
+                                content: message,
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                }
                 // A completion claim is not sole evidence. The model's own
                 // verification field is checked against this drive's command
                 // record; a failed test/build cannot be closed as complete,
@@ -2990,7 +3365,14 @@ impl AgentHarness for Drive<'_> {
                     if let Some(scope) = scope {
                         let requirements = goal_scope::extract(&scope.objective, &scope.amendments);
                         if !requirements.is_empty() {
-                            let accounting = match goal_scope::parse_accounting(&call.arguments) {
+                            // The accounting cap follows the requirement set: a long
+                            // but legitimate task must be able to account for every
+                            // requirement it has. The floor keeps a short goal from
+                            // accepting an unbounded array.
+                            let accounting = match goal_scope::parse_accounting(
+                                &call.arguments,
+                                requirements.len(),
+                            ) {
                                 Ok(accounting) => accounting,
                                 Err(message) => {
                                     denied_calls_this_round += 1;
@@ -3255,8 +3637,20 @@ impl AgentHarness for Drive<'_> {
             }
 
             // spawn_agent defers to the concurrent batch after this pass, so
-            // several spawns in one round run in parallel.
+            // several spawns in one round run in parallel. The call itself is
+            // announced FIRST: a delegation that only ever emitted its result
+            // left no durable record of what was asked for, so a refused spawn
+            // reached clients as a synthesized block with no arguments, and an
+            // audit keyed on tool starts could see a child with no request
+            // behind it. Same rule the ownership claim already follows.
             if call.name == SPAWN_AGENT_TOOL {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: SPAWN_AGENT_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
                 spawn_jobs.push((index, call));
                 continue;
             }
@@ -3982,10 +4376,30 @@ impl AgentHarness for Drive<'_> {
             {
                 match PlanState::from_model_explicit(steps) {
                     Ok(next) => {
-                        self.plan_state = next;
+                        // The model may legitimately rewrite its plan; the
+                        // record must not lose a step that was replaced
+                        // instead of finished. The replaced step stays in the
+                        // list as `abandoned` (never `completed`) and the
+                        // model is told which one it dropped, so a re-declared
+                        // plan cannot turn unfinished delivery into 100%.
+                        let replaced = self.plan_state.absorb_declaration(next.steps);
                         (self.observer)(AgentEvent::PlanUpdated {
                             steps: self.plan_state.steps.clone(),
                         });
+                        if !replaced.is_empty() {
+                            content.push_str(&format!(
+                                "\n\n[plan] {} step(s) from your previous plan were replaced \
+                                 rather than completed and are recorded as `abandoned`, not \
+                                 done:\n{}\nIf a replaced step is still owed, put it back and \
+                                 finish it; if it is no longer needed, say what changed.",
+                                replaced.len(),
+                                replaced
+                                    .iter()
+                                    .map(|step| format!("- {}", step.step))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ));
+                        }
                     }
                     Err(msg) => {
                         content = msg;
@@ -4614,17 +5028,30 @@ impl AgentHarness for Drive<'_> {
                             role,
                             &result,
                         );
+                        let content = leveler_tools::registry::cap_output_with(
+                            &content,
+                            tool_result_budget,
+                        );
+                        // The call that asked for this child settles NOW. A
+                        // foreground spawn waited for exactly this result, so a
+                        // row left `running` would keep a "waiting for a child"
+                        // indicator alive after the child ended.
+                        (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
+                            execution_status: None,
+                            id: call_id.as_str().to_string(),
+                            name: SPAWN_AGENT_TOOL.to_string(),
+                            is_error: !ok,
+                            preview: preview(&content),
+                            applied_diff: None,
+                        });
                         results[index] = Some(ContentPart::ToolResult {
                             result: ToolResultContent {
+                                // Sub-agent results bypass the registry, so the
+                                // cap above is this call's own bound too.
                                 call_id,
-                                // Sub-agent results bypass the registry, so apply
-                                // the central cap here — at this round's
-                                // remaining-capacity budget, the same bound the
-                                // registry applied to every other result.
-                                content: leveler_tools::registry::cap_output_with(
-                                    &content,
-                                    tool_result_budget,
-                                ),
+                                content,
                                 is_error: !ok,
                             },
                         });
@@ -4687,6 +5114,12 @@ impl AgentHarness for Drive<'_> {
         if cancelled_mid_batch {
             self.drain_background_children(rt, messages).await?;
             return Err(AgentError::Cancelled);
+        }
+        // A refused goal resolution asked for its children's settlements. They
+        // are appended only now, after this round's tool results, so the
+        // assistant message that carried the call keeps its paired result.
+        if drain_before_next_round {
+            self.drain_background_children(rt, messages).await?;
         }
 
         // V2: forward background children's live progress and settle any
@@ -4948,8 +5381,7 @@ impl AgentHarness for Drive<'_> {
                 kind: AdvisoryKind::ContextCompaction,
             });
             // Compaction discards detail by design; this is the only moment
-            // a project can keep something first (export it, push it to
-            // memory) without the loop guessing what matters.
+            // a project can export a checkpoint before details are discarded.
             if self.executor.hook_runner.has_lifecycle() {
                 self.executor
                     .hook_runner

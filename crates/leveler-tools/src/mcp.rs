@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Configuration for one MCP server (stdio transport).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,

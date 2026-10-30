@@ -123,6 +123,11 @@ pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
                 status: match s.status.as_str() {
                     "in_progress" => PlanStepStatus::Running,
                     "completed" => PlanStepStatus::Done,
+                    // The harness records a step the model replaced rather
+                    // than finished as `abandoned`. It is neither pending work
+                    // the runtime should keep driving nor delivery, so it has
+                    // its own projection instead of being read as a skip.
+                    "abandoned" => PlanStepStatus::Abandoned,
                     _ => PlanStepStatus::Pending,
                 },
             })
@@ -283,7 +288,17 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
     let detail = stop_detail.filter(|s| !s.trim().is_empty());
     match stop {
         StopReason::Completed => RuntimeEvent::TurnCompleted,
-        StopReason::Answered => RuntimeEvent::TurnAnswered,
+        StopReason::Answered => match detail.as_deref() {
+            // A pause is an answer inside the authorized range, but it is NOT
+            // the goal finishing: the durable record keeps the goal running,
+            // and the client must present it as waiting, never as complete.
+            Some(detail) if leveler_agent::closeout::is_user_pause_detail(detail) => {
+                RuntimeEvent::TurnPaused {
+                    reason: "目标已暂停 · 等待你授权继续".to_string(),
+                }
+            }
+            _ => RuntimeEvent::TurnAnswered,
+        },
         StopReason::Incomplete => RuntimeEvent::TurnIncomplete {
             reason: detail.unwrap_or_else(|| "完整性检查未通过或无法完成".to_string()),
         },
@@ -331,18 +346,16 @@ fn delegation_stage_label(action: &str, detail: &str) -> String {
 
 /// A required stage in the words the rest of the UI uses.
 ///
-/// `action` is an audit key (`review_launching`, `analyze_finished_ok`, or a
-/// bare `launching` for the closure reviewer) and `detail` is its
-/// machine-readable reason. Pasted together they printed
-/// "review review_launching: review" at the user — three machine words and no
-/// sentence.
+/// `action` is an audit key (`review_launching`, or a bare `launching` for
+/// the closure reviewer). `detail` is its machine-readable reason. Pasted
+/// together they printed "review review_launching: review" at the user — three
+/// machine words and no sentence.
 fn review_stage_label(action: &str, detail: &str) -> String {
     let (stage, verb) = match action.split_once('_') {
         Some((stage, verb)) => (stage, verb),
         None => ("reviewer", action),
     };
     let stage = match stage {
-        "analyze" => "分析",
         "review" | "reviewer" => "评审",
         other => other,
     };
@@ -656,7 +669,7 @@ impl EventBridge {
 
     pub fn forward(&mut self, event: EngineEvent) {
         // TaskFinished is the closed event boundary. No event from the old
-        // epoch may project after it and race a newly admitted turn.
+        // epoch may project after it and race a newly admitted turn. A replay
         if self.terminal_published {
             return;
         }
@@ -664,6 +677,7 @@ impl EventBridge {
             active.touch(session_id);
         }
         match event {
+            EngineEvent::RetiredMemory {} => {}
             EngineEvent::FinalizationStarted { .. } => {
                 if !self.terminal_published {
                     let _ = self.events.send(RuntimeEvent::TurnFinalizing {
@@ -981,45 +995,7 @@ impl EventBridge {
                 let plan = ui_plan(steps);
                 let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
             }
-            EngineEvent::MemoryRecalled {
-                count,
-                ids,
-                experience,
-                injections,
-                ..
-            } => {
-                // Structured, so no client parses the injected system block.
-                // The references let the person see WHICH memory this turn
-                // used; titles are bounded and redacted, bodies never travel.
-                let injected = injections
-                    .into_iter()
-                    .map(|receipt| leveler_client_protocol::UiMemoryReference {
-                        id: receipt.id,
-                        scope: ui_memory_scope_from_name(&receipt.scope),
-                        title: Some(receipt.title),
-                        mode: Some(receipt.mode),
-                    })
-                    .collect();
-                let _ = self.events.send(RuntimeEvent::MemoryRecalled {
-                    count,
-                    ids,
-                    experience_count: experience,
-                    injected,
-                });
-            }
-            EngineEvent::MemoryChanged {
-                operation,
-                id,
-                title,
-                authority,
-            } => {
-                let _ = self.events.send(RuntimeEvent::MemoryChanged {
-                    operation,
-                    id,
-                    title,
-                    authority,
-                });
-            }
+
             EngineEvent::GoalIntercepted { kind, detail } => {
                 // Surface as activity label; full tool error remains the model path.
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
@@ -1133,6 +1109,10 @@ impl EventBridge {
                     AdvisoryKind::ContextCompaction => "压缩上下文中…",
                     AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
+                        CloseoutReason::PlanUnresolved => "催办:计划仍有未完成步骤,再询一轮",
+                        CloseoutReason::TaskUnregistered => {
+                            "催办:任务登记被拒绝但用户目标仍未完成,再询一轮"
+                        }
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
                     },
                 };
@@ -1674,6 +1654,12 @@ mod bridge_tests {
                 ),
                 "update_goal",
             ),
+            (
+                leveler_agent::AdvisoryKind::CloseoutNudge(
+                    leveler_agent::closeout::CloseoutReason::PlanUnresolved,
+                ),
+                "计划",
+            ),
         ] {
             let (tx, mut rx) = broadcast::channel(16);
             let mut bridge = EventBridge::new(tx);
@@ -1778,6 +1764,12 @@ mod bridge_tests {
                         id: None,
                         origin: leveler_agent::PlanOrigin::ModelExplicit,
                     },
+                    leveler_agent::PlanStep {
+                        step: "replace an obsolete step".into(),
+                        status: "abandoned".into(),
+                        id: None,
+                        origin: leveler_agent::PlanOrigin::ModelExplicit,
+                    },
                 ],
             },
         );
@@ -1793,12 +1785,17 @@ mod bridge_tests {
                 _ => None,
             })
             .expect("PlanUpdated must be forwarded");
-        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps.len(), 4);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
         assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
         assert_eq!(plan.steps[1].description, "fix it");
         assert_eq!(plan.steps[2].status, PlanStepStatus::Pending);
         assert_eq!(plan.steps[2].index, 2);
+        assert_eq!(
+            plan.steps[3].status,
+            PlanStepStatus::Abandoned,
+            "a replaced open step keeps its own projection instead of reading as skippage"
+        );
     }
 
     /// The id of the Completed event that carries `preview`.
@@ -2621,6 +2618,23 @@ mod bridge_tests {
         ));
     }
 
+    /// A pause is carried by the `Answered` stop's own detail (the goal row
+    /// keeps the durable pause). Replay reaches the same terminal through this
+    /// mapping, so a paused goal is never re-rendered as complete.
+    #[test]
+    fn a_user_pause_projects_as_paused_not_answered() {
+        let paused = turn_end_event(
+            StopReason::Answered,
+            Some(leveler_agent::closeout::user_pause_detail()),
+        );
+        assert!(
+            matches!(paused, RuntimeEvent::TurnPaused { .. }),
+            "the pause must survive replay: {paused:?}"
+        );
+        let plain = turn_end_event(StopReason::Answered, Some("done".to_string()));
+        assert!(matches!(plain, RuntimeEvent::TurnAnswered));
+    }
+
     #[test]
     fn a_budget_cutoff_tells_the_user_how_to_carry_on() {
         // Short product copy: next action (continue / /goal), not a long essay.
@@ -2869,37 +2883,6 @@ mod projection_equivalence {
             } => format!("progress:{phase}:closing={closing}:streak={no_progress_streak}"),
             other => format!("{other:?}"),
         }
-    }
-
-    #[test]
-    fn memory_events_project_to_structured_runtime_events() {
-        let shapes = project(vec![
-            EngineEvent::MemoryRecalled {
-                count: 1,
-                ids: vec!["k-probe".into()],
-                experience: 0,
-                injections: Vec::new(),
-                omitted: Vec::new(),
-                budget: leveler_engine::MemoryInjectionBudgetRecord::default(),
-                block_digest: String::new(),
-                catalog_ids: Vec::new(),
-                catalog_digest: None,
-                catalog_version: None,
-                catalog_delta_ids: Vec::new(),
-                catalog_delta_version: None,
-                degraded: None,
-            },
-            EngineEvent::MemoryChanged {
-                operation: "created".into(),
-                id: "k-probe".into(),
-                title: "发布探针代号：ORANGE-7319".into(),
-                authority: Some("explicit_user".into()),
-            },
-        ]);
-        assert!(shapes[0].contains("MemoryRecalled"), "{shapes:?}");
-        assert!(shapes[0].contains("k-probe"), "{shapes:?}");
-        assert!(shapes[1].contains("MemoryChanged"), "{shapes:?}");
-        assert!(shapes[1].contains("created"), "{shapes:?}");
     }
 
     fn tool_started(id: &str, name: &str, agent: Option<&str>) -> EngineEvent {
@@ -3717,18 +3700,5 @@ mod projection_equivalence {
         }]);
         assert_eq!(shapes.len(), 1, "{shapes:?}");
         assert_eq!(shapes[0], "expanded:256000->512000:reread_pressure");
-    }
-}
-
-/// Map the builder's own scope spelling onto the protocol's scope.
-///
-/// An unknown name is `Project`: the only visible effect of a wrong scope is
-/// that the page may not find the record in its listing, which then shows the
-/// count without a title rather than inventing one.
-fn ui_memory_scope_from_name(scope: &str) -> leveler_client_protocol::UiMemoryScope {
-    match scope {
-        "global" => leveler_client_protocol::UiMemoryScope::Global,
-        "local" => leveler_client_protocol::UiMemoryScope::Local,
-        _ => leveler_client_protocol::UiMemoryScope::Project,
     }
 }

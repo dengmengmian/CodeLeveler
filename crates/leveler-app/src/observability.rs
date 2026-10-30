@@ -65,7 +65,7 @@ pub(crate) async fn record_auxiliary_call(
     };
     use leveler_model::ModelRuntime;
     let profile = app
-        .registry
+        .registry()
         .profile(&leveler_model::ModelRef::new(provider, model))
         .await
         .ok();

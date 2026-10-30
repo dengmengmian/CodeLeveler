@@ -245,9 +245,7 @@ async fn harness(responses: Vec<ModelResponse>, summary: Summary) -> Harness {
             model: ModelRef::new("mock", "m"),
             commit_co_author: false,
             overrides: None,
-            memory_expose: true,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: leveler_execution::PermissionRuleSet::default(),
             permission_rules_path: None,
@@ -257,7 +255,6 @@ async fn harness(responses: Vec<ModelResponse>, summary: Summary) -> Harness {
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),

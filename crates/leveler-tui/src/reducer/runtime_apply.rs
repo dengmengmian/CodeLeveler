@@ -39,6 +39,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::SessionUpdated { session } => {
             let previous = state.mode;
             apply_meta(state, &session);
+            // A turn terminal that does not settle the goal republishes this
+            // row: the goal is still owed, and the pause the user set is still
+            // theirs. Reading it here is what keeps the badge honest across an
+            // ordinary question in a Chat session.
+            adopt_execution_task(state, session.execution_task.clone());
             // The runtime's axis is the route the NEXT turn takes. A session the
             // runtime returned to Chat is not running a Goal turn, so the mode
             // chip must not keep claiming one after a goal lifecycle ended.
@@ -404,6 +409,75 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         // candidate files and token guess. Nothing produces it any more, and the
         // gauge takes its number from the runtime's snapshot, so the variant is
         // kept for wire compatibility while it is ignored here.
+        RuntimeEvent::ConfigReloaded {
+            query_id,
+            outcome,
+            version,
+            error,
+            provider: _,
+            model,
+            thinking,
+            changed,
+            deferred_to_next_turn,
+            restart_required,
+        } => {
+            let explicit = query_id.is_some();
+            let touches_model = changed.iter().any(|dimension| {
+                matches!(dimension.as_str(), "default_model" | "models" | "thinking")
+            });
+            // An automatic reload that changed only providers, tools or UI
+            // policy has nothing the user must read; a model change or an
+            // explicit `/reload` does.
+            if !explicit && outcome == "applied" && !touches_model {
+                return;
+            }
+            let t = state.t();
+            let version = version.to_string();
+            let notice = match outcome.as_str() {
+                "applied" => {
+                    let mut message = t.config_reloaded.replacen("{}", &version, 1);
+                    if let Some(model) = model.as_deref() {
+                        message.push_str(&format!(" · {model}"));
+                    }
+                    if let Some(thinking) = thinking.as_deref() {
+                        message.push_str(&format!(" · {thinking}"));
+                    }
+                    if deferred_to_next_turn {
+                        message.push_str(" · ");
+                        message.push_str(t.config_next_turn);
+                    }
+                    if !restart_required.is_empty() {
+                        message.push(' ');
+                        message.push_str(t.config_restart_required);
+                        let named: Vec<&str> = restart_required
+                            .iter()
+                            .map(|component| match component.as_str() {
+                                "ui_language" => t.config_restart_ui,
+                                "browser" => t.config_restart_browser,
+                                other => other,
+                            })
+                            .collect();
+                        message.push_str(&named.join(", "));
+                    }
+                    Notification {
+                        level: NotificationLevel::Info,
+                        message,
+                    }
+                }
+                "unchanged" => Notification {
+                    level: NotificationLevel::Info,
+                    message: t.config_unchanged.to_string(),
+                },
+                _ => Notification {
+                    level: NotificationLevel::Warning,
+                    message: t
+                        .config_reload_failed
+                        .replacen("{}", error.as_deref().unwrap_or("unknown"), 1)
+                        .replacen("{}", &version, 1),
+                },
+            };
+            state.notification = Some(notice);
+        }
         RuntimeEvent::ContextUpdated { .. } => {}
         RuntimeEvent::TokenUsage {
             input_tokens,
@@ -455,6 +529,23 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::TurnAnswered => {
             finish_turn(state, TurnEndStatus::Answered, None);
         }
+        RuntimeEvent::TurnPaused { reason } => {
+            // The model answered inside the range the user authorized. What
+            // differs is the GOAL lifecycle: it still owes the withheld stage,
+            // so the header must say paused, not completed, and the work stays
+            // resumable. The plan strip already names the boundary from the
+            // user's own instruction.
+            finish_turn(state, TurnEndStatus::Answered, None);
+            if let Some(goal) = state.active_goal.as_mut() {
+                goal.pause(std::time::Instant::now());
+            }
+            state.execution_task_active = true;
+            state.resumable_task = true;
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: reason,
+            });
+        }
         RuntimeEvent::TurnTruncated { error } => {
             finish_turn(state, TurnEndStatus::Truncated, Some(error));
             state.notification = None;
@@ -483,17 +574,21 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // A resumable failure is a continuation point: show it as paused,
             // which is what `继续` can re-enter. A hard failure stays red.
             let resumable = state.resumable_task;
+            // The turn that failed may not have been the goal's at all (a
+            // question asked while the goal waits). The user's pause is still
+            // the truth about the goal, so a turn failure never settles it.
+            let paused_owed = owed_goal_is_paused(state);
             if let Some(goal) = state.active_goal.as_mut() {
                 let now = std::time::Instant::now();
-                if resumable {
+                if resumable || paused_owed {
                     goal.pause(now);
                 } else {
                     goal.fail(now);
                 }
             }
-            // A hard failure settles the task; only a resumable failure keeps
-            // the owed-task badge.
-            if !resumable {
+            // A hard failure settles the task; only a resumable failure — or a
+            // pause the user set — keeps the owed-task badge.
+            if !resumable && !paused_owed {
                 state.execution_task_active = false;
             }
             // ONE terminal failure → ONE primary block. The turn-end marker
@@ -526,14 +621,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.push_failure(block);
             let summary = turn_end_summary(state, TurnEndStatus::Failed);
             archive_active_plan(state);
-            state.transcript.push_turn_end_with_receipt(
-                TurnEndStatus::Failed,
-                state.turn_tool_calls,
-                state.elapsed_secs,
-                summary,
-                None,
-                turn_receipt(state),
-            );
+            push_turn_receipt(state, TurnEndStatus::Failed, summary, None);
             state.turn_diff_files = None;
         }
         RuntimeEvent::TurnCancelled => {
@@ -555,14 +643,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
             archive_active_plan(state);
             state.turn_diff_files = None;
-            state.transcript.push_turn_end_with_receipt(
-                TurnEndStatus::Cancelled,
-                state.turn_tool_calls,
-                state.elapsed_secs,
-                summary,
-                None,
-                turn_receipt(state),
-            );
+            push_turn_receipt(state, TurnEndStatus::Cancelled, summary, None);
             seal_analysis_segment(state);
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
@@ -579,6 +660,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.goal_mode_active = false;
             state.execution_task_active = false;
             state.resumable_task = false;
+            // The cancelled goal can never be continued; its durable
+            // projection is gone with it.
+            state.execution_goal = None;
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
             state.active_goal = None;
@@ -760,116 +844,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 .team
                 .apply_activity(&id, &phase, &tool, &preview, is_error);
             state.transcript.update_sub_agent_activity(&id, step);
-        }
-        RuntimeEvent::MemoryList {
-            query_id,
-            memory_dir,
-            active,
-            archived,
-            pending,
-        } => {
-            // The management page owns its own queries, separate from the
-            // legacy `/memory list` transcript dump. Only the session-open
-            // probe may announce new candidates: a listing the user opened or
-            // a post-decision refresh is not news.
-            let announce = query_id.is_some() && query_id == state.memory.probe_query;
-            let page_query = query_id.is_some() && query_id == state.memory.list_query;
-            if announce || page_query {
-                if announce {
-                    state.memory.probe_query = None;
-                } else {
-                    state.memory.list_query = None;
-                }
-                let _ = memory_dir;
-                state.memory.apply_list(active, archived, pending, announce);
-                return;
-            }
-            let ours = query_id.is_some() && query_id == state.memory_query;
-            if !ours {
-                return;
-            }
-            state.memory_query = None;
-            // Keep the durable summary in the transcript; the storage path and
-            // entry ids stay available behind its disclosure row.
-            let t = state.t();
-            let summary = t
-                .memory_summary
-                .replace("{active}", &active.len().to_string())
-                .replace("{pending}", &pending.len().to_string());
-            let mut lines = vec![
-                format!("memory_dir={memory_dir}"),
-                format!("{} ({})", t.memory_active, active.len()),
-            ];
-            if active.is_empty() {
-                lines.push(format!("  {}", t.memory_none));
-            } else {
-                for e in &active {
-                    // A sensitive entry is kept but withheld from the model;
-                    // saying so is the difference between "stored" and "used".
-                    let mut row = format!("  [{}] {}", e.id, e.title);
-                    if let Some(kind) = &e.kind {
-                        row.push_str(&format!(" ({})", memory_kind_label(*kind)));
-                    }
-                    if e.sensitive {
-                        row.push_str(" · 敏感内容，不提供给模型");
-                    }
-                    lines.push(row);
-                }
-            }
-            lines.push(format!("{} ({})", t.memory_archived, archived.len()));
-            if archived.is_empty() {
-                lines.push(format!("  {}", t.memory_none));
-            } else {
-                for e in &archived {
-                    lines.push(format!("  [{}] {}", e.id, e.title));
-                }
-            }
-            // Pending candidates were previously invisible here, so the only
-            // way to adopt one was the CLI. Listing them is what makes the
-            // consent gate usable from the UI it gates.
-            lines.push(format!("{} ({})", t.memory_pending, pending.len()));
-            if pending.is_empty() {
-                lines.push(format!("  {}", t.memory_none));
-            } else {
-                for e in &pending {
-                    lines.push(format!("  [{}] {}", e.id, e.title));
-                    // Approving a title alone is not informed consent: show a
-                    // compact preview of what would actually be stored.
-                    let body = e.body.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let preview: String = body.chars().take(160).collect();
-                    if !preview.is_empty() {
-                        let ellipsis = if body.chars().count() > 160 {
-                            "…"
-                        } else {
-                            ""
-                        };
-                        lines.push(format!("      {preview}{ellipsis}"));
-                    }
-                    lines.push(format!("      kind={} source={}", e.kind, e.source));
-                }
-            }
-            lines.push(if pending.is_empty() {
-                t.memory_hint_empty.to_string()
-            } else {
-                t.memory_hint_pending.to_string()
-            });
-            state.transcript.push_memory_list(summary, lines.join("\n"));
-            // A listing summary must not overwrite a specific message that
-            // just landed ("已保存记忆 [id]…"). The refresh follows the write,
-            // and on a one-line status bar it would erase the only
-            // confirmation the user gets.
-            if state.notification.is_some() {
-                return;
-            }
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message: format!(
-                    "memory · active={} pending={} archived={}",
-                    active.len(),
-                    pending.len(),
-                    archived.len()
-                ),
-            });
         }
         RuntimeEvent::UserShellStarted {
             execution_id,
@@ -1088,13 +1062,29 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             query_id,
             accounting,
         } => {
-            // Only the answer to the query this view owns.
-            let ours = query_id.is_some() && query_id == state.context.pending_query_id;
-            if ours {
-                state.context.pending_query_id = None;
-                state.context.loaded = accounting;
-                crate::context::clamp(&mut state.context);
+            // Only the answer to the query this view is waiting for. A
+            // superseded query (the page re-asked while this one was in flight)
+            // is dropped instead of overwriting the newer answer.
+            if !state.context.track.accept(query_id.as_ref()) {
+                return;
             }
+            state.context.loaded = accounting;
+            crate::context::clamp(&mut state.context);
+        }
+        RuntimeEvent::UsageLoaded { query_id, report } => {
+            // Same correlation as the Context answer: a replay, another
+            // client's answer, or an answer to a scope the user already left.
+            if !state.usage.track.accept(query_id.as_ref()) {
+                return;
+            }
+            if report.scope != state.usage.scope {
+                // A `Tab` landed while this query was in flight. The answer is
+                // for a scope that is no longer on screen, so it is dropped and
+                // the page asks again for the scope now selected.
+                state.usage.track.mark_dirty();
+                return;
+            }
+            state.usage.loaded = Some(*report);
         }
         RuntimeEvent::ObservabilityLoaded {
             observation,
@@ -1102,9 +1092,8 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         } => {
             // Only a correlated current response for the query this view owns.
             // `query_id: None` is a legacy 1.5 payload — decode-safe, not owned.
-            match (&state.trace.pending_query_id, &query_id) {
-                (Some(pending), Some(incoming)) if pending == incoming => {}
-                _ => return,
+            if !state.trace.track.accept(query_id.as_ref()) {
+                return;
             }
             state.trace.loaded = Some(observation);
             state.trace.clamp();
@@ -1247,222 +1236,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
             replace_active_background_tasks(state, &tasks);
         }
-        RuntimeEvent::MemoryRecalled {
-            count,
-            experience_count,
-            injected,
-            ..
-        } => {
-            // Keep the last count even when it is zero: "recall ran and found
-            // nothing" is different from "no recall has happened yet".
-            state.last_memory_recall = Some(count);
-            // What this turn actually used, so `/memory` can answer "why did it
-            // know that?" without replaying the injected text.
-            state.memory.set_recalled(injected);
-            // The runtime emits this only for a real recall, so a search that
-            // found nothing never reaches here. Keep one auditable transcript
-            // line, but do not duplicate routine recall as a transient toast.
-            if count == 0 {
-                return;
-            }
-            let t = state.t();
-            let label = if experience_count > 0 {
-                t.memory_recalled_experience
-                    .replacen("{}", &count.to_string(), 1)
-                    .replacen("{}", &experience_count.to_string(), 1)
-            } else {
-                t.memory_recalled.replace("{}", &count.to_string())
-            };
-            state.transcript.push_note(label);
-        }
-        RuntimeEvent::MemoryStatus { query_id, status } => {
-            let ours = query_id.is_some() && query_id == state.memory_status_query;
-            if !ours {
-                return;
-            }
-            state.memory_status_query = None;
-            let lines = memory_status_lines(state, &status);
-            state.transcript.push_note(lines);
-        }
-        RuntimeEvent::MemoryChanged {
-            operation, title, ..
-        } => {
-            let t = state.t();
-            let verb = match operation.as_str() {
-                "created" => t.memory_created,
-                "superseded" => t.memory_superseded,
-                "updated" => t.memory_updated,
-                "expired" => t.memory_expired,
-                "merged" => t.memory_merged,
-                "experience_created" => t.memory_experience_created,
-                "experience_updated" | "experience_merged" => t.memory_experience_updated,
-                "experience_queued" => t.memory_experience_queued,
-                _ => t.memory_created,
-            };
-            let line = verb.replace("{}", &title);
-            state.transcript.push_note(line.clone());
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message: line,
-            });
-        }
-    }
-}
-
-/// Drop any parked interaction the predicate matches — used when a resolution
-/// event names a request that is queued behind the active overlay rather than
-/// One `/memory status` block. Counts and states only; the runtime already
-/// redacted titles and errors.
-fn memory_status_lines(
-    state: &AppState,
-    status: &leveler_client_protocol::UiMemoryStatus,
-) -> String {
-    let t = state.t();
-    let on = |enabled: bool| {
-        if enabled {
-            t.memory_status_on
-        } else {
-            t.memory_status_off
-        }
-    };
-    let experience = if status.experience_enabled {
-        format!("{}{}", on(true), t.memory_status_experimental)
-    } else {
-        on(false).to_string()
-    };
-    let mut lines = vec![
-        format!(
-            "{}: {} {} · {} {} · {} {} · {} {}",
-            t.memory_status_title,
-            t.memory_active,
-            status.active,
-            t.memory_pending,
-            status.pending,
-            t.memory_archived,
-            status.archived,
-            t.memory_status_sensitive,
-            status.sensitive,
-        ),
-        t.memory_status_switches
-            .replace("{total}", on(status.total_enabled))
-            .replace("{user}", on(status.user_enabled))
-            .replace("{experience}", &experience),
-    ];
-    if status.user_enabled {
-        lines.push(
-            t.memory_status_user_counts
-                .replace("{active}", &status.user_active.to_string())
-                .replace("{pending}", &status.user_pending.to_string())
-                .replace("{archived}", &status.user_archived.to_string()),
-        );
-    }
-    lines.push(format!(
-        "{}: pending={} processing={} retry={} processed={}",
-        t.memory_status_inbox,
-        status.inbox_pending,
-        status.inbox_processing,
-        status.inbox_failed_retryable,
-        status.inbox_processed,
-    ));
-    // Experience is its own lane: learned lessons are counted and classified
-    // separately from user-stated facts.
-    lines.push(format!(
-        "{} · {}",
-        t.memory_experience_status
-            .replace("{active}", &status.experience_active.to_string())
-            .replace("{verified}", &status.experience_verified.to_string())
-            .replace("{unverified}", &status.experience_unverified.to_string())
-            .replace("{pending}", &status.experience_pending.to_string())
-            .replace("{archived}", &status.experience_archived.to_string()),
-        t.memory_experience_inbox
-            .replace("{pending}", &status.experience_inbox_pending.to_string())
-            .replace(
-                "{processing}",
-                &status.experience_inbox_processing.to_string()
-            )
-            .replace(
-                "{retry}",
-                &status.experience_inbox_failed_retryable.to_string()
-            )
-            .replace(
-                "{processed}",
-                &status.experience_inbox_processed.to_string()
-            ),
-    ));
-    if let Some(last) = &status.last_experience {
-        let mut line = t
-            .memory_experience_last
-            .replace("{at}", &last.at)
-            .replace("{created}", &last.created.to_string())
-            .replace("{updated}", &last.updated.to_string())
-            .replace("{pending}", &last.pending.to_string())
-            .replace("{skipped}", &last.skipped.to_string())
-            .replace("{rejected}", &last.rejected.to_string());
-        if let Some(reason) = &last.reason {
-            let reason = match reason.as_str() {
-                "no_experience_signal" => t.memory_experience_skip_no_signal,
-                value if value.starts_with("task_") || value.starts_with("turn_") => {
-                    t.memory_experience_skip_task
-                }
-                value => value,
-            };
-            line.push_str(" · ");
-            line.push_str(&t.memory_experience_skipped.replace("{reason}", reason));
-        }
-        lines.push(line);
-    }
-    if let Some(next) = &status.experience_next_retry_at {
-        lines.push(format!("{}: {next}", t.memory_status_next_retry));
-    }
-    lines.push(format!(
-        "{}: accepted={} rejected={} skipped={}",
-        t.memory_status_totals,
-        status.extraction_totals.accepted,
-        status.extraction_totals.rejected,
-        status.extraction_totals.skipped,
-    ));
-    match &status.last_extraction {
-        Some(last) => {
-            let mut line = t
-                .memory_status_extraction
-                .replace("{at}", &last.at)
-                .replace("{accepted}", &last.accepted.to_string())
-                .replace("{rejected}", &last.rejected.to_string())
-                .replace("{skipped}", &last.skipped.to_string());
-            if last.zero_candidates {
-                line.push_str(" · ");
-                line.push_str(t.memory_status_zero_candidates);
-            }
-            lines.push(line);
-        }
-        None => lines.push(t.memory_status_no_extraction.to_string()),
-    }
-    if let Some(error) = &status.last_error {
-        let retry = status
-            .retry_attempt
-            .map(|attempt| format!(" (attempt {attempt})"))
-            .unwrap_or_default();
-        lines.push(format!("{}{retry}: {error}", t.memory_status_last_error));
-    }
-    if let Some(next) = &status.next_retry_at {
-        lines.push(format!("{}: {next}", t.memory_status_next_retry));
-    }
-    lines.push(match state.last_memory_recall {
-        Some(count) => format!("{}: {count}", t.memory_status_last_recall),
-        None => t.memory_status_recall_never.to_string(),
-    });
-    lines.join("\n")
-}
-
-/// Short label for a memory kind, so a listing says how an entry reaches the
-/// model instead of making the reader remember the rules.
-fn memory_kind_label(kind: leveler_client_protocol::UiMemoryKind) -> &'static str {
-    use leveler_client_protocol::UiMemoryKind;
-    match kind {
-        UiMemoryKind::Preference => "长期偏好",
-        UiMemoryKind::Decision => "决策",
-        UiMemoryKind::Note => "笔记",
-        UiMemoryKind::Experience => "经验",
     }
 }
 
@@ -1502,6 +1275,18 @@ fn note_turn_settled(state: &mut AppState) {
 
 fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<String>) {
     note_turn_settled(state);
+    // The runtime's own terminal says the goal lifecycle reached a successful
+    // end. A missing final PROSE does not undo that: the acceptance gate ran
+    // and passed. Keep the two facts separate instead of turning the goal
+    // header red because the model closed with `update_goal` and no sentence.
+    let goal_completed = matches!(
+        status,
+        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings
+    );
+    // A goal the user paused is still owed, and this turn answering an
+    // ordinary question is not that goal's terminal: the runtime never ran it,
+    // so the pause survives, and so does the badge that shows it.
+    let paused_owed = owed_goal_is_paused(state);
     state.status = RuntimeStatus::Idle;
     state.finalization_stage = None;
     state.resumable_task = false;
@@ -1521,8 +1306,12 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         other => other,
     };
     // A clean turn end settles the delegated task. Any other terminal keeps
-    // it visible: the goal still owes work and `继续` can re-enter it.
-    if work_is_finished(status) {
+    // it visible: the goal still owes work and `继续` can re-enter it. An
+    // accepted goal is finished even when its closing prose is missing. A
+    // paused goal is settled only by its own completion, never by a turn that
+    // merely answered a question.
+    let settles_the_goal = !paused_owed || goal_completed;
+    if (work_is_finished(status) || goal_completed) && settles_the_goal {
         state.execution_task_active = false;
     }
     // Active Goal terminal. Done (green) fades on its own; a turn that stopped
@@ -1530,14 +1319,23 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // have to act on (red) never hides on a timer.
     if let Some(goal) = state.active_goal.as_mut() {
         let now = std::time::Instant::now();
-        match status {
-            TurnEndStatus::Completed
-            | TurnEndStatus::CompletedWithWarnings
-            | TurnEndStatus::Answered => goal.complete(now),
-            TurnEndStatus::Truncated | TurnEndStatus::Incomplete | TurnEndStatus::Cancelled => {
-                goal.pause(now)
+        if goal_completed {
+            goal.complete(now);
+        } else if paused_owed {
+            // The user's pause is still the last word about this goal, whatever
+            // the unrelated turn that just ended concluded.
+            goal.pause(now);
+        } else {
+            match status {
+                TurnEndStatus::Answered => goal.complete(now),
+                TurnEndStatus::Truncated | TurnEndStatus::Incomplete | TurnEndStatus::Cancelled => {
+                    goal.pause(now)
+                }
+                TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
+                TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings => {
+                    goal.complete(now)
+                }
             }
-            TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
         }
     }
     state.cancel_armed = false;
@@ -1559,14 +1357,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     let summary = turn_end_summary(state, status);
     archive_active_plan(state);
     state.turn_diff_files = None;
-    state.transcript.push_turn_end_with_receipt(
-        status,
-        state.turn_tool_calls,
-        state.elapsed_secs,
-        summary,
-        detail,
-        turn_receipt(state),
-    );
+    push_turn_receipt(state, status, summary, detail);
     if status != TurnEndStatus::Cancelled
         && let Some(handoff) = handoff
     {
@@ -1594,6 +1385,11 @@ fn work_is_finished(status: TurnEndStatus) -> bool {
         status,
         TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
     )
+}
+
+/// Whether the session owes a goal the user paused.
+fn owed_goal_is_paused(state: &AppState) -> bool {
+    crate::active_goal::paused_owed(state)
 }
 
 /// The always-visible failure line. When the runtime spent automatic retries
@@ -1824,12 +1620,24 @@ fn archive_active_plan(state: &mut AppState) {
     }
 }
 
+fn push_turn_receipt(
+    state: &mut AppState,
+    status: TurnEndStatus,
+    summary: Option<String>,
+    detail: Option<String>,
+) {
+    state.transcript.push_turn_end_with_receipt(
+        status,
+        state.turn_tool_calls,
+        state.elapsed_secs,
+        summary,
+        detail,
+        turn_receipt(state),
+    );
+}
+
 pub(super) fn start_turn(state: &mut AppState) {
     crate::away_summary::cancel(state);
-    // A new turn owns the current activity view. The previous turn's settled
-    // children are history now — the transcript kept them — and must not keep
-    // rendering as work in flight. A child still open at the boundary stays:
-    // the runtime continues or settles it in a later turn.
     state.team.retire_settled(state.elapsed_secs);
     // Finished background tasks stay in the projection as the list page's
     // "recently finished" window; the footer never shows them. A still-running
@@ -1931,6 +1739,8 @@ fn restore_history(
         scratch.transcript.finalize_in_flight();
     }
     state.transcript.replace_with(scratch.transcript);
+    // The rebuilt transcript has its own positions; an index from the previous
+    // transcript would name another entry.
 }
 
 /// Update header metadata from a snapshot without touching the transcript.
@@ -2017,6 +1827,71 @@ pub(super) fn apply_session_confirmation(
 
 fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     apply_session_with(state, session, TranscriptAdoption::Replace);
+}
+
+/// Adopt the runtime's durable projection of the goal this session owes.
+///
+/// The snapshot is the only authority for WHICH goal is owed, whether a window
+/// is executing it, and whether the user's own pause is in force. The live
+/// phase stays on [`crate::active_goal::ActiveGoal`], which owns this client's
+/// clock; this decides what is owed, not what is running right now.
+fn adopt_execution_task(
+    state: &mut AppState,
+    task: Option<leveler_client_protocol::UiExecutionTask>,
+) {
+    let Some(task) = task else {
+        state.execution_goal = None;
+        // Mid-turn the commit's badge is this turn's own fact; the terminal
+        // event settles it, never a metadata refresh.
+        if !state.is_busy() {
+            state.execution_task_active = false;
+        }
+        return;
+    };
+    state.execution_task_active = true;
+    // Only a live window executes the goal contract; owed work with no window,
+    // or work the user paused, is not running.
+    state.goal_mode_active = task.running && state.status == RuntimeStatus::Busy;
+    let now = std::time::Instant::now();
+    let paused = task.user_paused || !task.running;
+    let title =
+        crate::active_goal::short_title(&task.objective).unwrap_or_else(|| task.objective.clone());
+    match state.active_goal.as_mut() {
+        Some(goal) => {
+            // A different goal id is not this goal continuing: identity, Phase
+            // and the display clock belong to the goal that owns them, so a
+            // second goal starts its own window instead of inheriting the
+            // first one's pause or elapsed time.
+            let switched = state
+                .execution_goal
+                .as_ref()
+                .is_some_and(|previous| previous.goal_id != task.goal_id);
+            if switched {
+                goal.replace_with_objective(title, task.objective.clone(), now);
+            } else {
+                goal.adopt_objective(title, task.objective.clone());
+            }
+            if paused {
+                goal.pause(now);
+            } else if goal.phase() == crate::active_goal::GoalPhase::Paused {
+                // The user released the pause, so the durable row is the newer
+                // fact: the display follows it back into the window.
+                goal.resume(now);
+            }
+        }
+        None => {
+            let mut goal = crate::active_goal::ActiveGoal::running_with_objective(
+                title,
+                task.objective.clone(),
+                now,
+            );
+            if paused {
+                goal.pause(now);
+            }
+            state.active_goal = Some(goal);
+        }
+    }
+    state.execution_goal = Some(task);
 }
 
 fn apply_session_with(
@@ -2133,17 +2008,16 @@ fn apply_session_with(
 
     if switching {
         state.history_query = None;
-        state.memory_query = None;
-        state.memory_status_query = None;
-        state.last_memory_recall = None;
         state.agents_list_query = None;
         state.agent_detail_query = None;
         state.child_contribution_query = None;
         state.diff_query = None;
         state.diff_pending = false;
-        state.context.pending_query_id = None;
+        state.context.track.reset();
         state.context.loaded = None;
-        state.trace.pending_query_id = None;
+        state.usage.track.reset();
+        state.usage.loaded = None;
+        state.trace.track.reset();
         state.context_tokens = 0;
         state.token_input = 0;
         state.token_output = 0;
@@ -2196,34 +2070,7 @@ fn apply_session_with(
     // A committed task outlives the turn window. The snapshot carries its
     // durable goal so a reconnecting client restores the badge and the real
     // objective — including the paused state of work that is still owed.
-    if let Some(task) = session.execution_task.as_ref() {
-        state.execution_task_active = true;
-        // Only a live window executes the goal contract; owed work with no
-        // window is paused, not running.
-        state.goal_mode_active = task.running && state.status == RuntimeStatus::Busy;
-        let now = std::time::Instant::now();
-        let title = crate::active_goal::short_title(&task.objective)
-            .unwrap_or_else(|| task.objective.clone());
-        match state.active_goal.as_mut() {
-            Some(goal) => {
-                goal.adopt_objective(title, task.objective.clone());
-                if !task.running {
-                    goal.pause(now);
-                }
-            }
-            None => {
-                let mut goal = crate::active_goal::ActiveGoal::running_with_objective(
-                    title,
-                    task.objective.clone(),
-                    now,
-                );
-                if !task.running {
-                    goal.pause(now);
-                }
-                state.active_goal = Some(goal);
-            }
-        }
-    }
+    adopt_execution_task(state, session.execution_task.clone());
     // A reconnect snapshot replaces (rather than merges) the active process
     // projection. Its entries come from the process registry, so terminal
     // records retained by the registry or replayed transcript events cannot

@@ -2641,12 +2641,14 @@ mod tests {
                 stream.read_exact(&mut bytes).await.unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 let kind = request["body"]["type"].as_str().unwrap();
+                if kind != "subscribe" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 // This predates workspace selection: unknown request variants
                 // are refused, while unknown fields of CreateSession were ignored.
                 let response = match kind {
                     "subscribe" => serde_json::json!({"type":"ack"}),
                     "create_session" => {
-                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         serde_json::json!({"type":"session_created","body":{"session":TestRuntime::new().snapshot.lock().unwrap().clone(),"context_window":128000}})
                     }
                     _ => {
@@ -2664,23 +2666,23 @@ mod tests {
                 }
             }
         });
-        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
-        let result = client
-            .create_session(CreateSessionRequest {
-                request_id: None,
-                collaboration: CollaborationMode::Chat,
-                workspace: CreateWorkspaceSelection::None,
-                goal: "without workspace".into(),
-                model: None,
-                mode: PermissionProfile::Assisted,
-                approval_policy: ApprovalPolicy::Interactive,
-            })
-            .await;
+        // A breaking protocol boundary rejects the peer during subscription,
+        // before session creation or versioned delivery can fall back.
+        let result = LocalSocketRuntimeClient::connect(&path).await;
         assert!(
-            result.is_err(),
-            "legacy daemon must never claim a repository session fulfilled None"
+            matches!(
+                result,
+                Err(TransportError::Protocol(
+                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+                ))
+            ),
+            "a legacy daemon must be explicitly refused at the major-version boundary"
         );
-        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            creates.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an incompatible daemon must receive no operation or fallback"
+        );
         shutdown.cancel();
         server.await.unwrap();
     }
@@ -2708,12 +2710,14 @@ mod tests {
                 stream.read_exact(&mut bytes).await.unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 let kind = request["body"]["type"].as_str().unwrap();
+                if kind != "subscribe" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 // This predates workspace selection: unknown request variants
                 // are refused, while unknown fields of CreateSession were ignored.
                 let response = match kind {
                     "subscribe" => serde_json::json!({"type":"ack"}),
                     "create_session" => {
-                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         serde_json::json!({"type":"session_created","body":{"session":TestRuntime::new().snapshot.lock().unwrap().clone(),"context_window":128000}})
                     }
                     _ => {
@@ -2731,23 +2735,23 @@ mod tests {
                 }
             }
         });
-        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
-        let result = client
-            .create_session(CreateSessionRequest {
-                request_id: Some(leveler_client_protocol::CommandId::new("identified-create")),
-                collaboration: CollaborationMode::Chat,
-                workspace: CreateWorkspaceSelection::RuntimeDefault,
-                goal: "without workspace".into(),
-                model: None,
-                mode: PermissionProfile::Assisted,
-                approval_policy: ApprovalPolicy::Interactive,
-            })
-            .await;
+        // A breaking protocol boundary rejects the peer during subscription,
+        // before session creation or versioned delivery can fall back.
+        let result = LocalSocketRuntimeClient::connect(&path).await;
         assert!(
-            result.is_err(),
-            "legacy daemon must never claim a repository session fulfilled None"
+            matches!(
+                result,
+                Err(TransportError::Protocol(
+                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+                ))
+            ),
+            "a legacy daemon must be explicitly refused at the major-version boundary"
         );
-        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            creates.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an incompatible daemon must receive no operation or fallback"
+        );
         shutdown.cancel();
         server.await.unwrap();
     }
@@ -2775,6 +2779,9 @@ mod tests {
                 stream.read_exact(&mut bytes).await.unwrap();
                 let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 let kind = request["body"]["type"].as_str().unwrap();
+                if kind != "subscribe" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 // The old peer accepts legacy Deliver and ignores its optional
                 // version field. Unknown operation names are refused.
                 let response = match kind {
@@ -2784,7 +2791,6 @@ mod tests {
                             request["body"]["body"]["body"]["command"]["type"],
                             "rename_session"
                         );
-                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         serde_json::json!({"type":"ack"})
                     }
                     _ => {
@@ -2802,27 +2808,25 @@ mod tests {
                 }
             }
         });
-        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
-        let result = client
-            .deliver(CommandEnvelope {
-                command_id: leveler_client_protocol::CommandId::new("versioned-old-peer"),
-                session_id: SessionId::new("s1"),
-                expected_version: Some(0),
-                issued_at: "2026-10-09T00:00:00Z".into(),
-                command: ClientCommand::RenameSession {
-                    session_id: SessionId::new("s1"),
-                    name: "must-not-run".into(),
-                },
-            })
-            .await;
-        let effects = renames.load(std::sync::atomic::Ordering::SeqCst);
+        // A breaking protocol boundary rejects the peer during subscription,
+        // before session creation or versioned delivery can fall back.
+        let result = LocalSocketRuntimeClient::connect(&path).await;
+        assert!(
+            matches!(
+                result,
+                Err(TransportError::Protocol(
+                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+                ))
+            ),
+            "a legacy daemon must be explicitly refused at the major-version boundary"
+        );
+        assert_eq!(
+            renames.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an incompatible daemon must receive no operation or fallback"
+        );
         shutdown.cancel();
         server.await.unwrap();
-        assert!(
-            result.is_err(),
-            "old peer must explicitly refuse versioned settings; observed legacy effects={effects}"
-        );
-        assert_eq!(effects, 0, "old daemon must perform no rename");
     }
 
     #[cfg(unix)]
@@ -2936,7 +2940,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(server.serve(shutdown.clone()));
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let mut envelope = serde_json::json!({"protocol":{"major":1,"minor":12},"body":{"type":"snapshot","body":{"session_id":"s1"}}});
+        let mut envelope = serde_json::json!({"protocol":leveler_client_protocol::PROTOCOL_VERSION,"body":{"type":"snapshot","body":{"session_id":"s1"}}});
         if capable {
             envelope["capabilities"] = serde_json::json!(["optional_workspace"]);
         }

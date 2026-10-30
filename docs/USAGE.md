@@ -6,6 +6,8 @@
 
 Run `leveler login` to choose a provider and model. Settings live in `~/.leveler/config.toml`. For another OpenAI-compatible service, run `leveler init` and edit that file.
 
+Configuration is read again while the app runs: editing `~/.leveler/config.toml` (or the repository bundle) applies to the next turn, and `/reload` re-reads it immediately without restarting. A running turn keeps the model and provider it started with; a session that never chose a model follows the new default, while an explicit `/model` choice stays put. An invalid or partially written file is rejected and the last working configuration stays in force. Settings that can only apply on start-up, such as the UI language, are reported as requiring a restart instead of being reported as applied.
+
 Use `/thinking high` to change reasoning intensity for the session, or `/thinking reset` to return to the configured default. Choices are `auto`, `off`, `minimal`, `low`, `medium`, `high`, and `max`; run `leveler doctor` to check model support. The default is `high`; `max` uses the model's strongest supported level, and `auto` leaves the choice to the provider.
 
 ## Input and results
@@ -15,6 +17,7 @@ Use `/thinking high` to change reasoning intensity for the session, or `/thinkin
 - Click a tool group for details, use `Ctrl+O` for the latest execution, or `Ctrl+G` for the final answer.
 - Type `!` in an empty input to enter Shell Mode; Tab completes commands and paths.
 - `/output` opens full local command output; `/copy output` copies it.
+- An edit paints its complete applied diff by default; click its head row or press `Ctrl+O` to fold it to one `+A/-R` row. Dragging over the diff copies the selected source lines (no gutter, no `+`/`-` marker); `/copy diff` copies the complete applied patch instead.
 - `Ctrl+B` moves a running local command to the background; `Ctrl+C` stops that execution.
 
 Open background tasks from the footer to inspect output or stop an individual task. Esc only returns to the list. Closing the terminal does not stop background tasks when connected to the background service.
@@ -22,6 +25,8 @@ Open background tasks from the footer to inspect output or stop an individual ta
 ## Sessions and background work
 
 Use `leveler resume` to continue a session. On macOS and Linux, `leveler serve` also keeps work running in the background. A local background service is not supported on Windows.
+
+If the process that owns background services is lost (crash or kill), `leveler tui` keeps starting: affected tasks become `unknown`, and the startup notice says whether their process was still present. CodeLeveler never signals or re-runs them in that state; use `leveler background list` to inspect what was left, `leveler background logs` for the retained output, and `leveler background journal list` for write reservations that remain unresolved.
 
 `leveler run "task"` runs a task to its end. Add `--collaboration chat` for a single response.
 

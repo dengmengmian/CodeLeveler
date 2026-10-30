@@ -2,7 +2,7 @@
 //!
 //! These are the commands a person runs to *look* at something: the resolved
 //! configuration, the model catalogue, the theme, the agent roster, the skill
-//! list, sessions, background tasks, memory, permission rules, the trace and the
+//! list, sessions, background tasks, permission rules, the trace and the
 //! LSP surface. None of them needs a model, a network or a credential, so none of
 //! them has an excuse for having no acceptance: the contract asserted here is
 //! what the process prints, whether it exits 0 or refuses, that it never crashes
@@ -32,9 +32,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn leveler(home: &Path, args: &[&str]) -> Output {
-    // Run in a workspace that is NOT the state root and NOT the repository: a
-    // read opens the project's Markdown memory root, and Memory 2.0 refuses a
-    // private state root inside the repository.
+    // Keep test invocations in an isolated workspace.
     let workspace = home.join("ws");
     std::fs::create_dir_all(workspace.join(".leveler")).unwrap();
     leveler_in(&workspace, home, args)
@@ -139,60 +137,6 @@ fn sessions_list_reports_an_empty_history() {
 #[test]
 fn background_list_reports_no_tasks() {
     assert_lists(&["background", "list"], &[]);
-}
-
-#[test]
-fn memory_list_reports_an_empty_store() {
-    assert_lists(&["memory", "list"], &[]);
-}
-
-#[test]
-fn memory_status_names_both_switches_and_the_experimental_lane() {
-    // No config file: user facts keep the historical default, automatic
-    // experience is closed until the project opts in.
-    assert_lists(
-        &["memory", "status"],
-        &[
-            "Memory switches",
-            "total: on",
-            "user facts: on",
-            "auto experience: off",
-        ],
-    );
-}
-
-#[test]
-fn memory_status_reports_a_closed_lane_as_off() {
-    let home = scratch("memory-lane");
-    let ws = scratch("memory-lane-ws");
-    std::fs::create_dir_all(ws.join(".leveler")).unwrap();
-    std::fs::write(
-        ws.join(".leveler/config.yaml"),
-        "memory:\n  enabled: true\n  user_enabled: false\n  experience_enabled: true\n",
-    )
-    .unwrap();
-    let output = leveler_in(&ws, &home, &["memory", "status"]);
-    let rendered = text(&output);
-    assert!(
-        output.status.success(),
-        "memory status must succeed: {rendered}"
-    );
-    assert_no_secret_or_panic(&rendered, &["memory", "status"]);
-    // A local process cannot read the pending queue, so the lane line reports
-    // only what it read and the limitation is stated separately. Printing
-    // `pending 0` here would claim a store this process never opened.
-    assert!(
-        rendered.contains("user facts: off (active 0 · archived 0)"),
-        "a closed user lane must be reported as off: {rendered}"
-    );
-    assert!(
-        rendered.contains("auto experience: on (experimental)"),
-        "the open experience lane keeps its experimental marker: {rendered}"
-    );
-    assert!(
-        rendered.contains("pending review: only visible from the TUI/desktop"),
-        "the unreadable pending queue must be stated, not implied as empty: {rendered}"
-    );
 }
 
 #[test]

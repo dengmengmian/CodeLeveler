@@ -142,6 +142,10 @@ impl Harness {
         )
         .with_approver(Arc::new(AutoApprove))
         .with_delegation(false)
+        // The seeded plan stays OPEN on purpose: these scripts end with a
+        // final answer, so the bounded plan continuation rides along and the
+        // extra `done()` responses below feed it. Process ownership is what
+        // this file asserts.
         .with_seeded_plan(leveler_agent::PlanState {
             steps: vec![leveler_agent::PlanStep {
                 step: "Manage the owned background process".into(),
@@ -163,7 +167,7 @@ impl Harness {
         );
         let mut events = Vec::new();
         let mut saved = Saved::default();
-        self.executor("owner", vec![spawn, done()], false)
+        self.executor("owner", vec![spawn, done(), done(), done()], false)
             .run(
                 "Start a background process for this session",
                 &mut |event| events.push(event),
@@ -244,6 +248,8 @@ async fn later_main_agent_turn_observes_and_stops_owned_tree_without_file_write_
             response("get_task", serde_json::json!({"task_id":id})),
             response("kill_task", serde_json::json!({"task_id":id})),
             done(),
+            done(),
+            done(),
         ],
         false,
     )
@@ -298,6 +304,8 @@ async fn main_agent_rejects_foreign_and_unknown_owned_task_targets() {
                 vec![
                     response(name, serde_json::json!({"task_id":target})),
                     done(),
+                    done(),
+                    done(),
                 ],
                 false,
             )
@@ -347,6 +355,8 @@ async fn read_only_side_surface_observes_owned_task_but_cannot_stop_it() {
         vec![
             response("get_task", serde_json::json!({"task_id":id})),
             response("kill_task", serde_json::json!({"task_id":id})),
+            done(),
+            done(),
             done(),
         ],
         true,

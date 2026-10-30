@@ -17,12 +17,7 @@ pub mod capability;
 mod child_profile;
 pub mod coding;
 pub mod executor;
-pub mod experience;
 mod injected_tools;
-mod memory_context;
-mod memory_extract;
-#[cfg(test)]
-mod memory_scale_bench;
 mod nudges;
 pub mod ownership;
 mod prompt;
@@ -41,12 +36,6 @@ pub use executor::{
     StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy,
     auxiliary_budget_available, closeout,
 };
-pub use experience::{
-    ExperienceCandidate, ExperienceEvent, ExperienceEvidencePack, ExperienceExtraction,
-    ExperienceExtractor, ExperienceRejection, ExperienceRun, ModelExperienceExtractor,
-    ValidatedExperiences, build_evidence_pack, evidence_fingerprint, experience_system_prompt,
-    parse_experience_candidates, validate_experience_candidate, validate_experience_candidates,
-};
 pub use leveler_agent_core::{
     BudgetDimension, BudgetExhaustion, DEFAULT_MODEL_STEP_CEILING, ModelStepLimits,
 };
@@ -62,14 +51,6 @@ pub use leveler_execution::{
 pub use leveler_lifecycle::{
     ChildLimit, ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource,
     PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase,
-};
-pub use memory_context::{MemoryInjectionBudget, MemoryInjectionReceipt, MemoryOmission};
-pub use memory_extract::{
-    BatchCandidateRejection, BatchCandidateValidation, BatchSemanticCandidate, BatchSourceTurn,
-    DEFAULT_EXTRACTION_MAX_TOKENS, DEFAULT_EXTRACTION_TIMEOUT, ExtractionCall, ExtractionContext,
-    ExtractionError, KnownIdentity, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS, MAX_CANDIDATES,
-    MAX_EXTRACTOR_INPUT_CHARS, MAX_OUTPUT_TOKENS, ModelSemanticExtractor, SemanticExtractor,
-    batch_extraction_system_prompt, extraction_system_prompt, validate_batch_candidates,
 };
 pub use sub_agent::{ChildResult, ChildStatus, RUNTIME_NOTICE_HEADERS, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

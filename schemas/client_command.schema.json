@@ -145,29 +145,6 @@
       }
     },
     {
-      "description": "Run the Develop workflow on an explicit goal: `Analyze → Coding → Verify → Review`.\n\nDistinct from [`Self::RunGoal`] because it is a different product promise, not a different phrasing of the same one: the user is asking for the change to be investigated before it is written and read back after it is verified. An ordinary message never becomes one of these.",
-      "type": "object",
-      "required": [
-        "content",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "content": {
-          "type": "string"
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "run_develop"
-          ]
-        }
-      }
-    },
-    {
       "description": "Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn.\n\nThe client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message.\n\n`content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it.",
       "type": "object",
       "required": [
@@ -300,6 +277,32 @@
           "type": "string",
           "enum": [
             "force_retire"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Re-read every configured source and apply what can be applied without a restart (the `/reload` command).\n\nSession-less by design: configuration is runtime-wide, and the answer belongs to the requester, not to one conversation. The runtime keeps executing turns on the generation they started with; only later turns see the new one.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::ConfigReloaded`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "reload_config"
           ]
         }
       }
@@ -579,326 +582,6 @@
           "type": "string",
           "enum": [
             "confirm_plan_to_goal"
-          ]
-        }
-      }
-    },
-    {
-      "description": "List project durable memory (active; optional archived) for TUI/CLI.",
-      "type": "object",
-      "required": [
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "include_archived": {
-          "description": "Include archived (forgotten) entries.",
-          "default": false,
-          "type": "boolean"
-        },
-        "query_id": {
-          "description": "Correlates this query-shaped response to the requesting client.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/CommandId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "list_memory"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Project memory health (store counts + durable extraction queue).",
-      "type": "object",
-      "required": [
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "query_id": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/CommandId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "memory_status"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Pin or unpin one active memory. A user pin is a standing constraint: it is recalled first and is never crowded out by a weak candidate. A model pin is only a ranking hint, which is why this command exists only on the user's surface.",
-      "type": "object",
-      "required": [
-        "id",
-        "pinned",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "pinned": {
-          "type": "boolean"
-        },
-        "scope": {
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "set_memory_pin"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Retire one active memory as no longer true (`deprecated`), keeping its history. Distinct from [`Self::ForgetMemory`], which removes the record from every read path.",
-      "type": "object",
-      "required": [
-        "id",
-        "revision",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "revision": {
-          "description": "The revision the user was looking at. A mismatch is a conflict, not a silent overwrite of a newer record.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "scope": {
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "deprecate_memory"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Rewrite the title and body of one active memory the user is looking at.\n\n`revision` is the revision the page opened: a mismatch is a conflict the user has to resolve, never a silent overwrite of a newer record. The user's own edit IS the authority, so this command is minted by a client surface; the model edits through `memory.update` and its own admission path instead.",
-      "type": "object",
-      "required": [
-        "body",
-        "id",
-        "revision",
-        "session_id",
-        "title",
-        "type"
-      ],
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "revision": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "scope": {
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "title": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "update_memory"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Archive (forget) one active memory id — user-authoritative (no model).",
-      "type": "object",
-      "required": [
-        "id",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "scope": {
-          "description": "Which store holds the record; `(scope, id)` is the identity.",
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "forget_memory"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable.",
-      "type": "object",
-      "required": [
-        "id",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "scope": {
-          "description": "The scope the user reviewed. Never inferred from the id.",
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "accept_memory"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Decline one pending candidate and suppress the same signal from being re-proposed. Distinct from [`Self::ForgetMemory`], which archives an ACTIVE entry: sending a pending id to forget did nothing at all, which is what the Web \"忽略\" button was doing.",
-      "type": "object",
-      "required": [
-        "id",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "scope": {
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "reject_memory"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose.",
-      "type": "object",
-      "required": [
-        "body",
-        "session_id",
-        "type"
-      ],
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "kind": {
-          "description": "Omitted means [`UiMemoryKind::Preference`]: `/remember` exists for \"apply this from now on\", which is what a preference is.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/UiMemoryKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "scope": {
-          "description": "Where the user's explicit write lands. A client that shows no scope picker writes to the project store, as it always has.",
-          "default": "project",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiMemoryScope"
-            }
-          ]
-        },
-        "session_id": {
-          "$ref": "#/definitions/SessionId"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "remember_memory"
           ]
         }
       }
@@ -1404,6 +1087,51 @@
           "enum": [
             "query_context"
           ]
+        }
+      }
+    },
+    {
+      "description": "Read-only usage query over the runtime's durable model-call ledger.\n\nRead-only in the strictest sense: it opens no turn, sends no provider request, and mutates nothing. Answers with [`crate::RuntimeEvent::UsageLoaded`]. A client may issue it while a turn runs; the numbers come from rows that already settled.",
+      "type": "object",
+      "required": [
+        "scope",
+        "session_id",
+        "type",
+        "utc_offset_minutes"
+      ],
+      "properties": {
+        "query_id": {
+          "description": "Correlation token for [`crate::RuntimeEvent::UsageLoaded`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "description": "Which window to aggregate. The runtime resolves it into an explicit range and echoes that range back.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiUsageScope"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_usage"
+          ]
+        },
+        "utc_offset_minutes": {
+          "description": "The caller's UTC offset in minutes, so `today`/`last 7 days`/ `last 30 days` are the caller's own calendar days instead of the runtime host's. Range is validated by the runtime (`-1440..=1440`).",
+          "type": "integer",
+          "format": "int32"
         }
       }
     },
@@ -1999,46 +1727,51 @@
         "user"
       ]
     },
-    "UiMemoryKind": {
-      "description": "What a durable memory IS. Strongly typed so no client invents its own strings for a field the domain has to interpret.",
+    "UiUsageScope": {
+      "description": "The window a usage report covers.\n\nThe runtime — not the client — resolves a scope into an explicit `[from, to)` range and echoes it in the report, so two surfaces showing the same scope can never disagree about its boundary.",
       "oneOf": [
         {
-          "description": "Injected into every turn while active.",
+          "description": "The session's latest turn (the running one, else the last one).",
           "type": "string",
           "enum": [
-            "preference"
+            "turn"
           ]
         },
         {
-          "description": "Reachable by query recall and the catalog, never auto-injected.",
+          "description": "Everything the current session ever spent.",
           "type": "string",
           "enum": [
-            "decision"
+            "session"
           ]
         },
         {
-          "description": "Same reach as a decision.",
+          "description": "The caller's local calendar day.",
           "type": "string",
           "enum": [
-            "note"
+            "today"
           ]
         },
         {
-          "description": "Evidence-bound agent experience. Recalled only when relevant; never injected as a standing rule and never listed in the catalog.",
+          "description": "The caller's local day six days ago through now.",
           "type": "string",
           "enum": [
-            "experience"
+            "last7_days"
+          ]
+        },
+        {
+          "description": "The caller's local day twenty-nine days ago through now.",
+          "type": "string",
+          "enum": [
+            "last30_days"
+          ]
+        },
+        {
+          "description": "Every durable call this runtime's ledger holds.",
+          "type": "string",
+          "enum": [
+            "all"
           ]
         }
-      ]
-    },
-    "UiMemoryScope": {
-      "description": "The scope a memory row or decision belongs to.\n\n`(scope, id)` is the record's identity: the same id in two scopes is two independent memories. An older runtime that sends no scope predates multi-scope listings and only ever served the project store.",
-      "type": "string",
-      "enum": [
-        "global",
-        "project",
-        "local"
       ]
     },
     "UserShellId": {

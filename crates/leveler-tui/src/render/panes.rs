@@ -60,6 +60,24 @@ pub(crate) fn render_list_rows(
     hits: &mut Vec<(Rect, String)>,
 ) {
     let offset = list_scroll_offset(lines.len(), area.height as usize, focus);
+    render_rows_at_offset(frame, area, lines, rows, offset, theme, hits);
+}
+
+/// The same list painter under a scroll offset the PAGE owns.
+///
+/// A page that is one scrolling document (its cursor is only one of the things
+/// on it) cannot let the cursor pick the offset: the user's own scroll and a
+/// section reveal must both be able to move the viewport. The hits come from
+/// this offset, so a click still lands on the row under the pointer.
+pub(crate) fn render_rows_at_offset(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    rows: &[(usize, String)],
+    offset: usize,
+    theme: &crate::theme::Theme,
+    hits: &mut Vec<(Rect, String)>,
+) {
     if area.width > 0 {
         for (line, key) in rows {
             if *line < offset {

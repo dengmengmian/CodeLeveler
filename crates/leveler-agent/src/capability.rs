@@ -1,5 +1,12 @@
 //! Model-requested disclosure. Availability and permission are host facts;
-//! active packs are scoped to one goal and never inferred from task text.
+//! activated packs are session exposure and never inferred from task text.
+//!
+//! `capability(enable)` promises the tools on the following request, so the
+//! activation must outlive the disclosure of one turn: every turn builds a
+//! fresh disclosure from the host facts of that turn, and reads its activated
+//! packs from the session's shared cell. A goal contributes its durable
+//! activations to that cell; it never removes one, because exposure is not
+//! authority and losing it silently is what made the model contradict itself.
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
@@ -13,7 +20,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityId {
     Browser,
-    Memory,
     MultiAgent,
     Skills,
     CodeIntelligence,
@@ -24,9 +30,8 @@ pub enum CapabilityId {
     ExternalTools,
 }
 impl CapabilityId {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Browser,
-        Self::Memory,
         Self::MultiAgent,
         Self::Skills,
         Self::CodeIntelligence,
@@ -39,7 +44,6 @@ impl CapabilityId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Browser => "browser",
-            Self::Memory => "memory",
             Self::MultiAgent => "multi_agent",
             Self::Skills => "skills",
             Self::CodeIntelligence => "code_intelligence",
@@ -59,7 +63,6 @@ impl CapabilityId {
     fn description(self) -> &'static str {
         match self {
             Self::Browser => "Browse/interact with pages",
-            Self::Memory => "Recall/persist context",
             Self::MultiAgent => "Delegate work",
             Self::Skills => "Load instructions",
             Self::CodeIntelligence => "Symbols/references/diagnostics",
@@ -75,7 +78,6 @@ impl CapabilityId {
 pub fn tool_capability(name: &str) -> Option<CapabilityId> {
     match name {
         name if name.starts_with("browser_") => Some(CapabilityId::Browser),
-        "memory" | "remember" | "forget" => Some(CapabilityId::Memory),
         "spawn_agent" => Some(CapabilityId::MultiAgent),
         "load_skill" => Some(CapabilityId::Skills),
         "find_symbol" | "read_symbol" | "find_references" | "diagnostics" | "blast_radius" => {
@@ -89,6 +91,67 @@ pub fn tool_capability(name: &str) -> Option<CapabilityId> {
         "request_user_input" | "ask_user" => Some(CapabilityId::HostInteraction),
         name if name.starts_with("mcp__") => Some(CapabilityId::ExternalTools),
         _ => None,
+    }
+}
+
+/// The activated packs of one SESSION, shared by every turn's disclosure.
+///
+/// A turn's engine is built and dropped per turn, and it must not own the
+/// answer to "which packs did the model enable": the runtime told the model
+/// those tools are available on the following request, and the following
+/// request can belong to a later turn. This cell is that one owner.
+///
+/// Two facts live here, because they have two authorities:
+///
+/// - `session`: activations no goal record owns — a Chat turn's enable, or a
+///   Full-authority enable that deliberately writes no grant. They last for the
+///   session.
+/// - `goal`: what the bound goal contributes — its durable rows plus
+///   activations made while it was bound. Binding another goal replaces this
+///   set, so a new goal still starts with a small surface.
+///
+/// Availability and permission are not here: every turn recomputes them from
+/// its own host facts, so a narrowed profile still gates what this cell holds.
+#[derive(Clone, Default)]
+pub struct SharedCapabilityActivation {
+    session: Arc<RwLock<BTreeSet<CapabilityId>>>,
+    goal: Arc<RwLock<BTreeSet<CapabilityId>>>,
+}
+
+impl SharedCapabilityActivation {
+    pub fn new(active: impl IntoIterator<Item = CapabilityId>) -> Self {
+        Self {
+            session: Arc::new(RwLock::new(active.into_iter().collect())),
+            goal: Arc::new(RwLock::new(BTreeSet::new())),
+        }
+    }
+
+    fn contains(&self, id: CapabilityId) -> bool {
+        self.session.read().expect("capability lock").contains(&id)
+            || self.goal.read().expect("capability lock").contains(&id)
+    }
+
+    /// The union, read-only: asking which packs are active must not move one
+    /// fact into the other's set.
+    fn ids(&self) -> Vec<CapabilityId> {
+        let session: BTreeSet<_> = self.session.read().expect("capability lock").clone();
+        let goal: BTreeSet<_> = self.goal.read().expect("capability lock").clone();
+        session.union(&goal).copied().collect()
+    }
+
+    fn insert_session(&self, id: CapabilityId) -> bool {
+        self.session.write().expect("capability lock").insert(id)
+    }
+
+    fn insert_goal(&self, id: CapabilityId) -> bool {
+        self.goal.write().expect("capability lock").insert(id)
+    }
+
+    /// The bound goal's activation is exactly its record plus what this turn
+    /// activated on it. A different goal replaces it; the session's own
+    /// activations are untouched.
+    fn replace_goal(&self, next: BTreeSet<CapabilityId>) {
+        *self.goal.write().expect("capability lock") = next;
     }
 }
 
@@ -106,7 +169,7 @@ pub struct CapabilityDisclosure {
     /// are exposed without an enable round trip and are never persisted as a
     /// grant, so a goal restore cannot take them away.
     default_active: BTreeSet<CapabilityId>,
-    active: Arc<RwLock<BTreeSet<CapabilityId>>>,
+    active: SharedCapabilityActivation,
     binding: RwLock<Option<GoalBinding>>,
     enable_gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -126,10 +189,31 @@ impl CapabilityDisclosure {
             available,
             permitted,
             default_active: BTreeSet::new(),
-            active: Arc::new(RwLock::new(active)),
+            active: SharedCapabilityActivation::new(active),
             binding: RwLock::new(None),
             enable_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// Build the disclosure of one turn over a session's shared activation.
+    ///
+    /// Unlike [`Self::new`], an activation the CURRENT turn's host facts do not
+    /// support is not an error: the mode, the permission profile or a project
+    /// switch may have narrowed since the enable. The cell keeps it, and
+    /// [`Self::exposed`] reports the truth for this request.
+    pub fn for_session(
+        available: Vec<CapabilityId>,
+        permitted: Vec<CapabilityId>,
+        activation: SharedCapabilityActivation,
+    ) -> Self {
+        Self {
+            available: available.into_iter().collect(),
+            permitted: permitted.into_iter().collect(),
+            default_active: BTreeSet::new(),
+            active: activation,
+            binding: RwLock::new(None),
+            enable_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// Mark capabilities as part of the product's default surface.
@@ -166,29 +250,26 @@ impl CapabilityDisclosure {
                 return Err(format!("capability not permitted: {}", id.as_str()));
             }
             // Full removes the permission check, not disclosure. Activate the
-            // pack for this session so its tools reach the next request, but
-            // never write a grant: exposure is not authority, and a resumed
-            // Full session asks again through the same catalog.
-            let mut active = self.active.write().expect("capability lock");
-            return Ok(active.insert(id));
+            // pack for this session so its tools reach the following requests,
+            // but never write a grant: exposure is not authority, and a resumed
+            // Full session asks again through the same catalog. No goal record
+            // owns this fact, so it joins the session's activations.
+            return Ok(self.active.insert_session(id));
         }
         self.enable(id).await
     }
 
     pub fn active(&self) -> Vec<CapabilityId> {
         self.active
-            .read()
-            .expect("capability lock")
-            .iter()
-            .copied()
+            .ids()
+            .into_iter()
             .filter(|id| self.available.contains(id) && self.permitted.contains(id))
             .collect()
     }
     pub fn exposed(&self, id: CapabilityId) -> bool {
         self.available.contains(&id)
             && self.permitted.contains(&id)
-            && (self.default_active.contains(&id)
-                || self.active.read().expect("capability lock").contains(&id))
+            && (self.default_active.contains(&id) || self.active.contains(id))
     }
     pub fn permits_tool(&self, name: &str) -> bool {
         tool_capability(name).is_none_or(|id| self.exposed(id))
@@ -263,14 +344,18 @@ impl CapabilityDisclosure {
             return Ok(false);
         }
         let binding = self.binding.read().expect("capability lock").clone();
-        if let Some(binding) = binding {
-            binding
-                .store
-                .enable_capability(&binding.token, &binding.goal, id.as_str())
-                .await
-                .map_err(|error| format!("capability persistence failed: {error}"))?;
-        }
-        self.active.write().expect("capability lock").insert(id);
+        let Some(binding) = binding else {
+            // No goal owns this activation: it is the session's.
+            self.active.insert_session(id);
+            tracing::info!(capability = id.as_str(), event = "capability_enabled");
+            return Ok(true);
+        };
+        binding
+            .store
+            .enable_capability(&binding.token, &binding.goal, id.as_str())
+            .await
+            .map_err(|error| format!("capability persistence failed: {error}"))?;
+        self.active.insert_goal(id);
         tracing::info!(capability = id.as_str(), event = "capability_enabled");
         Ok(true)
     }
@@ -287,19 +372,19 @@ impl CapabilityDisclosure {
             .map_err(|e| e.to_string())?;
         let active: BTreeSet<_> = restored
             .iter()
+            .filter(|id| id.as_str() != "memory")
             .map(|id| CapabilityId::parse(id))
             .collect::<Result<_, _>>()?;
         if !active.is_subset(&self.available) || !active.is_subset(&self.permitted) {
             return Err("restored capability unavailable or not permitted".into());
         }
-        *self.active.write().expect("capability lock") = active;
+        // The bound goal's durable activations replace the previous goal's, so
+        // a new goal never inherits an older one's pack. This session's own
+        // activations are untouched.
+        self.active.replace_goal(active);
         *self.binding.write().expect("capability lock") = Some(GoalBinding { store, token, goal });
         tracing::info!(event = "tool_surface_changed", reason = "resume_restored", active_capabilities = ?self.active());
         Ok(())
-    }
-    pub fn reset(&self) {
-        self.active.write().expect("capability lock").clear();
-        *self.binding.write().expect("capability lock") = None;
     }
 }
 
@@ -316,6 +401,61 @@ pub fn control_definition() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn legacy_goal_activation_skips_only_the_retired_pack() {
+        use leveler_core::{BootId, OwnerEpoch, RuntimeId, TaskId};
+        use leveler_storage::{
+            MemoryGoalStore, MemoryOwnershipState, MemoryOwnershipStore, OwnershipStore,
+        };
+        let ownership = Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("legacy-capability-goal");
+        ownership.register_task(&task);
+        let token = MemoryOwnershipStore::new(ownership.clone())
+            .acquire(
+                &task,
+                &RuntimeId::new("runtime"),
+                &BootId::new("boot"),
+                OwnerEpoch::UNOWNED,
+            )
+            .await
+            .unwrap();
+        let store = Arc::new(MemoryGoalStore::new().with_ownership(ownership));
+        let goal = store
+            .open(&token, "resume work", leveler_core::now())
+            .await
+            .unwrap();
+        store
+            .enable_capability(&token, &goal, "memory")
+            .await
+            .unwrap();
+        store
+            .enable_capability(&token, &goal, "browser")
+            .await
+            .unwrap();
+        let disclosure = CapabilityDisclosure::new(
+            vec![CapabilityId::Browser],
+            vec![CapabilityId::Browser],
+            vec![],
+        )
+        .unwrap();
+        disclosure
+            .bind_goal(store.clone(), token.clone(), goal.clone())
+            .await
+            .unwrap();
+        assert_eq!(disclosure.active(), vec![CapabilityId::Browser]);
+        store
+            .enable_capability(&token, &goal, "unknown_future_pack")
+            .await
+            .unwrap();
+        assert!(
+            disclosure
+                .bind_goal(store, token, goal)
+                .await
+                .unwrap_err()
+                .contains("unknown_future_pack")
+        );
+    }
+
     #[tokio::test]
     async fn enabled_pack_exposes_only_its_tools_and_is_idempotent() {
         let state = CapabilityDisclosure::new(
@@ -338,8 +478,8 @@ mod tests {
         // stays available-but-unpermitted here to prove disclosure still obeys
         // the host's authority fact.
         let state = CapabilityDisclosure::new(
-            vec![CapabilityId::Memory, CapabilityId::Web],
-            vec![CapabilityId::Memory],
+            vec![CapabilityId::Skills, CapabilityId::Web],
+            vec![CapabilityId::Skills],
             vec![],
         )
         .unwrap();
@@ -352,15 +492,15 @@ mod tests {
         );
         assert!(
             state
-                .enable_with_authority(CapabilityId::Memory, true)
+                .enable_with_authority(CapabilityId::Skills, true)
                 .await
                 .unwrap(),
             "Full activates an available capability without approval"
         );
-        assert!(state.exposed(CapabilityId::Memory));
+        assert!(state.exposed(CapabilityId::Skills));
         assert!(
             !state
-                .enable_with_authority(CapabilityId::Memory, true)
+                .enable_with_authority(CapabilityId::Skills, true)
                 .await
                 .unwrap(),
             "a second enable is idempotent"
@@ -379,34 +519,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_default_capability_needs_no_enable_round_trip_and_survives_reset() {
-        let state = CapabilityDisclosure::new(
-            vec![CapabilityId::Memory],
-            vec![CapabilityId::Memory],
-            vec![],
-        )
-        .unwrap()
-        .with_default_active(vec![CapabilityId::Memory])
-        .unwrap();
+    async fn a_default_capability_needs_no_enable_round_trip_and_is_not_a_grant() {
+        let session = SharedCapabilityActivation::default();
+        let default_turn = |activation: SharedCapabilityActivation| {
+            CapabilityDisclosure::for_session(
+                vec![CapabilityId::Skills],
+                vec![CapabilityId::Skills],
+                activation,
+            )
+            .with_default_active(vec![CapabilityId::Skills])
+            .unwrap()
+        };
+        let state = default_turn(session.clone());
         assert!(
-            state.exposed(CapabilityId::Memory),
+            state.exposed(CapabilityId::Skills),
             "the product's default surface is visible on the first request"
         );
-        assert!(state.permits_tool("remember"));
+        assert!(state.permits_tool("load_skill"));
         assert!(
-            !state.enable(CapabilityId::Memory).await.unwrap(),
+            !state.enable(CapabilityId::Skills).await.unwrap(),
             "a default is already exposed; enabling it is a no-op, not a new grant"
         );
-        state.reset();
+        // The next turn builds its own disclosure over the same session cell.
+        let next = default_turn(session);
         assert!(
-            state.exposed(CapabilityId::Memory),
-            "a chat turn reset must not take the default surface away"
+            next.exposed(CapabilityId::Skills),
+            "the default surface is not something a turn boundary can take away"
         );
         assert!(
-            state.active().is_empty(),
+            next.active().is_empty(),
             "a default must never be reported as a persisted grant"
         );
-        assert!(state.fresh().exposed(CapabilityId::Memory));
+        assert!(state.fresh().exposed(CapabilityId::Skills));
     }
 
     #[tokio::test]
@@ -414,21 +558,21 @@ mod tests {
         let unavailable = CapabilityDisclosure::new(vec![], vec![], vec![]).unwrap();
         assert!(
             unavailable
-                .with_default_active(vec![CapabilityId::Memory])
+                .with_default_active(vec![CapabilityId::Skills])
                 .is_err()
         );
         let unpermitted =
-            CapabilityDisclosure::new(vec![CapabilityId::Memory], vec![], vec![]).unwrap();
+            CapabilityDisclosure::new(vec![CapabilityId::Skills], vec![], vec![]).unwrap();
         assert!(
             unpermitted
-                .with_default_active(vec![CapabilityId::Memory])
+                .with_default_active(vec![CapabilityId::Skills])
                 .is_err()
         );
     }
 
     #[tokio::test]
     async fn availability_and_permission_both_gate_enable() {
-        let state = CapabilityDisclosure::new(vec![CapabilityId::Memory], vec![], vec![]).unwrap();
+        let state = CapabilityDisclosure::new(vec![CapabilityId::Skills], vec![], vec![]).unwrap();
         assert!(
             state
                 .enable(CapabilityId::Browser)
@@ -438,7 +582,7 @@ mod tests {
         );
         assert!(
             state
-                .enable(CapabilityId::Memory)
+                .enable(CapabilityId::Skills)
                 .await
                 .unwrap_err()
                 .contains("not permitted")
@@ -469,13 +613,96 @@ mod tests {
             vec![CapabilityId::Browser],
         )
         .unwrap();
-        let mut memory = control_definition();
-        memory.name = "memory".into();
-        let child = parent.for_child(&[memory]);
+        let mut skill = control_definition();
+        skill.name = "load_skill".into();
+        let child = parent.for_child(&[skill]);
         assert!(!child.exposed(CapabilityId::Browser));
         assert!(child.enable(CapabilityId::Authoring).await.is_err());
-        assert!(child.enable(CapabilityId::Memory).await.unwrap());
-        assert!(parent.exposed(CapabilityId::Memory));
+        assert!(child.enable(CapabilityId::Skills).await.unwrap());
+        assert!(parent.exposed(CapabilityId::Skills));
         assert!(!child.permits_tool("browser_tab"));
+    }
+
+    /// A turn's engine is thrown away; the session's activation is not. This
+    /// is the surface a real TUI run saw vanish one turn after the enable.
+    #[tokio::test]
+    async fn a_session_activation_outlives_the_disclosure_of_one_turn() {
+        let session = SharedCapabilityActivation::default();
+        let turn_one = CapabilityDisclosure::for_session(
+            CapabilityId::ALL.to_vec(),
+            CapabilityId::ALL.to_vec(),
+            session.clone(),
+        );
+        assert!(!turn_one.permits_tool("spawn_agent"));
+        assert!(turn_one.enable(CapabilityId::MultiAgent).await.unwrap());
+
+        let turn_two = CapabilityDisclosure::for_session(
+            CapabilityId::ALL.to_vec(),
+            CapabilityId::ALL.to_vec(),
+            session.clone(),
+        );
+        assert!(
+            turn_two.permits_tool("spawn_agent"),
+            "the next turn's request must carry the pack the previous turn enabled"
+        );
+        let catalog = turn_two.catalog();
+        let entry = catalog
+            .as_array()
+            .expect("the catalog is a list")
+            .iter()
+            .find(|entry| entry["id"] == "multi_agent")
+            .expect("multi_agent is in the catalog");
+        assert_eq!(entry["exposed"].as_bool(), Some(true));
+
+        // Narrowed host facts gate it for this turn without destroying the
+        // activation: authority is recomputed, exposure is remembered.
+        let narrowed = CapabilityDisclosure::for_session(
+            CapabilityId::ALL.to_vec(),
+            CapabilityId::ALL
+                .into_iter()
+                .filter(|id| *id != CapabilityId::MultiAgent)
+                .collect(),
+            session.clone(),
+        );
+        assert!(!narrowed.permits_tool("spawn_agent"));
+        assert!(
+            narrowed
+                .enable(CapabilityId::MultiAgent)
+                .await
+                .unwrap_err()
+                .contains("not permitted")
+        );
+
+        let turn_three = CapabilityDisclosure::for_session(
+            CapabilityId::ALL.to_vec(),
+            CapabilityId::ALL.to_vec(),
+            session,
+        );
+        assert!(
+            turn_three.permits_tool("spawn_agent"),
+            "a gate that lifted must not have silently erased the activation"
+        );
+    }
+
+    /// Goal activation stays scoped to its goal: a new goal starts small and
+    /// does not inherit the previous goal's packs, while the session's own
+    /// activations are not the goal's to take away.
+    #[test]
+    fn a_new_goal_replaces_the_goals_packs_and_keeps_the_sessions_own() {
+        let session = SharedCapabilityActivation::default();
+        session.replace_goal([CapabilityId::Skills].into_iter().collect());
+        assert!(session.contains(CapabilityId::Skills));
+
+        session.insert_session(CapabilityId::MultiAgent);
+        session.replace_goal(BTreeSet::new());
+        assert!(
+            !session.contains(CapabilityId::Skills),
+            "a new goal must not inherit the previous goal's activation"
+        );
+        assert!(
+            session.contains(CapabilityId::MultiAgent),
+            "the goal rebind is not the session's to revoke"
+        );
+        assert_eq!(session.ids(), vec![CapabilityId::MultiAgent]);
     }
 }

@@ -547,15 +547,6 @@ async function handleDeliver(ws, frame) {
     case 'restore_checkpoint':
       emit({ type: 'notification', level: 'info', message: `已回滚到检查点 ${command.checkpoint_id}` });
       return;
-    case 'list_memory':
-      emit({
-        type: 'memory_list',
-        memory_dir: '.leveler/memory',
-        active: [{ id: 'mem-1', title: '构建用 cargo nextest' }],
-        archived: [],
-        pending: [{ id: 'mem-p1', title: '项目使用 Rust workspace 布局' }],
-      });
-      return;
     case 'list_agents':
       emit({ type: 'agents_loaded', query_id: command.query_id, agents: resolveAgents().map((r) => r.entry), problems: [] });
       return;
@@ -573,9 +564,6 @@ async function handleDeliver(ws, frame) {
     case 'delete_agent':
       mutateAgent(command);
       return;
-    case 'accept_memory':
-      emit({ type: 'notification', level: 'info', message: `记忆已采纳：${command.id}` });
-      return;
     case 'btw': {
       emit({ type: 'btw_started', question: command.question });
       await sleep(400);
@@ -589,7 +577,6 @@ async function handleDeliver(ws, frame) {
     case 'confirm_plan_to_goal':
     case 'add_attachment':
     case 'add_clipboard_image':
-    case 'forget_memory':
       // 协议内合法但 demo 未实现：ack 已回，给个提示事件而不是 error
       emit({ type: 'notification', level: 'info', message: `mock 未实现命令：${command.type}` });
       return;

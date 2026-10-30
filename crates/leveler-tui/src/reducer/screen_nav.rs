@@ -82,9 +82,20 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
         Screen::Team => crate::multi_agent::select_team_delta(state, notches),
         Screen::Issue => crate::issue::move_selection(state, notches),
         Screen::Trace => state.trace.move_sel(notches),
-        Screen::Context => crate::context::move_sel(&mut state.context, notches),
+        Screen::Context => match state.stats_section {
+            crate::screen::StatsSection::Context => {
+                crate::context::move_sel(&mut state.context, notches)
+            }
+            crate::screen::StatsSection::Usage => {
+                let lines = (notches * 3).unsigned_abs();
+                state.screen_scroll = if notches < 0 {
+                    state.screen_scroll.saturating_sub(lines)
+                } else {
+                    state.screen_scroll.saturating_add(lines)
+                }
+            }
+        },
         Screen::Clean => state.clean.move_selection(notches),
-        Screen::Memory => crate::memory::wheel(state, notches),
         Screen::Help => {
             let t = state.t();
             state.help.move_selection(notches, t);
@@ -148,9 +159,6 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
                 state.help.select(index, state.t());
             }
         }
-        // Memory rows are keyed by stable record id (or `menu:<n>`); the page
-        // decides whether that id still exists.
-        Screen::Memory => crate::memory::select_row(state, key),
         _ => {}
     }
     Vec::new()
@@ -461,15 +469,38 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 }
             }
         }
-        Screen::Context => match key.code {
-            KeyCode::Esc => return back(state),
-            KeyCode::Up | KeyCode::Char('k') => crate::context::move_sel(&mut state.context, -1),
-            KeyCode::Down | KeyCode::Char('j') => crate::context::move_sel(&mut state.context, 1),
-            KeyCode::Enter => crate::context::toggle_selected(&mut state.context),
-            _ => {
-                scroll_screen_key(state, &key, true);
+        Screen::Context => {
+            use crate::screen::StatsSection;
+            match key.code {
+                KeyCode::Esc => return close_stats_effect(state),
+                // `Tab`/`Shift+Tab` and `[`/`]` change the Usage range. None of
+                // them is bound elsewhere on this page, so the page adds one
+                // interaction without disturbing the navigation it already had.
+                KeyCode::Tab | KeyCode::Char(']') => return cycle_usage_scope(state, true),
+                // Shift+Tab is the permission cycle everywhere (handled before
+                // any page key), so backwards is `[`, not a stolen chord.
+                KeyCode::Char('[') => return cycle_usage_scope(state, false),
+                // The cursor belongs to the Context breakdown. In the Usage
+                // section the arrow keys scroll the document instead, because
+                // that section has no selectable rows.
+                KeyCode::Up | KeyCode::Char('k') => match state.stats_section {
+                    StatsSection::Context => crate::context::move_sel(&mut state.context, -1),
+                    StatsSection::Usage => {
+                        state.screen_scroll = state.screen_scroll.saturating_sub(1)
+                    }
+                },
+                KeyCode::Down | KeyCode::Char('j') => match state.stats_section {
+                    StatsSection::Context => crate::context::move_sel(&mut state.context, 1),
+                    StatsSection::Usage => {
+                        state.screen_scroll = state.screen_scroll.saturating_add(1)
+                    }
+                },
+                KeyCode::Enter => crate::context::toggle_selected(&mut state.context),
+                _ => {
+                    scroll_screen_key(state, &key, true);
+                }
             }
-        },
+        }
         Screen::Clean => match key.code {
             // Esc leaves the page. It never cancels foreground Agent work, and
             // a cleanup already running keeps running: the page owns no work
@@ -493,10 +524,6 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 scroll_screen_key(state, &key, true);
             }
         },
-        // The memory page owns ESC's one-level rule itself (detail → list →
-        // home → conversation). A/R are the only keys that decide consent;
-        // Esc never does.
-        Screen::Memory => return crate::memory::screen_key(state, key),
         Screen::Conversation => {}
     }
     Vec::new()
@@ -534,15 +561,10 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
                 crate::activity::close_background_list(state);
             }
         }
+        // The Context & Usage page drops the queries it owned on the way out.
+        Screen::Context => close_stats(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
-        // The memory page has internal levels; Esc and the header's `←` both
-        // walk exactly one of them.
-        Screen::Memory if crate::memory::owns_back(state) => crate::memory::back_one(state),
-        // A page that was opened FROM another page returns there: the opener
-        // recorded itself, so the page never guesses its parent. Pages with no
-        // opener (the ones the workbench, a slash command or the state strip
-        // opens) have no target and leave for the conversation.
         _ => match state.detail_return.take() {
             Some(parent) => {
                 state.active_screen = parent;
@@ -680,6 +702,13 @@ fn selected_child_cancel(state: &AppState) -> Option<leveler_client_protocol::Cl
 fn close_screen(state: &mut AppState) {
     state.active_screen = Screen::Conversation;
     state.screen_scroll = 0;
+    // Leaving a live read-only page ends the queries it owned: an answer that
+    // arrives after the reader left must not be applied to a page nobody is
+    // looking at, and must not leave the next open stuck in "loading".
+    state.trace.track.reset();
+    state.context.track.reset();
+    state.usage.track.reset();
+    state.stats_reveal = None;
 }
 
 /// Toggle a screen on/off (returns to the conversation if already active).
@@ -742,16 +771,58 @@ pub(super) fn open_trace(
     ))]
 }
 
-/// Open the Context Inspector and ask the runtime for the current accounting.
-pub(super) fn open_context(state: &mut AppState) -> Vec<Effect> {
-    if state.active_screen == Screen::Context {
-        state.active_screen = Screen::Conversation;
-        return Vec::new();
-    }
+/// Open the Context & Usage page at `section`.
+///
+/// `/context` and `/usage` are two entry points into ONE page: the Context
+/// section (what the next request is made of) and the Usage section (what the
+/// session spent). Neither has a body of its own, so a change to either can
+/// never make the two commands drift apart.
+///
+/// Opening is always "show this page at this section"; Esc is the one way out.
+/// The page owns the keyboard while it is up, so a second command can only be
+/// typed after leaving it — a toggle on the same section would be unreachable.
+///
+/// Both queries are read-only and are issued here rather than by a turn: no
+/// model request, no queue, and both answer while the agent is running.
+pub(super) fn open_stats(
+    state: &mut AppState,
+    section: crate::screen::StatsSection,
+) -> Vec<Effect> {
     state.active_screen = Screen::Context;
+    state.stats_section = section;
+    state.stats_reveal = Some(section);
     state.screen_scroll = 0;
     state.context.selected = 0;
-    vec![Effect::Send(crate::context::issue_query(state))]
+    // One page, two sections: BOTH are asked for, whichever section the entry
+    // point reveals. Opening `/context` must not leave the Usage section
+    // pretending to wait for an answer nobody requested.
+    vec![
+        Effect::Send(crate::context::issue_query(state)),
+        Effect::Send(crate::usage::query(state)),
+    ]
+}
+
+/// Esc handler for the page: leave it and forget the queries it owned.
+fn close_stats_effect(state: &mut AppState) -> Vec<Effect> {
+    close_stats(state);
+    Vec::new()
+}
+
+/// Leave the page. The queries it owns stop being owed answers.
+pub(super) fn close_stats(state: &mut AppState) {
+    state.active_screen = Screen::Conversation;
+    state.screen_scroll = 0;
+    state.stats_reveal = None;
+    state.context.track.reset();
+    state.usage.track.reset();
+}
+
+/// Switch the Usage section's range and ask for the report for it.
+pub(super) fn cycle_usage_scope(state: &mut AppState, forward: bool) -> Vec<Effect> {
+    state.usage.cycle_scope(forward);
+    state.stats_section = crate::screen::StatsSection::Usage;
+    state.stats_reveal = Some(crate::screen::StatsSection::Usage);
+    vec![Effect::Send(crate::usage::query(state))]
 }
 
 /// Open `/clean` and start a fresh scan. The scan runs off-thread in the event

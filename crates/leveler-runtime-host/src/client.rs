@@ -998,13 +998,37 @@ pub async fn reconcile_runtime_generation(
             Ok(None)
         }
         RuntimeConsistency::ConfigChanged => {
+            // A same-build runtime serving an older configuration generation is
+            // NOT a reason to replace it: the configuration is hot-reloadable
+            // state. Ask it to re-read the files instead. A runtime that does
+            // not understand the command (an older build) answers with a
+            // transport error; only then is a replacement the right answer.
             tracing::info!(
-                "local runtime loaded a different configuration generation; asking it to retire"
+                "local runtime loaded an older configuration generation; asking it to reload"
             );
+            if reload_runtime_config(&client).await.is_ok() {
+                return Ok(Some(client));
+            }
+            tracing::info!("runtime cannot reload configuration in place; asking it to retire");
             retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui).await?;
             Ok(None)
         }
     }
+}
+
+/// Ask a running runtime to re-read its configuration sources and apply them.
+///
+/// The command is acknowledged only after the reload handler ran, so a
+/// successful answer means the runtime already published (or refused) the new
+/// generation. A failure here is a transport/protocol failure — the command is
+/// unknown to an older daemon, or the connection died — and the caller decides
+/// what that means.
+#[cfg(any(unix, windows))]
+async fn reload_runtime_config(client: &LocalSocketRuntimeClient) -> anyhow::Result<()> {
+    client
+        .send(leveler_client_protocol::ClientCommand::ReloadConfig { query_id: None })
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 #[cfg(not(any(unix, windows)))]

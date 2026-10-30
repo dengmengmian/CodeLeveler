@@ -62,6 +62,117 @@ pub struct HostedTask {
     pub finished_at_ms: Option<u64>,
     pub log_end: u64,
     pub log_prefix_len: usize,
+    /// Set only by recovery, after the owning host was proven gone. Its
+    /// presence means the exit fact is missing: the status is `Unknown` and
+    /// [`TaskLoss::process`] says whether a workload may still exist.
+    #[serde(default)]
+    pub loss: Option<TaskLoss>,
+}
+
+impl HostedTask {
+    /// The record still describes work its host owns. Recovery converges these;
+    /// nothing else rewrites them.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.snapshot.status,
+            BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
+        )
+    }
+
+    /// Whether an unrecovered record may still describe a running workload.
+    /// Only a recovery pass that found the process identity gone says no.
+    pub fn process_may_still_exist(&self) -> bool {
+        self.loss
+            .as_ref()
+            .is_some_and(|loss| loss.process.may_still_own_process())
+    }
+
+    /// Terminal status plus proof that nothing of this workload is left. This is
+    /// the precondition for semantic settlement of its write reservation.
+    ///
+    /// `Unknown` alone is not proof: it means the owner lost the ability to
+    /// observe the process. Only recovery's `Gone` evidence (or the host's own
+    /// `Exited`/`Killed` fact) says the namespace can no longer be written.
+    pub fn settlement_proven(&self) -> bool {
+        match self.snapshot.status {
+            BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed => true,
+            BackgroundTaskStatus::Unknown => self
+                .loss
+                .as_ref()
+                .is_some_and(|loss| !loss.process.may_still_own_process()),
+            BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing => false,
+        }
+    }
+}
+
+/// What a recovery pass could observe about the process a lost host owned.
+///
+/// A lost host has no handle, pipes or child status any more; these are the only
+/// OS facts left. They are never used to signal, adopt or replay a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessPresence {
+    /// The recorded process group and its session have no members left: the
+    /// workload is over. No exit code was observed, so the status is `Unknown`.
+    Gone,
+    /// A process with the recorded group or session identity still exists. A
+    /// recycled id cannot be told apart from the lost workload, so it is
+    /// neither signalled nor adopted.
+    Present,
+    /// No identity was recorded, or this platform cannot probe it.
+    Unobservable,
+}
+
+impl ProcessPresence {
+    /// Whether this evidence allows a write reservation to be settled. Only
+    /// `Gone` proves that a workload can no longer write.
+    pub fn may_still_own_process(self) -> bool {
+        !matches!(self, Self::Gone)
+    }
+}
+
+/// The durable explanation for a terminal task whose exit fact never arrived.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskLoss {
+    /// When the recovery observed the host's absence.
+    pub observed_at_ms: u64,
+    /// The status the lost host last recorded, preserved for audit.
+    pub previous: BackgroundTaskStatus,
+    /// What was observable about the workload at that moment.
+    pub process: ProcessPresence,
+}
+
+/// What one recovery pass converged for a repository's durable host state.
+#[derive(Clone, Debug)]
+pub struct HostRecovery {
+    pub observed_at_ms: u64,
+    /// Archived live tasks converged to `Unknown`.
+    pub tasks: Vec<RecoveredTask>,
+    /// Spawn intents that never proved whether a process was launched.
+    pub unresolved_intents: Vec<String>,
+}
+
+impl HostRecovery {
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty() && self.unresolved_intents.is_empty()
+    }
+}
+
+/// One task the recovery converged, in the terms the user can act on.
+#[derive(Clone, Debug)]
+pub struct RecoveredTask {
+    pub task_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub previous: BackgroundTaskStatus,
+    pub process: ProcessPresence,
+}
+
+/// What a probe found, and what it had to reconcile to answer.
+pub struct HostProbe {
+    /// The live host, when one answered with the recorded instance.
+    pub client: Option<ExecutionHostClient>,
+    /// Residue of a host that is provably gone, converged in this probe.
+    pub recovery: Option<HostRecovery>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Ready {
@@ -249,6 +360,13 @@ fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     Ok(())
 }
 fn lock(path: &Path) -> Result<std::fs::File, String> {
+    try_lock(path)?.ok_or_else(|| "Execution Host lifecycle lock is busy".to_string())
+}
+
+/// Take the lock when it is free, so a caller can tell "held by a live owner"
+/// from "I may act". A lock error that is not contention is also reported as
+/// held: unknown ownership is never guessed at either.
+fn try_lock(path: &Path) -> Result<Option<std::fs::File>, String> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -257,9 +375,10 @@ fn lock(path: &Path) -> Result<std::fs::File, String> {
         options.mode(0o600);
     }
     let f = options.open(path).map_err(|e| e.to_string())?;
-    f.try_lock_exclusive()
-        .map_err(|_| "Execution Host lifecycle lock is busy".to_string())?;
-    Ok(f)
+    match f.try_lock_exclusive() {
+        Ok(()) => Ok(Some(f)),
+        Err(_) => Ok(None),
+    }
 }
 fn ready(config: &ExecutionHostConfig) -> Result<Ready, String> {
     secure_dir(&config.state_dir)?;
@@ -325,7 +444,8 @@ impl std::error::Error for SpawnError {}
 /// caller that must decide between "residue" and "unknown" reads them here.
 pub struct HostRecords {
     tasks: Vec<HostedTask>,
-    intents_outstanding: bool,
+    active_intents: Vec<SpawnIntent>,
+    unresolved_intents: Vec<UnresolvedIntent>,
 }
 
 impl HostRecords {
@@ -338,39 +458,71 @@ impl HostRecords {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(format!("could not read Execution Host task archive: {e}")),
         };
-        let intents_outstanding = match std::fs::read(state_dir.join("intents.json")) {
-            Ok(bytes) => {
-                let intents: Vec<SpawnIntent> = serde_json::from_slice(&bytes)
-                    .map_err(|e| format!("invalid Execution Host spawn intents: {e}"))?;
-                !intents.is_empty()
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        let active_intents = match std::fs::read(state_dir.join("intents.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("invalid Execution Host spawn intents: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(format!("could not read Execution Host spawn intents: {e}")),
+        };
+        let unresolved_intents = match std::fs::read(state_dir.join("intents.unresolved.json")) {
+            Ok(bytes) => serde_json::from_slice::<Vec<UnresolvedIntent>>(&bytes)
+                .map_err(|e| format!("invalid unresolved Execution Host spawn intents: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(format!(
+                    "could not read unresolved Execution Host spawn intents: {e}"
+                ));
+            }
         };
         Ok(Self {
             tasks,
-            intents_outstanding,
+            active_intents,
+            unresolved_intents,
         })
     }
 
     /// A task the archive still holds as live is ownership, never residue.
     pub fn has_unmanaged_process(&self) -> bool {
-        self.tasks.iter().any(|task| {
-            matches!(
-                task.snapshot.status,
-                BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
-            )
-        })
+        self.tasks.iter().any(HostedTask::is_live)
     }
 
     /// A spawn whose OS result was never recorded may still be running.
+    /// Recovery archives these before a runtime may start.
     pub fn intents_outstanding(&self) -> bool {
-        self.intents_outstanding
+        !self.active_intents.is_empty()
+    }
+
+    /// This task's spawn may have been launched but never recorded. It is never
+    /// treated as "never admitted".
+    pub fn has_active_intent(&self, task_id: &str) -> bool {
+        self.active_intents
+            .iter()
+            .any(|intent| intent.id == task_id)
     }
 
     /// Whether the host ever admitted this task as a process fact.
     pub fn has_task(&self, task_id: &str) -> bool {
-        self.tasks.iter().any(|task| task.snapshot.id == task_id)
+        self.task(task_id).is_some()
+    }
+
+    pub fn task(&self, task_id: &str) -> Option<&HostedTask> {
+        self.tasks.iter().find(|task| task.snapshot.id == task_id)
+    }
+
+    /// The archived process facts, including terminal ones whose controlling
+    /// host is gone. Reading them is not ownership: callers must not signal or
+    /// adopt from this list.
+    pub fn tasks(&self) -> &[HostedTask] {
+        &self.tasks
+    }
+
+    /// A recorded spawn intent whose launch was never proven either way. It owns
+    /// no process fact, but it may own a process, so it is never treated as
+    /// "never admitted".
+    pub fn has_unresolved_intent(&self, task_id: &str) -> bool {
+        self.unresolved_intents
+            .iter()
+            .any(|unresolved| unresolved.intent.id == task_id)
     }
 }
 
@@ -391,27 +543,172 @@ impl ConnectFailure {
     }
 }
 
-/// Remove the ready file of a host that is provably gone.
+/// What the OS can still say about a lost host's process group.
+///
+/// The recorded pid is the group leader (every spawn uses `process_group(0)`,
+/// terminal tasks additionally own a session), so absence of the group and its
+/// session is the only proof available without the host that owned them. Every
+/// other answer — present, `EPERM`, a probe this platform cannot run — is not
+/// proof, and recovery is not allowed to guess.
+fn process_presence(pid: Option<u32>) -> ProcessPresence {
+    #[cfg(unix)]
+    {
+        use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+        let Some(pid) = pid else {
+            return ProcessPresence::Unobservable;
+        };
+        match killpg(Pid::from_raw(pid as i32), None) {
+            Err(Errno::ESRCH) => {}
+            Ok(()) | Err(_) => return ProcessPresence::Present,
+        }
+        // A terminal task owns a session: job-control shells create further
+        // process groups inside it, so an empty group alone is not the end.
+        match crate::pty::session_members(pid as i32) {
+            Ok(members) if members.is_empty() => ProcessPresence::Gone,
+            Ok(_) => ProcessPresence::Present,
+            Err(_) => ProcessPresence::Unobservable,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        ProcessPresence::Unobservable
+    }
+}
+
+/// Reconcile the durable records of a host that is provably gone.
 ///
 /// The lifecycle lock is the authority: `serve` holds it for the host's whole
 /// life and the kernel drops it when the holder dies, so a lock this process can
-/// take proves the owner is gone. The durable records must agree — an archive
-/// that still lists live work, an unresolved spawn intent, or records that
-/// cannot be read all mean the residue may still describe ownership, and
-/// ownership is never guessed at.
-fn clear_dead_host_residue(config: &ExecutionHostConfig) -> Result<(), String> {
-    if lock(&config.state_dir.join("host.lock")).is_err() {
-        return Err("the lifecycle lock is held".into());
+/// take proves the owner is gone. `Ok(None)` therefore means "not mine to
+/// recover" — either a live host still holds the lock, or there is no residue.
+///
+/// Live archive records are converged to `Unknown` with the observed evidence,
+/// never to a fabricated exit: the host can no longer observe an exit code, so
+/// the only honest terminal fact is that control is lost. A workload that may
+/// still exist is recorded as present and is never signalled, adopted or
+/// replayed. Spawn intents that no host can resolve move to
+/// `intents.unresolved.json`, keeping their evidence out of the way of startup
+/// without pretending a process fact exists.
+fn recover_dead_host(config: &ExecutionHostConfig) -> Result<Option<HostRecovery>, String> {
+    let dir = &config.state_dir;
+    if !dir.exists() {
+        return Ok(None);
     }
+    // An empty namespace has nothing to recover; do not touch it (or validate
+    // it) merely because a command asked about liveness.
+    let has_residue = dir.join("ready.json").exists()
+        || dir.join("tasks.json").exists()
+        || dir.join("intents.json").exists();
+    if !has_residue {
+        return Ok(None);
+    }
+    // Recovery writes durable facts: the directory must still be this user's,
+    // owner-only and not a symlink. An insecure state dir is reported, not
+    // rewritten.
+    secure_dir(dir)?;
+    let Some(_owner) = try_lock(&dir.join("host.lock"))? else {
+        return Ok(None);
+    };
     let records = HostRecords::read(&config.state_dir)?;
-    if records.has_unmanaged_process() {
-        return Err("the archive still lists a running or killing task".into());
+    let ready_path = config.state_dir.join("ready.json");
+    let intents = active_intents(&config.state_dir)?;
+    if !records.has_unmanaged_process() && intents.is_empty() && !ready_path.exists() {
+        return Ok(None);
     }
-    if records.intents_outstanding() {
-        return Err("a spawn intent is unresolved".into());
+    let observed_at_ms = wall_ms();
+    let mut tasks = records.tasks;
+    let mut recovery = HostRecovery {
+        observed_at_ms,
+        tasks: Vec::new(),
+        unresolved_intents: Vec::new(),
+    };
+    for task in tasks.iter_mut().filter(|task| task.is_live()) {
+        let previous = task.snapshot.status;
+        let process = process_presence(task.snapshot.pid);
+        recovery.tasks.push(RecoveredTask {
+            task_id: task.snapshot.id.clone(),
+            program: task.snapshot.program.clone(),
+            args: task.snapshot.args.clone(),
+            previous,
+            process,
+        });
+        task.snapshot.status = BackgroundTaskStatus::Unknown;
+        task.snapshot.duration_ms = observed_at_ms.saturating_sub(task.started_at_ms);
+        task.finished_at_ms = Some(observed_at_ms);
+        task.loss = Some(TaskLoss {
+            observed_at_ms,
+            previous,
+            process,
+        });
     }
-    let path = config.state_dir.join("ready.json");
-    std::fs::remove_file(&path).map_err(|e| format!("could not remove {}: {e}", path.display()))
+    let converged = !recovery.tasks.is_empty();
+    if converged {
+        atomic_json(&config.state_dir.join("tasks.json"), &tasks)?;
+    }
+    if !intents.is_empty() {
+        let mut unresolved = match std::fs::read(config.state_dir.join("intents.unresolved.json")) {
+            Ok(bytes) => serde_json::from_slice::<Vec<UnresolvedIntent>>(&bytes)
+                .map_err(|e| format!("invalid unresolved Execution Host spawn intents: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(format!("could not read unresolved spawn intents: {e}")),
+        };
+        for intent in intents {
+            recovery.unresolved_intents.push(intent.id.clone());
+            if unresolved
+                .iter()
+                .any(|existing| existing.intent.id == intent.id)
+            {
+                continue;
+            }
+            unresolved.push(UnresolvedIntent {
+                intent,
+                observed_at_ms,
+            });
+        }
+        // Archive before clearing: a crash between the two leaves the intent
+        // both active and archived, and the next pass dedupes it by id.
+        atomic_json(
+            &config.state_dir.join("intents.unresolved.json"),
+            &unresolved,
+        )?;
+        atomic_json(
+            &config.state_dir.join("intents.json"),
+            &Vec::<SpawnIntent>::new(),
+        )?;
+    }
+    match std::fs::remove_file(&ready_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("could not remove {}: {e}", ready_path.display()));
+        }
+    }
+    for task in &recovery.tasks {
+        tracing::warn!(
+            task = %task.task_id,
+            program = %task.program,
+            previous = ?task.previous,
+            process = ?task.process,
+            "Execution Host was lost; task converged to unobserved state"
+        );
+    }
+    for task_id in &recovery.unresolved_intents {
+        tracing::warn!(
+            task = %task_id,
+            "Execution Host spawn intent kept as unresolved; its launch was never proven"
+        );
+    }
+    Ok(Some(recovery))
+}
+
+fn active_intents(state_dir: &Path) -> Result<Vec<SpawnIntent>, String> {
+    match std::fs::read(state_dir.join("intents.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("invalid Execution Host spawn intents: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("could not read Execution Host spawn intents: {e}")),
+    }
 }
 
 #[derive(Clone)]
@@ -424,25 +721,40 @@ pub struct ExecutionHostClient {
     peer_major: u32,
 }
 impl ExecutionHostClient {
-    /// Read a live host, or `None` when none exists.
+    /// Read a live host, or recover the residue of one that is gone.
     ///
     /// A ready file is a derived fact, not an owner: its existence says nothing
     /// by itself. When the recorded endpoint refuses the connection, the
-    /// lifecycle lock and the durable records decide whether this is a dead
-    /// host's residue (absent) or an owner whose state is still unknown
-    /// (error). Residue is removed; unknown state is preserved and reported.
-    pub async fn probe(config: &ExecutionHostConfig) -> Result<Option<Self>, String> {
-        if !config.state_dir.join("ready.json").exists() {
-            return Ok(None);
+    /// lifecycle lock is the authority. A lock this process can take proves the
+    /// owner is gone, so its records are reconciled from OS evidence and the
+    /// endpoint is removed; a held lock means an owner may still exist and its
+    /// state stays unknown. A ready file answered by its own metadata (for
+    /// example an incompatible major) is never residue.
+    pub async fn probe(config: &ExecutionHostConfig) -> Result<HostProbe, String> {
+        let ready_path = config.state_dir.join("ready.json");
+        if ready_path.exists() {
+            return match Self::connect_classified(config.clone()).await {
+                Ok(client) => Ok(HostProbe {
+                    client: Some(client),
+                    recovery: None,
+                }),
+                Err(ConnectFailure::Metadata(error)) => Err(error),
+                Err(ConnectFailure::Refused(error)) => match recover_dead_host(config)? {
+                    Some(recovery) => Ok(HostProbe {
+                        client: None,
+                        recovery: Some(recovery),
+                    }),
+                    None => Err(error),
+                },
+            };
         }
-        match Self::connect_classified(config.clone()).await {
-            Ok(client) => Ok(Some(client)),
-            Err(ConnectFailure::Metadata(error)) => Err(error),
-            Err(ConnectFailure::Refused(error)) => match clear_dead_host_residue(config) {
-                Ok(()) => Ok(None),
-                Err(reason) => Err(format!("{error}; residue kept: {reason}")),
-            },
-        }
+        // No endpoint, but a crash before readiness (or a spawn that never
+        // recorded its fact) can still leave records no host will resolve.
+        let recovery = recover_dead_host(config)?;
+        Ok(HostProbe {
+            client: None,
+            recovery,
+        })
     }
     pub async fn connect(config: ExecutionHostConfig) -> Result<Self, String> {
         Self::connect_classified(config)
@@ -505,24 +817,31 @@ impl ExecutionHostClient {
                 Ok(c) => return Ok(c),
                 Err(e) => {
                     // Never replace a live host on incompatibility or a transient connection failure.
-                    if lock(&config.state_dir.join("host.lock")).is_err() {
-                        return Err(e);
-                    }
-                    let tasks: Vec<HostedTask> =
-                        match std::fs::read(config.state_dir.join("tasks.json")) {
-                            Ok(b) => serde_json::from_slice(&b).map_err(|e| e.to_string())?,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                            Err(e) => return Err(e.to_string()),
-                        };
-                    if tasks.iter().any(|t| {
-                        matches!(
-                            t.snapshot.status,
-                            BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
-                        )
-                    }) {
-                        return Err("Execution Host was lost; persisted services have unknown/unmanaged state. Refusing PID adoption or automatic replacement".into());
+                    // Only residue whose owner is provably gone is recovered, and
+                    // that recovery preserves every record and never signals.
+                    match recover_dead_host(&config) {
+                        Ok(Some(recovery)) => {
+                            tracing::warn!(
+                                tasks = recovery.tasks.len(),
+                                intents = recovery.unresolved_intents.len(),
+                                "recovered a lost Execution Host before starting a new one"
+                            );
+                        }
+                        Ok(None) => return Err(e),
+                        Err(reason) => {
+                            return Err(format!("{e}; recovery refused: {reason}"));
+                        }
                     }
                 }
+            }
+        } else {
+            // No endpoint: reconcile residue that no live host can resolve.
+            if let Some(recovery) = recover_dead_host(&config)? {
+                tracing::warn!(
+                    tasks = recovery.tasks.len(),
+                    intents = recovery.unresolved_intents.len(),
+                    "recovered ownerless Execution Host residue before starting a host"
+                );
             }
         }
         let _startup = lock(&config.state_dir.join("startup.lock"))?;
@@ -883,6 +1202,20 @@ struct SpawnIntent {
     cwd: PathBuf,
     started_at_ms: u64,
 }
+
+/// A spawn intent that outlived the host which wrote it.
+///
+/// The intent is durable before an OS spawn and removed only after the process
+/// fact is persisted. A host that died inside that window leaves a command that
+/// may or may not have launched; no live host can resolve it, and discarding it
+/// would delete the only evidence. It is moved here, where it blocks nothing but
+/// is still inspectable.
+#[derive(Clone, Serialize, Deserialize)]
+struct UnresolvedIntent {
+    intent: SpawnIntent,
+    /// When recovery found the intent without a host to resolve it.
+    observed_at_ms: u64,
+}
 fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -930,6 +1263,8 @@ impl Host {
                         finished_at_ms,
                         log_end,
                         log_prefix_len,
+                        // This host observed the entry; the exit fact is its own.
+                        loss: None,
                     },
                 );
             }
@@ -1173,7 +1508,9 @@ impl Host {
                     t.snapshot.id == id
                         && matches!(
                             t.snapshot.status,
-                            BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
+                            BackgroundTaskStatus::Exited
+                                | BackgroundTaskStatus::Killed
+                                | BackgroundTaskStatus::Unknown
                         )
                 }) {
                     if !unrestricted && task.snapshot.owner_scope.as_deref() != Some(&owner) {
@@ -1227,7 +1564,9 @@ impl Host {
                     t.snapshot.id == id
                         && matches!(
                             t.snapshot.status,
-                            BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
+                            BackgroundTaskStatus::Exited
+                                | BackgroundTaskStatus::Killed
+                                | BackgroundTaskStatus::Unknown
                         )
                 }) {
                     if !unrestricted && task.snapshot.owner_scope.as_deref() != Some(&owner) {
@@ -1327,14 +1666,14 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
             BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
         )
     }) {
-        return Err("previous Execution Host lost with unmanaged tasks; recovery requires explicit inspection".into());
+        return Err("previous Execution Host lost with unmanaged tasks; start the runtime so it can reconcile them from OS evidence".into());
     }
     match std::fs::read(config.state_dir.join("intents.json")) {
         Ok(b) => {
             let intents: Vec<SpawnIntent> =
                 serde_json::from_slice(&b).map_err(|e| e.to_string())?;
             if !intents.is_empty() {
-                return Err("previous Execution Host has uncertain spawn intents; refusing automatic recovery".into());
+                return Err("previous Execution Host has uncertain spawn intents; start the runtime so they are archived before a host starts".into());
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2399,27 +2738,61 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_archive(config: &ExecutionHostConfig, status: &str) {
-        let task = serde_json::json!({
+    fn task_record(
+        config: &ExecutionHostConfig,
+        id: &str,
+        status: &str,
+        pid: u32,
+    ) -> serde_json::Value {
+        serde_json::json!({
             "snapshot": {
-                "id": "host-recorded", "program": "sleep", "args": ["30"],
+                "id": id, "program": "sleep", "args": ["30"],
                 "cwd": config.repo_root.clone(), "status": status, "exit_code": null,
-                "log": "", "duration_ms": 0, "pid": 4242, "owner_scope": "session"
+                "log": "", "duration_ms": 0, "pid": pid, "owner_scope": "session"
             },
             "lifetime": "Persistent",
             "writer_scope": "parent",
             "write_scope": "Unrestricted",
-            "process_id": 4242,
+            "process_id": pid,
             "started_at_ms": 0,
             "finished_at_ms": null,
             "log_end": 0,
             "log_prefix_len": 0
-        });
+        })
+    }
+
+    fn write_archive(config: &ExecutionHostConfig, status: &str, pid: u32) {
+        write_archive_tasks(config, &[("host-recorded", status, pid)]);
+    }
+
+    fn write_archive_tasks(config: &ExecutionHostConfig, tasks: &[(&str, &str, u32)]) {
+        let tasks = tasks
+            .iter()
+            .map(|(id, status, pid)| task_record(config, id, status, *pid))
+            .collect::<Vec<_>>();
         std::fs::write(
             config.state_dir.join("tasks.json"),
-            serde_json::to_vec(&vec![task]).unwrap(),
+            serde_json::to_vec(&tasks).unwrap(),
         )
         .unwrap();
+    }
+
+    /// A process group that is gone, represented by the pid of a real child that
+    /// has been spawned as a group leader and reaped.
+    #[cfg(unix)]
+    fn exited_group_leader() -> u32 {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn group leader");
+        let pid = child.id();
+        child.wait().expect("reap group leader");
+        pid
     }
 
     /// A refused endpoint plus a free lifecycle lock plus settled records is a
@@ -2431,43 +2804,163 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = host_config(root.path());
         write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
-        let probed = ExecutionHostClient::probe(&config).await;
-        match probed {
-            Ok(None) => {}
-            Ok(Some(_)) => panic!("settled residue must read as an absent host"),
-            Err(error) => panic!("settled residue must not surface an error: {error}"),
-        }
+        let probed = ExecutionHostClient::probe(&config)
+            .await
+            .expect("settled residue must not surface an error");
+        assert!(probed.client.is_none(), "no host owns this endpoint");
+        assert!(
+            probed
+                .recovery
+                .is_none_or(|recovery| recovery.tasks.is_empty()),
+            "there is nothing to recover"
+        );
         assert!(
             !config.state_dir.join("ready.json").exists(),
             "residue of a provably dead host is not state"
         );
     }
 
-    /// Residue that may still own a process stays visible: the CLI answers with
-    /// an error rather than an empty inventory, and the record is preserved.
+    /// Each record is judged on its own evidence: one finished workload and one
+    /// that may still be alive must not get the same status or reservation.
     #[cfg(unix)]
     #[tokio::test]
-    async fn probe_preserves_residue_that_may_still_own_a_process() {
+    async fn probe_converges_each_task_from_its_own_evidence() {
+        use std::os::unix::process::CommandExt;
         let root = tempfile::tempdir().unwrap();
         let config = host_config(root.path());
         write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
-        write_archive(&config, "Running");
-        let error = match ExecutionHostClient::probe(&config).await {
-            Ok(_) => panic!("unmanaged work must stay visible"),
-            Err(error) => error,
-        };
-        assert!(error.contains("unavailable"), "{error}");
-        assert!(
-            config.state_dir.join("ready.json").exists(),
-            "residue that may own live work is never cleaned"
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live group");
+        let live_pid = live.id();
+        write_archive_tasks(
+            &config,
+            &[
+                ("host-finished", "Running", exited_group_leader()),
+                ("host-live", "Running", live_pid),
+            ],
         );
+
+        let probed = ExecutionHostClient::probe(&config).await.unwrap();
+        let recovery = probed.recovery.expect("both records are converged");
+        assert_eq!(recovery.tasks.len(), 2);
+        let records = HostRecords::read(&config.state_dir).unwrap();
+        let finished = records.task("host-finished").unwrap();
+        let running = records.task("host-live").unwrap();
+        assert_eq!(
+            finished.loss.as_ref().unwrap().process,
+            ProcessPresence::Gone
+        );
+        assert!(finished.settlement_proven());
+        assert_eq!(
+            running.loss.as_ref().unwrap().process,
+            ProcessPresence::Present
+        );
+        assert!(!running.settlement_proven());
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(live_pid as i32), None).is_ok(),
+            "the live workload is untouched"
+        );
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(live_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = live.wait();
+    }
+
+    /// A live record whose process group is gone is converged from OS evidence.
+    /// It becomes an unobserved terminal fact, never a fabricated exit, and the
+    /// product can start again without deleting anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_converges_a_running_record_whose_process_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        let pid = exited_group_leader();
+        write_archive(&config, "Running", pid);
+
+        let probed = ExecutionHostClient::probe(&config)
+            .await
+            .expect("residue must not block startup forever");
+        assert!(probed.client.is_none());
+        let recovery = probed.recovery.expect("the pass reports what it converged");
+        assert_eq!(recovery.tasks.len(), 1);
+        assert_eq!(recovery.tasks[0].process, ProcessPresence::Gone);
+        assert_eq!(recovery.tasks[0].previous, BackgroundTaskStatus::Running);
+        assert!(!config.state_dir.join("ready.json").exists());
+
+        let records = HostRecords::read(&config.state_dir).unwrap();
+        let task = records.task("host-recorded").expect("the record is kept");
+        assert_eq!(task.snapshot.status, BackgroundTaskStatus::Unknown);
+        assert_eq!(task.snapshot.pid, Some(pid), "the OS pid stays as evidence");
+        let loss = task.loss.as_ref().expect("the loss is explained");
+        assert_eq!(loss.previous, BackgroundTaskStatus::Running);
+        assert_eq!(loss.process, ProcessPresence::Gone);
+        assert!(task.finished_at_ms.is_some());
+        assert!(task.settlement_proven());
+    }
+
+    /// A record whose process group still exists is not adopted, not signalled
+    /// and not replayed. Control is recorded as lost, and the workload stays
+    /// alive for its owner to handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_never_claims_or_kills_a_process_group_that_still_exists() {
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live group");
+        let pid = live.id();
+        write_archive(&config, "Killing", pid);
+
+        let probed = ExecutionHostClient::probe(&config)
+            .await
+            .expect("a live process is evidence, not a startup error");
+        let recovery = probed.recovery.expect("the pass reports what it converged");
+        assert_eq!(recovery.tasks[0].process, ProcessPresence::Present);
+        let records = HostRecords::read(&config.state_dir).unwrap();
+        let task = records.task("host-recorded").unwrap();
+        assert_eq!(task.snapshot.status, BackgroundTaskStatus::Unknown);
+        assert_eq!(
+            task.loss.as_ref().unwrap().previous,
+            BackgroundTaskStatus::Killing
+        );
+        assert!(!task.settlement_proven(), "a live process is not settled");
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok(),
+            "recovery must not signal a process it cannot prove it owns"
+        );
+
+        // A second pass has nothing live to converge: recovery is idempotent.
+        let again = ExecutionHostClient::probe(&config).await.unwrap();
+        assert!(again.recovery.is_none(), "nothing left to converge");
+
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = live.wait();
     }
 
     /// An intent persisted before an OS spawn leaves the same uncertainty as a
-    /// live process: the host may have launched something it never recorded.
+    /// live process: the host may have launched something it never recorded. It
+    /// is archived as evidence and blocks nothing, because no host can ever
+    /// resolve it and discarding it would delete the only trace.
     #[cfg(unix)]
     #[tokio::test]
-    async fn probe_preserves_residue_while_a_spawn_intent_is_outstanding() {
+    async fn probe_archives_a_spawn_intent_no_host_can_resolve() {
         let root = tempfile::tempdir().unwrap();
         let config = host_config(root.path());
         write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
@@ -2476,12 +2969,41 @@ mod tests {
             br#"[{"id":"host-unresolved","owner":"session","program":"sh","args":["-c","true"],"cwd":"/tmp","started_at_ms":0}]"#,
         )
         .unwrap();
-        let error = match ExecutionHostClient::probe(&config).await {
-            Ok(_) => panic!("an unresolved spawn intent must stay visible"),
-            Err(error) => error,
-        };
-        assert!(error.contains("unavailable"), "{error}");
-        assert!(config.state_dir.join("ready.json").exists());
+
+        let probed = ExecutionHostClient::probe(&config)
+            .await
+            .expect("an unprovable spawn must not block startup forever");
+        let recovery = probed.recovery.expect("the pass reports the intent");
+        assert_eq!(recovery.unresolved_intents, vec!["host-unresolved"]);
+        assert!(!config.state_dir.join("ready.json").exists());
+
+        let records = HostRecords::read(&config.state_dir).unwrap();
+        assert!(records.has_unresolved_intent("host-unresolved"));
+        assert!(!records.has_task("host-unresolved"));
+        assert!(!records.intents_outstanding());
+        assert_eq!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(
+                &std::fs::read(config.state_dir.join("intents.json")).unwrap()
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        let archived: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(config.state_dir.join("intents.unresolved.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived.len(), 1, "the intent's evidence is kept");
+        assert_eq!(archived[0]["intent"]["program"], "sh");
+
+        // Idempotent: a second pass cannot duplicate the archived evidence.
+        let again = ExecutionHostClient::probe(&config).await.unwrap();
+        assert!(again.recovery.is_none());
+        let archived: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(config.state_dir.join("intents.unresolved.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived.len(), 1);
     }
 
     /// An incompatible ready file is a live host's own metadata: the error the
@@ -2498,5 +3020,42 @@ mod tests {
         };
         assert!(error.contains("incompatible"), "{error}");
         assert!(config.state_dir.join("ready.json").exists());
+    }
+
+    /// The endpoint is the fast path, not the authority: a live host answers and
+    /// is reused, and only a host the kernel proves gone is recovered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reuses_a_live_host_and_recovers_only_after_it_dies() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        let server = tokio::spawn(serve(config.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ExecutionHostClient::connect(config.clone()).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let live = ExecutionHostClient::probe(&config).await.unwrap();
+        assert!(live.client.is_some(), "a live host must be reused");
+        assert!(live.recovery.is_none(), "there is no residue to recover");
+
+        // A crash: the holder dies without removing its endpoint. The kernel
+        // drops the lifecycle lock with it; the endpoint then refuses.
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ExecutionHostClient::connect(config.clone()).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let after = ExecutionHostClient::probe(&config).await.unwrap();
+        assert!(after.client.is_none());
+        assert!(after.recovery.is_some(), "the dead host's residue is read");
+        assert!(!config.state_dir.join("ready.json").exists());
     }
 }

@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/leveler-core",
     "crates/leveler-lifecycle",
-    "crates/leveler-memory",
     "crates/leveler-model",
     "crates/leveler-protocol",
     "crates/leveler-provider",
@@ -50,7 +49,6 @@ repository = "https://github.com/dengmengmian/CodeLeveler"
 # Internal crates
 leveler-core = { version = "1.0.21", path = "crates/leveler-core" }
 leveler-lifecycle = { version = "1.0.21", path = "crates/leveler-lifecycle" }
-leveler-memory = { version = "1.0.21", path = "crates/leveler-memory" }
 leveler-model = { version = "1.0.21", path = "crates/leveler-model" }
 leveler-protocol = { version = "1.0.21", path = "crates/leveler-protocol" }
 leveler-provider = { version = "1.0.21", path = "crates/leveler-provider" }

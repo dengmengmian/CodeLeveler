@@ -60,6 +60,18 @@ impl AppState {
         self.item_span(index, width).map(|(start, _)| start)
     }
 
+    /// The transcript item painted at absolute conversation line `line`, from
+    /// the same memoized layout the viewport draws. A pointer gesture can only
+    /// ever describe a record that is actually on screen.
+    pub fn item_at_line(&self, line: usize, width: usize) -> Option<usize> {
+        let (_, _, _, _, spans, _, _) = self.conversation_build(width);
+        spans
+            .iter()
+            .enumerate()
+            .find(|(_, (start, end))| (*start..*end).contains(&line))
+            .map(|(index, _)| index)
+    }
+
     /// The copy projection for the current conversation build: exact screen
     /// text plus the renderer-owned copy policy. Both come from the same build
     /// the viewport paints, so a selection can never describe a different
@@ -268,6 +280,7 @@ fn build_conversation(
         monochrome: state.theme.monochrome,
         locale: state.locale,
         tools_expanded: state.tools_expanded,
+        plan_waiting: crate::workbench::plan_waiting_for_user_projection(state),
     };
     // Take the previous per-item memo so unchanged units can be moved forward
     // instead of re-wrapped. The borrow is released before any rendering runs.
@@ -431,6 +444,7 @@ fn build_conversation(
                     }
                     let base = out.len();
                     let mut rows = Vec::new();
+                    let mut group_copy = Vec::new();
                     out.extend(crate::activity_stream::render_activity(
                         group,
                         theme,
@@ -443,6 +457,7 @@ fn build_conversation(
                         &mut rows,
                         Some(&state.conv.process_folds.borrow()),
                         state.question_card_open(),
+                        &mut group_copy,
                     ));
                     for row in rows {
                         commands.push(super::view::CommandHit {
@@ -453,7 +468,9 @@ fn build_conversation(
                             stoppable: row.stoppable,
                         });
                     }
-                    // Tool execution is evidence UI, not message body.
+                    // Tool execution is evidence UI, not message body — with
+                    // one exception the renderer names itself: an expanded
+                    // edit's diff rows are the patch's own source lines.
                     copy.extend(std::iter::repeat_n(
                         crate::selection::PlainRow {
                             skip: true,
@@ -461,6 +478,7 @@ fn build_conversation(
                         },
                         out.len() - base,
                     ));
+                    crate::selection::apply_copy_rows(&mut copy[base..], &group_copy);
                 }
                 TranscriptItem::SubAgent(first) => {
                     // A run of consecutive sub-agent blocks renders as one tree
@@ -702,6 +720,55 @@ pub(crate) fn keyboard_detail_calls(state: &AppState, target: usize) -> Vec<(usi
         Some(run) => plan.runs[run].members.clone(),
         None => Vec::new(),
     }
+}
+
+/// The edit calls in one transcript item, in paint order — but only when the
+/// item is an edit-ONLY node.
+///
+/// A group that also holds commands keeps `Ctrl+O`'s existing meaning (open
+/// the process receipt). Reserving the key for the edit in such a group would
+/// silently stop opening the commands beside it.
+fn edit_calls_at(state: &AppState, item: usize) -> Vec<usize> {
+    let Some(TranscriptItem::ToolGroup(group)) = state.transcript.items().get(item) else {
+        return Vec::new();
+    };
+    let visible: Vec<(usize, &crate::transcript::ToolCallBlock)> = group
+        .calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| crate::activity_stream::is_conversation_visible(call))
+        .collect();
+    if visible.is_empty()
+        || !visible
+            .iter()
+            .all(|(_, call)| crate::activity_stream::is_edit_call(call))
+    {
+        return Vec::new();
+    }
+    visible
+        .into_iter()
+        .filter(|(_, call)| crate::activity_stream::is_edit_call(call))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Toggle the diff drawer of the edit-only node a keyboard fold targets.
+///
+/// An edit's drawer is per CALL (a merged node paints its first call's mode),
+/// and it is not part of the process-run fold set: `Ctrl+O` on a settled edit
+/// must fold the diff, not the exploration receipt above it. Returns the new
+/// expanded state, or `None` when the item holds no edit.
+pub(crate) fn toggle_edit_fold(state: &mut AppState, item: usize) -> Option<bool> {
+    let calls = edit_calls_at(state, item);
+    let first = *calls.first()?;
+    let TranscriptItem::ToolGroup(group) = state.transcript.items().get(item)? else {
+        return None;
+    };
+    let expanded = !group.calls.get(first)?.expanded;
+    for call in calls {
+        state.transcript.set_call_expanded(item, call, expanded);
+    }
+    Some(expanded)
 }
 
 /// Explicit command focus reveals its containing receipt without changing call drawers.
@@ -947,6 +1014,7 @@ fn render_cacheable_unit(
     let theme = &state.theme;
     let t = state.t();
     let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut commands: Vec<super::view::CachedCommand> = Vec::new();
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut copy: Vec<crate::selection::PlainRow> = Vec::new();
     match item {
@@ -959,15 +1027,6 @@ fn render_cacheable_unit(
             let (lines, rows) = assistant_render_with_copy(block, theme, width);
             out.extend(lines);
             copy = rows;
-        }
-        TranscriptItem::MemoryList(block) => {
-            hits.push((0, 0));
-            out.extend(item_render(item, theme, width, state.tools_expanded, t));
-            let marker = if block.expanded { "▾ " } else { "▸ " };
-            copy = prefixed_copy_rows(marker, &block.summary, width);
-            if block.expanded {
-                copy.extend(prefixed_copy_rows("  ", &block.details, width));
-            }
         }
         TranscriptItem::GoalRecap(_) => {
             // A goal recap's first line is its disclosure row: click expands the
@@ -1015,6 +1074,56 @@ fn render_cacheable_unit(
             out.extend(lines);
             copy = rows;
         }
+        TranscriptItem::ToolGroup(group) => {
+            // A SETTLED group still owns click targets: an edit's diff folds
+            // from its own head row, and a historical fold must work exactly
+            // like a live one. The memoized path therefore keeps the command
+            // rows `render_activity` produced, instead of dropping them.
+            let mut rows = Vec::new();
+            let mut group_copy = Vec::new();
+            let base = out.len();
+            out.extend(crate::activity_stream::render_activity(
+                group,
+                theme,
+                width,
+                state.locale,
+                t,
+                0,
+                None,
+                None,
+                &mut rows,
+                None,
+                false,
+                &mut group_copy,
+            ));
+            for row in rows {
+                commands.push(super::view::CachedCommand {
+                    line: row.line,
+                    item_offset: 0,
+                    call: row.call,
+                    stoppable: row.stoppable,
+                });
+            }
+            copy.extend(std::iter::repeat_n(
+                crate::selection::PlainRow {
+                    skip: true,
+                    ..Default::default()
+                },
+                out.len() - base,
+            ));
+            crate::selection::apply_copy_rows(&mut copy[base..], &group_copy);
+        }
+        TranscriptItem::Plan(plan) => {
+            let waiting_for_user = crate::workbench::plan_waiting_for_user_projection(state);
+            crate::render::transcript_lines::historical_plan_lines_with_context(
+                plan,
+                theme,
+                width,
+                &mut out,
+                t,
+                waiting_for_user,
+            );
+        }
         other => out.extend(item_render(other, theme, width, state.tools_expanded, t)),
     }
     // A surface with no semantic rows (a settled status block, a tool group,
@@ -1032,7 +1141,7 @@ fn render_cacheable_unit(
             out.len()
         ];
     }
-    (out, hits, Vec::new(), copy)
+    (out, hits, commands, copy)
 }
 
 #[cfg(test)]
@@ -1145,27 +1254,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expanding_a_memory_list_rebuilds_that_item() {
-        let mut s = test_state();
-        s.transcript.push_user("hi".into());
-        s.transcript
-            .push_memory_list("summary line".into(), "detail line".into());
-        let collapsed = build_conversation(&s, 60).0;
-        {
-            let items = s.transcript.items_mut();
-            let last = items.last_mut().expect("memory item");
-            if let TranscriptItem::MemoryList(block) = last {
-                block.expanded = true;
-            }
-        }
-        let expanded = build_conversation(&s, 60).0;
-        assert!(
-            expanded.len() > collapsed.len(),
-            "expanding must add the detail line"
-        );
-    }
-
     /// A summarized diff keeps a fixed row budget independent of viewport
     /// height, and says how much it hides.
     /// The memo boundary for tool groups: a settled one is reusable, a running
@@ -1261,11 +1349,15 @@ mod tests {
             .collect();
         assert!(
             plain.iter().any(|r| r.contains("+ new call 39")),
-            "the summarized diff keeps its tail, so the end of the change is readable: {plain:?}"
+            "every applied row is painted: {plain:?}"
         );
         assert!(
-            plain.iter().any(|r| r.contains("还有")),
-            "a summarized diff states how many rows it hides: {plain:?}"
+            plain.iter().any(|r| r.contains("+ new call 20")),
+            "the middle of a long diff is never folded away: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|r| r.contains("还有")),
+            "no hidden-middle hint exists any more: {plain:?}"
         );
     }
 }
@@ -2025,9 +2117,12 @@ mod exploration_fold_tests {
             );
             assert!(lines.iter().any(|r| r.contains("change_0")));
             assert!(lines.iter().any(|r| r.contains("change_79")));
+            let hit = s
+                .command_hit_at(width, position(&lines, "编辑文件"))
+                .expect("the edit head is its own fold target");
             assert!(
-                s.command_hit_at(width, position(&lines, "编辑文件"))
-                    .is_none()
+                !hit.receipt,
+                "the edit is never absorbed into a process receipt at width {width}"
             );
         }
     }
@@ -2973,59 +3068,782 @@ mod semantic_copy_tests {
         }
     }
 
-    /// A finished execution opens in full: the first line is reachable
-    /// without an extra click, and no automatic fold marker hides it.
+    /// A long finished execution never buries the chat: the record paints a
+    /// bounded window at the live edge and counts the rows above it. The rows
+    /// are not folded — scrolling reaches every one of them.
     #[test]
-    fn a_long_shell_result_keeps_the_named_fold_instead_of_burying_the_chat() {
+    fn a_long_shell_result_is_a_bounded_window_instead_of_a_fold() {
         let mut s = dark_state();
         let output: String = (0..100).map(|i| format!("line-{i:03}\n")).collect();
         let index = push_shell(&mut s, "seq 0 99", &output);
-        let crate::transcript::TranscriptItem::UserShell(shell) = &s.transcript.items()[index]
-        else {
-            panic!("shell expected");
-        };
-        assert!(
-            !shell.expanded,
-            "a long finished result keeps the established fold"
-        );
         let (plain, _) = s.conversation_plain(80);
         assert!(
             !plain.iter().any(|line| line.contains("line-000")),
-            "the folded head is not painted"
+            "the window does not lay out the whole head"
         );
         assert!(
             plain.iter().any(|line| line.contains("line-099")),
             "the tail is painted"
         );
         assert!(
-            plain.iter().any(|line| line.contains("更早的输出已折叠")),
-            "the fold is named, never silent"
+            plain.iter().any(|line| line.contains("上方还有 88 行")),
+            "what is above the window is counted, never hidden silently"
+        );
+        assert!(
+            !plain.iter().any(|line| line.contains("已折叠")),
+            "there is no fold in this record"
+        );
+        assert!(
+            plain.len() < 60,
+            "100 output rows must not lay out 100 conversation rows: {}",
+            plain.len()
+        );
+
+        // Scrolling reaches the first row and keeps it on screen.
+        let width = crate::conversation::geometry::content_width(&s);
+        let room = crate::render::user_shell_output_room(width);
+        let total = crate::shell_render::output_rows(&output, &[], room).len();
+        let max = crate::shell_render::output_max_scroll(total);
+        assert!(max > 0);
+        s.transcript.scroll_user_shell_output(
+            &leveler_core::UserShellId::new("ush-copy"),
+            -(max as isize),
+            max,
+        );
+        let (plain, _) = s.conversation_plain(80);
+        assert!(
+            plain.iter().any(|line| line.contains("line-000")),
+            "the head is reachable by scrolling"
+        );
+        assert!(
+            plain.iter().any(|line| line.contains("下方还有")),
+            "the rows below the window are counted"
+        );
+        let _ = index;
+    }
+
+    /// A user shell has no fold: writing one is refused instead of pretending
+    /// the record collapsed.
+    #[test]
+    fn a_user_shell_rejects_a_fold_write() {
+        let mut s = dark_state();
+        let index = push_shell(&mut s, "seq 0 2", "0\n1\n2\n");
+        assert!(
+            !s.transcript
+                .set_item_display(index, crate::fold::DisplayMode::Collapsed),
+            "a scroll window is not a fold"
+        );
+    }
+}
+
+/// The applied-diff default a reader actually meets: an edit opens with its
+/// complete diff, folds to one stat row on request, and never has its rows
+/// trimmed by a line-count heuristic.
+#[cfg(test)]
+mod diff_default_tests {
+    use super::*;
+    use crate::state::{AppState, Boot};
+    use leveler_client_protocol::{SessionId, ToolCallId, UiCommandStop};
+
+    fn state() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("diff"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        );
+        s.size = (80, 40);
+        s.conv.rect = Some((0, 2, 80, 30));
+        s.transcript.push_user("change the file".into());
+        s
+    }
+
+    /// The canonical diff the runtime reports for a whole-file write.
+    fn whole_file_diff(path: &str, before: &str, after: &str) -> String {
+        let hunks = leveler_tools::tools::applied_diff::whole_file_hunks(before, after);
+        leveler_tools::tools::applied_diff::unified_diff(path, &hunks).expect("a real applied diff")
+    }
+
+    fn write(s: &mut AppState, id: &str, path: &str, before: &str, after: &str) -> String {
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            "write_file".into(),
+            serde_json::json!({ "path": path, "content": after }).to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        let diff = whole_file_diff(path, before, after);
+        s.transcript.complete_tool(
+            &ToolCallId::new(id),
+            true,
+            format!("Created {path}"),
+            3,
+            Some(diff.clone()),
+        );
+        diff
+    }
+
+    fn render(s: &AppState, width: usize) -> Vec<String> {
+        s.conversation_lines(width)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .collect()
+    }
+
+    fn content(lines: usize) -> String {
+        (1..=lines)
+            .map(|i| format!("    expectLine{i}()\n"))
+            .collect()
+    }
+
+    /// A created file opens its whole body. The old render cut every change
+    /// run to its first and last three rows, so a 103-line file showed six.
+    #[test]
+    fn a_created_file_opens_every_line_at_any_size() {
+        for (path, lines) in [
+            ("backend/internal/httpapi/cookies_test.go", 103usize),
+            ("internal/httpapi/health.go", 34usize),
+        ] {
+            let mut s = state();
+            write(&mut s, "w", path, "", &content(lines));
+            s.transcript.push_note("tail".into());
+            let rows = render(&s, 80);
+            for i in 1..=lines {
+                assert!(
+                    rows.iter().any(|r| r.contains(&format!("expectLine{i}()"))),
+                    "{path}: line {i} of {lines} is missing"
+                );
+            }
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("{lines:>4} │ +"))),
+                "{path}: the last new-file line is numbered {lines}: {rows:#?}"
+            );
+            assert!(
+                !rows.iter().any(|r| r.contains("还有")),
+                "{path}: no elision hint exists any more: {rows:#?}"
+            );
+
+            // The head names the file and keeps its status glyph.
+            assert!(
+                rows.iter().any(|r| r.contains(path) && r.contains('✓')),
+                "{path}: head keeps glyph + file: {rows:#?}"
+            );
+        }
+    }
+
+    /// The collapsed row is the ONE row the reader asked for: file + `+A/-R`.
+    #[test]
+    fn a_folded_created_file_is_one_row_with_its_stats() {
+        let mut s = state();
+        write(
+            &mut s,
+            "w",
+            "backend/internal/httpapi/cookies_test.go",
+            "",
+            &content(103),
+        );
+        s.transcript.push_note("tail".into());
+        let expanded = s.conversation_lines(80).len();
+        let head = s
+            .command_hit_at(80, 2)
+            .expect("the edit head is a fold target");
+        s.transcript.toggle_call_at(head.item, head.call);
+        let rows = render(&s, 80);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.contains("cookies_test.go"))
+                .count(),
+            1,
+            "{rows:#?}"
+        );
+        let head_row = rows
+            .iter()
+            .find(|r| r.contains("cookies_test.go"))
+            .expect("the folded head");
+        assert!(head_row.contains("+103/-0"), "{head_row}");
+        assert!(!head_row.contains("expectLine"), "{head_row}");
+        assert!(
+            s.conversation_lines(80).len() < expanded - 100,
+            "folding a 103-line diff removes its rows"
+        );
+
+        // And one more toggle restores every row.
+        s.transcript.toggle_call_at(head.item, head.call);
+        let rows = render(&s, 80);
+        assert!(
+            rows.iter().any(|r| r.contains("expectLine103()")),
+            "{rows:#?}"
         );
     }
 
-    /// A user's explicit collapse is a choice, not something completion may
-    /// override.
+    /// A removal is just as complete: every `-` row, numbered from the old
+    /// file, with `+0/-N` stats.
     #[test]
-    fn completion_does_not_reopen_a_user_pinned_collapse() {
-        let mut s = dark_state();
-        let index = push_shell(&mut s, "seq 0 2", "0\n1\n2\n");
-        // The helper completes first; pin the fold afterwards, exactly as a
-        // click does, then complete a second time.
+    fn a_removed_file_paints_every_removal() {
+        let mut s = state();
+        write(&mut s, "d", "src/dead.go", &content(40), "");
+        s.transcript.push_note("tail".into());
+        let rows = render(&s, 80);
+        for i in 1..=40 {
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(&format!("-     expectLine{i}()"))),
+                "removal {i} is missing: {rows:#?}"
+            );
+        }
+        let head = rows
+            .iter()
+            .position(|r| r.contains("dead.go"))
+            .expect("the head names the file");
+        let hit = s.command_hit_at(80, head).expect("fold target");
+        s.transcript.toggle_call_at(hit.item, hit.call);
+        let folded = render(&s, 80);
         assert!(
-            s.transcript
-                .set_item_display(index, crate::fold::DisplayMode::Collapsed)
+            folded
+                .iter()
+                .any(|r| r.contains("dead.go") && r.contains("+0/-40")),
+            "{folded:#?}"
         );
-        let id = leveler_core::UserShellId::new("ush-copy");
-        s.transcript.complete_user_shell(
-            &id,
+    }
+
+    /// A successful write whose content did not change reports no diff. The
+    /// request must not be re-drawn as if it had landed.
+    #[test]
+    fn a_no_change_write_is_not_painted_as_a_change() {
+        let mut s = state();
+        s.transcript.push_tool_started(
+            ToolCallId::new("n"),
+            "write_file".into(),
+            serde_json::json!({
+                "path": "src/same.rs",
+                "content": "fn same() {}\n"
+            })
+            .to_string(),
+            false,
+            0,
             Some(0),
-            120,
-            crate::transcript::UserShellStatus::Success,
+            None,
         );
-        let crate::transcript::TranscriptItem::UserShell(shell) = &s.transcript.items()[index]
-        else {
-            panic!("shell expected");
+        s.transcript
+            .complete_tool(&ToolCallId::new("n"), true, "Replaced".into(), 2, None);
+        s.transcript.push_note("tail".into());
+        let rows = render(&s, 80);
+        assert!(
+            rows.iter().any(|r| r.contains("无可用 diff")),
+            "absence is stated: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("+ fn same")),
+            "the request is not the result: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("+0/-0")),
+            "nothing changed, so there are no counts: {rows:#?}"
+        );
+        assert!(
+            s.command_hit_at(80, rows.iter().position(|r| r.contains("same.rs")).unwrap())
+                .is_none(),
+            "an empty node has nothing to fold"
+        );
+    }
+
+    /// A cancelled edit reports no diff. It is neither a success nor a change.
+    #[test]
+    fn a_cancelled_edit_shows_no_fabricated_diff() {
+        let mut s = state();
+        s.transcript.push_tool_started(
+            ToolCallId::new("c"),
+            "write_file".into(),
+            serde_json::json!({
+                "path": "src/stopped.rs",
+                "content": "fn never() {}\n"
+            })
+            .to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        s.transcript.complete_command(
+            &ToolCallId::new("c"),
+            false,
+            "cancelled".into(),
+            2,
+            None,
+            None,
+            Some(UiCommandStop::Confirmed),
+        );
+        s.transcript.push_note("tail".into());
+        let rows = render(&s, 80);
+        assert!(
+            rows.iter().any(|r| r.contains("⊘")),
+            "a cancelled edit keeps the cancelled glyph: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("never()")),
+            "a request that never ran is never painted as code: {rows:#?}"
+        );
+    }
+
+    /// Replay paints from the same transcript facts: a finished session's
+    /// scrollback keeps the whole diff, not a preview.
+    #[test]
+    fn a_replayed_transcript_still_paints_the_whole_diff() {
+        let mut s = state();
+        write(&mut s, "w", "src/replayed.rs", "", &content(50));
+        s.transcript.push_note("tail".into());
+        let item = s
+            .transcript
+            .items()
+            .iter()
+            .find(|item| matches!(item, TranscriptItem::ToolGroup(_)))
+            .expect("the edit group");
+        let lines = crate::render::transcript_lines::item_render(
+            item,
+            &crate::theme::Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+        );
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        for i in [1usize, 25, 50] {
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("expectLine{i}()"))),
+                "replay keeps line {i}: {rows:#?}"
+            );
+        }
+    }
+
+    /// A width change re-wraps every row; the top of the viewport must stay on
+    /// the same transcript row, not on a different one that happens to share
+    /// its line number.
+    #[test]
+    fn a_reflow_keeps_the_reader_on_the_same_row() {
+        let mut s = state();
+        write(&mut s, "w", "src/long.rs", "", &content(60));
+        s.transcript.push_note("tail".into());
+        s.conv.auto_scroll = false;
+        s.conv.scroll = 12;
+        let anchor =
+            crate::conversation::interaction::reading_anchor(&s).expect("a reading anchor");
+        let before = crate::selection::line_to_plain(&s.conversation_lines(80)[12]);
+        // The viewport re-wraps at 40 columns, then restores the anchor.
+        s.conv.rect = Some((0, 2, 40, 30));
+        crate::conversation::interaction::restore_reading_anchor(&mut s, Some(anchor));
+        let after = crate::selection::line_to_plain(&s.conversation_lines(40)[s.conv.scroll]);
+        assert_eq!(
+            after.trim_end(),
+            before.trim_end(),
+            "the reader stays on the same content row"
+        );
+    }
+}
+
+/// Dragging over an edit's diff copies the patch's own code.
+///
+/// The painted gutter, the `+`/`-` direction marker and the leading indent are
+/// decoration the renderer owns; a selection crosses them without taking them.
+/// The complete unified diff is a different product entry (`/copy diff`), so a
+/// selected row must never smuggle patch metadata into source text.
+#[cfg(test)]
+mod diff_copy_tests {
+    use crate::selection::{TextPos, TextSelection, extract_selected_text_with_layout};
+    use crate::state::{AppState, Boot};
+    use leveler_client_protocol::{SessionId, ToolCallId};
+
+    fn state() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("diff-copy"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        );
+        s.size = (80, 40);
+        s.conv.rect = Some((0, 2, 80, 30));
+        s.transcript.push_user("change the file".into());
+        s
+    }
+
+    fn whole_file_diff(path: &str, before: &str, after: &str) -> String {
+        let hunks = leveler_tools::tools::applied_diff::whole_file_hunks(before, after);
+        leveler_tools::tools::applied_diff::unified_diff(path, &hunks).expect("a real applied diff")
+    }
+
+    fn edit(s: &mut AppState, id: &str, path: &str, before: &str, after: &str) -> String {
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            "write_file".into(),
+            serde_json::json!({ "path": path, "content": after }).to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        let diff = whole_file_diff(path, before, after);
+        s.transcript.complete_tool(
+            &ToolCallId::new(id),
+            true,
+            format!("Created {path}"),
+            3,
+            Some(diff.clone()),
+        );
+        diff
+    }
+
+    fn edit_without_diff(s: &mut AppState, id: &str, path: &str, content: &str) {
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            "write_file".into(),
+            serde_json::json!({ "path": path, "content": content }).to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        s.transcript
+            .complete_tool(&ToolCallId::new(id), true, format!("Wrote {path}"), 3, None);
+    }
+
+    fn copy_rows(state: &AppState, width: usize, start: usize, end: usize) -> String {
+        let (plain, layout) = state.conversation_plain(width);
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: start, col: 0 });
+        sel.extend(TextPos {
+            row: end.saturating_sub(1),
+            col: 10_000,
+        });
+        sel.finish();
+        extract_selected_text_with_layout(&plain, &layout, &sel)
+    }
+
+    fn copy_item(state: &AppState, width: usize, item: usize) -> String {
+        let (start, end) = state.item_span(item, width).expect("item span");
+        copy_rows(state, width, start, end)
+    }
+
+    fn rows(state: &AppState, width: usize) -> Vec<String> {
+        state
+            .conversation_lines(width)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .collect()
+    }
+
+    const SRC: &str = "fn main() {\n    let a = 1;\n    let b = 2;\n}\n";
+
+    #[test]
+    fn an_expanded_diff_copies_the_patch_source_not_the_gutter() {
+        let mut s = state();
+        edit(&mut s, "e1", "src/main.rs", "", SRC);
+        let item = s.transcript.items().len() - 1;
+        let painted = rows(&s, 80);
+        assert!(
+            painted.iter().any(|r| r.contains("│ +")),
+            "the diff is expanded by default: {painted:#?}"
+        );
+        let copied = copy_item(&s, 80, item);
+        assert_eq!(copied, SRC.trim_end(), "copied: {copied:?}");
+        assert!(!copied.contains('│'), "no gutter: {copied:?}");
+        assert!(!copied.contains("+ "), "no direction marker: {copied:?}");
+        assert!(
+            !copied.contains("写入文件") && !copied.contains("main.rs"),
+            "the node's head row is chrome, not source: {copied:?}"
+        );
+    }
+
+    #[test]
+    fn a_modified_hunk_copies_removals_and_additions_as_source_lines() {
+        let mut s = state();
+        edit(
+            &mut s,
+            "e1",
+            "src/main.rs",
+            "fn main() {\n    let a = 1;\n}\n",
+            "fn main() {\n    let a = 2;\n}\n",
+        );
+        let item = s.transcript.items().len() - 1;
+        let copied = copy_item(&s, 80, item);
+        // A unified hunk interleaves old and new side; the selection yields the
+        // lines exactly as the patch spells them, minus the marker columns.
+        assert_eq!(
+            copied, "fn main() {\n    let a = 1;\n    let a = 2;\n}",
+            "{copied:?}"
+        );
+        assert!(!copied.contains('│'), "{copied:?}");
+        assert!(!copied.contains("- "), "{copied:?}");
+        assert!(!copied.contains("+ "), "{copied:?}");
+    }
+
+    #[test]
+    fn a_soft_wrapped_diff_line_rejoins_without_inserting_characters() {
+        let long = "    let value = call_something(alpha, beta, gamma, delta, epsilon, zeta) + another_call();";
+        let mut s = state();
+        edit(&mut s, "e1", "src/main.rs", "", &format!("{long}\n"));
+        let item = s.transcript.items().len() - 1;
+        for width in [80usize, 48, 32, 24] {
+            let copied = copy_item(&s, width, item);
+            assert_eq!(copied, long, "width {width} lost or gained characters");
+        }
+    }
+
+    #[test]
+    fn a_cross_hunk_selection_keeps_the_lines_in_order_and_separate() {
+        let before: String = (0..40).map(|i| format!("line{i}\n")).collect();
+        let mut after = before.clone();
+        after = after.replace("line2\n", "line2 changed\n");
+        after = after.replace("line30\n", "line30 changed\n");
+        let mut s = state();
+        let diff = edit(&mut s, "e1", "src/main.rs", &before, &after);
+        assert_eq!(diff.matches("@@").count(), 2, "two hunks: {diff}");
+        let item = s.transcript.items().len() - 1;
+        let copied = copy_item(&s, 80, item);
+        let lines: Vec<&str> = copied.lines().collect();
+        let first = lines
+            .iter()
+            .position(|l| l.trim() == "line2 changed")
+            .expect("first hunk copied");
+        let second = lines
+            .iter()
+            .position(|l| l.trim() == "line30 changed")
+            .expect("second hunk copied");
+        assert!(second > first, "hunks keep their own order: {copied:?}");
+        // The separator between hunks ends the previous line: two unrelated
+        // source lines are never glued into one.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("line2 changedline30 changed")),
+            "hunks merged: {copied:?}"
+        );
+        assert!(!copied.contains('⋯'), "the separator is chrome: {copied:?}");
+        assert!(
+            !copied.contains("@@"),
+            "hunk headers are chrome: {copied:?}"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_edit_copies_no_source_text() {
+        let mut s = state();
+        edit(&mut s, "e1", "src/main.rs", "", SRC);
+        let item = s.transcript.items().len() - 1;
+        s.transcript.set_call_expanded(item, 0, false);
+        let painted = rows(&s, 80);
+        assert!(
+            !painted.iter().any(|r| r.contains("│ +")),
+            "folded: {painted:#?}"
+        );
+        let copied = copy_item(&s, 80, item);
+        assert_eq!(copied, "", "a folded node carries no code: {copied:?}");
+    }
+
+    #[test]
+    fn an_edit_without_an_applied_diff_copies_no_invented_code() {
+        let mut s = state();
+        // A successful write that reported no patch: the request must never be
+        // painted (or copied) as an applied change.
+        edit_without_diff(&mut s, "e1", "src/main.rs", "fn not_a_change() {}\n");
+        let item = s.transcript.items().len() - 1;
+        let painted = rows(&s, 80);
+        assert!(
+            painted
+                .iter()
+                .any(|r| r.contains(crate::i18n::Locale::Zh.text().diff_unavailable)),
+            "the absence is stated: {painted:#?}"
+        );
+        let copied = copy_item(&s, 80, item);
+        assert_eq!(copied, "", "{copied:?}");
+    }
+
+    #[test]
+    fn created_modified_and_deleted_file_patches_copy_their_own_text() {
+        // created
+        let mut s = state();
+        edit(
+            &mut s,
+            "e1",
+            "src/new.rs",
+            "",
+            "pub fn a() {}\npub fn b() {}\n",
+        );
+        let item = s.transcript.items().len() - 1;
+        assert_eq!(copy_item(&s, 80, item), "pub fn a() {}\npub fn b() {}");
+
+        // deleted
+        let mut s = state();
+        edit(
+            &mut s,
+            "e1",
+            "src/old.rs",
+            "pub fn a() {}\npub fn b() {}\n",
+            "",
+        );
+        let item = s.transcript.items().len() - 1;
+        assert_eq!(copy_item(&s, 80, item), "pub fn a() {}\npub fn b() {}");
+    }
+
+    #[test]
+    fn two_edits_of_one_file_copy_only_the_node_they_belong_to() {
+        let mut s = state();
+        edit(&mut s, "e1", "src/one.rs", "", "first_file\n");
+        s.transcript.push_note("sealed".into());
+        edit(&mut s, "e2", "src/two.rs", "", "second_file\n");
+        let second = s.transcript.items().len() - 1;
+        let copied = copy_item(&s, 80, second);
+        assert_eq!(copied, "second_file");
+        assert!(!copied.contains("first_file"), "{copied:?}");
+    }
+
+    /// A drag that starts inside the gutter still copies whole code: the
+    /// gutter columns are decoration, and a selection that begins in them
+    /// reaches the first code cell.
+    #[test]
+    fn a_drag_that_starts_in_the_gutter_copies_code_from_its_first_cell() {
+        const SRC2: &str = "alpha beta\ngamma delta\n";
+        let mut s = state();
+        edit(&mut s, "e1", "src/g.rs", "", SRC2);
+        let item = s.transcript.items().len() - 1;
+        let (start, _) = s.item_span(item, 80).expect("span");
+        let (plain, layout) = s.conversation_plain(80);
+        // The head row is `start`; the code rows follow it.
+        let first_code = start + 1;
+        let second_code = start + 2;
+        assert!(
+            plain[first_code].contains("alpha beta"),
+            "{:?}",
+            plain[first_code]
+        );
+        let mut sel = TextSelection::default();
+        // Column 2 is inside the `    ` lead + gutter decoration.
+        sel.begin(TextPos {
+            row: first_code,
+            col: 2,
+        });
+        // The end column is a SCREEN column, so it must reach past the same
+        // decoration on the last row to cover any code there.
+        sel.extend(TextPos {
+            row: second_code,
+            col: usize::from(layout[second_code].indent) + 5,
+        });
+        sel.finish();
+        let copied = extract_selected_text_with_layout(&plain, &layout, &sel);
+        assert_eq!(copied, "alpha beta\ngamma", "{copied:?}");
+    }
+
+    /// A drag inside one code line copies exactly the cells it covers, with no
+    /// decoration on either side.
+    #[test]
+    fn a_partial_selection_inside_a_diff_row_copies_only_those_cells() {
+        const SRC2: &str = "alpha beta\ngamma delta\n";
+        let mut s = state();
+        edit(&mut s, "e1", "src/g.rs", "", SRC2);
+        let item = s.transcript.items().len() - 1;
+        let (start, _) = s.item_span(item, 80).expect("span");
+        let (plain, layout) = s.conversation_plain(80);
+        let row = start + 1;
+        let indent = usize::from(layout[row].indent);
+        assert_eq!(indent, 10, "the painted gutter width");
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos {
+            row,
+            col: indent + 6,
+        });
+        sel.extend(TextPos {
+            row,
+            col: indent + 10,
+        });
+        sel.finish();
+        let copied = extract_selected_text_with_layout(&plain, &layout, &sel);
+        assert_eq!(copied, "beta", "{copied:?}");
+    }
+
+    /// A tabbed diff line copies the expanded columns it paints.
+    #[test]
+    fn a_tabbed_diff_line_copies_the_expanded_columns_it_paints() {
+        let mut s = state();
+        edit(&mut s, "e1", "src/tabs.rs", "", "\tlet a = 1;\n");
+        let item = s.transcript.items().len() - 1;
+        let copied = copy_item(&s, 80, item);
+        assert_eq!(copied, "    let a = 1;");
+        assert!(!copied.contains('\t'), "{copied:?}");
+    }
+
+    /// The archived plan block carries the user's explicit pause, so an ended
+    /// turn does not look like an unexplained unfinished plan.
+    #[test]
+    fn an_archived_plan_stopped_by_the_user_says_so() {
+        use leveler_client_protocol::{PlanStepStatus, UiExecutionTask, UiPlan, UiPlanStep};
+        let mut s = state();
+        s.execution_goal = Some(UiExecutionTask {
+            goal_id: "g1".into(),
+            objective: "阶段 1 完成后停下，等待我确认再执行阶段 2。".into(),
+            running: false,
+            user_paused: true,
+        });
+        s.transcript
+            .push_user("阶段 1 完成后停下，等待我确认再执行阶段 2。".into());
+        s.transcript.push_plan(UiPlan {
+            steps: vec![
+                UiPlanStep {
+                    index: 0,
+                    description: "阶段 1：实现接口".into(),
+                    status: PlanStepStatus::Done,
+                },
+                UiPlanStep {
+                    index: 1,
+                    description: "阶段 2：写测试".into(),
+                    status: PlanStepStatus::Pending,
+                },
+            ],
+            state: Default::default(),
+        });
+        let conversation = |s: &AppState| {
+            crate::conversation::build::build_conversation_lines(s, 100)
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        assert!(!shell.expanded, "the user's fold stays");
+        let text = conversation(&s);
+        assert!(text.contains("1/2"), "{text}");
+        assert!(text.contains("等待用户确认"), "{text}");
+        assert!(!text.contains("最后记录"), "{text}");
+
+        // Another goal's history is not this plan's authorization: the pause
+        // is projected per goal, so an unpaused goal leaves the plan neutral.
+        s.execution_goal = Some(UiExecutionTask {
+            goal_id: "g2".into(),
+            objective: "实现新的数据导出功能，一次完成。".into(),
+            running: false,
+            user_paused: false,
+        });
+        let text = conversation(&s);
+        assert!(text.contains("1/2"), "{text}");
+        assert!(!text.contains("等待用户确认"), "{text}");
     }
 }

@@ -17,7 +17,6 @@ leveler-project = { workspace = true }
 leveler-lsp = { workspace = true }
 leveler-browser = { workspace = true }
 leveler-skills = { workspace = true }
-leveler-memory = { workspace = true }
 leveler-media = { workspace = true }
 leveler-vcs = { workspace = true }
 ignore = { workspace = true }

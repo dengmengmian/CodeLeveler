@@ -3059,8 +3059,8 @@ const TRAJECTORY_LIVE_ONLY = new Set([
   'observability_loaded', 'session_list', 'runtime_ready', 'model_retrying',
   'turn_finalizing', 'plan_updated', 'diff_updated', 'diff_failed', 'attachment_added',
   'attachment_processing_failed', 'prompt_suggestion', 'away_summary', 'project_rules_loaded',
-  'context_updated', 'background_tasks_reconciled', 'memory_list', 'memory_recalled',
-  'memory_changed', 'goal_recap_created', 'unfinished_goals_loaded', 'child_contribution_loaded',
+  'context_updated', 'background_tasks_reconciled',
+  'goal_recap_created', 'unfinished_goals_loaded', 'child_contribution_loaded',
 ]);
 const TRAJECTORY_TERMINALS = new Set([
   'turn_completed', 'turn_completed_with_warnings', 'turn_answered', 'turn_cancelled',

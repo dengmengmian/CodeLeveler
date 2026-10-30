@@ -1619,8 +1619,6 @@ mod layout_tests {
 
     #[test]
     fn a_summary_stands_in_when_there_is_no_command() {
-        // Tools without a command line (memory writes, MCP calls) still need a
-        // headline that says what is about to happen.
         let ov = Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
             grant: None,
             requires_human_consent: false,

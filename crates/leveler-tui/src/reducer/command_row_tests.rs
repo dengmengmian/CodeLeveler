@@ -1419,7 +1419,7 @@ fn paused_background_unread_grows_after_log_cap() {
 }
 
 #[test]
-fn long_edits_remain_complete_without_disclosure_or_ctrl_o() {
+fn long_edits_remain_complete_by_default_and_fold_on_request() {
     let mut s = state();
     for (id, path) in [("first", "first.rs"), ("second", "second.rs")] {
         s.transcript.push_tool_started(
@@ -1443,13 +1443,51 @@ fn long_edits_remain_complete_without_disclosure_or_ctrl_o() {
     assert!(plain(&s).iter().any(|l| l.contains("second_79")));
     let first_header = row_with(&s, "first.rs").unwrap().0;
     assert!(
-        s.command_hit_at(100, first_header).is_none(),
-        "complete diffs have no per-edit disclosure"
+        s.command_hit_at(100, first_header).is_some(),
+        "an edit head is a disclosure row: one click folds the diff"
     );
-    let before = plain(&s);
+    let expanded = plain(&s);
+
+    // One click on the head folds the diff to its single stat row.
+    let hit = s.command_hit_at(100, first_header).unwrap();
+    s.transcript.toggle_call_at(hit.item, hit.call);
+    let folded = plain(&s);
+    assert!(
+        folded
+            .iter()
+            .any(|l| l.contains("first.rs") && l.contains("+80/-0")),
+        "a folded edit is one row with its stats: {folded:?}"
+    );
+    assert!(
+        !folded.iter().any(|l| l.contains("first_0")),
+        "its diff rows are gone: {folded:?}"
+    );
+    assert!(
+        folded.iter().any(|l| l.contains("second_79")),
+        "a sibling edit keeps its own drawer: {folded:?}"
+    );
+
+    // Clicking again restores every row.
+    s.transcript.toggle_call_at(hit.item, hit.call);
+    assert_eq!(plain(&s), expanded, "one toggle back restores the diff");
+
+    // Ctrl+O owns an edit-only node's drawer too.
+    let rows = plain(&s);
     reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
     );
-    assert_eq!(plain(&s), before, "Ctrl+O cannot hide canonical diffs");
+    let after = plain(&s);
+    assert_ne!(rows, after, "Ctrl+O toggles the latest edit's diff");
+    assert!(
+        after
+            .iter()
+            .any(|l| l.contains("second.rs") && l.contains("+80/-0")),
+        "the latest edit folded to its stat row: {after:?}"
+    );
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+    );
+    assert_eq!(plain(&s), rows, "and one more press restores it");
 }

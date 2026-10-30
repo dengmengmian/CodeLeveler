@@ -119,7 +119,6 @@ pub(crate) async fn cmd_run(
         Ok(())
     };
 
-    flush_memory_before_exit(&app, output).await;
     let code = finish(result, &session_id.to_string(), output, execution)?;
     if cancellation.is_cancelled() {
         return Ok(std::process::ExitCode::from(130));
@@ -287,6 +286,55 @@ impl HandoffLang {
             Self::Zh => zh,
             Self::En => en,
         }
+    }
+}
+
+/// Say what a lost Execution Host meant for the user's background services.
+///
+/// This is a startup fact, so it goes to stderr before the alternate screen: a
+/// converged task is no longer running under this product, and the wording says
+/// exactly which evidence decided that. Nothing here was killed or restarted.
+fn report_host_recovery(recovery: &leveler_execution::execution_host::HostRecovery) {
+    use leveler_execution::execution_host::ProcessPresence;
+    let zh = matches!(leveler_tui::Locale::resolve(None), leveler_tui::Locale::Zh);
+    let pick = |zh_text: &'static str, en_text: &'static str| {
+        if zh { zh_text } else { en_text }
+    };
+    for task in &recovery.tasks {
+        let command = blocker_command_line(&task.program, &task.args);
+        let state = match task.process {
+            ProcessPresence::Gone => pick(
+                "进程已确认结束，退出状态未能记录",
+                "the process is confirmed gone; its exit status was never recorded",
+            ),
+            ProcessPresence::Present => pick(
+                "进程可能仍在运行：未终止，也未重新执行",
+                "its process may still be running: not signalled and not started again",
+            ),
+            ProcessPresence::Unobservable => pick(
+                "无法确认进程状态：未终止，也未重新执行",
+                "its process state could not be verified: not signalled and not started again",
+            ),
+        };
+        eprintln!(
+            "{} {}\n  {} ({state})",
+            pick(
+                "上一个执行宿主已退出；后台任务控制权丢失：",
+                "The previous execution host is gone; background task control was lost:",
+            ),
+            task.task_id,
+            command,
+        );
+    }
+    if !recovery.unresolved_intents.is_empty() {
+        eprintln!(
+            "{} {}",
+            pick(
+                "上一个执行宿主留下未决启动意图（是否启动无法确认，已保留记录）：",
+                "The previous execution host left unresolved spawn intents (launch unproven, records kept):",
+            ),
+            recovery.unresolved_intents.join(", "),
+        );
     }
 }
 
@@ -777,6 +825,17 @@ fn map_ensure_error(error: anyhow::Error) -> anyhow::Error {
 
 #[cfg(any(unix, windows))]
 async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
+    // Reconcile the durable execution state BEFORE asking for a daemon: a lost
+    // host must not make the runtime's own startup fail, and the user has to be
+    // told which service lost its controlling host before the screen changes.
+    let probe = leveler_execution::execution_host::ExecutionHostClient::probe(
+        &leveler_app::execution_host_config(layout)?,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    if let Some(recovery) = probe.recovery.as_ref() {
+        report_host_recovery(recovery);
+    }
     let client = leveler_runtime_host::ensure_default_runtime(
         layout,
         &daemon_launch()?,
@@ -784,30 +843,31 @@ async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntim
     )
     .await
     .map_err(map_ensure_error)?;
-    if let Some(host) = leveler_execution::execution_host::ExecutionHostClient::probe(
-        &leveler_app::execution_host_config(layout)?,
-    )
-    .await
-    .map_err(anyhow::Error::msg)?
-    {
-        let count = host
-            .list()
-            .await
-            .map_err(anyhow::Error::msg)?
-            .into_iter()
-            .filter(|task| {
-                matches!(
-                    task.snapshot.status,
-                    leveler_execution::BackgroundTaskStatus::Running
-                        | leveler_execution::BackgroundTaskStatus::Killing
-                )
-            })
-            .count();
-        if count > 0 {
-            eprintln!("{} {count}", HandoffLang::current().pick(
-                "后台服务继续由独立执行宿主持有，不阻塞版本更新：",
-                "Background services remain owned by the execution host and do not block version updates:",
-            ));
+    if let Some(host) = probe.client.as_ref() {
+        // This count is informational; a host that vanished while the daemon
+        // was starting must not fail the launch (the daemon reconciles it).
+        match host.list().await {
+            Ok(tasks) => {
+                let count = tasks
+                    .into_iter()
+                    .filter(|task| {
+                        matches!(
+                            task.snapshot.status,
+                            leveler_execution::BackgroundTaskStatus::Running
+                                | leveler_execution::BackgroundTaskStatus::Killing
+                        )
+                    })
+                    .count();
+                if count > 0 {
+                    eprintln!("{} {count}", HandoffLang::current().pick(
+                        "后台服务继续由独立执行宿主持有，不阻塞版本更新：",
+                        "Background services remain owned by the execution host and do not block version updates:",
+                    ));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not count hosted background tasks");
+            }
         }
     }
     Ok(client)
@@ -1174,7 +1234,9 @@ pub(crate) async fn cmd_tui(
     }
 
     let app = Arc::new(Application::assemble(layout)?);
-    app.reconcile_execution_services().await?;
+    if let Some(recovery) = app.reconcile_execution_services().await? {
+        report_host_recovery(&recovery);
+    }
     let (model_ref, model_notice) = resolve_model_with_notice(app.as_ref(), model)?;
 
     // One resolution per launch. A resume falls back to the PERSISTED mode
@@ -1226,6 +1288,10 @@ pub(crate) async fn cmd_tui(
         false,
         auto_approve,
     ));
+    // Configuration is live state: watch the files and relay applied
+    // generations to the attached client without restarting the runtime.
+    app.start_config_watcher();
+    in_process_client.spawn_config_bridge();
     // The created row already carries `mode`; on a resume an explicit flag has
     // to move the persisted row + live cell like any other profile change.
     if let Some(persisted) = persisted_mode
@@ -1265,8 +1331,8 @@ pub(crate) async fn cmd_tui(
     let draft_path = app.layout.state_dir.join("draft.txt");
     let history_path = app.layout.state_dir.join("input_history.json");
     // The active model's context window feeds the TUI context gauge.
-    let context_window = app
-        .config
+    let effective_config = app.effective_config();
+    let context_window = effective_config
         .models
         .iter()
         .find(|m| m.profile.id == model_ref.model && m.profile.provider == model_ref.provider)
@@ -1282,12 +1348,11 @@ pub(crate) async fn cmd_tui(
         history_path: Some(history_path),
         context_window,
         // LEVELER_LANG → ~/.leveler/config.toml lang → system → zh.
-        locale: leveler_tui::Locale::resolve(app.config.lang.as_deref()),
+        locale: leveler_tui::Locale::resolve(app.effective_config().lang.as_deref()),
         untrusted_config: crate::trust_cmds::untrusted_config_display(
             app.layout.require_workspace()?,
         ),
-        thinking: app
-            .config
+        thinking: effective_config
             .models
             .iter()
             .find(|m| m.profile.id == model_ref.model && m.profile.provider == model_ref.provider)
@@ -1380,6 +1445,8 @@ pub(crate) async fn cmd_serve(
         .with_process_shutdown(shutdown.clone())
         .with_client_presence(local_waiters.clone()),
     );
+    app.start_config_watcher();
+    runtime.spawn_config_bridge();
     // The host establishes exclusive ownership before recovery and publishes
     // readiness only after the application finishes its existing recovery.
     let prepared = leveler_runtime_host::prepare_daemon(
@@ -1517,6 +1584,8 @@ pub(crate) async fn cmd_web(
                 sandbox,
                 auto_approve,
             ));
+            app.start_config_watcher();
+            runtime.spawn_config_bridge();
             let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
             let db = app.open_database().await?;
             let engine = app.task_engine(&db)?;
@@ -1534,7 +1603,6 @@ pub(crate) async fn cmd_web(
                     "reaped zombie turns before WebUI startup"
                 );
             }
-            app.start_memory_consolidator().await?;
             let router = leveler_web::RouterService::new(
                 service,
                 app.layout.require_workspace()?.to_path_buf(),
@@ -1822,7 +1890,6 @@ pub(crate) async fn cmd_run_resume(
         )
         .await;
 
-    flush_memory_before_exit(&app, output).await;
     finish(result, &id, output, execution)
 }
 
@@ -1951,34 +2018,6 @@ fn outcome_exit_code(
         | StopReason::TurnLimitReached
         | StopReason::Blocked
         | StopReason::Stalled => std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
-    }
-}
-
-/// Settle memory work a one-shot process just admitted.
-///
-/// The worker's idle debounce would otherwise outlive the process, leaving the
-/// last turn for the next launch. A flush that cannot finish leaves its rows
-/// durably queued, so the warning is honest rather than a success claim.
-async fn flush_memory_before_exit(app: &Application, output: OutputFormat) {
-    let Some(outcome) = app.flush_memory_for_headless().await else {
-        return;
-    };
-    if outcome.remaining == 0 {
-        return;
-    }
-    if output == OutputFormat::Text {
-        println!(
-            "{}",
-            Line::warn(&format!(
-                "Memory consolidation left {} item(s) queued for the next session{}.",
-                outcome.remaining,
-                if outcome.timed_out {
-                    " (exit time budget reached)"
-                } else {
-                    ""
-                }
-            ))
-        );
     }
 }
 

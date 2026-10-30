@@ -1052,34 +1052,6 @@ button { font-family: inherit; }
 .ag-star-row.completed .ag-status { color: var(--success); }
 .ag-star-row.failed .ag-status { color: var(--danger); }
 
-/* 记忆 tab（memory_list）：pending 需要用户同意，active 可遗忘 */
-.mem-row {
-  display: flex; gap: 8px; align-items: center; padding: 5px 0;
-  font-size: 12.5px; border-bottom: 1px solid var(--border-subtle);
-}
-.mem-row:last-child { border-bottom: none; }
-.mem-row .mem-title {
-  flex: 1; min-width: 0; color: var(--text-secondary);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.mem-row.pending .mem-title { color: var(--text-primary); }
-.mem-row.archived .mem-title { color: var(--text-muted); }
-.mem-row .mem-ops { flex: none; display: flex; gap: 6px; }
-.mem-btn {
-  font-family: var(--mono); font-size: 11px; color: var(--text-secondary);
-  background: none; border: 1px solid var(--border-default); border-radius: 4px;
-  padding: 2px 8px; cursor: pointer;
-}
-.mem-btn:hover { color: var(--text-primary); border-color: var(--border-strong); }
-.mem-btn.ghost { border-color: transparent; color: var(--text-muted); }
-.mem-btn.ghost:hover { color: var(--danger); }
-
-/* 记忆 tab 上的待采纳提示点 */
-.insp-dot {
-  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--warning); margin-left: 5px; vertical-align: 1px;
-}
-
 /* 待确认 */
 .confirm-item {
   display: flex; gap: 8px; align-items: center;

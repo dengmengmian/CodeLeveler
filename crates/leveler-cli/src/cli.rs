@@ -135,10 +135,6 @@ pub enum Command {
         deny_network: bool,
     },
 
-    /// Manage project-scoped durable memory (approved conclusions / preferences).
-    #[command(subcommand)]
-    Memory(MemoryCommand),
-
     /// Manage durable permission rules (`.leveler/permissions.yaml`).
     #[command(subcommand)]
     Permissions(PermissionsCommand),
@@ -476,141 +472,6 @@ pub enum TrustCommand {
     Revoke,
 }
 
-/// Project memory commands (`~/.leveler/projects/<repo>/memory/`).
-///
-/// Agent `remember`/`forget` still require interactive approval (K36). These
-/// CLI commands are user-authoritative: the human is writing the record.
-///
-/// `forget` is content destruction, not retirement: it deletes the record, its
-/// revisions and its index rows and keeps a minimal tombstone. `deprecate`
-/// (the retirement that keeps history) has no CLI verb yet — the TUI offers it
-/// on the `/memory` page.
-#[derive(Debug, Subcommand)]
-pub enum MemoryCommand {
-    /// List active memories.
-    List {
-        /// Also list historical (deprecated or superseded) entries.
-        #[arg(long)]
-        archived: bool,
-    },
-    /// Show the configured memory switches and what each lane stores.
-    Status,
-    /// Lexical search over active memories.
-    Search {
-        /// Query string (BM25 over title/body/tags).
-        query: String,
-        /// Max hits.
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-    /// Show one active memory by id (or title slug).
-    Show {
-        /// Memory id.
-        id: String,
-        /// Read the historical record instead of the active one.
-        /// Sensitive content stays withheld.
-        #[arg(long)]
-        archived: bool,
-    },
-    /// Forget one active memory for good: the text, its revisions and its
-    /// index rows are deleted, only a tombstone remains. Not the same as
-    /// retiring a record and keeping its history.
-    Forget {
-        /// Memory id.
-        id: String,
-    },
-    /// Create a new active memory (user-authoritative write; no model round).
-    ///
-    /// Never overwrites: saving the same title again with different text keeps
-    /// both, so nothing you wrote earlier disappears.
-    Remember {
-        /// Short title.
-        title: String,
-        /// Body text.
-        body: String,
-        /// How it reaches the model. `preference` is injected into every turn;
-        /// `decision` and `note` are found by relevance or by title.
-        #[arg(long, value_enum, default_value_t = MemoryKindArg::Note)]
-        kind: MemoryKindArg,
-        /// Optional tags (repeatable).
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-    },
-    /// List pending memory candidates (awaiting accept/reject).
-    Pending,
-    /// Accept a pending candidate into active durable memory (user consent).
-    Accept {
-        /// Pending candidate id.
-        id: String,
-    },
-    /// Reject a pending candidate and suppress re-prompt for that signal.
-    Reject {
-        /// Pending candidate id.
-        id: String,
-    },
-    /// Extract candidates from text (no active write).
-    Propose {
-        /// Explicit user text (e.g. "记住：用 pnpm").
-        #[arg(long)]
-        text: String,
-    },
-    /// Remove the retired JSON memory stores (dry run by default).
-    ///
-    /// Only directories that ARE a legacy store are deleted; anything
-    /// unrecognized is reported and left alone. Markdown memory, sessions and
-    /// configuration are never touched.
-    PurgeLegacy {
-        /// Delete what the report listed. Without it nothing is written.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Inspect a Markdown (Memory 2.0) scope without changing it.
-    ///
-    /// Reports blocked journals, invalid documents, external edits and
-    /// duplicate identities. It never creates, recovers or repairs anything,
-    /// so it is safe to run on a scope that failed to open.
-    Diagnose {
-        /// Directory holding the active `*.md` records.
-        #[arg(long)]
-        current: PathBuf,
-        /// Private state root (journal, history, pending, receipts).
-        #[arg(long)]
-        state: PathBuf,
-        /// Scope the roots belong to.
-        #[arg(long, value_enum, default_value_t = MemoryScopeArg::Project)]
-        scope: MemoryScopeArg,
-    },
-}
-
-/// The `--scope` values `leveler memory diagnose` accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum MemoryScopeArg {
-    Global,
-    Project,
-    Local,
-}
-
-impl From<MemoryScopeArg> for leveler_memory::v2::MemoryScope {
-    fn from(value: MemoryScopeArg) -> Self {
-        match value {
-            MemoryScopeArg::Global => Self::Global,
-            MemoryScopeArg::Project => Self::Project,
-            MemoryScopeArg::Local => Self::Local,
-        }
-    }
-}
-
-/// The `--kind` values `leveler memory remember` accepts.
-///
-/// `note` is the CLI default deliberately: a scripted or ad-hoc write should
-/// not silently become something injected into every future turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum MemoryKindArg {
-    Preference,
-    Decision,
-    Note,
-}
-
 #[derive(Debug, Subcommand)]
 pub enum McpCommand {
     /// List configured MCP servers.
@@ -919,6 +780,11 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn retired_memory_subcommand_is_rejected() {
+        assert!(Cli::try_parse_from(["leveler", "memory", "list"]).is_err());
+    }
+
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("args must parse")
     }
@@ -1039,67 +905,6 @@ mod tests {
                 max_model_steps, ..
             }) => assert_eq!(max_model_steps, None),
             other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn memory_list_parses() {
-        let cli = parse(&["leveler", "memory", "list", "--archived"]);
-        match cli.command {
-            Some(Command::Memory(MemoryCommand::List { archived })) => assert!(archived),
-            other => panic!("expected Memory::List, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn memory_search_parses() {
-        let cli = parse(&["leveler", "memory", "search", "workspace", "--limit", "3"]);
-        match cli.command {
-            Some(Command::Memory(MemoryCommand::Search { query, limit })) => {
-                assert_eq!(query, "workspace");
-                assert_eq!(limit, 3);
-            }
-            other => panic!("expected Memory::Search, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn memory_show_parses_the_archived_flag() {
-        let cli = parse(&["leveler", "memory", "show", "old-id", "--archived"]);
-        match cli.command {
-            Some(Command::Memory(MemoryCommand::Show { id, archived })) => {
-                assert_eq!(id, "old-id");
-                assert!(archived);
-            }
-            other => panic!("expected Memory::Show, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn memory_diagnose_parses_explicit_roots_and_scope() {
-        let cli = super::Cli::try_parse_from([
-            "leveler",
-            "memory",
-            "diagnose",
-            "--current",
-            "/tmp/memory-current",
-            "--state",
-            "/tmp/memory-state",
-            "--scope",
-            "local",
-        ])
-        .expect("diagnose must parse");
-        match cli.command {
-            Some(super::Command::Memory(super::MemoryCommand::Diagnose {
-                current,
-                state,
-                scope,
-            })) => {
-                assert_eq!(current, std::path::PathBuf::from("/tmp/memory-current"));
-                assert_eq!(state, std::path::PathBuf::from("/tmp/memory-state"));
-                assert_eq!(scope, super::MemoryScopeArg::Local);
-            }
-            other => panic!("expected Memory::Diagnose, got {other:?}"),
         }
     }
 

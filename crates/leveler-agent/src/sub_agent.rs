@@ -158,8 +158,35 @@ pub(crate) fn resumed_children_note(children: &[ResumableChild]) -> String {
     out
 }
 
+/// The durable outstanding children that are genuinely LOST, given the ones
+/// this window resumes.
+///
+/// One ledger entry can be in both lists: the crashed window recorded it as
+/// outstanding, and the engine has since decided to continue it. The resume is
+/// the newer fact, so that child is not lost. Emitting both notices for one
+/// child made a real run read them as a contradiction and spend rounds
+/// deciding which held.
+pub(crate) fn lost_children_among(outstanding: &[String], resumed_ids: &[&str]) -> Vec<String> {
+    outstanding
+        .iter()
+        .filter(|entry| {
+            let id = entry.split('|').next().unwrap_or_default();
+            !resumed_ids.contains(&id)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Truthful note for a resumed run whose previous window still had background
 /// children running: in-process children do not survive a restart.
+///
+/// A child can legitimately be named by BOTH recovery notices in one session:
+/// an earlier window resumed it, that activation ended with the next window,
+/// and this run settles it as lost. The two notices used to arrive without that
+/// ordering, and a real run read them as a contradiction ("one says lost,
+/// another says resumed… ambiguous") and spent rounds deciding which fact was
+/// true. The note therefore states which notice is the final one; history keeps
+/// both facts instead of being rewritten.
 pub(crate) fn lost_children_note(outstanding: &[String]) -> String {
     let mut out = String::from(
         "## Delegations lost at restart\n\
@@ -183,6 +210,11 @@ pub(crate) fn lost_children_note(outstanding: &[String]) -> String {
             ));
         }
     }
+    out.push_str(
+        "If an earlier notice in this session said one of these was resumed, that \
+         resume is over: this is its final state. Nothing is still running for it, \
+         so decide what to do next instead of waiting.",
+    );
     out
 }
 
@@ -372,6 +404,49 @@ mod tests {
         assert_ne!(a, b);
         assert!(!looks_like_run_ordinal(&a), "{a}");
         assert!(!looks_like_run_ordinal(&b), "{b}");
+    }
+
+    /// A session can carry both recovery notices for one child: an earlier
+    /// window resumed it, that activation died, and this window settles it as
+    /// lost. The lost note must say it is the final word — a real run read the
+    /// pair as a contradiction and spent rounds deciding which fact held.
+    /// A child the engine resumes is not lost, even when the crashed window's
+    /// durable ledger still lists it as outstanding.
+    #[test]
+    fn a_resumed_child_is_never_reported_lost_at_restart() {
+        let outstanding = vec![
+            "agent-2|Newton|worker|src/lib.rs".to_string(),
+            "agent-3|Curie|explorer|".to_string(),
+        ];
+        let lost = lost_children_among(&outstanding, &["agent-2"]);
+        assert_eq!(
+            lost,
+            vec!["agent-3|Curie|explorer|".to_string()],
+            "only the child this window does not resume is lost: {lost:?}"
+        );
+        assert!(
+            lost_children_among(&outstanding, &["agent-2", "agent-3"]).is_empty(),
+            "a fully resumed ledger reports nothing lost"
+        );
+        assert_eq!(
+            lost_children_among(&outstanding, &[]).len(),
+            2,
+            "with no resume decision every outstanding child is lost"
+        );
+    }
+
+    #[test]
+    fn a_lost_note_supersedes_an_earlier_resume_notice() {
+        let note = lost_children_note(&["agent-9|Euclid|worker|src/lib.rs".to_string()]);
+        assert!(note.contains("Euclid (agent-9, role=worker"), "{note}");
+        assert!(
+            note.contains("resume is over") && note.contains("final state"),
+            "the notice must say which of the two facts is final: {note}"
+        );
+        assert!(
+            !note.to_lowercase().contains("re-delegate"),
+            "a lost child is a fact, not an order to delegate again: {note}"
+        );
     }
 
     #[test]

@@ -26,7 +26,21 @@ use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::coding::policy::IndependentReviewPolicy;
 use crate::coding::turn::{TurnInput, content_objective_text, drive_turn};
 use crate::coding::workspace::GitWorkspace;
+use crate::executor::goal_scope;
 use crate::{ContinuationPolicy, StepLimits};
+
+/// Which reading decides whether a user message joins a goal's durable
+/// instruction sequence.
+///
+/// The two are deliberately different: a Goal window's instruction IS the
+/// goal's, including a constraint the user stated for it; a Chat message only
+/// joins the goal when it adds or waives work, so a constraint said about a
+/// side request is not remembered as the goal's own.
+#[derive(Debug, Clone, Copy)]
+enum InstructionBar {
+    GoalWindow,
+    ChatMessage,
+}
 
 const FINALIZATION_REVIEW: &str = "review";
 const FINALIZATION_RESOLVING_OUTCOME: &str = "resolving_outcome";
@@ -326,53 +340,6 @@ impl TaskReport {
     fn with_stop_detail(mut self, stop_detail: Option<String>) -> Self {
         self.stop_detail = stop_detail;
         self
-    }
-}
-
-/// Event/child labels for the Develop reading stages. They name the stage in
-/// the user's vocabulary; the execution contract is the Reviewer one either
-/// way (see `run_harness_child`).
-const DEVELOP_ANALYZE: &str = "analyze";
-const DEVELOP_REVIEW: &str = "review";
-
-/// One line each, for the person watching. Deliberately short: this is a
-/// status, not a summary of the stage's instructions.
-const ANALYZE_HEADLINE: &str = "阅读代码，确定根因与改动边界";
-const REANALYZE_HEADLINE: &str = "重新分析：上一版方向被评审否决";
-const REVIEW_HEADLINE: &str = "对照原始目标验收实际改动";
-
-/// A Develop workflow that never got as far as writing code.
-///
-/// `Blocked` rather than `Failed`: nothing broke, the workflow could not
-/// establish what to do. The text says which, because "blocked" alone sends
-/// the user looking for a stack trace that does not exist.
-fn develop_blocked(text: &str) -> TaskReport {
-    TaskReport::new(
-        TaskOutcome::Blocked,
-        text.to_string(),
-        Vec::new(),
-        leveler_lifecycle::StopReason::Blocked,
-        0,
-    )
-}
-
-/// How a Develop workflow that did not pass review says so.
-///
-/// Every branch here is a NON-pass. Reaching the retry ceiling is not a
-/// completion, and an undecided review is not an acceptance; the wording must
-/// leave no room to read either as one.
-fn develop_stop_warning(terminal: &crate::coding::develop::DevelopTerminal) -> String {
-    use crate::coding::develop::DevelopTerminal;
-    match terminal {
-        // Not produced here: a pass is not a warning.
-        DevelopTerminal::ReviewPassed => String::new(),
-        DevelopTerminal::StoppedBeforeReviewPassed { sendbacks } => format!(
-            "develop: stopped before Review passed — Review sent the work back {sendbacks} \
-             time(s) and the workflow reached its limit"
-        ),
-        DevelopTerminal::ReviewDidNotDecide => {
-            "develop: stopped before Review passed — Review produced no verdict".to_string()
-        }
     }
 }
 
@@ -909,21 +876,17 @@ impl CodingRuntime {
     /// the only surviving copy of the user's objective, and a later `继续`
     /// must continue that objective rather than become one itself.
     ///
-    /// `continue_running` says this turn is a message inside the session's
-    /// existing goal rather than a new declaration. A session that still owes a
-    /// running goal continues THAT goal: opening a sibling whose objective is
-    /// whatever sentence the user happened to type drops the original scope
-    /// and leaves two goals for one task. An explicit `/develop <task>` is a
-    /// new declaration and passes `false`.
+    /// A session that still owes a running goal continues THAT goal: opening a
+    /// sibling whose objective is whatever sentence the user happened to type
+    /// drops the original scope and leaves two goals for one task.
     async fn open_goal_for_turn(
         &self,
         token: &leveler_core::OwnershipToken,
         session_id: &SessionId,
         fallback_objective: &str,
-        continue_running: bool,
     ) -> Result<(leveler_core::GoalId, bool), EngineError> {
         let pending = self.engine.stores.sessions.pending_goal(session_id).await?;
-        if pending.is_none() && continue_running {
+        if pending.is_none() {
             // The session's route already decided this message is goal work, so
             // it continues the work that route is about. One owed goal is
             // unambiguous. With two owed goals the one this session was last
@@ -996,6 +959,63 @@ impl CodingRuntime {
             return Ok(None);
         };
         Ok(running.next().is_none().then_some(first.id))
+    }
+
+    /// Record one user-authored message in the goal's durable instruction
+    /// sequence.
+    ///
+    /// The authority is the user's own words, and the reading is the `bar`:
+    /// [`InstructionBar::GoalWindow`] for the instruction of a window that IS
+    /// the goal (a new deliverable, a prohibition, a waiver, a pause or an
+    /// authorization), [`InstructionBar::ChatMessage`] for a Chat message that
+    /// only joins the goal when it adds or waives WORK. A status question is
+    /// neither and is not recorded.
+    ///
+    /// This writes the user's instruction only. It never executes the new
+    /// requirement, never binds the window to the goal and never touches
+    /// `user_paused_at`, so a supplement added while the user withheld
+    /// authorization stays owed instead of being run or forgotten — and a
+    /// pause is released only by the user's own continuation.
+    async fn record_goal_instruction(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        goal_id: &leveler_core::GoalId,
+        text: &str,
+        bar: InstructionBar,
+    ) -> Result<(), EngineError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some(record) = self.engine.stores.goals.get(goal_id).await? else {
+            return Ok(());
+        };
+        // A settled or cancelled goal owes nothing: the store refuses such an
+        // amendment, and the user's words must not be attached to a finished
+        // goal's scope either.
+        if record.state != leveler_storage::GoalState::Running {
+            return Ok(());
+        }
+        if record.amendments.iter().any(|value| value.trim() == text) {
+            return Ok(());
+        }
+        let joins = match bar {
+            InstructionBar::GoalWindow => {
+                goal_scope::is_goal_instruction(&record.objective, &record.amendments, text)
+            }
+            InstructionBar::ChatMessage => {
+                goal_scope::is_chat_goal_instruction(&record.objective, &record.amendments, text)
+            }
+        };
+        if !joins {
+            return Ok(());
+        }
+        self.engine
+            .stores
+            .goals
+            .append_amendment(token, goal_id, text)
+            .await?;
+        Ok(())
     }
 
     /// Re-attribute every Chat window that was bound to this goal.
@@ -1203,7 +1223,6 @@ impl CodingRuntime {
                     limits: StepLimits::default(),
                 },
                 None,
-                None,
             )
             .await?;
         let tools = executor.request_tool_definitions();
@@ -1279,7 +1298,6 @@ impl CodingRuntime {
                     continuation: ContinuationPolicy::UntilTerminal,
                     limits: StepLimits::default(),
                 },
-                None,
                 None,
             )
             .await?;
@@ -1447,6 +1465,7 @@ impl CodingRuntime {
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: "goal".to_string(),
                 }),
+                model_pinned: true,
             })
             .await
     }
@@ -1820,48 +1839,14 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        self.run_task(session_id, spec, false, content, observer, cancellation)
+        self.run_task(session_id, spec, content, observer, cancellation)
             .await
-    }
-
-    /// Run one goal through the Develop workflow (`Analyze → Coding → Verify →
-    /// Review`) instead of straight to Coding.
-    ///
-    /// Same task, same goal, same session, same terminal authority as
-    /// [`Self::run`]. Only what happens inside differs.
-    pub async fn run_develop(
-        &self,
-        session_id: &SessionId,
-        spec: &TaskSpec,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: CancellationToken,
-    ) -> Result<TaskReport, EngineError> {
-        // Refuse a model this runtime cannot resolve BEFORE starting a task:
-        // a configuration mistake should not leave a failed task behind, and
-        // the user should hear about it from the command they typed.
-        crate::coding::develop::resolve_develop_model(
-            self.factory.develop_model.as_deref(),
-            &self.factory.model,
-        )
-        .map_err(EngineError::Config)?;
-        self.run_task(
-            session_id,
-            spec,
-            true,
-            vec![ContentPart::Text {
-                text: spec.runtime.goal.clone(),
-            }],
-            observer,
-            cancellation,
-        )
-        .await
     }
 
     async fn run_task(
         &self,
         session_id: &SessionId,
         spec: &TaskSpec,
-        develop: bool,
         content: Vec<ContentPart>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
@@ -1879,14 +1864,7 @@ impl CodingRuntime {
             )
             .await?;
         let (goal, continued_running) = match self
-            .open_goal_for_turn(
-                &token,
-                session_id,
-                &spec.runtime.goal,
-                // `/develop <task>` is an explicit new objective; an ordinary
-                // goal-profile message is work inside the goal already owed.
-                !develop,
-            )
+            .open_goal_for_turn(&token, session_id, &spec.runtime.goal)
             .await
         {
             Ok(goal) => goal,
@@ -1908,24 +1886,18 @@ impl CodingRuntime {
         // A message that continues a running goal is user scope authority for
         // that goal: a requirement it adds must reach the completion gate, or
         // the goal could be resolved on the narrower original wording. The
-        // declaration-free path records it here; `/goal` and resume record it
-        // through their own amendment paths.
-        let instruction = spec.runtime.goal.trim();
-        if continued_running
-            && !instruction.is_empty()
-            && let Err(error) = self
-                .engine
-                .stores
-                .goals
-                .append_amendment(&token, &goal, instruction)
-                .await
-        {
-            tracing::warn!(
-                %error,
-                %session_id,
-                goal = %goal,
-                "could not record the continuation instruction with its goal"
-            );
+        // declaration-free path records it here through the same reading the
+        // gate uses, so a status question adds nothing while a new
+        // deliverable, a prohibition or a waiver becomes durable scope.
+        // `/goal` and resume record theirs through their own amendment paths.
+        if continued_running {
+            self.record_goal_instruction(
+                &token,
+                &goal,
+                spec.runtime.goal.trim(),
+                InstructionBar::GoalWindow,
+            )
+            .await?;
         }
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
@@ -1986,20 +1958,8 @@ impl CodingRuntime {
 
         // Orchestrate execution path removed; legacy kind falls through to direct.
         let terminal_cancellation = cancellation.clone();
-        let result = match (develop, spec.runtime.kind) {
-            (true, _) => {
-                self.run_develop_loop(
-                    &log,
-                    &runner,
-                    spec,
-                    &goal,
-                    declaration,
-                    observer,
-                    cancellation,
-                )
-                .await
-            }
-            (false, ExecutionKind::Direct) => {
+        let result = match spec.runtime.kind {
+            ExecutionKind::Direct => {
                 self.run_direct(
                     &log,
                     &runner,
@@ -2012,7 +1972,7 @@ impl CodingRuntime {
                 )
                 .await
             }
-            (false, ExecutionKind::Parallel) => Err(EngineError::Config(
+            ExecutionKind::Parallel => Err(EngineError::Config(
                 "the parallel strategy lands in B9".to_string(),
             )),
         };
@@ -2048,9 +2008,11 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        if let Some(capabilities) = &self.factory.capabilities {
-            capabilities.reset();
-        }
+        // A Chat turn keeps the session's activated packs: the enable answered
+        // "tools available on the following request", and dropping it here is
+        // what made the next turn's catalog contradict the tool list the model
+        // had just been given. Nothing goal-scoped is loaded: a Chat turn owns
+        // no goal at start.
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
         let raw = self.load_request_transcript(session_id, None, None).await?;
@@ -2090,6 +2052,18 @@ impl CodingRuntime {
             })
             .next()
             .map(str::to_string);
+        // A Chat turn can add work to the one goal this task still owes. The
+        // user's own words are durable scope, never a binding: the goal keeps
+        // its identity, its window and its authorization, and this turn stays
+        // a Chat turn. Recording it here is what keeps a supplement from being
+        // lost when the user did not type `继续` (the resume path records the
+        // same text for a continuation).
+        if let Some(goal_id) = self.single_running_goal(&token.task_id).await?
+            && let Some(text) = objective_hint.as_deref()
+        {
+            self.record_goal_instruction(&token, &goal_id, text, InstructionBar::ChatMessage)
+                .await?;
+        }
         let runner = TurnRunner {
             stores: &self.engine.stores,
             token: token.clone(),
@@ -2406,12 +2380,12 @@ impl CodingRuntime {
                 match self.unique_legacy_running_goal(session_id).await? {
                     Some(goal_id) => Ok(goal_id),
                     None => self
-                        .open_goal_for_turn(&token, session_id, lineage.objective.text(), true)
+                        .open_goal_for_turn(&token, session_id, lineage.objective.text())
                         .await
                         .map(|(goal, _)| goal),
                 }
             } else {
-                self.open_goal_for_turn(&token, session_id, lineage.objective.text(), true)
+                self.open_goal_for_turn(&token, session_id, lineage.objective.text())
                     .await
                     .map(|(goal, _)| goal)
             };
@@ -2591,10 +2565,17 @@ impl CodingRuntime {
         // Same rules as chat: a checkpoint's block when one is fresh, else the
         // snapshot merged with the post-snapshot rows, folded if still oversized.
         let prior_result = async {
-        if let Some(capabilities) = &self.factory.capabilities {
-            if let Some(goal) = &goal {
-                capabilities.bind_goal(self.engine.stores.goals.clone(), token.clone(), goal.clone()).await.map_err(EngineError::Config)?;
-            } else { capabilities.reset(); }
+        if let Some(capabilities) = &self.factory.capabilities
+            && let Some(goal) = &goal
+        {
+            capabilities
+                .bind_goal(
+                    self.engine.stores.goals.clone(),
+                    token.clone(),
+                    goal.clone(),
+                )
+                .await
+                .map_err(EngineError::Config)?;
         }
             let scope = lineage.goal_id.as_ref().map(|id| id.as_str()).unwrap_or(lineage.root_turn_id.as_str());
             let scoped = crate::coding::turn::persisted_budget_progress(self.engine.stores.events.as_ref(), session_id, scope).await?;
@@ -2910,247 +2891,6 @@ impl CodingRuntime {
         .await
     }
 
-    /// The Develop workflow: `Analyze → Coding → Review`.
-    ///
-    /// One task, one goal, one session. Analyze and Review are harness-launched
-    /// read-only children — the same child primitive, lifecycle, ownership
-    /// fence and spend rollup the closure reviewer already uses — and Coding is
-    /// the ordinary Coding turn, unchanged except for a better first message.
-    ///
-    /// Nothing here is reachable from an ordinary turn.
-    async fn run_develop_loop(
-        &self,
-        log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
-        spec: &TaskSpec,
-        goal_id: &leveler_core::GoalId,
-        mut declaration: Option<String>,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: CancellationToken,
-    ) -> Result<TaskReport, EngineError> {
-        use crate::coding::develop::{
-            DevelopStep, DevelopTerminal, analyze_brief, coding_task, parse_review_decision,
-            reanalyze_brief, resolve_develop_model,
-        };
-
-        let develop_model =
-            resolve_develop_model(self.factory.develop_model.as_deref(), &self.factory.model)
-                .map_err(EngineError::Config)?;
-        // Pin only when it actually differs. An unnecessary pin would stamp a
-        // model override onto every child record that changed nothing.
-        let pinned = (develop_model != self.factory.model).then(|| develop_model.to_string());
-        let goal = spec.runtime.goal.clone();
-
-        let Some(mut work_order) = self
-            .develop_stage(
-                log,
-                runner,
-                spec,
-                goal_id.as_str(),
-                DEVELOP_ANALYZE,
-                ANALYZE_HEADLINE,
-                analyze_brief(&goal),
-                Vec::new(),
-                pinned.clone(),
-                observer,
-                &cancellation,
-            )
-            .await?
-        else {
-            return Ok(develop_blocked(
-                "Develop workflow stopped: Analyze produced no work order, so no \
-                 implementation was attempted.",
-            ));
-        };
-
-        let mut progress = crate::coding::develop::DevelopProgress::default();
-        loop {
-            let mut report = self
-                .run_coding_turn(
-                    log,
-                    runner,
-                    spec,
-                    goal_id,
-                    Message::user(
-                        coding_task(&goal, &work_order),
-                        TranscriptOrigin::RuntimeNotice {
-                            notice: RuntimeNoticeKind::DevelopTask,
-                        },
-                    ),
-                    // Develop owns its own Review stage; the closure reviewer
-                    // would read the same diff a second time on the same bill.
-                    IndependentReviewPolicy::Off,
-                    true,
-                    // The declaration belongs to the first Coding window; a
-                    // later stage runs inside the goal it already opened.
-                    declaration.take(),
-                    observer,
-                    cancellation.clone(),
-                )
-                .await?;
-            if report.outcome != TaskOutcome::Completed {
-                // A coding stage that stopped early is not something to review,
-                // and its own terminal is the truthful one.
-                report.completion_warnings.push(
-                    "develop: stopped before Review — the Coding stage did not complete"
-                        .to_string(),
-                );
-                return Ok(report);
-            }
-
-            let diff = match spec.coding.repository.as_deref() {
-                Some(root) => review_diff(root, &report.modified_files).await,
-                None => None,
-            };
-            let brief = crate::coding::develop::review_brief(
-                &goal,
-                &work_order,
-                &report.final_text,
-                &report.modified_files,
-                diff.as_deref(),
-            );
-            let review_report = self
-                .develop_stage(
-                    log,
-                    runner,
-                    spec,
-                    goal_id.as_str(),
-                    DEVELOP_REVIEW,
-                    REVIEW_HEADLINE,
-                    brief,
-                    report.modified_files.clone(),
-                    pinned.clone(),
-                    observer,
-                    &cancellation,
-                )
-                .await?;
-            let decision = review_report.as_deref().and_then(parse_review_decision);
-
-            match progress.advance(decision) {
-                DevelopStep::Stop(DevelopTerminal::ReviewPassed) => return Ok(report),
-                DevelopStep::Stop(terminal) => {
-                    report.outcome = TaskOutcome::Interrupted;
-                    report.stop_reason = StopReason::Stalled;
-                    report.stop_detail = Some(develop_stop_warning(&terminal));
-                    report
-                        .completion_warnings
-                        .push(develop_stop_warning(&terminal));
-                    return Ok(report);
-                }
-                DevelopStep::Coding => {
-                    // Review's own report IS the next work order: §12 requires a
-                    // send-back to carry a complete brief, and the brief says so.
-                    work_order = review_report.unwrap_or_default();
-                }
-                DevelopStep::Analyze => {
-                    let feedback = review_report.unwrap_or_default();
-                    let Some(next) = self
-                        .develop_stage(
-                            log,
-                            runner,
-                            spec,
-                            goal_id.as_str(),
-                            DEVELOP_ANALYZE,
-                            REANALYZE_HEADLINE,
-                            reanalyze_brief(&goal, &work_order, &feedback),
-                            Vec::new(),
-                            pinned.clone(),
-                            observer,
-                            &cancellation,
-                        )
-                        .await?
-                    else {
-                        report.outcome = TaskOutcome::Interrupted;
-                        report.stop_reason = StopReason::Stalled;
-                        report.stop_detail =
-                            Some("develop: re-analysis produced no work order".to_string());
-                        report.completion_warnings.push(
-                            "develop: stopped before Review passed — re-analysis produced no \
-                             work order"
-                                .to_string(),
-                        );
-                        return Ok(report);
-                    };
-                    work_order = next;
-                }
-            }
-        }
-    }
-
-    /// Run one Develop reading stage and return its report.
-    ///
-    /// `None` means the stage produced nothing the workflow may act on: it did
-    /// not reach a clean terminal, or it reached one with an empty report. A
-    /// partial work order is not a work order, and a partial review is not an
-    /// acceptance — both are handled as "did not decide" rather than guessed at.
-    #[allow(clippy::too_many_arguments)]
-    async fn develop_stage(
-        &self,
-        log: &EventLog<'_>,
-        runner: &TurnRunner<'_>,
-        spec: &TaskSpec,
-        budget_scope: &str,
-        nickname: &'static str,
-        headline: &str,
-        brief: String,
-        files: Vec<String>,
-        model: Option<String>,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<Option<String>, EngineError> {
-        let stage = |action: &str, detail: String| EngineEvent::ReviewStage {
-            required: true,
-            action: format!("{nickname}_{action}"),
-            detail,
-        };
-        log.append(None, stage("launching", nickname.to_string()), observer)
-            .await?;
-        // Elapsed is the parent's spent wall time; these stages run at the
-        // edges of the turn; run_harness_child derives their task residual
-        // from durable scoped spend rather than opening a new budget.
-        match run_harness_child(
-            runner,
-            &self.factory,
-            goal_profile(spec),
-            budget_scope,
-            nickname,
-            headline.to_string(),
-            brief,
-            files,
-            std::time::Duration::ZERO,
-            model,
-            observer,
-            cancellation.clone(),
-        )
-        .await
-        {
-            Ok(outcome) if outcome.completed && !outcome.report.trim().is_empty() => {
-                log.append(None, stage("finished_ok", nickname.to_string()), observer)
-                    .await?;
-                Ok(Some(outcome.report))
-            }
-            Ok(_) => {
-                log.append(
-                    None,
-                    stage("finished_incomplete", nickname.to_string()),
-                    observer,
-                )
-                .await?;
-                Ok(None)
-            }
-            Err(ReviewRunError::Launch(error)) => {
-                tracing::warn!(%error, stage = nickname, "develop stage could not be launched");
-                log.append(None, stage("launch_failed", error.to_string()), observer)
-                    .await?;
-                Ok(None)
-            }
-            Err(ReviewRunError::Settlement(error)) => Err(error),
-            Err(ReviewRunError::Unclosed(detail)) => {
-                Err(EngineError::UnclosedTerminalBoundary(detail))
-            }
-        }
-    }
-
     /// The direct strategy: one goal turn.
     async fn run_direct(
         &self,
@@ -3180,10 +2920,9 @@ impl CodingRuntime {
 
     /// One Coding turn on `task`.
     ///
-    /// `task` is normally the user's goal verbatim. The Develop workflow passes
-    /// the goal WITH its work order, which is the whole of what that workflow
-    /// changes about how the Coding agent runs: same executor, same plan, same
-    /// tools, same completion semantics — a better-informed first message.
+    /// `task` is the goal's initiating message: the user's words, plus any
+    /// attachments. Same executor, same plan, same tools, same completion
+    /// semantics for every turn.
     #[allow(clippy::too_many_arguments)]
     async fn run_coding_turn(
         &self,
@@ -3381,10 +3120,7 @@ impl CodingRuntime {
         budget_scope: &str,
         modified_files: &[String],
         execution_duration_ms: u64,
-        // The policy in force for THIS conclusion. Normally the factory's, but
-        // `/develop` passes `Off`: its own Review stage already reads the
-        // change against the user's goal, and running the closure reviewer as
-        // well would review the same diff twice for the same session's bill.
+        // The policy in force for THIS conclusion.
         policy: IndependentReviewPolicy,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: &CancellationToken,
@@ -3438,9 +3174,6 @@ impl CodingRuntime {
             review_brief(&spec.runtime.goal, modified_files, diff.as_deref()),
             modified_files.to_vec(),
             std::time::Duration::from_millis(execution_duration_ms),
-            // The closure reviewer runs on the task's own model, as it always
-            // has. Only `/develop` pins one.
-            None,
             observer,
             cancellation.clone(),
         )
@@ -3502,6 +3235,13 @@ impl CodingRuntime {
                 report_from_agent_outcome(outcome, TaskOutcome::Completed)
             };
 
+        // The user's pause authorization outlives this window. The window's own
+        // terminal says whether it stopped AT the boundary; the goal's durable
+        // user instructions say whether a pause is still in force. Recording it
+        // here is what keeps a later status question from silently releasing a
+        // boundary the person set in an earlier turn.
+        self.sync_goal_user_pause(&runner.token, budget_scope, &task_report)
+            .await?;
         // A configured required reviewer contributes durable completion
         // evidence (findings and a child terminal). Settle it before
         // TaskFinished so that terminal is a closed evidence boundary, not a
@@ -3545,6 +3285,56 @@ impl CodingRuntime {
         Ok(task_report)
     }
 
+    /// Persist the user's pause authorization for one goal window.
+    ///
+    /// `budget_scope` is the goal id for a Goal turn (and for a Chat turn that
+    /// committed a task); a plain Chat turn passes its turn id and has no goal
+    /// row, so this is a no-op there.
+    ///
+    /// Set when this window ended at the user's own boundary. Clear only when
+    /// the user's own NEWEST authorization signal is a continuation, or the
+    /// goal no longer owes work. An absent pause wording is never read as a
+    /// release: a goal declared by `commit_task` may not quote the user's pause
+    /// verbatim, and forgetting a boundary is the one error this must not make.
+    async fn sync_goal_user_pause(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        budget_scope: &str,
+        report: &TaskReport,
+    ) -> Result<(), EngineError> {
+        let goal_id = leveler_core::GoalId::new(budget_scope.to_string());
+        let Some(record) = self.engine.stores.goals.get(&goal_id).await? else {
+            return Ok(());
+        };
+        let paused = report
+            .stop_detail
+            .as_deref()
+            .is_some_and(crate::executor::closeout::is_user_pause_detail);
+        if paused {
+            if record.user_paused_at.is_none() {
+                self.engine
+                    .stores
+                    .goals
+                    .set_user_pause(token, &goal_id, Some(leveler_core::now()))
+                    .await?;
+            }
+            return Ok(());
+        }
+        let released = leveler_lifecycle::latest_authorization_signal(
+            std::iter::once(record.objective.as_str())
+                .chain(record.amendments.iter().map(String::as_str)),
+        ) == Some(leveler_lifecycle::AuthorizationSignal::Continue);
+        let settled = record.state == leveler_storage::GoalState::Settled;
+        if record.user_paused_at.is_some() && (released || settled) {
+            self.engine
+                .stores
+                .goals
+                .set_user_pause(token, &goal_id, None)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Produce a tracked handoff briefing when the projected request exceeds
     /// its resolved context threshold. Rejected summaries preserve history;
     /// request or accounting failures propagate to the durable turn.
@@ -3583,9 +3373,8 @@ async fn run_harness_child(
     factory: &ExecutorFactory,
     profile: TurnProfile,
     budget_scope: &str,
-    // What this child is FOR, in the user's vocabulary: `reviewer` for the
-    // closure review, `analyze` / `review` for the Develop workflow's reading
-    // stages. It names the child in events and in the parent's rollup.
+    // What this child is FOR, in the user's vocabulary: `reviewer` names the
+    // closure review. It names the child in events and in the parent's rollup.
     //
     // It is NOT a capability: every child launched here runs under the
     // Reviewer contract (read-only, harness-only, bounded rounds), which is
@@ -3602,13 +3391,12 @@ async fn run_harness_child(
     files: Vec<String>,
     // The task's wall time already spent: this child is its tail.
     parent_elapsed: std::time::Duration,
-    model: Option<String>,
     observer: &mut (dyn FnMut(EngineEvent) + Send),
     cancellation: CancellationToken,
 ) -> Result<HarnessChildOutcome, ReviewRunError> {
     let profile_for_budget = profile.clone();
     let mut executor = factory
-        .build(profile, None, None)
+        .build(profile, None)
         .await
         .map_err(ReviewRunError::Launch)?
         .with_approver(runner.approver.clone())
@@ -3690,7 +3478,6 @@ async fn run_harness_child(
                     brief,
                     files,
                     std::time::Duration::ZERO,
-                    model,
                     &mut forward,
                     cancellation,
                 )
@@ -3882,8 +3669,7 @@ struct HarnessChildOutcome {
     /// `false` even when it wrote something useful.
     completed: bool,
     findings: usize,
-    /// The child's own report. The closure reviewer only counts findings; the
-    /// Develop stages read this, because a work order and a verdict ARE text.
+    /// The child's own report: findings, and the text the caller reads.
     report: String,
 }
 
@@ -4057,7 +3843,10 @@ fn end_session_goal_route(terminal: &mut leveler_engine::TaskTerminal, goal_sess
     let paused = matches!(
         terminal.outcome,
         TaskOutcome::Interrupted | TaskOutcome::BudgetLimited
-    );
+    ) || terminal
+        .reason
+        .as_deref()
+        .is_some_and(crate::executor::closeout::is_user_pause_detail);
     goal.ends_session_goal = goal_session && !paused;
 }
 

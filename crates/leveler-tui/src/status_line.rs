@@ -246,8 +246,12 @@ pub(crate) fn fmt_tokens_compact(n: u32) -> String {
 fn footer_context_usage(state: &AppState) -> Option<(u64, u64, u64)> {
     // Two axes, never one number.
     //
-    // With a snapshot this is the COMPACTION axis: the runtime's projection for
-    // the next request against its own capacity.
+    // With a snapshot this is the MODEL-WINDOW axis: the runtime's projection for
+    // the next request against the window the model declares. The inspector is
+    // the other axis (the same projection against the effective input capacity
+    // the fold thresholds live on), and each surface names its denominator so a
+    // reader can tell the two apart instead of reading one ratio built from two
+    // totals.
     if let Some(acc) = state.context.loaded.as_ref() {
         if acc.used_tokens == 0 {
             return None;

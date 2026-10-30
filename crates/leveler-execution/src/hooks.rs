@@ -464,7 +464,7 @@ mod lifecycle_hook_tests {
     }
 
     /// Compaction throws away detail by design. A hook here is what lets a user
-    /// keep what matters (export it, push it to memory) without us guessing
+    /// keep what matters (export it to project documents) without us guessing
     /// what "matters" means or paying for an extra model call on every compact.
     #[tokio::test]
     #[cfg(unix)]

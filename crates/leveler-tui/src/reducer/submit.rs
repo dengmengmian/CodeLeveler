@@ -10,7 +10,7 @@ use super::overlay_keys::{
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
-    open_clean, open_context, open_diff_screen, open_sessions_screen, open_trace, toggle_screen,
+    open_clean, open_diff_screen, open_sessions_screen, open_stats, open_trace, toggle_screen,
 };
 
 /// "The composer text just changed" hook: re-arm the slash popup and drop any
@@ -198,10 +198,10 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     state.transcript.push_user_if_new(shown);
     // Stage the turn's goal identity before it flips to Busy. A continuation
     // phrase re-enters the goal already shown (and the runtime's own resume
-    // path); any other input opens a new one.
-    let continuation = attachments.is_empty()
-        && (state.collaboration.eq_ignore_ascii_case("goal")
-            || leveler_client_protocol::parse_continuation(&content).is_some());
+    // path); any other input opens a new one. A paused goal accepts the
+    // authorization forms the runtime itself honors ("确认，继续阶段 2，可以
+    // 吗？"), so the badge leaves the moment the user releases it.
+    let continuation = attachments.is_empty() && resumes_goal(state, &content);
     state.staged_goal = Some(crate::active_goal::StagedGoal {
         title: crate::active_goal::short_title(&content),
         objective: Some(content.clone()),
@@ -217,6 +217,19 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
         state.collaboration.eq_ignore_ascii_case("goal") && attachments.is_empty();
     let command = turn_input_command(state, content, attachments);
     submit_turn_input(state, command)
+}
+
+/// Whether this submitted text re-enters the goal already on screen.
+///
+/// In Goal mode every turn is the goal's; in Chat, only an explicit
+/// continuation is — either the client's own phrase parser or, for a paused
+/// goal, the authorization forms the runtime honors when it routes the same
+/// text to its resume path.
+fn resumes_goal(state: &AppState, content: &str) -> bool {
+    state.collaboration.eq_ignore_ascii_case("goal")
+        || leveler_client_protocol::parse_continuation(content).is_some()
+        || (crate::active_goal::paused_owed(state)
+            && leveler_lifecycle::authorizes_continuation(content))
 }
 
 /// The command a user's turn input becomes.
@@ -272,8 +285,7 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
     } else {
         // The runtime announces an admitted turn's message itself
         // (`UserMessageAdded`); only the optimistic Busy is ours to set.
-        let continuation = state.collaboration.eq_ignore_ascii_case("goal")
-            || leveler_client_protocol::parse_continuation(&content).is_some();
+        let continuation = resumes_goal(state, &content);
         state.staged_goal = Some(crate::active_goal::StagedGoal {
             title: crate::active_goal::short_title(&content),
             objective: Some(content.clone()),
@@ -559,7 +571,7 @@ fn start_remote(state: &mut AppState, local: bool) -> Vec<Effect> {
 }
 
 /// Handle a `/command` typed in the composer.
-fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let name = command.split_whitespace().next().unwrap_or("");
     // Busy gate from the registry (IdleOnly refuses while a turn is running).
     if state.is_busy()
@@ -590,7 +602,6 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "thinking" => thinking_slash(state, command),
         "goal" => run_goal(state, command),
-        "develop" => run_develop(state, command),
         "btw" => run_btw(state, command),
         "trace" => {
             let id = command.split_whitespace().nth(1).map(str::to_string);
@@ -598,13 +609,13 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             // the observatory's `←` goes back to.
             open_trace(state, id, crate::screen::Screen::Conversation)
         }
-        "context" => open_context(state),
+        "context" => open_stats(state, crate::screen::StatsSection::Context),
+        // Same page, other section: one implementation, two entry points.
+        "usage" => open_stats(state, crate::screen::StatsSection::Usage),
         "clean" => open_clean(state),
         "collab" => set_collab_cmd(state, command),
-        "memory" => memory_slash(state, command),
         "agents" => agents_slash(state, command),
         "skills" => skills_slash(state, command),
-        "remember" => remember_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
         "remote-loc" => start_remote(state, true),
@@ -624,6 +635,9 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "compact" => vec![Effect::Send(ClientCommand::CompactContext {
             session_id: state.session_id.clone(),
         })],
+        // Re-read the configured sources into the RUNNING runtime. Not a model
+        // message: the answer is the runtime's ConfigReloaded event.
+        "reload" => vec![Effect::Send(ClientCommand::ReloadConfig { query_id: None })],
         // Long-goal P3: the runtime cuts a durable goal checkpoint and
         // answers with GoalRecapCreated — the Recap is persisted truth, not
         // a client-side transcript summary.
@@ -670,13 +684,75 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     }
 }
 
-/// `/copy output|command|selection`.
+/// The applied patch of the most recent edit node, verbatim, for `/copy diff`.
+///
+/// The node is the unit the conversation paints as one edit, so the answer is
+/// the patch set of that node and nothing else: every member shares the tool,
+/// the touched files and the status (`tool_cell::patch_files_key` + name), so
+/// concatenating their own patches cannot claim a continuity the runtime never
+/// reported. A call with no applied diff contributes nothing, and when no call
+/// has one there is no patch to copy.
+fn latest_applied_patch(state: &AppState) -> Option<String> {
+    use crate::transcript::TranscriptItem;
+    let calls = state
+        .transcript
+        .items()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::ToolGroup(group)
+                if group.calls.iter().any(|c| {
+                    crate::activity_stream::is_edit_call(c) && applied_diff(c).is_some()
+                }) =>
+            {
+                Some(group.calls.as_slice())
+            }
+            _ => None,
+        })?;
+    let anchor = calls
+        .iter()
+        .rev()
+        .find(|c| crate::activity_stream::is_edit_call(c) && applied_diff(c).is_some())?;
+    let key = (
+        anchor.name.clone(),
+        crate::tool_cell::patch_files_key(&anchor.arguments),
+        anchor.status,
+    );
+    let patches: Vec<&str> = calls
+        .iter()
+        .filter(|c| {
+            (
+                c.name.clone(),
+                crate::tool_cell::patch_files_key(&c.arguments),
+                c.status,
+            ) == key
+        })
+        .filter_map(applied_diff)
+        .collect();
+    (!patches.is_empty()).then(|| patches.join("\n"))
+}
+
+/// The patch the runtime reported as APPLIED for one call. Never the request.
+fn applied_diff(call: &crate::transcript::ToolCallBlock) -> Option<&str> {
+    call.applied_diff
+        .as_deref()
+        .map(str::trim_end)
+        .filter(|d| !d.trim().is_empty())
+}
+
+/// `/copy diff|output|command|selection`.
 ///
 /// Both output paths copy the authored content, never painted rows: the
 /// command is the exact string the user ran, and the output comes from the
 /// raw capture (or the complete retained text when it was never capped). A
 /// truncated tail is refused rather than silently passed off as the whole
 /// result.
+///
+/// `/copy diff` copies the runtime's own applied patch, verbatim. It is a
+/// different thing from dragging over the diff body: a selection yields the
+/// source lines (no gutter, no `+`/`-` marker), while this entry yields a
+/// unified diff a reader can apply. A request the runtime never reported as
+/// applied is not a candidate — the model's intent is not a change.
 fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     use crate::transcript::{TranscriptItem, UserShellStatus};
     let arg = command.split_whitespace().nth(1).unwrap_or("");
@@ -696,6 +772,16 @@ fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             _ => None,
         });
     match arg {
+        "diff" => {
+            let Some(patch) = latest_applied_patch(state) else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_no_diff.to_string(),
+                });
+                return Vec::new();
+            };
+            copy_now(state, &patch)
+        }
         "command" => {
             let Some((_, command, _, _, _)) = latest else {
                 state.notification = Some(Notification {
@@ -1140,166 +1226,6 @@ fn agents_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     })]
 }
 
-/// `/memory` — list active (+archived); `/memory forget <id>` archives.
-fn memory_list_effect(state: &mut AppState, include_archived: bool) -> Effect {
-    let query_id = leveler_client_protocol::CommandId::generate();
-    state.memory_query = Some(query_id.clone());
-    Effect::Send(ClientCommand::ListMemory {
-        session_id: state.session_id.clone(),
-        query_id: Some(query_id),
-        include_archived,
-    })
-}
-
-fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let rest = command.strip_prefix("memory").unwrap_or(command).trim();
-    // `/memory` is the human entry point: a page over the runtime's listing,
-    // not a transcript dump. `/memory review` lands directly on the consent
-    // queue. The text commands below stay for scripts and narrow/headless use.
-    if rest.is_empty() {
-        return crate::memory::open_page(state, false);
-    }
-    if rest == "review" {
-        return crate::memory::open_page(state, true);
-    }
-    if rest == "list" {
-        return vec![memory_list_effect(state, true)];
-    }
-    if rest == "status" {
-        let query_id = leveler_client_protocol::CommandId::generate();
-        state.memory_status_query = Some(query_id.clone());
-        return vec![Effect::Send(ClientCommand::MemoryStatus {
-            session_id: state.session_id.clone(),
-            query_id: Some(query_id),
-        })];
-    }
-    // Accepting a pending candidate is the user's consent (K36) — the reason
-    // the runtime never lets the model do it.
-    if let Some(id) = rest.strip_prefix("accept").map(str::trim) {
-        if id.is_empty() {
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: state.t().memory_accept_usage.to_string(),
-            });
-            return Vec::new();
-        }
-        let (scope, id) = crate::memory::parse_key(id);
-        return vec![
-            Effect::Send(ClientCommand::AcceptMemory {
-                session_id: state.session_id.clone(),
-                scope,
-                id: id.to_string(),
-            }),
-            memory_list_effect(state, false),
-        ];
-    }
-    // Rejecting a candidate is consent WITHHELD. It is a different operation
-    // from forgetting an active entry, and conflating them meant a pending id
-    // sent to forget did nothing at all.
-    if let Some(id) = rest.strip_prefix("reject").map(str::trim) {
-        if id.is_empty() {
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: state.t().memory_reject_usage.to_string(),
-            });
-            return Vec::new();
-        }
-        let (scope, id) = crate::memory::parse_key(id);
-        return vec![
-            Effect::Send(ClientCommand::RejectMemory {
-                session_id: state.session_id.clone(),
-                scope,
-                id: id.to_string(),
-            }),
-            memory_list_effect(state, false),
-        ];
-    }
-    if let Some(id) = rest.strip_prefix("forget").map(str::trim) {
-        if id.is_empty() {
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: state.t().memory_forget_usage.to_string(),
-            });
-            return Vec::new();
-        }
-        let (scope, id) = crate::memory::parse_key(id);
-        return vec![
-            Effect::Send(ClientCommand::ForgetMemory {
-                session_id: state.session_id.clone(),
-                scope,
-                id: id.to_string(),
-            }),
-            memory_list_effect(state, true),
-        ];
-    }
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: state.t().memory_usage.to_string(),
-    });
-    Vec::new()
-}
-
-/// `/remember <text>` — the user's own direct write.
-///
-/// It never reaches the model and never starts a turn: the command IS the
-/// authorization. That is the whole reason it exists next to the
-/// natural-language path, which can only ever propose, because a prefix parser
-/// must not silently rewrite someone's long-term state.
-///
-/// Defaults to `preference` because "remember this" almost always means "apply
-/// it from now on", and only preferences are injected every turn.
-fn remember_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let rest = command.strip_prefix("remember").unwrap_or(command).trim();
-    let (kind, body) = parse_remember_kind(rest);
-    let body = body.trim();
-    if body.is_empty() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: state.t().remember_usage.to_string(),
-        });
-        return Vec::new();
-    }
-    // A write mid-turn is accepted, but the running turn's context was already
-    // assembled, so say when it actually takes effect rather than implying now.
-    if state.is_busy() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: state.t().remember_busy_hint.to_string(),
-        });
-    }
-    vec![Effect::Send(ClientCommand::RememberMemory {
-        session_id: state.session_id.clone(),
-        scope: leveler_client_protocol::UiMemoryScope::Project,
-        body: body.to_string(),
-        kind: Some(kind),
-    })]
-}
-
-/// Split an optional leading `--kind <k>` off the body. Unknown kinds are a
-/// usage error rather than a silent fallback, so a typo cannot quietly store a
-/// note as a standing preference.
-fn parse_remember_kind(rest: &str) -> (leveler_client_protocol::UiMemoryKind, &str) {
-    use leveler_client_protocol::UiMemoryKind;
-    let Some(after) = rest.strip_prefix("--kind") else {
-        return (UiMemoryKind::Preference, rest);
-    };
-    let after = after.trim_start();
-    let (word, tail) = match after.split_once(char::is_whitespace) {
-        Some((w, t)) => (w, t),
-        None => (after, ""),
-    };
-    let kind = match word.trim() {
-        "decision" => UiMemoryKind::Decision,
-        "note" => UiMemoryKind::Note,
-        // Includes an explicit "preference" and anything unrecognised; an
-        // unrecognised word stays part of the body so the usage hint fires
-        // instead of storing it under a guessed kind.
-        "preference" => UiMemoryKind::Preference,
-        _ => return (UiMemoryKind::Preference, rest),
-    };
-    (kind, tail)
-}
-
 /// `/goal <task>` starts a goal turn; `/goal status` and `/goal clear` manage it.
 fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command
@@ -1366,48 +1292,6 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
             submit_turn_input(state, command)
         }
     }
-}
-
-/// `/develop <task>` runs the full development workflow on one goal.
-///
-/// The command word is not part of the goal: what reaches the runtime is what
-/// the user actually asked for, so Analyze reads a task and not a transcript
-/// of how it was typed.
-///
-/// There is no `status` or `clear` sub-command here. `/goal` needs them
-/// because goal mode is a session state the user turns on and off; a Develop
-/// workflow is one task that runs to a terminal, and the session's ordinary
-/// cancel already stops it.
-fn run_develop(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let goal = command
-        .strip_prefix("develop")
-        .unwrap_or(command)
-        .trim()
-        .to_string();
-    if goal.is_empty() {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: state.t().develop_usage.to_string(),
-        });
-        return Vec::new();
-    }
-    if turn_input_held(state) {
-        // The slash parser already took the composer; hand it back.
-        state.composer.replace(format!("/develop {goal}"));
-        return Vec::new();
-    }
-    state.transcript.push_user_if_new(goal.clone());
-    state.staged_goal = Some(crate::active_goal::StagedGoal {
-        title: crate::active_goal::short_title(&goal),
-        objective: Some(goal.clone()),
-        continuation: false,
-    });
-    start_turn(state);
-    let command = ClientCommand::RunDevelop {
-        session_id: state.session_id.clone(),
-        content: goal,
-    };
-    submit_turn_input(state, command)
 }
 
 fn goal_status(state: &mut AppState) {
@@ -1806,5 +1690,151 @@ mod export_tests {
         assert!(
             matches!(&s.notification, Some(n) if n.message.contains("无法在浏览器打开") && n.message.contains("open failed"))
         );
+    }
+}
+
+/// `/copy diff` — the complete applied patch, and never a request.
+#[cfg(test)]
+mod copy_diff_tests {
+    use super::*;
+    use crate::state::Boot;
+    use crate::theme::Theme;
+    use leveler_client_protocol::{SessionId, ToolCallId};
+
+    fn state() -> AppState {
+        let mut s = AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s-copy-diff"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        );
+        s.transcript.push_user("change the file".into());
+        s
+    }
+
+    fn whole_file_diff(path: &str, before: &str, after: &str) -> String {
+        let hunks = leveler_tools::tools::applied_diff::whole_file_hunks(before, after);
+        leveler_tools::tools::applied_diff::unified_diff(path, &hunks).expect("a real applied diff")
+    }
+
+    fn write(s: &mut AppState, id: &str, path: &str, after: &str, applied: Option<String>) {
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            "write_file".into(),
+            serde_json::json!({ "path": path, "content": after }).to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        s.transcript.complete_tool(
+            &ToolCallId::new(id),
+            true,
+            format!("Wrote {path}"),
+            3,
+            applied,
+        );
+    }
+
+    const SRC: &str = "fn main() {\n    let a = 1;\n}\n";
+
+    #[test]
+    fn copy_diff_returns_the_applied_unified_diff_verbatim() {
+        let mut s = state();
+        let diff = whole_file_diff("src/main.rs", "", SRC);
+        write(&mut s, "e1", "src/main.rs", SRC, Some(diff.clone()));
+        let copied = latest_applied_patch(&s).expect("the applied patch");
+        assert_eq!(copied.trim_end(), diff.trim_end());
+        assert!(copied.starts_with("--- "), "{copied:?}");
+        assert!(copied.contains("+++ b/src/main.rs"), "{copied:?}");
+        assert!(copied.contains("@@ "), "{copied:?}");
+    }
+
+    #[test]
+    fn copy_diff_refuses_an_edit_that_reported_no_patch() {
+        let mut s = state();
+        // A successful write whose runtime reported no diff — the no-change
+        // write. The request exists; it is not an applied change.
+        write(&mut s, "e1", "src/main.rs", "fn untouched() {}\n", None);
+        assert!(latest_applied_patch(&s).is_none());
+    }
+
+    #[test]
+    fn copy_diff_ignores_a_failed_edit_that_never_landed() {
+        let mut s = state();
+        s.transcript.push_tool_started(
+            ToolCallId::new("e1"),
+            "write_file".into(),
+            serde_json::json!({ "path": "src/main.rs", "content": SRC }).to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        s.transcript
+            .complete_tool(&ToolCallId::new("e1"), false, "denied".into(), 3, None);
+        assert!(latest_applied_patch(&s).is_none());
+    }
+
+    #[test]
+    fn copy_diff_takes_the_most_recent_edit() {
+        let mut s = state();
+        write(
+            &mut s,
+            "e1",
+            "src/one.rs",
+            "first\n",
+            Some(whole_file_diff("src/one.rs", "", "first\n")),
+        );
+        s.transcript.push_note("sealed".into());
+        write(
+            &mut s,
+            "e2",
+            "src/two.rs",
+            "second\n",
+            Some(whole_file_diff("src/two.rs", "", "second\n")),
+        );
+        let copied = latest_applied_patch(&s).expect("the newest patch");
+        assert!(copied.contains("src/two.rs"), "{copied:?}");
+        assert!(!copied.contains("src/one.rs"), "{copied:?}");
+    }
+
+    /// One node that merged several snapshots of the same file copies every
+    /// member's own patch, in paint order — never a stitched hunk.
+    #[test]
+    fn copy_diff_of_a_merged_node_keeps_each_patch_separate() {
+        let mut s = state();
+        let first = whole_file_diff("src/main.rs", "", "one\n");
+        let second = whole_file_diff("src/main.rs", "one\n", "two\n");
+        write(&mut s, "e1", "src/main.rs", "one\n", Some(first.clone()));
+        write(&mut s, "e2", "src/main.rs", "two\n", Some(second.clone()));
+        let copied = latest_applied_patch(&s).expect("a patch set");
+        assert_eq!(
+            copied,
+            format!("{}\n{}", first.trim_end(), second.trim_end())
+        );
+    }
+
+    #[test]
+    fn the_usage_text_names_every_argument_it_accepts() {
+        for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
+            let usage = locale.text().copy_usage;
+            for arg in ["diff", "output", "command", "selection"] {
+                assert!(
+                    usage.contains(arg),
+                    "{locale:?} usage misses {arg}: {usage}"
+                );
+            }
+        }
     }
 }

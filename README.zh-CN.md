@@ -51,7 +51,7 @@ leveler
 
 `leveler run --parallel 2` 保留指定的权限模式、网络限制和模型步数上限，支持 `--output jsonl`。并行任务会在启动前拒绝 shipping 参数（`--commit`、`--push`、`--pr`、`--branch`、`--pr-base`）；请审查合并结果后单独提交或推送。单任务的 shipping 支持两种输出格式，失败时返回非零退出码。 候选初始化、执行或提交出错时，会在集成前保留原始原因并返回失败，同时记录候选结束并清理本次 worktree。 并行候选继承父任务的状态 home。清理失败会以警告报告残留路径并持久化，不撤销已集成结果，也不覆盖原始任务错误。
 
-终端里可以使用 `/develop <目标>` 完成分析、编码、验证和评审。`/help` 查看命令与快捷键，`/thinking` 调整模型思考强度。
+终端里可以使用 `/goal <任务>` 显式执行一个目标，并由完成门禁判定何时真正完成。`/help` 查看命令与快捷键，`/thinking` 调整模型思考强度。
 
 工具执行摘要末尾显示实际执行耗时，每秒更新，全部执行结束后冻结；重新连接时恢复运行时计时。缺少可靠时间的旧历史和后台进程生命周期保持原有摘要，不会把不同计时基准拼成耗时。权限确认默认选中**仅允许本次**，Esc 仍然拒绝。
 
@@ -79,7 +79,6 @@ leveler update
 
 - [日常使用](docs/USAGE.zh-CN.md)
 - [自定义 Agent](docs/AGENT_EXTENSIBILITY.zh-CN.md)
-- [持久记忆](docs/MEMORY.zh-CN.md)
 - [本版更新](docs/RELEASE.zh-CN.md)
 - [历史版本](CHANGELOG.zh-CN.md)
 

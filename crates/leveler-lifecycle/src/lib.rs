@@ -51,6 +51,7 @@ mod objective;
 mod plan;
 mod progress;
 pub mod runtime;
+mod user_boundary;
 pub mod workflow;
 
 pub use axes::CollaborationMode;
@@ -61,8 +62,12 @@ pub use checkpoint::{
 pub use findings::{ChildResultProjection, ChildStatus, FindingKind, FindingRecord};
 pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};
-pub use plan::{PlanOrigin, PlanState, PlanStep};
+pub use plan::{ABANDONED, PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
+pub use user_boundary::{
+    AuthorizationSignal, UserPauseBoundary, authorizes_continuation, effective_user_pause,
+    extract_user_pause, latest_authorization_signal, pause_in_force, user_pause_reached,
+};
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
 pub use runtime::{

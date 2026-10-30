@@ -164,6 +164,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         RuntimeEvent::TurnCompleted
         | RuntimeEvent::TurnCompletedWithWarnings { .. }
         | RuntimeEvent::TurnAnswered
+        | RuntimeEvent::TurnPaused { .. }
         | RuntimeEvent::TurnTruncated { .. }
         | RuntimeEvent::TurnIncomplete { .. }
         | RuntimeEvent::TurnFailed { .. }

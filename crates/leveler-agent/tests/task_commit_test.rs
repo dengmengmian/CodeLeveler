@@ -254,9 +254,7 @@ async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
-            memory_expose: false,
-            memory_service: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             background_tasks: Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
             permission_rules: Default::default(),
             permission_rules_path: None,
@@ -266,7 +264,6 @@ async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
             allow_host_input: true,
             capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
-            develop_model: None,
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
@@ -445,6 +442,171 @@ async fn a_declared_objective_cannot_narrow_the_users_request() {
         goals[0].objective, USER_REQUEST,
         "the durable objective is the user's request; the model's restatement cannot shrink it"
     );
+}
+
+/// A request whose deliverables the runtime can actually enumerate.
+const STAGED_REQUEST: &str = "完成文章发布、评论回复、内容权限校验三个功能，完成后通过测试";
+
+async fn chat_with_request(
+    fx: &Fixture,
+    request: &'static str,
+    cancellation: CancellationToken,
+) -> leveler_agent::coding::TaskReport {
+    let mut spec = spec(fx);
+    spec.runtime.goal = request.into();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec,
+            vec![ContentPart::Text {
+                text: request.into(),
+            }],
+            &mut |_| {},
+            cancellation,
+        )
+        .await
+        .unwrap()
+}
+
+/// A refused declaration is about the CONTRACT, not the request. The harness
+/// must not treat the refusal as the end of the task, and must not promote the
+/// Chat turn into a goal on the model's behalf either: one bounded continuation
+/// states the refusal and the user's work is still outstanding.
+#[tokio::test]
+async fn a_refused_declaration_buys_a_continuation_and_does_not_create_a_goal() {
+    let fx = fixture(
+        vec![
+            // Covers one deliverable out of three: the refusal is deterministic.
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["文章发布可访问"]
+                }),
+            ),
+            Scripted::Text("我先完成了文章发布这一部分。"),
+            Scripted::run_tests(),
+            Scripted::Text("另外两项也做完了，测试通过。"),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+
+    assert_eq!(
+        fx.runtime.calls.load(Ordering::SeqCst),
+        4,
+        "the quiet round after a refusal buys exactly one continuation, and the          resumed work then closes"
+    );
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        // The refusal itself is structured and actionable.
+        let refusal = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("commit_task refused"))
+            .expect("the model sees the refusal");
+        assert!(refusal.contains("[deliverable]"), "{refusal}");
+        assert!(
+            refusal.contains("评论回复") && refusal.contains("内容权限校验"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("Fix:"), "{refusal}");
+        // The continuation names the refusal as the reason, not the plan.
+        let nudge = requests[2]
+            .messages
+            .iter()
+            .map(|message| message.text_content())
+            .find(|text| text.contains("commit_task declaration was refused"))
+            .expect("the continuation states the refused declaration");
+        assert!(nudge.contains("not about the user's request"), "{nudge}");
+        assert!(nudge.contains("still outstanding"), "{nudge}");
+        assert!(
+            !nudge.contains("update_goal"),
+            "a refusal does not silently turn a Chat turn into a goal: {nudge}"
+        );
+    }
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "no goal was registered: the harness never declares a task on the model's behalf"
+    );
+    // The turn answered. That is the turn's fact, not a delivery verdict: the
+    // terminal carries the refused declaration so the answer cannot be read as
+    // acceptance of the user's request.
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Answered);
+    assert!(
+        report.completion_warnings.iter().any(|warning| warning
+            .contains("no execution task was registered")
+            && warning.contains("not with a verified delivery")),
+        "the report says what the refusal means: {report:?}"
+    );
+}
+
+/// The other honest recovery: the model fixes the contract and re-declares.
+#[tokio::test]
+async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["文章发布可访问"]
+                }),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": [
+                        "文章发布可访问",
+                        "评论回复可提交且可见",
+                        "内容权限校验覆盖作者与管理员",
+                        "sh run-tests.sh 通过"
+                    ]
+                }),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "三项社区业务完成",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"requirement": "文章发布", "status": "done", "evidence": "发布链路可访问"},
+                        {"requirement": "评论回复", "status": "done", "evidence": "回复可见"},
+                        {"requirement": "内容权限校验", "status": "done", "evidence": "作者/管理员/只读"},
+                        {"requirement": "tests", "status": "done", "evidence": test_runner_label()}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the corrected declaration registers one goal"
+    );
+    assert_eq!(goals[0].objective, STAGED_REQUEST);
+    assert!(
+        goals[0].state == leveler_storage::GoalState::Settled,
+        "the corrected contract completes: {:?}",
+        goals[0].state
+    );
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }
 
 #[tokio::test]
@@ -935,6 +1097,122 @@ async fn a_narrow_acceptance_cannot_commit_the_users_full_request() {
     );
 }
 
+/// A deterministic scope refusal cannot be satisfied by sending the exact
+/// same objective and acceptance again. The second answer must say that
+/// nothing changed, so the model knows to alter its plan instead of looping.
+#[tokio::test]
+async fn an_identical_commit_refusal_is_named_as_a_repeat() {
+    let fx = fixture(
+        vec![
+            commit_with(vec!["stage-1.txt 存在"], staged_objective()),
+            commit_with(vec!["stage-1.txt 存在"], staged_objective()),
+            Scripted::Text("I will change the acceptance checks."),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged_objective()),
+            vec![ContentPart::Text {
+                text: staged_objective().into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refusals: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "acceptance_narrowed" =>
+            {
+                Some(detail)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        refusals.len() >= 2,
+        "both refusals must be visible: {events:?}"
+    );
+    assert!(
+        refusals
+            .iter()
+            .any(|detail| detail.contains("refusal #2") && detail.contains("have not changed")),
+        "a repeated deterministic refusal must say it is unchanged: {refusals:?}"
+    );
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "a refused commit must not create a task"
+    );
+}
+
+/// Markdown section numbering is document structure, not an enumerated
+/// deliverable. A long spec whose headings use `## 一、...` used to extract
+/// `## 一` as a requirement, so `commit_task` refused every honest acceptance
+/// list. The real binder must accept this request.
+#[tokio::test]
+async fn markdown_headings_do_not_become_commit_requirements() {
+    const OBJECTIVE: &str = "# Phase 3C 开发任务\n\n\
+        ## 一、项目目标\n\n在现有项目中实现内容社区功能。\n\n\
+        ## 二、后端实现\n\n使用 Go + PostgreSQL 完成业务接口。\n\n\
+        ## 三、前端实现\n\n实现文章、讨论和评论界面。\n\n\
+        ## 四、验收\n\n运行测试，验证功能完整性。\n\n\
+        请自主规划并执行。\n允许根据任务需要拆分并委托子任务。";
+    let fx = fixture(
+        vec![
+            commit_with(
+                vec!["实现文章、讨论和评论界面", "运行测试并验证功能完整性"],
+                OBJECTIVE,
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "blocked",
+                    "summary": "scope confirmed; implementation not started in this contract test"
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, OBJECTIVE),
+            vec![ContentPart::Text {
+                text: OBJECTIVE.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "acceptance_narrowed" && detail.contains("##")
+        )),
+        "a Markdown heading must never be the reason a commit is refused: {events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the real binder must accept a spec with Markdown headings: {report:?}"
+    );
+    assert_eq!(goals[0].acceptance.len(), 2);
+}
+
 #[tokio::test]
 async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
     let fx = fixture(
@@ -1218,4 +1496,899 @@ async fn a_multi_round_chat_with_tools_does_not_upgrade_itself() {
         "chat",
         "the session's axis is untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A Goal bound from a Chat turn, stopped at the user's own stage boundary.
+//
+// The user authorized stage 1 only. The goal still owes stage 2, and the pause
+// is an AUTHORIZATION fact — not a completion, not a failure, and not something
+// a status question can release. Only the user's own continuation does.
+// ---------------------------------------------------------------------------
+
+fn staged_pause_objective() -> &'static str {
+    if cfg!(windows) {
+        "完成两个阶段：阶段 1 创建 stage-1.txt 并运行 cmd /c verify.cmd 验收；\
+         阶段 1 完成后停下，等待我确认再执行阶段 2；\
+         阶段 2 创建 stage-2.txt 并运行 cmd /c verify.cmd 验收。"
+    } else {
+        "完成两个阶段：阶段 1 创建 stage-1.txt 并运行 sh ./verify.sh 验收；\
+         阶段 1 完成后停下，等待我确认再执行阶段 2；\
+         阶段 2 创建 stage-2.txt 并运行 sh ./verify.sh 验收。"
+    }
+}
+
+fn staged_full_objective() -> &'static str {
+    if cfg!(windows) {
+        "一次完成两个阶段：阶段 1 创建 stage-1.txt 并运行 cmd /c verify.cmd 验收；\
+         阶段 2 创建 stage-2.txt 并运行 cmd /c verify.cmd 验收。\
+         中间不要停下来等我确认。"
+    } else {
+        "一次完成两个阶段：阶段 1 创建 stage-1.txt 并运行 sh ./verify.sh 验收；\
+         阶段 2 创建 stage-2.txt 并运行 sh ./verify.sh 验收。\
+         中间不要停下来等我确认。"
+    }
+}
+
+fn stage_plan(status1: &'static str, status2: &'static str) -> Scripted {
+    Scripted::Tool(
+        "update_plan",
+        serde_json::json!({
+            "plan": [
+                {"step": "阶段 1：创建 stage-1.txt 并验收", "status": status1},
+                {"step": "阶段 2：创建 stage-2.txt 并验收", "status": status2}
+            ]
+        }),
+    )
+}
+
+fn write_named(name: &'static str) -> Scripted {
+    Scripted::Tool(
+        "write_file",
+        serde_json::json!({"path": name, "content": format!("{name}\n")}),
+    )
+}
+
+fn pause_stage_one_script() -> Vec<Scripted> {
+    vec![
+        commit_with(
+            vec![
+                "stage-1.txt 存在",
+                "stage-2.txt 存在",
+                verifier_acceptance(),
+            ],
+            staged_pause_objective(),
+        ),
+        stage_plan("in_progress", "pending"),
+        write_named("stage-1.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        stage_plan("completed", "pending"),
+        Scripted::Text("阶段 1 已完成并验收。按你的要求，阶段 2 等待你的确认，本轮先停在这里。"),
+    ]
+}
+
+#[tokio::test]
+async fn a_goal_bound_pause_keeps_the_goal_open_and_unpressured() {
+    let fx = fixture(pause_stage_one_script(), false).await;
+    write_verifier(fx.dir.path());
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged_pause_objective()),
+            vec![ContentPart::Text {
+                text: staged_pause_objective().into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Answered,
+        "a user pause ends the round normally, not as a stall: {report:?}"
+    );
+    assert!(
+        report
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the terminal must say WHY the round ended: {report:?}"
+    );
+    assert_eq!(
+        fx.runtime.calls.load(Ordering::SeqCst),
+        6,
+        "the reached boundary buys NO extra model round"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::RuntimeInjection { kind, .. }
+                if kind.contains("goal_unresolved")
+        )),
+        "a user pause is not an unresolved goal to pressure: {events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Running,
+        "the goal is not cancelled and not completed"
+    );
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "the pause is durable with the goal it bounds: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].acceptance.len(),
+        3,
+        "the full acceptance plan is preserved: {goals:?}"
+    );
+    assert!(
+        !fx.dir.path().join("stage-2.txt").exists(),
+        "the withheld stage must not be executed"
+    );
+    assert!(fx.dir.path().join("stage-1.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+#[tokio::test]
+async fn a_status_question_after_a_pause_does_not_release_it() {
+    let mut script = pause_stage_one_script();
+    script.push(Scripted::Text(
+        "阶段 1 修改了 stage-1.txt；验收命令 sh ./verify.sh 退出码 0。",
+    ));
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    let staged = staged_pause_objective();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged),
+            vec![ContentPart::Text {
+                text: staged.into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let goal_id = goal_records(&fx).await[0].id.clone();
+
+    let query = "刚才阶段 1 修改了哪些文件？测试通过了吗？";
+    let answer = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text { text: query.into() }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(answer.stop_reason, leveler_agent::StopReason::Answered);
+    assert!(
+        !answer
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the question is an ordinary answer, not a second pause boundary"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "a question must not open a second goal");
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "the pause outlives the question: {goals:?}"
+    );
+    assert!(
+        !fx.dir.path().join("stage-2.txt").exists(),
+        "the question does not authorize the withheld stage"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+#[tokio::test]
+async fn an_explicit_continuation_resumes_the_paused_goal_and_verifies_it() {
+    let mut script = pause_stage_one_script();
+    script.extend([
+        write_named("stage-2.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        stage_plan("completed", "completed"),
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "阶段 1 与阶段 2 都已交付并验收",
+                "verification": {"status": "passed", "detail": verifier_label()},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done",
+                     "evidence": "created stage-1.txt"},
+                    {"requirement": "stage-2.txt", "status": "done",
+                     "evidence": "created stage-2.txt"},
+                    {"requirement": verifier_path(), "status": "done",
+                     "evidence": "ran the verifier"}
+                ]
+            }),
+        ),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    let staged = staged_pause_objective();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged),
+            vec![ContentPart::Text {
+                text: staged.into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let paused = goal_records(&fx).await;
+    let goal_id = paused[0].id.clone();
+    assert!(paused[0].user_paused_at.is_some());
+
+    let resumed = fx
+        .coding
+        .resume_with_instruction(
+            &fx.session,
+            &spec_for(&fx, staged),
+            Message::user_input("确认，继续阶段 2，把剩余任务完成并验收。"),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resumed.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "completion requires the real verification, not the pause being lifted: {resumed:?}"
+    );
+    assert_eq!(resumed.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "the same goal, not a smaller replacement");
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert_eq!(
+        goals[0].objective, staged,
+        "the original objective is never narrowed by the continuation"
+    );
+    assert_eq!(
+        goals[0].acceptance.len(),
+        3,
+        "the stored acceptance plan is unchanged: {goals:?}"
+    );
+    assert!(
+        goals[0].user_paused_at.is_none(),
+        "authorization to continue clears the pause: {goals:?}"
+    );
+    assert!(
+        goals[0]
+            .amendments
+            .iter()
+            .any(|amendment| amendment.contains("继续阶段 2")),
+        "the continuation is durable with its goal: {goals:?}"
+    );
+    assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// The reverse: without a user pause, a model claiming it needs confirmation
+/// is still held to the goal contract, and the harness drives it to finish.
+#[tokio::test]
+async fn a_model_claimed_confirmation_does_not_pause_a_goal() {
+    let fx = fixture(
+        vec![
+            commit_with(
+                vec![
+                    "stage-1.txt 存在",
+                    "stage-2.txt 存在",
+                    verifier_acceptance(),
+                ],
+                staged_full_objective(),
+            ),
+            stage_plan("in_progress", "pending"),
+            write_named("stage-1.txt"),
+            stage_plan("completed", "pending"),
+            Scripted::Text("阶段 1 完成了。阶段 2 需要你确认后才能继续。"),
+            // The harness states the still-active goal; the model continues.
+            write_named("stage-2.txt"),
+            Scripted::Tool("run_command", verifier_call()),
+            stage_plan("completed", "completed"),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "两个阶段都已完成并验收",
+                    "verification": {"status": "passed", "detail": verifier_label()},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done",
+                         "evidence": "created stage-1.txt"},
+                        {"requirement": "stage-2.txt", "status": "done",
+                         "evidence": "created stage-2.txt"},
+                        {"requirement": verifier_path(), "status": "done",
+                         "evidence": "ran the verifier"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    write_verifier(fx.dir.path());
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged_full_objective()),
+            vec![ContentPart::Text {
+                text: staged_full_objective().into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the model's own claim is not a user pause: {report:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::RuntimeInjection { kind, .. }
+                if kind.contains("goal_unresolved")
+        )),
+        "the Goal continuation must still fire without a user pause: {events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert!(goals[0].user_paused_at.is_none());
+    assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// A Goal session (not a Chat turn that committed) keeps its route armed at a
+/// user pause, so the next message is still about this goal. A status question
+/// must be answered inside that route WITHOUT the harness driving the withheld
+/// stage; an explicit authorization then continues the same goal.
+#[tokio::test]
+async fn a_paused_goal_route_answers_a_query_then_continues_on_authorization() {
+    let query = "刚才阶段 1 修改了哪些文件？测试通过了吗？";
+    let release = "确认，继续阶段 2，把剩余任务完成并验收。";
+    let fx = fixture(
+        vec![
+            stage_plan("in_progress", "pending"),
+            write_named("stage-1.txt"),
+            Scripted::Tool("run_command", verifier_call()),
+            stage_plan("completed", "pending"),
+            Scripted::Text("阶段 1 已完成并验收。按你的要求，阶段 2 等待你的确认。"),
+            // The query turn: an ordinary answer, not authorization.
+            Scripted::Text("阶段 1 修改了 stage-1.txt；验收命令 sh ./verify.sh 退出码 0。"),
+            // The authorization turn: the model continues for real.
+            write_named("stage-2.txt"),
+            Scripted::Tool("run_command", verifier_call()),
+            stage_plan("completed", "completed"),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "两个阶段都已交付并验收",
+                    "verification": {"status": "passed", "detail": verifier_label()},
+                    "requirements": [
+                        {"requirement": "stage-1.txt", "status": "done",
+                         "evidence": "created stage-1.txt"},
+                        {"requirement": "stage-2.txt", "status": "done",
+                         "evidence": "created stage-2.txt"},
+                        {"requirement": verifier_path(), "status": "done",
+                         "evidence": "ran the verifier"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    write_verifier(fx.dir.path());
+    let staged = staged_pause_objective();
+    let mut first_events = Vec::new();
+    let paused = fx
+        .coding
+        .run(
+            &fx.session,
+            &spec_for(&fx, staged),
+            &mut |event| first_events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paused.stop_reason, leveler_agent::StopReason::Answered);
+    assert!(
+        paused
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail)
+    );
+    let goal_id = goal_records(&fx).await[0].id.clone();
+    assert!(goal_records(&fx).await[0].user_paused_at.is_some());
+    let calls_after_pause = fx.runtime.calls.load(Ordering::SeqCst);
+
+    let mut query_events = Vec::new();
+    let answered = fx
+        .coding
+        .run(
+            &fx.session,
+            &spec_for(&fx, query),
+            &mut |event| query_events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        answered.stop_reason,
+        leveler_agent::StopReason::Answered,
+        "the query turn ends normally: {answered:?}"
+    );
+    assert!(
+        answered
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the durable pause still governs the query turn: {answered:?}"
+    );
+    assert_eq!(
+        fx.runtime.calls.load(Ordering::SeqCst),
+        calls_after_pause + 1,
+        "a query buys exactly its own answer, no goal continuation"
+    );
+    assert!(
+        !query_events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::RuntimeInjection { kind, .. }
+                if kind.contains("goal_unresolved")
+        )),
+        "a paused goal must not be pressured by a status question: {query_events:?}"
+    );
+    let after_query = goal_records(&fx).await;
+    assert_eq!(after_query.len(), 1);
+    assert_eq!(after_query[0].id, goal_id);
+    assert_eq!(after_query[0].state, leveler_storage::GoalState::Running);
+    assert!(after_query[0].user_paused_at.is_some());
+    assert!(!fx.dir.path().join("stage-2.txt").exists());
+
+    let mut release_events = Vec::new();
+    let completed = fx
+        .coding
+        .run(
+            &fx.session,
+            &spec_for(&fx, release),
+            &mut |event| release_events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        completed.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the user's authorization continues the goal to real completion: {completed:?} events={release_events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert!(goals[0].user_paused_at.is_none());
+    assert_eq!(
+        goals[0].objective, staged,
+        "the query and the authorization never replace the goal's objective"
+    );
+    assert_eq!(
+        goals[0].acceptance.len(),
+        0,
+        "a /goal-shaped task has no model plan"
+    );
+    assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// The real-provider shape: a model that reached the user's boundary reports
+/// "waiting for the user" and reaches for `update_goal(blocked)`. That would
+/// hide the pause, end the goal route and leave resumption to a literal `继续`.
+/// The harness must state that the pause is not an obstruction and let the
+/// round end normally, keeping the goal paused and recoverable.
+#[tokio::test]
+async fn a_blocked_claim_at_the_user_boundary_is_a_pause_not_a_block() {
+    let fx = fixture(
+        vec![
+            commit_with(
+                vec!["stage-1.txt 存在", "stage-2.txt 存在", verifier_acceptance()],
+                staged_pause_objective(),
+            ),
+            Scripted::Tool(
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "阶段 1：创建 stage-1.txt", "status": "in_progress"},
+                    {"step": "阶段 1：运行 sh ./verify.sh 确认", "status": "pending"},
+                    {"step": "阶段 1 完成后停下，等待用户确认后再继续", "status": "pending"},
+                    {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                ]}),
+            ),
+            write_named("stage-1.txt"),
+            Scripted::Tool("run_command", verifier_call()),
+            Scripted::Tool(
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "阶段 1：创建 stage-1.txt", "status": "completed"},
+                    {"step": "阶段 1：运行 sh ./verify.sh 确认", "status": "completed"},
+                    {"step": "阶段 1 完成后停下，等待用户确认后再继续", "status": "in_progress"},
+                    {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                ]}),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({"status": "blocked", "summary": "waiting for the user's confirmation"}),
+            ),
+            Scripted::Text("阶段 1 已完成并验收；阶段 2 等待你的确认。"),
+        ],
+        false,
+    )
+    .await;
+    write_verifier(fx.dir.path());
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged_pause_objective()),
+            vec![ContentPart::Text {
+                text: staged_pause_objective().into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Answered,
+        "the user's pause is not a blocked goal: {report:?}"
+    );
+    assert!(
+        report
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the terminal records the pause: {report:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, .. }
+                if kind == "user_pause_boundary"
+        )),
+        "the blocked claim is answered with the pause fact: {events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    assert!(goals[0].user_paused_at.is_some());
+    assert!(!fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+// ---------------------------------------------------------------------------
+// A user supplement stated while the goal waits for them.
+//
+// A new execution requirement, a status question, an authorization to continue
+// and the completion of the work are four different facts. The user's own
+// supplement is SCOPE: it must reach the durable amendment list so a later
+// window cannot forget it, and it must not release the pause, start the
+// withheld stage, or open a second goal.
+// ---------------------------------------------------------------------------
+
+/// A supplement that names a new deliverable and needs no `继续` to be scope.
+fn supplement_request() -> &'static str {
+    if cfg!(windows) {
+        "顺便把 stage-extra.txt 也补上，内容为一行 extra，然后运行 cmd /c verify.cmd 确认。"
+    } else {
+        "顺便把 stage-extra.txt 也补上，内容为一行 extra，然后运行 sh ./verify.sh 确认。"
+    }
+}
+
+async fn pause_a_goal(fx: &Fixture) {
+    let staged = staged_pause_objective();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec_for(fx, staged),
+            vec![ContentPart::Text {
+                text: staged.into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn say(fx: &Fixture, text: &str) -> leveler_agent::coding::TaskReport {
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec(fx),
+            vec![ContentPart::Text { text: text.into() }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_supplement_to_a_paused_goal_is_recorded_without_releasing_the_pause() {
+    let mut script = pause_stage_one_script();
+    script.push(Scripted::Text("补充要求已记下；阶段 2 仍等你确认。"));
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+    let paused = goal_records(&fx).await;
+    assert_eq!(paused.len(), 1, "{paused:?}");
+    let goal_id = paused[0].id.clone();
+    assert!(paused[0].user_paused_at.is_some(), "{paused:?}");
+
+    let supplement = supplement_request();
+    say(&fx, supplement).await;
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "a supplement must not open a second goal: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].id, goal_id,
+        "the same goal the user was talking about"
+    );
+    assert!(
+        goals[0]
+            .amendments
+            .iter()
+            .any(|amendment| amendment.trim() == supplement),
+        "the user's own words are durable scope: {goals:?}"
+    );
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "adding a requirement is not an authorization to continue: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Running,
+        "the goal still owes its work"
+    );
+    assert!(
+        !fx.dir.path().join("stage-extra.txt").exists(),
+        "the supplement is recorded, not executed: {:?}",
+        fx.runtime.requests.lock().unwrap().len()
+    );
+    assert!(
+        !fx.dir.path().join("stage-2.txt").exists(),
+        "the withheld stage stays withheld"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+#[tokio::test]
+async fn a_status_question_in_a_paused_goal_is_not_scope() {
+    let mut script = pause_stage_one_script();
+    script.push(Scripted::Text(
+        "阶段 1 修改了 stage-1.txt；验收命令退出码 0。",
+    ));
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+    let paused = goal_records(&fx).await;
+    assert_eq!(paused[0].amendments.len(), 0, "{paused:?}");
+
+    say(
+        &fx,
+        "刚才阶段 1 修改了哪些文件？测试通过了吗？现在进度怎么样？",
+    )
+    .await;
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "{goals:?}");
+    assert_eq!(
+        goals[0].amendments,
+        Vec::<String>::new(),
+        "a question about the work changes no scope: {goals:?}"
+    );
+    assert!(goals[0].user_paused_at.is_some(), "{goals:?}");
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+#[tokio::test]
+async fn an_independent_request_with_no_deliverable_is_not_scope() {
+    let mut script = pause_stage_one_script();
+    script.push(Scripted::Text("README 没有过时的说明。"));
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+
+    say(&fx, "另外帮我检查一下 README 有没有过时的说明。").await;
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "{goals:?}");
+    assert_eq!(
+        goals[0].amendments,
+        Vec::<String>::new(),
+        "an open-ended request enumerates no deliverable, so it adds no scope: {goals:?}"
+    );
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "an unrelated request does not release the pause: {goals:?}"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// A requirement the user added mid-flight is gated with its OWN mechanical
+/// evidence.
+///
+/// The reported shape: the supplement entered the goal scope and the goal still
+/// closed on the model's account alone. Here the first completion is refused
+/// because the newly required artifact does not exist, and only the window that
+/// really creates it (and re-runs the verifier) may complete.
+#[tokio::test]
+async fn a_dynamic_requirement_needs_its_own_mechanical_evidence() {
+    fn complete(accounts: serde_json::Value) -> Scripted {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "阶段 2 与补充要求都已交付",
+                "verification": {"status": "passed", "detail": verifier_label()},
+                "requirements": accounts
+            }),
+        )
+    }
+    let mut script = pause_stage_one_script();
+    script.push(Scripted::Text("补充要求已记下；阶段 2 仍等你确认。"));
+    script.extend([
+        // Stage 2 only: the supplement is still owed, and the model claims it
+        // anyway. The runtime must refuse, not warn.
+        write_named("stage-2.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        stage_plan("completed", "completed"),
+        complete(serde_json::json!([
+            {"requirement": "stage-1.txt", "status": "done", "evidence": "created stage-1.txt"},
+            {"requirement": "stage-2.txt", "status": "done", "evidence": "created stage-2.txt"},
+            {"requirement": "stage-extra.txt", "status": "done", "evidence": "created stage-extra.txt"},
+            {"requirement": verifier_path(), "status": "done", "evidence": "ran the verifier"}
+        ])),
+        // The refusal is answered with the real work.
+        write_named("stage-extra.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        complete(serde_json::json!([
+            {"requirement": "stage-1.txt", "status": "done", "evidence": "created stage-1.txt"},
+            {"requirement": "stage-2.txt", "status": "done", "evidence": "created stage-2.txt"},
+            {"requirement": "stage-extra.txt", "status": "done", "evidence": "created stage-extra.txt"},
+            {"requirement": verifier_path(), "status": "done", "evidence": "ran the verifier"}
+        ])),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+    say(&fx, supplement_request()).await;
+
+    let staged = staged_pause_objective();
+    let mut events = Vec::new();
+    let resumed = fx
+        .coding
+        .resume_with_instruction(
+            &fx.session,
+            &spec_for(&fx, staged),
+            Message::user_input("确认，继续阶段 2，把剩余任务和补充要求一起完成并验收。"),
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "requirements_refused" && detail.contains("stage-extra.txt")
+        )),
+        "the missing dynamic deliverable must be refused by name: {events:?}"
+    );
+    assert_eq!(
+        resumed.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the goal closes on the real evidence of the second attempt: {resumed:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert!(
+        goals[0]
+            .amendments
+            .iter()
+            .any(|amendment| amendment.trim() == supplement_request()),
+        "the supplement survives the resume: {goals:?}"
+    );
+    assert!(
+        fx.dir.path().join("stage-extra.txt").exists(),
+        "the dynamic requirement was really delivered"
+    );
+    assert!(
+        !resumed
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("stage-extra.txt")),
+        "a delivered, mechanically checked requirement is not an unverified boundary: {resumed:?}"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// The user's authorization is the newest word about the pause.
+///
+/// The durable pause is cleared at the END of a window, so during the window
+/// the user just authorized it is still stored. Reading the stored column as
+/// "still paused" would cut the authorized window short at its first quiet
+/// round and re-pause a goal the user has already released.
+#[tokio::test]
+async fn an_authorized_window_is_not_cut_short_as_paused() {
+    let mut script = pause_stage_one_script();
+    script.extend([
+        write_named("stage-2.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        stage_plan("completed", "completed"),
+        // The model delivers and closes with prose, without declaring the goal
+        // complete. The window must not be read as a user pause again.
+        Scripted::Text("阶段 2 也已交付并验收，两个阶段都完成了。"),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    let staged = staged_pause_objective();
+    pause_a_goal(&fx).await;
+    let paused = goal_records(&fx).await;
+    assert!(paused[0].user_paused_at.is_some(), "{paused:?}");
+
+    let resumed = fx
+        .coding
+        .resume_with_instruction(
+            &fx.session,
+            &spec_for(&fx, staged),
+            Message::user_input("确认，继续阶段 2，把剩余任务完成并验收。"),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !resumed
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the user released the pause, so the window is not a pause: {resumed:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert!(
+        goals[0].user_paused_at.is_none(),
+        "the authorized window must not re-pause the goal: {goals:?}"
+    );
+    assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
 }

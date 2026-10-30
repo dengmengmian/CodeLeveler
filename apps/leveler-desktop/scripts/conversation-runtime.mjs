@@ -67,7 +67,7 @@ async function rawIPC(command) {
   const sockets = [];
   async function visit(dir) { for (const name of await readdir(dir)) { const file = path.join(dir, name), stat = await lstat(file); if (stat.isSocket()) sockets.push(file); else if (stat.isDirectory()) await visit(file); } }
   await visit(path.join(home, 'run'));
-  const wrap = body => ({ protocol: { major: 1, minor: 14 }, capabilities: ['optional_workspace'], body });
+  const wrap = body => ({ protocol: { major: 2, minor: 0 }, capabilities: ['optional_workspace'], body });
   async function request(socket, body) {
     return new Promise((resolve, reject) => { const stream = connect(socket); let bytes = Buffer.alloc(0); const timer = setTimeout(() => { stream.destroy(); reject(new Error('raw IPC timeout')); }, 15000);
       stream.on('connect', () => { const payload = Buffer.from(JSON.stringify(wrap(body))), size = Buffer.alloc(4); size.writeUInt32BE(payload.length); stream.write(Buffer.concat([size, payload])); });

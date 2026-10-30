@@ -46,7 +46,12 @@ impl Application {
 
         let workflow_options = WorkflowOptions {
             branch,
-            commit_message: commit_message(&title, &body, model, self.config.vcs_co_author),
+            commit_message: commit_message(
+                &title,
+                &body,
+                model,
+                self.config.snapshot().loaded.vcs_co_author,
+            ),
             commit: options.commit,
             stage_paths: modified_files.to_vec(),
             push: options.push,

@@ -142,11 +142,13 @@ pub async fn run(
 
     let theme_id = crate::theme_config::load_theme_id().unwrap_or(crate::theme::ThemeId::DEFAULT);
     let mut state = AppState::new(Theme::resolve(theme_id, Theme::env_no_color()), boot);
-    // Which pending candidates this project has already been told about. It is
-    // notice bookkeeping, not memory state: the store stays the authority for
-    // what is pending.
-    if let Some(path) = crate::memory::memory_notice_path(&state) {
-        state.memory.notified = crate::memory::load_notified(&path);
+    if !state.theme.monochrome {
+        match crate::splash::NativeMascot::detect() {
+            Ok(image) => state.welcome_image = image,
+            Err(error) => {
+                tracing::warn!(%error, "welcome PNG could not be decoded; using terminal logo")
+            }
+        }
     }
     let (cols, rows) = size().unwrap_or((80, 24));
     state.size = (cols, rows);
@@ -459,14 +461,6 @@ pub async fn run(
             &mut stdout,
         );
 
-        // A newly discovered batch was recorded as announced; persist that
-        // before the process can exit so a restart does not repeat it.
-        if let Some(ids) = state.memory.take_notice_update()
-            && let Some(path) = crate::memory::memory_notice_path(&state)
-        {
-            crate::memory::save_notified(&path, &ids);
-        }
-
         // Busy spinner + elapsed clock.
         state.tick = state.tick.wrapping_add(1);
         state.motion_clock = motion_origin.elapsed();
@@ -687,10 +681,6 @@ async fn first_submission_attempt(
     match answer {
         DeliveryAnswer::Delivered => Ok(EffectCompletion::SubmissionDelivered {
             command_id: envelope.command_id.clone(),
-            // A delivered command may not start a turn (a `记住：…` message is
-            // consumed as the user's own memory write). The runtime's snapshot
-            // is what tells the client whether it is busy, instead of leaving
-            // the submit-time optimism stuck forever.
             snapshot: snapshot_within(client, &envelope.session_id).await,
         }),
         DeliveryAnswer::Rejected(message) => Ok(EffectCompletion::SubmissionRejected {
@@ -911,33 +901,6 @@ fn dispatch_effects(
                     crate::action::RemoteRequest::Reject
                 };
                 run_remote(remote_launcher.as_ref(), request, completion_tx);
-            }
-            Effect::CopyText { text, what } => {
-                // A memory record is small and already in memory, so the copy
-                // is immediate. The receipt decides what the page reports: a
-                // native copy is confirmed, an OSC 52 write is not.
-                let label = match what {
-                    crate::action::CopyWhat::Body => state.t().memory_copied_body,
-                    crate::action::CopyWhat::Reference => state.t().memory_copied_id,
-                };
-                state.notification = Some(match clipboard_result(&text) {
-                    Ok((receipt, count)) => Notification {
-                        level: NotificationLevel::Info,
-                        message: match receipt.delivery {
-                            crate::clipboard::Delivery::VerifiedNative => {
-                                label.replace("{count}", &count.to_string())
-                            }
-                            crate::clipboard::Delivery::SentUnverified => state
-                                .t()
-                                .memory_copied_unverified
-                                .replace("{count}", &count.to_string()),
-                        },
-                    },
-                    Err(error) => Notification {
-                        level: NotificationLevel::Warning,
-                        message: format!("{}: {error}", state.t().memory_copy_failed),
-                    },
-                });
             }
             Effect::OpenWebUrl(url) => {
                 let tx = completion_tx.clone();
@@ -1256,6 +1219,9 @@ fn paint(
     title: &mut crate::terminal_title::TerminalTitleProjection,
 ) -> Result<(), TuiError> {
     if alt.is_none() {
+        if let Some(image) = &mut state.welcome_image {
+            image.reset();
+        }
         execute!(stdout, EnterAlternateScreen)?;
         let mut t = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         t.clear()?;

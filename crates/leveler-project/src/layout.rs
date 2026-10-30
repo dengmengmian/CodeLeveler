@@ -19,7 +19,7 @@ pub struct Layout {
     /// Runtime-state directory for this repo: `<home>/state/projects/<id>/`.
     /// Lives OUTSIDE the project — under the global CodeLeveler home, keyed by
     /// the repo path — so a checkout stays clean and never needs `.gitignore`.
-    /// Holds the session DB, memory, composer drafts, and the image store.
+    /// Holds the session DB, composer drafts, and the image store.
     pub state_dir: PathBuf,
     /// The global home this layout's runtime paths derive from (sockets, locks).
     home: LevelerHome,
@@ -198,37 +198,6 @@ impl Layout {
             config_dir,
             state_dir,
             home,
-        }
-    }
-
-    /// Markdown current records for project scope (`<repo>/.leveler/memory`).
-    /// `None` when the layout has no workspace.
-    pub fn markdown_memory_dir(&self) -> Option<PathBuf> {
-        self.repo_root
-            .as_ref()
-            .map(|root| root.join(".leveler").join("memory"))
-    }
-
-    /// Markdown current records for local scope (`<repo>/.leveler/local/memory`).
-    /// `None` when the layout has no workspace.
-    pub fn local_memory_dir(&self) -> Option<PathBuf> {
-        self.repo_root
-            .as_ref()
-            .map(|root| root.join(".leveler").join("local").join("memory"))
-    }
-
-    /// Markdown current records for global scope (`<home>/memory`).
-    pub fn global_memory_dir(&self) -> PathBuf {
-        self.home.root().join("memory")
-    }
-
-    /// Private Markdown state root for a scope. Always outside the repository;
-    /// `global` lives under the home state dir rather than a project state dir.
-    pub fn memory_v2_state_dir(&self, scope: &str) -> PathBuf {
-        if scope == "global" {
-            self.home.state_dir().join("memory-v2").join("global")
-        } else {
-            self.state_dir.join("memory-v2").join(scope)
         }
     }
 
@@ -482,20 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_and_permissions_sit_beside_the_database() {
+    fn permissions_sit_beside_the_database() {
         let layout = Layout::resolve_with_environment(
             PathBuf::from("/repo"),
             None,
             &env_home("/h/.leveler"),
-        );
-        assert_eq!(
-            layout.markdown_memory_dir().unwrap(),
-            PathBuf::from("/repo/.leveler/memory")
-        );
-        assert!(
-            layout
-                .memory_v2_state_dir("project")
-                .starts_with("/h/.leveler/state/projects")
         );
         assert!(
             layout

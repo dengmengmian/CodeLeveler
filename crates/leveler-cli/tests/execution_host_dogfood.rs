@@ -39,6 +39,13 @@ impl Environment {
                 .success()
         );
         std::fs::write(repo.join("tracked.txt"), "before").unwrap();
+        // Startup self-update is off and a default model exists, so a `tui`
+        // launch in this fixture never reaches the network.
+        std::fs::write(
+            home.join("config.toml"),
+            "default_model = \"mock/m\"\n\n[update]\nauto_update = false\n",
+        )
+        .unwrap();
         std::fs::write(
             config.join("providers/mock.yaml"),
             format!("id: mock\nprotocol: openai_chat\nbase_url: {model_url}\n"),
@@ -674,49 +681,108 @@ fn execution_host_sigkill_reports_unknown_and_does_not_adopt_or_signal_services(
                 repo_root: std::fs::canonicalize(&env.repo).unwrap(),
                 executable: PathBuf::from(env!("CARGO_BIN_EXE_leveler")),
             };
-            let error = match leveler_execution::execution_host::ExecutionHostClient::ensure(config)
+            // Recovery reads the real OS evidence, not the archive: the
+            // service is still there, so its record becomes `unknown` with
+            // `Present`, and nothing signals it.
+            let probe = leveler_execution::execution_host::ExecutionHostClient::probe(&config)
                 .await
-            {
-                Ok(_) => panic!("Host with uncertain live services must not be silently replaced"),
-                Err(error) => error,
-            };
-            assert!(
-                error.contains("unknown")
-                    || error.contains("unmanaged")
-                    || error.contains("recovery"),
-                "explicit recovery diagnostic: {error}"
+                .expect("a lost host must not make startup fail");
+            assert!(probe.client.is_none(), "the killed host cannot answer");
+            let recovery = probe.recovery.expect("the pass reports what it converged");
+            assert_eq!(recovery.tasks.len(), 1);
+            assert_eq!(
+                recovery.tasks[0].process,
+                leveler_execution::ProcessPresence::Present,
+                "the surviving service must be observed, not guessed"
             );
-            let preserved_ready: serde_json::Value =
+            assert!(
+                !host_state.join("ready.json").exists(),
+                "the killed host's endpoint is no longer trusted"
+            );
+            // The runtime may continue with a new host. It must not adopt the
+            // unknown workload or signal a potentially reused persisted PID.
+            let replacement =
+                leveler_execution::execution_host::ExecutionHostClient::ensure(config.clone())
+                    .await
+                    .expect("startup must recover instead of refusing forever");
+            let replacement_ready: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(host_state.join("ready.json")).unwrap())
                     .unwrap();
-            assert_eq!(
-                preserved_ready["pid"], ready["pid"],
-                "no replacement Host was launched"
+            assert_ne!(
+                replacement_ready["pid"], ready["pid"],
+                "a replacement Host owns the endpoint now"
             );
             assert_eq!(
-                http_pid(port, "/after-refused-adoption").await.unwrap(),
+                http_pid(port, "/after-recovery").await.unwrap(),
                 service_pid,
-                "refused recovery must never signal a potentially reused persisted PID"
+                "recovery must never signal or restart the uncertain service"
             );
-            let output = env
-                .command()
-                .args(["background", "list", "--json"])
-                .output()
-                .unwrap();
-            assert!(
-                !output.status.success(),
-                "CLI must not report an empty successful inventory after Host loss"
+            let tasks = replacement.list().await.unwrap();
+            assert_eq!(tasks.len(), 1, "the archived task is still visible");
+            assert_eq!(
+                tasks[0].snapshot.status,
+                leveler_execution::BackgroundTaskStatus::Unknown
             );
-            let diagnostic = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                diagnostic.contains("unknown")
-                    || diagnostic.contains("unavailable")
-                    || diagnostic.contains("recovery"),
-                "CLI must expose lost ownership: {diagnostic}"
+            assert_eq!(tasks[0].snapshot.pid, Some(service_pid));
+            assert_eq!(
+                tasks[0].loss.as_ref().unwrap().previous,
+                leveler_execution::BackgroundTaskStatus::Running
             );
+            assert_eq!(
+                tasks[0].loss.as_ref().unwrap().process,
+                leveler_execution::ProcessPresence::Present
+            );
+            // The write reservation is retained because the workload may still
+            // write; reporting it is not a startup failure.
+            let journal = env.background(&["journal", "list", "--json"]);
+            let journal: serde_json::Value = serde_json::from_str(&journal).unwrap();
+            let pending = journal.as_array().unwrap();
+            assert_eq!(pending.len(), 1, "the uncertain task keeps its reservation");
+            assert_eq!(pending[0]["task_id"], task_id.as_str());
+            assert_eq!(pending[0]["releasable"], false);
+            // The CLI exposes the inventory instead of a false error/empty list.
+            let list = env.background(&["list", "--json"]);
+            let inventory: serde_json::Value = serde_json::from_str(&list).unwrap();
+            let entry = inventory
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["task_id"] == task_id.as_str())
+                .expect("the unknown task is still in the inventory");
+            assert_eq!(entry["status"], "unknown");
             assert!(
                 daemon.try_wait().unwrap().is_none(),
                 "Runtime is a separate surviving failure domain"
+            );
+            // The reported user flow, after the crash: both launchers must open
+            // a session instead of dying on the leftover Running record.
+            for args in [vec!["tui"], vec!["tui", "--in-process"]] {
+                let output = env.command().args(&args).output().unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !stderr.contains("execution host error")
+                        && !stderr.contains("Execution Host unavailable")
+                        && !stderr.contains("residue kept"),
+                    "`leveler {}` must start after host loss: {stderr}",
+                    args.join(" ")
+                );
+                assert!(
+                    !output.status.success(),
+                    "the TUI cannot take over a non-tty, but must have started"
+                );
+            }
+            assert_eq!(
+                http_pid(port, "/after-tui-launches").await.unwrap(),
+                service_pid,
+                "no TUI launch signalled, adopted or replayed the uncertain service"
+            );
+            let tasks: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(host_state.join("tasks.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                tasks.as_array().unwrap().len(),
+                1,
+                "the crash must not add or duplicate a task record"
             );
             drop(client);
             assert_eq!(http_pid(port, "/exit-offline").await.unwrap(), service_pid);
@@ -729,7 +795,7 @@ fn execution_host_sigkill_reports_unknown_and_does_not_adopt_or_signal_services(
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             eprintln!(
-                "DOGFOOD PASS host_crash_task={task_id} host_pid={host_pid} service_pid={service_pid} actual_host_sigkill=true same_pid_service_survived=true recovery_explicit_unknown=true no_replacement_host=true cli_no_false_empty=true"
+                "DOGFOOD PASS host_crash_task={task_id} host_pid={host_pid} service_pid={service_pid} actual_host_sigkill=true same_pid_service_survived=true recovered_status=unknown process=present no_signal_no_replay=true replacement_host_started=true inventory_visible=true reservation_retained=true tui_started=true tui_in_process_started=true"
             );
         },
     );

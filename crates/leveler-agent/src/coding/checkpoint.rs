@@ -679,6 +679,7 @@ mod tests {
             windows_run: 0,
             acceptance: Vec::new(),
             amendments: Vec::new(),
+            user_paused_at: None,
         }
     }
 

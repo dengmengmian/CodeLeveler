@@ -5,7 +5,7 @@
 //! each tool is constructed with exactly the handles it uses.
 //!
 //! This replaced `ToolContext::services`, where the language servers, the
-//! browser runtime, the memory root, the artifact store and the background
+//! browser runtime, the artifact store and the background
 //! task registry all sat in one struct that every tool received on every call.
 //! `read_file` could reach the browser and `grep` could start a language
 //! server — not because either needed to, but because the context was a
@@ -33,12 +33,7 @@ pub struct Capabilities {
     /// Where oversized command output is spilled (content-addressed) instead
     /// of being truncated. `None` truncates with a marker.
     pub artifact_store: Option<Arc<ArtifactStore>>,
-    /// The unified memory service. `None` means memory is unconfigured, and
-    /// the memory tools say so rather than inventing a location.
-    pub memory: Option<Arc<leveler_memory::MemoryService>>,
-    /// Which memory lanes the tools may expose. The root can be present while
-    /// one lane is closed; that lane's entries must stay invisible.
-    pub memory_lanes: leveler_memory::MemoryLanes,
+
     /// The daemon-owned browser, shared across turns so its tabs, cookies and
     /// login state survive client disconnect. `None` is the same mechanical
     /// fact as `CapabilityPacks::browser == false`: no browser is drivable
@@ -53,7 +48,7 @@ pub struct Capabilities {
 
 impl Capabilities {
     /// Handles that need nothing from a host: a fresh language-server pool and
-    /// a fresh background registry over `environment`, no store, no memory
+    /// a fresh background registry over `environment`, no store, no browser
     /// root, no browser.
     ///
     /// A production host builds on top of this with the services it owns
@@ -63,8 +58,7 @@ impl Capabilities {
             lsp: Arc::new(leveler_lsp::LspSessions::new(environment.clone())),
             background_tasks: Arc::new(BackgroundTaskRegistry::with_environment(environment)),
             artifact_store: None,
-            memory: None,
-            memory_lanes: leveler_memory::MemoryLanes::ALL,
+
             browser: None,
             search_provider: None,
         }
@@ -73,18 +67,6 @@ impl Capabilities {
     /// Spill oversized command output to `store` instead of truncating it.
     pub fn with_artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
-        self
-    }
-
-    /// The unified memory service, already bound to the configured backend.
-    pub fn with_memory_service(mut self, service: leveler_memory::MemoryService) -> Self {
-        self.memory = Some(Arc::new(service));
-        self
-    }
-
-    /// Restrict the memory tools to the project's effective lanes.
-    pub fn with_memory_lanes(mut self, lanes: leveler_memory::MemoryLanes) -> Self {
-        self.memory_lanes = lanes;
         self
     }
 

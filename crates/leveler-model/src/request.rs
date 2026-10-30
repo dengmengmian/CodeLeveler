@@ -364,8 +364,8 @@ mod tests {
             "B",
         ));
         control.push(PromptSegment::control(
-            "memory_recall",
-            PromptSource::MemoryRecall { ids: vec![] },
+            "project_rules",
+            PromptSource::ProjectRules { paths: vec![] },
             PromptAuthority::AdvisoryContext,
             SegmentLifecycle::Turn,
             false,

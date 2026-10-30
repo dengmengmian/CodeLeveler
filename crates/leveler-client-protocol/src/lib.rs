@@ -58,6 +58,8 @@ pub mod session_wire;
 mod skills;
 mod snapshot;
 mod terminal;
+/// Durable usage reporting: the runtime's own model-call ledger, projected.
+mod usage;
 mod version;
 pub use terminal::{TerminalOperation, TerminalRequest, TerminalState};
 mod wire_types;
@@ -86,9 +88,7 @@ pub use skills::{
 
 pub use event::{
     ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RuntimeEvent,
-    UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry,
-    UiMemoryExperience, UiMemoryExtraction, UiMemoryExtractionTotals, UiMemoryKind,
-    UiMemoryReference, UiMemoryScope, UiMemoryStatus, parse_runtime_event,
+    UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, parse_runtime_event,
 };
 pub use global_tasks::{
     UiGlobalTaskIndex, UiGlobalTaskSourceError, UiGlobalTaskSourceErrorKind, UiGlobalTaskSummary,
@@ -116,6 +116,7 @@ pub use snapshot::{
     UiSessionSummary, UiTaskDeclaration, UiThinkingAccess, UiThinkingState, UiToolTiming,
     UiTurnBlocker, UiUserShell,
 };
+pub use usage::{UiModelUsage, UiUsageReport, UiUsageScope};
 pub use version::{
     PROTOCOL_VERSION, ProtocolCapability, ProtocolEnvelope, ProtocolError, ProtocolVersion,
 };

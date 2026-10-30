@@ -31,39 +31,6 @@ use leveler_lifecycle::{AgentState, TaskOutcome, TurnOutcome};
 
 use crate::EngineError;
 
-/// One memory line the builder actually rendered into a request.
-///
-/// The body is never stored: id, revision, scope, mode and a line digest are
-/// enough to prove which version reached the model and to find the text again
-/// in Markdown history.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct MemoryInjectionRecord {
-    pub id: String,
-    pub revision: u64,
-    pub scope: String,
-    pub kind: String,
-    /// `standing`, `candidate` or `experience`.
-    pub mode: String,
-    pub tokens: u32,
-    pub title: String,
-    pub digest: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct MemoryOmissionRecord {
-    pub reason: String,
-    pub count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct MemoryInjectionBudgetRecord {
-    pub total_tokens: u32,
-    pub used_tokens: u32,
-    pub standing_tokens: u32,
-    pub candidate_tokens: u32,
-    pub experience_tokens: u32,
-}
-
 /// How a session executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -450,55 +417,18 @@ pub enum EngineEvent {
     PlanUpdated {
         steps: Vec<leveler_lifecycle::PlanStep>,
     },
-    /// The runtime recalled durable project memory into this turn's model
-    /// context. Emitted whenever memory was consulted for the turn, including
-    /// a zero-hit result; carries ids/count, never bodies.
-    MemoryRecalled {
-        count: u32,
-        ids: Vec<String>,
-        /// How many of `ids` were evidence-bound agent experience.
-        #[serde(default)]
-        experience: u32,
-        /// One receipt per rendered line. This is what the builder selected
-        /// and assembled into the request, not a claim about transport.
-        #[serde(default)]
-        injections: Vec<MemoryInjectionRecord>,
-        #[serde(default)]
-        omitted: Vec<MemoryOmissionRecord>,
-        #[serde(default)]
-        budget: MemoryInjectionBudgetRecord,
-        /// sha256 of the complete advisory block.
-        #[serde(default)]
-        block_digest: String,
-        /// Catalog actually rendered into this run's session prefix.
-        #[serde(default)]
-        catalog_ids: Vec<String>,
-        #[serde(default)]
-        catalog_digest: Option<String>,
-        #[serde(default)]
-        catalog_version: Option<u64>,
-        /// Ids announced in this round's tail delta; empty when the catalog
-        /// did not change.
-        #[serde(default)]
-        catalog_delta_ids: Vec<String>,
-        /// Version the delta brought the model's view to. `catalog_version`
-        /// remains the prefix's version.
-        #[serde(default)]
-        catalog_delta_version: Option<u64>,
-        /// `index_unavailable` or similar when retrieval could not run fully.
-        #[serde(default)]
-        degraded: Option<String>,
-    },
-    /// A durable memory lifecycle change (created / superseded / expired /
-    /// merged). `operation` is an opaque stable key chosen by the memory
-    /// capability so the engine stays free of its types.
-    MemoryChanged {
-        operation: String,
-        id: String,
-        title: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        authority: Option<String>,
-    },
+    /// Read-only tombstone for retired durable-memory events in old sessions.
+    /// Historical payloads do not participate in execution or presentation.
+    #[serde(
+        skip_serializing,
+        alias = "memory_recalled",
+        alias = "memory_changed",
+        alias = "memory_change_proposed",
+        alias = "memory_review_decided",
+        alias = "memory_write_started",
+        alias = "memory_write_settled"
+    )]
+    RetiredMemory {},
     /// Host refused update_goal(complete) (process gate). Persisted for UI/resume.
     GoalIntercepted {
         kind: String,
@@ -924,10 +854,7 @@ impl EngineEvent {
             | EngineEvent::AdvisoryStarted { .. }
             | EngineEvent::CommandProgress { .. }
             | EngineEvent::ModelRetrying { .. }
-            // A memory id/operation is a project fact; a recalled set is
-            // per-turn UI data. Neither belongs on a remote projection.
-            | EngineEvent::MemoryRecalled { .. }
-            | EngineEvent::MemoryChanged { .. }
+            | EngineEvent::RetiredMemory { .. }
             // User shell facts carry the raw command line and its output —
             // local-sensitive by construction.
             | EngineEvent::UserShellStarted { .. }
@@ -1100,8 +1027,7 @@ impl EngineEvent {
             | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ModelRetrying { .. }
             | EngineEvent::CommandProgress { .. }
-            | EngineEvent::MemoryRecalled { .. }
-            | EngineEvent::MemoryChanged { .. }
+            | EngineEvent::RetiredMemory { .. }
             | EngineEvent::ContextUsage { .. } => return None,
         })
     }
@@ -1584,5 +1510,32 @@ mod contract_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod retired_memory_compatibility_tests {
+    use super::EngineEvent;
+
+    #[test]
+    fn old_memory_rows_decode_without_restoring_a_product_interface() {
+        for tag in [
+            "memory_recalled",
+            "memory_changed",
+            "memory_change_proposed",
+            "memory_review_decided",
+            "memory_write_started",
+            "memory_write_settled",
+        ] {
+            let payload =
+                serde_json::json!({"type": tag, "payload": {"id": "historical", "count": 1}});
+            let event = EngineEvent::from_payload(&payload.to_string()).unwrap();
+            assert!(matches!(event, EngineEvent::RetiredMemory {}));
+            assert!(
+                event.to_row().is_err(),
+                "retired events must never be emitted"
+            );
+            assert!(event.public_projection().is_none());
+        }
     }
 }

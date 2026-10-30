@@ -212,273 +212,6 @@ fn hit_after_turn_started_test_barrier() {}
 #[cfg(not(feature = "test-crash-barrier"))]
 fn hit_before_receipt_settled_test_barrier() {}
 
-/// The user's own listing actor. These commands arrive through an in-process
-/// interaction surface, so the trusted invocation is minted here, once.
-fn user_listing_actor(query_id: Option<&leveler_core::CommandId>) -> leveler_memory::v2::Actor {
-    leveler_memory::v2::Actor::User {
-        invocation: leveler_memory::v2::UserInvocationId::mint(format!(
-            "ui:memory-list:{}",
-            query_id
-                .map(leveler_core::CommandId::as_str)
-                .unwrap_or("open")
-        )),
-    }
-}
-
-/// A bounded label for a write outcome, for a one-line status message.
-fn outcome_title(outcome: &leveler_memory::WriteOutcome) -> String {
-    match outcome {
-        leveler_memory::WriteOutcome::Applied { id, title, .. } if title.is_empty() => id.clone(),
-        leveler_memory::WriteOutcome::Applied { title, .. } => title.clone(),
-        leveler_memory::WriteOutcome::Pending { title, .. } => title.clone(),
-        leveler_memory::WriteOutcome::Forgotten { title, .. } => title.clone(),
-        leveler_memory::WriteOutcome::Skipped { reason, .. }
-        | leveler_memory::WriteOutcome::Rejected { reason }
-        | leveler_memory::WriteOutcome::NotStored { reason } => reason.clone(),
-        leveler_memory::WriteOutcome::Conflict { target, .. } => target.clone(),
-    }
-}
-
-/// The status line for a trusted direct write.
-///
-/// Only `Applied` changed current memory. Pending, skipped, rejected,
-/// conflicting and unstored writes did not, so they must not be reported as
-/// saved. The write itself already happened through the service; this only
-/// tells the person what it did.
-fn direct_write_notification(
-    outcome: &leveler_memory::WriteOutcome,
-    title: &str,
-    busy: bool,
-) -> (leveler_client_protocol::NotificationLevel, String) {
-    use leveler_client_protocol::NotificationLevel;
-    use leveler_memory::WriteOutcome;
-    match outcome {
-        WriteOutcome::Applied { id, .. } => (
-            NotificationLevel::Info,
-            if busy {
-                // This turn's context was assembled already, so say when the
-                // memory actually starts being recalled.
-                format!("已保存记忆 [{id}]：{title}。将从下一次用户回合开始参与自动召回。")
-            } else {
-                format!("已保存记忆 [{id}]：{title}")
-            },
-        ),
-        WriteOutcome::Pending { id, reason, .. } => (
-            NotificationLevel::Info,
-            format!("记忆待确认 [{id}]：{title}；确认后才会生效（{reason}）"),
-        ),
-        WriteOutcome::Skipped { reason, .. }
-        | WriteOutcome::Rejected { reason }
-        | WriteOutcome::NotStored { reason } => (
-            NotificationLevel::Warning,
-            format!("未保存记忆：{title}（{reason}）"),
-        ),
-        WriteOutcome::Conflict { target, .. } => (
-            NotificationLevel::Warning,
-            format!("未保存记忆：{title} 与 [{target}] 的当前版本冲突，请刷新后重试"),
-        ),
-        WriteOutcome::Forgotten { id, .. } => (
-            NotificationLevel::Info,
-            format!("已删除记忆 [{id}]：{title}"),
-        ),
-    }
-}
-
-fn ui_memory_kind(
-    view: &leveler_memory::MemoryView,
-) -> Option<leveler_client_protocol::UiMemoryKind> {
-    use leveler_client_protocol::UiMemoryKind;
-    match view.kind.as_str() {
-        "preference" => Some(UiMemoryKind::Preference),
-        "decision" => Some(UiMemoryKind::Decision),
-        "note" | "user_fact" => Some(UiMemoryKind::Note),
-        "experience" => Some(UiMemoryKind::Experience),
-        // Legacy and derived entries have no product kind to claim.
-        _ => None,
-    }
-}
-
-/// The wire scope for a domain scope. The two enums stay separate because the
-/// wire must not gain lifecycle semantics the domain owns.
-fn ui_memory_scope(scope: leveler_memory::ServiceScope) -> leveler_client_protocol::UiMemoryScope {
-    match scope {
-        leveler_memory::ServiceScope::Global => leveler_client_protocol::UiMemoryScope::Global,
-        leveler_memory::ServiceScope::Project => leveler_client_protocol::UiMemoryScope::Project,
-        leveler_memory::ServiceScope::Local => leveler_client_protocol::UiMemoryScope::Local,
-    }
-}
-
-fn service_memory_scope(
-    scope: leveler_client_protocol::UiMemoryScope,
-) -> leveler_memory::ServiceScope {
-    match scope {
-        leveler_client_protocol::UiMemoryScope::Global => leveler_memory::ServiceScope::Global,
-        leveler_client_protocol::UiMemoryScope::Project => leveler_memory::ServiceScope::Project,
-        leveler_client_protocol::UiMemoryScope::Local => leveler_memory::ServiceScope::Local,
-    }
-}
-
-/// One listing row. A credential-shaped record keeps its row so the user can
-/// find and archive it, but never its text.
-fn memory_row_from_view(
-    view: &leveler_memory::MemoryView,
-    scope: leveler_memory::ServiceScope,
-) -> leveler_client_protocol::UiMemoryEntry {
-    leveler_client_protocol::UiMemoryEntry {
-        id: view.id.clone(),
-        scope: ui_memory_scope(scope),
-        title: if view.sensitive {
-            leveler_memory::REDACTED_TITLE.to_string()
-        } else {
-            view.title.clone()
-        },
-        body: if view.sensitive {
-            leveler_memory::REDACTED_BODY.to_string()
-        } else {
-            view.body.clone()
-        },
-        kind: ui_memory_kind(view),
-        sensitive: view.sensitive,
-        status: Some(view.status.clone()),
-        authority: Some(view.authority.clone()),
-        revision: view.revision,
-        updated_at: view.updated_at.clone(),
-        pinned: view.pinned_by_user,
-    }
-}
-
-/// Pending candidates include the body, kind and source needed for informed
-/// consent. Preserve service errors rather than presenting them as no
-/// candidates.
-fn pending_entries(
-    service: &leveler_memory::MemoryService,
-    actor: &leveler_memory::v2::Actor,
-    scope: leveler_memory::ServiceScope,
-) -> Result<Vec<leveler_client_protocol::UiMemoryCandidate>, leveler_memory::ServiceError> {
-    Ok(service
-        .pending(actor, scope)?
-        .into_iter()
-        .map(|view| leveler_client_protocol::UiMemoryCandidate {
-            id: view.id,
-            scope: ui_memory_scope(scope),
-            title: if view.sensitive {
-                leveler_memory::REDACTED_TITLE.to_string()
-            } else {
-                view.title
-            },
-            body: if view.sensitive {
-                leveler_memory::REDACTED_BODY.to_string()
-            } else {
-                view.body
-            },
-            kind: view.kind,
-            source: view.authority,
-        })
-        .collect())
-}
-
-fn project_memory_consolidation_event(
-    event: crate::memory_consolidator::MemoryConsolidationEvent,
-) -> RuntimeEvent {
-    if event.operation == "proposed" {
-        RuntimeEvent::Notification {
-            level: leveler_client_protocol::NotificationLevel::Info,
-            message: if event.count == 1 {
-                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。"
-                    .to_string()
-            } else {
-                format!(
-                    "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。",
-                    event.count
-                )
-            },
-        }
-    } else {
-        RuntimeEvent::MemoryChanged {
-            operation: event.operation,
-            id: event.id,
-            title: event.title,
-            authority: Some(event.authority),
-        }
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn proposed_memory_projects_to_truthful_pending_notification() {
-    let event = crate::memory_consolidator::MemoryConsolidationEvent {
-        session_id: "session".to_string(),
-        operation: "proposed".to_string(),
-        id: "cand-output".to_string(),
-        title: "输出保持紧凑".to_string(),
-        authority: "explicit_user".to_string(),
-        count: 1,
-    };
-    match project_memory_consolidation_event(event) {
-        RuntimeEvent::Notification { message, .. } => {
-            assert_eq!(
-                message,
-                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory review 查看。"
-            );
-        }
-        other => panic!("pending candidate became a durable change: {other:?}"),
-    }
-}
-
-/// A complete listing is evidence only when every requested read succeeds.
-/// The configured backend decides which store is read: the same one writes go
-/// to, never a second database.
-fn send_memory_list(
-    events: &crate::event_bridge::RuntimeEventSender,
-    service: &leveler_memory::MemoryService,
-    lanes: leveler_memory::MemoryLanes,
-    memory_dir: &std::path::Path,
-    include_archived: bool,
-    query_id: Option<leveler_core::CommandId>,
-) {
-    let actor = user_listing_actor(query_id.as_ref());
-    let listing = (|| -> Result<RuntimeEvent, leveler_memory::ServiceError> {
-        let mut active = Vec::new();
-        let mut archived = Vec::new();
-        let mut pending = Vec::new();
-        // Every configured scope is a separate store. A failure in any one of
-        // them fails the whole listing: a partial list would look complete
-        // while a pending record stayed invisible.
-        for scope in service.configured_scopes() {
-            active.extend(
-                service
-                    .listing_for_user(scope, lanes)?
-                    .iter()
-                    .map(|view| memory_row_from_view(view, scope)),
-            );
-            if include_archived {
-                archived.extend(
-                    service
-                        .archived(&actor, scope, lanes, None)?
-                        .iter()
-                        .map(|view| memory_row_from_view(view, scope)),
-                );
-            }
-            pending.extend(pending_entries(service, &actor, scope)?);
-        }
-        Ok(RuntimeEvent::MemoryList {
-            query_id,
-            memory_dir: memory_dir.display().to_string(),
-            active,
-            archived,
-            pending,
-        })
-    })();
-    let event = match listing {
-        Ok(event) => event,
-        Err(error) => RuntimeEvent::Notification {
-            level: leveler_client_protocol::NotificationLevel::Warning,
-            message: format!("memory list failed: {error}"),
-        },
-    };
-    let _ = events.send(event);
-}
-
 fn execution_mode(value: leveler_client_protocol::PermissionProfile) -> PermissionProfile {
     match value {
         leveler_client_protocol::PermissionProfile::RequestApproval => {
@@ -808,6 +541,10 @@ pub struct InProcessRuntimeClient {
     tool_call_cancels: ChildCancels,
     /// Optional prompt/recap generation, cancelled before a real turn starts.
     auxiliary_assists: Arc<AuxiliaryAssists>,
+    /// Highest configuration generation whose effects (session refresh,
+    /// notification) were already announced, so a watcher and an explicit
+    /// `/reload` observing the same generation announce it once.
+    config_announced: Arc<std::sync::atomic::AtomicU64>,
 }
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
@@ -1313,44 +1050,6 @@ impl InProcessRuntimeClient {
     ) -> Self {
         let (events, _) = broadcast::channel(2048);
         let session_events = Arc::new(SessionStreams::default());
-        let mut memory_events = app.subscribe_memory_events();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let all_events = events.clone();
-            let scoped_events = Arc::downgrade(&session_events);
-            let shutdown = session_events.shutdown.clone();
-            handle.spawn(async move {
-                loop {
-                    let event = match tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => return,
-                        event = memory_events.recv() => event,
-                    } {
-                        Ok(event) => event,
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "memory event bridge lagged");
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    };
-                    let session_id = event.session_id.clone();
-                    let runtime_event = project_memory_consolidation_event(event);
-                    let Some(streams) = scoped_events.upgrade() else {
-                        return;
-                    };
-                    let sender = streams
-                        .streams
-                        .lock()
-                        .unwrap()
-                        .get(&SessionId::new(session_id))
-                        .map(|stream| stream.events.clone());
-                    if let Some(sender) = sender {
-                        let _ = sender.send(runtime_event);
-                    } else {
-                        let _ = all_events.send(runtime_event);
-                    }
-                }
-            });
-        }
         let media_root = app.layout.state_dir.join("media");
         let in_flight = app.in_flight_commands();
         // One flag, shared: the runtime reports it and admission enforces it.
@@ -1385,6 +1084,7 @@ impl InProcessRuntimeClient {
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
             tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
             auxiliary_assists: Arc::new(AuxiliaryAssists::default()),
+            config_announced: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
@@ -1396,6 +1096,210 @@ impl InProcessRuntimeClient {
             client_presence: None,
             in_flight,
         }
+    }
+
+    /// Relay automatically applied configuration generations to every attached
+    /// client: one event, one refreshed snapshot per open session. Called by
+    /// the composition roots that also start the watcher.
+    pub fn spawn_config_bridge(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut applied = self.app.config_manager().subscribe();
+        let mut failures = self.app.config_manager().subscribe_failures();
+        let weak = Arc::downgrade(self);
+        handle.spawn(async move {
+            loop {
+                tokio::select! {
+                    received = applied.recv() => match received {
+                        Ok(applied) => {
+                            let Some(client) = weak.upgrade() else {
+                                break;
+                            };
+                            client.announce_applied_config(&applied, None).await;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "config change stream lagged");
+                            // A missed generation still leaves the runtime on the
+                            // latest one; ask it for the truth rather than replaying
+                            // a stale event.
+                            let Some(client) = weak.upgrade() else {
+                                break;
+                            };
+                            let snapshot = client.app.config_snapshot();
+                            let applied = crate::config_manager::ConfigApplied {
+                                version: snapshot.version,
+                                previous_version: snapshot.version,
+                                change: Default::default(),
+                                provider: None,
+                                model: snapshot.loaded.default_model.clone(),
+                                thinking: None,
+                            };
+                            client.announce_applied_config(&applied, None).await;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    received = failures.recv() => match received {
+                        Ok((version, error)) => {
+                            let Some(client) = weak.upgrade() else {
+                                break;
+                            };
+                            client.announce_reload_failure(version, error, None);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                }
+            }
+        });
+    }
+
+    /// Publish one applied generation to every attached client. Effects are
+    /// announced at most once per version, so a watcher reload and a `/reload`
+    /// that observed the same generation do not notify twice.
+    async fn announce_applied_config(
+        &self,
+        applied: &crate::config_manager::ConfigApplied,
+        query_id: Option<CommandId>,
+    ) {
+        let fresh = self
+            .config_announced
+            .swap(applied.version, std::sync::atomic::Ordering::SeqCst)
+            != applied.version;
+        let running = self.active.load().0 > 0;
+        let event = RuntimeEvent::ConfigReloaded {
+            query_id,
+            outcome: "applied".to_string(),
+            version: applied.version,
+            error: None,
+            provider: applied.provider.clone(),
+            model: applied.model.clone(),
+            thinking: applied.thinking.clone(),
+            changed: applied
+                .change
+                .labels()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            deferred_to_next_turn: running,
+            restart_required: Self::restart_required(applied),
+        };
+        self.broadcast_event(event);
+        if !fresh {
+            return;
+        }
+        if applied.change.default_model || applied.change.models || applied.change.thinking {
+            self.refresh_open_sessions().await;
+        }
+    }
+
+    /// Settings that the applied generation changed but that cannot be applied
+    /// to a live process. Named facts, never a silent success.
+    fn restart_required(applied: &crate::config_manager::ConfigApplied) -> Vec<String> {
+        let mut components = Vec::new();
+        if applied.change.ui {
+            components.push("ui_language".to_string());
+        }
+        if applied.change.browser {
+            components.push("browser".to_string());
+        }
+        components
+    }
+
+    /// Report a load that kept the previous generation. Deliberately NOT a
+    /// success with a warning: the outcome string is `failed` and the reason
+    /// is the load error.
+    fn announce_reload_failure(&self, version: u64, error: String, query_id: Option<CommandId>) {
+        self.broadcast_event(RuntimeEvent::ConfigReloaded {
+            query_id,
+            outcome: "failed".to_string(),
+            version,
+            error: Some(error),
+            provider: None,
+            model: None,
+            thinking: None,
+            changed: Vec::new(),
+            deferred_to_next_turn: false,
+            restart_required: Vec::new(),
+        });
+    }
+
+    /// Send one runtime event to the global compatibility stream AND every
+    /// open session stream: a configuration fact belongs to the runtime, and a
+    /// client watching any session must learn it.
+    fn broadcast_event(&self, event: RuntimeEvent) {
+        let _ = self.events.send(event.clone());
+        let streams = self
+            .session_events
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stream in streams.values() {
+            let _ = stream.events.send(event.clone());
+        }
+    }
+
+    /// Republish metadata for every session this runtime already knows, so a
+    /// client adopts the model/thinking/available-model list the NEXT turn will
+    /// use. A running turn's snapshot still names the model it is using.
+    async fn refresh_open_sessions(&self) {
+        let mut ids: Vec<SessionId> = self
+            .session_events
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        ids.extend(
+            self.session_runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned(),
+        );
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids.dedup();
+        for session_id in ids {
+            if let Ok(session) = self.snapshot(&session_id).await {
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::SessionUpdated { session });
+            }
+        }
+    }
+
+    /// `/reload`: force a fresh read of every configured source and report what
+    /// actually happened. A running turn is never interrupted; it keeps the
+    /// generation it started with.
+    async fn reload_runtime_config(&self, query_id: Option<CommandId>) -> Result<(), ClientError> {
+        let outcome = self
+            .app
+            .reload_config(crate::config_manager::ReloadOrigin::Command, true)
+            .await;
+        match outcome {
+            crate::config_manager::ReloadOutcome::Applied(applied) => {
+                self.announce_applied_config(&applied, query_id).await;
+            }
+            crate::config_manager::ReloadOutcome::Unchanged { version } => {
+                self.broadcast_event(RuntimeEvent::ConfigReloaded {
+                    query_id,
+                    outcome: "unchanged".to_string(),
+                    version,
+                    error: None,
+                    provider: None,
+                    model: None,
+                    thinking: None,
+                    changed: Vec::new(),
+                    deferred_to_next_turn: false,
+                    restart_required: Vec::new(),
+                });
+            }
+            crate::config_manager::ReloadOutcome::Failed { error, version } => {
+                self.announce_reload_failure(version, error, query_id);
+            }
+        }
+        Ok(())
     }
 
     /// Answer a delivery that found its command's receipt `dispatching`.
@@ -1795,18 +1699,29 @@ impl InProcessRuntimeClient {
         ))
     }
 
-    /// Publish the session row after a turn that may have ended its Goal route.
+    /// Publish the session row after a turn that may have changed its routes.
     ///
-    /// The terminal commit ends Goal mode in the SAME transaction as the
-    /// terminal fact (a goal nothing can continue ends the route), so no client
-    /// may keep painting a Goal turn: the next submit would be predicted as
-    /// Goal while the runtime runs Chat. A turn whose axis did not move — the
+    /// Two facts live only in the durable session projection:
+    ///
+    /// - the collaboration axis. The terminal commit ends Goal mode in the
+    ///   SAME transaction as the terminal fact (a goal nothing can continue
+    ///   ends the route), so no client may keep painting a Goal turn: the next
+    ///   submit would be predicted as Goal while the runtime runs Chat.
+    /// - the goal the session still owes. A turn that did not drive it (an
+    ///   ordinary question in a Chat session that owes a paused goal) must not
+    ///   make clients forget it: the row is how a client re-reads the goal's
+    ///   own pause state, and it is the same projection another client, a
+    ///   reconnect and a replay read.
+    ///
+    /// A turn whose axis did not move and which owes no goal — the
     /// overwhelming majority — pays one indexed read and no snapshot.
-    async fn publish_axis_if_changed(&self, session_id: &SessionId, axis_at_start: &str) {
-        let Ok(axis) = self.app.session_product_axes(session_id).await else {
-            return;
-        };
-        if axis.as_str() == axis_at_start {
+    async fn publish_routes_after_turn(&self, session_id: &SessionId, axis_at_start: &str) {
+        let axis_moved = self
+            .app
+            .session_product_axes(session_id)
+            .await
+            .is_ok_and(|axis| axis.as_str() != axis_at_start);
+        if !axis_moved && !self.goal_still_owed(session_id).await {
             return;
         }
         if let Ok(session) = self.snapshot(session_id).await {
@@ -1814,6 +1729,26 @@ impl InProcessRuntimeClient {
                 .events_for(session_id)
                 .send(RuntimeEvent::SessionUpdated { session });
         }
+    }
+
+    /// Whether the session's durable task still has a running goal.
+    ///
+    /// Best effort, like every other projection read here: a client that cannot
+    /// be told keeps the state it already had, and the next snapshot (or the
+    /// terminal itself) is the authority.
+    async fn goal_still_owed(&self, session_id: &SessionId) -> bool {
+        let Ok(db) = self.app.open_database().await else {
+            return false;
+        };
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let Ok(Some(task)) = stores.tasks.task_for_session(session_id).await else {
+            return false;
+        };
+        stores.goals.for_task(&task).await.is_ok_and(|goals| {
+            goals
+                .iter()
+                .any(|goal| goal.state == leveler_storage::GoalState::Running)
+        })
     }
 
     fn config_from_settings(
@@ -1832,21 +1767,37 @@ impl InProcessRuntimeClient {
             .get(session_id)
             .map(|config| config.approval_policy)
             .unwrap_or(ApprovalPolicy::Interactive);
-        Self::decode_settings(session_id, settings, approval_policy)
+        Self::decode_settings(
+            session_id,
+            settings,
+            approval_policy,
+            self.app.configured_default_model(),
+        )
     }
 
     fn decode_settings(
         session_id: &SessionId,
         settings: &leveler_storage::SessionSettingsSnapshot,
         approval_policy: ApprovalPolicy,
+        configured_default: Option<ModelRef>,
     ) -> Result<SessionRuntimeConfig, ClientError> {
         let record = &settings.session;
-        let model = ModelRef::parse(&record.model).ok_or_else(|| {
+        let stored = ModelRef::parse(&record.model).ok_or_else(|| {
             ClientError::Runtime(format!(
                 "session {session_id} stores invalid model reference `{}`",
                 record.model
             ))
         })?;
+        // An explicit `/model` choice is durable and wins. Otherwise the session
+        // INHERITS the current configured default, so editing `default_model`
+        // reaches the next turn without a restart. A default this environment
+        // cannot resolve leaves the session on the model it already had — an
+        // unusable global default must never strand a working session.
+        let model = if settings.model_pinned {
+            stored
+        } else {
+            configured_default.unwrap_or(stored)
+        };
         let mode = crate::session::mode_from_str(&settings.mode).ok_or_else(|| {
             ClientError::Runtime(format!(
                 "session {session_id} stores invalid execution mode `{}`",
@@ -1988,6 +1939,20 @@ impl InProcessRuntimeClient {
                         "已切换到 {model}，但默认模型保存失败：{error}；下次启动可能恢复原模型"
                     ))
                 })?;
+                // The file write is not application. Reconcile the RUNNING
+                // runtime now so this process never serves a generation older
+                // than the file it just wrote (the watcher would get there a
+                // moment later; a turn started in between must not miss it).
+                if let crate::config_manager::ReloadOutcome::Failed { error, .. } = self
+                    .app
+                    .reload_config(crate::config_manager::ReloadOrigin::Write, true)
+                    .await
+                {
+                    return Err(ClientError::Runtime(format!(
+                        "已切换到 {model} 并写入默认模型，但运行时应用失败：{error}；\
+                         运行时仍在使用上一版有效配置"
+                    )));
+                }
             } else {
                 let _ = self
                     .events_for(session_id)
@@ -2875,7 +2840,7 @@ impl InProcessRuntimeClient {
         }
         let vision = self
             .app
-            .registry
+            .registry()
             .profile(model)
             .await
             .map(|p| p.capabilities.vision)
@@ -3148,6 +3113,7 @@ impl InProcessRuntimeClient {
         let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
+        self.active.note_model(&session_id, &config.model);
         let model = config.model;
         let mode = config.mode;
         let sandbox = config.sandbox;
@@ -3225,7 +3191,7 @@ impl InProcessRuntimeClient {
                 // The goal's terminal may have ended this session's Goal route;
                 // publish the row so the UI stops claiming a Goal that is over.
                 client
-                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
                 // Session-owned background reap moved to the engine's terminal
                 // settlement (finish_from_result) so chat-routed continuations
@@ -3356,26 +3322,15 @@ impl InProcessRuntimeClient {
         Ok(())
     }
 
-    /// Route an ordinary user message: memory commands, the vision gate, then
+    /// Route an ordinary user message through the vision gate, then
     /// a chat/content or goal turn chosen by the session's collaboration axis.
     async fn handle_submit_message(
         &self,
         session_id: SessionId,
         content: String,
         attachments: Vec<AttachmentRef>,
-        origin: Option<&CommandId>,
+        _origin: Option<&CommandId>,
     ) -> Result<(), ClientError> {
-        // A message that is ONLY a memory command is the user's own write, not
-        // a task. Classified HERE, before `stage_turn`, so TUI, Web, mobile and
-        // remote all get the same answer — doing it in a client reducer would
-        // mean one client saving and another handing the same sentence to the
-        // model. `origin` is the delivery identity, so a retried command
-        // replays its write instead of becoming a second one.
-        if attachments.is_empty()
-            && self.handle_direct_memory_message(&session_id, &content, origin)
-        {
-            return Ok(());
-        }
         // `/goal` is product semantics, not a client feature. A client that
         // does not parse slash commands (Desktop, an older build, a steering
         // message) still reaches the same durable axis and the same executor
@@ -3397,6 +3352,25 @@ impl InProcessRuntimeClient {
             };
         }
         let config = self.runtime_config(&session_id).await?;
+        // A paused goal is waiting for the user's authorization, and the user
+        // just gave it. A Chat session keeps its axis after a committed task,
+        // so this continuation would otherwise be a fresh conversation and the
+        // owed goal would never be re-entered. The authorization reader is the
+        // same one the closeout honors: `继续阶段 2` is the user's own
+        // instruction, and the goal is re-entered by identity (same acceptance,
+        // same plan evidence).
+        if attachments.is_empty()
+            && !collaboration_routes_submit_to_goal(&config.collaboration)
+            && leveler_lifecycle::authorizes_continuation(&content)
+            && let Some(goal) = self.paused_running_goal(&session_id).await?
+        {
+            tracing::info!(
+                session = %session_id.as_str(),
+                goal = %goal,
+                "user continuation authorization resumes the paused goal"
+            );
+            return self.resume_session_task(session_id, content).await;
+        }
         // The TUI asks the user about this first, but the reducer is one
         // client. Every other one — web, headless, a model changed between
         // staging and sending — arrives here, and here the answer is the same:
@@ -3475,6 +3449,19 @@ impl InProcessRuntimeClient {
                 "continuation intent resumes the session's logical task"
             );
         }
+        self.resume_session_task(session_id, content).await
+    }
+
+    /// Re-enter the session's logical task with the user's own instruction.
+    ///
+    /// The caller has already decided that a resume is warranted; this is the
+    /// mechanics every continuation path shares (staging, the model pinned on
+    /// the session row, the resume turn).
+    async fn resume_session_task(
+        &self,
+        session_id: SessionId,
+        content: String,
+    ) -> Result<(), ClientError> {
         let instruction = Message::user_input(content.clone());
         let axis_at_start = self
             .app
@@ -3484,8 +3471,55 @@ impl InProcessRuntimeClient {
             .as_str()
             .to_string();
         let cancel = self.stage_turn(&session_id, &content, false, 0).await?;
+        // A resume continues the execution whose model is on the session row,
+        // not the current default: a configuration reload must not silently
+        // move an interrupted task onto another model. Name that model so the
+        // live view reports what is actually running.
+        if let Ok(db) = self.app.open_database().await
+            && let Ok(Some(record)) = SessionRepository::new(&db).get(&session_id).await
+            && let Some(model) = ModelRef::parse(&record.model)
+        {
+            self.active.note_model(&session_id, &model);
+        }
         let accepted = self.spawn_resume_turn(session_id, instruction, cancel, axis_at_start);
         await_turn_acceptance(accepted).await
+    }
+
+    /// The one running goal that is waiting for the user's continuation
+    /// authorization.
+    ///
+    /// Ambiguity is not guessed: two paused goals in one task mean the message
+    /// cannot be routed by this fact alone.
+    async fn paused_running_goal(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<leveler_core::GoalId>, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let Some(task) = stores
+            .tasks
+            .task_for_session(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let paused: Vec<leveler_core::GoalId> = stores
+            .goals
+            .for_task(&task)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .into_iter()
+            .filter(|goal| {
+                goal.state == leveler_storage::GoalState::Running && goal.user_paused_at.is_some()
+            })
+            .map(|goal| goal.id)
+            .collect();
+        Ok((paused.len() == 1).then(|| paused[0].clone()))
     }
 
     /// What a continuation intent (`继续`) means for this session.
@@ -3707,101 +3741,7 @@ impl InProcessRuntimeClient {
                 }
                 // A resume that ends its goal for good also ends Goal mode.
                 client
-                    .publish_axis_if_changed(&session_id, &axis_at_start)
-                    .await;
-            });
-        });
-        accepted_rx
-    }
-
-    /// `/develop`: one goal through `Analyze → Coding → Verify → Review`.
-    ///
-    /// Identical plumbing to [`Self::spawn_direct_goal_turn`] — same admission,
-    /// same approver, clarifier and steering, same terminal publication — so
-    /// cancelling, approving and resuming behave exactly as they do for any
-    /// other turn. Only the harness entry point differs.
-    fn spawn_develop_turn(
-        &self,
-        session_id: SessionId,
-        content: String,
-        admission: crate::active_turns::TurnLease,
-        config: SessionRuntimeConfig,
-    ) -> oneshot::Receiver<Result<(), ClientError>> {
-        let app = self.app.clone();
-        let client = self.clone();
-        let events = self.events_for(&session_id);
-        let active = self.active.clone();
-        let model = config.model;
-        let mode = config.mode;
-        let sandbox = config.sandbox;
-        let axis_at_start = config.collaboration.clone();
-        let repo = self.app.layout.repo_root.clone();
-        let cancel = admission.cancellation();
-        let approver = self.approver(&session_id, cancel.clone());
-        let clarifier = self.clarifier(&session_id, cancel.clone());
-        let steering = self.steering_for(&session_id);
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(async move {
-                emit_project_rules(&events, repo.as_deref());
-                let terminal_active = active.clone();
-                let terminal_admission = admission.clone();
-                let terminal_events = events.clone();
-                let mut bridge = EventBridge::new(events.clone())
-                    .with_progress(active.clone(), session_id.clone())
-                    .with_terminal_publisher(move |event| {
-                        terminal_active.finish_with(&terminal_admission, || {
-                            let _ = terminal_events.send(event);
-                        });
-                    });
-                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
-                let observer_acceptance = accepted_tx.clone();
-                let result = {
-                    let mut observer = |event: leveler_engine::EngineEvent| {
-                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
-                            && let Some(tx) = observer_acceptance
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take()
-                        {
-                            let _ = tx.send(Ok(()));
-                            hit_after_turn_started_test_barrier();
-                        }
-                        bridge.forward(event);
-                    };
-                    app.run_develop_in_session(
-                        &session_id,
-                        &model,
-                        mode,
-                        &content,
-                        approver,
-                        clarifier,
-                        sandbox,
-                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
-                        admission.task_cancel(),
-                        &mut observer,
-                        cancel,
-                    )
-                    .await
-                };
-                if let Some(tx) = accepted_tx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    let _ = tx.send(Err(turn_rejection(&result)));
-                }
-                if !bridge.terminal_published() {
-                    active.finish_with(&admission, || {
-                        let _ = events.send(turn_runtime_event(result));
-                    });
-                } else {
-                    active.finish(&admission);
-                }
-                client
-                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
             });
         });
@@ -3928,7 +3868,7 @@ impl InProcessRuntimeClient {
             request.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
             let started = std::time::Instant::now();
             let outcome = app
-                .registry
+                .registry()
                 .generate(request, CancellationToken::new())
                 .await;
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -4050,7 +3990,7 @@ impl InProcessRuntimeClient {
                 let result: Result<String, String> = async {
                     let db = app.open_database().await.map_err(|e| e.to_string())?;
                     let profile = app
-                        .registry
+                        .registry()
                         .profile(&model)
                         .await
                         .map_err(|e| e.to_string())?;
@@ -4170,7 +4110,7 @@ impl InProcessRuntimeClient {
                     // the one execution boundary stays one boundary.
                     let side_executor = side_tools.as_ref().map(|(registry, tool_context)| {
                         leveler_agent::Executor::new(
-                            app.registry.clone(),
+                            app.registry(),
                             Arc::new(registry.clone()),
                             tool_context.clone(),
                             model.clone(),
@@ -4178,7 +4118,7 @@ impl InProcessRuntimeClient {
                         )
                         .with_approver(Arc::new(AutoApprove))
                     });
-                    let route = app.registry.route_identity(&model);
+                    let route = app.registry().route_identity(&model);
                     let project = |messages: &[Message]| {
                         leveler_model::RequestProjection::project_for_route(
                             messages,
@@ -4218,7 +4158,7 @@ impl InProcessRuntimeClient {
                     {
                         let retention = policy.context_policy.retention;
                         let summary_request = leveler_context::summary_request(
-                            app.registry.as_ref(),
+                            app.registry().as_ref(),
                             &model,
                             leveler_engine::ModelCallKind::Compaction.default_reasoning_effort(),
                             &messages,
@@ -4246,7 +4186,10 @@ impl InProcessRuntimeClient {
                         }
                         let summary_effort = summary_request.reasoning_effort.map(|e| e.as_wire());
                         let started = std::time::Instant::now();
-                        let outcome = app.registry.generate(summary_request, cancel.clone()).await;
+                        let outcome = app
+                            .registry()
+                            .generate(summary_request, cancel.clone())
+                            .await;
                         let latency_ms =
                             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                         crate::observability::record_auxiliary_call(
@@ -4312,7 +4255,7 @@ impl InProcessRuntimeClient {
                             "BTW_MODEL_DISPATCH"
                         );
                         let started = std::time::Instant::now();
-                        let outcome = app.registry.generate(request, cancel.clone()).await;
+                        let outcome = app.registry().generate(request, cancel.clone()).await;
                         let latency_ms =
                             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                         tracing::info!(
@@ -4513,72 +4456,6 @@ impl InProcessRuntimeClient {
         }
     }
 
-    /// Save a message that is ONLY a memory command, and report it.
-    ///
-    /// Returns true when the message was consumed as a write, so no turn is
-    /// staged, no model request is made, and the running turn (if any) is not
-    /// steered. Anything ambiguous returns false and stays an ordinary
-    /// message: failing to save is recoverable, swallowing a real task is not.
-    fn handle_direct_memory_message(
-        &self,
-        session_id: &SessionId,
-        content: &str,
-        origin: Option<&CommandId>,
-    ) -> bool {
-        let Some(body) = leveler_memory::parse_direct_memory_command(content) else {
-            return false;
-        };
-        let events = self.events_for(session_id);
-        let title = leveler_memory::title_from_body(&body);
-        // The message arrived through this process's user input surface, so
-        // the invocation is minted HERE and never derived from the text. The
-        // delivery id is the operation identity: a retry replays, while two
-        // independent identical commands remain two operations.
-        let invocation = Self::memory_invocation("direct", session_id, origin);
-        let request = leveler_memory::RememberRequest {
-            op_id: leveler_memory::v2::OpId::derived("direct", invocation.as_str()),
-            scope: leveler_memory::ServiceScope::Project,
-            title: title.clone(),
-            body: body.clone(),
-            // A commanded save defaults to a lasting preference: "remember
-            // this" almost always means "apply it from now on".
-            kind: "preference".to_string(),
-            subject: None,
-            value: None,
-            tags: Vec::new(),
-            // The exact span the direct write owns. The same turn's extractor
-            // matches this structurally instead of duplicating the fact.
-            evidence: Some(body),
-            expires_at: None,
-            replaces_id: None,
-        };
-        match self
-            .app
-            .memory_service()
-            .remember(&leveler_memory::v2::Actor::User { invocation }, request)
-        {
-            Ok(outcome) => {
-                let busy = self.active.is_running(session_id);
-                let (level, message) = direct_write_notification(&outcome, &title, busy);
-                let _ = events.send(RuntimeEvent::Notification { level, message });
-                // Deliberately no list refresh here: the confirmation above
-                // IS the feedback, and a follow-up listing notification would
-                // overwrite it on a one-line status bar. Clients that show a
-                // panel re-list on their own after a write.
-                true
-            }
-            Err(error) => {
-                // Refused (a credential, say). Report it and do NOT fall
-                // through to the model, which would hand it the same text.
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("保存记忆失败：{error}"),
-                });
-                true
-            }
-        }
-    }
-
     fn spawn_content_turn(
         &self,
         session_id: SessionId,
@@ -4590,6 +4467,7 @@ impl InProcessRuntimeClient {
         let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
+        self.active.note_model(&session_id, &config.model);
         let model = config.model;
         let mode = config.mode;
         let sandbox = config.sandbox;
@@ -4670,7 +4548,7 @@ impl InProcessRuntimeClient {
                 // Clients display the row, so the new axis is published while
                 // the turn that committed it is still the only writer.
                 client
-                    .publish_axis_if_changed(&session_id, &axis_at_start)
+                    .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
             });
         });
@@ -4913,24 +4791,6 @@ impl InProcessRuntimeClient {
 }
 
 impl InProcessRuntimeClient {
-    /// Identity of one trusted user memory operation.
-    ///
-    /// A delivered command carries a durable `command_id`; that is the
-    /// operation identity, so a retry replays and two independent identical
-    /// commands stay distinct. The raw `send` seam has no delivery identity,
-    /// so it mints a fresh one per call.
-    fn memory_invocation(
-        prefix: &str,
-        session_id: &SessionId,
-        origin: Option<&CommandId>,
-    ) -> leveler_memory::v2::UserInvocationId {
-        let operation = match origin {
-            Some(command_id) => command_id.as_str().to_string(),
-            None => format!("raw:{}:{}", session_id, leveler_core::new_uuid_string()),
-        };
-        leveler_memory::v2::UserInvocationId::mint(format!("{prefix}:{operation}"))
-    }
-
     /// Dispatch a command that arrived with its durable delivery identity.
     /// Only commands whose authorization derives from this exact user action
     /// consume it; everything else keeps the ordinary dispatcher.
@@ -4962,418 +4822,9 @@ impl InProcessRuntimeClient {
                 self.handle_resume_task(session_id, content, Some(origin))
                     .await
             }
-            ClientCommand::AcceptMemory {
-                session_id,
-                scope,
-                id,
-            } => {
-                self.accept_memory(session_id, scope, id, Some(origin))
-                    .await
-            }
-            ClientCommand::RejectMemory {
-                session_id,
-                scope,
-                id,
-            } => {
-                self.reject_memory(session_id, scope, id, Some(origin))
-                    .await
-            }
-            ClientCommand::RememberMemory {
-                session_id,
-                scope,
-                body,
-                kind,
-            } => {
-                self.remember_memory(session_id, scope, body, kind, Some(origin))
-                    .await
-            }
-            ClientCommand::ForgetMemory {
-                session_id,
-                scope,
-                id,
-            } => {
-                self.forget_memory(session_id, scope, id, Some(origin))
-                    .await
-            }
-            ClientCommand::SetMemoryPin {
-                session_id,
-                scope,
-                id,
-                pinned,
-            } => {
-                self.set_memory_pin(session_id, scope, id, pinned, Some(origin))
-                    .await
-            }
-            ClientCommand::DeprecateMemory {
-                session_id,
-                scope,
-                id,
-                revision,
-            } => {
-                self.deprecate_memory(session_id, scope, id, revision, Some(origin))
-                    .await
-            }
-            ClientCommand::UpdateMemory {
-                session_id,
-                scope,
-                id,
-                revision,
-                title,
-                body,
-            } => {
-                self.update_memory(session_id, scope, id, revision, title, body, Some(origin))
-                    .await
-            }
+
             command => self.send(command).await,
         }
-    }
-
-    async fn accept_memory(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        id: String,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        // User-authoritative promotion: this command arrived through an
-        // in-process review surface, which is why the model can never reach
-        // it. The invocation is minted here, not passed in.
-        let events = self.events_for(&session_id);
-        let invocation = Self::memory_invocation("ui:accept", &session_id, origin);
-        let actor = leveler_memory::v2::Actor::User { invocation };
-        match self.app.memory_service().review(
-            &actor,
-            service_memory_scope(scope),
-            &id,
-            leveler_memory::ReviewRequest::Accept,
-        ) {
-            Ok(outcome) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: format!("已采纳记忆 [{id}]: {}", outcome_title(&outcome)),
-                });
-            }
-            Err(err) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("accept failed [{id}]: {err}"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Pin or unpin one record through the memory service.
-    ///
-    /// A user pin is a standing constraint, so the invocation is minted here
-    /// from the user's own command; the model has no path to it.
-    async fn set_memory_pin(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        id: String,
-        pinned: bool,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        let events = self.events_for(&session_id);
-        let invocation = Self::memory_invocation(
-            if pinned { "ui:pin" } else { "ui:unpin" },
-            &session_id,
-            origin,
-        );
-        let actor = leveler_memory::v2::Actor::User { invocation };
-        match self
-            .app
-            .memory_service()
-            .pin(&actor, service_memory_scope(scope), &id, pinned)
-        {
-            Ok(outcome) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: if pinned {
-                        format!("已固定记忆 [{id}]: {}", outcome_title(&outcome))
-                    } else {
-                        format!("已取消固定记忆 [{id}]: {}", outcome_title(&outcome))
-                    },
-                });
-            }
-            Err(error) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("pin failed [{id}]: {error}"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Retire one record as no longer true, keeping its history.
-    ///
-    /// The revision the user was looking at is required: a newer record is a
-    /// conflict to show, not a state to overwrite silently.
-    async fn deprecate_memory(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        id: String,
-        revision: u64,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        let events = self.events_for(&session_id);
-        let invocation = Self::memory_invocation("ui:deprecate", &session_id, origin);
-        let actor = leveler_memory::v2::Actor::User { invocation };
-        match self.app.memory_service().deprecate(
-            &actor,
-            service_memory_scope(scope),
-            &id,
-            revision,
-            "the user marked this memory as no longer true".into(),
-        ) {
-            Ok(outcome) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: format!("已标记过期记忆 [{id}]: {}", outcome_title(&outcome)),
-                });
-            }
-            Err(error) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("deprecate failed [{id}]: {error}"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Rewrite one record from the user's own /memory page.
-    ///
-    /// The command carries the revision the page opened, so a record another
-    /// process changed in the meantime is a conflict the user must resolve —
-    /// never a silent overwrite. The invocation is minted from the user's
-    /// command id: the model has no path to this handler.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_memory(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        id: String,
-        revision: u64,
-        title: String,
-        body: String,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        let events = self.events_for(&session_id);
-        let invocation = Self::memory_invocation("ui:update", &session_id, origin);
-        let actor = leveler_memory::v2::Actor::User { invocation };
-        let request = leveler_memory::UpdateRequest {
-            title: Some(title),
-            body: Some(body),
-            value: None,
-            tags: None,
-            expires_at: None,
-            subject: None,
-        };
-        match self.app.memory_service().update(
-            &actor,
-            service_memory_scope(scope),
-            &id,
-            revision,
-            request,
-        ) {
-            Ok(outcome) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: format!("已更新记忆 [{id}]: {}", outcome_title(&outcome)),
-                });
-            }
-            Err(error) => {
-                // A conflict is a specific, actionable answer: the record is
-                // at a newer revision and the caller's text was NOT written.
-                // The message says which, so the page can keep the edit.
-                let message = match &error {
-                    leveler_memory::ServiceError::Conflict(_) => {
-                        format!("update conflict [{id}]: {error}")
-                    }
-                    leveler_memory::ServiceError::NotCurrent(_) => {
-                        format!("update rejected [{id}]: {error}")
-                    }
-                    _ => format!("update failed [{id}]: {error}"),
-                };
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn reject_memory(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        id: String,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        // Declines a PENDING candidate and suppresses that signal, so the
-        // same proposal does not return on the next turn.
-        let events = self.events_for(&session_id);
-        let invocation = Self::memory_invocation("ui:reject", &session_id, origin);
-        let actor = leveler_memory::v2::Actor::User { invocation };
-        match self.app.memory_service().review(
-            &actor,
-            service_memory_scope(scope),
-            &id,
-            leveler_memory::ReviewRequest::Reject {
-                reason: "rejected by the user".to_string(),
-            },
-        ) {
-            Ok(_) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: format!("已拒绝候选 [{id}]，不再重复提示"),
-                });
-            }
-            Err(err) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("reject failed [{id}]: {err}"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn remember_memory(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        body: String,
-        kind: Option<leveler_client_protocol::UiMemoryKind>,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        // The user's own write: no model, no agent turn, no candidate. The
-        // command IS the authorization; the invocation identity is minted
-        // here from the trusted in-process command.
-        use leveler_client_protocol::UiMemoryKind;
-        let events = self.events_for(&session_id);
-        let body = body.trim().to_string();
-        if body.is_empty() {
-            let _ = events.send(RuntimeEvent::Notification {
-                level: leveler_client_protocol::NotificationLevel::Warning,
-                message: "记忆内容不能为空".to_string(),
-            });
-            return Ok(());
-        }
-        let domain_kind = match kind.unwrap_or(UiMemoryKind::Preference) {
-            UiMemoryKind::Preference => "preference",
-            UiMemoryKind::Decision => "decision",
-            UiMemoryKind::Note => "note",
-            // An experience needs the structured evidence a task records. A
-            // hand-typed /remember has none, and storing it as one would
-            // claim a verification that never happened.
-            UiMemoryKind::Experience => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: "经验条目由已完成任务的运行证据自动生成，不能用 /remember 直接写入"
-                        .to_string(),
-                });
-                return Ok(());
-            }
-        };
-        // The title is derived HERE, once, so TUI / Web / CLI cannot drift
-        // into three conventions. Never model-generated.
-        let title = leveler_memory::title_from_body(&body);
-        let invocation = Self::memory_invocation("ui:remember", &session_id, origin);
-        let request = leveler_memory::RememberRequest {
-            op_id: leveler_memory::v2::OpId::derived("ui:remember", invocation.as_str()),
-            scope: service_memory_scope(scope),
-            title: title.clone(),
-            body: body.clone(),
-            kind: domain_kind.to_string(),
-            subject: None,
-            value: None,
-            tags: Vec::new(),
-            evidence: Some(body),
-            expires_at: None,
-            replaces_id: None,
-        };
-        match self
-            .app
-            .memory_service()
-            .remember(&leveler_memory::v2::Actor::User { invocation }, request)
-        {
-            Ok(outcome) => {
-                let busy = self.active.is_running(&session_id);
-                let (level, message) = direct_write_notification(&outcome, &title, busy);
-                let _ = events.send(RuntimeEvent::Notification { level, message });
-            }
-            Err(err) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("保存记忆失败：{err}"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn forget_memory(
-        &self,
-        session_id: SessionId,
-        scope: leveler_client_protocol::UiMemoryScope,
-        id: String,
-        origin: Option<&CommandId>,
-    ) -> Result<(), ClientError> {
-        // Archives an ACTIVE entry. A pending id used to land here and
-        // silently do nothing — the Web "忽略" button's bug — so a candidate
-        // id is refused with a pointer to the right action.
-        let events = self.events_for(&session_id);
-        let invocation = Self::memory_invocation("ui:forget", &session_id, origin);
-        let actor = leveler_memory::v2::Actor::User { invocation };
-        let service = self.app.memory_service();
-        let service_scope = service_memory_scope(scope);
-        let is_pending = match service.pending(&actor, service_scope) {
-            Ok(pending) => pending.iter().any(|view| view.id == id),
-            Err(error) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("forget failed [{id}]: {error}"),
-                });
-                return Ok(());
-            }
-        };
-        if is_pending {
-            let _ = events.send(RuntimeEvent::Notification {
-                level: leveler_client_protocol::NotificationLevel::Warning,
-                message: format!("[{id}] 是待确认候选，不是已保存记忆；请改用拒绝"),
-            });
-            return Ok(());
-        }
-        match service.forget(&actor, service_scope, &id) {
-            Ok(leveler_memory::WriteOutcome::Forgotten { id, title }) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Info,
-                    message: format!("已归档记忆 [{id}]: {title}"),
-                });
-            }
-            Ok(outcome) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!(
-                        "forget was queued, not applied: {}",
-                        outcome_title(&outcome)
-                    ),
-                });
-            }
-            Err(err) => {
-                let _ = events.send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!("forget failed: {err}"),
-                });
-            }
-        }
-        Ok(())
     }
 }
 
@@ -5525,15 +4976,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 content,
             } => self.run_goal_turn(session_id, content).await,
-            ClientCommand::RunDevelop {
-                session_id,
-                content,
-            } => {
-                let config = self.runtime_config(&session_id).await?;
-                let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
-                let accepted = self.spawn_develop_turn(session_id, content, cancel, config);
-                await_turn_acceptance(accepted).await
-            }
             ClientCommand::AddAttachment {
                 session_id,
                 path,
@@ -5649,47 +5091,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
                 await_turn_acceptance(accepted).await
             }
-            ClientCommand::ListMemory {
-                session_id,
-                include_archived,
-                query_id,
-            } => {
-                // The location shown is the current Markdown root: the store
-                // this process actually reads.
-                let memory_dir = self
-                    .app
-                    .layout
-                    .markdown_memory_dir()
-                    .unwrap_or_else(|| self.app.layout.state_dir.clone());
-                let events = self.events_for(&session_id);
-                send_memory_list(
-                    &events,
-                    &self.app.memory_service(),
-                    self.app.memory_lanes(),
-                    &memory_dir,
-                    include_archived,
-                    query_id,
-                );
-                Ok(())
-            }
-            ClientCommand::MemoryStatus {
-                session_id,
-                query_id,
-            } => {
-                let events = self.events_for(&session_id);
-                match crate::memory_status::report(&self.app).await {
-                    Ok(status) => {
-                        let _ = events.send(RuntimeEvent::MemoryStatus { query_id, status });
-                    }
-                    Err(error) => {
-                        let _ = events.send(RuntimeEvent::Notification {
-                            level: leveler_client_protocol::NotificationLevel::Warning,
-                            message: format!("memory status failed: {error}"),
-                        });
-                    }
-                }
-                Ok(())
-            }
+
             ClientCommand::SteerCurrentTurn {
                 session_id,
                 content,
@@ -5731,59 +5133,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }))
                 .await;
             }
-            ClientCommand::AcceptMemory {
-                session_id,
-                scope,
-                id,
-            } => self.accept_memory(session_id, scope, id, None).await,
-            ClientCommand::RejectMemory {
-                session_id,
-                scope,
-                id,
-            } => self.reject_memory(session_id, scope, id, None).await,
-            ClientCommand::RememberMemory {
-                session_id,
-                scope,
-                body,
-                kind,
-            } => {
-                self.remember_memory(session_id, scope, body, kind, None)
-                    .await
-            }
-            ClientCommand::ForgetMemory {
-                session_id,
-                scope,
-                id,
-            } => self.forget_memory(session_id, scope, id, None).await,
-            ClientCommand::SetMemoryPin {
-                session_id,
-                scope,
-                id,
-                pinned,
-            } => {
-                self.set_memory_pin(session_id, scope, id, pinned, None)
-                    .await
-            }
-            ClientCommand::DeprecateMemory {
-                session_id,
-                scope,
-                id,
-                revision,
-            } => {
-                self.deprecate_memory(session_id, scope, id, revision, None)
-                    .await
-            }
-            ClientCommand::UpdateMemory {
-                session_id,
-                scope,
-                id,
-                revision,
-                title,
-                body,
-            } => {
-                self.update_memory(session_id, scope, id, revision, title, body, None)
-                    .await
-            }
+
             ClientCommand::RequestDiff {
                 session_id,
                 query_id,
@@ -5850,19 +5200,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // the session list, so `/clear` is a reversible move (reopen
                 // the old session) rather than an unrecoverable wipe.
                 let mut config = self.runtime_config(&requester_session_id).await?;
-                // A new conversation inherits configured model defaults, not
-                // the previous conversation's explicit Thinking intent.
+                // A new conversation starts on the CURRENT configured default,
+                // not on a model the previous conversation picked, and not with
+                // its explicit Thinking intent.
                 config.thinking = None;
+                let new_model = self
+                    .app
+                    .configured_default_model()
+                    .unwrap_or_else(|| config.model.clone());
                 match self
                     .app
                     .create_daemon_session(
-                        &config.model,
+                        &new_model,
                         PLACEHOLDER_GOAL,
                         config.mode,
                         // `/clear` opens a sibling conversation under the
                         // caller's own axis; an unreadable value falls back to
                         // the product default rather than guessing chat.
                         config.collaboration.parse().unwrap_or_default(),
+                        false,
                     )
                     .await
                 {
@@ -6018,6 +5374,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         format!("{} (分叉)", record.goal)
                     };
                     let engine = self.app.task_engine(&db)?;
+                    // A fork copies the conversation AND its model choice; it
+                    // inherits the source's pin state so a later default change
+                    // treats both sessions the same way.
+                    let model_pinned = leveler_storage::SessionRepository::new(&db)
+                        .settings_snapshot(&session_id)
+                        .await?
+                        .map(|settings| settings.model_pinned)
+                        .unwrap_or(true);
                     let fork_id = engine
                         .create_task(&leveler_engine::NewSession {
                             workspace: record.repository.clone(),
@@ -6029,6 +5393,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             axes: Some(leveler_engine::NewSessionAxes {
                                 collaboration: record.collaboration.clone(),
                             }),
+                            model_pinned,
                         })
                         .await?;
                     let messages = MessageRepository::new(&db);
@@ -6113,7 +5478,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             bridge.forward(event);
                             // The cancelled goal can never be continued, so its
                             // terminal ended the session's Goal route too.
-                            self.publish_axis_if_changed(&session_id, &axis_before)
+                            self.publish_routes_after_turn(&session_id, &axis_before)
                                 .await;
                         }
                         Ok(None) => self.notify_error(
@@ -6205,6 +5570,31 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .send(RuntimeEvent::ContextLoaded {
                         query_id,
                         accounting,
+                    });
+                Ok(())
+            }
+            ClientCommand::QueryUsage {
+                session_id,
+                query_id,
+                scope,
+                utc_offset_minutes,
+            } => {
+                // Read-only: a durable aggregate, no turn, no provider call.
+                // It therefore answers while a turn runs — the same guarantee
+                // `/trace` and `/context` carry.
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let report = crate::usage::query_usage(&db, &session_id, scope, utc_offset_minutes)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::UsageLoaded {
+                        query_id,
+                        report: Box::new(report),
                     });
                 Ok(())
             }
@@ -6462,6 +5852,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 spawn_force_retire_drain(self);
                 Ok(())
             }
+            ClientCommand::ReloadConfig { query_id } => self.reload_runtime_config(query_id).await,
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -6745,8 +6136,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let mut available_models = self.app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
 
-        let model = config.model.clone();
-        let profile = self.app.registry.profile(&model).await.ok();
+        // A live turn keeps the model it started with, even when a reload has
+        // already changed the session's NEXT model. Reporting the next model as
+        // if it were executing would name a model that is sending nothing.
+        let model = self
+            .active
+            .run_model(session_id)
+            .unwrap_or_else(|| config.model.clone());
+        let profile = self.app.registry().profile(&model).await.ok();
         // Whether the current model accepts images (spec §42).
         let vision = profile
             .as_ref()
@@ -6830,14 +6227,30 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .cmp(&b.transcript_ordinal)
                     .then_with(|| a.created_at.cmp(&b.created_at))
             });
-            execution_task = goals
-                .iter()
-                .find(|goal| goal.state == leveler_storage::GoalState::Running)
-                .map(|goal| leveler_client_protocol::UiExecutionTask {
-                    goal_id: goal.id.to_string(),
-                    objective: goal.objective.clone(),
-                    running: runtime_active,
-                });
+            // Which owed goal this snapshot is about: the one the running
+            // turn was opened for when there is one. A paused goal and a new
+            // executing goal can be owed at the same time, and "first running
+            // row" would show the paused one's wait while the other runs.
+            let executing = if runtime_active {
+                leveler_storage::TurnRepository::new(&db)
+                    .list_running(Some(session_id))
+                    .await
+                    .ok()
+                    .and_then(|turns| crate::session_projection::running_turn_goal(&turns))
+            } else {
+                None
+            };
+            execution_task =
+                crate::session_projection::project_execution_goal(&goals, executing.as_ref()).map(
+                    |goal| leveler_client_protocol::UiExecutionTask {
+                        goal_id: goal.id.to_string(),
+                        objective: goal.objective.clone(),
+                        // A goal the user paused is not being executed, whatever
+                        // a turn that merely settles its lease may still report.
+                        running: runtime_active && goal.user_paused_at.is_none(),
+                        user_paused: goal.user_paused_at.is_some(),
+                    },
+                );
         }
         let facts = db
             .session_facts_for(session_id)
@@ -7156,7 +6569,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                     .ok_or_else(|| ClientError::Runtime("created session has no model".into()))?;
                 let context_window = self
                     .app
-                    .registry
+                    .registry()
                     .profile(model)
                     .await
                     .map_err(|e| ClientError::Runtime(e.to_string()))?
@@ -7186,7 +6599,12 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 explicit
             }
             None => {
-                let preferred = self.default_runtime.model.clone();
+                // A session created NOW starts on the configuration in force
+                // now, not on the model this process launched with.
+                let preferred = self
+                    .app
+                    .configured_default_model()
+                    .unwrap_or_else(|| self.default_runtime.model.clone());
                 if self.app.model_refs().contains(&preferred) {
                     preferred
                 } else {
@@ -7236,6 +6654,8 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                         axes: Some(leveler_engine::NewSessionAxes {
                             collaboration: request.collaboration.as_str().to_string(),
                         }),
+                        // An explicit create request chose this model.
+                        model_pinned: request.model.is_some(),
                     },
                     request_id,
                     &fingerprint,
@@ -7250,6 +6670,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                         &request.goal,
                         execution_mode(request.mode),
                         request.collaboration,
+                        request.model.is_some(),
                     )
                     .await
                     .map_err(|error| ClientError::Runtime(error.to_string()))?,
@@ -7281,7 +6702,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         let session = self.snapshot(&session_id).await?;
         let context_window =
             self.app
-                .registry
+                .registry()
                 .profile(
                     session.model.as_ref().ok_or_else(|| {
                         ClientError::Runtime("created session has no model".into())
@@ -7656,7 +7077,7 @@ async fn compact_conversation(
     request_messages.push(Message::text(Role::User, COMPACT_PROMPT));
     let mut request = ModelRequest::new(model.clone(), request_messages);
     let requested_effort = leveler_engine::ModelCallKind::Compaction.default_reasoning_effort();
-    let profile = match app.registry.profile(model).await {
+    let profile = match app.registry().profile(model).await {
         Ok(profile) => profile,
         Err(error) => {
             fail(format!(
@@ -7673,7 +7094,7 @@ async fn compact_conversation(
         &request.tools,
         leveler_model::ReasoningReplayContract::resolve(profile.protocol, &profile.compatibility),
         leveler_model::ReasoningRetention::default(),
-        app.registry.route_identity(model).as_ref(),
+        app.registry().route_identity(model).as_ref(),
     ));
     let estimated_tokens = request
         .projection
@@ -7707,7 +7128,8 @@ async fn compact_conversation(
     });
     let started = std::time::Instant::now();
     let call_cancel = cancellation.child_token();
-    let generate = app.registry.generate(request, call_cancel.clone());
+    let registry = app.registry();
+    let generate = registry.generate(request, call_cancel.clone());
     tokio::pin!(generate);
     let response = if let Some(max_duration) = limits.max_duration {
         let remaining = max_duration.saturating_sub(std::time::Duration::from_millis(
@@ -7829,6 +7251,7 @@ async fn compact_conversation(
         session_id,
         &settings,
         ApprovalPolicy::Interactive,
+        app.configured_default_model(),
     ) {
         Ok(config) => config,
         Err(error) => {
@@ -7851,7 +7274,7 @@ async fn compact_conversation(
             .collect();
         let mut available_models = app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
-        let profile = app.registry.profile(&model).await.ok();
+        let profile = app.registry().profile(&model).await.ok();
         let vision = profile
             .as_ref()
             .map(|p| p.capabilities.vision)
@@ -8922,9 +8345,7 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
             tmp.path().join("configs"),
             tmp.path().join("state"),
         );
-        let mut app = Application::assemble(layout).unwrap();
-        app.config.assist_prompt_suggestions = true;
-        let app = Arc::new(app);
+        let app = Arc::new(Application::assemble(layout).unwrap());
         let model = ModelRef::new("mock", "m");
         let session = app
             .create_session(&model, "prediction boundary")
@@ -9100,179 +8521,6 @@ mod session_declaration_tests {
                 "projection must not rewrite session lifecycle"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod memory_listing_tests {
-    use super::*;
-
-    fn project_service(dir: &std::path::Path) -> leveler_memory::MemoryService {
-        leveler_memory::MemoryService::new(leveler_memory::MemoryRoots::new().with_project(
-            leveler_memory::v2::ScopeRoots::new(
-                leveler_memory::v2::MemoryScope::Project,
-                dir.join("memory"),
-                dir.join("memory-v2"),
-            ),
-        ))
-    }
-
-    fn user() -> leveler_memory::v2::Actor {
-        leveler_memory::v2::Actor::User {
-            invocation: leveler_memory::v2::UserInvocationId::mint("listing-test"),
-        }
-    }
-
-    #[test]
-    fn memory_listing_real_empty_preserves_shape_and_query_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-        for include_archived in [false, true] {
-            send_memory_list(
-                &events.clone().into(),
-                &project_service(directory.path()),
-                leveler_memory::MemoryLanes::ALL,
-                directory.path(),
-                include_archived,
-                Some("memory-query".into()),
-            );
-            match receiver.try_recv().unwrap() {
-                RuntimeEvent::MemoryList {
-                    query_id,
-                    active,
-                    archived,
-                    pending,
-                    ..
-                } => {
-                    assert_eq!(query_id.unwrap().as_str(), "memory-query");
-                    assert!(active.is_empty() && archived.is_empty() && pending.is_empty());
-                }
-                other => panic!("expected genuine empty listing, got {other:?}"),
-            }
-        }
-    }
-
-    /// A current record that cannot be read is a broken store, not an empty
-    /// one: the listing must say so instead of presenting a short list.
-    #[test]
-    fn memory_listing_a_broken_record_is_reported_not_shown_as_empty() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = project_service(directory.path());
-        // A malformed document in the current root.
-        std::fs::create_dir_all(directory.path().join("memory")).unwrap();
-        std::fs::write(
-            directory.path().join("memory").join("broken.md"),
-            b"---\nid: [unterminated\n---\nbody",
-        )
-        .unwrap();
-        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-        send_memory_list(
-            &events.clone().into(),
-            &service,
-            leveler_memory::MemoryLanes::ALL,
-            directory.path(),
-            true,
-            Some("memory-query".into()),
-        );
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap(),
-                RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    ..
-                }
-            ),
-            "an unreadable store must be visible"
-        );
-        assert!(
-            receiver.try_recv().is_err(),
-            "failed listing must not emit MemoryList"
-        );
-    }
-
-    /// A credential-shaped record cannot enter the store at all, so no listing
-    /// row can carry one. The refusal is the protection; the listing proves it.
-    #[test]
-    fn a_credential_shaped_write_never_reaches_a_listing_row() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = project_service(directory.path());
-        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
-        let refused = service.remember(
-            &user(),
-            leveler_memory::RememberRequest::new(
-                leveler_memory::v2::OpId::derived("listing", "secret"),
-                leveler_memory::ServiceScope::Project,
-                "Deploy token",
-                format!("token={secret}"),
-                "note",
-            ),
-        );
-        assert!(refused.is_err(), "a credential must not be stored");
-
-        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-        send_memory_list(
-            &events.clone().into(),
-            &service,
-            leveler_memory::MemoryLanes::ALL,
-            directory.path(),
-            true,
-            Some("query".into()),
-        );
-        match receiver.try_recv().unwrap() {
-            RuntimeEvent::MemoryList {
-                active, pending, ..
-            } => {
-                let wire = format!("{active:?} {pending:?}");
-                assert!(active.is_empty() && pending.is_empty(), "{wire}");
-                assert!(!wire.contains(secret), "listing leaked the credential");
-            }
-            other => panic!("expected memory listing, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn memory_listing_directory_read_errors_are_not_empty_results() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        let service = project_service(directory.path());
-        // One current record so the store is initialized, then make the
-        // current root unreadable.
-        service
-            .remember(
-                &user(),
-                leveler_memory::RememberRequest::new(
-                    leveler_memory::v2::OpId::derived("listing", "one"),
-                    leveler_memory::ServiceScope::Project,
-                    "Deploy preference",
-                    "Use foreground service startup.",
-                    "note",
-                ),
-            )
-            .unwrap();
-        let path = directory.path().join("memory");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
-        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
-        send_memory_list(
-            &events.clone().into(),
-            &service,
-            leveler_memory::MemoryLanes::ALL,
-            directory.path(),
-            true,
-            Some("directory-query".into()),
-        );
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap(),
-                RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    ..
-                }
-            ),
-            "a directory read failure must be visible"
-        );
-        assert!(receiver.try_recv().is_err());
     }
 }
 

@@ -10,7 +10,7 @@ use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, Session
 use leveler_model::{ModelRef, ThinkingLevel};
 
 use super::media::AttachmentRef;
-use super::{ApprovalDecision, PermissionProfile, UiMemoryKind, UiMemoryScope};
+use super::{ApprovalDecision, PermissionProfile};
 
 /// Why a runtime is being asked to retire.
 ///
@@ -82,17 +82,6 @@ pub enum ClientCommand {
         session_id: SessionId,
         content: String,
     },
-    /// Run the Develop workflow on an explicit goal: `Analyze → Coding →
-    /// Verify → Review`.
-    ///
-    /// Distinct from [`Self::RunGoal`] because it is a different product
-    /// promise, not a different phrasing of the same one: the user is asking
-    /// for the change to be investigated before it is written and read back
-    /// after it is verified. An ordinary message never becomes one of these.
-    RunDevelop {
-        session_id: SessionId,
-        content: String,
-    },
     /// Continue the session's interrupted logical task through the runtime's
     /// existing resume path, instead of starting a fresh turn.
     ///
@@ -150,6 +139,18 @@ pub enum ClientCommand {
     /// kills background work. The caller must have settled those first; the
     /// runtime keeps waiting for them if any remain.
     ForceRetire { reason: RestartReason },
+    /// Re-read every configured source and apply what can be applied without a
+    /// restart (the `/reload` command).
+    ///
+    /// Session-less by design: configuration is runtime-wide, and the answer
+    /// belongs to the requester, not to one conversation. The runtime keeps
+    /// executing turns on the generation they started with; only later turns
+    /// see the new one.
+    ReloadConfig {
+        /// Correlation token for [`crate::RuntimeEvent::ConfigReloaded`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Cooperatively cancel the running turn (graceful; resumable).
     ///
     /// This is the only turn cancel the protocol offers: it asks the runtime
@@ -242,104 +243,6 @@ pub enum ClientCommand {
         session_id: SessionId,
         /// Optional plan body; empty uses the last assistant proposal text.
         content: String,
-    },
-    /// List project durable memory (active; optional archived) for TUI/CLI.
-    ListMemory {
-        session_id: SessionId,
-        /// Correlates this query-shaped response to the requesting client.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        query_id: Option<CommandId>,
-        /// Include archived (forgotten) entries.
-        #[serde(default)]
-        include_archived: bool,
-    },
-    /// Project memory health (store counts + durable extraction queue).
-    MemoryStatus {
-        session_id: SessionId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        query_id: Option<CommandId>,
-    },
-    /// Pin or unpin one active memory. A user pin is a standing constraint: it
-    /// is recalled first and is never crowded out by a weak candidate. A model
-    /// pin is only a ranking hint, which is why this command exists only on the
-    /// user's surface.
-    SetMemoryPin {
-        session_id: SessionId,
-        #[serde(default)]
-        scope: UiMemoryScope,
-        id: String,
-        pinned: bool,
-    },
-    /// Retire one active memory as no longer true (`deprecated`), keeping its
-    /// history. Distinct from [`Self::ForgetMemory`], which removes the record
-    /// from every read path.
-    DeprecateMemory {
-        session_id: SessionId,
-        #[serde(default)]
-        scope: UiMemoryScope,
-        id: String,
-        /// The revision the user was looking at. A mismatch is a conflict, not
-        /// a silent overwrite of a newer record.
-        revision: u64,
-    },
-    /// Rewrite the title and body of one active memory the user is looking at.
-    ///
-    /// `revision` is the revision the page opened: a mismatch is a conflict the
-    /// user has to resolve, never a silent overwrite of a newer record. The
-    /// user's own edit IS the authority, so this command is minted by a client
-    /// surface; the model edits through `memory.update` and its own admission
-    /// path instead.
-    UpdateMemory {
-        session_id: SessionId,
-        #[serde(default)]
-        scope: UiMemoryScope,
-        id: String,
-        revision: u64,
-        title: String,
-        body: String,
-    },
-    /// Archive (forget) one active memory id — user-authoritative (no model).
-    ForgetMemory {
-        session_id: SessionId,
-        /// Which store holds the record; `(scope, id)` is the identity.
-        #[serde(default)]
-        scope: UiMemoryScope,
-        id: String,
-    },
-    /// Promote one pending candidate to durable memory. User-authoritative:
-    /// this IS the consent K36 requires, so it is never model-callable.
-    AcceptMemory {
-        session_id: SessionId,
-        /// The scope the user reviewed. Never inferred from the id.
-        #[serde(default)]
-        scope: UiMemoryScope,
-        id: String,
-    },
-    /// Decline one pending candidate and suppress the same signal from being
-    /// re-proposed. Distinct from [`Self::ForgetMemory`], which archives an
-    /// ACTIVE entry: sending a pending id to forget did nothing at all, which
-    /// is what the Web "忽略" button was doing.
-    RejectMemory {
-        session_id: SessionId,
-        #[serde(default)]
-        scope: UiMemoryScope,
-        id: String,
-    },
-    /// Create a durable memory directly. The user's own command IS the
-    /// authorization, so this never reaches the model and never becomes a
-    /// pending candidate — it is the deterministic counterpart to the
-    /// natural-language path, which can only propose.
-    RememberMemory {
-        session_id: SessionId,
-        /// Where the user's explicit write lands. A client that shows no
-        /// scope picker writes to the project store, as it always has.
-        #[serde(default)]
-        scope: UiMemoryScope,
-        body: String,
-        /// Omitted means [`UiMemoryKind::Preference`]: `/remember` exists for
-        /// "apply this from now on", which is what a preference is.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        kind: Option<UiMemoryKind>,
     },
     /// Recompute and return the working-tree diff.
     RequestDiff {
@@ -469,6 +372,25 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// Read-only usage query over the runtime's durable model-call ledger.
+    ///
+    /// Read-only in the strictest sense: it opens no turn, sends no provider
+    /// request, and mutates nothing. Answers with
+    /// [`crate::RuntimeEvent::UsageLoaded`]. A client may issue it while a
+    /// turn runs; the numbers come from rows that already settled.
+    QueryUsage {
+        session_id: SessionId,
+        /// Correlation token for [`crate::RuntimeEvent::UsageLoaded`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        /// Which window to aggregate. The runtime resolves it into an explicit
+        /// range and echoes that range back.
+        scope: crate::UiUsageScope,
+        /// The caller's UTC offset in minutes, so `today`/`last 7 days`/
+        /// `last 30 days` are the caller's own calendar days instead of the
+        /// runtime host's. Range is validated by the runtime (`-1440..=1440`).
+        utc_offset_minutes: i32,
+    },
     /// Load one child's findings for the Contribution Inspector.
     ///
     /// A query, not a subscription: findings live in the ledger, and pushing
@@ -594,7 +516,6 @@ impl ClientCommand {
             | ClientCommand::SteerCurrentTurn { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
             | ClientCommand::ResumeTask { session_id, .. }
-            | ClientCommand::RunDevelop { session_id, .. }
             | ClientCommand::AddAttachment { session_id, .. }
             | ClientCommand::AddAttachmentData { session_id, .. }
             | ClientCommand::AddClipboardImage { session_id }
@@ -608,15 +529,6 @@ impl ClientCommand {
             | ClientCommand::SetThinkingLevel { session_id, .. }
             | ClientCommand::SetProductAxes { session_id, .. }
             | ClientCommand::ConfirmPlanToGoal { session_id, .. }
-            | ClientCommand::ListMemory { session_id, .. }
-            | ClientCommand::MemoryStatus { session_id, .. }
-            | ClientCommand::AcceptMemory { session_id, .. }
-            | ClientCommand::RejectMemory { session_id, .. }
-            | ClientCommand::RememberMemory { session_id, .. }
-            | ClientCommand::ForgetMemory { session_id, .. }
-            | ClientCommand::SetMemoryPin { session_id, .. }
-            | ClientCommand::UpdateMemory { session_id, .. }
-            | ClientCommand::DeprecateMemory { session_id, .. }
             | ClientCommand::RequestDiff { session_id, .. }
             | ClientCommand::CompactContext { session_id }
             | ClientCommand::ClearConversation { session_id }
@@ -642,6 +554,7 @@ impl ClientCommand {
             | ClientCommand::UpdateAgent { session_id, .. }
             | ClientCommand::DeleteAgent { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. }
+            | ClientCommand::QueryUsage { session_id, .. }
             | ClientCommand::QueryContext { session_id, .. } => Some(session_id),
             ClientCommand::QueryGlobalTasks { requester_session_id, .. }
             | ClientCommand::RequestSessionListFor {
@@ -660,6 +573,7 @@ impl ClientCommand {
             } => Some(requester_session_id),
             ClientCommand::ApprovalDecision { .. }
             | ClientCommand::AnswerClarification { .. }
+            | ClientCommand::ReloadConfig { .. }
             | ClientCommand::RequestSessionList
             // Retiring the runtime is a process-lifecycle request: it belongs
             // to no session, and it must not be attributed to one.
@@ -672,6 +586,16 @@ impl ClientCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_memory_command_is_rejected() {
+        assert!(
+            serde_json::from_str::<super::ClientCommand>(
+                r#"{"type":"list_memory","session_id":"session","include_archived":false}"#
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
 
     fn roundtrip(cmd: ClientCommand, expected_type: &str) {
@@ -1002,6 +926,34 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn query_usage_roundtrips_and_keeps_its_correlation_id() {
+        roundtrip(
+            ClientCommand::QueryUsage {
+                session_id: SessionId::new("s1"),
+                query_id: Some(CommandId::new("q1")),
+                scope: crate::UiUsageScope::Last7Days,
+                utc_offset_minutes: -480,
+            },
+            "query_usage",
+        );
+        // A 1.5-era peer omits the id; a current client must then treat the
+        // answer as unowned rather than as its own.
+        let json = serde_json::to_string(&ClientCommand::QueryUsage {
+            session_id: SessionId::new("s1"),
+            query_id: None,
+            scope: crate::UiUsageScope::Session,
+            utc_offset_minutes: 0,
+        })
+        .unwrap();
+        assert!(!json.contains("query_id"), "{json}");
+        let decoded: ClientCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ClientCommand::QueryUsage { query_id: None, .. }
+        ));
     }
 
     #[test]

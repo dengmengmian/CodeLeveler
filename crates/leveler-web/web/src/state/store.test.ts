@@ -1,5 +1,5 @@
 // 状态层契约测试：Runtime 事件必须真实进入 web state ——
-// memory / sub-agent / background task / 产品轴 / 终态保真。
+// sub-agent / background task / 产品轴 / 终态保真。
 
 import { describe, expect, it } from 'vitest';
 import type { ProjectInfo, UiObservabilityLoaded, UiSessionSnapshot } from '../types/protocol';
@@ -553,21 +553,6 @@ describe('turn terminal truth', () => {
   });
 });
 
-describe('memory', () => {
-  it('memory_list lands in state including pending (K36 consent gate)', () => {
-    const state = stateWithSession();
-    reducer(state, {
-      type: 'memory_list',
-      dir: '/repo/.leveler/memory',
-      active: [{ id: 'a1', title: 'prefer nextest' }],
-      archived: [],
-      pending: [{ id: 'p1', title: 'rust workspace', body: '正文', kind: 'preference', source: 'user_explicit' }],
-    });
-    expect(state.current?.memory?.dir).toBe('/repo/.leveler/memory');
-    expect(state.current?.memory?.active).toHaveLength(1);
-    expect(state.current?.memory?.pending[0]?.id).toBe('p1');
-  });
-});
 
 describe('sub-agents', () => {
   it('sub_agent_updated creates a running block and completes it in place', () => {

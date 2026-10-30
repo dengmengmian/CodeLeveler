@@ -29,13 +29,11 @@
 /// promoting stale prose to `FinalAnswer`. Never a presentation list: how
 /// loudly a row is shown is the surface's own question.
 pub const BOOKKEEPING_TOOLS: &[&str] = &[
-    "consolidate_memory",
     "create_checkpoint",
     "expand_tools",
     "get_task",
     "git_status",
     "list_files",
-    "memory",
     "spawn_agent",
     "update_goal",
     "update_plan",
@@ -181,8 +179,6 @@ mod tests {
             "git_status",
             "create_checkpoint",
             "expand_tools",
-            "memory",
-            "consolidate_memory",
             "spawn_agent",
         ] {
             assert!(!acts_on_answer(name, "{}"), "{name} is bookkeeping");

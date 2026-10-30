@@ -41,7 +41,7 @@ pub(crate) fn resolve_model_with_notice(
     // Every caller of this is about to make a model call. A provider whose key
     // is missing is knowable here, and saying so here is the difference between
     // a fix the user can apply and the provider's own wire advice.
-    ensure_provider_key(&app.config.providers, &chosen)?;
+    ensure_provider_key(&app.effective_config().providers, &chosen)?;
     Ok((chosen, notice))
 }
 
@@ -56,15 +56,13 @@ fn choose_model(
         return Ok((parse_model_ref(&m)?, None));
     }
     let configured = app.model_refs();
+    let effective = app.effective_config();
     let persisted = [
         app.project_config()
             .model
             .as_deref()
             .and_then(ModelRef::parse),
-        app.config
-            .default_model
-            .as_deref()
-            .and_then(ModelRef::parse),
+        effective.default_model.as_deref().and_then(ModelRef::parse),
     ];
     let mut abandoned: Vec<String> = Vec::new();
     for candidate in persisted.into_iter().flatten() {

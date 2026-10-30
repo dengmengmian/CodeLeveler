@@ -36,7 +36,6 @@ import type {
   UiHistoryEntry,
   UiAgentDraft,
   UiAgentScope,
-  UiMemoryKind,
   UiSessionSnapshot,
 } from '../types/protocol';
 
@@ -56,8 +55,6 @@ export class RuntimeBridge {
   /** selectSession 后等待的目标会话 id（防止采纳别会话的广播整量） */
   private pendingCreation: { key: string; id: string } | null = null;
   private pendingSessionId: SessionId | null = null;
-  /** Only this client's latest list-memory query may replace its Memory view. */
-  private pendingMemoryQueryId: string | null = null;
   private pendingAgentListQueryId: string | null = null;
   private pendingAgentDetailQueryId: string | null = null;
   private readonly pendingAgentMutationQueryIds = new Set<string>();
@@ -429,7 +426,7 @@ export class RuntimeBridge {
         this.sink({ type: 'notice', message: `附件处理失败：${ev.error}` });
         break;
       case 'notification':
-        // info 也展示：runtime 的结构化事实（bg 任务、memory 提示等）不许静默丢。
+        // info 也展示：runtime 的结构化事实（bg 任务等）不许静默丢。
         this.sink({ type: 'notice', message: ev.message });
         break;
       case 'reasoning_delta':
@@ -523,17 +520,6 @@ export class RuntimeBridge {
           exitCode: ev.exit_code ?? null,
           durationMs: ev.duration_ms,
           ok: ev.ok,
-        });
-        break;
-      case 'memory_list':
-        if (!ev.query_id || ev.query_id !== this.pendingMemoryQueryId) break;
-        this.pendingMemoryQueryId = null;
-        this.sink({
-          type: 'memory_list',
-          dir: ev.memory_dir,
-          active: ev.active,
-          archived: ev.archived,
-          pending: ev.pending ?? [],
         });
         break;
       case 'agents_loaded':
@@ -995,58 +981,6 @@ export class RuntimeBridge {
     }
   }
 
-  // ── 项目记忆（用户权威操作：接受/遗忘后刷新列表）───────────────────
-
-  listMemory(): string | null {
-    const current = this.getState().current;
-    if (!current) return null;
-    const queryId = crypto.randomUUID();
-    this.pendingMemoryQueryId = queryId;
-    this.deliver({
-      type: 'list_memory',
-      session_id: current.id,
-      query_id: queryId,
-      include_archived: true,
-    });
-    return queryId;
-  }
-
-  acceptMemory(id: string): void {
-    const current = this.getState().current;
-    if (!current) return;
-    this.deliver({ type: 'accept_memory', session_id: current.id, id });
-    this.listMemory();
-  }
-
-  /** 归档一条已保存的记忆。只对 active 条目有效。 */
-  forgetMemory(id: string): void {
-    const current = this.getState().current;
-    if (!current) return;
-    this.deliver({ type: 'forget_memory', session_id: current.id, id });
-    this.listMemory();
-  }
-
-  /** 拒绝一条待确认候选，并压制同一信号再次提议。
-   *
-   * 不能用 forgetMemory 代替：forget 只处理 active/archive，把 pending 的 id
-   * 发给它什么也不会发生 —— 这正是 pending 行「忽略」按钮原来的 bug。 */
-  rejectMemory(id: string): void {
-    const current = this.getState().current;
-    if (!current) return;
-    this.deliver({ type: 'reject_memory', session_id: current.id, id });
-    this.listMemory();
-  }
-
-  /** 用户自己直接写入一条记忆：不经过模型，也不产生待确认候选。 */
-  rememberMemory(body: string, kind: UiMemoryKind): void {
-    const current = this.getState().current;
-    if (!current) return;
-    const text = body.trim();
-    if (!text) return;
-    this.deliver({ type: 'remember_memory', session_id: current.id, body: text, kind });
-    this.listMemory();
-  }
-
   // ── Agents 注册表（用户命令即授权；runtime 校验并原子写入）──────────
   // 每个方法返回 query_id，让发起的表单认领自己的应答；无会话时返回 null。
 
@@ -1124,10 +1058,6 @@ export class RuntimeBridge {
     this.sink({ type: 'stage_view', view: 'diff' });
   }
 
-  openMemory(): void {
-    this.listMemory();
-    this.sink({ type: 'set_inspector_more', open: true });
-  }
 
   /** 仅从待发列表移除附件（服务端已注册的无法撤回） */
   removeAttachment(id: string): void {
@@ -1230,13 +1160,6 @@ export class RuntimeBridge {
           return;
         }
         this.deliver({ type: 'restore_checkpoint', session_id: sid, checkpoint_id: arg });
-        return;
-      }
-      case '/memory': {
-        const sid = needSession();
-        if (!sid) return;
-        this.listMemory();
-        this.sink({ type: 'notice', message: '记忆已刷新，见右栏「记忆」' });
         return;
       }
       case '/cancel': {

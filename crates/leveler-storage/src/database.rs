@@ -145,7 +145,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn optional_workspace_migration_preserves_old_children_and_admission() {
+    async fn optional_workspace_migration_preserves_old_children() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -270,13 +270,6 @@ mod tests {
             .is_err()
         );
         sqlx::query("INSERT INTO turns(id,session_id,ordinal,kind,payload,created_at) VALUES('fresh','none',1,'user','{\"initiating_message\":{}}','t')").execute(&pool).await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_inbox WHERE turn_id='fresh'")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            1
-        );
         sqlx::query("DELETE FROM sessions WHERE id='none'")
             .execute(&pool)
             .await
@@ -296,6 +289,87 @@ mod tests {
             .await
             .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_removes_memory_state_and_preserves_session_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let mut conn = create_legacy_database(&path, 47).await;
+            sqlx::query("INSERT INTO sessions(id,repository,goal,status,model,state,created_at,updated_at) VALUES('retired','/r','keep goal','completed','m','complete','t','t')").execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO turns(id,session_id,ordinal,kind,payload,status,created_at) VALUES('retired-turn','retired',1,'user','{\"initiating_message\":{}}','completed','t')").execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO events(id,session_id,turn_id,sequence,type,payload,created_at) VALUES('retired-memory','retired','retired-turn',1,'memory_changed','{\"type\":\"memory_changed\",\"payload\":{\"detail\":\"erase old memory body\"}}','t')").execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO events(id,session_id,turn_id,sequence,type,payload,created_at) VALUES('kept-event','retired','retired-turn',2,'turn_started','{\"type\":\"turn_started\",\"payload\":{\"keep\":true}}','t')").execute(&mut conn).await.unwrap();
+            sqlx::query(
+                "INSERT INTO tasks(id,session_id,created_at) VALUES('kept-task','retired','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO goals(id,task_id,objective,state,opened_at) VALUES('kept-goal','kept-task','keep goal','running','t')").execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO goal_capabilities(goal_id,capability_id) VALUES('kept-goal','memory'),('kept-goal','browser')").execute(&mut conn).await.unwrap();
+            let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(queued, 1);
+        }
+        let db = Database::connect(&path).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('memory_inbox','experience_inbox','admit_fresh_turn_to_memory_inbox','admit_fresh_turn_to_experience_inbox','admit_continuation_to_experience_inbox')").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(remaining, 0);
+        let event: (String, i64, String) =
+            sqlx::query_as("SELECT id,sequence,payload FROM events WHERE id='retired-memory'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(event.0, "retired-memory");
+        assert_eq!(event.1, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&event.2).unwrap(),
+            serde_json::json!({"type":"memory_changed","payload":{}})
+        );
+        let kept: String =
+            sqlx::query_scalar("SELECT payload FROM events WHERE id='kept-event' AND sequence=2")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            kept,
+            "{\"type\":\"turn_started\",\"payload\":{\"keep\":true}}"
+        );
+        let capabilities: Vec<String> = sqlx::query_scalar(
+            "SELECT capability_id FROM goal_capabilities WHERE goal_id='kept-goal'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(capabilities, vec!["browser"]);
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(!columns.iter().any(|name| name.contains("memory")));
+        let goal: String = sqlx::query_scalar("SELECT goal FROM sessions WHERE id='retired'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(goal, "keep goal");
+        let turns: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM turns WHERE session_id='retired'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(turns, 1);
+        sqlx::query("INSERT INTO turns(id,session_id,ordinal,kind,payload,status,created_at) VALUES('new-turn','retired',2,'user','{\"initiating_message\":{}}','completed','t')").execute(db.pool()).await.unwrap();
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -529,38 +603,19 @@ mod tests {
         );
     }
 
-    /// Creating the inbox must not reinterpret historical turns as newly
-    /// accepted work. Only inserts made after the admission trigger exists
-    /// belong in the queue.
+    /// Historical sessions predate the explicit/inherited distinction. The
+    /// migration keeps them on the model they were running with, so opening an
+    /// upgraded database cannot silently move a user's existing work.
     #[tokio::test]
-    async fn migration_0027_does_not_backfill_historical_turns() {
-        use sqlx::ConnectOptions;
-        use sqlx::migrate::Migrate;
-
+    async fn migration_0045_pins_historical_sessions_to_their_stored_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.db");
         {
-            let mut conn = SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true)
-                .connect()
-                .await
-                .unwrap();
-            conn.ensure_migrations_table().await.unwrap();
-            for migration in MIGRATOR.migrations.iter().filter(|m| m.version < 27) {
-                conn.apply(migration).await.unwrap();
-            }
+            let mut conn = create_legacy_database(&path, 45).await;
             sqlx::query(
                 "INSERT INTO sessions (id, repository, goal, status, model, state, \
                  created_at, updated_at) VALUES \
-                 ('s','/r','g','completed','provider/model','complete','t','t')",
-            )
-            .execute(&mut conn)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at) \
-                 VALUES ('historical','s',1,'user','{}','completed','t')",
+                 ('legacy','/r','g','completed','provider/model','complete','t','t')",
             )
             .execute(&mut conn)
             .await
@@ -568,71 +623,20 @@ mod tests {
         }
 
         let db = Database::connect(&path).await.unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    /// A database created before the lane split must keep both lanes open.
-    /// The columns default to 1, so historical sessions keep admitting work
-    /// exactly as they did before the migration.
-    #[tokio::test]
-    async fn migration_0044_keeps_both_lanes_open_for_historical_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.db");
-        {
-            let mut conn = create_legacy_database(&path, 44).await;
-            sqlx::query(
-                "INSERT INTO sessions (id, repository, goal, status, model, state, \
-                 created_at, updated_at, memory_enabled) VALUES \
-                 ('legacy','/r','g','completed','provider/model','complete','t','t',1)",
-            )
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        }
-
-        let db = Database::connect(&path).await.unwrap();
-        let lanes: (i64, i64) = sqlx::query_as(
-            "SELECT user_memory_enabled, experience_memory_enabled \
-             FROM sessions WHERE id = 'legacy'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(lanes, (1, 1));
-
-        let payload = serde_json::json!({
-            "version": 1,
-            "initiating_message": {
-                "role": "user",
-                "content": [{"type": "text", "text": "记住用 Flash"}]
-            }
-        })
-        .to_string();
-        sqlx::query(
-            "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at) \
-             VALUES ('after-migration','legacy',1,'user',?1,'completed','t')",
-        )
-        .bind(&payload)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        let user: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        let experience: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM experience_inbox")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!((user, experience), (1, 1));
+        let (model, pinned): (String, bool) =
+            sqlx::query_as("SELECT model, model_pinned FROM sessions WHERE id = 'legacy'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(model, "provider/model");
+        assert!(
+            pinned,
+            "a pre-existing session must stay on the model it was running with"
+        );
     }
 
     #[tokio::test]
-    async fn migration_0036_maps_legacy_profiles_and_preserves_explicit_memory_policy() {
+    async fn migration_0036_maps_legacy_profiles() {
         use sqlx::ConnectOptions;
         use sqlx::migrate::Migrate;
 
@@ -663,17 +667,17 @@ mod tests {
             }
         }
         let db = Database::connect(&path).await.unwrap();
-        let profiles: Vec<(String, String, i64)> =
-            sqlx::query_as("SELECT id, work_profile, memory_enabled FROM sessions ORDER BY id")
+        let profiles: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, work_profile FROM sessions ORDER BY id")
                 .fetch_all(db.pool())
                 .await
                 .unwrap();
         assert_eq!(
             profiles,
             vec![
-                ("balanced".into(), "single".into(), 1),
-                ("core".into(), "single".into(), 0),
-                ("economy".into(), "single".into(), 1),
+                ("balanced".into(), "single".into()),
+                ("core".into(), "single".into()),
+                ("economy".into(), "single".into()),
             ]
         );
         assert_eq!(
@@ -683,11 +687,6 @@ mod tests {
                 .unwrap(),
             0
         );
-        let trigger: String = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'admit_fresh_turn_to_memory_inbox'",
-        ).fetch_one(db.pool()).await.unwrap();
-        assert!(!trigger.contains("work_profile"));
-        assert!(trigger.contains("memory_enabled"));
     }
 
     #[tokio::test]

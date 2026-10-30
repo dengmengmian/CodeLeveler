@@ -31,8 +31,6 @@ import type {
   UiClarificationRequest,
   UiCompletionReport,
   UiDiff,
-  UiMemoryCandidate,
-  UiMemoryEntry,
   UiObservabilityLoaded,
   UiPlan,
   UiRole,
@@ -179,16 +177,6 @@ export interface BackgroundTaskView {
   startedAt: number;
 }
 
-/** 项目记忆（memory_list）：active / pending（待用户采纳）/ archived。
- *
- * pending 用 UiMemoryCandidate 而不是 UiMemoryEntry：只凭标题批准一条记忆
- * 不算知情同意，正文、kind 和来源都要跟着一起到前端。 */
-export interface MemoryView {
-  dir: string;
-  active: UiMemoryEntry[];
-  archived: UiMemoryEntry[];
-  pending: UiMemoryCandidate[];
-}
 
 /** Agents 注册表（list_agents / get_agent / *_agent 的应答）。按会话所在项目解析。 */
 export interface AgentsView {
@@ -228,7 +216,6 @@ export interface SessionView {
   diff: UiDiff | null;
   checkpoints: UiCheckpoint[];
   completionReport: UiCompletionReport | null;
-  memory: MemoryView | null;
   turnActive: boolean;
   /** agent_activity / command_progress / turn_progress 的统一 coarse activity */
   activity: string | null;
@@ -321,7 +308,7 @@ export interface AppState {
   /** Single sidebar open. */
   railOpen: boolean;
   inspectorOpen: boolean;
-  /** Open the Inspector More disclosure (Checkpoints / Memory). */
+  /** Open the Inspector More disclosure (Checkpoints). */
   inspectorMore: boolean;
   /** Durable observatory payload (QueryObservability). Not live SessionView.tools. */
   observation: UiObservabilityLoaded | null;
@@ -457,7 +444,6 @@ export type Action =
   | { type: 'agents_loaded'; entries: UiAgentEntry[]; problems: UiAgentProblem[] }
   | { type: 'agent_loaded'; name: string; agent: UiAgentDetail | null; error: string | null }
   | { type: 'agent_mutated'; name: string; ok: boolean; error: string | null; queryId: string | null }
-  | { type: 'memory_list'; dir: string; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; pending: UiMemoryCandidate[] }
   | { type: 'approval_requested'; request: UiApprovalRequest }
   | { type: 'approval_resolved'; requestId: string }
   | { type: 'clarification_requested'; request: UiClarificationRequest }
@@ -565,7 +551,6 @@ function viewFromSnapshot(
     diff: snap.diff ?? null,
     checkpoints: snap.checkpoints ?? [],
     completionReport: snap.completion_report ?? null,
-    memory: sameSession ? prev.memory : null,
     turnActive,
     activity:
       taskCancelled ? null : snap.finalization_stage != null
@@ -1170,16 +1155,6 @@ export function reducer(state: AppState, action: Action): void {
       };
       // 成功写入后旧的详情已过期；失败时 runtime 什么也没写，详情仍然有效。
       if (action.ok) delete state.agents.detail[action.name];
-      return;
-    case 'memory_list':
-      if (state.current) {
-        state.current.memory = {
-          dir: action.dir,
-          active: action.active,
-          archived: action.archived,
-          pending: action.pending,
-        };
-      }
       return;
     case 'approval_requested':
       if (state.current && !state.current.pendingApprovals.some((a) => a.id === action.request.id)) {

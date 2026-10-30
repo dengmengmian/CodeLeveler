@@ -28,19 +28,67 @@ use crate::status_line::status_lines;
 /// The conversation never shrinks below this, whatever the plan dock wants.
 const MIN_CONVERSATION_ROWS: u16 = 3;
 
-/// Done-count / total for a multi-step plan (`k/n`).
+/// Done-count / total for the CURRENT plan (`k/n`).
 ///
 /// `k` counts steps that have finished successfully or were skipped; failed and
 /// still-running/pending steps stay out of the numerator so progress does not
-/// look complete while work remains.
+/// look complete while work remains. An abandoned step is history: the model
+/// removed it, which proves neither delivery nor a legitimate skip, so it is in
+/// neither the numerator nor the denominator. Its count still travels beside
+/// the progress via [`plan_abandoned_count`], so replacement history is visible
+/// without inflating the current plan.
 pub(crate) fn plan_done_total(plan: &UiPlan) -> (usize, usize) {
-    let n = plan.steps.len();
-    let k = plan
-        .steps
-        .iter()
-        .filter(|s| is_plan_step_settled(s.status))
-        .count();
+    let current = || {
+        plan.steps
+            .iter()
+            .filter(|s| s.status != PlanStepStatus::Abandoned)
+    };
+    let n = current().count();
+    let k = current().filter(|s| is_plan_step_settled(s.status)).count();
     (k, n)
+}
+
+/// How many replaced steps the record still carries as history.
+pub(crate) fn plan_abandoned_count(plan: &UiPlan) -> usize {
+    plan.steps
+        .iter()
+        .filter(|s| s.status == PlanStepStatus::Abandoned)
+        .count()
+}
+
+/// The history count beside current progress, when the record has any.
+pub(crate) fn plan_history_label(plan: &UiPlan, t: &crate::i18n::UiText) -> Option<String> {
+    let count = plan_abandoned_count(plan);
+    (count > 0).then(|| {
+        t.plan_history_abandoned
+            .replacen("{}", &count.to_string(), 1)
+    })
+}
+
+/// Whether the plan is stopped at the user's pause.
+///
+/// The goal's own durable projection decides, not a scan of the conversation:
+/// the runtime records the pause on ONE goal (`goals.user_paused_at`), and the
+/// snapshot publishes it. A model's own claim that it needs confirmation is
+/// not enough, and neither is another goal's instruction. The strip states why
+/// open steps are not being driven; it adds no state and no authority.
+fn plan_waiting_for_user(state: &AppState, plan: &UiPlan) -> bool {
+    let _ = plan;
+    plan_waiting_for_user_projection(state)
+}
+
+/// Whether the plan on screen belongs to a goal the user paused.
+///
+/// The durable goal projection is the ONLY source: a pause is the user's
+/// authorization for one goal, so another goal's instruction sequence — a
+/// completed goal's pause in the same conversation, or any earlier turn — can
+/// never mark this plan as waiting. Without a projection there is no reliable
+/// association, and the strip says only what it knows ("last recorded").
+pub(crate) fn plan_waiting_for_user_projection(state: &AppState) -> bool {
+    state
+        .execution_goal
+        .as_ref()
+        .is_some_and(|goal| goal.user_paused)
 }
 
 fn is_plan_step_settled(status: PlanStepStatus) -> bool {
@@ -105,6 +153,8 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
         .iter()
         .any(|step| step.status == PlanStepStatus::Failed);
     let all_settled = plan.steps.iter().all(|s| is_plan_step_settled(s.status));
+    let history = plan_history_label(plan, t);
+    let waiting_for_user = !live && plan_waiting_for_user(state, plan);
     if failed {
         return PlanStrip {
             glyph: "✕",
@@ -119,7 +169,10 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
             glyph: "✓",
             glyph_color: theme.status.success,
             core,
-            detail: Some(t.plan_state_done.to_string()),
+            detail: Some(join_detail(
+                Some(t.plan_state_done.to_string()),
+                history.as_deref(),
+            )),
             detail_color: theme.status.success,
         };
     }
@@ -147,6 +200,7 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
                     .count();
                 (pending > 0).then(|| t.plan_pending_count.replace("{n}", &pending.to_string()))
             });
+        let detail = Some(join_detail(detail, history.as_deref()));
         return PlanStrip {
             glyph: "●",
             glyph_color,
@@ -159,8 +213,24 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
         glyph: "○",
         glyph_color: theme.text.muted,
         core,
-        detail: Some(t.plan_state_last.to_string()),
+        detail: Some(join_detail(
+            Some(if waiting_for_user {
+                t.plan_waiting_user.to_string()
+            } else {
+                t.plan_state_last.to_string()
+            }),
+            history.as_deref(),
+        )),
         detail_color: theme.text.muted,
+    }
+}
+
+fn join_detail(primary: Option<String>, history: Option<&str>) -> String {
+    match (primary, history) {
+        (Some(primary), Some(history)) => format!("{primary} · {history}"),
+        (Some(primary), None) => primary,
+        (None, Some(history)) => history.to_string(),
+        (None, None) => String::new(),
     }
 }
 
@@ -4120,6 +4190,141 @@ mod tests {
             plan_panel_should_show(&failed),
             "failed plan stays visible so the failure is scannable"
         );
+    }
+
+    #[test]
+    fn an_abandoned_step_is_neither_delivered_nor_open_work() {
+        let plan = UiPlan {
+            steps: vec![
+                UiPlanStep {
+                    index: 0,
+                    description: "done".into(),
+                    status: PlanStepStatus::Done,
+                },
+                UiPlanStep {
+                    index: 1,
+                    description: "replaced without finishing".into(),
+                    status: PlanStepStatus::Abandoned,
+                },
+            ],
+            state: Default::default(),
+        };
+        assert_eq!(
+            plan_done_total(&plan),
+            (1, 1),
+            "a replaced step is history, not current-plan denominator"
+        );
+        assert_eq!(plan_abandoned_count(&plan), 1);
+        let state = test_state();
+        assert_eq!(
+            plan_history_label(&plan, state.t()).as_deref(),
+            Some("1 项历史步骤已弃用")
+        );
+        assert!(
+            plan_panel_should_show(&plan),
+            "an abandoned step is not a delivered plan"
+        );
+        assert!(
+            plan_indicator_should_show(&plan, false),
+            "the record stays visible after the turn"
+        );
+    }
+
+    /// The rendered strip must carry the same current-plan denominator and the
+    /// history separately: `计划 1/1` is not a lie about the replaced step, and
+    /// `1 项历史步骤已弃用` keeps that record visible.
+    #[test]
+    fn the_plan_strip_separates_current_progress_from_abandoned_history() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        let plan = UiPlan {
+            steps: vec![
+                UiPlanStep {
+                    index: 0,
+                    description: "stage 1".into(),
+                    status: PlanStepStatus::Done,
+                },
+                UiPlanStep {
+                    index: 1,
+                    description: "stage 2 (reworded)".into(),
+                    status: PlanStepStatus::Pending,
+                },
+                UiPlanStep {
+                    index: 2,
+                    description: "stage 2 (original)".into(),
+                    status: PlanStepStatus::Abandoned,
+                },
+            ],
+            state: Default::default(),
+        };
+        let rows = strip_rows(&mut state, Some(plan), 100);
+        assert!(rows[0].contains("计划 1/2"), "{rows:?}");
+        assert!(rows[0].contains("1 项历史步骤已弃用"), "{rows:?}");
+        assert!(
+            !rows[0].contains("计划 1/3"),
+            "the replaced step is not in the current denominator: {rows:?}"
+        );
+    }
+
+    /// The strip states the user's pause only for the goal the runtime recorded
+    /// it on; an unrelated goal's history is not this plan's authorization.
+    #[test]
+    fn the_plan_strip_states_an_explicit_user_pause() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        let plan = UiPlan {
+            steps: vec![
+                UiPlanStep {
+                    index: 0,
+                    description: "阶段 1：实现接口".into(),
+                    status: PlanStepStatus::Done,
+                },
+                UiPlanStep {
+                    index: 1,
+                    description: "阶段 2：写测试".into(),
+                    status: PlanStepStatus::Pending,
+                },
+            ],
+            state: Default::default(),
+        };
+        // The conversation saying so is not authority: only the durable goal
+        // projection the runtime publishes can mark work as waiting.
+        state
+            .transcript
+            .push_user("阶段 1 完成后停下，等待我确认再执行阶段 2。".to_string());
+        let rows = strip_rows(&mut state, Some(plan.clone()), 100);
+        assert!(rows[0].contains("计划 1/2"), "{rows:?}");
+        assert!(!rows[0].contains("等待用户确认"), "{rows:?}");
+        assert!(rows[0].contains("最后记录"), "{rows:?}");
+
+        // The runtime records the user's pause on THIS goal.
+        state.execution_goal = Some(leveler_client_protocol::UiExecutionTask {
+            goal_id: "g1".into(),
+            objective: "阶段 1 完成后停下，等待我确认再执行阶段 2。".into(),
+            running: false,
+            user_paused: true,
+        });
+        let rows = strip_rows(&mut state, Some(plan.clone()), 100);
+        assert!(rows[0].contains("等待用户确认"), "{rows:?}");
+
+        // A question asked in the same conversation neither restates nor
+        // releases it: the projection is unchanged.
+        state
+            .transcript
+            .push_user("刚才阶段 1 修改了哪些文件？测试通过了吗？".to_string());
+        let rows = strip_rows(&mut state, Some(plan.clone()), 100);
+        assert!(rows[0].contains("等待用户确认"), "{rows:?}");
+
+        // A different goal that never paused does not inherit it.
+        state.execution_goal = Some(leveler_client_protocol::UiExecutionTask {
+            goal_id: "g2".into(),
+            objective: "实现新的数据导出功能，一次完成。".into(),
+            running: false,
+            user_paused: false,
+        });
+        let rows = strip_rows(&mut state, Some(plan), 100);
+        assert!(!rows[0].contains("等待用户确认"), "{rows:?}");
+        assert!(rows[0].contains("最后记录"), "{rows:?}");
     }
 
     #[test]

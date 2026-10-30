@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 /// The protocol version this build speaks. Bump `minor` for additive changes,
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
-    major: 1,
-    // 1.16: tool execution timing and optional snapshot timing.
-    minor: 16,
+    major: 2,
+    // 2.0: retire durable-memory commands, events and DTOs.
+    minor: 0,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
@@ -100,22 +100,28 @@ mod tests {
     #[test]
     fn same_major_is_compatible_across_minor() {
         assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion {
-            major: 1,
+            major: 2,
             minor: 99
         }));
-        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion { major: 2, minor: 0 }));
+        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion {
+            major: 1,
+            minor: 17
+        }));
     }
 
     #[test]
     fn unknown_major_is_rejected_not_misparsed() {
         let env = ProtocolEnvelope {
-            protocol: ProtocolVersion { major: 2, minor: 0 },
+            protocol: ProtocolVersion {
+                major: 1,
+                minor: 17,
+            },
             body: ClientCommand::Quit,
             capabilities: Vec::new(),
         };
         assert_eq!(
             env.into_body().unwrap_err(),
-            ProtocolError::IncompatibleMajor { got: 2, ours: 1 }
+            ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
         );
     }
 
@@ -133,7 +139,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":16},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
+            r#"{"protocol":{"major":2,"minor":0},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

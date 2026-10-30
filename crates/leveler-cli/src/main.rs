@@ -21,7 +21,6 @@ mod info_cmds;
 mod init_cmd;
 mod login_cmd;
 mod mcp_lsp_cmds;
-mod memory_cmds;
 mod output;
 mod permissions_cmds;
 mod remote_cmds;
@@ -50,7 +49,6 @@ use info_cmds::{
     cmd_theme_preview,
 };
 use mcp_lsp_cmds::{cmd_lsp, cmd_mcp};
-use memory_cmds::cmd_memory;
 use permissions_cmds::cmd_permissions;
 use run_cmds::{
     cmd_resume, cmd_run, cmd_run_parallel, cmd_run_resume, cmd_serve, cmd_tui, cmd_web,
@@ -323,7 +321,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             .await
         }
         Command::Doctor => cmd_doctor(layout),
-        Command::Memory(mc) => cmd_memory(layout, mc),
         Command::Permissions(pc) => cmd_permissions(layout, pc),
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,

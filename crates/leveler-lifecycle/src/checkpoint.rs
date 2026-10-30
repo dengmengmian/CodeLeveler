@@ -156,13 +156,22 @@ impl CheckpointPlan {
             .filter(|s| s.status == "completed")
             .map(|s| s.step.as_str())
             .collect();
-        let next_step = plan
+        // A replaced step is durable history, not work in the current plan. Its
+        // count must not become the denominator of progress, and it can never
+        // be counted as completed either.
+        let current_total = plan
             .steps
             .iter()
-            .find(|s| s.status != "completed")
-            .map(|s| bounded_text(&s.step));
+            .filter(|s| s.status != crate::plan::ABANDONED)
+            .count() as u32;
+        // A step the model replaced rather than finished is recorded as
+        // abandoned and is not "next": resuming points at open work only.
+        let next_step = plan
+            .open_steps()
+            .first()
+            .map(|step| bounded_text(&step.step));
         Some(Self {
-            total: plan.steps.len() as u32,
+            total: current_total,
             completed: completed.len() as u32,
             completed_steps: bounded_list(completed.into_iter().map(bounded_text)),
             next_step,
@@ -471,6 +480,24 @@ mod tests {
             CheckpointPlan::from_state(&PlanState::default()).is_none(),
             "an empty plan is absent, not zero-of-zero"
         );
+    }
+
+    #[test]
+    fn abandoned_steps_are_history_not_current_plan_denominator() {
+        let plan = PlanState {
+            steps: vec![
+                step("audit", "completed"),
+                step("verify", "pending"),
+                step("replaced", crate::plan::ABANDONED),
+            ],
+        };
+        let projected = CheckpointPlan::from_state(&plan).unwrap();
+        assert_eq!(projected.total, 2, "the abandoned step is not current work");
+        assert_eq!(
+            projected.completed, 1,
+            "an abandoned step is never completed"
+        );
+        assert_eq!(projected.next_step.as_deref(), Some("verify"));
     }
 
     /// A structured checkpoint without a semantic summary must still present

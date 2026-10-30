@@ -58,6 +58,9 @@ pub struct SessionSettingsSnapshot {
     pub kind: String,
     /// Persisted thinking override.
     pub thinking: Option<String>,
+    /// Whether the stored model is an explicit user choice. `false` means the
+    /// session inherits the runtime's current default model.
+    pub model_pinned: bool,
     /// Latest event sequence in the same read transaction.
     pub sequence: Option<i64>,
 }
@@ -97,6 +100,9 @@ pub struct SessionRecord {
     pub collaboration: String,
     /// Legacy database compatibility only; no runtime policy meaning.
     pub work_profile: String,
+    /// Whether `model` is an explicit user choice. `false` means the session
+    /// inherits the runtime's current default model. Persisted on insert.
+    pub model_pinned: bool,
 }
 
 /// The raw text row as stored; decoded into a typed [`SessionRecord`].
@@ -127,6 +133,9 @@ impl SessionRow {
             updated_at: self.updated_at,
             collaboration: self.collaboration,
             work_profile: self.work_profile,
+            // Not part of this SELECT: callers that care read the pin through
+            // `settings_snapshot`. A legacy row reads as an explicit model.
+            model_pinned: true,
         })
     }
 }
@@ -145,13 +154,25 @@ impl<'a> SessionRepository<'a> {
     /// Insert a new session.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(&self, record: &SessionRecord) -> Result<(), StorageError> {
+        self.create_with_model_pin(record, record.model_pinned)
+            .await
+    }
+
+    /// Insert a new session and say whether its model is an explicit choice
+    /// (`true`) or an inherited default (`false`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_model_pin(
+        &self,
+        record: &SessionRecord,
+        model_pinned: bool,
+    ) -> Result<(), StorageError> {
         // Explicit mode/sandbox/kind: migration 0003 DEFAULT is still the obsolete
         // `workspace_write` string; never depend on that for new rows.
         sqlx::query(
             "INSERT INTO sessions \
              (id, repository, goal, status, model, state, created_at, updated_at, \
-              collaboration, work_profile, mode, sandbox, kind) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'assisted', 0, 'direct')",
+              collaboration, work_profile, mode, sandbox, kind, model_pinned) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'assisted', 0, 'direct', ?11)",
         )
         .bind(&record.id)
         .bind(&record.repository)
@@ -163,6 +184,7 @@ impl<'a> SessionRepository<'a> {
         .bind(&record.updated_at)
         .bind(&record.collaboration)
         .bind("single")
+        .bind(model_pinned)
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -193,49 +215,6 @@ impl<'a> SessionRepository<'a> {
             .bind(archived_at.map(|t| t.to_rfc3339()))
             .execute(self.db.pool())
             .await?;
-        Ok(())
-    }
-
-    /// Persist whether this session may admit turns to memory extraction.
-    ///
-    /// Called at the start of every turn from the project's `memory.enabled`
-    /// switch, so a config change is reflected before the turn row is inserted
-    /// and the admission trigger reads it. `updated_at` is deliberately not
-    /// touched: this is a policy snapshot, not session activity.
-    ///
-    /// This is the historical all-or-nothing form; [`Self::set_memory_lanes`]
-    /// is what lets the user and experience lanes close independently.
-    pub async fn set_memory_enabled(
-        &self,
-        id: &SessionId,
-        enabled: bool,
-    ) -> Result<(), StorageError> {
-        self.set_memory_lanes(id, enabled, enabled, enabled).await
-    }
-
-    /// Persist the total switch and both lane switches as one snapshot.
-    ///
-    /// `enabled` is the total switch: when it is false both lanes are closed
-    /// regardless of their own values. The trigger reads exactly this
-    /// conjunction, so a closed lane never accumulates turns that would be
-    /// extracted after the switch is reopened.
-    pub async fn set_memory_lanes(
-        &self,
-        id: &SessionId,
-        enabled: bool,
-        user_enabled: bool,
-        experience_enabled: bool,
-    ) -> Result<(), StorageError> {
-        sqlx::query(
-            "UPDATE sessions SET memory_enabled = ?2, user_memory_enabled = ?3, \
-             experience_memory_enabled = ?4 WHERE id = ?1",
-        )
-        .bind(id.as_str())
-        .bind(i64::from(enabled))
-        .bind(i64::from(user_enabled))
-        .bind(i64::from(experience_enabled))
-        .execute(self.db.pool())
-        .await?;
         Ok(())
     }
 
@@ -414,7 +393,9 @@ impl<'a> SessionRepository<'a> {
                 "goal",
             ),
             SessionEdit::Model(value) => (
-                "UPDATE sessions SET model = ?2, updated_at = ?3 WHERE id = ?1",
+                // An explicit model choice pins the session, so a later global
+                // default change cannot silently rewrite it.
+                "UPDATE sessions SET model = ?2, model_pinned = 1, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
                 None,
                 "model",
@@ -494,6 +475,11 @@ impl<'a> SessionRepository<'a> {
                 .bind(id.as_str())
                 .fetch_one(&mut *tx)
                 .await?;
+        let model_pinned: bool =
+            sqlx::query_scalar("SELECT model_pinned FROM sessions WHERE id = ?1")
+                .bind(id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
         let sequence = sqlx::query_scalar("SELECT MAX(sequence) FROM events WHERE session_id = ?1")
             .bind(id.as_str())
             .fetch_one(&mut *tx)
@@ -505,6 +491,7 @@ impl<'a> SessionRepository<'a> {
             sandbox,
             kind,
             thinking,
+            model_pinned,
             sequence,
         }))
     }
@@ -717,6 +704,9 @@ impl SessionRecord {
             updated_at: ts,
             collaboration: "goal".into(),
             work_profile: "single".into(),
+            // A record built without an explicit statement is an explicit
+            // model choice; only callers that resolve a DEFAULT set this false.
+            model_pinned: true,
         }
     }
 
