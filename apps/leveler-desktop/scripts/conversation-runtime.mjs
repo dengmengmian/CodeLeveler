@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, writeFile, readFile, readdir, lstat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -67,9 +68,19 @@ async function rawIPC(command) {
   const sockets = [];
   async function visit(dir) { for (const name of await readdir(dir)) { const file = path.join(dir, name), stat = await lstat(file); if (stat.isSocket()) sockets.push(file); else if (stat.isDirectory()) await visit(file); } }
   await visit(path.join(home, 'run'));
-  const wrap = body => ({ protocol: { major: 2, minor: 0 }, capabilities: ['optional_workspace'], body });
+  // The wire major/minor are read from the product's single source of truth:
+  // a script that hardcoded them silently stopped speaking to the runtime the
+  // day the protocol moved, and reported the silence as a product timeout.
+  const protocol = (() => {
+    const text = readFileSync(path.join(source, 'crates/leveler-client-protocol/src/version.rs'), 'utf8');
+    const block = text.match(/pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion \{([\s\S]*?)\};/);
+    if (!block) throw new Error('cannot read PROTOCOL_VERSION from the candidate source');
+    const pick = name => Number(block[1].match(new RegExp(name + ":\\s*(\\d+)"))[1]);
+    return { major: pick('major'), minor: pick('minor') };
+  })();
+  const wrap = body => ({ protocol, capabilities: ['optional_workspace'], body });
   async function request(socket, body) {
-    return new Promise((resolve, reject) => { const stream = connect(socket); let bytes = Buffer.alloc(0); const timer = setTimeout(() => { stream.destroy(); reject(new Error('raw IPC timeout')); }, 15000);
+    return new Promise((resolve, reject) => { const stream = connect(socket); let bytes = Buffer.alloc(0); const timer = setTimeout(() => { stream.destroy(); reject(new Error('raw IPC timeout')); }, 30000);
       stream.on('connect', () => { const payload = Buffer.from(JSON.stringify(wrap(body))), size = Buffer.alloc(4); size.writeUInt32BE(payload.length); stream.write(Buffer.concat([size, payload])); });
       stream.on('error', reject); stream.on('data', data => { bytes = Buffer.concat([bytes, data]); if (bytes.length >= 4 && bytes.length >= bytes.readUInt32BE(0) + 4) { clearTimeout(timer); stream.end(); resolve(JSON.parse(bytes.subarray(4, bytes.readUInt32BE(0) + 4)).body); } });
     });

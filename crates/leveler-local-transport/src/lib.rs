@@ -2655,8 +2655,10 @@ mod tests {
                         serde_json::json!({"type":"error","body":{"message":"unsupported legacy request","session_id":null}})
                     }
                 };
+                // A wire generation older than any this build can read: the
+                // major is the boundary, and nothing below it may run.
                 let reply = serde_json::to_vec(
-                    &serde_json::json!({"protocol":{"major":1,"minor":12},"body":response}),
+                    &serde_json::json!({"protocol":{"major":0,"minor":0},"body":response}),
                 )
                 .unwrap();
                 stream.write_u32(reply.len() as u32).await.unwrap();
@@ -2673,7 +2675,7 @@ mod tests {
             matches!(
                 result,
                 Err(TransportError::Protocol(
-                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 0, ours: 1 }
                 ))
             ),
             "a legacy daemon must be explicitly refused at the major-version boundary"
@@ -2724,8 +2726,10 @@ mod tests {
                         serde_json::json!({"type":"error","body":{"message":"unsupported legacy request","session_id":null}})
                     }
                 };
+                // A wire generation older than any this build can read: the
+                // major is the boundary, and nothing below it may run.
                 let reply = serde_json::to_vec(
-                    &serde_json::json!({"protocol":{"major":1,"minor":12},"body":response}),
+                    &serde_json::json!({"protocol":{"major":0,"minor":0},"body":response}),
                 )
                 .unwrap();
                 stream.write_u32(reply.len() as u32).await.unwrap();
@@ -2742,7 +2746,7 @@ mod tests {
             matches!(
                 result,
                 Err(TransportError::Protocol(
-                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 0, ours: 1 }
                 ))
             ),
             "a legacy daemon must be explicitly refused at the major-version boundary"
@@ -2797,8 +2801,10 @@ mod tests {
                         serde_json::json!({"type":"error","body":{"message":"unsupported legacy request","session_id":null}})
                     }
                 };
+                // A wire generation older than any this build can read: the
+                // major is the boundary, and nothing below it may run.
                 let reply = serde_json::to_vec(
-                    &serde_json::json!({"protocol":{"major":1,"minor":12},"body":response}),
+                    &serde_json::json!({"protocol":{"major":0,"minor":0},"body":response}),
                 )
                 .unwrap();
                 stream.write_u32(reply.len() as u32).await.unwrap();
@@ -2815,7 +2821,7 @@ mod tests {
             matches!(
                 result,
                 Err(TransportError::Protocol(
-                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+                    leveler_client_protocol::ProtocolError::IncompatibleMajor { got: 0, ours: 1 }
                 ))
             ),
             "a legacy daemon must be explicitly refused at the major-version boundary"
