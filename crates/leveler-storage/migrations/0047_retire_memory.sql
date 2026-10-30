@@ -9,13 +9,11 @@ ALTER TABLE sessions DROP COLUMN memory_enabled;
 ALTER TABLE sessions DROP COLUMN user_memory_enabled;
 ALTER TABLE sessions DROP COLUMN experience_memory_enabled;
 
--- Erase retired event bodies without deleting log positions needed by resume.
-UPDATE events
-SET payload = json_object('type', type, 'payload', json('{}'))
-WHERE type IN (
-    'memory_recalled', 'memory_changed', 'memory_change_proposed',
-    'memory_review_decided', 'memory_write_started', 'memory_write_settled'
-);
+-- Historical events are KEPT verbatim, including the retired `memory_*` types.
+-- The runtime no longer emits or interprets them, and unknown event types are
+-- skipped on replay; rewriting their bodies would destroy an audit row that a
+-- user's existing session already owns. The retirement removes live storage,
+-- not the record of what happened.
 
 -- A restored goal keeps its other capabilities without a retired membership.
 DELETE FROM goal_capabilities WHERE capability_id = 'memory';

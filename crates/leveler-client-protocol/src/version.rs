@@ -11,9 +11,18 @@ use serde::{Deserialize, Serialize};
 /// The protocol version this build speaks. Bump `minor` for additive changes,
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
-    major: 2,
-    // 2.0: retire durable-memory commands, events and DTOs.
-    minor: 0,
+    major: 1,
+    // 1.16: retire durable-memory commands, events and DTOs.
+    //
+    // Memory removal is a per-message change, not an envelope change: a peer
+    // that still sends a retired command gets a decode error for THAT command,
+    // and an event variant it does not know is skipped. The envelope major is
+    // what the runtime handover uses to recognise a peer at all, so it stays 1:
+    // a major bump here would make every older runtime undiscoverable, and the
+    // lifecycle contract (an idle previous generation may be atomically
+    // retired, a busy one is deferred) could never be applied across the
+    // upgrade it exists for.
+    minor: 16,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
@@ -100,28 +109,22 @@ mod tests {
     #[test]
     fn same_major_is_compatible_across_minor() {
         assert!(PROTOCOL_VERSION.is_compatible_with(ProtocolVersion {
-            major: 2,
+            major: 1,
             minor: 99
         }));
-        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion {
-            major: 1,
-            minor: 17
-        }));
+        assert!(!PROTOCOL_VERSION.is_compatible_with(ProtocolVersion { major: 2, minor: 0 }));
     }
 
     #[test]
     fn unknown_major_is_rejected_not_misparsed() {
         let env = ProtocolEnvelope {
-            protocol: ProtocolVersion {
-                major: 1,
-                minor: 17,
-            },
+            protocol: ProtocolVersion { major: 2, minor: 0 },
             body: ClientCommand::Quit,
             capabilities: Vec::new(),
         };
         assert_eq!(
             env.into_body().unwrap_err(),
-            ProtocolError::IncompatibleMajor { got: 1, ours: 2 }
+            ProtocolError::IncompatibleMajor { got: 2, ours: 1 }
         );
     }
 
@@ -139,7 +142,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":2,"minor":0},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
+            r#"{"protocol":{"major":1,"minor":16},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

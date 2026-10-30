@@ -300,7 +300,7 @@ mod tests {
             let mut conn = create_legacy_database(&path, 47).await;
             sqlx::query("INSERT INTO sessions(id,repository,goal,status,model,state,created_at,updated_at) VALUES('retired','/r','keep goal','completed','m','complete','t','t')").execute(&mut conn).await.unwrap();
             sqlx::query("INSERT INTO turns(id,session_id,ordinal,kind,payload,status,created_at) VALUES('retired-turn','retired',1,'user','{\"initiating_message\":{}}','completed','t')").execute(&mut conn).await.unwrap();
-            sqlx::query("INSERT INTO events(id,session_id,turn_id,sequence,type,payload,created_at) VALUES('retired-memory','retired','retired-turn',1,'memory_changed','{\"type\":\"memory_changed\",\"payload\":{\"detail\":\"erase old memory body\"}}','t')").execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO events(id,session_id,turn_id,sequence,type,payload,created_at) VALUES('retired-memory','retired','retired-turn',1,'memory_changed','{\"type\":\"memory_changed\",\"payload\":{\"detail\":\"historical memory body\"}}','t')").execute(&mut conn).await.unwrap();
             sqlx::query("INSERT INTO events(id,session_id,turn_id,sequence,type,payload,created_at) VALUES('kept-event','retired','retired-turn',2,'turn_started','{\"type\":\"turn_started\",\"payload\":{\"keep\":true}}','t')").execute(&mut conn).await.unwrap();
             sqlx::query(
                 "INSERT INTO tasks(id,session_id,created_at) VALUES('kept-task','retired','t')",
@@ -326,9 +326,11 @@ mod tests {
                 .unwrap();
         assert_eq!(event.0, "retired-memory");
         assert_eq!(event.1, 1);
+        // The retired row is KEPT verbatim: the type decodes as a tombstone and
+        // the body is a historical audit fact the session already owns.
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&event.2).unwrap(),
-            serde_json::json!({"type":"memory_changed","payload":{}})
+            serde_json::json!({"type":"memory_changed","payload":{"detail":"historical memory body"}})
         );
         let kept: String =
             sqlx::query_scalar("SELECT payload FROM events WHERE id='kept-event' AND sequence=2")
