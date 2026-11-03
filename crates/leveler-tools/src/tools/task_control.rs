@@ -3130,7 +3130,13 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "program": "sh",
-                    "args": ["-c", "echo ok > src/lib.rs; echo bad > outside.txt"],
+                    // The backgrounded sleep keeps the process group alive
+                    // after the launcher's non-zero exit, so the wait takes the
+                    // early-wake path instead of racing into it.
+                    "args": [
+                        "-c",
+                        "echo ok > src/lib.rs; (sleep 1 &); echo bad > outside.txt"
+                    ],
                     "background": true,
                 }),
                 constrained.clone(),
@@ -3146,7 +3152,7 @@ mod tests {
             .expect("task_id")
             .to_string();
 
-        let wait = WaitTaskTool::new(reg.clone())
+        let mut wait = WaitTaskTool::new(reg.clone())
             .execute(
                 serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
                 constrained.clone(),
@@ -3155,7 +3161,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(wait.is_error, "allowlist violation must fail wait");
+        // A non-zero launcher exit wakes the waiter before the process group is
+        // gone; the settlement is written only once it is. That early answer is
+        // the command's failure, not its settlement, so keep waiting for the
+        // terminal task before judging what it wrote.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wait.content.contains("status: running") || wait.content.contains("status: killing") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never became terminal: {}",
+                wait.content
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            wait = WaitTaskTool::new(reg.clone())
+                .execute(
+                    serde_json::json!({"task_id": task_id, "cursor": 0, "timeout_seconds": 10}),
+                    constrained.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            wait.is_error,
+            "a failed command and its denied scope must fail wait: {}",
+            wait.content
+        );
         assert!(
             wait.content.contains("Operation not permitted")
                 || wait.content.contains("Permission denied")
@@ -3182,7 +3213,8 @@ mod tests {
             .unwrap_or_default();
         assert!(
             modified == vec![serde_json::json!("src/lib.rs")],
-            "settlement contains only owned writes: {modified:?}"
+            "settlement contains only owned writes: {modified:?}; wait said: {}",
+            wait.content
         );
         let reread = WaitTaskTool::new(reg)
             .execute(
