@@ -1371,6 +1371,7 @@ fn background_command_identity_is_complete_live_and_restored() {
         elapsed_ms: 90_000,
         pid: Some(42),
         ready_evidence: None,
+        lifetime: None,
     }];
     let mut restored = state();
     reduce(
@@ -1737,6 +1738,7 @@ fn reconcile_carries_readiness_and_never_invents_it() {
                     elapsed_ms: 5_000,
                     pid: None,
                     ready_evidence: Some("listening on :8080".into()),
+                    lifetime: None,
                 },
                 leveler_client_protocol::UiActiveBackgroundTask {
                     task_id: "t-silent".into(),
@@ -1745,6 +1747,7 @@ fn reconcile_carries_readiness_and_never_invents_it() {
                     elapsed_ms: 5_000,
                     pid: None,
                     ready_evidence: None,
+                    lifetime: None,
                 },
             ],
         }),

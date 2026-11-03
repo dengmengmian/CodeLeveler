@@ -607,6 +607,11 @@ pub struct UiActiveBackgroundTask {
     /// has been observed, never that the service is not ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_evidence: Option<String>,
+    /// The task's lifetime (`goal`, `session`, `runtime`, `persistent`). A
+    /// client exit owns only `goal`: the others survive it by contract.
+    /// Additive; absent is a runtime that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
 }
 
 /// One live background task that is keeping a runtime from becoming idle.

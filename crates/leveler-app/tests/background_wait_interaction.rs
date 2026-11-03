@@ -353,8 +353,13 @@ async fn two_steers_during_a_wait_both_reach_the_same_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
     let f = fixture().await;
+    // The exit and the steer must land together, but a wall-clock sleep makes
+    // that a machine-speed race. The service waits for the trigger the test
+    // writes immediately after the steer, so both facts are in flight at once.
     let task = f
-        .start_service("sleep 1; printf 'tests done\\n'; exit 0")
+        .start_service(
+            "while [ ! -f exit-flag ]; do sleep 0.05; done; printf 'tests done\\n'; exit 0",
+        )
         .await;
     f.server
         .push(tool_call(
@@ -375,8 +380,6 @@ async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
         .await
         .unwrap();
     f.wait_for_tool_call(&mut rx, "wait_task").await;
-    // Exactly inside the window where the process ends by itself.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
     f.client
         .send(ClientCommand::SteerCurrentTurn {
             session_id: f.session.clone(),
@@ -384,6 +387,7 @@ async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
         })
         .await
         .unwrap();
+    std::fs::write(f.repo.join("exit-flag"), b"").unwrap();
     f.wait_for_turn_end(&mut rx).await;
     // Whether the exit or the steer wins the race, both facts must reach the
     // model: the exit as its result, the steer as the user's own words.

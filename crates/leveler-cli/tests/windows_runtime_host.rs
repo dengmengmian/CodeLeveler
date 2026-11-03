@@ -174,22 +174,21 @@ async fn run(root: &Path) {
     );
     drop(reconnected);
     drop(client);
-    // A changed config generation asks the real old daemon to retire before
-    // a replacement owns the same endpoint; no fake runtime is involved.
+    // A changed configuration generation is hot-reloadable state: the same
+    // real owner adopts it in place, and the endpoint keeps one authority.
     std::fs::write(
         root.join("configs/providers/mock.yaml"),
         "id: mock\nprotocol: openai_chat\nbase_url: http://127.0.0.1:10\n",
     )
     .unwrap();
     let replacement = ensure_default_runtime(&layout, &launch, ui).await.unwrap();
-    // Successful handoff relinquished the old owner; never retain its PID
-    // for later cleanup because Windows can recycle process identifiers.
-    guard.0.retain(|pid| *pid != revived.pid);
     let info = LocalRuntimeService::runtime_info(&replacement)
         .await
         .unwrap();
-    guard.0.push(info.pid);
-    assert_ne!(info.pid, revived.pid);
+    assert_eq!(
+        info.pid, revived.pid,
+        "a hot-reloadable configuration change keeps the same owner"
+    );
     assert_eq!(info.runtime_id, first.runtime_id);
     assert_eq!(
         info.config_fingerprint.as_deref(),

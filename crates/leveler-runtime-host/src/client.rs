@@ -621,11 +621,8 @@ pub async fn observe_retiring_runtime(
         None,
     )
     .await
-    .0
 }
 
-/// A returned runtime identity is evidence of a reusable atomic Busy answer.
-/// Health snapshots and unsupported retirement never produce that evidence.
 #[cfg(any(unix, windows))]
 async fn observe_retiring_runtime_with_grace(
     client: &LocalSocketRuntimeClient,
@@ -634,8 +631,8 @@ async fn observe_retiring_runtime_with_grace(
     interval: Duration,
     grace: Duration,
     ui: &dyn HandoffUi,
-    requested: Option<(RestartReason, Option<&str>)>,
-) -> (DrainOutcome, Option<RuntimeInfo>) {
+    requested: Option<RestartReason>,
+) -> DrainOutcome {
     let mut last = String::new();
     let mut input: Option<UnboundedReceiver<HandoffAction>> = None;
     let mut grace_deadline: Option<tokio::time::Instant> = None;
@@ -664,16 +661,16 @@ async fn observe_retiring_runtime_with_grace(
                 .flatten()
                 .is_none()
         {
-            return (DrainOutcome::Drained, None);
+            return DrainOutcome::Drained;
         }
         if let Some(info) = info.as_ref()
             && observed_pid.is_some_and(|pid| info.pid != pid)
         {
-            return (DrainOutcome::Drained, None);
+            return DrainOutcome::Drained;
         }
         let health = info.as_ref().map(|info| info.health.clone());
         // ---- Ask for the decision, when it has not been made yet -----------
-        if let (Some((reason, reuse_busy_config)), Some(info)) = (pending, info.as_ref()) {
+        if let (Some(reason), Some(info)) = (pending, info.as_ref()) {
             let request = leveler_client_protocol::RetireRequest {
                 reason,
                 expected_build: info.build.clone(),
@@ -708,21 +705,11 @@ async fn observe_retiring_runtime_with_grace(
                     // state and returns. Waiting is only meaningful for a
                     // shell that can decide (keep waiting, interrupt, force) —
                     // everything else just looks hung.
-                    let reusable = reuse_busy_config.is_some_and(|expected| {
-                        reason == RestartReason::BuildMismatch
-                            && info.build.is_known()
-                            && info.config_fingerprint.as_deref() == Some(expected)
-                            && !info.health.shutting_down
-                            && info.health.retiring_reason.is_none()
-                    });
-                    if reusable || !ui.interactive() {
-                        return (
-                            DrainOutcome::Deferred {
-                                active_turns,
-                                active_background_tasks,
-                            },
-                            reusable.then(|| info.clone()),
-                        );
+                    if !ui.interactive() {
+                        return DrainOutcome::Deferred {
+                            active_turns,
+                            active_background_tasks,
+                        };
                     }
                 }
                 Ok(leveler_client_protocol::RetireDecision::GenerationChanged) => {
@@ -733,16 +720,13 @@ async fn observe_retiring_runtime_with_grace(
                     // spinning.
                     generation_changes += 1;
                     if generation_changes > MAX_GENERATION_CHANGES {
-                        return (
-                            DrainOutcome::Undecided {
-                                waited: started.elapsed(),
-                                active_turns: health.as_ref().map_or(0, |h| h.active_turns),
-                                active_background_tasks: health
-                                    .as_ref()
-                                    .map_or(0, |h| h.active_background_tasks),
-                            },
-                            None,
-                        );
+                        return DrainOutcome::Undecided {
+                            waited: started.elapsed(),
+                            active_turns: health.as_ref().map_or(0, |h| h.active_turns),
+                            active_background_tasks: health
+                                .as_ref()
+                                .map_or(0, |h| h.active_background_tasks),
+                        };
                     }
                     tokio::time::sleep(interval).await;
                     continue;
@@ -759,13 +743,10 @@ async fn observe_retiring_runtime_with_grace(
                             active_turns: health.active_turns,
                             active_background_tasks: health.active_background_tasks,
                         });
-                        return (
-                            DrainOutcome::Deferred {
-                                active_turns: health.active_turns,
-                                active_background_tasks: health.active_background_tasks,
-                            },
-                            None,
-                        );
+                        return DrainOutcome::Deferred {
+                            active_turns: health.active_turns,
+                            active_background_tasks: health.active_background_tasks,
+                        };
                     }
                     let reason = "the previous runtime does not support atomic retirement; \
                                   let its owner exit normally before upgrading"
@@ -773,7 +754,7 @@ async fn observe_retiring_runtime_with_grace(
                     ui.emit(HandoffEvent::MigrationFailed {
                         reason: reason.clone(),
                     });
-                    return (DrainOutcome::MigrationBlocked { reason }, None);
+                    return DrainOutcome::MigrationBlocked { reason };
                 }
                 Err(error) => {
                     // No usable answer at all: not a decision, and not a
@@ -790,15 +771,12 @@ async fn observe_retiring_runtime_with_grace(
                     ui.emit(HandoffEvent::MigrationFailed {
                         reason: error.to_string(),
                     });
-                    return (
-                        DrainOutcome::MigrationBlocked {
-                            reason: format!(
-                                "the previous runtime did not answer the atomic retirement question: \
+                    return DrainOutcome::MigrationBlocked {
+                        reason: format!(
+                            "the previous runtime did not answer the atomic retirement question: \
                              {error}"
-                            ),
-                        },
-                        None,
-                    );
+                        ),
+                    };
                 }
             }
         }
@@ -833,14 +811,11 @@ async fn observe_retiring_runtime_with_grace(
                 && started.elapsed() >= budget
                 && !ui.interactive()
             {
-                return (
-                    DrainOutcome::Undecided {
-                        waited: started.elapsed(),
-                        active_turns: turns,
-                        active_background_tasks: background,
-                    },
-                    None,
-                );
+                return DrainOutcome::Undecided {
+                    waited: started.elapsed(),
+                    active_turns: turns,
+                    active_background_tasks: background,
+                };
             }
         }
         if let Some(deadline) = grace_deadline
@@ -892,79 +867,54 @@ async fn observe_retiring_runtime_with_grace(
 /// Settle a retirement end to end: obtain the runtime's authoritative decision
 /// (unless a caller already obtained it), then wait for the endpoint to be
 /// released. One loop, so the decision, its reporting and the wait can never
-/// disagree about what this client is waiting for. Returns `true` when the old
-/// generation drained, or `false` when its atomic Busy answer allowed reuse.
+/// disagree about what this client is waiting for.
 #[cfg(any(unix, windows))]
 async fn retire_runtime(
     client: &LocalSocketRuntimeClient,
     socket_path: &Path,
     reason: RestartReason,
     ui: &dyn HandoffUi,
-    reuse_busy_config: Option<&str>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     let observed_pid = LocalRuntimeService::runtime_info(client)
         .await
         .ok()
         .map(|info| info.pid);
-    let (outcome, reusable) = observe_retiring_runtime_with_grace(
+    let outcome = observe_retiring_runtime_with_grace(
         client,
         socket_path,
         observed_pid,
         HANDOVER_STATUS_INTERVAL,
         HANDOVER_CANCEL_GRACE,
         ui,
-        Some((reason, reuse_busy_config)),
+        Some(reason),
     )
     .await;
-    match (outcome, reusable) {
-        (DrainOutcome::Drained, _) => Ok(true),
-        (DrainOutcome::Deferred { .. }, Some(observed)) => {
-            // The atomic Busy answer left the serving runtime unchanged.
-            // Only a configuration-matching build mismatch can use it.
-            let info = LocalRuntimeService::runtime_info(client).await?;
-            if info.pid == observed.pid
-                && info.build == observed.build
-                && info.config_fingerprint.as_deref() == reuse_busy_config
-                && !info.health.shutting_down
-                && info.health.retiring_reason.is_none()
-            {
-                Ok(false)
-            } else {
-                Err(EnsureError::UnknownGeneration.into())
-            }
-        }
-        (
-            DrainOutcome::Deferred {
-                active_turns,
-                active_background_tasks,
-            },
-            _,
-        ) => Err(EnsureError::RetireBlocked {
+    match outcome {
+        DrainOutcome::Drained => Ok(()),
+        DrainOutcome::Deferred {
+            active_turns,
+            active_background_tasks,
+        } => Err(EnsureError::RetireBlocked {
             waited_secs: 0,
             active_turns,
             active_background_tasks,
         }
         .into()),
-        (
-            DrainOutcome::Undecided {
-                waited,
-                active_turns,
-                active_background_tasks,
-            },
-            _,
-        ) => Err(EnsureError::RetireBlocked {
+        DrainOutcome::Undecided {
+            waited,
+            active_turns,
+            active_background_tasks,
+        } => Err(EnsureError::RetireBlocked {
             waited_secs: waited.as_secs(),
             active_turns,
             active_background_tasks,
         }
         .into()),
-        (DrainOutcome::MigrationBlocked { reason }, _) => {
-            Err(EnsureError::LegacyMigrationRefused {
-                socket: socket_path.to_path_buf(),
-                reason,
-            }
-            .into())
+        DrainOutcome::MigrationBlocked { reason } => Err(EnsureError::LegacyMigrationRefused {
+            socket: socket_path.to_path_buf(),
+            reason,
         }
+        .into()),
     }
 }
 
@@ -1013,8 +963,7 @@ pub async fn connect_global_task_runtime(
 ///
 /// Returned outcomes, all of them from the existing lifecycle vocabulary:
 ///
-/// - `Ok(Some(client))` — this generation, or a compatible busy previous build
-///   with the current configuration, is serving the endpoint; attach to it.
+/// - `Ok(Some(client))` — this generation is serving the endpoint; attach to it.
 /// - `Ok(None)` — nothing of this generation owns the endpoint any more. Either
 ///   nothing was listening, or a different generation handed over atomically.
 ///   The caller may start one.
@@ -1044,16 +993,8 @@ pub async fn reconcile_runtime_generation(
                 expected = %expected.short(),
                 "local runtime is a different build; asking it to retire"
             );
-            let config = expected_config_fingerprint(layout)?;
-            let retired = retire_runtime(
-                &client,
-                socket_path,
-                RestartReason::BuildMismatch,
-                ui,
-                Some(&config),
-            )
-            .await?;
-            Ok((!retired).then_some(client))
+            retire_runtime(&client, socket_path, RestartReason::BuildMismatch, ui).await?;
+            Ok(None)
         }
         RuntimeConsistency::ConfigChanged => {
             // A same-build runtime serving an older configuration generation is
@@ -1068,7 +1009,7 @@ pub async fn reconcile_runtime_generation(
                 return Ok(Some(client));
             }
             tracing::info!("runtime cannot reload configuration in place; asking it to retire");
-            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui, None).await?;
+            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui).await?;
             Ok(None)
         }
     }

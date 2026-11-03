@@ -283,6 +283,7 @@ mod tests {
     /// The production failure: stderr is a PTY slave whose master is already
     /// gone, so the write returns EIO. Reporting that must not panic, and the
     /// original text must still land in the crash directory.
+    #[cfg(unix)]
     #[test]
     fn a_fatal_report_is_kept_when_the_pty_stderr_is_already_closed() {
         const CHILD: &str = "LEVELER_TEST_FATAL_REPORT_CLOSED_PTY";
@@ -311,6 +312,7 @@ mod tests {
 
     /// The panic hook itself must not panic when stderr is a closed PTY.
     /// A second panic aborts the process and drops the original message.
+    #[cfg(unix)]
     #[test]
     fn a_panic_hook_records_the_original_panic_when_stderr_is_a_closed_pty() {
         const CHILD: &str = "LEVELER_TEST_PANIC_HOOK_CLOSED_PTY";
@@ -390,6 +392,7 @@ mod tests {
 
     /// Re-exec this test on a PTY slave whose master is already closed.
     /// The helper is Python so this crate can keep `forbid(unsafe_code)`.
+    #[cfg(unix)]
     fn on_closed_pty(test: &str, fds: &str, env: &[(&str, &str)]) -> std::process::Output {
         let script = r#"
 import os, pty, sys

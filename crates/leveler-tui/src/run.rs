@@ -683,7 +683,17 @@ async fn observe_session_cleanup(
         if snapshot.id != *session_id {
             return Err("runtime returned a snapshot for a different session".into());
         }
-        if snapshot.status == "running" {
+        let running = snapshot.status == "running";
+        // A client exit owns only `goal` work. `session`, `runtime` and
+        // `persistent` tasks outlive it by contract: a user shell handed to the
+        // background stays the Execution Host's, and the next client re-attaches
+        // to it. An absent lifetime is an older runtime; keep today's stop.
+        let owned: Vec<_> = snapshot
+            .active_background_tasks
+            .into_iter()
+            .filter(|task| matches!(task.lifetime.as_deref(), None | Some("goal")))
+            .collect();
+        if running {
             // A cancelling turn may still launch a final background process;
             // let its lifecycle settle before enumerating what must be stopped.
             if !turn_cancelled {
@@ -698,11 +708,11 @@ async fn observe_session_cleanup(
                 .map_err(|e| e.to_string())?;
                 turn_cancelled = true;
             }
-        } else if snapshot.active_background_tasks.is_empty() {
+        } else if owned.is_empty() {
             return Ok(());
         } else {
             let mut issued = false;
-            for task in snapshot.active_background_tasks {
+            for task in owned {
                 if requested.insert(task.task_id.clone()) {
                     issue_quit_command(
                         client,
@@ -1622,6 +1632,7 @@ mod tests {
                 elapsed_ms: 1,
                 pid: Some(100),
                 ready_evidence: None,
+                lifetime: Some("goal".into()),
             });
         snapshot
     }
@@ -1689,6 +1700,21 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_quit_leaves_a_runtime_owned_background_task_alone() {
+        let mut snapshot = quit_snapshot().await;
+        snapshot.active_background_tasks[0].lifetime = Some("runtime".into());
+        let runtime = QuitRuntime::new(snapshot, false);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+        stop_session_before_quit(&client, &SessionId::new("s1"), QUIT_CLEANUP_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(
+            runtime.inner.commands().is_empty(),
+            "a runtime-owned task outlives the client that launched it"
+        );
     }
 
     #[tokio::test]

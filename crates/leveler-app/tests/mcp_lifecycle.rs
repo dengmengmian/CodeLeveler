@@ -95,9 +95,12 @@ fn external_tools_entry(catalog: &serde_json::Value) -> serde_json::Value {
 }
 
 fn server_config(name: &str, script: &std::path::Path, python: &str) -> String {
+    // TOML basic strings use backslash escapes, and Windows paths are full of
+    // them. Escape both the interpreter and the script path.
+    let python = python.replace('\\', "\\\\");
+    let script = script.display().to_string().replace('\\', "\\\\");
     format!(
-        "[[mcp_servers]]\nname = \"{name}\"\ncommand = \"{python}\"\nargs = [\"-u\", \"{}\"]\n",
-        script.display()
+        "[[mcp_servers]]\nname = \"{name}\"\ncommand = \"{python}\"\nargs = [\"-u\", \"{script}\"]\n"
     )
 }
 

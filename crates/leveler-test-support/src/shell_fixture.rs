@@ -20,18 +20,18 @@ pub fn echo_command(text: &str) -> (String, Vec<String>) {
 
 /// A command that stays alive for about `seconds`, then exits.
 ///
-/// Windows needs a blocking primitive that wants neither a console nor a
-/// socket: `timeout` refuses redirected input, and `ping` needs the network a
-/// confined profile may not grant.
+/// Windows needs a blocking primitive that wants neither a console nor a shell
+/// wrapper: `timeout` refuses redirected input, and `powershell` is a shell
+/// that the command tool treats as an approval gate. `ping` is a real program
+/// and blocks for about `seconds`; loopback needs no granted network path.
 pub fn sleep_command(seconds: u32) -> (String, Vec<String>) {
     if cfg!(windows) {
         (
-            "powershell".to_string(),
+            "ping".to_string(),
             vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                format!("Start-Sleep -Seconds {seconds}"),
+                "-n".to_string(),
+                (seconds + 1).to_string(),
+                "127.0.0.1".to_string(),
             ],
         )
     } else {

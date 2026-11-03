@@ -1825,6 +1825,7 @@ impl InProcessRuntimeClient {
                                 elapsed_ms: task.duration_ms,
                                 pid: task.pid,
                                 ready_evidence: task.ready.map(|ready| ready.evidence),
+                                lifetime: Some(task.lifetime.as_str().to_string()),
                             })
                             .collect();
                         let _ = background_sender
@@ -6628,6 +6629,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 elapsed_ms: task.duration_ms,
                 pid: task.pid,
                 ready_evidence: task.ready.map(|ready| ready.evidence),
+                lifetime: Some(task.lifetime.as_str().to_string()),
             })
             .collect();
 
@@ -7649,6 +7651,7 @@ async fn compact_conversation(
                 elapsed_ms: task.duration_ms,
                 pid: task.pid,
                 ready_evidence: task.ready.map(|ready| ready.evidence),
+                lifetime: Some(task.lifetime.as_str().to_string()),
             })
             .collect();
         let task_projection = match db.session_facts_for(session_id).await {

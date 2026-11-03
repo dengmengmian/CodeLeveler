@@ -544,6 +544,8 @@ export interface UiActiveBackgroundTask {
   args: string[];
   /** Runtime-observed age at snapshot time. */
   elapsed_ms: number;
+  /** The task's lifetime (`goal`, `session`, `runtime`, `persistent`). A client exit owns only `goal`: the others survive it by contract. Additive; absent is a runtime that predates the field. */
+  lifetime?: string | null;
   /** The process-group leader's OS pid, when known. Additive; older clients decode it as absent. */
   pid?: number | null;
   program: string;
