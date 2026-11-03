@@ -741,13 +741,12 @@ impl SessionSteering {
             .get(&self.session_id)
             .is_some_and(|queue| !queue.is_empty());
         queued
-            || self
+            || !self
                 .goal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pending
-                .first()
-                .is_some()
+                .is_empty()
     }
 }
 

@@ -1568,7 +1568,7 @@ impl<'a> Drive<'a> {
                 repair: ProtocolRepairKind::GoalSettledDelivery,
             },
         );
-        self.sink.append(&[message.clone()]).await?;
+        self.sink.append(std::slice::from_ref(&message)).await?;
         messages.push(message);
         (self.observer)(AgentEvent::AdvisoryStarted {
             kind: AdvisoryKind::CloseoutNudge(CloseoutReason::GoalSettledDelivery),

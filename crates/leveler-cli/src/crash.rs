@@ -55,13 +55,13 @@ pub(crate) fn install(version: &str) {
 /// write is copied into the crash directory so the original text is not lost.
 pub(crate) fn report_fatal(prefix: &str, detail: &str) {
     let body = format!("{prefix}\n  {detail}\n");
-    if write_stderr(&body).is_err() {
-        if let Some(dir) = crash_dir() {
-            let _ = write_record(
-                &dir,
-                &format!("leveler fatal report\nstderr: unavailable\n{body}"),
-            );
-        }
+    if write_stderr(&body).is_err()
+        && let Some(dir) = crash_dir()
+    {
+        let _ = write_record(
+            &dir,
+            &format!("leveler fatal report\nstderr: unavailable\n{body}"),
+        );
     }
 }
 

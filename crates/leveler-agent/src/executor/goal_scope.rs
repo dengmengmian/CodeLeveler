@@ -2101,7 +2101,7 @@ fn verification_subject(segment: &str) -> Option<String> {
             continue;
         }
         // A waiver removes the demand, and a question is not a demand.
-        if is_waiver(&clause) || segment_is_negated(&clause) || question_form(&clause) {
+        if is_waiver(clause) || segment_is_negated(clause) || question_form(clause) {
             continue;
         }
         let lower = clause.to_lowercase();
@@ -2610,7 +2610,6 @@ mod tests {
         ));
     }
 
-    #[test]
     /// The real DevOrder objective. `CONFIG=internal/config/probe.yaml` was
     /// extracted as an artifact, so the completion gate demanded that a path
     /// literally named `CONFIG=internal/config/config.probe.local.yaml` exist —

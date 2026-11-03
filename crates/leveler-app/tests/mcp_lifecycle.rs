@@ -25,11 +25,11 @@ fn isolate_global_config(home: &std::path::Path) {
 }
 
 /// `LEVELER_HOME` is process-global: the tests in this binary must not read
-/// each other's config.
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// each other's config. The guard stays alive across awaits on purpose, so it
+/// is an async mutex rather than a blocking one.
+async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 fn layout(tmp: &tempfile::TempDir) -> Layout {
@@ -106,7 +106,7 @@ fn server_config(name: &str, script: &std::path::Path) -> String {
 /// been started), then it appears. The next turn must find its tools.
 #[tokio::test]
 async fn a_server_that_starts_after_the_first_turn_is_discovered_later() {
-    let _env = env_lock();
+    let _env = env_lock().await;
     let home = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     isolate_global_config(home.path());
@@ -151,7 +151,7 @@ async fn a_server_that_starts_after_the_first_turn_is_discovered_later() {
 /// is not reconnected on every later turn.
 #[tokio::test]
 async fn an_available_server_is_not_reconnected_every_turn() {
-    let _env = env_lock();
+    let _env = env_lock().await;
     let home = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     isolate_global_config(home.path());

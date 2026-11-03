@@ -3508,31 +3508,33 @@ async fn one_post_settlement_check_then_the_answer_is_the_delivery() {
         "{:?}",
         report.completion_warnings
     );
-    let requests = h.requests.lock().unwrap();
-    assert_eq!(
-        requests.len(),
-        4,
-        "read, resolve, one check, the answer — no extra request: {}",
-        requests.len()
-    );
-    let notice = requests
-        .iter()
-        .flat_map(|request| request.messages.iter())
-        .map(Message::text_content)
-        .find(|text| text.contains("this round is the delivery"))
-        .unwrap_or_default();
-    assert!(
-        notice.contains("still owed after that result returns"),
-        "a check after acceptance must not be described as the same round as the answer: {notice}"
-    );
-    assert!(
-        !notice.contains("run it in this round and then answer"),
-        "the notice must not tell the model to answer before the check returns: {notice}"
-    );
-    assert!(
-        !notice.contains("nohup does not"),
-        "the notice must not send the model to rewrite process groups: {notice}"
-    );
+    {
+        let requests = h.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "read, resolve, one check, the answer — no extra request: {}",
+            requests.len()
+        );
+        let notice = requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .map(Message::text_content)
+            .find(|text| text.contains("this round is the delivery"))
+            .unwrap_or_default();
+        assert!(
+            notice.contains("still owed after that result returns"),
+            "a check after acceptance must not be described as the same round as the answer: {notice}"
+        );
+        assert!(
+            !notice.contains("run it in this round and then answer"),
+            "the notice must not tell the model to answer before the check returns: {notice}"
+        );
+        assert!(
+            !notice.contains("nohup does not"),
+            "the notice must not send the model to rewrite process groups: {notice}"
+        );
+    };
     // The live turn can show the answer while session_messages still ends on
     // the delivery notice. Resume reloads the sink, so the answer has to be
     // the row after that notice.
