@@ -6,6 +6,8 @@
 //! library test harness with stdout already closed fails inside libtest
 //! before the restore call.
 
+#![cfg(unix)]
+
 use std::panic::AssertUnwindSafe;
 
 #[test]
