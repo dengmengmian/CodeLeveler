@@ -114,7 +114,7 @@ const OBSERVE_SLICE: Duration = Duration::from_millis(250);
 /// yield. The window is longer than one observation slice and short enough
 /// that a steer still feels immediate; outside it, the yield wins and the
 /// result is still available to a later `wait_task`/`get_task`.
-const YIELD_SETTLE_GRACE: Duration = Duration::from_millis(200);
+const YIELD_SETTLE_GRACE: Duration = Duration::from_millis(1000);
 const YIELD_SETTLE_SLICE: Duration = Duration::from_millis(10);
 
 /// The bounded interval `wait_task` waits for, shared with a sub-agent wait so

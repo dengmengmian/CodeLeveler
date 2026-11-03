@@ -380,14 +380,24 @@ async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
         .await
         .unwrap();
     f.wait_for_tool_call(&mut rx, "wait_task").await;
-    f.client
-        .send(ClientCommand::SteerCurrentTurn {
-            session_id: f.session.clone(),
-            content: "进展如何？".into(),
-        })
-        .await
-        .unwrap();
+    // Spawn the steer and release the exit in the same tick. Awaiting the
+    // steer first lets the runtime finish its handoff before the trigger is
+    // visible, which turns a tie into "steer first" for reasons unrelated to
+    // the contract under test.
+    let steer = tokio::spawn({
+        let client = f.client.clone();
+        let session = f.session.clone();
+        async move {
+            client
+                .send(ClientCommand::SteerCurrentTurn {
+                    session_id: session,
+                    content: "进展如何？".into(),
+                })
+                .await
+        }
+    });
     std::fs::write(f.repo.join("exit-flag"), b"").unwrap();
+    steer.await.unwrap().unwrap();
     f.wait_for_turn_end(&mut rx).await;
     // Whether the exit or the steer wins the race, both facts must reach the
     // model: the exit as its result, the steer as the user's own words.

@@ -1275,6 +1275,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stdio_and_http_register_together() {
         let (url, _) = serve(Mode::Modern).await;

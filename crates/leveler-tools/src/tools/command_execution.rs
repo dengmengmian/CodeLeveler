@@ -1304,13 +1304,17 @@ mod grant_tests {
 #[cfg(test)]
 mod foreground_handoff_tests {
     use super::*;
-    use crate::tool::{Tool, ToolContext};
+    #[cfg(unix)]
+    use crate::tool::Tool;
+    use crate::tool::ToolContext;
     #[cfg(unix)]
     use crate::tools::GetTaskTool;
+    #[cfg(unix)]
     use crate::tools::WaitTaskTool;
+    #[cfg(unix)]
+    use leveler_execution::BackgroundTaskStatus;
     use leveler_execution::{
-        BackgroundTaskLifetime, BackgroundTaskRegistry, BackgroundTaskStatus, PermissionProfile,
-        Workspace,
+        BackgroundTaskLifetime, BackgroundTaskRegistry, PermissionProfile, Workspace,
     };
     use leveler_test_support::git::scratch_repo;
     use std::sync::Arc;
@@ -1472,6 +1476,7 @@ mod foreground_handoff_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_command_still_running_after_15s_is_handed_to_the_existing_registry() {
         let dir = scratch_repo();
         let (ctx, reg, commands) = harness(dir.path());
