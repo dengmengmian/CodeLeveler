@@ -136,6 +136,8 @@ pub enum RuntimeNoticeKind {
     GoalCheckpoint,
     /// Image bytes a tool returned, re-hosted so a provider can see them.
     LoadedImage,
+    /// Terminal process state and retained output.
+    BackgroundTaskResult,
     /// The harness frame around a side question. The person's words are quoted
     /// inside it; the row itself is not the submitted input. The frame is the
     /// `/btw` mode contract and is classified as [`PromptAuthority::CoreContract`].
@@ -156,8 +158,27 @@ pub enum TranscriptOrigin {
     ProtocolRepair { repair: ProtocolRepairKind },
     /// The harness is reporting runtime state or another agent's output.
     RuntimeNotice { notice: RuntimeNoticeKind },
+    /// Terminal results already committed to this transcript, either as an
+    /// unsolicited fact or through a tool the model chose to call.
+    BackgroundTaskResults { task_ids: Vec<String> },
     /// A fold breadcrumb. Legacy rows are also recognized by their marker.
-    CompactionSummary,
+    CompactionSummary {
+        /// Preserve delivery across a destructive transcript compaction.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delivered_background_tasks: Vec<String>,
+    },
+}
+
+impl TranscriptOrigin {
+    pub fn delivered_background_task_ids(&self) -> &[String] {
+        match self {
+            Self::BackgroundTaskResults { task_ids }
+            | Self::CompactionSummary {
+                delivered_background_tasks: task_ids,
+            } => task_ids,
+            _ => &[],
+        }
+    }
 }
 
 /// Where a block was produced. The body does not get to rename this.
@@ -305,12 +326,15 @@ pub fn classify_transcript_origin(origin: Option<&TranscriptOrigin>) -> OriginCl
             authority: PromptAuthority::CoreContract,
             authority_mismatch: false,
         },
-        Some(TranscriptOrigin::CompactionSummary) => OriginClass {
+        Some(TranscriptOrigin::CompactionSummary { .. }) => OriginClass {
             source: PromptSource::CompactionSummary,
             authority: PromptAuthority::AdvisoryContext,
             authority_mismatch: false,
         },
         Some(TranscriptOrigin::RuntimeNotice { notice }) => classify_runtime_notice(*notice),
+        Some(TranscriptOrigin::BackgroundTaskResults { .. }) => {
+            classify_runtime_notice(RuntimeNoticeKind::BackgroundTaskResult)
+        }
         None => OriginClass {
             source: PromptSource::LegacyUser,
             authority: PromptAuthority::Unclassified,
@@ -329,7 +353,9 @@ fn classify_runtime_notice(notice: RuntimeNoticeKind) -> OriginClass {
         // person at the keyboard.
         RuntimeNoticeKind::ChildTask => (PromptAuthority::AdvisoryContext, false),
         // Tool output moved onto the user transport so a provider can see it.
-        RuntimeNoticeKind::LoadedImage => (PromptAuthority::ExternalData, false),
+        RuntimeNoticeKind::LoadedImage | RuntimeNoticeKind::BackgroundTaskResult => {
+            (PromptAuthority::ExternalData, false)
+        }
         // `/btw` is an explicit interaction mode. The frame is that mode's
         // product contract: read-only investigation is allowed, while file
         // edits and any change to the main task are not. The person's question

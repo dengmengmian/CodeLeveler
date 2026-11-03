@@ -914,6 +914,7 @@ impl Application {
         // the layer with a client to notify.
         let _ = ();
         let spec = self.direct_spec(goal, mode, sandbox);
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
         let result = run_collaboration_turn(
             &engine,
             execution,
@@ -1041,6 +1042,10 @@ impl Application {
                 // conversation, not a new Goal.
                 ends_session_goal: true,
             });
+        let cleanup = self
+            .background_tasks()
+            .detach_cleanup(session_id.as_str(), goal.as_ref().map(|goal| &goal.goal_id))
+            .await;
         let mut events = Vec::new();
         engine
             .finish_task(
@@ -1060,6 +1065,8 @@ impl Application {
             )
             .await
             .map_err(app_error_from_engine)?;
+        cleanup.settle().await;
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
         Ok(events.into_iter().next())
     }
 
@@ -1073,6 +1080,7 @@ impl Application {
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
         let (engine, spec) = self
             .resume_prepare(
                 session_id,
@@ -1114,6 +1122,7 @@ impl Application {
         observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
         let (engine, spec) = self
             .resume_prepare(session_id, approver, clarifier, task_cancel)
             .await?;

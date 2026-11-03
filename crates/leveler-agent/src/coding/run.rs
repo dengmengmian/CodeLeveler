@@ -1705,7 +1705,12 @@ impl CodingRuntime {
         // no window that could still use them.
         let mut cleanup_ticket = if explicit_task_cancel || !interrupted {
             match self.factory.tool_context.session_scope.as_deref() {
-                Some(scope) => Some(self.factory.background_tasks.detach_cleanup(scope).await),
+                Some(scope) => Some(
+                    self.factory
+                        .background_tasks
+                        .detach_cleanup(scope, goal)
+                        .await,
+                ),
                 None => None,
             }
         } else {
@@ -1747,12 +1752,15 @@ impl CodingRuntime {
         // The goal's own settle decision is the authority on whether any window
         // can still follow, so it is read from the FINAL terminal above and
         // used by the post-terminal cleanup gate below.
+        // A Chat turn can end while its session still owns observable work.
+        // The legacy Goal route can settle without a goal row, so it still
+        // follows its task terminal.
         let mut reap_now = explicit_task_cancel
             || (!interrupted
                 && terminal
                     .goal
                     .as_ref()
-                    .map_or(!goal_continues, |goal| goal.settle));
+                    .map_or(goal_session && !goal_continues, |goal| goal.settle));
         let mut settled = self
             .engine
             .finish_task(token, session_id, terminal.clone(), observer)
@@ -1770,7 +1778,12 @@ impl CodingRuntime {
             cancelled_at_commit = true;
             if cleanup_ticket.is_none() {
                 cleanup_ticket = match self.factory.tool_context.session_scope.as_deref() {
-                    Some(scope) => Some(self.factory.background_tasks.detach_cleanup(scope).await),
+                    Some(scope) => Some(
+                        self.factory
+                            .background_tasks
+                            .detach_cleanup(scope, goal)
+                            .await,
+                    ),
                     None => None,
                 };
             }

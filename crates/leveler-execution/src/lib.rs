@@ -55,8 +55,9 @@ pub use approval::{
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{
     AdoptError, AdoptedTaskSpec, BackgroundCleanupTicket, BackgroundSettlement,
-    BackgroundTaskEvent, BackgroundTaskLifetime, BackgroundTaskObservation, BackgroundTaskRegistry,
-    BackgroundTaskSnapshot, BackgroundTaskStatus, MutationBaseline, TaskReadiness,
+    BackgroundTaskEvent, BackgroundTaskLifetime, BackgroundTaskObservation, BackgroundTaskOrigin,
+    BackgroundTaskRegistry, BackgroundTaskSnapshot, BackgroundTaskStatus, MutationBaseline,
+    TaskReadiness,
 };
 pub use checkpoint::Checkpoint;
 pub use clarify::{

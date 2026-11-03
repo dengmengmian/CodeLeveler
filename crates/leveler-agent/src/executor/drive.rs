@@ -229,6 +229,8 @@ pub(crate) struct Drive<'a> {
     context_diverged: bool,
     session_approved: HashSet<String>,
     background_children: BackgroundChildren,
+    /// Cache of terminal result identities already committed to the transcript.
+    delivered_background_tasks: Option<HashSet<String>>,
     /// Whether this run's resumed children (if any) were launched yet.
     resumed_children_launched: bool,
     run_agents_semaphore: Arc<tokio::sync::Semaphore>,
@@ -392,7 +394,49 @@ fn is_goal_bookkeeping(name: &str) -> bool {
     name == UPDATE_GOAL_TOOL || name == "update_plan"
 }
 
-/// Summarize one running task for a delivery notice: its id and what it runs.
+fn background_task_result_message(
+    task_id: String,
+    session: &str,
+    goal_id: Option<&leveler_core::GoalId>,
+    status: leveler_execution::BackgroundTaskStatus,
+    exit_code: Option<i32>,
+    output: &str,
+    output_truncated: bool,
+) -> Message {
+    use leveler_execution::BackgroundTaskStatus;
+    let outcome = match (status, exit_code) {
+        (BackgroundTaskStatus::Exited, Some(0)) => "success",
+        (BackgroundTaskStatus::Exited, _) => "failure",
+        (BackgroundTaskStatus::Killed, _) => "cancelled",
+        _ => "unknown",
+    };
+    const MAX_OUTPUT_BYTES: usize = 2 * 1024;
+    let start =
+        leveler_core::ceil_char_boundary(output, output.len().saturating_sub(MAX_OUTPUT_BYTES));
+    let result = serde_json::json!({
+        "task_id": task_id,
+        "session_id": session,
+        "goal_id": goal_id,
+        "status": status,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "output_tail": &output[start..],
+        "output_truncated": output_truncated || start > 0,
+        "retained_log_reference": {
+            "tool": "get_task",
+            "task_id": task_id,
+            "availability": "while the execution registry retains this task",
+        },
+    });
+    Message::user(
+        format!("Background task terminal result: {result}"),
+        TranscriptOrigin::BackgroundTaskResults {
+            task_ids: vec![task_id],
+        },
+    )
+}
+
+/// Summarize one running task for a delivery notice.
 fn task_line(task: &leveler_execution::BackgroundTaskSnapshot) -> String {
     let line = if task.args.is_empty() {
         task.program.clone()
@@ -873,6 +917,7 @@ impl Executor {
             background_children: BackgroundChildren {
                 children: Vec::new(),
             },
+            delivered_background_tasks: None,
             resumed_children_launched: false,
             run_agents_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 self.policy.max_concurrent_agents.max(1),
@@ -1195,6 +1240,93 @@ impl<'a> Drive<'a> {
             (self.observer)(event);
             Ok(())
         }
+    }
+
+    /// Reconcile at request admission against the registry and durable log.
+    /// An exit concurrent with this read remains available for the next
+    /// admission. The transcript append is the delivery commit, so recovery
+    /// replays the same row instead of minting another notice.
+    async fn deliver_background_task_results(
+        &mut self,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let (Some(registry), Some(owner)) = (
+            self.executor.background_tasks.as_ref(),
+            self.executor.tool_context.session_scope.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        if self.executor.depth != 0 || self.executor.tool_context.writer_scope() != "parent" {
+            return Ok(());
+        }
+        let delivered = match self.delivered_background_tasks.as_mut() {
+            Some(delivered) => delivered,
+            None => {
+                let ids = self.sink.delivered_background_task_ids().await?;
+                self.delivered_background_tasks
+                    .insert(ids.into_iter().collect())
+            }
+        };
+        // Bound fresh notices independently of each task's retained log.
+        const MAX_FACTS: usize = 8;
+        let mut results = Vec::new();
+        let mut admitted = HashSet::new();
+        for event in self.sink.background_task_results().await? {
+            let leveler_engine::EngineEvent::BackgroundTaskFinished {
+                task_id,
+                goal_id,
+                exit_code,
+                status,
+                output,
+                output_truncated,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if delivered.contains(&task_id) || !admitted.insert(task_id.clone()) {
+                continue;
+            }
+            results.push(background_task_result_message(
+                task_id,
+                owner,
+                goal_id.as_ref(),
+                status.unwrap_or(leveler_execution::BackgroundTaskStatus::Exited),
+                exit_code,
+                &output,
+                output_truncated,
+            ));
+            if results.len() == MAX_FACTS {
+                break;
+            }
+        }
+        if results.len() < MAX_FACTS {
+            for task in registry
+                .local_terminal_snapshots_for_scope(
+                    Some(owner),
+                    |id| !delivered.contains(id) && !admitted.contains(id),
+                    MAX_FACTS - results.len(),
+                )
+                .await
+            {
+                admitted.insert(task.id.clone());
+                results.push(background_task_result_message(
+                    task.id,
+                    owner,
+                    task.goal_id.as_ref(),
+                    task.status,
+                    task.exit_code,
+                    &task.log,
+                    task.log_truncated,
+                ));
+            }
+        }
+        if !results.is_empty() {
+            self.sink.append(&results).await?;
+            delivered.extend(admitted);
+            messages.extend(results);
+        }
+        Ok(())
     }
 
     /// Non-blocking settlement of finished background children — the notice
@@ -2367,7 +2499,7 @@ impl AgentHarness for Drive<'_> {
     async fn on_round_admitted(
         &mut self,
         rt: &mut LoopContext,
-        _messages: &mut Vec<Message>,
+        messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
         let model_steps = rt.model_steps();
         self.model_steps = model_steps;
@@ -2419,6 +2551,7 @@ impl AgentHarness for Drive<'_> {
             ));
             self.model_step_note_sent = true;
         }
+        self.deliver_background_task_results(messages).await?;
         Ok(Flow::Continue)
     }
 
@@ -3090,6 +3223,7 @@ impl AgentHarness for Drive<'_> {
         // Tool results, filled by call index. Parallel-safe read-only tools
         // may finish out of order, but the model must receive their results
         // in the original call order — providers reject reordered results.
+        let mut observed_terminal_tasks = Vec::new();
         let mut results: Vec<Option<ContentPart>> = (0..calls.len()).map(|_| None).collect();
         // Whether this round's assistant message said anything to the person.
         // A round that resolved the goal without a word is the case the delivery
@@ -5013,6 +5147,10 @@ impl AgentHarness for Drive<'_> {
                     }
                 }
             }
+            if let Some(task_id) = command_facts.terminal_task_id.as_ref() {
+                observed_terminal_tasks.push(task_id.clone());
+            }
+
             // The REAL result of a command whose call only reported a start:
             // `wait_task`/`get_task` observed the task's terminal state, and the
             // lifecycle tools attached it as a structured fact. Without this a
@@ -5122,6 +5260,9 @@ impl AgentHarness for Drive<'_> {
                     pending_images.push(part);
                 }
                 let facts = super::dispatch::extract_command_facts(&metadata);
+                if let Some(task_id) = facts.terminal_task_id.as_ref() {
+                    observed_terminal_tasks.push(task_id.clone());
+                }
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: facts.exit_code,
                     stop: facts.stop,
@@ -5683,7 +5824,11 @@ impl AgentHarness for Drive<'_> {
             .collect();
 
         let tool_message = Message {
-            origin: None,
+            origin: (!observed_terminal_tasks.is_empty()).then(|| {
+                TranscriptOrigin::BackgroundTaskResults {
+                    task_ids: observed_terminal_tasks.clone(),
+                }
+            }),
             role: Role::Tool,
             content: results,
             route: None,
@@ -5693,6 +5838,9 @@ impl AgentHarness for Drive<'_> {
         // a sink I/O failure must not drop this batch's command/file totals.
         self.flush_epoch(rt);
         self.sink.append(&[assistant, tool_message]).await?;
+        if let Some(delivered) = self.delivered_background_tasks.as_mut() {
+            delivered.extend(observed_terminal_tasks);
+        }
         // Batch was cancelled: the round is durable (results paired, spend
         // flushed above) — exit now instead of starting another model round.
         if cancelled_mid_batch {

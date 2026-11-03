@@ -298,6 +298,21 @@ pub fn qualify_only(
 
 // ── read-only surfaces ──────────────────────────────────────────────────────
 
+/// Time spent in one stage of the current attempt.
+///
+/// The transaction-level [`Transaction::duration`] spans every attempt since the
+/// release started, so after a few `--resume`s it reports days for a stage that
+/// started minutes ago. Reporting that number as the only elapsed time made a
+/// slow stage indistinguishable from a stuck one.
+fn stage_elapsed(transaction: &state::Transaction, stage: u8) -> f64 {
+    let record = transaction.stage_record(stage);
+    match (record.started_at, record.finished_at) {
+        (Some(start), Some(finish)) => (finish - start).max(0.0),
+        (Some(start), None) => (crate::clock::now() - start).max(0.0),
+        _ => 0.0,
+    }
+}
+
 fn status(host: &dyn Host, repo: &Path) -> Result<Report, Fail> {
     let Some(release_id) = state::read_current(repo) else {
         return Ok(Report::ok(
@@ -329,8 +344,12 @@ fn status(host: &dyn Host, repo: &Path) -> Result<Report, Fail> {
             crate::clock::iso8601(transaction.started_at)
         ),
         format!(
-            "elapsed:       {}",
+            "elapsed:       {} (all attempts)",
             crate::clock::human_duration(transaction.duration())
+        ),
+        format!(
+            "stage elapsed: {}",
+            crate::clock::human_duration(stage_elapsed(&transaction, current_stage))
         ),
         format!("resumes:       {}", transaction.resume_count),
         format!(

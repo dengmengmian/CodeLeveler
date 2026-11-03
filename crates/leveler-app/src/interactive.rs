@@ -875,58 +875,79 @@ async fn append_user_shell_chunk(
 /// a resume. The registry owns the task→call link; this writes the fact that
 /// call_id, the argv, and the exit decided.
 ///
-/// Only a natural exit is recorded. A stopped or unobservable task produced no
-/// result, and recording one would let a cancel or a lost process count as
-/// evidence. Recording is idempotent per task id, so the live bridge and the
-/// turn-boundary reconcile can both call it without double-counting.
+/// The terminal state is observable even when it provides no verification
+/// evidence. The lifecycle bridge and turn-boundary reconcile share the same
+/// fenced, idempotent append.
 pub(crate) async fn persist_background_task_finished(
     app: &Application,
     session_id: SessionId,
-    task: leveler_execution::BackgroundTaskSnapshot,
+    task: &leveler_execution::BackgroundTaskSnapshot,
 ) {
-    if task.status != leveler_execution::BackgroundTaskStatus::Exited {
+    if !task.status.is_terminal() || task.owner_scope.as_deref() != Some(session_id.as_str()) {
         return;
     }
-    let Some(call_id) = app.background_tasks().origin_call_id_of(&task.id).await else {
-        // Started by a caller that recorded no tool call (a user shell, an
-        // internal service): there is no call to attribute the result to.
-        return;
+    let origin = if task.id.starts_with("host-") {
+        app.background_tasks()
+            .hosted_task_origin(&task.id, session_id.as_str())
+    } else {
+        Some(leveler_execution::BackgroundTaskOrigin {
+            call_id: task.origin_call_id.clone(),
+            goal_id: task.goal_id.clone(),
+        })
     };
-    let Ok(db) = app.open_database().await else {
-        return;
-    };
-    use leveler_storage::EventStore as _;
-    let Ok(rows) = db
-        .load_by_types(&session_id, &["background_task_finished"])
-        .await
+    let Some(leveler_execution::BackgroundTaskOrigin {
+        call_id: Some(call_id),
+        goal_id,
+    }) = origin
     else {
+        // User shells and internal services have no tool call to attribute.
         return;
     };
-    let already = rows.iter().any(|row| {
-        serde_json::from_str::<serde_json::Value>(&row.payload)
-            .ok()
-            .map(|value| {
-                let body = value.get("payload").cloned().unwrap_or(value);
-                body.get("task_id").and_then(serde_json::Value::as_str) == Some(task.id.as_str())
-            })
-            .unwrap_or(false)
-    });
-    if already {
-        return;
-    }
+    const OUTPUT_TAIL_BYTES: usize = 4096;
+    let output_start = leveler_core::ceil_char_boundary(
+        &task.log,
+        task.log.len().saturating_sub(OUTPUT_TAIL_BYTES),
+    );
+    let task_id = &task.id;
     let event = leveler_engine::EngineEvent::BackgroundTaskFinished {
         call_id,
-        task_id: task.id,
-        program: task.program,
-        args: task.args,
+        task_id: task_id.clone(),
+        goal_id,
+        program: task.program.clone(),
+        args: task.args.clone(),
         // A zero exit is the only pass. An exit whose code could not be
         // established is not a pass either.
-        is_error: task.exit_code != Some(0),
+        is_error: task.status != leveler_execution::BackgroundTaskStatus::Exited
+            || task.exit_code != Some(0),
         exit_code: task.exit_code,
+        status: Some(task.status),
+        output: task.log[output_start..].to_owned(),
+        output_truncated: task.log_truncated || output_start != 0,
     };
     // The result belongs to the call that started it, not to whichever turn
     // happens to be open now; the goal reader scopes by call identity.
-    append_durable_session_event(app, session_id, None, event).await;
+    let result = async {
+        let db = app.open_database().await?;
+        let runtime = app.runtime_id()?;
+        let boot = app.boot_id()?;
+        let (_, payload) = event
+            .to_row()
+            .map_err(crate::session::app_error_from_engine)?;
+        db.append_background_task_finished(
+            &session_id,
+            &runtime,
+            &boot,
+            task_id,
+            &payload,
+            leveler_core::now(),
+        )
+        .await?;
+        Ok::<_, crate::AppError>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, %task_id, "could not persist background terminal fact");
+    }
 }
 
 /// Record background results that finished while nothing was watching.
@@ -937,49 +958,16 @@ pub(crate) async fn persist_background_task_finished(
 /// turn that RESUMES after a crash. Idempotent: an already-recorded task is
 /// skipped, so a result is never counted twice.
 pub(crate) async fn reconcile_background_evidence(app: &Application, session_id: &SessionId) {
-    let Ok(snapshots) = app.background_tasks().try_all_snapshots().await else {
-        return;
-    };
-    for task in snapshots
-        .into_iter()
-        .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
-    {
-        persist_background_task_finished(app, session_id.clone(), task).await;
+    let registry = app.background_tasks();
+    let mut snapshots = registry
+        .local_terminal_snapshots_for_scope(Some(session_id.as_str()), |_| true, usize::MAX)
+        .await;
+    match registry.hosted_terminal_snapshots_for_scope(session_id.as_str()) {
+        Ok(hosted) => snapshots.extend(hosted),
+        Err(error) => tracing::warn!(%error, "cannot reconcile hosted background facts"),
     }
-}
-
-/// Append one durable engine event to a session's log as this runtime, without
-/// claiming a turn it does not own.
-///
-/// A live turn from this runtime already owns the session: its token is reused.
-/// An idle session has no writer, so the unowned epoch is acquired briefly and
-/// released after the append. A foreign owner means this runtime must not write;
-/// the live event remains the only delivery.
-async fn append_durable_session_event(
-    app: &Application,
-    session_id: SessionId,
-    turn_id: Option<leveler_core::TurnId>,
-    event: leveler_engine::EngineEvent,
-) {
-    let Ok(db) = app.open_database().await else {
-        return;
-    };
-    let Ok(engine) = app.task_engine(&db) else {
-        return;
-    };
-    let (token, acquired) = match engine.current_ownership(&session_id).await {
-        Ok(Some(token)) => (token, false),
-        Ok(None) => match engine.acquire_if_unowned(&session_id).await {
-            Ok(Some(token)) => (token, true),
-            Ok(None) | Err(_) => return,
-        },
-        Err(_) => return,
-    };
-    let log = leveler_engine::EventLog::new_owned(&db, session_id, token.clone());
-    let mut forward = |_event: leveler_engine::EngineEvent| {};
-    let _ = log.append(turn_id.as_ref(), event, &mut forward).await;
-    if acquired {
-        let _ = engine.release_ownership(&token).await;
+    for task in snapshots {
+        persist_background_task_finished(app, session_id.clone(), &task).await;
     }
 }
 
@@ -1766,17 +1754,15 @@ impl InProcessRuntimeClient {
                                 });
                             }
                         }
-                        // The durable result, for `update_goal(complete)` and for
-                        // resume. A stop or an unobservable task produced no
-                        // result, so only a natural exit is recorded.
-                        if task.status == leveler_execution::BackgroundTaskStatus::Exited
-                            && let Some(app) = background_app.upgrade()
-                        {
-                            let session = background_session_id.clone();
-                            let terminal = task.clone();
-                            tokio::spawn(async move {
-                                persist_background_task_finished(&app, session, terminal).await;
-                            });
+                        // Keep the terminal fact for resume even when no
+                        // observer is waiting for the originating tool.
+                        if let Some(app) = background_app.upgrade() {
+                            persist_background_task_finished(
+                                &app,
+                                background_session_id.clone(),
+                                &task,
+                            )
+                            .await;
                         }
                         if task.status == leveler_execution::BackgroundTaskStatus::Unknown {
                             let _ = background_sender.send(RuntimeEvent::BackgroundTaskUnknown {
@@ -1803,7 +1789,7 @@ impl InProcessRuntimeClient {
                         // queued for the next receive, so the replacement
                         // cannot leave a stale active id behind.
                         background_events = background_registry.subscribe();
-                        let snapshots = match background_registry.try_active_snapshots().await {
+                        let snapshots = match background_registry.try_all_snapshots().await {
                             Ok(tasks) => tasks,
                             Err(error) => {
                                 let _ = background_sender.send(RuntimeEvent::Notification {
@@ -1813,11 +1799,27 @@ impl InProcessRuntimeClient {
                                 continue;
                             }
                         };
-                        let tasks = snapshots
+                        let owned = snapshots.into_iter().filter(|task| {
+                            task.owner_scope.as_deref() == Some(background_session_id.as_str())
+                        });
+                        let mut tasks = Vec::new();
+                        let app = background_app.upgrade();
+                        for task in owned {
+                            if task.status.is_terminal() {
+                                if let Some(app) = &app {
+                                    persist_background_task_finished(
+                                        app,
+                                        background_session_id.clone(),
+                                        &task,
+                                    )
+                                    .await;
+                                }
+                            } else {
+                                tasks.push(task);
+                            }
+                        }
+                        let tasks = tasks
                             .into_iter()
-                            .filter(|task| {
-                                task.owner_scope.as_deref() == Some(background_session_id.as_str())
-                            })
                             .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
                                 task_id: task.id,
                                 program: task.program,
@@ -2572,6 +2574,7 @@ impl InProcessRuntimeClient {
                             });
                         let shell_deadline = parts.request.timeout;
                         let spec = AdoptedTaskSpec {
+                            goal_id: None,
                             owner_scope: Some(session_id.as_str().to_string()),
                             writer_scope: "user-shell".to_string(),
                             // The registry row is a display fact for a process
@@ -6214,6 +6217,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 if killed > 0 {
                     tracing::info!("shutdown reaped {killed} background task(s)");
                 }
+                let terminal = self
+                    .app
+                    .background_tasks()
+                    .local_terminal_snapshots_for_scope(None, |_| true, usize::MAX)
+                    .await;
+                for task in terminal {
+                    if let Some(owner) = &task.owner_scope {
+                        persist_background_task_finished(
+                            &self.app,
+                            SessionId::new(owner.clone()),
+                            &task,
+                        )
+                        .await;
+                    }
+                }
                 self.app.browser().shutdown().await;
                 Ok(())
             }
@@ -7417,6 +7435,14 @@ async fn compact_conversation(
     }
     // What the compaction replaces, for the durable `Compacted` fact below.
     let compacted_from = request_messages.len();
+    let delivered_background_tasks = request_messages
+        .iter()
+        .filter_map(|message| message.origin.as_ref())
+        .flat_map(TranscriptOrigin::delivered_background_task_ids)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .cloned()
+        .collect();
     request_messages.push(Message::text(Role::User, COMPACT_PROMPT));
     let mut request = ModelRequest::new(model.clone(), request_messages);
     let requested_effort = leveler_engine::ModelCallKind::Compaction.default_reasoning_effort();
@@ -7552,7 +7578,9 @@ async fn compact_conversation(
             "{}：\n{summary}",
             leveler_client_protocol::COMPACTION_SUMMARY_PREFIX
         ),
-        TranscriptOrigin::CompactionSummary,
+        TranscriptOrigin::CompactionSummary {
+            delivered_background_tasks,
+        },
     );
     let background_snapshots = match app.background_tasks().try_active_snapshots().await {
         Ok(tasks) => tasks,

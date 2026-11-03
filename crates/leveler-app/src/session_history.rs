@@ -350,10 +350,12 @@ impl EpochWindow {
             else {
                 continue;
             };
-            if messages
-                .iter()
-                .any(|message| message.origin == Some(TranscriptOrigin::CompactionSummary))
-            {
+            if messages.iter().any(|message| {
+                matches!(
+                    message.origin,
+                    Some(TranscriptOrigin::CompactionSummary { .. })
+                )
+            }) {
                 window.rebased_at = Some(index);
             } else if messages.is_empty() && *watermark == 0 {
                 window.dropped_at = Some(index);
@@ -1199,7 +1201,9 @@ mod tests {
                 "{}：\n前面的话题已折叠。",
                 leveler_client_protocol::COMPACTION_SUMMARY_PREFIX
             ),
-            TranscriptOrigin::CompactionSummary,
+            TranscriptOrigin::CompactionSummary {
+                delivered_background_tasks: Vec::new(),
+            },
         )
     }
 

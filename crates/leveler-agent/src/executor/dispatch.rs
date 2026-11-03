@@ -49,6 +49,7 @@ pub(crate) struct CommandFacts {
     /// was observed to finish. Distinct from the call's own outcome: the call
     /// reported a START, and this is the result the start did not have yet.
     pub background_result: Option<BackgroundResultFacts>,
+    pub terminal_task_id: Option<String>,
     /// The task id a command call reported when it only STARTED the process.
     ///
     /// A start is neither a pass nor a failure, so it is never evidence. It is
@@ -123,6 +124,10 @@ pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFact
         stop,
         execution_status,
         background_result,
+        terminal_task_id: metadata
+            .get("terminal_task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         started_task,
     }
 }

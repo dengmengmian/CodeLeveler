@@ -280,6 +280,22 @@ pub fn compact_messages(
         }
     }
     files.truncate(20);
+    // Elided rows are the only record that these terminal facts were already
+    // delivered. The breadcrumb keeps their identities so a later admission
+    // does not inject the same facts again.
+    let mut delivered_background_tasks = Vec::new();
+    for message in middle {
+        if let Some(origin) = &message.origin {
+            for task_id in origin.delivered_background_task_ids() {
+                if !delivered_background_tasks
+                    .iter()
+                    .any(|existing| existing == task_id)
+                {
+                    delivered_background_tasks.push(task_id.clone());
+                }
+            }
+        }
+    }
     let files_note = if files.is_empty() {
         String::new()
     } else {
@@ -299,7 +315,9 @@ pub fn compact_messages(
         ),
     };
     let breadcrumb = Message {
-        origin: Some(TranscriptOrigin::CompactionSummary),
+        origin: Some(TranscriptOrigin::CompactionSummary {
+            delivered_background_tasks,
+        }),
         role: Role::User,
         content: vec![ContentPart::Text { text: body }],
         route: None,
@@ -917,6 +935,61 @@ mod span_tests {
             out.iter()
                 .any(|m| m.text_content().contains(COMPACTION_BREADCRUMB_MARKER)),
             "fold breadcrumb no longer contains the detection marker"
+        );
+    }
+
+    /// A fold deletes the rows that recorded delivery. Their task identities
+    /// have to move onto the breadcrumb, or the next admission injects the
+    /// same terminal facts again.
+    #[test]
+    fn a_fold_keeps_background_facts_already_delivered_in_the_elided_span() {
+        let mut msgs = vec![
+            msg(Role::User, "task"),
+            Message {
+                origin: Some(TranscriptOrigin::BackgroundTaskResults {
+                    task_ids: vec!["bg-stable-1".into()],
+                }),
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: "Background task terminal result: first".into(),
+                }],
+                route: None,
+            },
+            Message {
+                origin: Some(TranscriptOrigin::CompactionSummary {
+                    delivered_background_tasks: vec!["bg-stable-2".into()],
+                }),
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: format!("{COMPACTION_BREADCRUMB_MARKER} earlier fold"),
+                }],
+                route: None,
+            },
+        ];
+        for i in 0..8 {
+            msgs.push(msg(Role::Assistant, &format!("step {i}")));
+        }
+        let out = compact_messages(&msgs, 2, 0, Some("brief"), None);
+        let breadcrumb = out
+            .iter()
+            .find(|message| {
+                matches!(
+                    message.origin,
+                    Some(TranscriptOrigin::CompactionSummary { .. })
+                ) && message
+                    .text_content()
+                    .contains(COMPACTION_BREADCRUMB_MARKER)
+            })
+            .expect("the fold leaves a breadcrumb");
+        let Some(TranscriptOrigin::CompactionSummary {
+            delivered_background_tasks,
+        }) = &breadcrumb.origin
+        else {
+            panic!("breadcrumb lost its origin");
+        };
+        assert_eq!(
+            delivered_background_tasks,
+            &vec!["bg-stable-1".to_string(), "bg-stable-2".to_string()]
         );
     }
 }

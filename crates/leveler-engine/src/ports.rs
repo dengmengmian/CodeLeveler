@@ -205,6 +205,18 @@ pub trait TranscriptSink: Send {
 
     async fn append(&mut self, messages: &[Message]) -> Result<(), PortError>;
 
+    /// Previously committed terminal results, including messages already
+    /// folded out of the live context.
+    async fn delivered_background_task_ids(&mut self) -> Result<Vec<String>, PortError> {
+        Ok(Vec::new())
+    }
+
+    /// The session's durable background results, including facts that landed
+    /// while no turn was running.
+    async fn background_task_results(&mut self) -> Result<Vec<crate::EngineEvent>, PortError> {
+        Ok(Vec::new())
+    }
+
     /// Persist only observed text from a failed invocation. Durable transcript
     /// implementations may attach host metadata for history projection; the
     /// default still uses the same append sink and propagates storage errors.

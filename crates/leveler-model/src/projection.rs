@@ -861,7 +861,9 @@ impl RequestProjection {
                         && text.contains(COMPACTION_BREADCRUMB_MARKER)
                     {
                         classify_transcript_origin(Some(
-                            &crate::TranscriptOrigin::CompactionSummary,
+                            &crate::TranscriptOrigin::CompactionSummary {
+                                delivered_background_tasks: Vec::new(),
+                            },
                         ))
                     } else {
                         classify_transcript_origin(message.origin.as_ref())

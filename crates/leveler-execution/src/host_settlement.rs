@@ -14,7 +14,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{BackgroundSettlement, MutationBaseline, WorkspaceSnapshot, WriteScope};
+use crate::{
+    BackgroundSettlement, BackgroundTaskOrigin, MutationBaseline, WorkspaceSnapshot, WriteScope,
+};
 
 const JOURNAL_VERSION: u32 = 1;
 
@@ -31,6 +33,8 @@ pub struct SemanticTask {
     pub task_id: String,
     pub owner: String,
     pub writer: String,
+    #[serde(default)]
+    pub origin: BackgroundTaskOrigin,
     /// Retained even when a non-Git workspace has no mutation baseline.
     pub write_scope: WriteScope,
     pub baseline: Option<MutationBaseline>,
@@ -78,6 +82,26 @@ impl SettlementJournal {
         baseline: Option<MutationBaseline>,
         write_scope: WriteScope,
     ) -> Result<(), String> {
+        self.prepare_with_origin(
+            task_id,
+            owner,
+            writer,
+            baseline,
+            write_scope,
+            BackgroundTaskOrigin::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_with_origin(
+        &self,
+        task_id: &str,
+        owner: &str,
+        writer: &str,
+        baseline: Option<MutationBaseline>,
+        write_scope: WriteScope,
+        origin: BackgroundTaskOrigin,
+    ) -> Result<(), String> {
         if task_id.is_empty() || owner.is_empty() || writer.is_empty() {
             return Err("semantic admission requires task, session and writer identity".into());
         }
@@ -93,6 +117,7 @@ impl SettlementJournal {
             task_id: task_id.into(),
             owner: owner.into(),
             writer: writer.into(),
+            origin,
             write_scope,
             baseline,
             settlement: None,
@@ -102,6 +127,7 @@ impl SettlementJournal {
             if existing.owner != record.owner
                 || existing.writer != record.writer
                 || existing.write_scope != record.write_scope
+                || existing.origin != record.origin
                 || serde_json::to_vec(&existing.baseline).map_err(|e| e.to_string())?
                     != serde_json::to_vec(&record.baseline).map_err(|e| e.to_string())?
             {
@@ -474,6 +500,31 @@ mod tests {
         assert_eq!(pending[0].owner, "session");
         assert_eq!(pending[0].writer, "writer");
         assert!(pending[0].settlement.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_replacement_runtime_recovers_the_hosted_task_origin() {
+        let state = tempfile::tempdir().unwrap();
+        let origin = BackgroundTaskOrigin {
+            call_id: Some("originating-call".into()),
+            goal_id: Some(leveler_core::GoalId::new("owning-goal")),
+        };
+        SettlementJournal::open(state.path())
+            .unwrap()
+            .prepare_with_origin(
+                "host-recovery",
+                "owning-session",
+                "parent",
+                None,
+                WriteScope::Unrestricted,
+                origin.clone(),
+            )
+            .await
+            .unwrap();
+        let replacement = SettlementJournal::open(state.path()).unwrap();
+        let record = replacement.read("host-recovery").unwrap();
+        assert_eq!(record.owner, "owning-session");
+        assert_eq!(record.origin, origin);
     }
 
     #[tokio::test]

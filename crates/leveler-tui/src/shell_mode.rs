@@ -504,7 +504,13 @@ fn complete_file(
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // `~/` is the user home, not the CodeLeveler state directory. HOME is
+    // empty on some Windows CI hosts; USERPROFILE is the same fallback the
+    // rest of the product uses.
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
+        .map(PathBuf::from)
 }
 
 struct SplitToken<'a> {

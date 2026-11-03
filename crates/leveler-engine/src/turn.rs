@@ -19,7 +19,7 @@ use leveler_core::{GoalId, SessionId, TurnId};
 use leveler_execution::{Approver, Clarifier};
 use leveler_lifecycle::{ObjectiveAnchor, StopReason};
 use leveler_model::{Message, Role};
-use leveler_storage::{EngineStores, MessageStore, ModelRequestStore};
+use leveler_storage::{EngineStores, EventStore, MessageStore, ModelRequestStore};
 
 use crate::log::EventLog;
 use crate::ports::{EventBarrier, ExecutionFence, ModelRequestRecord, PortError, TranscriptSink};
@@ -333,6 +333,7 @@ pub struct TurnRecordedOutcome<T> {
 
 /// A transcript sink that stamps every persisted message with the turn.
 pub struct TurnSink {
+    events: Arc<dyn EventStore>,
     messages: Arc<dyn MessageStore>,
     model_requests: Arc<dyn ModelRequestStore>,
     token: leveler_core::OwnershipToken,
@@ -364,6 +365,33 @@ impl TranscriptSink for TurnSink {
             .await
             .map(Some)
             .map_err(|error| PortError::Persistence(error.to_string()))
+    }
+
+    async fn delivered_background_task_ids(&mut self) -> Result<Vec<String>, PortError> {
+        let rows = self
+            .messages
+            .load(&self.session_id)
+            .await
+            .map_err(|error| PortError::Persistence(error.to_string()))?;
+        let ids = rows
+            .into_iter()
+            .filter_map(|row| serde_json::from_str::<Message>(&row).ok()?.origin)
+            .flat_map(|origin| origin.delivered_background_task_ids().to_vec())
+            .collect();
+        Ok(ids)
+    }
+
+    async fn background_task_results(&mut self) -> Result<Vec<EngineEvent>, PortError> {
+        self.events
+            .load_by_types(&self.session_id, &["background_task_finished"])
+            .await
+            .map_err(|error| PortError::Persistence(error.to_string()))?
+            .into_iter()
+            .map(|row| {
+                EngineEvent::from_payload(&row.payload)
+                    .map_err(|error| PortError::Persistence(error.to_string()))
+            })
+            .collect()
     }
 
     async fn append(&mut self, messages: &[Message]) -> Result<(), PortError> {
@@ -937,6 +965,7 @@ impl TurnRunner<'_> {
         let (events, mut rx, pump_state) =
             EventEmitter::channel(EVENT_BUFFER_CAPACITY, cancellation.clone());
         let sink = TurnSink {
+            events: self.stores.events.clone(),
             budget_scope: budget_scope.clone(),
             messages: self.stores.messages.clone(),
             model_requests: self.stores.model_requests.clone(),

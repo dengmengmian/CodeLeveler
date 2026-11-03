@@ -470,13 +470,21 @@ pub(crate) async fn load_goal_verification_runs(
         };
         // A background task's RESULT is written when it exits, which can be
         // long after its turn closed and under no turn at all. It is attributed
-        // by the CALL that started it, so it is scoped by that call's presence
-        // in this goal rather than by the row's own turn.
+        // by its Goal and the call that started it, never the row's own turn.
+        // Legacy records only carry the call.
         if let EngineEvent::BackgroundTaskFinished {
-            call_id, is_error, ..
+            call_id,
+            goal_id: owner_goal,
+            is_error,
+            status,
+            ..
         } = &event
         {
-            if let Some(run) = background_result_run(&started, call_id, *is_error, mutation_ops) {
+            if owner_goal.as_ref().is_none_or(|owner| owner == goal_id)
+                && status
+                    .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited)
+                && let Some(run) = background_result_run(&started, call_id, *is_error, mutation_ops)
+            {
                 runs.push(run);
             }
             continue;

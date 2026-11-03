@@ -239,6 +239,12 @@ async fn a_finished_background_command_becomes_durable_evidence() {
     .await
     .expect("the durable result is written");
 
+    let (_, payload) = recorded[0].to_row().unwrap();
+    assert!(
+        payload.contains("[stdout] running tests"),
+        "missing durable output: {payload}"
+    );
+
     match &recorded[0] {
         leveler_engine::EngineEvent::BackgroundTaskFinished {
             call_id,
@@ -247,6 +253,7 @@ async fn a_finished_background_command_becomes_durable_evidence() {
             args,
             is_error,
             exit_code,
+            ..
         } => {
             assert_eq!(call_id, "call-bg-ok", "attributed to the starting call");
             assert_eq!(task_id, &id);
@@ -293,10 +300,9 @@ async fn a_failed_background_command_is_recorded_as_a_failure() {
     }
 }
 
-/// A stopped task produced no result. Persisting one would let a cancel count
-/// as evidence.
+/// The durable fact distinguishes an explicit stop from a failed exit.
 #[tokio::test]
-async fn a_stopped_background_command_records_no_result() {
+async fn a_stopped_background_command_records_a_cancelled_fact() {
     let f = fixture().await;
     let mut events = f.runtime.subscribe_session(&f.session);
     f.record_starting_call("call-bg-stop", "cargo", &["test"])
@@ -314,11 +320,27 @@ async fn a_stopped_background_command_records_no_result() {
     }
     f.app.background_tasks().kill(&id).await.expect("kill");
     f.wait_for_events(&mut events).await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(
-        f.result_events().await.is_empty(),
-        "a cancel is not a result"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(event) = f.result_events().await.first() {
+                assert!(
+                    matches!(
+                        event,
+                        leveler_engine::EngineEvent::BackgroundTaskFinished {
+                            status: Some(leveler_execution::BackgroundTaskStatus::Killed),
+                            is_error: true,
+                            ..
+                        }
+                    ),
+                    "{event:?}"
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the durable cancellation fact is written");
 }
 
 /// A task with no recorded starting call (an internal service, a user shell)
@@ -331,4 +353,91 @@ async fn a_task_without_a_starting_call_records_no_result() {
     f.wait_for_events(&mut events).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(f.result_events().await.is_empty(), "no call, no evidence");
+}
+
+/// A competing fact writer must neither duplicate the receipt nor claim a turn.
+#[tokio::test]
+async fn background_fact_append_is_fenced_and_idempotent() {
+    let f = fixture().await;
+    let db = f.app.open_database().await.unwrap();
+    let engine = f.app.task_engine(&db).unwrap();
+    let owner = engine.acquire_ownership(&f.session).await.unwrap();
+    let foreign_boot = leveler_core::BootId::new("different-boot");
+    let (_, payload) = leveler_engine::EngineEvent::BackgroundTaskFinished {
+        call_id: "call-fenced".into(),
+        task_id: "task-fenced".into(),
+        goal_id: None,
+        program: "sh".into(),
+        args: Vec::new(),
+        is_error: false,
+        exit_code: Some(0),
+        status: Some(leveler_execution::BackgroundTaskStatus::Exited),
+        output: "from the owning boot".into(),
+        output_truncated: false,
+    }
+    .to_row()
+    .unwrap();
+    let append = |boot| {
+        db.append_background_task_finished(
+            &f.session,
+            &owner.runtime_id,
+            boot,
+            "task-fenced",
+            &payload,
+            leveler_core::now(),
+        )
+    };
+
+    append(&foreign_boot).await.unwrap();
+    assert!(f.result_events().await.is_empty());
+    tokio::try_join!(append(&owner.boot_id), append(&owner.boot_id)).unwrap();
+    assert_eq!(f.result_events().await.len(), 1);
+    engine.release_ownership(&owner).await.unwrap();
+    append(&owner.boot_id).await.unwrap();
+    assert_eq!(f.result_events().await.len(), 1);
+    let next = engine.acquire_ownership(&f.session).await.unwrap();
+    assert_eq!(Some(next.owner_epoch), owner.owner_epoch.next());
+    engine.release_ownership(&next).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_an_idle_goal_reaps_its_background_process() {
+    let f = fixture().await;
+    let db = f.app.open_database().await.unwrap();
+    let engine = f.app.task_engine(&db).unwrap();
+    let owner = engine.acquire_ownership(&f.session).await.unwrap();
+    let goal = engine
+        .open_goal(&owner, "finish the running command")
+        .await
+        .unwrap();
+    engine.release_ownership(&owner).await.unwrap();
+    let registry = f.app.background_tasks();
+    let id = registry
+        .spawn_with_origin(
+            leveler_execution::ProcessRequest::new(
+                "sh",
+                vec!["-c".into(), "exec sleep 30".into()],
+                f.repo.clone(),
+            ),
+            None,
+            Some(f.session.as_str()),
+            "parent",
+            leveler_execution::BackgroundTaskLifetime::Goal,
+            leveler_execution::BackgroundTaskOrigin {
+                call_id: Some("call-idle".into()),
+                goal_id: Some(goal),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registry.get(&id).await.unwrap().status,
+        leveler_execution::BackgroundTaskStatus::Running
+    );
+    assert!(f.app.cancel_task(&f.session).await.unwrap().is_some());
+    assert_eq!(
+        registry.get(&id).await.unwrap().status,
+        leveler_execution::BackgroundTaskStatus::Killed
+    );
 }

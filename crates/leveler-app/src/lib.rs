@@ -842,7 +842,8 @@ impl Application {
 
         // Project config + env (composition root may read env — AGENTS.md).
         let background_tasks =
-            leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone());
+            leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone())
+                .with_stable_task_ids();
         let background_tasks = Arc::new(match layout.primary_workspace() {
             Some(_) => background_tasks.with_execution_host(execution_host_config(&layout)?),
             None => background_tasks,

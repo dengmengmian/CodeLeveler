@@ -216,18 +216,67 @@ def dogfood_case_totals(record):
 
 
 def pty_rows(record):
+    """The L2 PTY gate is one verdict with a list of critical gates inside it.
+
+    It is NOT a dict of suites keyed by name: iterating it produced one row per
+    metadata field (binary, notes, stages, ...) and never read the gate's own
+    status, so the dashboard reported "13 PTY suite(s)" and a green card while a
+    PTY contract was failing.
+    """
     pty = dig(record, "dogfood", "gate", "layers", "L2", "pty", default=None)
-    rows = []
-    if isinstance(pty, dict):
-        for name in sorted(pty):
-            entry = pty[name] if isinstance(pty[name], dict) else {"status": pty[name]}
+    if not isinstance(pty, dict):
+        return []
+    gates = pty.get("gates")
+    if isinstance(gates, list) and gates:
+        rows = []
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
             rows.append(
                 {
-                    "name": name,
-                    "status": str(entry.get("status", NOT_VERIFIED)).upper(),
-                    "detail": text(entry.get("detail"), ""),
+                    "name": text(gate.get("gate") or gate.get("name")),
+                    "status": str(
+                        gate.get("verdict") or gate.get("status") or NOT_VERIFIED
+                    ).upper(),
+                    "detail": text(gate.get("reason") or gate.get("detail"), ""),
                 }
             )
+        return rows
+    status = pty.get("status")
+    if not status:
+        return []
+    return [
+        {
+            "name": "PTY critical gates",
+            "status": str(status).upper(),
+            "detail": "; ".join(text(note) for note in (pty.get("notes") or [])),
+        }
+    ]
+
+
+def contract_failure_rows(record):
+    """Every L1 contract that is not a pass, with the reason it is not.
+
+    These are the grounds a release is BLOCKED on, so they belong in the report
+    and not only in the release log.
+    """
+    checks = dig(record, "dogfood", "gate", "layers", "L1", "checks", default=[]) or []
+    rows = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status", NOT_VERIFIED)).upper()
+        if status == "PASS":
+            continue
+        rows.append(
+            {
+                "id": text(check.get("id") or check.get("gate")),
+                "name": text(check.get("name"), ""),
+                "status": status,
+                "label": text(check.get("failure_label"), ""),
+                "detail": text(check.get("detail") or check.get("reason"), ""),
+            }
+        )
     return rows
 
 
@@ -375,7 +424,11 @@ def summary_cards(record):
     stages = {row["stage"]: row for row in stage_rows(record)}
     decision = dig(record, "dogfood", "gate", "decision", "decision", default=None)
     pty = pty_rows(record)
-    pty_failed = [p for p in pty if p["status"] == "FAIL"]
+    pty_failed = [p for p in pty if p["status"] != "PASS"]
+    contracts = contract_failure_rows(record)
+    tui_contract_failed = any(
+        row["id"] == "conversation_presentation_contract" for row in contracts
+    )
     post = record.get("post_release") or {}
     fresh = post.get("fresh_install") or {}
     upgrade = post.get("upgrade") or {}
@@ -397,12 +450,24 @@ def summary_cards(record):
         ),
         (
             "TUI / PTY",
-            "FAIL" if pty_failed else (layers.get("L2", {}).get("status", NOT_VERIFIED)),
-            "%d PTY suite(s)" % len(pty),
+            "FAIL"
+            if pty_failed or tui_contract_failed
+            else str(
+                dig(
+                    record, "dogfood", "gate", "layers", "L2", "pty", "status",
+                    default=layers.get("L2", {}).get("status", NOT_VERIFIED),
+                )
+            ).upper(),
+            "%d PTY gate(s)" % len(pty),
         ),
         (
             "Feature coverage",
-            layers.get("L3", {}).get("status", NOT_VERIFIED),
+            str(
+                dig(
+                    record, "dogfood", "gate", "feature_coverage", "status",
+                    default=NOT_VERIFIED,
+                )
+            ).upper(),
             "core %s%%" % text(dig(record, "dogfood", "gate", "feature_coverage", "summary", "coverage_core_percent")),
         ),
         (
@@ -664,11 +729,30 @@ def render_version(record):
         parts.append(table(["Measure", "Value"], [(esc(k), esc(v)) for k, v in cov]))
     pty = pty_rows(record)
     if pty:
-        parts.append("<h3>PTY suites</h3>")
+        parts.append("<h3>PTY gates</h3>")
         parts.append(
             table(
-                ["Suite", "Status", "Detail"],
+                ["Gate", "Status", "Detail"],
                 [(esc(p["name"]), ("badge", p["status"]), esc(p["detail"])) for p in pty],
+            )
+        )
+
+    # Contracts: the reasons a release is blocked, not just the layer verdict.
+    contracts = contract_failure_rows(record)
+    if contracts:
+        parts.append("<h3>Contract failures</h3>")
+        parts.append(
+            table(
+                ["Contract", "Status", "Failure label", "Detail"],
+                [
+                    (
+                        esc(r["id"]),
+                        ("badge", r["status"]),
+                        esc(r["label"]),
+                        esc(r["detail"] or r["name"]),
+                    )
+                    for r in contracts
+                ],
             )
         )
 

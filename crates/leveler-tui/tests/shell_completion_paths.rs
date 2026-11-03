@@ -285,13 +285,18 @@ fn dot_relative_and_absolute_paths_resolve_against_the_shell_cwd() {
         displays(&s)
     );
 
-    // Absolute prefix.
-    let absolute = format!("{}/scripts/bu", root.display());
+    // Use a shell path: bare backslashes are escape characters.
+    let directory = if cfg!(windows) {
+        root.to_string_lossy().replace('\\', "/")
+    } else {
+        root.to_string_lossy().into_owned()
+    };
+    let absolute = format!("{directory}/scripts/bu");
     let mut s = typed_into(&root, &format!("cat {absolute}"));
     tab(&mut s);
     assert_eq!(
         s.composer.text(),
-        format!("cat {}/scripts/build.sh", root.display())
+        format!("cat {directory}/scripts/build.sh")
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -470,34 +475,23 @@ fn a_quoted_directory_prefix_drills_and_quotes_the_file() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `~/` lists HOME while the inserted candidate keeps the user's `~/` spelling.
+/// `~/` lists the user's home while the replacement keeps its tilde.
 #[test]
 fn home_relative_completion_keeps_the_tilde_in_the_replacement() {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
-    let probe = home.join("leveler-home-probe");
-    let _ = std::fs::create_dir_all(&probe);
-    let name = "leveler-home-probe";
-    let Ok(mut entries) = std::fs::read_dir(&home) else {
-        return;
-    };
-    let unique = !entries.any(|entry| {
-        entry
-            .ok()
-            .and_then(|e| e.file_name().into_string().ok())
-            .is_some_and(|n| n.starts_with("leveler-home"))
-    });
-    if !unique {
-        // A sibling probe directory already exists; the prefix is ambiguous and
-        // the assertion below would not describe completion behaviour.
-        let _ = std::fs::remove_dir_all(&probe);
-        return;
-    }
     let root = fixture("homekeep");
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
+        .map(std::path::PathBuf::from)
+        .expect("user home directory");
+    let name = root.file_name().unwrap().to_str().unwrap();
+    let probe = home.join(name);
+    std::fs::create_dir(&probe).unwrap();
     let mut s = typed_into(&root, &format!("cat ~/{name}"));
     tab(&mut s);
+    std::fs::remove_dir(&probe).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(s.composer.text(), format!("cat ~/{name}/"));
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&probe);
 }
 
 /// A `cd`-style prefix inside a compound line completes only the segment's

@@ -18,6 +18,7 @@ use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEv
 use leveler_execution::{BackgroundTaskLifetime, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
+use leveler_storage::EventStore as _;
 use leveler_test_support::{MockResponse, MockServer};
 
 fn isolate_global_config() {
@@ -149,6 +150,25 @@ impl Fixture {
             .expect("spawn the service")
     }
 
+    async fn wait_for_task_exit(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<leveler_execution::BackgroundTaskEvent>,
+        task: &str,
+    ) -> leveler_execution::BackgroundTaskSnapshot {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let leveler_execution::BackgroundTaskEvent::Exited { task: snapshot, .. } =
+                    events.recv().await.unwrap()
+                    && snapshot.id == task
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("the original process reaches a terminal state")
+    }
+
     /// Wait until a call of `name` is announced, then report when.
     async fn wait_for_tool_call(
         &self,
@@ -188,6 +208,30 @@ impl Fixture {
                     .map(|body| &body[body.len().saturating_sub(600)..])
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Block until `count` terminal facts are rows in the event log.
+    ///
+    /// The admission cap reads this log. A registry snapshot that has not been
+    /// written yet is not the fact the next process would recover.
+    async fn wait_for_durable_results(&self, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let db = self.app.open_database().await.expect("database");
+            let rows = db
+                .load_by_types(&self.session, &["background_task_finished"])
+                .await
+                .expect("load terminal facts");
+            if rows.len() >= count {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "durable terminal facts stalled at {} of {count}",
+                rows.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -353,6 +397,7 @@ async fn two_steers_during_a_wait_both_reach_the_same_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
     let f = fixture().await;
+    let mut background = f.app.background_tasks().subscribe();
     // The exit and the steer must land together, but a wall-clock sleep makes
     // that a machine-speed race. The service waits for the trigger the test
     // writes immediately after the steer, so both facts are in flight at once.
@@ -399,12 +444,173 @@ async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
     std::fs::write(f.repo.join("exit-flag"), b"").unwrap();
     steer.await.unwrap().unwrap();
     f.wait_for_turn_end(&mut rx).await;
-    // Whether the exit or the steer wins the race, both facts must reach the
-    // model: the exit as its result, the steer as the user's own words.
-    f.wait_for_request_containing("tests done").await;
+    let terminal = f.wait_for_task_exit(&mut background, &task).await;
+    assert_eq!(terminal.exit_code, Some(0));
+    assert!(terminal.log.contains("tests done"));
+    // Always admit another real model request after the terminal event. The
+    // steered round can legitimately have taken its context snapshot first.
+    // The following request must carry the result either way, without the
+    // model issuing a second wait, and the steer must also have arrived.
+    f.server.push(text("已核对结果。")).await;
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "核对完成结果。".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+    let bodies = f.server.request_bodies().await;
+    assert!(bodies.last().unwrap().contains("tests done"));
     f.wait_for_request_containing("进展如何").await;
     let snapshots = f.app.background_tasks().try_all_snapshots().await.unwrap();
     assert_eq!(snapshots.len(), 1, "no second task was started");
+}
+
+/// The process cannot exit until the first steered turn has answered. Its
+/// eventual result must reach a new request without another observation tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_fact_after_the_steered_turn_reaches_the_next_request() {
+    let f = fixture().await;
+    let mut background = f.app.background_tasks().subscribe();
+    let task = f
+        .start_service(
+            "while [ ! -f exit-flag ]; do sleep 0.05; done; printf 'late exit marker\\n'; exit 7",
+        )
+        .await;
+    let mut second_background = f.app.background_tasks().subscribe();
+    let second = f
+        .start_service(
+            "while [ ! -f exit-flag ]; do sleep 0.05; done; printf 'second exit marker\\n'; exit 0",
+        )
+        .await;
+    f.server
+        .push(tool_call(
+            "call-wait",
+            "wait_task",
+            serde_json::json!({ "task_id": task }),
+        ))
+        .await;
+    f.server.push(text("Still running.")).await;
+    f.server.push(text("The task exited.")).await;
+    f.server.push(text("The result is already recorded.")).await;
+    f.server
+        .push(MockResponse::json_ok(
+            &serde_json::json!({
+                "id": "compact-response",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Compacted conversation."},
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        ))
+        .await;
+    f.server.push(text("Continue.")).await;
+    let mut rx = f.client.subscribe();
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "Start and verify.".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_tool_call(&mut rx, "wait_task").await;
+    f.client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: f.session.clone(),
+            content: "Status?".into(),
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+    std::fs::write(f.repo.join("exit-flag"), b"").unwrap();
+    let (snapshot, second_snapshot) = tokio::join!(
+        f.wait_for_task_exit(&mut background, &task),
+        f.wait_for_task_exit(&mut second_background, &second),
+    );
+    assert_eq!(snapshot.exit_code, Some(7));
+    assert!(snapshot.log.contains("late exit marker"));
+    assert_eq!(second_snapshot.exit_code, Some(0));
+    assert!(second_snapshot.log.contains("second exit marker"));
+
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "Continue checking the result.".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+    let bodies = f.server.request_bodies().await;
+    let request = bodies.last().expect("the next turn requested a model");
+    assert!(request.contains("late exit marker"));
+    assert!(request.contains(&task));
+    assert!(request.contains("second exit marker"));
+    assert!(request.contains(&second));
+
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "Review the report.".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+    let bodies = f.server.request_bodies().await;
+    let request = bodies.last().expect("another model request was admitted");
+    assert_eq!(
+        request.matches("Background task terminal result:").count(),
+        2
+    );
+
+    f.client
+        .send(ClientCommand::CompactContext {
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await.unwrap() {
+                RuntimeEvent::ContextCompacted { .. } => break,
+                RuntimeEvent::TurnFailed { error, .. } => panic!("compaction failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("compaction completes");
+    let db = f.app.open_database().await.unwrap();
+    let transcript = leveler_storage::MessageRepository::new(&db)
+        .load(&f.session)
+        .await
+        .unwrap();
+    assert_eq!(
+        transcript.len(),
+        1,
+        "compaction really replaced the transcript"
+    );
+
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "Continue with the summary.".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+    f.wait_for_request_containing("Continue with the summary.")
+        .await;
+    let bodies = f.server.request_bodies().await;
+    let request = bodies.last().unwrap();
+    assert!(request.contains("Compacted conversation."));
+    assert!(!request.contains("Background task terminal result:"));
 }
 
 /// A message that arrives while the turn is already finalizing has no round
@@ -473,4 +679,189 @@ async fn a_steer_landing_after_the_last_round_is_still_delivered() {
 
     f.wait_for_request_containing("最后一句：结果如何").await;
     f.app.background_tasks().kill(&task).await.ok();
+}
+
+fn terminal_result_count(body: &str) -> usize {
+    body.matches("Background task terminal result:").count()
+}
+
+/// Nine finished tasks are waiting before any model request. One admission
+/// carries eight notices. The ninth reaches the next admission, and a third
+/// admission does not mint any of them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nine_undelivered_terminal_facts_drain_without_dropping_the_last() {
+    let f = fixture().await;
+    // The session bridge is what writes the exit into the event log. It has
+    // to be listening before the processes finish.
+    let _events = f.client.subscribe_session(&f.session);
+    let mut ids = Vec::new();
+    for index in 0..9 {
+        ids.push(
+            f.start_service(&format!("printf 'FACT9_{index:02}\\n'; exit 0"))
+                .await,
+        );
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshots = f.app.background_tasks().try_all_snapshots().await.unwrap();
+        let settled = ids.iter().all(|id| {
+            snapshots
+                .iter()
+                .any(|task| task.id == *id && task.status.is_terminal())
+        });
+        if settled {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a spawned task never reached a terminal snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    f.wait_for_durable_results(9).await;
+
+    let mut rx = f.client.subscribe();
+    for (label, expect_notices) in [
+        ("第一轮核对。", 8),
+        ("第二轮核对。", 9),
+        ("第三轮核对。", 9),
+    ] {
+        f.server.push(text("已记录。")).await;
+        f.client
+            .send(ClientCommand::SubmitMessage {
+                session_id: f.session.clone(),
+                content: label.into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        f.wait_for_turn_end(&mut rx).await;
+        let bodies = f.server.request_bodies().await;
+        let request = bodies
+            .iter()
+            .rev()
+            .find(|body| body.contains(label))
+            .expect("the admission was sent");
+        assert_eq!(
+            terminal_result_count(request),
+            expect_notices,
+            "{label} carried the wrong number of terminal notices"
+        );
+    }
+    let bodies = f.server.request_bodies().await;
+    let first = bodies
+        .iter()
+        .find(|body| body.contains("第一轮核对。"))
+        .unwrap();
+    let second = bodies
+        .iter()
+        .find(|body| body.contains("第二轮核对。"))
+        .unwrap();
+    let deferred = (0..9)
+        .find(|index| !first.contains(&format!("FACT9_{index:02}")))
+        .expect("the first admission must leave one fact for the next one");
+    assert!(
+        second.contains(&format!("FACT9_{deferred:02}")),
+        "deferred fact FACT9_{deferred:02} never reached the next request"
+    );
+    let third = bodies
+        .iter()
+        .find(|body| body.contains("第三轮核对。"))
+        .unwrap();
+    for index in 0..9 {
+        assert!(
+            third.contains(&format!("FACT9_{index:02}")),
+            "FACT9_{index:02} was dropped from the transcript"
+        );
+    }
+}
+
+/// The fact is already inside the request that failed. The retry sends that
+/// same request, and the following turn does not drop the fact or inject it
+/// a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_failure_retries_the_request_that_already_holds_the_fact() {
+    let f = fixture().await;
+    let _events = f.client.subscribe_session(&f.session);
+    let id = f
+        .start_service("printf 'provider-retry-marker\\n'; exit 0")
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshots = f.app.background_tasks().try_all_snapshots().await.unwrap();
+        if snapshots
+            .iter()
+            .any(|task| task.id == id && task.status.is_terminal())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the task never exited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    f.wait_for_durable_results(1).await;
+
+    f.server
+        .push(MockResponse::TruncatedBody {
+            body: String::new(),
+            content_type: "text/event-stream".into(),
+        })
+        .await;
+    f.server.push(text("已恢复。")).await;
+
+    let mut rx = f.client.subscribe();
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "看刚才的结果。".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+
+    let bodies = f.server.request_bodies().await;
+    assert!(
+        bodies.len() >= 2,
+        "an empty provider body must be retried, saw {}",
+        bodies.len()
+    );
+    assert!(
+        bodies[0].contains("provider-retry-marker"),
+        "the failed request was sent without the terminal fact"
+    );
+    assert!(
+        bodies[1].contains("provider-retry-marker"),
+        "the retry dropped the terminal fact"
+    );
+    assert_eq!(
+        terminal_result_count(&bodies[0]),
+        terminal_result_count(&bodies[1]),
+        "the retry was not the same admitted request"
+    );
+
+    f.server.push(text("没有重复。")).await;
+    f.client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "再核对一次。".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    f.wait_for_turn_end(&mut rx).await;
+    let bodies = f.server.request_bodies().await;
+    let last = bodies
+        .iter()
+        .rev()
+        .find(|body| body.contains("再核对一次。"))
+        .expect("the follow-up admission was sent");
+    assert_eq!(
+        terminal_result_count(last),
+        1,
+        "the fact was injected again after the failed request"
+    );
+    assert!(last.contains("provider-retry-marker"));
 }

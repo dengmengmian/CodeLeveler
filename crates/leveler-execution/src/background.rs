@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use leveler_core::GoalId;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -155,6 +156,13 @@ pub struct BackgroundTaskSnapshot {
     /// stopped by their owner through the runtime; daemon-scoped tasks have no
     /// owner and are not addressable by a client session.
     pub owner_scope: Option<String>,
+    /// Goal that admitted this process, if it was started during goal work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<GoalId>,
+    /// Starting tool call, captured with the process fact so later registry
+    /// eviction cannot remove its attribution from an already emitted event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_call_id: Option<String>,
     /// True when the retained log dropped earlier bytes. The marker is also in
     /// the log; this is the machine-readable form for projections.
     #[serde(default)]
@@ -234,6 +242,13 @@ pub struct BackgroundTaskObservation {
     pub log_remaining: bool,
 }
 
+/// The runtime-stamped origin of a tool process.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackgroundTaskOrigin {
+    pub call_id: Option<String>,
+    pub goal_id: Option<GoalId>,
+}
+
 /// Metadata for adopting an already-running foreground process.
 ///
 /// The process itself arrives in a [`ProcessHandoff`]; this is only the
@@ -242,6 +257,7 @@ pub struct BackgroundTaskObservation {
 #[derive(Clone)]
 pub struct AdoptedTaskSpec {
     pub owner_scope: Option<String>,
+    pub goal_id: Option<GoalId>,
     pub writer_scope: String,
     pub program: String,
     pub args: Vec<String>,
@@ -399,6 +415,7 @@ struct TaskInner {
     /// no owner. Session-owned task cleanup follows `lifetime`; runtime shutdown
     /// reaps every remaining task regardless of lifetime (R004 F7).
     owner_scope: Option<String>,
+    origin: BackgroundTaskOrigin,
     writer_scope: String,
     write_scope: crate::WriteScope,
     lifetime: BackgroundTaskLifetime,
@@ -454,6 +471,7 @@ struct TaskInner {
 #[derive(Clone)]
 pub struct BackgroundTaskRegistry {
     instance_identity: Arc<str>,
+    stable_task_ids: bool,
     inner: Arc<Mutex<RegistryState>>,
     /// Spawn reservations live outside the async mutex so dropping a
     /// cancelled spawn future can release its slot synchronously.
@@ -478,16 +496,12 @@ impl Default for BackgroundTaskRegistry {
 
 #[derive(Default)]
 struct RegistryState {
-    tasks: HashMap<String, TaskInner>,
     next: u64,
+    tasks: HashMap<String, TaskInner>,
     /// Observed readiness, keyed by task id. Kept beside the task records
     /// because a host-owned task's record lives in the Execution Host while
     /// its readiness is observed by this runtime.
     readiness: HashMap<String, TaskReadiness>,
-    /// The starting tool call of each task, keyed by task id. Registry-side so
-    /// a host-owned task (whose record lives in the Execution Host) still
-    /// answers "which call asked for this?" when it exits.
-    origins: HashMap<String, String>,
 }
 
 impl RegistryState {
@@ -603,6 +617,7 @@ impl BackgroundTaskRegistry {
         let (lifecycle_events, _) = broadcast::channel(256);
         Self {
             instance_identity: Arc::from(leveler_core::new_uuid_string()),
+            stable_task_ids: false,
             inner: Arc::new(Mutex::new(RegistryState::default())),
             pending_spawns: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -613,6 +628,21 @@ impl BackgroundTaskRegistry {
             hosted_monitors: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             runner: CommandRunner::with_environment(environment),
             lifecycle_events,
+        }
+    }
+
+    /// Use globally unique task identities when facts outlive this registry.
+    pub fn with_stable_task_ids(mut self) -> Self {
+        self.stable_task_ids = true;
+        self
+    }
+
+    fn next_local_task_id(&self, state: &mut RegistryState) -> String {
+        state.next += 1;
+        if self.stable_task_ids {
+            format!("bg-{}-{}", self.instance_identity, state.next)
+        } else {
+            format!("bg-{}", state.next)
         }
     }
 
@@ -769,6 +799,60 @@ impl BackgroundTaskRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Read terminal local tool tasks for one owner without moving a log
+    /// cursor, reconciling mutations, or making an execution-host request.
+    pub async fn local_terminal_snapshots_for_scope(
+        &self,
+        scope: Option<&str>,
+        is_pending: impl Fn(&str) -> bool + Send,
+        limit: usize,
+    ) -> Vec<BackgroundTaskSnapshot> {
+        let state = self.inner.lock().await;
+        let mut tasks: Vec<_> = state
+            .tasks
+            .values()
+            .filter(|task| {
+                task.owner_scope
+                    .as_deref()
+                    .is_some_and(|owner| scope.is_none_or(|scope| scope == owner))
+                    && task.status.is_terminal()
+                    && task.origin.call_id.is_some()
+                    && is_pending(&task.id)
+            })
+            .collect();
+        tasks.sort_by(|a, b| a.finished.cmp(&b.finished).then_with(|| a.id.cmp(&b.id)));
+        tasks.into_iter().take(limit).map(snapshot).collect()
+    }
+
+    /// Terminal process facts retained by the Execution Host. Reading the
+    /// atomic archive neither claims a process nor acknowledges its result.
+    pub fn hosted_terminal_snapshots_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        let Some(config) = &self.execution_host else {
+            return Ok(Vec::new());
+        };
+        let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
+        let mut tasks: Vec<_> = records
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.snapshot.status.is_terminal()
+                    && task.snapshot.owner_scope.as_deref() == Some(scope)
+            })
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.finished_at_ms
+                .cmp(&b.finished_at_ms)
+                .then_with(|| a.snapshot.id.cmp(&b.snapshot.id))
+        });
+        Ok(tasks
+            .into_iter()
+            .map(|task| task.snapshot.clone())
+            .collect())
     }
 
     pub async fn try_all_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
@@ -1061,7 +1145,7 @@ impl BackgroundTaskRegistry {
         owner: Option<&str>,
         writer: &str,
         lifetime: BackgroundTaskLifetime,
-        origin_call_id: Option<String>,
+        origin: BackgroundTaskOrigin,
     ) -> Result<String, String> {
         let owner = owner.ok_or("hosted service requires a creating session")?;
         let config = self
@@ -1070,19 +1154,22 @@ impl BackgroundTaskRegistry {
             .ok_or("persistent execution is not configured")?;
         let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
         let id = format!("host-{}", crate::execution_host::fresh_id()?);
-        // Register the starting call BEFORE the process can exist: a hosted
-        // task may exit while the spawn reply is still in flight.
-        if let Some(call_id) = origin_call_id {
-            self.inner.lock().await.origins.insert(id.clone(), call_id);
-        }
+        // The semantic admission is durable before the process can exist.
+        // A later runtime can attribute an exit from the same Execution Host.
         self.journal()?
-            .prepare_with_scope(&id, owner, writer, baseline, request.write_scope.clone())
+            .prepare_with_origin(
+                &id,
+                owner,
+                writer,
+                baseline,
+                request.write_scope.clone(),
+                origin,
+            )
             .await?;
         // Transport failure is ambiguous: retain the prepared write reservation.
         let task = match client.spawn(&id, request, owner, writer, lifetime).await {
             Ok(task) => task,
             Err(crate::execution_host::SpawnError::Rejected(error)) => {
-                self.inner.lock().await.origins.remove(&id);
                 self.journal()?.abandon_prepared(&id)?;
                 return Err(error);
             }
@@ -1238,6 +1325,29 @@ impl BackgroundTaskRegistry {
         lifetime: BackgroundTaskLifetime,
         origin_call_id: Option<String>,
     ) -> Result<String, String> {
+        self.spawn_with_origin(
+            request,
+            mutation_baseline,
+            owner_scope,
+            writer_scope,
+            lifetime,
+            BackgroundTaskOrigin {
+                call_id: origin_call_id,
+                goal_id: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn spawn_with_origin(
+        &self,
+        request: ProcessRequest,
+        mutation_baseline: Option<MutationBaseline>,
+        owner_scope: Option<&str>,
+        writer_scope: &str,
+        lifetime: BackgroundTaskLifetime,
+        origin: BackgroundTaskOrigin,
+    ) -> Result<String, String> {
         // A dev server / watcher belongs to the persistent execution substrate,
         // not to the generation that happened to launch it: `Runtime` is
         // therefore hosted exactly like `Session`/`Persistent`. That is what
@@ -1260,7 +1370,7 @@ impl BackgroundTaskRegistry {
                     owner_scope,
                     writer_scope,
                     lifetime,
-                    origin_call_id,
+                    origin,
                 )
                 .await;
         }
@@ -1276,9 +1386,8 @@ impl BackgroundTaskRegistry {
                 ));
             }
             self.pending_spawns.fetch_add(1, Ordering::AcqRel);
-            st.next += 1;
             (
-                format!("bg-{}", st.next),
+                self.next_local_task_id(&mut st),
                 SpawnReservation::new(self.pending_spawns.clone()),
             )
         };
@@ -1321,9 +1430,6 @@ impl BackgroundTaskRegistry {
 
         let mut st = self.inner.lock().await;
         self.kill_on_drop.insert(id.clone(), identity);
-        if let Some(call_id) = origin_call_id {
-            st.origins.insert(id.clone(), call_id);
-        }
         let process = reservation.take_process();
         st.tasks.insert(
             id.clone(),
@@ -1332,6 +1438,7 @@ impl BackgroundTaskRegistry {
                 terminal: None,
                 id: id.clone(),
                 owner_scope: owner_scope.map(str::to_string),
+                origin,
                 writer_scope: writer_scope.to_string(),
                 write_scope: request.write_scope.clone(),
                 lifetime,
@@ -1546,18 +1653,11 @@ impl BackgroundTaskRegistry {
             let stdout_task = handoff.stdout_task;
             let stderr_task = handoff.stderr_task;
             let drain = handoff.drain;
-            st.next += 1;
-            let id = format!("bg-{}", st.next);
+            let id = self.next_local_task_id(&mut st);
             let done = Arc::new(Notify::new());
             let changed = Arc::new(Notify::new());
             let mut log = leveler_core::sanitize_terminal_output(&spec.initial_output);
             let log_prefix_len = truncate_log(&mut log).unwrap_or(0);
-            // The adopted process came from a tool call whose result the model
-            // has not seen yet: the call reported a start. Keep the link so its
-            // real outcome is attributable when it exits.
-            if let Some(call_id) = spec.origin_call_id.clone() {
-                st.origins.insert(id.clone(), call_id);
-            }
             st.tasks.insert(
                 id.clone(),
                 TaskInner {
@@ -1565,6 +1665,10 @@ impl BackgroundTaskRegistry {
                     terminal: None,
                     id: id.clone(),
                     owner_scope: spec.owner_scope.clone(),
+                    origin: BackgroundTaskOrigin {
+                        call_id: spec.origin_call_id.clone(),
+                        goal_id: spec.goal_id.clone(),
+                    },
                     writer_scope: spec.writer_scope.clone(),
                     write_scope: spec.write_scope.clone(),
                     lifetime: spec.lifetime,
@@ -1935,10 +2039,13 @@ impl BackgroundTaskRegistry {
         self.inner.lock().await.readiness.get(id).cloned()
     }
 
-    /// The tool call that started one task, if this runtime observed the spawn.
-    /// Read-only; the record is retained until the registry prunes the task.
-    pub async fn origin_call_id_of(&self, id: &str) -> Option<String> {
-        self.inner.lock().await.origins.get(id).cloned()
+    /// The trusted tool and Goal attribution retained at task admission.
+    pub fn hosted_task_origin(&self, id: &str, owner: &str) -> Option<BackgroundTaskOrigin> {
+        if !id.starts_with("host-") {
+            return None;
+        }
+        let admission = self.journal().ok()?.read(id).ok()?;
+        (admission.owner == owner).then_some(admission.origin)
     }
 
     pub async fn get_authorized(
@@ -2635,13 +2742,18 @@ impl BackgroundTaskRegistry {
     /// holds its lock across process I/O, so this synchronization is bounded
     /// to an in-memory snapshot; process signalling happens only when the
     /// caller settles the ticket later.
-    pub async fn detach_cleanup(&self, scope: &str) -> BackgroundCleanupTicket {
+    pub async fn detach_cleanup(
+        &self,
+        scope: &str,
+        goal_id: Option<&GoalId>,
+    ) -> BackgroundCleanupTicket {
         let ids = {
             let st = self.inner.lock().await;
             st.tasks
                 .values()
                 .filter(|task| {
                     task.owner_scope.as_deref() == Some(scope)
+                        && task.origin.goal_id.as_ref() == goal_id
                         && task.lifetime == BackgroundTaskLifetime::Goal
                         && !task.status.is_terminal()
                 })
@@ -2831,7 +2943,6 @@ fn prune_terminal_tasks(state: &mut RegistryState) {
     for (_, id) in terminal.into_iter().take(remove_count) {
         state.tasks.remove(&id);
         state.readiness.remove(&id);
-        state.origins.remove(&id);
     }
 }
 
@@ -3129,6 +3240,8 @@ fn snapshot_with_log(task: &TaskInner, log: String) -> BackgroundTaskSnapshot {
         duration_ms,
         pid: task.pid,
         owner_scope: task.owner_scope.clone(),
+        goal_id: task.origin.goal_id.clone(),
+        origin_call_id: task.origin.call_id.clone(),
         log_truncated: task.log_prefix_len > 0,
         ready: None,
         silent_ms: task
@@ -3282,6 +3395,7 @@ mod tests {
                 rx,
                 AdoptedTaskSpec {
                     owner_scope: Some("session".into()),
+                    goal_id: None,
                     writer_scope: "user-shell".into(),
                     program: "sh".into(),
                     args: vec!["-c".into(), "echo before; sleep 1; echo after".into()],
@@ -3372,6 +3486,7 @@ mod tests {
                 rx,
                 AdoptedTaskSpec {
                     owner_scope: Some("session".into()),
+                    goal_id: None,
                     writer_scope: "user-shell".into(),
                     program: "sh".into(),
                     args: vec!["-c".into(), "echo linked; sleep 0.2".into()],
@@ -3455,6 +3570,7 @@ mod tests {
                 rx,
                 AdoptedTaskSpec {
                     owner_scope: Some("session".into()),
+                    goal_id: None,
                     writer_scope: "user-shell".into(),
                     program: "sh".into(),
                     args: vec!["-c".into(), "sleep 30".into()],
@@ -3536,6 +3652,7 @@ mod tests {
                 rx,
                 AdoptedTaskSpec {
                     owner_scope: Some("session".into()),
+                    goal_id: None,
                     writer_scope: "parent".into(),
                     program: "sh".into(),
                     args: vec!["-c".into(), "sleep 30".into()],
@@ -3610,6 +3727,7 @@ mod tests {
                 tokio::sync::mpsc::channel(64).1,
                 AdoptedTaskSpec {
                     owner_scope: Some("session".into()),
+                    goal_id: None,
                     writer_scope: "user-shell".into(),
                     program: "sh".into(),
                     args: vec!["-c".into(), "sleep 30".into()],
@@ -3921,6 +4039,7 @@ mod tests {
                     terminal: None,
                     id,
                     owner_scope: None,
+                    origin: BackgroundTaskOrigin::default(),
                     writer_scope: "parent".into(),
                     write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Goal,
@@ -3964,6 +4083,7 @@ mod tests {
                     terminal: None,
                     id: id.into(),
                     owner_scope: None,
+                    origin: BackgroundTaskOrigin::default(),
                     writer_scope: "parent".into(),
                     write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Goal,
@@ -4022,6 +4142,7 @@ mod tests {
             terminal: None,
             id: "done".into(),
             owner_scope: None,
+            origin: BackgroundTaskOrigin::default(),
             writer_scope: "parent".into(),
             write_scope: crate::WriteScope::Unrestricted,
             lifetime: BackgroundTaskLifetime::Goal,
@@ -4067,6 +4188,7 @@ mod tests {
             terminal: None,
             id: "done".into(),
             owner_scope: Some("owner".into()),
+            origin: BackgroundTaskOrigin::default(),
             writer_scope: "parent".into(),
             write_scope: crate::WriteScope::Unrestricted,
             lifetime: BackgroundTaskLifetime::Goal,

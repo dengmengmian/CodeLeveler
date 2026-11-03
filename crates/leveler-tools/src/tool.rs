@@ -47,6 +47,8 @@ pub struct ToolContext {
     /// The tool call being dispatched. The host stamps this per call, so a
     /// tool can attribute a write to the exact call that requested it.
     pub tool_call_scope: Option<Arc<str>>,
+    /// Goal bound by the host when this call begins, for process ownership.
+    pub background_goal: Option<leveler_core::GoalId>,
     /// Execution writer within the session. Unlike session identity, this
     /// ends when a delegated writer releases its exclusive path ownership.
     pub writer_scope: Option<Arc<str>>,
@@ -404,6 +406,7 @@ impl ToolContext {
             },
             session_scope: None,
             tool_call_scope: None,
+            background_goal: None,
             writer_scope: None,
             command_lease: None,
             output: None,

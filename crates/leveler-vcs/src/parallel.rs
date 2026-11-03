@@ -140,17 +140,18 @@ mod tests {
         let result = GitWorkflow::new(&dir)
             .remove_worktree(&path, "candidate", &CancellationToken::new())
             .await;
-        let error = format!("{result:?}");
         let retained = path.exists();
         run_git(&dir, &["worktree", "unlock", path_arg]);
         run_git(&dir, &["worktree", "remove", "--force", path_arg]);
         run_git(&dir, &["branch", "-D", "candidate"]);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(retained, "a lock must prevent removal");
-        assert!(
-            error.contains("locked") && error.contains(path_arg),
-            "cleanup must report the locked worktree and original error: {error}"
-        );
+        let Err(VcsError::Git { args, code, stderr }) = result else {
+            panic!("cleanup must report the original Git failure: {result:?}");
+        };
+        assert_eq!(args, ["worktree", "remove", "--force", path_arg]);
+        assert!(code.is_some_and(|code| code != 0));
+        assert!(stderr.contains("locked"), "unexpected Git error: {stderr}");
     }
 
     #[tokio::test]

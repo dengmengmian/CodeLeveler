@@ -162,13 +162,16 @@ impl CommandExecution {
         // decides whether goal terminal cleanup includes it; daemon-scoped
         // spawning remains reserved for runtime-internal services.
         match reg
-            .spawn_for_writer(
+            .spawn_with_origin(
                 req,
                 mutation_baseline,
                 Some(context.session_scope()),
                 context.writer_scope(),
                 lifetime,
-                context.tool_call_scope.as_deref().map(str::to_string),
+                leveler_execution::BackgroundTaskOrigin {
+                    call_id: context.tool_call_scope.as_deref().map(str::to_string),
+                    goal_id: context.background_goal.clone(),
+                },
             )
             .await
         {
@@ -712,6 +715,7 @@ impl CommandExecution {
                 let started = parts.started;
                 let spec = AdoptedTaskSpec {
                     owner_scope: Some(context.session_scope().to_string()),
+                    goal_id: context.background_goal.clone(),
                     writer_scope: context.writer_scope().to_string(),
                     // The call that is being handed over: its result is still
                     // the START, so the eventual exit has to be attributable to

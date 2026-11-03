@@ -1180,3 +1180,32 @@ async fn a_settled_goal_reaps_its_services_even_when_the_session_looks_resumable
     // Settled means no window can follow: the service must not outlive it.
     assert_terminal_within(&h.registry, "bg-1", "settled goal").await;
 }
+
+#[tokio::test]
+async fn goal_completion_does_not_reap_background_work_it_did_not_start() {
+    let h = harness(vec![
+        spawn_sleep_server(),
+        tool_call(
+            "closeout",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+    ])
+    .await;
+    let unrelated = h
+        .registry
+        .spawn_owned(sleep_request(h.dir.path()), None, Some(SESSION_SCOPE))
+        .await
+        .expect("existing session work");
+    let s = spec(&h, "start a service and finish");
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("the goal settles");
+
+    assert_terminal_within(&h.registry, "bg-2", "this goal's task").await;
+    let surviving = h.registry.get(&unrelated).await.unwrap();
+    assert_eq!(surviving.status, BackgroundTaskStatus::Running);
+    h.registry.kill(&unrelated).await.unwrap();
+}

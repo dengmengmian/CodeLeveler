@@ -1325,6 +1325,9 @@ impl Executor {
         }
         let mut ctx = admitted.execution_context().clone();
         ctx.tool_call_scope = Some(call.id.as_str().into());
+        if let Some(binder) = self.goal_binder() {
+            ctx.background_goal = binder.bound();
+        }
         ctx.yield_now = Some(yield_now);
         ctx.output = output;
         let started = std::time::Instant::now();

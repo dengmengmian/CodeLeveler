@@ -401,17 +401,26 @@ pub enum EngineEvent {
     /// same argv a `run_command` call names; a reader derives the command label
     /// from them with the one labelling function, and a `shell_command` caller's
     /// own tokens still appear inside them. `is_error` is the task's terminal
-    /// verdict: anything but a zero exit. A stopped or unobservable task is not a
-    /// result and is never persisted this way.
+    /// verdict: only a natural zero exit is successful. Stopped and unknown
+    /// tasks are observable but cannot serve as command verification evidence.
     BackgroundTaskFinished {
         call_id: String,
         task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal_id: Option<leveler_core::GoalId>,
         program: String,
         #[serde(default)]
         args: Vec<String>,
         is_error: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        /// Older records only represented a natural exit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<leveler_execution::BackgroundTaskStatus>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output: String,
+        #[serde(default)]
+        output_truncated: bool,
     },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a

@@ -29,6 +29,15 @@ fn redact_validated(
     )
 }
 
+/// SQLite assigns the sequence inside the insert. A concurrent ordinary event
+/// can still observe the same maximum and lose the unique index. That conflict
+/// is retryable; a fence rejection or a duplicate task id inserts nothing and
+/// is not an error.
+fn event_sequence_conflict(error: &sqlx::Error) -> bool {
+    let text = error.to_string();
+    text.contains("UNIQUE constraint failed") && text.contains("events")
+}
+
 /// Append/load access to the canonical event log, abstracted over the backing
 /// store. Deliberately narrow: only what `EventLog` and incremental readers
 /// need.
@@ -210,6 +219,63 @@ pub trait EventStore: Send + Sync {
 }
 
 /// The production SQLite adapter: delegates to [`EventRepository`].
+impl Database {
+    /// Append an out-of-turn terminal fact without taking or advancing a turn
+    /// epoch. Only the owning boot or an idle session may receive this fact.
+    /// The authority and stable task-id deduplication are checked in the insert.
+    pub async fn append_background_task_finished(
+        &self,
+        session_id: &SessionId,
+        runtime: &leveler_core::RuntimeId,
+        boot: &leveler_core::BootId,
+        task_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        let event_type = "background_task_finished";
+        let payload = redact_validated(event_type, payload, session_id)?;
+        let created_at = now.to_rfc3339();
+        // Enough for every concurrent writer on this session to land once.
+        const SEQUENCE_ATTEMPTS: usize = 64;
+        let mut last_conflict = None;
+        for _ in 0..SEQUENCE_ATTEMPTS {
+            let inserted = sqlx::query(
+                "INSERT INTO events \
+                 (id, session_id, turn_id, sequence, type, payload, created_at, schema_version) \
+                 SELECT ?1, ?2, NULL, \
+                        (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?2), \
+                        ?3, ?4, ?5, ?6 \
+                 WHERE EXISTS (SELECT 1 FROM tasks WHERE session_id = ?2 AND ( \
+                           (owner_runtime_id = ?7 AND owner_boot_id = ?8) OR \
+                           (owner_runtime_id IS NULL AND owner_boot_id IS NULL AND NOT EXISTS ( \
+                               SELECT 1 FROM turns WHERE session_id = ?2 AND status = 'running' \
+                               AND finished_at IS NULL)))) \
+                   AND NOT EXISTS (SELECT 1 FROM events WHERE session_id = ?2 AND type = ?3 \
+                                   AND json_extract(payload, '$.payload.task_id') = ?9)",
+            )
+            .bind(leveler_core::EventId::generate().into_inner())
+            .bind(session_id.as_str())
+            .bind(event_type)
+            .bind(&payload)
+            .bind(&created_at)
+            .bind(EVENT_SCHEMA_VERSION)
+            .bind(runtime.as_str())
+            .bind(boot.as_str())
+            .bind(task_id)
+            .execute(self.pool())
+            .await;
+            match inserted {
+                Ok(_) => return Ok(()),
+                Err(error) if event_sequence_conflict(&error) => last_conflict = Some(error),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(StorageError::Sqlx(
+            last_conflict.expect("sequence conflict"),
+        ))
+    }
+}
+
 #[async_trait]
 impl EventStore for Database {
     async fn append(
@@ -866,5 +932,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rec.sequence, 1, "sequences must not leak across sessions");
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_facts_keep_a_gapless_log_and_do_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::connect(&dir.path().join("state.db"))
+            .await
+            .unwrap();
+        let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        sqlx::query("INSERT INTO tasks (id, session_id, created_at) VALUES (?1, ?1, ?2)")
+            .bind(session.as_str())
+            .bind(leveler_core::now().to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let runtime = leveler_core::RuntimeId::new("runtime");
+        let boot = leveler_core::BootId::new("boot");
+        let mut joins = Vec::new();
+        for index in 0..24 {
+            let db = db.clone();
+            let session = session.clone();
+            let runtime = runtime.clone();
+            let boot = boot.clone();
+            joins.push(tokio::spawn(async move {
+                let task_id = format!("task-{index}");
+                let payload = format!(
+                    r#"{{"type":"background_task_finished","payload":{{"task_id":"{task_id}"}}}}"#
+                );
+                db.append_background_task_finished(
+                    &session,
+                    &runtime,
+                    &boot,
+                    &task_id,
+                    &payload,
+                    leveler_core::now(),
+                )
+                .await
+                .expect("terminal fact");
+                if index % 2 == 0 {
+                    EventRepository::new(&db)
+                        .append(&session, None, "tick", "{}", leveler_core::now())
+                        .await
+                        .expect("ordinary event");
+                }
+            }));
+        }
+        for join in joins {
+            join.await.unwrap();
+        }
+        db.append_background_task_finished(
+            &session,
+            &runtime,
+            &boot,
+            "task-0",
+            r#"{"type":"background_task_finished","payload":{"task_id":"task-0"}}"#,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let facts = EventRepository::new(&db)
+            .load_by_types(&session, &["background_task_finished"])
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 24, "each task is stored once");
+        let sequences: Vec<_> = EventRepository::new(&db)
+            .load(&session)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.sequence)
+            .collect();
+        let mut ordered = sequences.clone();
+        ordered.sort();
+        ordered.dedup();
+        assert_eq!(
+            ordered.len(),
+            sequences.len(),
+            "duplicate sequence: {sequences:?}"
+        );
+        for (index, sequence) in ordered.iter().enumerate() {
+            assert_eq!(*sequence, index as i64 + 1, "gap in {ordered:?}");
+        }
     }
 }

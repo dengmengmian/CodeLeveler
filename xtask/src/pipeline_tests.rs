@@ -1501,6 +1501,27 @@ fn status_and_report_describe_the_release_in_progress() {
 }
 
 #[test]
+fn status_separates_the_transaction_elapsed_from_the_current_stage() {
+    // The defect: `elapsed` spanned every attempt since the release started, so a
+    // release resumed seven times reported ~98h of elapsed time while the stage
+    // actually running had been going for minutes. A reader could not tell a
+    // slow stage from a stuck one, and the number read like a hang.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    let (code, rendered, _) = world.run(&["publish", "--status"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("(all attempts)"),
+        "the transaction total must be labelled as such: {rendered}"
+    );
+    assert!(
+        rendered.contains("stage elapsed:"),
+        "the stage actually running must report its own elapsed time: {rendered}"
+    );
+}
+
+#[test]
 fn carrying_a_layer_does_not_rewrite_the_file_it_came_from() {
     // The defect: a layer an earlier stage produced was cloned, given a
     // `carried_from_run` marker, and then written back to its own `L*.json`. That
