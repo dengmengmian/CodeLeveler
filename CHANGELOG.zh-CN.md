@@ -2,6 +2,10 @@
 
 [English](CHANGELOG.md) · [安装与使用](README.zh-CN.md)
 
+## [Unreleased]
+
+- 支持 Streamable HTTP MCP。`[[mcp_servers]]` 在原有 stdio 的 `command` / `args` / `env` 之外，可以写 `url`（以及可选的 `transport = "streamable_http"`、`headers`、`bearer_token_env`）。请求头和 Bearer 的值是环境变量名。客户端优先协商 MCP `2026-07-28`，并按需要回退到仍在使用的旧版 Streamable HTTP。超时或会话中断后结果未知的工具调用不会自动再发一次。尚未实现 OAuth 2.1。已有 stdio 配置无需修改。
+
 ## [1.0.22] - 2026-10-30
 
 - 空会话打开时显示欢迎卡片：品牌标识、标语、轮换提示（`/goal`、`/diff`、`/context`、`/theme`），以及可点击的「历史会话 / 查看帮助 / 选择模型」。会话一旦有真实内容就隐藏；窄终端自动折叠为紧凑布局；终端支持原生图片协议时绘制原始吉祥物。

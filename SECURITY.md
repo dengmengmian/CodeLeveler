@@ -45,6 +45,15 @@ and update checks may contact their configured destinations as required for
 their function. Those paths must remain explicit and scoped to the data needed
 for that capability; they must not become hidden telemetry channels.
 
+Streamable HTTP MCP is one of those explicit paths. The URL, header names, and
+bearer variable name come from the user's config. Header and bearer values are
+read from the environment at load and are not written back to the config, the
+session log, or tool-argument display. HTTPS verifies the server certificate;
+there is no setting that disables that check. Redirects that would send
+credentials to another origin are not followed. Tool descriptions from an MCP
+server stay on that tool. They are not copied into the system prompt and they
+do not change the permission profile. OAuth 2.1 is not implemented.
+
 Any future diagnostics, crash reporting, or usage analytics must be explicit
 opt-in and disableable. Credentials and secrets must never be included as
 telemetry.

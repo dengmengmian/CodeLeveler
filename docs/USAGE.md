@@ -22,6 +22,8 @@ Use `/thinking high` to change reasoning intensity for the session, or `/thinkin
 
 Open background tasks from the footer to inspect output or stop an individual task. Esc only returns to the list. Closing the terminal does not stop background tasks when connected to the background service.
 
+A foreground command still running after 15 seconds moves to the background and returns a `task_id`. That is not a successful exit: observe it with `get_task` / `wait_task` and stop it with `kill_task`. `timeout_seconds` is a process execution deadline only when the caller sets it (counted from process start and still applied after the move to the background). When it is not set, the 120 second default bounds how long this one call waits — it does not kill a running service. Start a long-lived service with `background=true`; its lifetime follows `background_lifetime` (`goal` by default, or `runtime` / `session` / `persistent`), not the wait budget.
+
 ## Sessions and background work
 
 Use `leveler resume` to continue a session. On macOS and Linux, `leveler serve` also keeps work running in the background. A local background service is not supported on Windows.
@@ -47,6 +49,40 @@ timeout_ms = 15000
 ```
 
 Set the named environment variable before starting CodeLeveler. A key alone does not enable search without `[web.search]`. UI links and `/web` use your system browser.
+
+## MCP servers
+
+CodeLeveler can call tools from MCP servers. A stdio server is a local program. A Streamable HTTP server is an `http://` or `https://` endpoint. Both show up as `mcp__<server>__<tool>`. One server failing to connect does not remove the others.
+
+Stdio, unchanged from earlier versions:
+
+```toml
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp_servers.env]
+GITHUB_TOKEN = "GITHUB_TOKEN"
+```
+
+`env` values are environment-variable names, not the secrets themselves.
+
+Streamable HTTP:
+
+```toml
+[[mcp_servers]]
+name = "devorder"
+transport = "streamable_http"
+url = "http://127.0.0.1:8081/mcp"
+
+[mcp_servers.headers]
+X-API-Key = "DEVORDER_MCP_API_KEY"
+```
+
+Or `leveler mcp add devorder --url http://127.0.0.1:8081/mcp --header X-API-Key=DEVORDER_MCP_API_KEY`. A bearer token is `--bearer-env SOME_TOKEN` or `bearer_token_env = "SOME_TOKEN"`; CodeLeveler sends `Authorization: Bearer <value>`. Header values are environment-variable names. Do not put a token in the URL. HTTPS verifies the server certificate. OAuth 2.1 is not implemented: a server that only speaks OAuth cannot be used by pasting a bearer token and calling that OAuth.
+
+`leveler mcp list` prints the transport, the URL, and header names. `leveler doctor` warns when a referenced variable is unset. The Tools view shows a call after it runs; connection state is in the log (`MCP server connected`, including the negotiated protocol version and tool count).
 
 ## Troubleshooting
 

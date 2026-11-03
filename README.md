@@ -53,6 +53,8 @@ Start with a clean Git working tree so changes are easy to review. Run `leveler 
 
 In the terminal, `/goal <task>` runs an explicit goal to completion, with the completion gate deciding when it is done. Use `/help` for commands and shortcuts, and `/thinking` to adjust reasoning intensity.
 
+Multiple TUIs in the same project share its runtime. If an upgrade finds that runtime busy, a client with a compatible protocol and matching configuration opens against the existing runtime; a later startup retries the upgrade once it is idle. Normal TUI exit first cancels any remaining turn and stops background tasks in the current session, leaving other sessions running. Exit waits for cleanup to finish and reports failures instead of silently disconnecting. A lost connection or forcibly terminated client does not stop the shared runtime's tasks.
+
 Tool execution summaries append elapsed time from actual admitted dispatch, update once per second, and freeze at the final execution boundary. Reconnects restore the runtime clock. Old history and detached process lifetimes without reliable execution timing keep their original summaries; unrelated clocks are never combined. Approval dialogs initially select **Allow once**; Esc still denies.
 
 ## Permissions and privacy
