@@ -1421,7 +1421,7 @@ mod generation_attach_tests {
     }
 
     #[tokio::test]
-    async fn a_second_client_attaches_to_a_compatible_busy_previous_build() {
+    async fn a_second_unattended_client_does_not_reuse_a_busy_previous_build() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = layout(tmp.path());
         let (runtime, serving) = runtime(
@@ -1436,33 +1436,27 @@ mod generation_attach_tests {
         let first = LocalSocketRuntimeClient::connect(&layout.socket_path())
             .await
             .unwrap();
-        let ui = Ui::default();
-        let result = tokio::time::timeout(
+        let ui = NonInteractiveHandoffUi::new();
+        let error = tokio::time::timeout(
             Duration::from_secs(1),
-            reconcile_runtime_generation(&layout.socket_path(), &layout, &ui),
+            reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()),
         )
-        .await;
-        let client = result
-            .expect("a busy compatible generation must not hold the second TUI in an upgrade wait")
-            .unwrap()
-            .expect("reuse the serving generation");
+        .await
+        .expect("a busy previous build must answer promptly, not hold the client")
+        .err()
+        .expect("a different build is never attached while it is busy");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::RetireBlocked { .. })
+            ),
+            "{error}"
+        );
         assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
         assert!(runtime.info.health.accepting_work);
-        // Both clients continue through the same serving authority.
+        // The serving generation keeps working for the client that owns it.
         first.send(ClientCommand::RequestSessionList).await.unwrap();
-        client
-            .send(ClientCommand::RequestSessionList)
-            .await
-            .unwrap();
-        assert_eq!(runtime.commands.load(Ordering::SeqCst), 2);
-        let events = ui.0.lock().unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [HandoffEvent::UpgradeDeferred {
-                active_background_tasks: 1,
-                ..
-            }]
-        ));
+        assert_eq!(runtime.commands.load(Ordering::SeqCst), 1);
         serving.abort();
     }
 
@@ -1637,8 +1631,11 @@ mod generation_attach_tests {
         runtime
             .retire_before_confirmation
             .store(true, Ordering::SeqCst);
+        // An unattended client must be told the upgrade is blocked, not be
+        // left waiting on a generation that has already started retiring.
+        let ui = NonInteractiveHandoffUi::new();
         let result =
-            reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default()).await;
+            reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()).await;
         serving.abort();
         let error = result
             .err()
@@ -1646,7 +1643,7 @@ mod generation_attach_tests {
         assert!(
             matches!(
                 error.downcast_ref::<EnsureError>(),
-                Some(EnsureError::UnknownGeneration)
+                Some(EnsureError::RetireBlocked { .. })
             ),
             "{error}"
         );
