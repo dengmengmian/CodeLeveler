@@ -1305,7 +1305,9 @@ mod grant_tests {
 mod foreground_handoff_tests {
     use super::*;
     use crate::tool::{Tool, ToolContext};
-    use crate::tools::{GetTaskTool, WaitTaskTool};
+    #[cfg(unix)]
+    use crate::tools::GetTaskTool;
+    use crate::tools::WaitTaskTool;
     use leveler_execution::{
         BackgroundTaskLifetime, BackgroundTaskRegistry, BackgroundTaskStatus, PermissionProfile,
         Workspace,

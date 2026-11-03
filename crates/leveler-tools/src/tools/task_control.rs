@@ -936,7 +936,7 @@ impl WaitTaskTool {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_idle_ceiling(mut self, secs: u64) -> Self {
         self.idle_ceiling = secs;
         self

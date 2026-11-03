@@ -3895,13 +3895,23 @@ async fn harness_reviewer_uses_parent_residual_token_budget() {
             _ => None,
         })
         .unwrap();
-    // The sum of the fixture's own reported usage, including the reviewer
-    // round that fit inside the parent's remaining budget. Two prompt facts
-    // lengthen the projection and nothing else: the acceptance receipt states
-    // the unverified boundary, and the post-acceptance delivery notice tells
-    // the model the answer is still owed. The figure tracks that wording, not
-    // a budget change. Request count above is the budget contract.
-    assert_eq!(ledger.cumulative_model_tokens, 225_133);
+    // The fixture reports 210,000 tokens of usage across the parent rounds and
+    // the reviewer's own round. The remainder of the ledger is the projection
+    // for the request that the spent budget refused. That projection tracks the
+    // host's prompt (tool catalog and rules), so the contract is its bound: it
+    // stays inside the parent's remaining 50,000 tokens, not a fresh 200,000
+    // cap. The request count above is what proves the refusal.
+    let observed = 210_000;
+    assert!(
+        ledger.cumulative_model_tokens >= observed,
+        "the ledger must carry the fixture's reported spend: {}",
+        ledger.cumulative_model_tokens
+    );
+    assert!(
+        ledger.cumulative_model_tokens <= observed + 50_000,
+        "the refused request's projection must stay inside the parent's remaining 50,000 tokens: {}",
+        ledger.cumulative_model_tokens
+    );
 }
 
 #[tokio::test]
