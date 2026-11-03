@@ -622,6 +622,10 @@ fn git_response(script: &mut Script, spec: &CommandSpec) -> Result<ProcessOut, c
             Ok(text(""))
         }
         "diff" | "log" => Ok(text("")),
+        // `--is-ancestor`: exit 0 is the linear, same-history answer these
+        // fixtures assume. The rewritten-history case is owned by
+        // report::tests, which runs real git against a foreign lineage.
+        "merge-base" => Ok(text("")),
         "cat-file" => {
             // `git cat-file -e <sha>^{commit}` probing the lab clone.
             if script.candidate_missing_from_lab

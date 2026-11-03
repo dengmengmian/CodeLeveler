@@ -642,7 +642,7 @@ def render_version(record):
         (
             "Commits in release",
             "—",
-            text(changed.get("commit_count")),
+            "—" if changed.get("note") else text(changed.get("commit_count")),
             "—",
         ),
         (
@@ -679,6 +679,8 @@ def render_version(record):
 
     # Changes
     parts.append("<h2>Release changes</h2>")
+    if changed.get("note"):
+        parts.append('<p class="note">%s</p>' % esc(text(changed.get("note"))))
     for label, group in change_rows(record).items():
         parts.append("<h3>%s <span class=\"sub\">(%d)</span></h3>" % (esc(label), group["total"]))
         if group["items"]:

@@ -132,5 +132,30 @@ class ContractFailuresTest(unittest.TestCase):
         self.assertEqual(dashboard.contract_failure_rows(record), [])
 
 
+class RewrittenHistoryTest(unittest.TestCase):
+    def test_the_page_states_why_the_change_list_is_a_tree_difference(self):
+        # v1.0.21's tag belongs to a history this repository no longer shares.
+        # The report must not show that line's commits as this release's work.
+        record = record_with()
+        record["state"].update(
+            {
+                "version": "1.0.22",
+                "release_id": "v1.0.22",
+                "candidate_sha": "a" * 40,
+            }
+        )
+        record["changes"] = {
+            "commit_count": 0,
+            "changed_files": 12,
+            "features": [],
+            "fixes": [],
+            "other": [],
+            "note": "v1.0.21 is not an ancestor of this candidate",
+        }
+        page = dashboard.render_version(record)
+        self.assertIn("not an ancestor", page)
+        self.assertEqual(dashboard.change_rows(record)["Features"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

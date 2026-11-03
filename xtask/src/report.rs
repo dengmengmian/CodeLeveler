@@ -200,6 +200,45 @@ fn collect_changes(context: &Context, transaction: &Transaction) -> Changes {
              computed (run `git fetch --tags` and re-open the report)"
         ));
     }
+    // A release tag can belong to a history this candidate no longer shares
+    // (a rewritten main). A commit range across two lineages lists the other
+    // side's commits as if this release had produced them, so when the two
+    // endpoints are unrelated the only honest change set is the tree difference.
+    let ancestor = context
+        .host
+        .run(&exec::git(
+            &context.repo,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                previous,
+                &transaction.candidate_sha,
+            ],
+        ))
+        .map(|out| out.status == 0)
+        .unwrap_or(false);
+    if !ancestor {
+        let files = git(
+            context.host,
+            &context.repo,
+            &["diff", "--name-only", previous, &transaction.candidate_sha],
+        )
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+        return Changes {
+            commits: Vec::new(),
+            files,
+            note: Some(format!(
+                "{previous} is not an ancestor of {}: the two releases do not share one \
+                 history, so a commit range cannot name this release's changes. The counts \
+                 below are the file-level tree difference; the release notes name the \
+                 user-facing changes.",
+                transaction.candidate_sha
+            )),
+        };
+    }
     let range = format!("{previous}..{}", transaction.candidate_sha);
     let commits = git(
         context.host,
@@ -1093,4 +1132,152 @@ pub fn conclusion(transaction: &Transaction) -> (String, String) {
             transaction.current_stage()
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::SystemHost;
+    use crate::root::Lab;
+    use crate::tests::Tmp;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap_or_else(|err| panic!("git {args:?}: {err}"));
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn commit(repo: &Path, message: &str) {
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=dev@example.com",
+                "-c",
+                "user.name=dev",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    fn write(repo: &Path, name: &str, body: &str) {
+        std::fs::write(repo.join(name), body).unwrap();
+        git(repo, &["add", name]);
+    }
+
+    fn head(repo: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn changes_of(repo: &Path, previous: &str) -> Json {
+        let host = SystemHost { echo: false };
+        let context = Context {
+            host: &host,
+            repo: repo.to_path_buf(),
+            lab: Lab {
+                root: repo.to_path_buf(),
+                model: "test/model".to_string(),
+            },
+            branch: "main".to_string(),
+            slug: "owner/repo".to_string(),
+            rustc: "rustc test".to_string(),
+            definition_hash: "definition".to_string(),
+            opts: crate::pipeline::PublishOpts::default(),
+            baseline_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            holds_lock: false,
+        };
+        let mut transaction = Transaction::new("v1.1.0", "1.1.0", head(repo), 0.0);
+        transaction.previous_release = Some(previous.to_string());
+        changes(&context, &transaction)
+    }
+
+    fn subjects(doc: &Json, key: &str) -> Vec<String> {
+        match doc.at(key) {
+            Json::Arr(items) => items
+                .iter()
+                .map(|item| match item {
+                    Json::Str(text) => text.clone(),
+                    other => panic!("{key} holds a non-string: {other:?}"),
+                })
+                .collect(),
+            other => panic!("{key} is not an array: {other:?}"),
+        }
+    }
+
+    /// The release tag may belong to a history this candidate no longer shares
+    /// (this repository has been rewritten at least once). A commit range over
+    /// two unrelated lineages lists every commit of both, so the report must not
+    /// present those subjects as this release's changes.
+    #[test]
+    fn a_previous_release_from_another_lineage_is_a_tree_difference_not_a_commit_list() {
+        let tmp = Tmp::new();
+        let repo = tmp.path.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        write(&repo, "base.txt", "base\n");
+        commit(&repo, "base");
+        let base = head(&repo);
+        write(&repo, "old.txt", "old\n");
+        commit(&repo, "feat: already released in v1.0.0");
+        git(&repo, &["tag", "v1.0.0"]);
+
+        // The tag's lineage is rewritten from the same base: the previous
+        // release's own commit is re-created under a new sha, then real work
+        // lands. `v1.0.0..candidate` would list both.
+        git(&repo, &["checkout", "-q", &base, "-b", "rewritten"]);
+        write(&repo, "old.txt", "old\n");
+        write(&repo, "rewrite-marker.txt", "rewritten\n");
+        commit(&repo, "feat: already released in v1.0.0");
+        write(&repo, "real.txt", "real\n");
+        commit(&repo, "feat: the only real change");
+
+        let doc = changes_of(&repo, "v1.0.0");
+        let features = subjects(&doc, "features");
+        assert!(
+            !features.iter().any(|s| s.contains("already released")),
+            "a commit the previous release already shipped is not this release's change: {features:?}"
+        );
+        assert!(
+            features.is_empty(),
+            "a foreign lineage cannot name this release's features: {features:?}"
+        );
+        assert_eq!(doc.at("changed_files"), &Json::num(2.0));
+        let note = doc.at("note").as_str().unwrap_or_default();
+        assert!(
+            note.contains("not an ancestor"),
+            "the report must state why no commit list is shown: {note}"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_release_still_lists_the_commits_it_gained() {
+        let tmp = Tmp::new();
+        let repo = tmp.path.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        write(&repo, "base.txt", "base\n");
+        commit(&repo, "base");
+        git(&repo, &["tag", "v1.0.0"]);
+        write(&repo, "real.txt", "real\n");
+        commit(&repo, "feat: the only real change");
+
+        let doc = changes_of(&repo, "v1.0.0");
+        assert_eq!(
+            subjects(&doc, "features"),
+            vec!["feat: the only real change"]
+        );
+        assert_eq!(doc.at("changed_files"), &Json::num(1.0));
+        assert_eq!(doc.at("note"), &Json::Null);
+    }
 }
