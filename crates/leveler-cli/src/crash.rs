@@ -376,6 +376,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn crash_text(home: &std::path::Path) -> String {
         let dir = home.join("logs").join("crash");
         let mut out = String::new();
