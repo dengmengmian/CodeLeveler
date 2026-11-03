@@ -129,12 +129,18 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
 }
 
 impl Fixture {
-    /// A resident process, registered exactly as a previous round's
-    /// `run_command(background: true)` would leave it.
+    /// A resident process a service goal left running, registered exactly as
+    /// its own round's `run_command(background: true)` would leave it.
+    ///
+    /// It belongs to a goal that is not the turn being ended, which is the case
+    /// the runtime must spare when it settles its own goal: a `goal`-lifetime
+    /// task owned by the very turn that ends is stopped with that turn (that is
+    /// what the live PTY background contract proves). The cases below need a
+    /// process that outlives the turn so a terminal fact can land later.
     async fn start_service(&self, script: &str) -> String {
         self.app
             .background_tasks()
-            .spawn_for_writer(
+            .spawn_with_origin(
                 leveler_execution::ProcessRequest::new(
                     "sh",
                     vec!["-c".into(), script.to_string()],
@@ -144,7 +150,10 @@ impl Fixture {
                 Some(self.session.as_str()),
                 "parent",
                 BackgroundTaskLifetime::Goal,
-                Some("call-start".into()),
+                leveler_execution::BackgroundTaskOrigin {
+                    call_id: Some("call-start".into()),
+                    goal_id: Some(leveler_core::GoalId::new("service-goal")),
+                },
             )
             .await
             .expect("spawn the service")
