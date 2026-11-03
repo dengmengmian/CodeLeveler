@@ -694,29 +694,28 @@ async fn nine_undelivered_terminal_facts_drain_without_dropping_the_last() {
     // The session bridge is what writes the exit into the event log. It has
     // to be listening before the processes finish.
     let _events = f.client.subscribe_session(&f.session);
-    let mut ids = Vec::new();
+    // The registry admits four active tasks. These facts only have to be
+    // terminal and undelivered, so each one finishes before the next starts.
+    // A burst of nine hits `MAX_CONCURRENT` on a host that reaps slower.
     for index in 0..9 {
-        ids.push(
-            f.start_service(&format!("printf 'FACT9_{index:02}\\n'; exit 0"))
-                .await,
-        );
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let snapshots = f.app.background_tasks().try_all_snapshots().await.unwrap();
-        let settled = ids.iter().all(|id| {
-            snapshots
+        let id = f
+            .start_service(&format!("printf 'FACT9_{index:02}\\n'; exit 0"))
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshots = f.app.background_tasks().try_all_snapshots().await.unwrap();
+            let settled = snapshots
                 .iter()
-                .any(|task| task.id == *id && task.status.is_terminal())
-        });
-        if settled {
-            break;
+                .any(|task| task.id == id && task.status.is_terminal());
+            if settled {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "spawned task {id} never reached a terminal snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a spawned task never reached a terminal snapshot"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     f.wait_for_durable_results(9).await;
 
