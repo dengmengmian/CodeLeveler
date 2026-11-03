@@ -202,10 +202,10 @@ impl HttpSession {
         &self,
     ) -> Result<Arc<rmcp::service::RunningService<RoleClient, LevelerHandler>>, String> {
         let mut guard = self.service.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            if !existing.is_closed() {
-                return Ok(Arc::clone(existing));
-            }
+        if let Some(existing) = guard.as_ref()
+            && !existing.is_closed()
+        {
+            return Ok(Arc::clone(existing));
         }
         // The previous call, if any, already returned. This opens a new session
         // for the next call and does not replay the call that just failed.
@@ -362,11 +362,8 @@ async fn try_open(
         if let Ok(mut subscription) = service.listen(filter).await {
             let flag = tools_changed;
             tokio::spawn(async move {
-                loop {
-                    match subscription.next().await {
-                        Ok(Some(_)) => flag.store(true, Ordering::Relaxed),
-                        _ => break,
-                    }
+                while let Ok(Some(_)) = subscription.next().await {
+                    flag.store(true, Ordering::Relaxed);
                 }
             });
         }
@@ -541,10 +538,10 @@ fn secret_values(cfg: &McpServerConfig) -> Vec<String> {
             secrets.push(value.clone());
         }
     }
-    if let Some(token) = &cfg.bearer_token {
-        if token.len() >= 4 {
-            secrets.push(token.clone());
-        }
+    if let Some(token) = &cfg.bearer_token
+        && token.len() >= 4
+    {
+        secrets.push(token.clone());
     }
     secrets
 }
@@ -678,10 +675,10 @@ mod tests {
                     .into_response();
             }
         }
-        if let Mode::ApiKey(token) = &state.mode {
-            if header(&headers, "x-api-key") != Some(token.as_str()) {
-                return (StatusCode::FORBIDDEN, "forbidden").into_response();
-            }
+        if let Mode::ApiKey(token) = &state.mode
+            && header(&headers, "x-api-key") != Some(token.as_str())
+        {
+            return (StatusCode::FORBIDDEN, "forbidden").into_response();
         }
         if let Mode::Status(code) = &state.mode {
             return (
@@ -737,8 +734,6 @@ mod tests {
             "initialize" => {
                 let version = if matches!(&state.mode, Mode::Only03026) {
                     "2025-03-26"
-                } else if matches!(&state.mode, Mode::Legacy | Mode::Expire) {
-                    "2025-11-25"
                 } else {
                     "2025-11-25"
                 };

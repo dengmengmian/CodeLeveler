@@ -732,7 +732,7 @@ for line in sys.stdin:
             vec!["-u".into(), "-c".into(), script.into()],
             vec![],
         );
-        let client = McpClient::connect_with_authority(&cfg, &leveler_core::environment(), true)
+        let client = McpClient::connect_with_authority(&cfg, leveler_core::environment(), true)
             .await
             .unwrap();
         let tool = McpTool::new(

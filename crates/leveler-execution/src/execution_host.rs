@@ -2812,10 +2812,12 @@ mod tests {
         assert_eq!(snapshot.lifetime, BackgroundTaskLifetime::Persistent);
     }
 
+    #[cfg(unix)]
     fn write_archive(config: &ExecutionHostConfig, status: &str, pid: u32) {
         write_archive_tasks(config, &[("host-recorded", status, pid)]);
     }
 
+    #[cfg(unix)]
     fn write_archive_tasks(config: &ExecutionHostConfig, tasks: &[(&str, &str, u32)]) {
         let tasks = tasks
             .iter()

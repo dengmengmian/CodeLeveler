@@ -127,7 +127,7 @@ enum WaitOutcome {
     Reached(ToolOutput),
     /// The task reached a terminal status (or its command already failed).
     /// The shared post-wait path reports it exactly as `until: exit` would.
-    Terminal(leveler_execution::BackgroundTaskObservation),
+    Terminal(Box<leveler_execution::BackgroundTaskObservation>),
 }
 
 /// How an `until: exit` wait ended without a terminal status.
@@ -478,7 +478,7 @@ async fn observe_until(
                     if observed.snapshot.status.is_terminal()
                         || observed.snapshot.command_already_failed()
                     {
-                        return Ok(WaitOutcome::Terminal(observed));
+                        return Ok(WaitOutcome::Terminal(Box::new(observed)));
                     }
                     let mut delta = observed.snapshot.log.clone();
                     cap_tail(&mut delta, MATCH_WINDOW_BYTES);
@@ -510,7 +510,7 @@ async fn observe_until(
         if observation.snapshot.status.is_terminal()
             || observation.snapshot.command_already_failed()
         {
-            return Ok(WaitOutcome::Terminal(observation));
+            return Ok(WaitOutcome::Terminal(Box::new(observation)));
         }
         let reached = match until {
             WaitUntil::Match => pattern.as_ref().and_then(|pattern| {
@@ -1131,7 +1131,7 @@ impl Tool for WaitTaskTool {
             .await
             {
                 Ok(WaitOutcome::Reached(output)) => return Ok(output),
-                Ok(WaitOutcome::Terminal(observation)) => Ok((observation, false)),
+                Ok(WaitOutcome::Terminal(observation)) => Ok((*observation, false)),
                 Err(error) => Err(error),
             }
         };

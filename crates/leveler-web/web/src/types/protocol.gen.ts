@@ -479,6 +479,8 @@ export type RuntimeEvent =
   | { type: 'background_task_started'; args: string[]; pid?: number | null; program: string; task_id: string }
   /** A live chunk of a background task's combined stdout/stderr, already sanitized and capped by the runtime. Additive; older clients ignore the unknown type. The final [`Self::BackgroundTaskExited`] log stays authoritative. */
   | { type: 'background_task_output'; chunk: string; task_id: string }
+  /** A still-running background task printed a readiness signal that a caller was waiting for (its own output matched an explicit pattern). `evidence` is the line that matched. This is an OBSERVATION, not a health check and not an exit: the process keeps running, and the terminal event still follows whenever it ends. Additive; older clients ignore the unknown type and keep showing the task as running. */
+  | { type: 'background_task_ready'; elapsed_ms?: number; evidence: string; task_id: string }
   /** A background task's state could not be established (for example its adopted driver failed). This is not a natural exit and not a stop: the UI must show unknown, never Running, failed, or stopped. */
   | { type: 'background_task_unknown'; duration_ms: number; output: string; task_id: string }
   /** A background task finished (exit or kill). `output` is the task's final retained log, authoritative over the streamed chunks (a lifecycle broadcast lag can drop a chunk). Empty when the runtime produced none. */
@@ -545,6 +547,8 @@ export interface UiActiveBackgroundTask {
   /** The process-group leader's OS pid, when known. Additive; older clients decode it as absent. */
   pid?: number | null;
   program: string;
+  /** Readiness evidence observed for this still-running task, when a caller waited for a real signal in its output. Additive; absent means no signal has been observed, never that the service is not ready. */
+  ready_evidence?: string | null;
   task_id: string;
 }
 

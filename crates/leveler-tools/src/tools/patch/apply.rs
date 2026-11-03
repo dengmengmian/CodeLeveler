@@ -599,7 +599,7 @@ mod tests {
             &["  dsn: host=127.0.0.1 user=develop password=[REDACTED] dbname=orders"],
             &["  dsn: host=127.0.0.1 user=develop password=[REDACTED] dbname=orders_test"],
         );
-        let err = apply_update(&content, &[c]).unwrap_err();
+        let err = apply_update(content, &[c]).unwrap_err();
         assert!(
             err.contains("password=[REDACTED]") && err.contains("Tool output replaces secret"),
             "a failed hunk that carries a redacted value must name that cause; got:\n{err}"
