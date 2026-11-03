@@ -1753,14 +1753,18 @@ impl CodingRuntime {
         // can still follow, so it is read from the FINAL terminal above and
         // used by the post-terminal cleanup gate below.
         // A Chat turn can end while its session still owns observable work.
-        // The legacy Goal route can settle without a goal row, so it still
-        // follows its task terminal.
+        // With no goal row there is no goal that could still owe work, so the
+        // turn's own terminal is the boundary a `goal`-lifetime task was
+        // promised: settle it unless the window continues. The session's
+        // collaboration axis is not that authority — a plain Chat session owns
+        // no goal row at all, and reading the decision through the axis left
+        // its services running past the turn.
         let mut reap_now = explicit_task_cancel
             || (!interrupted
                 && terminal
                     .goal
                     .as_ref()
-                    .map_or(goal_session && !goal_continues, |goal| goal.settle));
+                    .map_or(!goal_continues, |goal| goal.settle));
         let mut settled = self
             .engine
             .finish_task(token, session_id, terminal.clone(), observer)

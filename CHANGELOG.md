@@ -25,6 +25,7 @@
 - The context page no longer prints a separate `Free` detail row; remaining capacity stays in the occupancy map and the header ratio.
 - Fixed a buffer overrun that crashed the `/` command menu on narrow terminals (40 columns and below).
 - A background task that reaches its terminal state while the user steers still delivers both the exit and the message. Undelivered task facts drain on the next admission, a failed provider attempt retries the request that already holds the fact, compaction keeps the delivered task identities, and concurrent terminal writes stay gapless.
+- Fixed a background task started with the default `goal` lifetime inside a plain chat session outliving its turn. The turn's terminal is the boundary that lifetime promises, so the task is stopped there; a goal that still owes work keeps its services.
 - A runtime of a different build is never attached while it is busy: a client that finds the endpoint busy defers its upgrade instead of silently joining the previous generation. An active background task now states its own lifetime, so quitting the TUI stops goal-scoped work while a shell the user sent to the background keeps running.
 
 ## [1.0.21] - 2026-10-29

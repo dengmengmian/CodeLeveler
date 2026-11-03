@@ -365,6 +365,49 @@ async fn chat_routed_terminal_reaps_session_owned_background_tasks() {
     );
 }
 
+/// The TUI's default Chat session owns no goal row. A `goal`-lifetime task it
+/// starts must still stop at the turn's terminal: that lifetime's contract is
+/// the creating terminal, not the presence of a goal. Reading the reap decision
+/// through `goal_session` alone left this path running until it exited by
+/// itself (the live PTY probe caught it as "not stopped at turn end").
+#[tokio::test]
+async fn a_goal_less_chat_session_reaps_goal_lifetime_tasks() {
+    let h = harness(vec![spawn_sleep_server(), text("server started; done")]).await;
+    let s = spec(&h, "start the dev server and report");
+    let session = h
+        .engine
+        .engine
+        .create_task(&leveler_engine::NewSession {
+            workspace: Some(h.dir.path().display().to_string()),
+            goal: String::new(),
+            model: "mock/m".into(),
+            mode: "assisted".into(),
+            sandbox: false,
+            kind: leveler_engine::ExecutionKind::Direct,
+            axes: Some(leveler_engine::NewSessionAxes {
+                collaboration: "chat".into(),
+            }),
+            model_pinned: true,
+        })
+        .await
+        .unwrap();
+
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "起服务".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat turn should settle");
+
+    assert_terminal_within(&h.registry, "bg-1", "goal-less chat path").await;
+}
+
 /// Control: the direct/goal route (the one the R004 fix DID cover) must still
 /// reap now that the reap lives at the engine's terminal settlement.
 #[tokio::test]
