@@ -4,9 +4,9 @@
 
 ## [Unreleased]
 
-- Streamable HTTP MCP. `[[mcp_servers]]` accepts `url` (and optional `transport = "streamable_http"`, `headers`, `bearer_token_env`) in addition to the existing stdio `command` / `args` / `env` form. Header and bearer values are environment-variable names. The client negotiates MCP `2026-07-28` and falls back through the Streamable HTTP versions still used by older servers. A tool call whose result is unknown after a timeout or a dropped session is not sent again. OAuth 2.1 is not implemented. Existing stdio servers keep working without a config change.
+## [1.0.22] - 2026-11-04
 
-## [1.0.22] - 2026-10-30
+- Streamable HTTP MCP. `[[mcp_servers]]` accepts `url` (and optional `transport = "streamable_http"`, `headers`, `bearer_token_env`) in addition to the existing stdio `command` / `args` / `env` form. Header and bearer values are environment-variable names. The client negotiates MCP `2026-07-28` and falls back through the Streamable HTTP versions still used by older servers. A tool call whose result is unknown after a timeout or a dropped session is not sent again. OAuth 2.1 is not implemented. Existing stdio servers keep working without a config change.
 
 - An empty conversation opens on a welcome card: the brand mark, the tagline, a rotating tip that names `/goal`, `/diff`, `/context` and `/theme`, and clickable entries for session history, help and model selection. It disappears as soon as the conversation has real content, folds to a narrow layout on small terminals, and paints the original mascot where the terminal supports a native image protocol.
 
@@ -24,6 +24,8 @@
 - Fixed read-only diagnostics during a running turn: `/trace`, `/context` and `/usage` open immediately while the agent works, read the same runtime state, and coalesce event-driven refreshes into a single query so answers are no longer discarded.
 - The context page no longer prints a separate `Free` detail row; remaining capacity stays in the occupancy map and the header ratio.
 - Fixed a buffer overrun that crashed the `/` command menu on narrow terminals (40 columns and below).
+- A background task that reaches its terminal state while the user steers still delivers both the exit and the message. Undelivered task facts drain on the next admission, a failed provider attempt retries the request that already holds the fact, compaction keeps the delivered task identities, and concurrent terminal writes stay gapless.
+- A runtime of a different build is never attached while it is busy: a client that finds the endpoint busy defers its upgrade instead of silently joining the previous generation. An active background task now states its own lifetime, so quitting the TUI stops goal-scoped work while a shell the user sent to the background keeps running.
 
 ## [1.0.21] - 2026-10-29
 
