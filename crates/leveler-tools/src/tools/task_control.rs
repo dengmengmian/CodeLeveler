@@ -110,6 +110,13 @@ const MATCH_WINDOW_BYTES: usize = 64 * 1024;
 /// to spin.
 const OBSERVE_SLICE: Duration = Duration::from_millis(250);
 
+/// A terminal fact that lands inside the user's handoff window outranks the
+/// yield. The window is longer than one observation slice and short enough
+/// that a steer still feels immediate; outside it, the yield wins and the
+/// result is still available to a later `wait_task`/`get_task`.
+const YIELD_SETTLE_GRACE: Duration = Duration::from_millis(200);
+const YIELD_SETTLE_SLICE: Duration = Duration::from_millis(10);
+
 /// The bounded interval `wait_task` waits for, shared with a sub-agent wait so
 /// both kinds of task id wait the same way.
 pub fn wait_interval(timeout_seconds: Option<u64>) -> Duration {
@@ -464,31 +471,38 @@ async fn observe_until(
                 biased;
                 observed = &mut observe => observed?,
                 _ = yield_now.cancelled() => {
-                    let observed = tasks
-                        .observe_authorized(
-                            task_id,
-                            owner,
-                            unrestricted,
-                            cursor,
-                            log_budget,
-                            Duration::ZERO,
-                            cancellation,
-                        )
-                        .await?;
-                    if observed.snapshot.status.is_terminal()
-                        || observed.snapshot.command_already_failed()
-                    {
-                        return Ok(WaitOutcome::Terminal(Box::new(observed)));
+                    let settle_by = tokio::time::Instant::now() + YIELD_SETTLE_GRACE;
+                    loop {
+                        let observed = tasks
+                            .observe_authorized(
+                                task_id,
+                                owner,
+                                unrestricted,
+                                cursor,
+                                log_budget,
+                                Duration::ZERO,
+                                cancellation,
+                            )
+                            .await?;
+                        if observed.snapshot.status.is_terminal()
+                            || observed.snapshot.command_already_failed()
+                        {
+                            return Ok(WaitOutcome::Terminal(Box::new(observed)));
+                        }
+                        let now = tokio::time::Instant::now();
+                        if now >= settle_by {
+                            let mut delta = observed.snapshot.log.clone();
+                            cap_tail(&mut delta, MATCH_WINDOW_BYTES);
+                            return Ok(WaitOutcome::Reached(yielded_report(
+                                &observed,
+                                until,
+                                &delta,
+                                observed.dropped_bytes,
+                                quiet,
+                            )));
+                        }
+                        tokio::time::sleep(YIELD_SETTLE_SLICE.min(settle_by - now)).await;
                     }
-                    let mut delta = observed.snapshot.log.clone();
-                    cap_tail(&mut delta, MATCH_WINDOW_BYTES);
-                    return Ok(WaitOutcome::Reached(yielded_report(
-                        &observed,
-                        until,
-                        &delta,
-                        observed.dropped_bytes,
-                        quiet,
-                    )));
                 }
             },
             None => observe.await?,
