@@ -99,6 +99,11 @@ impl TextSelection {
 ///   A diff separator or hunk header paints chrome between two runs of real
 ///   code, and those runs are separate source lines: skipping the row without
 ///   a break would glue hunk A's last line onto hunk B's first one.
+/// * `suffix` — trailing display columns that are decoration (a duration, a
+///   fold hint). A selection that runs into them copies none of those columns.
+/// * `source` — the row's real text when the paint truncated it. Used only
+///   when the selection covers the whole content region; a drag through the
+///   middle still copies the painted cells.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PlainRow {
     pub indent: u16,
@@ -106,6 +111,8 @@ pub struct PlainRow {
     pub joiner: Option<Box<str>>,
     pub prefix: Option<Box<str>>,
     pub break_line: bool,
+    pub suffix: u16,
+    pub source: Option<Box<str>>,
 }
 
 /// One painted row a renderer declares copyable, addressed relative to the
@@ -173,14 +180,19 @@ pub fn extract_selected_text_with_layout(
         let line = plain_lines.get(row).map(String::as_str).unwrap_or("");
         let from_raw = if row == start_row { start.col } else { 0 };
         let indent = usize::from(row_layout.indent);
+        let suffix = usize::from(row_layout.suffix);
+        let line_width = UnicodeWidthStr::width(line);
+        // Trailing decoration stays on screen and out of the clipboard.
+        let content_end = line_width.saturating_sub(suffix);
         let from = from_raw.max(indent);
-        let to = if row == end_row {
-            end.col
-        } else {
-            UnicodeWidthStr::width(line)
-        };
+        let to_raw = if row == end_row { end.col } else { line_width };
+        let to = to_raw.min(content_end);
+        // The whole content region is selected: a truncated row then copies
+        // the source the renderer named, not the ellipsis it painted.
+        let covers_content = from_raw <= indent && to_raw >= content_end && content_end > indent;
+        let use_source = covers_content && row_layout.source.is_some();
         // The selection ends inside this row's decoration: it reaches no text.
-        if to < from {
+        if !use_source && to < from {
             continue;
         }
         if wrote_row {
@@ -196,7 +208,9 @@ pub fn extract_selected_text_with_layout(
         {
             out.push_str(prefix);
         }
-        if to > from {
+        if let Some(source) = row_layout.source.as_deref().filter(|_| use_source) {
+            out.push_str(source);
+        } else if to > from {
             out.push_str(&slice_display_cols(line, from, to));
         }
         wrote_row = true;
@@ -521,6 +535,61 @@ mod tests {
         sel.extend(TextPos { row: 0, col: 1 });
         sel.finish();
         assert_eq!(extract_selected_text_with_layout(&lines, &layout, &sel), "");
+    }
+
+    /// A fold hint painted on the same row is decoration. Selecting the row
+    /// copies the words and stops before the hint.
+    #[test]
+    fn a_trailing_suffix_is_decoration() {
+        let lines = vec!["验收范围不完整 (+2 行)".to_string()];
+        let hint = unicode_width::UnicodeWidthStr::width(" (+2 行)");
+        let layout = vec![PlainRow {
+            suffix: hint as u16,
+            ..Default::default()
+        }];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos {
+            row: 0,
+            col: 10_000,
+        });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "验收范围不完整"
+        );
+    }
+
+    /// Covering a truncated row copies the source the renderer named. A drag
+    /// that stops inside the painted cells copies only those cells.
+    #[test]
+    fn a_covered_truncated_row_copies_its_source() {
+        let lines = vec!["目标未提交  在本地把 DevOrder…".to_string()];
+        let full = "目标未提交  在本地把 DevOrder 全套服务起来";
+        let layout = vec![PlainRow {
+            source: Some(full.into()),
+            ..Default::default()
+        }];
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos {
+            row: 0,
+            col: 10_000,
+        });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            full
+        );
+
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: 0, col: 0 });
+        sel.extend(TextPos { row: 0, col: 10 });
+        sel.finish();
+        assert_eq!(
+            extract_selected_text_with_layout(&lines, &layout, &sel),
+            "目标未提交"
+        );
     }
 
     #[test]

@@ -204,3 +204,7 @@ debug = "line-tables-only"
 # 737k files, and rustc then stalled in directory lookup. Packed debuginfo is
 # one bundle per output, so deps stays a normal directory.
 split-debuginfo = "packed"
+
+# Keep the existing input backend while fixing terminal hangup propagation.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

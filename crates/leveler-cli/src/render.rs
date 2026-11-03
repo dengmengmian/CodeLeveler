@@ -193,6 +193,9 @@ fn render_event_text(event: AgentEvent) {
                         "nudge: refused task declaration, user request still open"
                     }
                     leveler_agent::closeout::CloseoutReason::EmptyAnswer => "nudge: empty answer",
+                    leveler_agent::closeout::CloseoutReason::GoalSettledDelivery => {
+                        "goal settled; asking for the final answer"
+                    }
                 },
             };
             println!("  {} {label}", console::style("⋯").yellow());

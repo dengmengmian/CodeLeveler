@@ -97,12 +97,40 @@ pub enum BackgroundTaskLifetime {
     Persistent,
 }
 
+/// Wire name of a lifetime, as it appears in tool results and events.
+impl BackgroundTaskLifetime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Goal => "goal",
+            Self::Runtime => "runtime",
+            Self::Session => "session",
+            Self::Persistent => "persistent",
+        }
+    }
+
+    /// What ends this task's process, as one phrase for a model and a user.
+    ///
+    /// The same sentence appears when the task starts and when it is observed,
+    /// so a caller that has to decide "will this service still be running when
+    /// I report back" never has to derive the answer from a lifetime name.
+    pub fn stop_condition(self) -> &'static str {
+        match self {
+            Self::Goal => "the current goal finishes",
+            Self::Runtime => "the independent Execution Host shuts down",
+            Self::Session => "the session is deleted",
+            Self::Persistent => "it is stopped explicitly",
+        }
+    }
+}
+
 impl BackgroundTaskStatus {
     fn is_active(self) -> bool {
         matches!(self, Self::Running | Self::Killing)
     }
 
-    fn is_terminal(self) -> bool {
+    /// A status this task cannot leave. Terminal records are retained for
+    /// later reads; nothing in the lifecycle reopens them.
+    pub fn is_terminal(self) -> bool {
         matches!(self, Self::Exited | Self::Killed | Self::Unknown)
     }
 }
@@ -131,6 +159,67 @@ pub struct BackgroundTaskSnapshot {
     /// the log; this is the machine-readable form for projections.
     #[serde(default)]
     pub log_truncated: bool,
+    /// Readiness observed for a task that is still running, when a caller
+    /// waited for a real signal in the task's own output.
+    ///
+    /// This is an OBSERVATION, not a health verdict: it records the line that
+    /// matched and when, and never turns a live process into a finished one.
+    /// `None` means no readiness signal has been observed — not "not ready".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<TaskReadiness>,
+    /// How long the task's own output has been silent, in milliseconds.
+    ///
+    /// A wait that expires has to say whether it saw anything. Without this a
+    /// caller cannot tell "the command is working silently" from "nothing has
+    /// happened in ten minutes", and those two need opposite decisions.
+    #[serde(default)]
+    pub silent_ms: u64,
+    /// The cleanup boundary this task was spawned with, so an observer can see
+    /// that completing the goal will stop it without re-reading the spawn call.
+    #[serde(default = "default_lifetime")]
+    pub lifetime: BackgroundTaskLifetime,
+    /// How many `until: exit` waits on this task have already expired without
+    /// the task reaching a terminal status. A repeat is a fact the waiter must
+    /// see: an identical probe that changed nothing is not new information.
+    #[serde(default)]
+    pub expired_exit_waits: u32,
+    /// Total bytes this task has produced on its own streams. `0` with a
+    /// running status means the command has not written anything at all — a
+    /// fact a caller cannot infer from an empty log delta alone.
+    #[serde(default)]
+    pub output_bytes: u64,
+}
+
+fn default_lifetime() -> BackgroundTaskLifetime {
+    BackgroundTaskLifetime::Goal
+}
+
+/// Why the registry keeps each task's starting call id.
+///
+/// A terminal task must be attributable to the call — and therefore the goal
+/// window — that asked for the work. The call's name, arguments and model step
+/// live in the durable engine event log under that id, so this registry stores
+/// the link only: one fact, one owner.
+/// Evidence that a still-running task announced its own readiness.
+///
+/// Produced only by a caller that observed the task's output matching a
+/// pattern it chose; the registry stores it so every projection reads the same
+/// fact instead of re-deriving it from the command line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskReadiness {
+    /// The output line that matched. Bounded, single line, control-free.
+    pub evidence: String,
+    /// Milliseconds from process start to the observation.
+    pub elapsed_ms: u64,
+}
+
+impl BackgroundTaskSnapshot {
+    /// The direct child has exited non-zero while this task is still running.
+    /// The exit is the command's result; leftover group members keep the task
+    /// stoppable and are not a reason to keep waiting.
+    pub fn command_already_failed(&self) -> bool {
+        self.status == BackgroundTaskStatus::Running && self.exit_code.is_some_and(|code| code != 0)
+    }
 }
 
 /// One atomic observation of status and a bounded slice of retained output.
@@ -159,9 +248,22 @@ pub struct AdoptedTaskSpec {
     pub cwd: PathBuf,
     pub write_scope: crate::WriteScope,
     pub lifetime: BackgroundTaskLifetime,
+    /// The tool call that started the foreground run this task takes over, when
+    /// it came from one. Carried so the eventual terminal fact can be
+    /// attributed to that call.
+    pub origin_call_id: Option<String>,
     /// The foreground process start, not the adoption time: duration is the
     /// whole execution, as the user saw it.
     pub started: Instant,
+    /// The caller's own execution deadline, measured from [`Self::started`].
+    ///
+    /// `None` is the ordinary case for a process that left the foreground: the
+    /// calling tool's wait budget is NOT a process lifetime, so adoption must
+    /// not inherit one. The task then lives under its [`Self::lifetime`] until
+    /// it exits, the owner stops it, or that lifecycle ends. `Some` is a
+    /// deadline the caller stated (`timeout_seconds`); it follows the execution
+    /// into the registry and is never extended by the transfer.
+    pub deadline: Option<Duration>,
     /// Output already streamed before the handoff. It stays visible in the
     /// background task's log; it is never replayed as a new chunk.
     pub initial_output: String,
@@ -173,6 +275,10 @@ pub struct AdoptedTaskSpec {
     /// view uses this to establish the execution↔task link first, so no
     /// terminal fact can overtake the transfer in that view.
     pub on_adopted: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Pre-command snapshot captured by the foreground owner. `None` for a
+    /// user shell, which does not attribute workspace writes. The reaper
+    /// settles it once, after the process group is gone.
+    pub mutation_baseline: Option<MutationBaseline>,
 }
 
 /// A refused adoption. The caller still owns the running process and its
@@ -197,6 +303,14 @@ pub enum BackgroundTaskEvent {
         owner_scope: Option<String>,
         task_id: String,
         chunk: String,
+    },
+    /// A caller observed the still-running task's own output signalling
+    /// readiness. The process keeps running; this is not an exit.
+    Ready {
+        owner_scope: Option<String>,
+        task_id: String,
+        evidence: String,
+        elapsed_ms: u64,
     },
     Exited {
         owner_scope: Option<String>,
@@ -304,6 +418,12 @@ struct TaskInner {
     default_log_cursor: u64,
     started: Instant,
     finished: Option<Instant>,
+    /// When the task's own output last grew. Set at spawn so "silent since"
+    /// is measured from the process start, not from an arbitrary observation.
+    last_output: Instant,
+    /// Expiries of `until: exit` waits on this task that saw no terminal
+    /// status. Counted here so the fact survives the tool call that observed it.
+    expired_exit_waits: u32,
     child: Option<ManagedProcess>,
     identity: Option<ProcessIdentity>,
     done: Arc<Notify>,
@@ -360,6 +480,24 @@ impl Default for BackgroundTaskRegistry {
 struct RegistryState {
     tasks: HashMap<String, TaskInner>,
     next: u64,
+    /// Observed readiness, keyed by task id. Kept beside the task records
+    /// because a host-owned task's record lives in the Execution Host while
+    /// its readiness is observed by this runtime.
+    readiness: HashMap<String, TaskReadiness>,
+    /// The starting tool call of each task, keyed by task id. Registry-side so
+    /// a host-owned task (whose record lives in the Execution Host) still
+    /// answers "which call asked for this?" when it exits.
+    origins: HashMap<String, String>,
+}
+
+impl RegistryState {
+    /// Attach observed readiness to one snapshot. The readiness map is the
+    /// single source; no projection reconstructs it from the command line.
+    fn attach_readiness(&self, snap: &mut BackgroundTaskSnapshot) {
+        if let Some(ready) = self.readiness.get(&snap.id) {
+            snap.ready = Some(ready.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -636,12 +774,19 @@ impl BackgroundTaskRegistry {
     pub async fn try_all_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
         let mut snapshots = {
             let st = self.inner.lock().await;
-            st.tasks.values().map(snapshot).collect::<Vec<_>>()
+            st.tasks
+                .values()
+                .map(|task| {
+                    let mut snap = snapshot(task);
+                    st.attach_readiness(&mut snap);
+                    snap
+                })
+                .collect::<Vec<_>>()
         };
         if let Some(config) = &self.execution_host {
             let probe = crate::execution_host::ExecutionHostClient::probe(config).await?;
             if let Some(client) = probe.client {
-                for task in client.list().await? {
+                for mut task in client.list().await? {
                     if task.settlement_proven() {
                         self.journal()?.reconcile(&task.snapshot.id).await?;
                         client
@@ -653,6 +798,9 @@ impl BackgroundTaskRegistry {
                                     .ok_or("missing hosted owner")?,
                             )
                             .await?;
+                    }
+                    if task.snapshot.ready.is_none() {
+                        task.snapshot.ready = self.readiness_of(&task.snapshot.id).await;
                     }
                     snapshots.push(task.snapshot);
                 }
@@ -913,6 +1061,7 @@ impl BackgroundTaskRegistry {
         owner: Option<&str>,
         writer: &str,
         lifetime: BackgroundTaskLifetime,
+        origin_call_id: Option<String>,
     ) -> Result<String, String> {
         let owner = owner.ok_or("hosted service requires a creating session")?;
         let config = self
@@ -921,6 +1070,11 @@ impl BackgroundTaskRegistry {
             .ok_or("persistent execution is not configured")?;
         let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
         let id = format!("host-{}", crate::execution_host::fresh_id()?);
+        // Register the starting call BEFORE the process can exist: a hosted
+        // task may exit while the spawn reply is still in flight.
+        if let Some(call_id) = origin_call_id {
+            self.inner.lock().await.origins.insert(id.clone(), call_id);
+        }
         self.journal()?
             .prepare_with_scope(&id, owner, writer, baseline, request.write_scope.clone())
             .await?;
@@ -928,6 +1082,7 @@ impl BackgroundTaskRegistry {
         let task = match client.spawn(&id, request, owner, writer, lifetime).await {
             Ok(task) => task,
             Err(crate::execution_host::SpawnError::Rejected(error)) => {
+                self.inner.lock().await.origins.remove(&id);
                 self.journal()?.abandon_prepared(&id)?;
                 return Err(error);
             }
@@ -1063,8 +1218,15 @@ impl BackgroundTaskRegistry {
         owner_scope: Option<&str>,
         lifetime: BackgroundTaskLifetime,
     ) -> Result<String, String> {
-        self.spawn_for_writer(request, mutation_baseline, owner_scope, "parent", lifetime)
-            .await
+        self.spawn_for_writer(
+            request,
+            mutation_baseline,
+            owner_scope,
+            "parent",
+            lifetime,
+            None,
+        )
+        .await
     }
 
     pub async fn spawn_for_writer(
@@ -1074,6 +1236,7 @@ impl BackgroundTaskRegistry {
         owner_scope: Option<&str>,
         writer_scope: &str,
         lifetime: BackgroundTaskLifetime,
+        origin_call_id: Option<String>,
     ) -> Result<String, String> {
         // A dev server / watcher belongs to the persistent execution substrate,
         // not to the generation that happened to launch it: `Runtime` is
@@ -1097,6 +1260,7 @@ impl BackgroundTaskRegistry {
                     owner_scope,
                     writer_scope,
                     lifetime,
+                    origin_call_id,
                 )
                 .await;
         }
@@ -1157,6 +1321,9 @@ impl BackgroundTaskRegistry {
 
         let mut st = self.inner.lock().await;
         self.kill_on_drop.insert(id.clone(), identity);
+        if let Some(call_id) = origin_call_id {
+            st.origins.insert(id.clone(), call_id);
+        }
         let process = reservation.take_process();
         st.tasks.insert(
             id.clone(),
@@ -1180,6 +1347,8 @@ impl BackgroundTaskRegistry {
                 default_log_cursor: 0,
                 started: Instant::now(),
                 finished: None,
+                last_output: Instant::now(),
+                expired_exit_waits: 0,
                 child: Some(process),
                 identity: Some(identity),
                 done: done.clone(),
@@ -1263,19 +1432,33 @@ impl BackgroundTaskRegistry {
                 };
                 (code, identity)
             };
-            {
+            let failed_launcher = {
                 let mut st = reg.lock().await;
                 let Some(task) = st.tasks.get_mut(&tid) else {
                     return;
                 };
                 task.process_done = true;
                 task.exit_code = code;
-            }
+                task.status == BackgroundTaskStatus::Running && code.is_some_and(|c| c != 0)
+            };
             // The process group, not its launcher, owns the write lifetime.
             // Keep the baseline and prohibit terminal publication until every
             // member is gone and its final mutations have been settled.
+            // A non-zero exit is already the command's result. When the group
+            // still has members, wake waiters now so the turn can handle the
+            // failure; the task stays running and stoppable until the group ends.
             if let Some(identity) = identity {
+                let mut announced = false;
                 while !identity.group_gone().await {
+                    if !announced && failed_launcher {
+                        announced = true;
+                        let st = reg.lock().await;
+                        if let Some(task) = st.tasks.get(&tid)
+                            && launcher_failed(task)
+                        {
+                            task.done.notify_waiters();
+                        }
+                    }
                     tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
                 }
             }
@@ -1343,7 +1526,7 @@ impl BackgroundTaskRegistry {
         spec: AdoptedTaskSpec,
         cancel: CancellationToken,
     ) -> Result<String, AdoptError> {
-        let (id, identity, process, stdout_task, stderr_task, drain, request) = {
+        let (id, identity, process, stdout_task, stderr_task, drain) = {
             let mut st = self.inner.lock().await;
             if !self.retain_process_facts {
                 prune_terminal_tasks(&mut st);
@@ -1363,13 +1546,18 @@ impl BackgroundTaskRegistry {
             let stdout_task = handoff.stdout_task;
             let stderr_task = handoff.stderr_task;
             let drain = handoff.drain;
-            let request = handoff.request;
             st.next += 1;
             let id = format!("bg-{}", st.next);
             let done = Arc::new(Notify::new());
             let changed = Arc::new(Notify::new());
             let mut log = leveler_core::sanitize_terminal_output(&spec.initial_output);
             let log_prefix_len = truncate_log(&mut log).unwrap_or(0);
+            // The adopted process came from a tool call whose result the model
+            // has not seen yet: the call reported a start. Keep the link so its
+            // real outcome is attributable when it exits.
+            if let Some(call_id) = spec.origin_call_id.clone() {
+                st.origins.insert(id.clone(), call_id);
+            }
             st.tasks.insert(
                 id.clone(),
                 TaskInner {
@@ -1392,6 +1580,8 @@ impl BackgroundTaskRegistry {
                     default_log_cursor: 0,
                     started: spec.started,
                     finished: None,
+                    last_output: Instant::now(),
+                    expired_exit_waits: 0,
                     // The adopted reaper owns the process handle directly;
                     // kill reaches it through the identity and token below.
                     child: None,
@@ -1402,21 +1592,13 @@ impl BackgroundTaskRegistry {
                     process_done: false,
                     log_pumps_remaining: 0,
                     group_reaped: false,
-                    mutation_baseline: None,
+                    mutation_baseline: spec.mutation_baseline,
                     settlement: None,
                     settlement_reported: false,
                     sandbox_scratch,
                 },
             );
-            (
-                id,
-                identity,
-                process,
-                stdout_task,
-                stderr_task,
-                drain,
-                request,
-            )
+            (id, identity, process, stdout_task, stderr_task, drain)
         };
         self.kill_on_drop.insert(id.clone(), identity);
         {
@@ -1465,25 +1647,35 @@ impl BackgroundTaskRegistry {
         let lifecycle_events = self.lifecycle_events.clone();
         let kill_on_drop = Arc::downgrade(&self.kill_on_drop);
         let reaper_identity = identity;
-        // The timeout belongs to the execution, not to the new owner: a
-        // transfer must not extend how long the process may run.
-        let timeout_left = request
-            .timeout
-            .checked_sub(spec.started.elapsed())
-            .unwrap_or_default();
+        // The caller's deadline belongs to the execution, not to the new owner:
+        // a transfer must not extend how long the process may run. An execution
+        // with no caller deadline gets none here either — the foreground wait
+        // budget is not a process lifetime.
+        let deadline_left = spec
+            .deadline
+            .map(|deadline| deadline.saturating_sub(spec.started.elapsed()));
+        let deadline_secs = spec.deadline.map(|deadline| deadline.as_secs());
         let supervisor_reg = reg.clone();
         let supervisor_tid = tid.clone();
         let supervisor_events = lifecycle_events.clone();
         let supervisor_kill_on_drop = kill_on_drop.clone();
         let reaper = tokio::spawn(async move {
             let mut process = process;
-            let first = tokio::select! {
-                biased;
-                status = process.wait() => AdoptedFirst::Exited(status),
-                _ = cancel.cancelled() => AdoptedFirst::Cancelled,
-                _ = tokio::time::sleep(timeout_left) => AdoptedFirst::TimedOut,
+            let first = match deadline_left {
+                Some(left) => tokio::select! {
+                    biased;
+                    status = process.wait() => AdoptedFirst::Exited(status),
+                    _ = cancel.cancelled() => AdoptedFirst::Cancelled,
+                    _ = tokio::time::sleep(left) => AdoptedFirst::TimedOut,
+                },
+                None => tokio::select! {
+                    biased;
+                    status = process.wait() => AdoptedFirst::Exited(status),
+                    _ = cancel.cancelled() => AdoptedFirst::Cancelled,
+                },
             };
             let mut cancelled = false;
+            let mut timed_out = false;
             let code = match first {
                 AdoptedFirst::Exited(status) => status.ok().and_then(|s| s.code()),
                 AdoptedFirst::Cancelled => {
@@ -1494,6 +1686,7 @@ impl BackgroundTaskRegistry {
                     None
                 }
                 AdoptedFirst::TimedOut => {
+                    timed_out = true;
                     process.terminate_tree().await;
                     let status = process.wait_deadline().await;
                     status.ok().and_then(|s| s.code())
@@ -1503,6 +1696,24 @@ impl BackgroundTaskRegistry {
             while !reaper_identity.group_gone().await {
                 tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
             }
+            // Group identity expires when the group is gone, before a slow
+            // diff can observe a recycled process-group id. A handoff with no
+            // baseline (the user shell) keeps the old identity until the
+            // terminal lock, so this wait does not change that path.
+            let baseline = {
+                let mut st = reg.lock().await;
+                st.tasks.get_mut(&tid).and_then(|task| {
+                    let baseline = task.mutation_baseline.take();
+                    if baseline.is_some() {
+                        task.identity = None;
+                    }
+                    baseline
+                })
+            };
+            let settlement = match baseline {
+                Some(baseline) => Some(settle(&baseline).await),
+                None => None,
+            };
             // Detached grandchildren may hold the pipes; the child's own
             // output is already buffered. Bound the drain exactly like the
             // foreground path.
@@ -1524,6 +1735,13 @@ impl BackgroundTaskRegistry {
             } else {
                 None
             };
+            if timed_out && let Some(secs) = deadline_secs {
+                let note = format!(
+                    "[terminated at the caller's execution deadline: timeout_seconds={secs}; \
+                     the process group was stopped]\n"
+                );
+                let _ = append_text_log(&reg, &tid, BackgroundOutputStream::Stderr, &note).await;
+            }
             {
                 let mut st = reg.lock().await;
                 if let Some(task) = st.tasks.get_mut(&tid) {
@@ -1531,6 +1749,7 @@ impl BackgroundTaskRegistry {
                     task.exit_code = code;
                     task.group_reaped = true;
                     task.identity = None;
+                    task.settlement = settlement;
                     if cancelled
                         && !matches!(task.status, BackgroundTaskStatus::Killing)
                         && !task.status.is_terminal()
@@ -1610,7 +1829,11 @@ impl BackgroundTaskRegistry {
 
     pub async fn get(&self, id: &str) -> Option<BackgroundTaskSnapshot> {
         let st = self.inner.lock().await;
-        st.tasks.get(id).map(snapshot)
+        st.tasks.get(id).map(|task| {
+            let mut snap = snapshot(task);
+            st.attach_readiness(&mut snap);
+            snap
+        })
     }
 
     /// Inspect ownership without reconciling terminal facts, acknowledging them,
@@ -1664,6 +1887,60 @@ impl BackgroundTaskRegistry {
         self.get_authorized(id, owner, false).await
     }
 
+    /// Record that a caller OBSERVED this task's own output signalling
+    /// readiness. The process keeps running: this is not an exit, not a
+    /// health check, and never a substitute for waiting on a finite task.
+    ///
+    /// The first observation wins, so a later pattern cannot rewrite the
+    /// evidence the UI already showed. A terminal task refuses: readiness is a
+    /// running fact.
+    pub async fn mark_ready_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+        evidence: &str,
+    ) -> Result<TaskReadiness, String> {
+        let evidence = readiness_evidence(evidence)?;
+        // Authorization and the real status come from the same read path every
+        // other caller uses; the overlay below never invents a task.
+        let snapshot = self.get_authorized(id, owner, unrestricted).await?;
+        if snapshot.status.is_terminal() {
+            return Err(format!(
+                "task `{id}` already finished; readiness is a running fact"
+            ));
+        }
+        let ready = TaskReadiness {
+            evidence,
+            elapsed_ms: snapshot.duration_ms,
+        };
+        {
+            let mut st = self.inner.lock().await;
+            if let Some(existing) = st.readiness.get(id) {
+                return Ok(existing.clone());
+            }
+            st.readiness.insert(id.to_string(), ready.clone());
+        }
+        let _ = self.lifecycle_events.send(BackgroundTaskEvent::Ready {
+            owner_scope: snapshot.owner_scope,
+            task_id: id.to_string(),
+            evidence: ready.evidence.clone(),
+            elapsed_ms: ready.elapsed_ms,
+        });
+        Ok(ready)
+    }
+
+    /// The readiness observed for one task, if any. Read-only.
+    pub async fn readiness_of(&self, id: &str) -> Option<TaskReadiness> {
+        self.inner.lock().await.readiness.get(id).cloned()
+    }
+
+    /// The tool call that started one task, if this runtime observed the spawn.
+    /// Read-only; the record is retained until the registry prunes the task.
+    pub async fn origin_call_id_of(&self, id: &str) -> Option<String> {
+        self.inner.lock().await.origins.get(id).cloned()
+    }
+
     pub async fn get_authorized(
         &self,
         id: &str,
@@ -1685,6 +1962,11 @@ impl BackgroundTaskRegistry {
                     client.acknowledge(id, owner).await?;
                 };
             }
+            let ready = self.inner.lock().await.readiness.get(id).cloned();
+            let mut task = task;
+            if task.ready.is_none() {
+                task.ready = ready;
+            }
             return Ok(task);
         }
         let st = self.inner.lock().await;
@@ -1695,7 +1977,9 @@ impl BackgroundTaskRegistry {
         if !unrestricted {
             check_owner(task, owner)?;
         }
-        Ok(snapshot(task))
+        let mut snap = snapshot(task);
+        st.attach_readiness(&mut snap);
+        Ok(snap)
     }
 
     pub async fn wait_owned(
@@ -1722,6 +2006,7 @@ impl BackgroundTaskRegistry {
             loop {
                 let task = self.get_authorized(id, owner, unrestricted).await?;
                 if task.status.is_terminal()
+                    || task.command_already_failed()
                     || deadline.is_some_and(|d| tokio::time::Instant::now() >= d)
                 {
                     return Ok(task);
@@ -1734,6 +2019,113 @@ impl BackgroundTaskRegistry {
         // ownership again before delivering bytes or advancing a cursor.
         self.get_authorized(id, owner, unrestricted).await?;
         self.wait(id, timeout, cancellation).await
+    }
+
+    /// Record that an `until: exit` wait expired on a still-running task and
+    /// return the running total for that task.
+    ///
+    /// Counting is the registry's job because the fact must outlive the call
+    /// that observed it: a repeat is only recognizable against a prior one.
+    pub async fn note_expired_exit_wait_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+    ) -> Result<u32, String> {
+        if id.starts_with("host-") {
+            // A hosted record's snapshot already carries its own count; the
+            // runtime keeps no second copy it could increment.
+            let snap = self.get_authorized(id, owner, unrestricted).await?;
+            return Ok(snap.expired_exit_waits);
+        }
+        let mut st = self.inner.lock().await;
+        let task = st
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| format!("unknown task `{id}`"))?;
+        if !unrestricted {
+            check_owner(task, owner)?;
+        }
+        task.expired_exit_waits = task.expired_exit_waits.saturating_add(1);
+        Ok(task.expired_exit_waits)
+    }
+
+    /// Wait for a terminal status OR new output, without consuming a reader
+    /// cursor.
+    ///
+    /// [`Self::wait`] wakes only on the task's end, so a caller that also has to
+    /// notice output cannot use it to bound a long wait: it would sit out the
+    /// whole interval on a task that is talking. This registers on the task's
+    /// change notification AND compares the output length across the wait, so a
+    /// notification that arrives between two registrations cannot be lost — a
+    /// lost wake-up here means a caller waits its full bound on output it should
+    /// have seen immediately.
+    pub async fn wait_or_output_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskSnapshot, String> {
+        if id.starts_with("host-") {
+            // A hosted record is observed through the Execution Host; the
+            // runtime keeps no local copy of its output position.
+            self.get_authorized(id, owner, unrestricted).await?;
+            return self
+                .wait_owned(id, owner, Some(timeout), cancellation)
+                .await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut output_at_start = None;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err("wait cancelled".into());
+            }
+            let mut st = self.inner.lock().await;
+            let task = st
+                .tasks
+                .get_mut(id)
+                .ok_or_else(|| format!("unknown task `{id}`"))?;
+            if !unrestricted {
+                check_owner(task, owner)?;
+            }
+            let output_at_start = *output_at_start.get_or_insert(task.log_end);
+            let grew = task.log_end > output_at_start;
+            if task.status != BackgroundTaskStatus::Running
+                || launcher_failed(task)
+                || grew
+                || tokio::time::Instant::now() >= deadline
+            {
+                let mut snap = snapshot(task);
+                st.readiness
+                    .get(id)
+                    .cloned()
+                    .into_iter()
+                    .for_each(|ready| snap.ready = Some(ready));
+                return Ok(snap);
+            }
+            // Two notifications carry two different facts: `changed` is new
+            // output, `done` is the terminal transition (or a launcher that
+            // already failed while its descendants keep the group alive). This
+            // caller waits for either, so it subscribes to both.
+            let changed = task.changed.clone();
+            let done = task.done.clone();
+            let notified = changed.notified();
+            let finished = done.notified();
+            tokio::pin!(notified);
+            tokio::pin!(finished);
+            notified.as_mut().enable();
+            finished.as_mut().enable();
+            drop(st);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("wait cancelled".into()),
+                _ = &mut notified => {},
+                _ = &mut finished => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+        }
     }
 
     pub async fn take_settlement_owned(
@@ -1947,7 +2339,7 @@ impl BackgroundTaskRegistry {
                 .tasks
                 .get(id)
                 .ok_or_else(|| format!("unknown task `{id}`"))?;
-            if task.status.is_terminal() {
+            if task.status.is_terminal() || launcher_failed(task) {
                 return Ok(snapshot(task));
             }
             task.done.clone()
@@ -1960,7 +2352,7 @@ impl BackgroundTaskRegistry {
         {
             let st = self.inner.lock().await;
             if let Some(task) = st.tasks.get(id)
-                && task.status.is_terminal()
+                && (task.status.is_terminal() || launcher_failed(task))
             {
                 return Ok(snapshot(task));
             }
@@ -2065,6 +2457,9 @@ impl BackgroundTaskRegistry {
                     None => client.acknowledge_unrestricted(id).await?,
                 };
             }
+            if result.snapshot.ready.is_none() {
+                result.snapshot.ready = self.inner.lock().await.readiness.get(id).cloned();
+            }
             return Ok(result);
         }
         let deadline = tokio::time::Instant::now() + timeout;
@@ -2073,6 +2468,7 @@ impl BackgroundTaskRegistry {
                 return Err("wait cancelled".into());
             }
             let mut st = self.inner.lock().await;
+            let ready = st.readiness.get(id).cloned();
             let task = st
                 .tasks
                 .get_mut(id)
@@ -2100,23 +2496,37 @@ impl BackgroundTaskRegistry {
                 if cursor.is_none() {
                     task.default_log_cursor = position;
                 }
+                let mut snapshot = snapshot_with_log(task, log);
+                if snapshot.ready.is_none() {
+                    snapshot.ready = ready;
+                }
                 return Ok(BackgroundTaskObservation {
-                    snapshot: snapshot_with_log(task, log),
+                    snapshot,
                     settlement: task.settlement.clone(),
                     dropped_bytes,
                     next_cursor: position,
                     log_remaining: position < task.log_end,
                 });
             }
+            // Two notifications carry two different facts: `changed` is new
+            // output, `done` is the terminal transition (or a launcher that
+            // already failed while its descendants keep the group alive). A
+            // caller waiting for either must subscribe to both, or it sits out
+            // the interval on a task that has already ended.
             let changed = task.changed.clone();
+            let done = task.done.clone();
             let notified = changed.notified();
+            let finished = done.notified();
             tokio::pin!(notified);
+            tokio::pin!(finished);
             notified.as_mut().enable();
+            finished.as_mut().enable();
             drop(st);
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err("wait cancelled".into()),
                 _ = &mut notified => {},
+                _ = &mut finished => {},
                 _ = tokio::time::sleep_until(deadline) => {},
             }
         }
@@ -2211,7 +2621,11 @@ impl BackgroundTaskRegistry {
             .tasks
             .values()
             .filter(|task| task.owner_scope.as_deref() == Some(scope) && task.status.is_active())
-            .map(snapshot)
+            .map(|task| {
+                let mut snap = snapshot(task);
+                st.attach_readiness(&mut snap);
+                snap
+            })
             .collect();
         snapshots.sort_by(|a, b| a.id.cmp(&b.id));
         snapshots
@@ -2382,6 +2796,23 @@ fn check_owner(task: &TaskInner, owner: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Bound and clean readiness evidence before it is stored or broadcast.
+///
+/// One line, control-free, and capped: a chatty process must not be able to
+/// put an unbounded or terminal-repainting string into every projection.
+fn readiness_evidence(raw: &str) -> Result<String, String> {
+    let cleaned = leveler_core::sanitize_terminal_output(raw);
+    let line = cleaned
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if line.is_empty() {
+        return Err("readiness evidence is empty".into());
+    }
+    Ok(line.chars().take(200).collect())
+}
+
 /// Evict the oldest completed records while preserving every running/killing
 /// task. Called only before a spawn: completion waiters therefore get a stable
 /// chance to observe their terminal snapshot.
@@ -2399,6 +2830,8 @@ fn prune_terminal_tasks(state: &mut RegistryState) {
     terminal.sort_unstable();
     for (_, id) in terminal.into_iter().take(remove_count) {
         state.tasks.remove(&id);
+        state.readiness.remove(&id);
+        state.origins.remove(&id);
     }
 }
 
@@ -2547,6 +2980,15 @@ async fn settle(baseline: &MutationBaseline) -> BackgroundSettlement {
     }
 }
 
+/// The direct child has exited non-zero and the task is still the owner of
+/// whatever it left behind. That exit is the command's result. The task is
+/// not finished: its process group is still stoppable.
+fn launcher_failed(task: &TaskInner) -> bool {
+    task.status == BackgroundTaskStatus::Running
+        && task.process_done
+        && task.exit_code.is_some_and(|code| code != 0)
+}
+
 fn finalize_if_drained(task: &mut TaskInner) -> bool {
     // The task owns its process group: the direct child is not the task. A
     // workload is over only when the child has been reaped AND the group it
@@ -2619,6 +3061,7 @@ async fn append_text_log(
     let chunk = format!("[{}] {sanitized}", stream.label());
     task.log.push_str(&chunk);
     task.log_end = task.log_end.saturating_add(chunk.len() as u64);
+    task.last_output = Instant::now();
     if let Some(prefix_len) = truncate_log(&mut task.log) {
         task.log_prefix_len = prefix_len;
     }
@@ -2687,6 +3130,15 @@ fn snapshot_with_log(task: &TaskInner, log: String) -> BackgroundTaskSnapshot {
         pid: task.pid,
         owner_scope: task.owner_scope.clone(),
         log_truncated: task.log_prefix_len > 0,
+        ready: None,
+        silent_ms: task
+            .finished
+            .unwrap_or_else(Instant::now)
+            .duration_since(task.last_output)
+            .as_millis() as u64,
+        lifetime: task.lifetime,
+        expired_exit_waits: task.expired_exit_waits,
+        output_bytes: task.log_end,
     }
 }
 
@@ -2837,9 +3289,12 @@ mod tests {
                     write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Runtime,
                     started: Instant::now() - Duration::from_millis(100),
+                    deadline: None,
                     initial_output: first.text,
                     observer: None,
                     on_adopted: None,
+                    mutation_baseline: None,
+                    origin_call_id: None,
                 },
                 CancellationToken::new(),
             )
@@ -2924,11 +3379,14 @@ mod tests {
                     write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Runtime,
                     started: Instant::now(),
+                    deadline: None,
                     initial_output: first.text,
                     observer: None,
                     on_adopted: Some(std::sync::Arc::new(move |_task_id: &str| {
                         flag.store(true, Ordering::SeqCst);
                     })),
+                    mutation_baseline: None,
+                    origin_call_id: None,
                 },
                 CancellationToken::new(),
             )
@@ -3006,9 +3464,12 @@ mod tests {
                     // 600ms of the 700ms budget was already spent in the
                     // foreground; adoption must not reset the clock.
                     started: Instant::now() - Duration::from_millis(600),
+                    deadline: Some(Duration::from_millis(700)),
                     initial_output: String::new(),
                     observer: None,
                     on_adopted: None,
+                    mutation_baseline: None,
+                    origin_call_id: None,
                 },
                 CancellationToken::new(),
             )
@@ -3025,6 +3486,88 @@ mod tests {
             elapsed < Duration::from_millis(550),
             "the original budget must not restart at adoption: {elapsed:?}"
         );
+    }
+
+    /// A process that left the foreground because it was still running is not
+    /// killed by that call's wait budget.
+    ///
+    /// The reported failure: `make up` was moved to the background after 15s
+    /// with `timeout_seconds=600`, the adopted reaper kept enforcing that
+    /// number, and the API/MCP/portal processes it started died with it. The
+    /// wait budget belongs to the call that returned; an execution with no
+    /// caller deadline has none here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_task_without_a_caller_deadline_outlives_the_foreground_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = CommandRunner::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let mut request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        // The call's own foreground window, already shorter than the process.
+        request.timeout = Duration::from_millis(700);
+        let run = tokio::spawn({
+            let handoff = handoff.clone();
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run_streaming_handoff(request, CancellationToken::new(), tx, handoff)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handoff.cancel();
+        let parts = match tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("handoff returned")
+            .expect("driver task")
+        {
+            crate::command::StreamOutcome::HandedOff(parts) => *parts,
+            _ => panic!("a live process must be handed off"),
+        };
+        let reg = host_registry();
+        let id = reg
+            .adopt(
+                parts,
+                rx,
+                AdoptedTaskSpec {
+                    owner_scope: Some("session".into()),
+                    writer_scope: "parent".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: dir.path().to_path_buf(),
+                    write_scope: crate::WriteScope::Unrestricted,
+                    lifetime: BackgroundTaskLifetime::Goal,
+                    started: Instant::now(),
+                    // No `timeout_seconds` was set by the caller: the process
+                    // is a hosted execution, not a bounded call.
+                    deadline: None,
+                    initial_output: String::new(),
+                    observer: None,
+                    on_adopted: None,
+                    mutation_baseline: None,
+                    origin_call_id: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.error)
+            .expect("adopt");
+        // Strictly beyond the request's own 700ms window.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let snap = reg.get(&id).await.expect("task");
+        assert_eq!(
+            snap.status,
+            BackgroundTaskStatus::Running,
+            "the foreground wait budget is not a process lifetime: {:?}",
+            snap.log
+        );
+        assert!(snap.exit_code.is_none(), "{:?}", snap.log);
+        reg.kill(&id).await.expect("stop the service explicitly");
     }
 
     #[cfg(unix)]
@@ -3074,9 +3617,12 @@ mod tests {
                     write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Runtime,
                     started: Instant::now(),
+                    deadline: None,
                     initial_output: String::new(),
                     observer: None,
                     on_adopted: None,
+                    mutation_baseline: None,
+                    origin_call_id: None,
                 },
                 CancellationToken::new(),
             )
@@ -3100,6 +3646,78 @@ mod tests {
             "{terminal:?}"
         );
         assert!(!process_alive(pgid as u32), "the same process tree is gone");
+    }
+
+    /// A wait that also watches output must wake on the FIRST chunk, not at the
+    /// end of its slice: a silent-window bound is useless if the notification
+    /// it depends on is lost.
+    #[tokio::test]
+    async fn wait_or_output_wakes_on_the_first_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = BackgroundTaskRegistry::new();
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 0.2; echo first; sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let started = std::time::Instant::now();
+        let snap = reg
+            .wait_or_output_authorized(
+                &id,
+                "parent",
+                true,
+                Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("wait");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "output must wake the wait, not the slice: {elapsed:?} {:?}",
+            snap.output_bytes
+        );
+        assert!(snap.output_bytes > 0, "the chunk is visible: {snap:?}");
+        let _ = reg.kill(&id).await;
+    }
+
+    #[tokio::test]
+    async fn notify_waiters_wakes_an_enabled_notified_future() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let handle = notify.clone();
+        let notified = handle.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let n = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            n.notify_waiters();
+        });
+        tokio::select! {
+            _ = &mut notified => {},
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("lost wakeup"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_log_pump_delivers_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = BackgroundTaskRegistry::new();
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 0.2; echo first; sleep 30".into()],
+            dir.path().to_path_buf(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let snap = reg.get(&id).await.expect("task");
+        assert!(
+            snap.output_bytes > 0,
+            "the pump must have delivered the chunk: {snap:?}"
+        );
+        assert!(snap.silent_ms < 800, "silence accounting: {snap:?}");
+        let _ = reg.kill(&id).await;
     }
 
     #[tokio::test]
@@ -3318,6 +3936,8 @@ mod tests {
                     default_log_cursor: 0,
                     started: finished,
                     finished: Some(finished),
+                    last_output: Instant::now(),
+                    expired_exit_waits: 0,
                     child: None,
                     identity: None,
                     done: Arc::new(Notify::new()),
@@ -3359,6 +3979,8 @@ mod tests {
                     default_log_cursor: 0,
                     started: now,
                     finished: None,
+                    last_output: Instant::now(),
+                    expired_exit_waits: 0,
                     child: None,
                     identity: None,
                     done: Arc::new(Notify::new()),
@@ -3415,6 +4037,8 @@ mod tests {
             default_log_cursor: 0,
             started: Instant::now(),
             finished: None,
+            last_output: Instant::now(),
+            expired_exit_waits: 0,
             child: None,
             identity: None,
             done: Arc::new(Notify::new()),
@@ -3458,6 +4082,8 @@ mod tests {
             default_log_cursor: 0,
             started: Instant::now(),
             finished: None,
+            last_output: Instant::now(),
+            expired_exit_waits: 0,
             child: None,
             identity: None,
             done: Arc::new(Notify::new()),
@@ -3528,6 +4154,7 @@ mod tests {
                 Some("session"),
                 "child",
                 BackgroundTaskLifetime::Goal,
+                None,
             )
             .await
             .unwrap();
@@ -3538,6 +4165,7 @@ mod tests {
                 Some("session"),
                 "peer",
                 BackgroundTaskLifetime::Goal,
+                None,
             )
             .await
             .unwrap();

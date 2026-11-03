@@ -1230,8 +1230,37 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     chrome.output.push_str(&clean);
                     cap_background_output(&mut chrome.output);
                     chrome.last_output_at = Some(std::time::Instant::now());
+                    // The command row that started the task shows the same live
+                    // tail, so the user does not have to open the jobs page to
+                    // see that the process is doing something. One runtime
+                    // event, two projections of the same bytes.
+                    state
+                        .transcript
+                        .append_background_output(&task_id, &clean, state.elapsed_secs);
                 }
             }
+        }
+        RuntimeEvent::BackgroundTaskReady {
+            task_id, evidence, ..
+        } => {
+            // Readiness is a RUNNING fact: the process kept going. It is stored
+            // where every projection reads it and stamped onto the command row,
+            // and never touches `ok` / `stopped`.
+            let label = match state.background_task_labels.get_mut(&task_id) {
+                Some(chrome) => {
+                    if chrome.is_running() && chrome.ready.is_none() {
+                        chrome.ready = Some(evidence.clone());
+                    }
+                    chrome.label.clone()
+                }
+                None => state.t().background_task_generic.to_string(),
+            };
+            state.transcript.note_background_ready(&task_id, &evidence);
+            let message = state.t().background_task_ready.replace("{}", &label);
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message,
+            });
         }
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
             replace_active_background_tasks(state, &tasks);
@@ -1591,6 +1620,14 @@ fn replace_active_background_tasks(
         );
         chrome.output = previous_output;
         chrome.pid = task.pid;
+        // Readiness survives a reconnect because the runtime re-reports the
+        // evidence it observed. It is never reconstructed from the command.
+        if let Some(evidence) = task.ready_evidence.as_deref() {
+            chrome.ready = Some(evidence.to_string());
+            state
+                .transcript
+                .note_background_ready(&task.task_id, evidence);
+        }
         state
             .background_task_labels
             .insert(task.task_id.clone(), chrome);

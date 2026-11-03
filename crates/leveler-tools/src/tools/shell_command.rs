@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::RiskLevel;
+use leveler_execution::{BackgroundTaskLifetime, RiskLevel};
 
 use super::command_execution::CommandExecution;
 use super::shell_guard::refuse_shell_script;
@@ -29,9 +29,26 @@ struct Input {
     /// Accepts `workdir` as an alias for `cwd`.
     #[serde(default, alias = "workdir")]
     cwd: Option<String>,
-    /// Timeout in seconds. Defaults to 120.
+    /// Execution deadline in seconds. Leave it unset for an ordinary command:
+    /// the run then blocks for up to 120 seconds and, if it is still running, is
+    /// moved to the background without being killed at that point. Set it when
+    /// the command itself must not run longer than this — the deadline follows
+    /// the process, including after a move to the background.
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// When true, start the command in the background immediately and return a
+    /// task_id. Use get_task / wait_task / kill_task to manage it. This is the
+    /// explicit way to start a long-lived service (`make up`, a dev server, a
+    /// watcher): a background task has no execution deadline, so it is not
+    /// killed by this tool's wait budget.
+    #[serde(default)]
+    background: Option<bool>,
+    /// Cleanup boundary for a background command. Defaults to `goal`, which
+    /// stops it when the current goal finishes. Use `runtime`/`session`/
+    /// `persistent` only when the user explicitly asks a service to remain
+    /// running after task completion.
+    #[serde(default)]
+    background_lifetime: Option<super::run_command::BackgroundLifetimeInput>,
 }
 
 pub struct ShellCommandTool {
@@ -59,7 +76,17 @@ impl Tool for ShellCommandTool {
          system `/tmp`; other host paths are not writable. Reads of system and toolchain paths \
          are allowed. Writes outside the workspace, other user directories, \
          and readonly roots require approval outside full-access mode. \
-         Default timeout 120s. `&` and nohup require approval outside full-access mode. A `#` comment does \
+         A command still running after 15 seconds is moved to the background \
+         and this tool returns a task id while the process keeps running. That is \
+         not success, and it is not killed by the 15s/120s wait budget: \
+         `timeout_seconds` is a deadline only when you set it. Set `background` \
+         true to start a long-lived service in the background immediately. \
+         `background_lifetime` decides what stops it — `goal` (the default) stops \
+         it when the goal finishes, so a service the user asked to keep running \
+         needs `session` or `persistent`; a foreground command that is moved to the \
+         background keeps the lifetime you set. `wait_task` reads the eventual \
+         result and does not kill the task when its own bound expires. `&` and nohup require \
+         approval outside full-access mode. A `#` comment does \
          not hide a following command from the shell."
     }
 
@@ -134,13 +161,28 @@ impl Tool for ShellCommandTool {
         {
             return Ok(ToolOutput::error(reason));
         }
+        // A foreground command can still be moved to the background after the
+        // handoff threshold, and when that happens it keeps the boundary the
+        // caller chose. Rejecting the field here used to leave the caller no way
+        // to say "keep this service" about a command it had not yet classified.
         let (program, args) = leveler_execution::shell_invocation(cmd);
+        if input.background.unwrap_or(false) {
+            let lifetime: BackgroundTaskLifetime = input
+                .background_lifetime
+                .map(BackgroundTaskLifetime::from)
+                .unwrap_or(BackgroundTaskLifetime::Goal);
+            return self
+                .commands
+                .start_background(&program, args, input.cwd.as_deref(), lifetime, context)
+                .await;
+        }
         self.commands
-            .run_foreground(
+            .run_foreground_with_lifetime(
                 &program,
                 args,
                 input.cwd.as_deref(),
                 input.timeout_seconds,
+                input.background_lifetime.map(BackgroundTaskLifetime::from),
                 context,
                 cancellation,
             )
@@ -337,5 +379,56 @@ mod tests {
             "anti-pattern must fail closed immediately, took {elapsed:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+    /// A shell command is the most common way a project starts its services
+    /// (`make up`, a dev server). It must have the same explicit hosting path as
+    /// the argv tool: a task id immediately, no 15s block, no execution
+    /// deadline, and a lifetime the caller chose.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_true_hosts_a_shell_service_without_waiting() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-shell-bg-{}", super::super::test_ordinal()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        ));
+        let registry = std::sync::Arc::new(
+            leveler_execution::BackgroundTaskRegistry::with_environment(environment),
+        );
+        let tool = ShellCommandTool::new(std::sync::Arc::new(CommandExecution::new(
+            registry.clone(),
+            None,
+        )));
+        let start = Instant::now();
+        let out = tool
+            .execute(
+                serde_json::json!({"cmd": "sleep 20", "background": true}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "an explicit background command must not wait for the handoff: {:?}",
+            start.elapsed()
+        );
+        let task_id = out.metadata["task_id"]
+            .as_str()
+            .expect("the task identity is a structured fact")
+            .to_string();
+        assert!(out.content.contains(&task_id), "{out:?}");
+        assert!(out.content.contains("lifetime: goal"), "{out:?}");
+        registry
+            .kill(&task_id)
+            .await
+            .expect("stop the service explicitly");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

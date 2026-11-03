@@ -186,6 +186,8 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
         MockResponse::Sse {
             body: format!("data: {completed}\n\ndata: [DONE]\n\n"),
         },
+        // The resolution carried no sentence, so its delivery round answers.
+        quiet(),
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
@@ -346,7 +348,8 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
     let resumed =
         leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap()).unwrap();
     assert_eq!(resumed.goal_id.as_ref(), Some(&goals[0].id));
-    assert_eq!(server.request_count(), 4);
+    // The goal's three quiet rounds, its resolution, and the delivery round.
+    assert_eq!(server.request_count(), 5);
 }
 
 /// Upload acknowledgement is not the import result. Observe the authoritative

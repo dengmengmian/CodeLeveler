@@ -30,13 +30,38 @@ const SESSION_SCOPE: &str = "sess-under-test";
 
 struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
+    error_when_exhausted: Mutex<ModelError>,
     cancel_before_closeout: Mutex<Option<(Database, leveler_core::SessionId)>>,
+}
+
+/// Append the answer a real model must write after it resolves its goal.
+///
+/// The runtime takes one delivery round after `update_goal` when the resolving
+/// round carried no text, so a script that ends on that call needs one more
+/// response. The fixture states the contract rather than relying on the turn
+/// ending on a tool call.
+fn with_delivery(mut responses: Vec<ModelResponse>) -> Vec<ModelResponse> {
+    let resolves_without_text = responses.last().is_some_and(|response| {
+        response.message.text_content().trim().is_empty()
+            && response.message.content.iter().any(
+                |part| matches!(part, ContentPart::ToolCall { call } if call.name == "update_goal"),
+            )
+    });
+    if resolves_without_text {
+        responses.push(text("Done: the goal is resolved and reported."));
+    }
+    responses
 }
 
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
+        let responses = with_delivery(responses);
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
+            error_when_exhausted: Mutex::new(ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "no more responses",
+            )),
             cancel_before_closeout: Mutex::new(None),
         }
     }
@@ -49,9 +74,12 @@ impl ModelRuntime for MockRuntime {
         _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
-        })?;
+        let response = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| self.error_when_exhausted.lock().unwrap().clone())?;
         if response.message.content.iter().any(
             |part| matches!(part, ContentPart::ToolCall { call } if call.name == "update_goal"),
         ) {
@@ -238,6 +266,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -671,4 +700,483 @@ async fn a_work_window_boundary_keeps_goal_owned_services_alive() {
         "a goal-owned service must survive a work-window boundary so the next \
          window does not rebuild the environment"
     );
+}
+
+/// A provider stream failure ends a window, not the still-resumable goal that
+/// owns its service. The next window must find the same live process.
+#[tokio::test]
+async fn a_provider_timeout_keeps_the_open_goals_service_alive() {
+    let h = harness(vec![spawn_sleep_server()]).await;
+    *h.runtime.error_when_exhausted.lock().unwrap() = ModelError::new(
+        leveler_model::ModelErrorKind::Timeout,
+        "error decoding response body",
+    )
+    .with_delivery_state(leveler_model::DeliveryState::StreamInterrupted {
+        progress: leveler_model::StreamProgress {
+            text: true,
+            ..Default::default()
+        },
+    });
+    let s = spec(&h, "start a service, then keep working");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let result = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await;
+    let task = leveler_storage::TaskStore::task_for_session(&h.db, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = leveler_storage::GoalStore::for_task(&h.db, &task)
+        .await
+        .unwrap();
+    let snapshot = h.registry.get("bg-1").await.unwrap();
+    #[cfg(unix)]
+    let process_alive = std::process::Command::new("kill")
+        .args(["-0", &snapshot.pid.unwrap().to_string()])
+        .status()
+        .unwrap()
+        .success();
+    // Clean up even on the red run before asserting the captured facts.
+    h.registry.kill_all().await;
+    assert_terminal_within(&h.registry, "bg-1", "test cleanup").await;
+
+    assert!(
+        matches!(result, Err(leveler_engine::EngineError::Execution {
+            model: Some(ref error), ..
+        }) if error.kind == leveler_model::ModelErrorKind::Timeout),
+        "the window must retain the actual provider timeout: {result:?}"
+    );
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    assert_eq!(
+        snapshot.status,
+        BackgroundTaskStatus::Running,
+        "a provider failure must not destroy the open goal's environment"
+    );
+    #[cfg(unix)]
+    assert!(process_alive, "the service process must actually survive");
+}
+
+/// A provider rejection that cannot resume still settles the goal and reaps
+/// its service; retaining processes is not a blanket exception for errors.
+#[tokio::test]
+async fn an_unrecoverable_provider_failure_reaps_the_settled_goals_service() {
+    let h = harness(vec![spawn_sleep_server()]).await;
+    *h.runtime.error_when_exhausted.lock().unwrap() = ModelError::new(
+        leveler_model::ModelErrorKind::Auth,
+        "provider authentication rejected",
+    );
+    let s = spec(&h, "start a service, then keep working");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let result = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await;
+    let task = leveler_storage::TaskStore::task_for_session(&h.db, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = leveler_storage::GoalStore::for_task(&h.db, &task)
+        .await
+        .unwrap();
+    assert_terminal_within(&h.registry, "bg-1", "unrecoverable provider failure").await;
+    assert!(result.is_err(), "provider rejection must remain an error");
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+}
+
+/// Resume uses the original goal and background process after a transport
+/// failure; observing and explicitly stopping it completes that same goal.
+#[tokio::test]
+async fn resume_after_provider_timeout_observes_and_stops_the_original_service() {
+    let h = harness(vec![spawn_sleep_server()]).await;
+    *h.runtime.error_when_exhausted.lock().unwrap() = ModelError::new(
+        leveler_model::ModelErrorKind::Timeout,
+        "response stream timed out",
+    )
+    .with_delivery_state(leveler_model::DeliveryState::StreamInterrupted {
+        progress: leveler_model::StreamProgress {
+            text: true,
+            ..Default::default()
+        },
+    });
+    let s = spec(&h, "start a service, observe it, then stop it and report");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let first = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await;
+    let task = leveler_storage::TaskStore::task_for_session(&h.db, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let before_goals = leveler_storage::GoalStore::for_task(&h.db, &task)
+        .await
+        .unwrap();
+    let before = h.registry.get("bg-1").await.unwrap();
+    let pid = before.pid.unwrap();
+    #[cfg(unix)]
+    let alive_before = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    eprintln!(
+        "resume evidence before: goal={} state={:?} task=bg-1 pid={pid} status={:?}",
+        before_goals[0].id, before_goals[0].state, before.status
+    );
+
+    h.runtime
+        .responses
+        .lock()
+        .unwrap()
+        .extend(with_delivery(vec![
+            tool_call(
+                "observe-existing",
+                "get_task",
+                serde_json::json!({"task_id": "bg-1"}),
+            ),
+            tool_call(
+                "stop-existing",
+                "kill_task",
+                serde_json::json!({"task_id": "bg-1"}),
+            ),
+            tool_call(
+                "finish-existing",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "Observed the original service and stopped it."
+                }),
+            ),
+        ]));
+    let mut observed_running = false;
+    let resumed = h
+        .engine
+        .resume_with_instruction(
+            &session,
+            &s,
+            Message::user_input("继续"),
+            &mut |event| {
+                if let leveler_engine::EngineEvent::ToolCallFinished {
+                    call_id,
+                    is_error,
+                    preview,
+                    ..
+                } = event
+                    && call_id == "observe-existing"
+                {
+                    observed_running = !is_error && preview.contains("status: running");
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_terminal_within(&h.registry, "bg-1", "resumed explicit stop").await;
+    let after = h.registry.get("bg-1").await.unwrap();
+    #[cfg(unix)]
+    let alive_after = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    let after_goals = leveler_storage::GoalStore::for_task(&h.db, &task)
+        .await
+        .unwrap();
+    h.registry.kill_all().await;
+    eprintln!(
+        "resume evidence after: goal={} state={:?} task=bg-1 pid={:?} status={:?} tool_observed_running={observed_running}",
+        after_goals[0].id, after_goals[0].state, after.pid, after.status
+    );
+    #[cfg(unix)]
+    eprintln!(
+        "resume OS evidence: pid={pid} alive_before={alive_before} alive_after={alive_after}"
+    );
+
+    assert!(
+        first.is_err(),
+        "first window must fail at the provider boundary"
+    );
+    assert_eq!(before_goals.len(), 1);
+    assert_eq!(before_goals[0].state, leveler_storage::GoalState::Running);
+    assert_eq!(before.status, BackgroundTaskStatus::Running);
+    assert!(
+        observed_running,
+        "resumed model must observe the same live task through get_task"
+    );
+    assert_eq!(
+        resumed.unwrap().stop_reason,
+        leveler_agent::StopReason::Completed
+    );
+    assert_eq!(after_goals.len(), 1, "resume must not duplicate the goal");
+    assert_eq!(after_goals[0].id, before_goals[0].id);
+    assert_eq!(after_goals[0].state, leveler_storage::GoalState::Settled);
+    assert_eq!(
+        after.pid,
+        Some(pid),
+        "the stopped task must be the original process"
+    );
+    #[cfg(unix)]
+    assert!(
+        alive_before && !alive_after,
+        "original PID must survive the fault and disappear after explicit stop"
+    );
+}
+
+/// A background test run has not produced a result. Its START is not evidence
+/// of a pass: the completion gate must keep the goal open when the only test
+/// command in the record is a suite that is still running — even when the model
+/// cites that command. `execution_status` is the mechanical line between
+/// "started" and "ran to its own answer".
+#[tokio::test]
+async fn a_background_test_start_is_not_evidence_of_a_pass() {
+    let (script_name, script) = if cfg!(windows) {
+        ("run-tests.cmd", "ping -n 30 127.0.0.1 >NUL\r\n")
+    } else {
+        ("run-tests.sh", "sleep 30\n")
+    };
+    let (suite_program, suite_args) = if cfg!(windows) {
+        ("cmd", vec!["/c", script_name])
+    } else {
+        ("sh", vec![script_name])
+    };
+    let suite_label = format!("{suite_program} {}", suite_args.join(" "));
+    // A command that really completed, so the citation itself is valid and any
+    // refusal can only be about the tests.
+    let (quick_program, quick_args) = if cfg!(windows) {
+        ("cmd", vec!["/c", "exit 0"])
+    } else {
+        ("sh", vec!["-c", "exit 0"])
+    };
+    let quick_label = format!("{quick_program} {}", quick_args.join(" "));
+    let h = harness(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({"path": script_name, "content": script}),
+        ),
+        tool_call(
+            "b1",
+            "run_command",
+            serde_json::json!({
+                "program": suite_program,
+                "args": suite_args,
+                "background": true,
+                "reason": "run the suite the user required"
+            }),
+        ),
+        tool_call(
+            "q1",
+            "run_command",
+            serde_json::json!({
+                "program": quick_program,
+                "args": quick_args,
+                "reason": "a completed command the completion may cite"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "the suite is running",
+                "verification": {"status": "passed", "detail": quick_label},
+                "requirements": [{
+                    "requirement": "tests",
+                    "status": "done",
+                    "evidence": format!("{suite_label} started")
+                }]
+            }),
+        ),
+        tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "summary": "the suite's result is not in yet"
+            }),
+        ),
+    ])
+    .await;
+    let s = spec(&h, "跑通全部测试并确认通过。");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    refusals.push((kind, detail));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run should settle");
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Blocked,
+        "a suite that only started cannot close the goal: {report:?}"
+    );
+    assert!(
+        refusals.iter().any(|(kind, detail)| {
+            kind == "requirements_refused" && detail.contains("no test command ran")
+        }),
+        "the gate must say no test command RAN, not accept the start: {refusals:?}"
+    );
+}
+
+/// GR-02: a citation of a command that only STARTED is refused for the true
+/// reason. The real DevOrder run was told `make up` "never ran in this task"
+/// while its process was alive as `bg-1`; the model then re-ran a suite it had
+/// already run, because the feedback named a problem it did not have. The
+/// refusal must instead name the task whose result is missing.
+#[tokio::test]
+async fn a_citation_of_a_started_service_names_the_task_whose_result_is_missing() {
+    let (program, args) = leveler_test_support::sleep_command(300);
+    let label = format!("{program} {}", args.join(" "));
+    let h = harness(vec![
+        tool_call(
+            "b1",
+            "run_command",
+            serde_json::json!({
+                "program": program,
+                "args": args,
+                "background": true,
+                "reason": "start the local service"
+            }),
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "the service is up",
+                "verification": {"status": "passed", "detail": label},
+            }),
+        ),
+        tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "summary": "the service has no exit status to cite"
+            }),
+        ),
+    ])
+    .await;
+    let s = spec(&h, "启动本地服务并确认可用。");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    refusals.push((kind, detail));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run should settle");
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Blocked,
+        "a started service is not a passing check: {report:?}"
+    );
+    let detail = refusals
+        .iter()
+        .find(|(kind, _)| kind == "verification_refused")
+        .map(|(_, detail)| detail)
+        .unwrap_or_else(|| panic!("the citation must be refused: {refusals:?}"));
+    assert!(
+        detail.contains("only STARTED"),
+        "the refusal must say the command started: {detail}"
+    );
+    assert!(
+        detail.contains("bg-1"),
+        "the refusal must name the task to wait on: {detail}"
+    );
+    assert!(
+        !detail.contains("never ran"),
+        "the command did run; only its result is missing: {detail}"
+    );
+}
+
+/// LT-08: a goal that SETTLES must reap its goal-scoped services even when the
+/// session's terminal state still looks resumable.
+///
+/// Reproduced by the mock dogfood (`steer-match`): the model started a silent
+/// worker, cited a command that only STARTED three times, the gate's recovery
+/// bound stopped the turn as `incomplete`, and the goal SETTLED — no window can
+/// follow it — while the worker kept running. The cleanup gate read the draft
+/// session state ("execute") instead of the goal's own settle decision.
+#[tokio::test]
+async fn a_settled_goal_reaps_its_services_even_when_the_session_looks_resumable() {
+    let (program, args) = leveler_test_support::sleep_command(300);
+    let label = format!("{program} {}", args.join(" "));
+    // Three identical citations of a start: verification refusals, bounded by
+    // the recovery budget, stop the turn without executing anything.
+    let cite_the_start = || {
+        tool_call(
+            "g",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "the service is up",
+                "verification": {"status": "passed", "detail": label},
+            }),
+        )
+    };
+    let h = harness(vec![
+        tool_call(
+            "b1",
+            "run_command",
+            serde_json::json!({
+                "program": program,
+                "args": args,
+                "background": true,
+            }),
+        ),
+        cite_the_start(),
+        cite_the_start(),
+        cite_the_start(),
+    ])
+    .await;
+    let s = spec(&h, "启动本地服务并确认可用。");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await;
+
+    assert!(
+        matches!(&report, Ok(report) if report.outcome == leveler_engine::TaskOutcome::Failed),
+        "the recovery bound must stop the turn: {report:?}"
+    );
+    let task = leveler_storage::TaskStore::task_for_session(&h.db, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = leveler_storage::GoalStore::for_task(&h.db, &task)
+        .await
+        .unwrap();
+    assert!(
+        goals
+            .iter()
+            .all(|goal| goal.state == leveler_storage::GoalState::Settled),
+        "a failure nothing can re-enter must settle the goal: {goals:?}"
+    );
+    // Settled means no window can follow: the service must not outlive it.
+    assert_terminal_within(&h.registry, "bg-1", "settled goal").await;
 }

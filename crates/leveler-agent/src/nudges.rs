@@ -22,6 +22,18 @@ pub(crate) fn goal_continuation_nudge() -> String {
         .to_string()
 }
 
+/// Goal mode: the goal is resolved and its answer was never written.
+///
+/// Nothing is unresolved here, so this is not a continuation: the model went
+/// quiet after `update_goal` without telling the person anything. The harness
+/// states that fact only — what the answer says is the model's.
+pub(crate) fn goal_settled_delivery_nudge() -> String {
+    "The goal is resolved and recorded, and the turn has not written the answer the person \
+     is waiting for. Write it now: what you did, which checks ran and what they returned, what \
+     is still true afterwards, and anything that did not work. End the turn after that answer."
+        .to_string()
+}
+
 /// Chat: the turn went quiet while the model's own explicit plan still listed
 /// steps it never declared completed.
 ///

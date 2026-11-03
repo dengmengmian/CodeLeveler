@@ -323,6 +323,7 @@ pub(crate) fn render_group_rows(
             focused_command,
             question_card_open,
             &mut out,
+            copy,
         );
         return out;
     }
@@ -407,7 +408,8 @@ pub(crate) fn render_group_rows(
                 out.extend(lines);
             }
             StreamUnit::Single(call) => {
-                out.extend(unit_lines(
+                let at = out.len();
+                let lines = unit_lines(
                     call,
                     theme,
                     width,
@@ -422,8 +424,27 @@ pub(crate) fn render_group_rows(
                     true,
                     is_exploration_call(call),
                     question_card_open,
-                ));
+                );
+                let unit_len = lines.len();
+                out.extend(lines);
                 push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
+                record_goal_refusal_copy(
+                    copy,
+                    call,
+                    width,
+                    locale,
+                    t,
+                    group.expanded(),
+                    1,
+                    None,
+                    None,
+                    "",
+                    true,
+                    is_exploration_call(call),
+                    at,
+                    unit_len,
+                    out.len(),
+                );
             }
             StreamUnit::ExploreRun(members) => {
                 // A stretch of exploration inside a larger round: the collapsed
@@ -469,6 +490,7 @@ pub(crate) fn render_group_rows(
                     focused_command,
                     question_card_open,
                     &mut out,
+                    copy,
                 );
             }
             // A burst of ONE tool is a run that also happened concurrently:
@@ -492,6 +514,7 @@ pub(crate) fn render_group_rows(
                     focused_command,
                     question_card_open,
                     &mut out,
+                    copy,
                 );
             }
             StreamUnit::Batch(calls) => {
@@ -532,7 +555,8 @@ pub(crate) fn render_group_rows(
                         out.extend(lines);
                         continue;
                     }
-                    out.extend(unit_lines(
+                    let at = out.len();
+                    let lines = unit_lines(
                         call,
                         theme,
                         width,
@@ -547,8 +571,27 @@ pub(crate) fn render_group_rows(
                         true,
                         false,
                         question_card_open,
-                    ));
+                    );
+                    let unit_len = lines.len();
+                    out.extend(lines);
                     push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
+                    record_goal_refusal_copy(
+                        copy,
+                        call,
+                        width,
+                        locale,
+                        t,
+                        group.expanded(),
+                        1,
+                        None,
+                        Some(branch),
+                        "",
+                        true,
+                        false,
+                        at,
+                        unit_len,
+                        out.len(),
+                    );
                 }
             }
             StreamUnit::EditMerge(calls) => {
@@ -582,7 +625,9 @@ pub(crate) fn render_group_rows(
             }
             StreamUnit::FailMerge(calls) => {
                 let total_ms: u64 = calls.iter().filter_map(|c| c.duration_ms).sum();
-                out.extend(unit_lines(
+                let duration = (total_ms >= 100).then_some(total_ms);
+                let at = out.len();
+                let lines = unit_lines(
                     calls[0],
                     theme,
                     width,
@@ -590,7 +635,7 @@ pub(crate) fn render_group_rows(
                     t,
                     group.expanded(),
                     calls.len(),
-                    (total_ms >= 100).then_some(total_ms),
+                    duration,
                     // FailMerge is a finished failure group, never live-running.
                     0,
                     None,
@@ -599,7 +644,9 @@ pub(crate) fn render_group_rows(
                     true,
                     false,
                     question_card_open,
-                ));
+                );
+                let unit_len = lines.len();
+                out.extend(lines);
                 push_expanded_detail(
                     calls[0],
                     group.expanded(),
@@ -608,6 +655,23 @@ pub(crate) fn render_group_rows(
                     locale,
                     t,
                     &mut out,
+                );
+                record_goal_refusal_copy(
+                    copy,
+                    calls[0],
+                    width,
+                    locale,
+                    t,
+                    group.expanded(),
+                    calls.len(),
+                    duration,
+                    None,
+                    "",
+                    true,
+                    false,
+                    at,
+                    unit_len,
+                    out.len(),
                 );
             }
         }
@@ -627,6 +691,55 @@ pub(crate) fn render_group_rows(
         }
     }
     out
+}
+
+/// A detached process that is still running and has not announced readiness.
+/// Its row is alive: it carries its own clock and, once output arrives, a tail.
+fn live_background_member(call: &ToolCallBlock) -> bool {
+    started_in_background(call)
+        && matches!(detached_outcome(call), DetachedOutcome::Running)
+        && crate::transcript::detached_ready(call).is_none()
+}
+
+/// Whether a run's members must not be hidden behind the aggregate receipt.
+///
+/// Two facts default a run to open: a live background task (its progress is the
+/// reason the row exists) and a failed background task (its failure must stay
+/// readable, not fold into a count). Everything else keeps the compact default.
+/// How long a still-running background task may hold its run open by default.
+///
+/// Long enough to watch a service boot and print its first lines, short enough
+/// that a silent or endless task stops owning the page. The receipt row keeps
+/// showing its status, elapsed time and last output after the fold closes, so
+/// nothing is hidden — only the space it takes changes.
+pub(crate) const BACKGROUND_RUN_ATTENTION_SECS: u64 = 90;
+
+/// Whether this run still deserves to be open by default at `now_secs`.
+///
+/// A failure always does. A running task does while it is young and has no
+/// readiness evidence yet; after the grace window the aggregate receipt is the
+/// honest presentation. A task the runtime reported ready is a steady service,
+/// not something to watch.
+pub(crate) fn run_needs_attention(members: &[&ToolCallBlock], now_secs: u64) -> bool {
+    members.iter().any(|call| {
+        started_in_background(call)
+            && match detached_outcome(call) {
+                DetachedOutcome::Running => {
+                    crate::transcript::detached_ready(call).is_none()
+                        && running_for(call, now_secs) < BACKGROUND_RUN_ATTENTION_SECS
+                }
+                DetachedOutcome::Failed { .. } => true,
+                DetachedOutcome::Exited { .. } | DetachedOutcome::Stopped { .. } => false,
+            }
+    })
+}
+
+/// Seconds this call has been running, floored at zero.
+///
+/// `started_elapsed_secs` can be back-dated (a reconnect adopts the runtime's
+/// own clock), so the subtraction is allowed to come out negative.
+fn running_for(call: &ToolCallBlock, now_secs: u64) -> u64 {
+    now_secs.saturating_sub(call.started_elapsed_secs.max(0) as u64)
 }
 
 /// Whether this exact call is the one an open approval is holding.
@@ -1076,7 +1189,10 @@ pub(crate) fn process_member_lines_focused(
             awaits(call, awaiting_approval),
             focused_command,
         );
-        if !call.expanded {
+        // A folded run member is one row — except a detached process that is
+        // still working, whose tail IS the progress the run is showing. It
+        // collapses back to one row the moment readiness is observed.
+        if !call.expanded && !live_background_member(call) {
             lines.truncate(1);
         }
         return lines;
@@ -1977,6 +2093,7 @@ fn push_run(
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
     question_card_open: bool,
     out: &mut Vec<Line<'static>>,
+    copy: &mut Vec<crate::selection::CopyRow>,
 ) {
     // A run is active while any of its calls is; once all are settled the head
     // recedes with them. The children carry the per-call state either way.
@@ -2048,6 +2165,7 @@ fn push_run(
             out.extend(lines);
             continue;
         }
+        let at = out.len();
         out.extend(run_child_lines(
             call,
             theme,
@@ -2060,9 +2178,172 @@ fn push_run(
             awaits(call, awaiting_approval),
             question_card_open,
         ));
+        let unit_len = out.len() - at;
         let body = out.len();
         push_expanded_detail(call, group.expanded(), theme, width, locale, t, out);
-        indent_onto_rail(&mut out[body..], &child_rail(Some(branch)), theme);
+        let rail = child_rail(Some(branch));
+        indent_onto_rail(&mut out[body..], &rail, theme);
+        record_goal_refusal_copy(
+            copy,
+            call,
+            width,
+            locale,
+            t,
+            group.expanded(),
+            1,
+            None,
+            Some(branch),
+            &rail,
+            false,
+            false,
+            at,
+            unit_len,
+            out.len(),
+        );
+    }
+}
+
+/// A goal-owned tool result copies its own statement.
+///
+/// A refused `commit_task` declaration and a refused `update_goal` closeout
+/// both speak to the user in localized words with the runtime's own account
+/// behind the fold. The head is what the model wrote; the result row is the
+/// localized reason. Paint truncates both, so a selection that covers the row
+/// copies the full text. The anchor, warning glyph, duration and fold hint stay
+/// decoration. Expanded, the runtime's lines copy too, rejoined across the
+/// body's wraps.
+#[allow(clippy::too_many_arguments)]
+fn record_goal_refusal_copy(
+    copy: &mut Vec<crate::selection::CopyRow>,
+    call: &ToolCallBlock,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    expanded: bool,
+    repeat: usize,
+    duration_override: Option<u64>,
+    branch: Option<&str>,
+    detail_rail: &str,
+    show_action: bool,
+    exploration_row: bool,
+    at: usize,
+    unit_len: usize,
+    end: usize,
+) {
+    if unit_len == 0 {
+        return;
+    }
+    let note = if crate::tool_cell::is_goal_scope_refusal(call) {
+        t.goal_refused_acceptance
+    } else if let Some(note) = crate::tool_cell::goal_refusal_note_for(call, t) {
+        note
+    } else {
+        return;
+    };
+    let body = if crate::tool_cell::goal_refusal(call).is_some() {
+        crate::tool_cell::goal_refusal_body(call, t).unwrap_or_default()
+    } else {
+        let raw = call.preview.as_deref().unwrap_or("");
+        format!("{note}\n{raw}")
+    };
+    let action = crate::tool_cell::call_state_label(call, locale, t);
+    let summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    let has_summary = !summary.is_empty() && summary != "{}";
+    let render_action = exploration_row
+        || show_action
+        || !has_summary
+        || action != tool_action_label_for(&call.name, locale);
+    let source = match (render_action, has_summary) {
+        (true, true) => {
+            let gap = if exploration_row { " " } else { "  " };
+            format!("{action}{gap}{summary}")
+        }
+        (true, false) => action,
+        (false, true) => summary,
+        (false, false) => String::new(),
+    };
+    if !source.is_empty() {
+        let anchor = branch
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{TOOL_ANCHOR} "));
+        // The warning glyph is paint. The words start after it.
+        let indent = UnicodeWidthStr::width(anchor.as_str()) + UnicodeWidthStr::width("\u{26a0} ");
+        let tail = duration_override
+            .or(call.duration_ms)
+            .filter(|ms| *ms >= 100)
+            .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
+            .unwrap_or_default();
+        copy.push(crate::selection::CopyRow::new(
+            at,
+            crate::selection::PlainRow {
+                indent: indent as u16,
+                suffix: UnicodeWidthStr::width(tail.as_str()) as u16,
+                source: Some(source.into()),
+                ..Default::default()
+            },
+        ));
+    }
+    // Collapsed, the second row is the refusal class. Expanded with a retry
+    // count, that row stays and the runtime text follows it.
+    if unit_len >= 2 {
+        let stem = format!("{}  \u{2514} ", child_rail(branch));
+        let mut suffix = 0usize;
+        if !expanded {
+            let more = preview_line_count(call).saturating_sub(1);
+            if more > 0 {
+                let hint = format!(
+                    " {}",
+                    t.fold_more_lines_short.replace("{}", &more.to_string())
+                );
+                suffix += UnicodeWidthStr::width(hint.as_str());
+            }
+        }
+        if repeat > 1 {
+            suffix += UnicodeWidthStr::width(format!(" ×{repeat}").as_str());
+        }
+        copy.push(crate::selection::CopyRow::new(
+            at + 1,
+            crate::selection::PlainRow {
+                indent: UnicodeWidthStr::width(stem.as_str()) as u16,
+                suffix: suffix as u16,
+                source: Some(note.into()),
+                ..Default::default()
+            },
+        ));
+    }
+    let detail_start = at + unit_len;
+    if end <= detail_start {
+        return;
+    }
+    // `push_expanded_detail` hands `tool_lines` two columns less than the
+    // unit, and the body lead takes four more. The pieces must be the ones
+    // that painter wrapped, or a soft wrap would rejoin the wrong text.
+    let tool_width = width.saturating_sub(2).max(1);
+    let inner = tool_width.saturating_sub(4).max(1);
+    let wrapped = crate::render::text::wrap_with_joiners(&body, inner);
+    let shown = wrapped.len().min(24);
+    let rail_w = UnicodeWidthStr::width(detail_rail);
+    let detail_count = end - detail_start;
+    for (i, (_piece, joiner)) in wrapped.iter().take(shown).take(detail_count).enumerate() {
+        let lead = if i == 0 { "  \u{2514} " } else { "    " };
+        copy.push(crate::selection::CopyRow::new(
+            detail_start + i,
+            crate::selection::PlainRow {
+                indent: (rail_w + UnicodeWidthStr::width(lead)) as u16,
+                joiner: joiner.as_deref().map(Box::<str>::from),
+                ..Default::default()
+            },
+        ));
+    }
+    if detail_count > shown {
+        // The "N more lines" row is a count, not the refusal.
+        copy.push(crate::selection::CopyRow::new(
+            detail_start + shown,
+            crate::selection::PlainRow {
+                skip: true,
+                ..Default::default()
+            },
+        ));
     }
 }
 
@@ -2212,6 +2493,11 @@ pub(crate) const LIVE_TAIL_ROWS: usize = 6;
 /// enough for its live tail to be useful instead of a one-frame layout jump.
 const LIVE_TAIL_DELAY_SECS: u64 = 1;
 
+/// Seconds of silence on a running background task before its row says how long
+/// the visible tail has been still. A display threshold for a freshness note,
+/// never a lifecycle rule: silence neither promotes nor demotes a task.
+const QUIET_NOTE_SECS: u64 = 10;
+
 /// Rows a resolved clarification's answer may take in the transcript before
 /// the rest is folded. A multi-question answer is one row per question, and
 /// the whole set is the record of what the user decided.
@@ -2278,12 +2564,33 @@ fn command_head(
         // when it exits; until that stamp the row is still running. The
         // call's own duration and exit code are the spawn, not the process.
         ToolStatus::Ok if started_in_background(call) => match detached_outcome(call) {
-            DetachedOutcome::Running => head(
-                "\u{2197}",
-                theme.accent.primary,
-                vec![Some(t.command_backgrounded.to_string())],
-                false,
-            ),
+            // A detached run is still alive. Its own clock, not the spawn's
+            // duration, is the useful number; a service whose readiness signal
+            // was observed says so instead of "running in background".
+            DetachedOutcome::Running => {
+                let elapsed = Some(crate::status_line::fmt_elapsed(
+                    call.running_secs(now_elapsed_secs),
+                ));
+                if crate::transcript::detached_ready(call).is_some() {
+                    // The service announced itself and kept running: one line,
+                    // log collapsed, no completion claimed.
+                    head(
+                        "\u{2713}",
+                        theme.status.success,
+                        vec![Some(t.background_ready_running.to_string()), elapsed],
+                        false,
+                    )
+                } else {
+                    // Detached and alive. The existing detached mark stays; the
+                    // clock beside it is what turns a frozen row into a live one.
+                    head(
+                        "\u{2197}",
+                        theme.accent.primary,
+                        vec![Some(t.command_backgrounded.to_string()), elapsed],
+                        false,
+                    )
+                }
+            }
             DetachedOutcome::Exited { duration } => {
                 head("\u{2713}", theme.status.success, vec![duration], false)
             }
@@ -2597,6 +2904,79 @@ fn command_unit_lines(
                 width,
             ));
         }
+    } else if started_in_background(call)
+        && matches!(detached_outcome(call), DetachedOutcome::Running)
+        && crate::transcript::detached_ready(call).is_none()
+    {
+        // A detached process that is still running shows the same short live
+        // tail a foreground command does, so the user sees it work without
+        // opening the jobs page. Readiness collapses it: once the service says
+        // it is up, the row stays one line. Output is bounded in the transcript,
+        // so this is a tail, never the whole history (the row says how much is
+        // withheld, and Enter opens the retained result).
+        let logical: Vec<&str> = call
+            .output
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let stem = format!("{rail}  \u{2514} ");
+        let indent = " ".repeat(UnicodeWidthStr::width(stem.as_str()));
+        let room = width
+            .saturating_sub(UnicodeWidthStr::width(stem.as_str()))
+            .max(1);
+        if !logical.is_empty() {
+            // Freshness is this client's own clock: it says how long the tail
+            // below has been still, never that the process is healthy or hung.
+            if let Some(at) = crate::transcript::detached_last_output_secs(call) {
+                let quiet = call.running_secs(now_elapsed_secs).saturating_sub(at);
+                if quiet >= QUIET_NOTE_SECS {
+                    out.push(clip_line(
+                        vec![Span::styled(
+                            format!(
+                                "{body_indent}{}",
+                                t.background_quiet_for.replace("{}", &quiet.to_string())
+                            ),
+                            meta,
+                        )],
+                        width,
+                    ));
+                }
+            }
+            let hidden = logical.len().saturating_sub(LIVE_TAIL_ROWS);
+            let mut first = true;
+            let mut lead = || {
+                let lead = if first { stem.clone() } else { indent.clone() };
+                first = false;
+                lead
+            };
+            if hidden > 0 {
+                out.push(clip_line(
+                    vec![
+                        Span::styled(lead(), subtle),
+                        Span::styled(
+                            format!(
+                                "\u{2026} {}",
+                                t.command_output_hidden.replace("{}", &hidden.to_string())
+                            ),
+                            meta,
+                        ),
+                    ],
+                    width,
+                ));
+            }
+            for line in &logical[hidden..] {
+                out.push(clip_line(
+                    vec![
+                        Span::styled(lead(), subtle),
+                        Span::styled(
+                            truncate_display(line, room),
+                            Style::default().fg(theme.ink(Ink::Settled)),
+                        ),
+                    ],
+                    width,
+                ));
+            }
+        }
     } else if call.status == ToolStatus::Failed
         && !call_timed_out(call)
         && let Some(note) = failed_one_line_summary(call, t)
@@ -2757,7 +3137,12 @@ fn result_lines_for(
     let stem = format!("{rail}  \u{2514} ");
     let stem_w = UnicodeWidthStr::width(stem.as_str());
     if call.status == ToolStatus::Failed {
-        let note = if guard_denial {
+        // The runtime's own refusal kind, localized. The conversation row and
+        // this screen must read the same reason off the same recorded result.
+        let goal_refusal = crate::tool_cell::goal_refusal_note_for(call, t).is_some();
+        let note = if let Some(note) = crate::tool_cell::goal_refusal_note_for(call, t) {
+            Some(note.to_string())
+        } else if guard_denial {
             Some(crate::tool_cell::guard_denial_note(&call.name, t).to_string())
         } else {
             failed_one_line_summary(call, t)
@@ -2777,9 +3162,19 @@ fn result_lines_for(
                 Style::default().fg(theme.ink(Ink::Settled)),
             ),
         ];
-        if !expanded && !guard_denial {
+        // A refusal whose reason sits behind a fold must say that the rest is
+        // there — including the guard kinds, whose note replaces the text
+        // (the detail is still reachable with Ctrl+O).
+        if !expanded && (!guard_denial || goal_refusal) {
             let more = preview_line_count(call).saturating_sub(1);
-            if more > 0 {
+            if goal_refusal {
+                // The runtime's own refusal reason is one keypress away. Say
+                // so instead of a line count: the reason is the point.
+                spans.push(Span::styled(
+                    format!(" {}", t.goal_refusal_expand_hint),
+                    Style::default().fg(theme.ink(Ink::Meta)),
+                ));
+            } else if more > 0 {
                 spans.push(Span::styled(
                     format!(
                         " {}",
@@ -3092,12 +3487,15 @@ pub(crate) const NETWORK_PERMISSION_REQUIRED: &str = "[execution policy] Network
 /// The request is the truth: `background: true` returns as soon as the process
 /// is spawned. A refused background request fails, so a successful one always
 /// means "started".
+/// Whether this call's execution is continuing as a background task.
+///
+/// True for an explicit `background: true` request AND for a foreground run the
+/// runtime handed to the background after its window. The handoff is the case
+/// that matters for honesty: the tool returned a task id, not a result, so the
+/// row must not read as a finished command. The runtime's own `task_id` line in
+/// the result is the evidence, never the arguments alone.
 fn started_in_background(call: &ToolCallBlock) -> bool {
-    is_shell_call(call)
-        && serde_json::from_str::<serde_json::Value>(&call.arguments)
-            .ok()
-            .and_then(|v| v.get("background")?.as_bool())
-            .unwrap_or(false)
+    is_shell_call(call) && crate::transcript::runs_detached(call)
 }
 
 /// How a detached process ended, as stamped onto its starter preview.
@@ -3727,6 +4125,39 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
         }
+    }
+
+    /// A background task that keeps running and never reports readiness must
+    /// not hold the page open forever: it is open by default while it is young,
+    /// and the receipt row carries its status and elapsed time afterwards.
+    #[test]
+    fn a_long_running_background_task_stops_holding_the_page_open() {
+        let mut running = call(
+            "run_command",
+            r#"{"program":"make","args":["up"],"background":true}"#,
+            ToolStatus::Running,
+        );
+        running.started_elapsed_secs = 0;
+        let members = [&running];
+        assert!(
+            run_needs_attention(&members, 5),
+            "a just-started service is worth watching"
+        );
+        assert!(
+            run_needs_attention(&members, BACKGROUND_RUN_ATTENTION_SECS - 1),
+            "still inside the grace window"
+        );
+        assert!(
+            !run_needs_attention(&members, BACKGROUND_RUN_ATTENTION_SECS + 300),
+            "a silent task is compact after the window, not deleted"
+        );
+
+        // Failure is never folded away: the user has to see it.
+        let mut failed = running.clone();
+        failed.status = ToolStatus::Failed;
+        failed.exit_code = Some(3);
+        failed.preview = Some("status: failed\nexit_code: 3".into());
+        assert!(run_needs_attention(&[&failed], 10_000));
     }
 
     /// Live MEMBER rows: a `◌` row that names a tool, never the batch header
@@ -6520,6 +6951,52 @@ mod tests {
         );
     }
 
+    /// A refused closeout: the conversation row states the gate's own reason,
+    /// and the fold hint says the runtime's account is still behind Ctrl+O.
+    /// The real dogfood caught the hint missing: the guard branch suppressed it
+    /// for every `update_goal`, so the row looked like the whole story.
+    #[test]
+    fn a_refused_closeout_states_its_gate_and_keeps_the_fold_hint() {
+        let mut refusal = call(
+            "update_goal",
+            r#"{"status":"complete","summary":"13 组回归全过"}"#,
+            ToolStatus::Failed,
+        );
+        refusal.preview = Some(
+            "[goal_refused:requirements_refused]\nupdate_goal(complete) was refused: the \
+             user's stated scope is not fully accounted for.\n- `b.txt` is not covered\n- \
+             `c.txt` is not covered"
+                .into(),
+        );
+        let lines = render_group_text(&group(vec![refusal.clone()]), 100, Locale::Zh);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("目标未更新：用户要求的条件尚未全部满足"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("not fully accounted for") && !text.contains("goal_refused"),
+            "the model-facing account and the tag are not the row: {text}"
+        );
+        // A refused closeout names the affordance instead of a bare line count:
+        // the runtime's reason IS the point, and the person has to know it is
+        // one keypress away.
+        assert!(
+            text.contains(Locale::Zh.text().goal_refusal_expand_hint),
+            "the row must say the refusal reason is behind the fold: {text}"
+        );
+
+        // Opened, the runtime's own lines are there to read.
+        let mut g = group(vec![refusal]);
+        g.display = crate::fold::DisplayMode::Expanded;
+        let expanded = render_group_text(&g, 100, Locale::Zh).join("\n");
+        assert!(
+            expanded.contains("`b.txt` is not covered")
+                && expanded.contains("`c.txt` is not covered"),
+            "{expanded}"
+        );
+    }
+
     /// Reads and searches together are ONE exploration receipt that counts by
     /// KIND (`2 files, 2 searches`) — the reader still learns what the stretch
     /// did, without a row per call. A failure is NOT folded: the failing target
@@ -7660,6 +8137,86 @@ mod compact_command_tests {
             );
             assert!(rows[0].contains(word), "{word}: {rows:?}");
         }
+    }
+
+    /// BG-03: a detached process that keeps printing shows its tail on the
+    /// row's own surface, without a model round and without opening a page.
+    #[test]
+    fn a_running_background_command_shows_its_live_tail() {
+        let t = Locale::Zh.text();
+        let mut call = cmd(
+            r#"{"program":"make","args":["up"],"background":true}"#,
+            ToolStatus::Ok,
+        );
+        call.preview = Some("task_id: bg-1\nstatus: running".into());
+        call.output =
+            "Building backend...\nCompiling internal/api...\nCompiling internal/server...\n".into();
+        call.preview = Some(format!("{}\nlast_output_secs: 4", call.preview.unwrap()));
+        let rows = rows_at(call, 4);
+        assert!(
+            rows[0].contains("\u{2197}") && rows[0].contains(t.command_backgrounded),
+            "{rows:?}"
+        );
+        assert!(
+            rows[0].contains("4s"),
+            "the row carries the live clock: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Compiling internal/server...")),
+            "the newest output is on the row: {rows:?}"
+        );
+    }
+
+    /// BG-05: readiness collapses the log to one line and never claims the
+    /// process finished. The task is still running.
+    #[test]
+    fn a_ready_service_is_one_line_and_still_running() {
+        let t = Locale::Zh.text();
+        let mut call = cmd(
+            r#"{"program":"make","args":["up"],"background":true}"#,
+            ToolStatus::Ok,
+        );
+        call.preview = Some("task_id: bg-1\nstatus: running\nready: listening on :8080".into());
+        call.output = "Compiling internal/api...\n".into();
+        let rows = rows(call);
+        assert_eq!(rows.len(), 1, "a ready service collapses its log: {rows:?}");
+        assert!(rows[0].contains('\u{2713}'), "{rows:?}");
+        assert!(rows[0].contains(t.background_ready_running), "{rows:?}");
+        assert!(
+            !rows[0].contains(t.background_status_completed),
+            "ready is not completed: {rows:?}"
+        );
+    }
+
+    /// BG-04: silence is reported as silence, with the clock, not as readiness
+    /// and not as a hang.
+    #[test]
+    fn a_quiet_running_background_command_reports_the_silence() {
+        let t = Locale::Zh.text();
+        let mut call = cmd(
+            r#"{"program":"make","args":["up"],"background":true}"#,
+            ToolStatus::Ok,
+        );
+        call.preview = Some("task_id: bg-1\nstatus: running\nlast_output_secs: 0".into());
+        call.output = "Compiling internal/api...\n".into();
+        let rendered = rows_at(call, 65);
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains(&t.background_quiet_for.replace("{}", "65"))),
+            "silence has a real elapsed figure: {rendered:?}"
+        );
+        assert!(rendered[0].contains("\u{2197}"), "{rendered:?}");
+    }
+
+    fn rows_at(call: ToolCallBlock, now: u64) -> Vec<String> {
+        let theme = Theme::no_color();
+        lines_at(call, &theme, 100, now)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .map(|line| line.trim_end().to_string())
+            .collect()
     }
 
     #[test]

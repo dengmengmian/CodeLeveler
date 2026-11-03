@@ -388,6 +388,31 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         full_output: Option<String>,
     },
+    /// A background process task reached a natural exit AFTER the call that
+    /// started it already returned.
+    ///
+    /// The starting call's own `ToolCallFinished` records only that the process
+    /// STARTED (no execution status), which is correct — a start is not a
+    /// result. This event is the result: durable, tied to the same `call_id`,
+    /// and readable after a resume, so a test that outlived its turn by being
+    /// moved to the background can still justify `update_goal(complete)`.
+    ///
+    /// `program`/`args` are the process the registry actually ran, which are the
+    /// same argv a `run_command` call names; a reader derives the command label
+    /// from them with the one labelling function, and a `shell_command` caller's
+    /// own tokens still appear inside them. `is_error` is the task's terminal
+    /// verdict: anything but a zero exit. A stopped or unobservable task is not a
+    /// result and is never persisted this way.
+    BackgroundTaskFinished {
+        call_id: String,
+        task_id: String,
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a
     /// status line can name the wait instead of a bare "waiting for model". `kind`
@@ -861,6 +886,9 @@ impl EngineEvent {
             | EngineEvent::UserShellBackgrounded { .. }
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
+            // The background task's command line and its terminal verdict —
+            // local-sensitive like the call that started it.
+            | EngineEvent::BackgroundTaskFinished { .. }
             // Raw command output — local-sensitive like the user shell's.
             | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::TaskCancelRequested { .. }
@@ -1024,6 +1052,7 @@ impl EngineEvent {
             | EngineEvent::UserShellBackgrounded { .. }
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
+            | EngineEvent::BackgroundTaskFinished { .. }
             | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ModelRetrying { .. }
             | EngineEvent::CommandProgress { .. }

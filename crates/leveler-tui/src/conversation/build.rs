@@ -469,8 +469,8 @@ fn build_conversation(
                         });
                     }
                     // Tool execution is evidence UI, not message body — with
-                    // one exception the renderer names itself: an expanded
-                    // edit's diff rows are the patch's own source lines.
+                    // the exceptions the renderer names itself: an expanded
+                    // edit's diff rows, and a refused goal's own statement.
                     copy.extend(std::iter::repeat_n(
                         crate::selection::PlainRow {
                             skip: true,
@@ -690,8 +690,29 @@ fn fold_anchor_key(
 /// Whether a view-time exploration fold is open. Presentation-only state kept
 /// on the conversation view, keyed by the run's anchor call id.
 impl crate::conversation::ConversationView {
+    /// Test-side read of one run's fold state (the renderer asks through
+    /// [`Self::process_fold_expanded_by_default`] with its own default).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn process_fold_expanded(&self, key: &leveler_client_protocol::ToolCallId) -> bool {
-        self.process_folds.borrow().contains(key)
+        self.process_fold_expanded_by_default(key, false)
+    }
+
+    /// Whether the reader's own choice, or the run's own state, says the run is
+    /// open. An explicit toggle always wins; otherwise the caller's default
+    /// applies. A live background task and a failed one default to open, so its
+    /// progress or its failure is never hidden behind an aggregate receipt.
+    pub(crate) fn process_fold_expanded_by_default(
+        &self,
+        key: &leveler_client_protocol::ToolCallId,
+        default: bool,
+    ) -> bool {
+        if self.process_folds.borrow().contains(key) {
+            return true;
+        }
+        if self.process_folds_closed.borrow().contains(key) {
+            return false;
+        }
+        default
     }
 }
 
@@ -771,6 +792,35 @@ pub(crate) fn toggle_edit_fold(state: &mut AppState, item: usize) -> Option<bool
     Some(expanded)
 }
 
+/// Whether the run containing `item` is open RIGHT NOW, including a live
+/// background run's default. `None` when `item` is not the anchor of a run.
+///
+/// This is the read side of [`toggle_process_fold`]; a caller that wants to
+/// "make sure it is open" must ask this, never the explicit-only set.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn process_run_open(state: &AppState, item: usize) -> Option<bool> {
+    let items = state.transcript.items();
+    let plan = plan_process_folds(items);
+    let run = plan.owner.get(item).copied().flatten()?;
+    let fold = plan.runs.get(run)?;
+    if fold.anchor != item {
+        return None;
+    }
+    let key = fold_anchor_key(items, fold)?;
+    let members: Vec<&crate::transcript::ToolCallBlock> = fold
+        .members
+        .iter()
+        .filter_map(|(i, c)| match items.get(*i) {
+            Some(TranscriptItem::ToolGroup(group)) => group.calls.get(*c),
+            _ => None,
+        })
+        .collect();
+    Some(state.conv.process_fold_expanded_by_default(
+        &key,
+        crate::activity_stream::run_needs_attention(&members, state.elapsed_secs),
+    ))
+}
+
 /// Explicit command focus reveals its containing receipt without changing call drawers.
 pub(crate) fn reveal_command_receipt(state: &mut AppState, item: usize, call: usize) {
     let plan = plan_process_folds(state.transcript.items());
@@ -780,8 +830,9 @@ pub(crate) fn reveal_command_receipt(state: &mut AppState, item: usize, call: us
         .find(|fold| fold.members.contains(&(item, call)))
         .and_then(|fold| fold_anchor_key(state.transcript.items(), fold));
     if let Some(key) = key
-        && state.conv.process_folds.borrow_mut().insert(key)
+        && state.conv.process_folds.borrow_mut().insert(key.clone())
     {
+        state.conv.process_folds_closed.borrow_mut().remove(&key);
         state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
         state.conv.plain.clear();
         state.conv.plain_layout.clear();
@@ -797,10 +848,16 @@ pub(crate) fn toggle_span_receipt(state: &mut AppState, item: usize, call: usize
     };
     let key = group.calls.get(call)?.id.clone();
     let expanded = {
+        // The reader's choice is recorded in BOTH directions: opening removes a
+        // "closed" mark, closing records one, so a default-open run (a live
+        // background task) stays closed once the reader closes it.
         let mut folds = state.conv.process_folds.borrow_mut();
+        let mut closed = state.conv.process_folds_closed.borrow_mut();
         if folds.remove(&key) {
+            closed.insert(key);
             false
         } else {
+            closed.remove(&key);
             folds.insert(key);
             true
         }
@@ -832,11 +889,35 @@ pub(crate) fn toggle_process_fold(state: &mut AppState, item: usize) -> Option<b
         return None;
     }
     let key = fold_anchor_key(items, fold)?;
+    // What the reader is looking at now decides the direction, not just the
+    // "explicitly opened" set: a live background run is open without being in
+    // it, and the first click on such a run must CLOSE it.
+    let default_open = crate::activity_stream::run_needs_attention(
+        &fold
+            .members
+            .iter()
+            .filter_map(|(i, c)| match items.get(*i) {
+                Some(TranscriptItem::ToolGroup(group)) => group.calls.get(*c),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        state.elapsed_secs,
+    );
     let expanded = {
+        // The reader's choice is recorded in BOTH directions: opening removes a
+        // "closed" mark, closing records one, so a default-open run (a live
+        // background task) stays closed once the reader closes it.
+        let currently_open = state
+            .conv
+            .process_fold_expanded_by_default(&key, default_open);
         let mut folds = state.conv.process_folds.borrow_mut();
-        if folds.remove(&key) {
+        let mut closed = state.conv.process_folds_closed.borrow_mut();
+        if currently_open {
+            folds.remove(&key);
+            closed.insert(key);
             false
         } else {
+            closed.remove(&key);
             folds.insert(key);
             true
         }
@@ -865,8 +946,6 @@ fn render_process_fold(
     t: &crate::i18n::UiText,
 ) {
     let items = state.transcript.items();
-    let expanded =
-        fold_anchor_key(items, fold).is_some_and(|key| state.conv.process_fold_expanded(&key));
     let members: Vec<&crate::transcript::ToolCallBlock> = fold
         .members
         .iter()
@@ -875,6 +954,12 @@ fn render_process_fold(
             _ => None,
         })
         .collect();
+    let expanded = fold_anchor_key(items, fold).is_some_and(|key| {
+        state.conv.process_fold_expanded_by_default(
+            &key,
+            crate::activity_stream::run_needs_attention(&members, state.elapsed_secs),
+        )
+    });
     // An item-only disclosure is unambiguous only when this run owns the whole group.
     let group_is_mixed = matches!(items.get(fold.anchor), Some(TranscriptItem::ToolGroup(group))
         if group.calls.iter().any(|c| crate::activity_stream::is_conversation_visible(c) && !crate::activity_stream::is_process_fold_call(c)));
@@ -2839,6 +2924,192 @@ mod semantic_copy_tests {
         assert!(!copied.contains('›'), "{copied:?}");
         assert!(!copied.contains('▸'), "{copied:?}");
         assert!(!copied.contains("0.0s"), "{copied:?}");
+    }
+
+    const GOAL: &str = "在本地把 DevOrder 全套服务起来，并从头到尾跑一次真实端到端测试";
+    const REFUSAL: &str = "验收范围不完整：用户明确要求的交付物没有被验收条目覆盖";
+
+    /// A refused goal declaration is the user's own objective plus the reason
+    /// it was not bound. Selecting those rows copies that text. The anchor,
+    /// the warning glyph, the fold hint and the runtime tag are paint.
+    fn refused_goal() -> (AppState, usize) {
+        let mut s = dark_state();
+        s.transcript.push_user("提交这个目标".into());
+        let id = leveler_client_protocol::ToolCallId::new("goal");
+        s.transcript.push_tool_started(
+            id.clone(),
+            "commit_task".into(),
+            serde_json::json!({
+                "objective": GOAL,
+                "acceptance": ["服务能启动"]
+            })
+            .to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        s.transcript.complete_tool(
+            &id,
+            false,
+            "commit_task refused [acceptance_missing_deliverables]: 1 of 2 explicit user \
+             deliverables have no covering `acceptance` check.\n- R2 [deliverable] b.txt\n- R3 [deliverable] c.txt"
+                .into(),
+            5,
+            None,
+        );
+        s.transcript.push_note("sealed".into());
+        let item = s
+            .transcript
+            .items()
+            .iter()
+            .position(|item| matches!(item, crate::transcript::TranscriptItem::ToolGroup(_)))
+            .expect("the goal row");
+        (s, item)
+    }
+
+    #[test]
+    fn a_refused_goal_copies_its_objective_and_reason() {
+        let (s, item) = refused_goal();
+        let expected = format!("目标未提交  {GOAL}\n{REFUSAL}");
+        for width in [48usize, 80, 120] {
+            let copied = copy_item(&s, width, item);
+            assert_eq!(copied, expected, "width {width}");
+            assert!(
+                !copied.contains('›')
+                    && !copied.contains('└')
+                    && !copied.contains('⚠')
+                    && !copied.contains('…')
+                    && !copied.contains("(+")
+                    && !copied.contains("acceptance_missing"),
+                "chrome leaked at width {width}: {copied:?}"
+            );
+        }
+    }
+
+    /// Dragging through the middle of the truncated objective copies those
+    /// cells, not the whole source hiding behind the ellipsis.
+    #[test]
+    fn a_partial_drag_on_a_refused_goal_copies_only_those_cells() {
+        let (s, item) = refused_goal();
+        let (start, _) = s.item_span(item, 48).expect("span");
+        let (plain, _) = s.conversation_plain(48);
+        let head = &plain[start];
+        let needle = "DevOrder";
+        let byte = head.find(needle).expect("the visible objective");
+        let col = unicode_width::UnicodeWidthStr::width(&head[..byte]);
+        let mut sel = TextSelection::default();
+        sel.begin(TextPos { row: start, col });
+        sel.extend(TextPos {
+            row: start,
+            col: col + unicode_width::UnicodeWidthStr::width(needle),
+        });
+        sel.finish();
+        let copied = extract_selected_text_with_layout(&plain, &s.conversation_plain(48).1, &sel);
+        assert_eq!(copied, needle, "painted head: {head:?}");
+    }
+
+    /// Opening the fold reveals the runtime's own lines. Selecting them copies
+    /// those lines, still without the gutter.
+    #[test]
+    fn an_expanded_refused_goal_copies_the_runtime_detail() {
+        let (mut s, item) = refused_goal();
+        assert!(
+            s.transcript
+                .set_item_display(item, crate::fold::DisplayMode::Expanded,)
+        );
+        let copied = copy_item(&s, 100, item);
+        assert!(
+            copied.starts_with(&format!("目标未提交  {GOAL}\n")),
+            "{copied:?}"
+        );
+        assert!(copied.contains(REFUSAL), "{copied:?}");
+        assert!(
+            copied.contains(
+                "commit_task refused [acceptance_missing_deliverables]: 1 of 2 explicit user \
+                 deliverables have no covering `acceptance` check."
+            ) && copied.contains("- R2 [deliverable] b.txt")
+                && copied.contains("- R3 [deliverable] c.txt"),
+            "the folded detail is now text: {copied:?}"
+        );
+        assert!(!copied.contains('└') && !copied.contains('›'), "{copied:?}");
+    }
+
+    const CLOSEOUT_REASON: &str = "目标未更新：用户要求的条件尚未全部满足";
+    const CLOSEOUT_DETAIL: &str = "update_goal(complete) was refused: the user's stated scope \
+                                   is not fully accounted for.\n- `b.txt` is not covered\n- \
+                                   `c.txt` is not covered";
+
+    /// A refused closeout copies the localized reason, and the runtime's own
+    /// account only after the fold is opened. The wire tag is paint, not text.
+    fn refused_closeout() -> (AppState, usize) {
+        let mut s = dark_state();
+        s.transcript.push_user("跑通全部测试".into());
+        let id = leveler_client_protocol::ToolCallId::new("closeout");
+        s.transcript.push_tool_started(
+            id.clone(),
+            "update_goal".into(),
+            serde_json::json!({"status": "complete", "summary": "13 组回归全过"}).to_string(),
+            false,
+            0,
+            Some(3),
+            None,
+        );
+        s.transcript.complete_tool(
+            &id,
+            false,
+            format!("[goal_refused:requirements_refused]\n{CLOSEOUT_DETAIL}"),
+            5,
+            None,
+        );
+        s.transcript.push_note("sealed".into());
+        let item = s
+            .transcript
+            .items()
+            .iter()
+            .position(|item| matches!(item, crate::transcript::TranscriptItem::ToolGroup(_)))
+            .expect("the closeout row");
+        (s, item)
+    }
+
+    #[test]
+    fn a_refused_closeout_copies_its_localized_reason() {
+        let (s, item) = refused_closeout();
+        for width in [48usize, 80, 120] {
+            let copied = copy_item(&s, width, item);
+            assert!(
+                copied.starts_with("目标收尾  完成：13 组回归全过\n"),
+                "{copied:?}"
+            );
+            assert!(copied.contains(CLOSEOUT_REASON), "{copied:?}");
+            assert!(
+                !copied.contains("not fully accounted for")
+                    && !copied.contains("is not covered")
+                    && !copied.contains("goal_refused"),
+                "the model-facing account and the tag stay out of the copy: {copied:?}"
+            );
+            assert!(!copied.contains("(+"), "the fold hint is paint: {copied:?}");
+        }
+    }
+
+    #[test]
+    fn an_expanded_refused_closeout_copies_every_failing_requirement() {
+        let (mut s, item) = refused_closeout();
+        assert!(
+            s.transcript
+                .set_item_display(item, crate::fold::DisplayMode::Expanded,)
+        );
+        let copied = copy_item(&s, 100, item);
+        assert!(
+            copied.starts_with("目标收尾  完成：13 组回归全过\n"),
+            "{copied:?}"
+        );
+        assert!(copied.contains(CLOSEOUT_REASON), "{copied:?}");
+        assert!(
+            copied.contains("`b.txt` is not covered") && copied.contains("`c.txt` is not covered"),
+            "both failing requirements copy: {copied:?}"
+        );
+        assert!(!copied.contains("goal_refused"), "{copied:?}");
     }
 
     #[test]

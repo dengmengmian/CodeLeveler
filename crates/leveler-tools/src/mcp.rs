@@ -6,7 +6,7 @@
 //! built-in. A failed server (won't start, times out) is skipped with a log —
 //! it never aborts startup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,16 +22,110 @@ use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
+mod mcp_http;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Configuration for one MCP server (stdio transport).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Configuration for one MCP server.
+///
+/// A server with [`Self::url`] set uses Streamable HTTP. Otherwise it is the
+/// original stdio server (`command` / `args` / `env`). Old configs leave `url`
+/// empty and keep working.
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Streamable HTTP endpoint. `None` means stdio.
+    pub url: Option<String>,
+    /// Resolved request headers. Values are secrets and are not printed.
+    pub headers: Vec<(String, String)>,
+    /// Bearer token without the `Bearer ` prefix. Not printed.
+    pub bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field(
+                "env_keys",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .field("url", &self.url)
+            .field(
+                "header_names",
+                &self.headers.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "[set]"))
+            .finish()
+    }
+}
+
+impl McpServerConfig {
+    /// A stdio server. This is the pre-HTTP configuration shape.
+    pub fn stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            args,
+            env,
+            url: None,
+            headers: Vec::new(),
+            bearer_token: None,
+        }
+    }
+
+    /// A Streamable HTTP server. Header values and the bearer token are already
+    /// resolved; they must not be written back to config or logs.
+    pub fn streamable_http(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        headers: Vec<(String, String)>,
+        bearer_token: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url: Some(url.into()),
+            headers,
+            bearer_token,
+        }
+    }
+
+    pub fn is_streamable_http(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Endpoint safe to show: the URL, or the stdio command. No header values.
+    pub fn endpoint_label(&self) -> String {
+        if let Some(url) = &self.url {
+            url.clone()
+        } else {
+            std::iter::once(self.command.as_str())
+                .chain(self.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+}
+
+/// Reject a Streamable HTTP URL that is not `http`/`https`, or that carries
+/// credentials in the userinfo or the query. The error text never echoes the
+/// rejected value.
+pub fn validate_streamable_http_url(url: &str) -> Result<(), String> {
+    mcp_http::validate_mcp_url(url)
 }
 
 /// A discovered MCP tool's advertised shape.
@@ -52,6 +146,9 @@ pub struct McpClient {
     stdin: Mutex<ChildStdin>,
     pending: Pending,
     next_id: AtomicU64,
+    /// Set when the server's stdout closed: every discovered tool now points at
+    /// a dead pipe and the next turn must reconnect this server.
+    closed: Arc<std::sync::atomic::AtomicBool>,
     _child: Child,
 }
 
@@ -91,10 +188,12 @@ impl McpClient {
         let stdout = child.stdout.take().ok_or("MCP: 无 stdout")?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Reader task: route each JSON-RPC response line to its waiting request;
         // fail everything pending when the stream closes.
         {
             let pending = pending.clone();
+            let closed = closed.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -124,6 +223,7 @@ impl McpClient {
                 for (_, tx) in pending.lock().await.drain() {
                     let _ = tx.send(Err("MCP 连接已关闭".to_string()));
                 }
+                closed.store(true, Ordering::SeqCst);
             });
         }
 
@@ -134,6 +234,7 @@ impl McpClient {
             stdin: Mutex::new(stdin),
             pending,
             next_id: AtomicU64::new(1),
+            closed,
             _child: child,
         });
 
@@ -194,10 +295,38 @@ impl McpClient {
         Ok(())
     }
 
-    /// List the server's tools.
+    /// List the server's tools, following `nextCursor` up to 64 pages.
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>, String> {
-        let result = self.request("tools/list", serde_json::json!({})).await?;
-        Ok(parse_tools(&result))
+        let mut tools: Vec<McpToolInfo> = Vec::new();
+        let mut seen_cursors = HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..64 {
+            let params = match &cursor {
+                Some(cursor) => serde_json::json!({ "cursor": cursor }),
+                None => serde_json::json!({}),
+            };
+            let result = self.request("tools/list", params).await?;
+            for info in parse_tools(&result) {
+                if info.name.is_empty() || info.name.chars().any(|c| c.is_control()) {
+                    continue;
+                }
+                if tools.iter().any(|existing| existing.name == info.name) {
+                    tracing::warn!(
+                        tool = %info.name,
+                        "MCP server returned a duplicate tool name; keeping the first"
+                    );
+                    continue;
+                }
+                tools.push(info);
+            }
+            match result.get("nextCursor").and_then(|v| v.as_str()) {
+                Some(next) if seen_cursors.insert(next.to_string()) => {
+                    cursor = Some(next.to_string());
+                }
+                _ => break,
+            }
+        }
+        Ok(tools)
     }
 
     /// Call a tool by its remote name, returning its text content.
@@ -264,14 +393,26 @@ fn format_tool_result(result: &serde_json::Value) -> String {
             None => {}
         }
     }
+    if let Some(structured) = result.get("structuredContent") {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("structuredContent: ");
+        out.push_str(&structured.to_string());
+    }
     out.trim_end().to_string()
+}
+
+enum McpLink {
+    Stdio(Arc<McpClient>),
+    Http(Arc<mcp_http::HttpSession>),
 }
 
 /// A model-facing tool that proxies to an MCP server. Owns its
 /// runtime-discovered metadata — reconnect/reload can rebuild these without
 /// leaking the previous generation's strings.
 pub struct McpTool {
-    client: Arc<McpClient>,
+    link: McpLink,
     remote_name: String,
     exposed_name: String,
     description: String,
@@ -285,14 +426,19 @@ fn exposed_tool_name(server: &str, tool: &str) -> String {
 
 impl McpTool {
     fn new(client: Arc<McpClient>, server: &str, info: McpToolInfo) -> Self {
+        Self::from_link(McpLink::Stdio(client), server, info)
+    }
+
+    fn from_link(link: McpLink, server: &str, info: McpToolInfo) -> Self {
         let exposed_name = exposed_tool_name(server, &info.name);
         let description = if info.description.is_empty() {
             format!("MCP tool `{}` from server `{server}`.", info.name)
         } else {
+            // The server wrote this text. It is tool metadata, not an instruction.
             info.description
         };
         Self {
-            client,
+            link,
             remote_name: info.name,
             exposed_name,
             description,
@@ -317,8 +463,17 @@ impl Tool for McpTool {
 
     fn risk(&self) -> RiskLevel {
         // MCP servers can do anything; treat their tools as network-risk so a
-        // sandboxed/plan mode gates them.
+        // sandboxed/plan mode gates them. Untrusted annotations do not lower this.
         RiskLevel::Network
+    }
+
+    fn catalog_changed(&self) -> bool {
+        match &self.link {
+            McpLink::Http(session) => session.catalog_changed(),
+            // One-shot, like the HTTP flag: a failed reconnect must not make
+            // every following turn try again.
+            McpLink::Stdio(client) => client.closed.swap(false, Ordering::SeqCst),
+        }
     }
 
     async fn execute(
@@ -338,30 +493,51 @@ impl Tool for McpTool {
             ));
         }
         let unrestricted = context.policy.unrestricted_execution();
+        let http = matches!(self.link, McpLink::Http(_));
         let call = async {
-            // A frozen exact-call approval must not mutate the authority of the
-            // cached, process-lived server. A mismatch gets a call-owned server
-            // with the same configured program; dropping it ends that authority.
-            let client = if self.client.unrestricted == unrestricted {
-                self.client.clone()
-            } else {
-                McpClient::connect_with_authority(
-                    &self.client.config,
-                    &self.client.environment,
-                    unrestricted,
-                )
-                .await?
-            };
-            client.call_tool(&self.remote_name, input).await
+            match &self.link {
+                McpLink::Stdio(client) => {
+                    // A frozen exact-call approval must not mutate the authority of the
+                    // cached, process-lived server. A mismatch gets a call-owned server
+                    // with the same configured program; dropping it ends that authority.
+                    let client = if client.unrestricted == unrestricted {
+                        client.clone()
+                    } else {
+                        McpClient::connect_with_authority(
+                            &client.config,
+                            &client.environment,
+                            unrestricted,
+                        )
+                        .await?
+                    };
+                    client
+                        .call_tool(&self.remote_name, input)
+                        .await
+                        .map_err(|reason| format!("MCP 调用失败:{reason}"))
+                }
+                McpLink::Http(session) => match session.call_tool(&self.remote_name, input).await {
+                    mcp_http::CallOutcome::Done(text) => Ok(text),
+                    mcp_http::CallOutcome::Failed(reason) => Err(format!("MCP 调用失败:{reason}")),
+                    mcp_http::CallOutcome::Unknown(reason) => {
+                        Err(format!("MCP 调用结果未知:{reason}"))
+                    }
+                },
+            }
         };
         let out = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Ok(ToolOutput::error("MCP 调用已取消。")),
+            _ = cancellation.cancelled() => {
+                return Ok(ToolOutput::error(if http {
+                    "MCP 调用已取消。请求可能已送达服务端，结果未知，未自动重试。"
+                } else {
+                    "MCP 调用已取消。"
+                }));
+            }
             r = call => r,
         };
         match out {
             Ok(text) => Ok(ToolOutput::ok(text)),
-            Err(reason) => Ok(ToolOutput::error(format!("MCP 调用失败:{reason}"))),
+            Err(reason) => Ok(ToolOutput::error(reason)),
         }
     }
 }
@@ -379,21 +555,112 @@ pub async fn connect_all_with_authority(
     environment: &leveler_core::EnvSnapshot,
     unrestricted: bool,
 ) -> Vec<Arc<dyn Tool>> {
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    connect_all_detailed(configs, environment, unrestricted)
+        .await
+        .into_iter()
+        .flat_map(|connection| connection.tools)
+        .collect()
+}
+
+/// One configured server's connection attempt.
+///
+/// `error` is `Some` when the server could not be reached or its catalog could
+/// not be listed. A failed attempt says nothing durable about the server: the
+/// caller stays free to retry, and needs this outcome to tell a server that is
+/// merely not up yet from one that is already connected with zero tools.
+pub struct McpServerConnection {
+    pub server: String,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub error: Option<String>,
+}
+
+/// Connect to each configured server and report every attempt separately.
+pub async fn connect_all_detailed(
+    configs: &[McpServerConfig],
+    environment: &leveler_core::EnvSnapshot,
+    unrestricted: bool,
+) -> Vec<McpServerConnection> {
+    let mut connections: Vec<McpServerConnection> = Vec::new();
     for cfg in configs {
-        match McpClient::connect_with_authority(cfg, environment, unrestricted).await {
-            Ok(client) => match client.list_tools().await {
-                Ok(infos) => {
-                    for info in infos {
-                        tools.push(Arc::new(McpTool::new(client.clone(), &cfg.name, info)));
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let error = if cfg.is_streamable_http() {
+            match mcp_http::HttpSession::connect(cfg).await {
+                Ok(session) => match session.list_tools().await {
+                    Ok(infos) => {
+                        let protocol = session.protocol().await;
+                        let count = infos.len();
+                        tracing::info!(
+                            server = %cfg.name,
+                            transport = "streamable_http",
+                            endpoint = %cfg.endpoint_label(),
+                            protocol = %protocol,
+                            tools = count,
+                            "MCP server connected"
+                        );
+                        for info in infos {
+                            tools.push(Arc::new(McpTool::from_link(
+                                McpLink::Http(Arc::clone(&session)),
+                                &cfg.name,
+                                info,
+                            )));
+                        }
+                        None
                     }
+                    Err(error) => {
+                        tracing::warn!(
+                            server = %cfg.name,
+                            transport = "streamable_http",
+                            endpoint = %cfg.endpoint_label(),
+                            error = %error,
+                            "MCP tools/list failed"
+                        );
+                        Some(format!("tools/list failed: {error}"))
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        server = %cfg.name,
+                        transport = "streamable_http",
+                        endpoint = %cfg.endpoint_label(),
+                        error = %error,
+                        "MCP server unavailable"
+                    );
+                    Some(error)
                 }
-                Err(e) => tracing::warn!("MCP `{}` tools/list 失败:{e}", cfg.name),
-            },
-            Err(e) => tracing::warn!("{e}"),
-        }
+            }
+        } else {
+            match McpClient::connect_with_authority(cfg, environment, unrestricted).await {
+                Ok(client) => match client.list_tools().await {
+                    Ok(infos) => {
+                        tracing::info!(
+                            server = %cfg.name,
+                            transport = "stdio",
+                            tools = infos.len(),
+                            "MCP server connected"
+                        );
+                        for info in infos {
+                            tools.push(Arc::new(McpTool::new(client.clone(), &cfg.name, info)));
+                        }
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("MCP `{}` tools/list 失败:{e}", cfg.name);
+                        Some(format!("tools/list failed: {e}"))
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    Some(e)
+                }
+            }
+        };
+        connections.push(McpServerConnection {
+            server: cfg.name.clone(),
+            tools,
+            error,
+        });
     }
-    tools
+    connections
 }
 
 #[cfg(test)]
@@ -417,17 +684,17 @@ for line in sys.stdin:
     request = json.loads(line)
     if 'id' in request: print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{}}), flush=True)
 "#;
-            let cfg = McpServerConfig {
-                name: "authority-test".into(),
-                command: "/usr/bin/python3".into(),
-                args: vec![
+            let cfg = McpServerConfig::stdio(
+                "authority-test",
+                "/usr/bin/python3",
+                vec![
                     "-u".into(),
                     "-c".into(),
                     script.into(),
                     observed.to_string_lossy().into_owned(),
                 ],
-                env: vec![],
-            };
+                vec![],
+            );
             let client = McpClient::connect_with_authority(&cfg, &environment, unrestricted)
                 .await
                 .unwrap();
@@ -446,6 +713,64 @@ for line in sys.stdin:
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn a_stdio_server_that_exits_asks_for_a_catalog_refresh() {
+        // A child that exits leaves tools whose process is gone. The next turn
+        // must reconnect it instead of calling a dead pipe forever.
+        let script = r#"import json,sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method')
+    if method == 'tools/call':
+        sys.exit(0)
+    result = {'tools':[{'name':'echo','description':'echo','inputSchema':{'type':'object'}}]} if method == 'tools/list' else {}
+    if 'id' in request:
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+        let cfg = McpServerConfig::stdio(
+            "exiting",
+            "/usr/bin/python3",
+            vec!["-u".into(), "-c".into(), script.into()],
+            vec![],
+        );
+        let client = McpClient::connect_with_authority(&cfg, &leveler_core::environment(), true)
+            .await
+            .unwrap();
+        let tool = McpTool::new(
+            client,
+            "exiting",
+            McpToolInfo {
+                name: "echo".into(),
+                description: "echo".into(),
+                input_schema: serde_json::json!({}),
+            },
+        );
+        assert!(!tool.catalog_changed(), "a live child owes no refresh");
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(
+            leveler_execution::Workspace::new(dir.path()).unwrap(),
+            leveler_execution::PermissionProfile::FullAccess,
+        );
+        let out = tool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        let mut refreshed = false;
+        for _ in 0..100 {
+            if tool.catalog_changed() {
+                refreshed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            refreshed,
+            "the dead child must be reconnected on a later turn"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn approved_mcp_call_inherits_credentials_without_elevating_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let environment = leveler_core::EnvSnapshot::new(
@@ -460,12 +785,12 @@ for line in sys.stdin:
         result={'content':[{'type':'text','text':os.environ.get('SERVICE_API_KEY','absent')}]} if request['method']=='tools/call' else {}
         print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
 "#;
-        let cfg = McpServerConfig {
-            name: "approved-authority".into(),
-            command: "/usr/bin/python3".into(),
-            args: vec!["-u".into(), "-c".into(), script.into()],
-            env: vec![],
-        };
+        let cfg = McpServerConfig::stdio(
+            "approved-authority",
+            "/usr/bin/python3",
+            vec!["-u".into(), "-c".into(), script.into()],
+            vec![],
+        );
         let client = McpClient::connect_with_authority(&cfg, &environment, false)
             .await
             .unwrap();
@@ -515,17 +840,13 @@ for line in sys.stdin:
             .spawn()
             .unwrap();
         let client = Arc::new(McpClient {
-            config: McpServerConfig {
-                name: "test".into(),
-                command: "/usr/bin/true".into(),
-                args: vec![],
-                env: vec![],
-            },
+            config: McpServerConfig::stdio("test", "/usr/bin/true", vec![], vec![]),
             environment: leveler_core::EnvSnapshot::default(),
             unrestricted: false,
             stdin: Mutex::new(child.stdin.take().unwrap()),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             _child: child,
         });
         let tool = McpTool::new(

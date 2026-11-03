@@ -106,7 +106,12 @@ impl SteeringSource for CallHandles {
         Vec::new()
     }
 
-    fn tool_call_started(&self, id: &str, cancel: CancellationToken) {
+    fn tool_call_started(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+        _yield_now: CancellationToken,
+    ) {
         self.started.lock().unwrap().push((id.to_string(), cancel));
     }
 

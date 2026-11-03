@@ -52,10 +52,25 @@ pub(crate) enum VerificationDecision {
     Refuse(String),
 }
 
+/// A command this task STARTED and has not observed a result for.
+///
+/// It is not evidence in either direction: the process may still be running.
+/// It is recorded so a citation of it is refused for the real reason — no
+/// result yet — instead of "never ran in this task", which was untrue and sent
+/// a real agent looking for a citation problem it did not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCommand {
+    /// The same label a citation is matched against.
+    pub label: String,
+    /// The background task id, when the start reported one.
+    pub task_id: Option<String>,
+}
+
 /// Decide whether `update_goal(complete)` may resolve the goal.
 pub(crate) fn decide(
     claim: &VerificationClaim,
     runs: &[VerificationRun],
+    pending: &[PendingCommand],
     mutation_ops: u64,
     modified: bool,
 ) -> VerificationDecision {
@@ -82,6 +97,7 @@ pub(crate) fn decide(
                     return VerificationDecision::Refuse(unmatched_citation(
                         cited,
                         runs,
+                        pending,
                         mutation_ops,
                     ));
                 };
@@ -160,7 +176,32 @@ pub(crate) fn decide(
 /// Why a citation is not an execution record, and what the model can do.
 ///
 /// Matching stays exact. The text only reports commands the runtime recorded.
-fn unmatched_citation(cited: &str, runs: &[VerificationRun], mutation_ops: u64) -> String {
+fn unmatched_citation(
+    cited: &str,
+    runs: &[VerificationRun],
+    pending: &[PendingCommand],
+    mutation_ops: u64,
+) -> String {
+    // A command this task started is not a command that never ran. Saying so
+    // about a live process hid the real missing fact (its result) and pointed
+    // the model at the wrong problem.
+    if let Some(started) = pending.iter().rev().find(|p| cites(&p.label, cited)) {
+        let task = match started.task_id.as_deref() {
+            Some(id) => format!(" as background task {id}"),
+            None => String::new(),
+        };
+        let wait = match started.task_id.as_deref() {
+            Some(id) => format!("wait_task with task_id {id}"),
+            None => "wait_task for that task".to_string(),
+        };
+        return format!(
+            "`{cited}` was cited as verification but it has only STARTED{task} and reported no \
+             result yet. A start is not a pass and not a failure: its outcome is unknown, so it \
+             cannot close the goal. Wait for it ({wait}) and cite it again once it exits, or cite \
+             a command that already finished. If it is a service that never exits, cite the check \
+             that proved the service works instead."
+        );
+    }
     let partial = closest_recorded_command(cited, runs);
     let why = match &partial {
         Some(partial) if partial.glued => format!(
@@ -417,13 +458,24 @@ fn command_tokens(command: &str) -> Vec<String> {
 /// `gofmt -l . (only pre-existing files flagged)`. Only a note that closes
 /// the citation and starts outside a quoted argument is removed; a
 /// parenthesis that belongs to the command itself stays.
+///
+/// A fullwidth note is the same observation in Chinese
+/// (`make up（退出码 0，五单元探活 200）`) and needs no separator before it,
+/// because `（` is never part of a shell command. Requiring the ASCII shape
+/// refused evidence that had really run.
 fn strip_trailing_note(command: &str) -> &str {
     let command = command.trim_end();
-    let Some(open) = command.rfind(" (") else {
+    let open = if command.ends_with('）') {
+        command.rfind('（')
+    } else if command.ends_with(')') {
+        command.rfind(" (")
+    } else {
+        None
+    };
+    let Some(open) = open else {
         return command;
     };
-    let note = &command[open..];
-    if !note.ends_with(')') || note.contains('\n') {
+    if command[open..].contains('\n') {
         return command;
     }
     let mut quote: Option<char> = None;
@@ -471,6 +523,22 @@ pub(crate) fn command_label(name: &str, arguments: &serde_json::Value) -> Option
         }
         _ => None,
     }
+}
+
+/// The command label of a process the runtime actually ran, when the result
+/// arrives from the process itself rather than from the call that started it.
+///
+/// Uses the same rendering as a `run_command` call — `program arg arg` — so a
+/// cited command and its background result are compared as one command. A
+/// `shell_command` caller's argv is a shell invocation whose tokens contain the
+/// user's command, which is what [`cites`] matches on.
+pub(crate) fn background_command_label(program: &str, args: &[String]) -> Option<String> {
+    let program = program.trim();
+    if program.is_empty() {
+        return None;
+    }
+    let arguments = serde_json::json!({ "program": program, "args": args });
+    command_label("run_command", &arguments)
 }
 
 /// Whether a command is a test/build/check-class command.
@@ -550,13 +618,78 @@ pub(crate) fn is_verification_command(label: &str) -> bool {
     false
 }
 
+/// Suite names a repository gives its own test target.
+///
+/// A repository names its suite in its own words (`make regression`,
+/// `just e2e`); the runner vocabulary alone cannot see it, and a goal that
+/// demanded the tests then becomes unsatisfiable while the tests really ran.
+/// These stems are the words that still name a test suite. Build, check, lint
+/// and verify are deliberately absent: they are verification, not the suite
+/// the user asked to pass.
+const TEST_SUITE_STEMS: &[&str] = &[
+    "test",
+    "spec",
+    "e2e",
+    "regression",
+    "acceptance",
+    "integration",
+];
+
+/// Whether a build tool's target names a test suite.
+///
+/// Matched per word, so a target containing a stem by accident (`make
+/// inspect`) is not a suite. `run-tests` and `test-all` are.
+fn target_names_a_suite(target: &str) -> bool {
+    target
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| {
+            !part.is_empty()
+                && TEST_SUITE_STEMS
+                    .iter()
+                    .any(|stem| part == *stem || part.starts_with(stem))
+        })
+}
+
+/// What the runtime recognises as a test run, in words the model can act on.
+///
+/// A refusal that only says "no test command ran" leaves a model whose suite
+/// has an unrecognised name with nowhere to go; the vocabulary is mechanical,
+/// so it is stated instead of guessed.
+pub(crate) fn test_command_guidance() -> String {
+    format!(
+        "the runtime recognises a test run by its runner (`go test`, `cargo test`, `cargo \
+         nextest run`, `pytest`, `npm test`, `ctest`, …) or by a build-tool target named for a \
+         suite ({})",
+        TEST_SUITE_STEMS.join(", ")
+    )
+}
+
 /// Whether a command actually runs a test suite.
 ///
 /// Narrower than [`is_verification_command`]: a build, a type-check or a lint
 /// is verification, but it is not the test suite the user asked to pass.
 /// Deliberately mechanical and conservative; an unrecognised runner simply
-/// does not satisfy a test requirement.
+/// does not satisfy a test requirement, and a build target counts only when
+/// its own name names a suite (see [`TEST_SUITE_STEMS`]).
 pub(crate) fn is_test_command(label: &str) -> bool {
+    names_a_test_suite(label, true)
+}
+
+/// Whether a command is the standard test runner, without a repository's own
+/// suite name.
+///
+/// This is the question requirement *extraction* asks: a span that already
+/// reads as "run the tests" is covered by the Tests requirement, so it must
+/// not also become a named command. A project's own target is different — when
+/// the user writes `` `make regression` `` without demanding "the tests", it is
+/// a command they asked to run, and skipping it would drop the requirement
+/// instead of covering it.
+pub(crate) fn is_runner_named_test_command(label: &str) -> bool {
+    names_a_test_suite(label, false)
+}
+
+fn names_a_test_suite(label: &str, suite_targets: bool) -> bool {
     const TEST_TARGETS: &[&str] = &[
         "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
     ];
@@ -582,7 +715,9 @@ pub(crate) fn is_test_command(label: &str) -> bool {
                             .is_some_and(|word| matches!(*word, "test" | "tests")))
             }
             "make" | "just" | "bazel" | "mvn" | "gradle" | "dotnet" | "swift" | "flutter"
-            | "dart" | "mix" => words.iter().skip(1).any(|word| TEST_TARGETS.contains(word)),
+            | "dart" | "mix" => words.iter().skip(1).any(|word| {
+                TEST_TARGETS.contains(word) || (suite_targets && target_names_a_suite(word))
+            }),
             "pytest" | "phpunit" | "ctest" => true,
             "python" | "python3" | "py" => words
                 .windows(2)
@@ -664,6 +799,33 @@ fn number_after(text: &str, needle: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
+mod background_label_tests {
+    use super::*;
+
+    /// The result arrives from the PROCESS (argv), while the model cites the
+    /// command it asked for. Both must compare as one command.
+    #[test]
+    fn a_background_result_is_labelled_like_the_command_that_was_cited() {
+        let label =
+            background_command_label("cargo", &["test".into(), "--lib".into()]).expect("label");
+        assert_eq!(label, "cargo test --lib");
+        assert!(cites(&label, "cargo test --lib"));
+        // A shell invocation keeps the user's command inside its own tokens, so
+        // citing the user's command still matches the shell's argv result.
+        let shell = background_command_label("sh", &["-c".into(), "make up && make e2e".into()])
+            .expect("label");
+        assert!(cites(&shell, "make up && make e2e"), "{shell}");
+        assert!(cites(&shell, "make e2e"), "{shell}");
+        assert!(!cites(&shell, "make migrate"), "{shell}");
+    }
+
+    #[test]
+    fn an_empty_program_has_no_label() {
+        assert!(background_command_label("  ", &[]).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -714,6 +876,7 @@ mod tests {
             decide(
                 &VerificationClaim::Passed(vec!["go test ./...".into()]),
                 &runs,
+                &[],
                 2,
                 true
             ),
@@ -727,6 +890,7 @@ mod tests {
         let decision = decide(
             &VerificationClaim::Passed(vec!["go test ./...".into()]),
             &runs,
+            &[],
             2,
             true,
         );
@@ -751,6 +915,7 @@ mod tests {
         let decision = decide(
             &VerificationClaim::Passed(vec!["go test ./...".into()]),
             &runs,
+            &[],
             2,
             true,
         );
@@ -775,6 +940,34 @@ mod tests {
     /// the last argument, so the segment is not an execution record. The
     /// refusal must name that full command and the correction, and must not
     /// pretend the script never ran.
+    /// The real DevOrder refusal said "it never ran in this task" about
+    /// `make up`, which HAD started as background task `bg-1` and was still
+    /// running. The missing fact was its result, not its existence; naming that
+    /// (and the task to wait on) is what makes the refusal actionable.
+    #[test]
+    fn a_citation_of_a_started_command_names_the_task_to_wait_for() {
+        let pending = vec![PendingCommand {
+            label: "make up CONFIG=probe.yaml".to_string(),
+            task_id: Some("bg-1".to_string()),
+        }];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["make up CONFIG=probe.yaml".into()]),
+            &[],
+            &pending,
+            0,
+            false,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a start is not a pass");
+        };
+        assert!(message.contains("only STARTED"), "{message}");
+        assert!(message.contains("bg-1"), "{message}");
+        assert!(
+            !message.contains("never ran"),
+            "the command did run; its result is what is missing: {message}"
+        );
+    }
+
     #[test]
     fn a_compound_shell_subcommand_is_refused_and_names_the_full_command() {
         let recorded = "/bin/sh ./verify.sh; echo marker";
@@ -782,6 +975,7 @@ mod tests {
         let decision = decide(
             &VerificationClaim::Passed(vec!["/bin/sh ./verify.sh".into()]),
             &runs,
+            &[],
             2,
             true,
         );
@@ -818,6 +1012,7 @@ mod tests {
             decide(
                 &VerificationClaim::Passed(vec![recorded.into()]),
                 &runs,
+                &[],
                 2,
                 true
             ),
@@ -839,7 +1034,7 @@ mod tests {
                     "go test -v -run 'TestNamesOnly|TestRenderNamesIncludesInvalid' ./cmd/... ./internal/report/..."
                         .into()
                 ]),
-                &runs,
+                &runs, &[],
                 2,
                 true
             ),
@@ -861,7 +1056,7 @@ mod tests {
         }))
         .expect("valid claim");
         assert_eq!(
-            decide(&claim, &runs, 2, true),
+            decide(&claim, &runs, &[], 2, true),
             VerificationDecision::Accept { warning: None }
         );
     }
@@ -875,9 +1070,33 @@ mod tests {
                     "gofmt -l . (only pre-existing internal/config/config.go flagged; touched files clean)"
                         .into()
                 ]),
-                &runs,
+                &runs, &[],
                 2,
                 true
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
+    }
+
+    #[test]
+    fn a_cited_command_may_carry_a_cjk_annotation() {
+        // The citation the DevOrder session wrote for a command it had run
+        // (`bash -lc make up > tmp/run/up.log 2>&1; echo "make up 退出码: $?"`).
+        let runs = vec![run(
+            "bash -lc make up > tmp/run/up.log 2>&1; echo \"make up 退出码: $?\"",
+            true,
+            6,
+            0,
+        )];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec![
+                    "make up（退出码 0，五单元启动并探活 200）".into()
+                ]),
+                &runs,
+                &[],
+                0,
+                false
             ),
             VerificationDecision::Accept { warning: None }
         );
@@ -889,7 +1108,7 @@ mod tests {
         assert!(matches!(
             decide(
                 &VerificationClaim::Passed(vec!["grep 'a b' file".into()]),
-                &runs,
+                &runs, &[],
                 2,
                 true
             ),
@@ -901,7 +1120,7 @@ mod tests {
     fn a_citation_whose_last_run_failed_is_refused() {
         let runs = vec![run("go test ./...", false, 4, 2)];
         assert!(matches!(
-            decide(&VerificationClaim::Passed(vec!["go test".into()]), &runs, 2, true),
+            decide(&VerificationClaim::Passed(vec!["go test".into()]), &runs, &[], 2, true),
             VerificationDecision::Refuse(message) if message.contains("failed")
         ));
     }
@@ -910,7 +1129,7 @@ mod tests {
     fn a_citation_that_predates_the_last_change_is_refused() {
         let runs = vec![run("go test ./...", true, 4, 1)];
         assert!(matches!(
-            decide(&VerificationClaim::Passed(vec!["go test".into()]), &runs, 3, true),
+            decide(&VerificationClaim::Passed(vec!["go test".into()]), &runs, &[], 3, true),
             VerificationDecision::Refuse(message) if message.contains("before the most recent")
         ));
     }
@@ -930,6 +1149,7 @@ mod tests {
             decide(
                 &VerificationClaim::Passed(vec!["sleep 60".into()]),
                 &runs,
+                &[],
                 1,
                 true
             ),
@@ -941,13 +1161,13 @@ mod tests {
     fn a_failed_verification_blocks_completion_even_without_a_claim() {
         let runs = vec![run("cargo test", false, 5, 2)];
         assert!(matches!(
-            decide(&VerificationClaim::Missing, &runs, 2, true),
+            decide(&VerificationClaim::Missing, &runs, &[], 2, true),
             VerificationDecision::Refuse(message) if message.contains("failed")
         ));
         assert!(matches!(
             decide(
                 &VerificationClaim::NotApplicable("config only".into()),
-                &runs,
+                &runs, &[],
                 2,
                 true
             ),
@@ -962,7 +1182,7 @@ mod tests {
             run("cargo test", true, 7, 2),
         ];
         assert_eq!(
-            decide(&VerificationClaim::Missing, &runs, 2, true),
+            decide(&VerificationClaim::Missing, &runs, &[], 2, true),
             VerificationDecision::Accept { warning: None }
         );
     }
@@ -970,12 +1190,12 @@ mod tests {
     #[test]
     fn changed_files_without_evidence_complete_with_a_warning_and_read_only_goals_do_not() {
         assert!(matches!(
-            decide(&VerificationClaim::Missing, &[], 0, true),
+            decide(&VerificationClaim::Missing, &[], &[], 0, true),
             VerificationDecision::Accept { warning: Some(warning) }
                 if warning.contains("without executable verification")
         ));
         assert_eq!(
-            decide(&VerificationClaim::Missing, &[], 0, false),
+            decide(&VerificationClaim::Missing, &[], &[], 0, false),
             VerificationDecision::Accept { warning: None }
         );
     }
@@ -984,7 +1204,7 @@ mod tests {
     fn a_pass_that_predates_the_last_change_cannot_stand_in_for_a_fresh_one() {
         let runs = vec![run("go test ./...", true, 4, 1)];
         assert!(matches!(
-            decide(&VerificationClaim::Missing, &runs, 3, true),
+            decide(&VerificationClaim::Missing, &runs, &[], 3, true),
             VerificationDecision::Refuse(message) if message.contains("before the most recent")
         ));
     }
@@ -993,6 +1213,7 @@ mod tests {
     fn an_explicit_not_applicable_is_accepted_with_a_warning() {
         match decide(
             &VerificationClaim::NotApplicable("  documentation only  ".into()),
+            &[],
             &[],
             0,
             true,
@@ -1068,6 +1289,18 @@ mod tests {
             "pytest -q",
             "python3 -m unittest",
             "make test",
+            // A repository names its own suite; the target name is what the
+            // runtime has to read it by (`make regression` is DevOrder's full
+            // end-to-end suite).
+            "make regression",
+            "just e2e",
+            "just regression",
+            "make acceptance",
+            "make e2e",
+            "make integration",
+            "make test-all",
+            "make run-tests",
+            "make acceptance-suite",
             "sh run-tests.sh",
             "cmd /c run-tests.cmd",
             "./acceptance-test.sh",
@@ -1083,8 +1316,44 @@ mod tests {
             "sh verify.sh",
             "sh ./scripts/check.sh",
             "grep -rn test src",
+            // A build target that is not the suite: starting the services,
+            // reporting status, building, and a target whose name only
+            // contains a stem by accident.
+            "make up",
+            "make status",
+            "make build",
+            "make lint",
+            "make inspect",
+            "make prepare",
         ] {
             assert!(!is_test_command(command), "not a test suite: {command}");
+        }
+    }
+
+    /// A shell wrapper is still the command inside it when that command names
+    /// the standard runner (`bash -lc 'npm test'`). A repository's own suite
+    /// name inside a wrapper is NOT read: the runtime's label is the wrapper,
+    /// and it does not parse prose to guess what the script ran. The
+    /// requirement stays unproven instead, which is the honest answer — the
+    /// wrapper's body is not an execution record the gate can match.
+    #[test]
+    fn a_wrapped_runner_is_read_but_a_wrapped_suite_name_is_not_guessed() {
+        for wrapped in [
+            "bash -lc \"npm test\"",
+            "sh -c 'go test ./...'",
+            "bash -lc '/usr/bin/pytest -q'",
+            "pwsh -c 'cargo test --workspace'",
+        ] {
+            assert!(is_test_command(wrapped), "{wrapped}");
+        }
+        for not_evidence in [
+            "bash -lc \"make regression\"",
+            "sh -c 'just e2e'",
+            "sh ./scripts/lint.sh",
+            "bash ./scripts/check.sh",
+            "make lint",
+        ] {
+            assert!(!is_test_command(not_evidence), "{not_evidence}");
         }
     }
 

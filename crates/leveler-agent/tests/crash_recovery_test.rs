@@ -44,8 +44,24 @@ struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
 }
 
+/// Append the answer a real model writes after resolving its goal: the runtime
+/// takes one delivery round when the resolving round carried no text.
+fn with_delivery(mut responses: Vec<ModelResponse>) -> Vec<ModelResponse> {
+    let resolves_without_text = responses.last().is_some_and(|response| {
+        response.message.text_content().trim().is_empty()
+            && response.message.content.iter().any(
+                |part| matches!(part, ContentPart::ToolCall { call } if call.name == "update_goal"),
+            )
+    });
+    if resolves_without_text {
+        responses.push(text("Done: the goal is resolved and reported."));
+    }
+    responses
+}
+
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
+        let responses = with_delivery(responses);
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
         }
@@ -166,6 +182,7 @@ async fn harness(
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -1121,5 +1138,56 @@ async fn a_denied_escalation_leaves_no_dangling_call_behind() {
         )),
         "the refusal must be durable as the call's terminal, not only in the \
          model's transcript"
+    );
+}
+
+/// An interrupted OBSERVATION is not an unresolved side effect.
+///
+/// `wait_task` / `get_task` are `RiskLevel::Safe` but deliberately not
+/// replayable: a replay would consume the background task's settlement exactly
+/// once and could apply its rollback a second time. Halting the resume for them
+/// protects nothing, because the crash destroyed only the tool's ANSWER — the
+/// task registry still holds the task, and the model can simply ask again.
+///
+/// Found in a real TUI dogfood: a session killed while polling a long test
+/// suite could not be resumed at all. The user's next message was refused with
+/// "resume with --confirm-recovery", a flag the TUI resume path has no way to
+/// pass — so that session was permanently unusable.
+#[tokio::test]
+async fn an_interrupted_observation_is_skipped_and_does_not_block_resume() {
+    let (engine, db, dir) = harness(Arc::new(AutoDeny), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(
+        &db,
+        &engine,
+        &session,
+        "wait_task",
+        serde_json::json!({"task_id": "bg-1"}).to_string(),
+    )
+    .await;
+
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("an interrupted observation must not block resume");
+
+    let log = EventLog::new(&db, session.clone());
+    assert!(
+        log.dangling_tool_calls().await.unwrap().is_empty(),
+        "the interrupted observation must be closed, not left dangling"
+    );
+    let events = recorded_events(&db, &session).await;
+    let finished = events.iter().find_map(|e| match e {
+        EngineEvent::ToolCallFinished {
+            call_id, is_error, ..
+        } if call_id == "c1" => Some(*is_error),
+        _ => None,
+    });
+    assert_eq!(
+        finished,
+        Some(true),
+        "a skipped observation is recorded as an errored result, never as a success"
     );
 }

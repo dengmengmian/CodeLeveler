@@ -1846,6 +1846,36 @@
       }
     },
     {
+      "description": "A still-running background task printed a readiness signal that a caller was waiting for (its own output matched an explicit pattern). `evidence` is the line that matched. This is an OBSERVATION, not a health check and not an exit: the process keeps running, and the terminal event still follows whenever it ends. Additive; older clients ignore the unknown type and keep showing the task as running.",
+      "type": "object",
+      "required": [
+        "evidence",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "elapsed_ms": {
+          "description": "Milliseconds from process start to the observation.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "background_task_ready"
+          ]
+        }
+      }
+    },
+    {
       "description": "A background task's state could not be established (for example its adopted driver failed). This is not a natural exit and not a stop: the UI must show unknown, never Running, failed, or stopped.",
       "type": "object",
       "required": [
@@ -5259,6 +5289,36 @@
           }
         },
         {
+          "description": "A still-running background task printed a readiness signal that a caller was waiting for (its own output matched an explicit pattern). `evidence` is the line that matched. This is an OBSERVATION, not a health check and not an exit: the process keeps running, and the terminal event still follows whenever it ends. Additive; older clients ignore the unknown type and keep showing the task as running.",
+          "type": "object",
+          "required": [
+            "evidence",
+            "task_id",
+            "type"
+          ],
+          "properties": {
+            "elapsed_ms": {
+              "description": "Milliseconds from process start to the observation.",
+              "default": 0,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "evidence": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "background_task_ready"
+              ]
+            }
+          }
+        },
+        {
           "description": "A background task's state could not be established (for example its adopted driver failed). This is not a natural exit and not a stop: the UI must show unknown, never Running, failed, or stopped.",
           "type": "object",
           "required": [
@@ -5842,6 +5902,13 @@
         },
         "program": {
           "type": "string"
+        },
+        "ready_evidence": {
+          "description": "Readiness evidence observed for this still-running task, when a caller waited for a real signal in its output. Additive; absent means no signal has been observed, never that the service is not ready.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "task_id": {
           "type": "string"

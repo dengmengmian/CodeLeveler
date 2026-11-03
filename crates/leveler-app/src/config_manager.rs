@@ -660,11 +660,21 @@ fn model_catalog(config: &LoadedConfig) -> Vec<String> {
     rows
 }
 
-fn mcp_map(config: &LoadedConfig) -> BTreeMap<String, (String, Vec<String>, Vec<String>)> {
+fn mcp_map(
+    config: &LoadedConfig,
+) -> BTreeMap<String, (String, Vec<String>, Vec<String>, String, Vec<String>)> {
     config
         .mcp_servers
         .iter()
         .map(|server| {
+            let mut secrets = server
+                .headers
+                .iter()
+                .map(|(key, value)| format!("{key}={:x}", Sha256::digest(value.as_bytes())))
+                .collect::<Vec<_>>();
+            if let Some(token) = &server.bearer_token {
+                secrets.push(format!("bearer={:x}", Sha256::digest(token.as_bytes())));
+            }
             (
                 server.name.clone(),
                 (
@@ -675,6 +685,8 @@ fn mcp_map(config: &LoadedConfig) -> BTreeMap<String, (String, Vec<String>, Vec<
                         .iter()
                         .map(|(key, value)| format!("{key}={value}"))
                         .collect(),
+                    server.url.clone().unwrap_or_default(),
+                    secrets,
                 ),
             )
         })

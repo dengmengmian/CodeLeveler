@@ -20,7 +20,9 @@ use leveler_tui::state::{AppState, Boot};
 use leveler_tui::theme::Theme;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 fn opened() -> AppState {
     AppState::new(
@@ -311,4 +313,73 @@ fn session_list_distinguishes_answers_declarations_and_legacy_endings() {
         let row = text.lines().find(|line| line.contains(goal)).unwrap();
         assert!(row.contains(label), "{row}");
     }
+}
+
+fn wheel(kind: MouseEventKind, column: u16, row: u16) -> Action {
+    Action::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })
+}
+
+/// A long side answer is read with the wheel. The wheel belongs to this
+/// surface: it must move the side thread and leave the main transcript's
+/// scroll where it was, even when that transcript's old viewport still
+/// overlaps the pointer.
+#[test]
+fn wheel_scrolls_a_long_btw_answer_and_not_the_main_transcript() {
+    let body = (0..40)
+        .map(|i| format!("ROW{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut s = btw_state("q", &format!("```\n{body}\n```"));
+    s.conv.scroll = 12;
+    s.conv.rect = Some((0, 2, 80, 16));
+    let before = frame(&mut s, 80, 24);
+    assert!(
+        before.iter().any(|line| line.contains("ROW39")),
+        "the live edge is the tail:\n{}",
+        before.join("\n")
+    );
+    assert!(
+        !before.iter().any(|line| line.contains("ROW00")),
+        "the opening is above the viewport:\n{}",
+        before.join("\n")
+    );
+
+    reduce(&mut s, wheel(MouseEventKind::ScrollUp, 10, 5));
+    assert_eq!(s.btw.scroll, 3, "one wheel notch moves the side thread");
+    assert_eq!(s.conv.scroll, 12, "the main transcript does not move");
+
+    let after = frame(&mut s, 80, 24);
+    assert_ne!(
+        before.iter().position(|line| line.contains("ROW39")),
+        after.iter().position(|line| line.contains("ROW39")),
+        "the painted window must follow the wheel"
+    );
+
+    s.input_rect = Some((0, 20, 80, 3));
+    let parked = s.btw.scroll;
+    reduce(&mut s, wheel(MouseEventKind::ScrollUp, 10, 21));
+    assert_eq!(parked, s.btw.scroll, "a wheel over the composer stays put");
+}
+
+/// The header `←` is the mouse's Esc on this surface too.
+#[test]
+fn clicking_the_btw_back_glyph_returns_to_main() {
+    let mut s = btw_state("q", "a");
+    frame(&mut s, 80, 24);
+    let (row, x0, _) = s.back_hit.expect("the header publishes its back hit");
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x0,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(s.surface, SurfaceFocus::Main);
 }

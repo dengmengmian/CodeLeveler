@@ -57,6 +57,52 @@ fn texts(s: &AppState) -> Vec<String> {
     s.pending_inputs.iter().map(|p| p.text.clone()).collect()
 }
 
+/// A turn blocked on a background wait cannot reach its terminal event by
+/// itself, so Enter must steer rather than extend the queue.
+#[test]
+fn enter_during_a_background_wait_steers_the_running_turn() {
+    let mut s = state();
+    s.background_task_labels.insert(
+        "bg-a".into(),
+        crate::state::BackgroundTaskChrome::running("make up", 0),
+    );
+    s.transcript.push_tool_started(
+        leveler_client_protocol::ToolCallId::new("w1"),
+        "wait_task".into(),
+        serde_json::json!({ "task_id": "bg-a", "timeout_seconds": 600 }).to_string(),
+        false,
+        2,
+        None,
+        None,
+    );
+    let effects = type_and_enter(&mut s, "现在进展怎么样了？");
+    let (command, _) = submitted(&effects);
+    assert!(
+        matches!(command, ClientCommand::SteerCurrentTurn { ref content, .. } if content == "现在进展怎么样了？"),
+        "{command:?}"
+    );
+    assert!(texts(&s).is_empty(), "a steer is not a queued draft");
+    assert_eq!(user_messages(&s), vec!["现在进展怎么样了？"]);
+}
+
+/// The queue is unchanged for a turn that is making progress on its own.
+#[test]
+fn enter_during_an_ordinary_busy_turn_still_queues() {
+    let mut s = state();
+    s.transcript.push_tool_started(
+        leveler_client_protocol::ToolCallId::new("c1"),
+        "shell_command".into(),
+        serde_json::json!({ "cmd": "sleep 30" }).to_string(),
+        false,
+        2,
+        None,
+        None,
+    );
+    let effects = type_and_enter(&mut s, "顺便加一句");
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(texts(&s), vec!["顺便加一句"]);
+}
+
 fn submitted(effects: &[Effect]) -> (ClientCommand, CommandId) {
     match effects {
         [

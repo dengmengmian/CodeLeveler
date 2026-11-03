@@ -621,8 +621,11 @@ pub async fn observe_retiring_runtime(
         None,
     )
     .await
+    .0
 }
 
+/// A returned runtime identity is evidence of a reusable atomic Busy answer.
+/// Health snapshots and unsupported retirement never produce that evidence.
 #[cfg(any(unix, windows))]
 async fn observe_retiring_runtime_with_grace(
     client: &LocalSocketRuntimeClient,
@@ -631,8 +634,8 @@ async fn observe_retiring_runtime_with_grace(
     interval: Duration,
     grace: Duration,
     ui: &dyn HandoffUi,
-    requested: Option<RestartReason>,
-) -> DrainOutcome {
+    requested: Option<(RestartReason, Option<&str>)>,
+) -> (DrainOutcome, Option<RuntimeInfo>) {
     let mut last = String::new();
     let mut input: Option<UnboundedReceiver<HandoffAction>> = None;
     let mut grace_deadline: Option<tokio::time::Instant> = None;
@@ -661,16 +664,16 @@ async fn observe_retiring_runtime_with_grace(
                 .flatten()
                 .is_none()
         {
-            return DrainOutcome::Drained;
+            return (DrainOutcome::Drained, None);
         }
         if let Some(info) = info.as_ref()
             && observed_pid.is_some_and(|pid| info.pid != pid)
         {
-            return DrainOutcome::Drained;
+            return (DrainOutcome::Drained, None);
         }
         let health = info.as_ref().map(|info| info.health.clone());
         // ---- Ask for the decision, when it has not been made yet -----------
-        if let (Some(reason), Some(info)) = (pending, info.as_ref()) {
+        if let (Some((reason, reuse_busy_config)), Some(info)) = (pending, info.as_ref()) {
             let request = leveler_client_protocol::RetireRequest {
                 reason,
                 expected_build: info.build.clone(),
@@ -705,11 +708,21 @@ async fn observe_retiring_runtime_with_grace(
                     // state and returns. Waiting is only meaningful for a
                     // shell that can decide (keep waiting, interrupt, force) —
                     // everything else just looks hung.
-                    if !ui.interactive() {
-                        return DrainOutcome::Deferred {
-                            active_turns,
-                            active_background_tasks,
-                        };
+                    let reusable = reuse_busy_config.is_some_and(|expected| {
+                        reason == RestartReason::BuildMismatch
+                            && info.build.is_known()
+                            && info.config_fingerprint.as_deref() == Some(expected)
+                            && !info.health.shutting_down
+                            && info.health.retiring_reason.is_none()
+                    });
+                    if reusable || !ui.interactive() {
+                        return (
+                            DrainOutcome::Deferred {
+                                active_turns,
+                                active_background_tasks,
+                            },
+                            reusable.then(|| info.clone()),
+                        );
                     }
                 }
                 Ok(leveler_client_protocol::RetireDecision::GenerationChanged) => {
@@ -720,13 +733,16 @@ async fn observe_retiring_runtime_with_grace(
                     // spinning.
                     generation_changes += 1;
                     if generation_changes > MAX_GENERATION_CHANGES {
-                        return DrainOutcome::Undecided {
-                            waited: started.elapsed(),
-                            active_turns: health.as_ref().map_or(0, |h| h.active_turns),
-                            active_background_tasks: health
-                                .as_ref()
-                                .map_or(0, |h| h.active_background_tasks),
-                        };
+                        return (
+                            DrainOutcome::Undecided {
+                                waited: started.elapsed(),
+                                active_turns: health.as_ref().map_or(0, |h| h.active_turns),
+                                active_background_tasks: health
+                                    .as_ref()
+                                    .map_or(0, |h| h.active_background_tasks),
+                            },
+                            None,
+                        );
                     }
                     tokio::time::sleep(interval).await;
                     continue;
@@ -743,10 +759,13 @@ async fn observe_retiring_runtime_with_grace(
                             active_turns: health.active_turns,
                             active_background_tasks: health.active_background_tasks,
                         });
-                        return DrainOutcome::Deferred {
-                            active_turns: health.active_turns,
-                            active_background_tasks: health.active_background_tasks,
-                        };
+                        return (
+                            DrainOutcome::Deferred {
+                                active_turns: health.active_turns,
+                                active_background_tasks: health.active_background_tasks,
+                            },
+                            None,
+                        );
                     }
                     let reason = "the previous runtime does not support atomic retirement; \
                                   let its owner exit normally before upgrading"
@@ -754,7 +773,7 @@ async fn observe_retiring_runtime_with_grace(
                     ui.emit(HandoffEvent::MigrationFailed {
                         reason: reason.clone(),
                     });
-                    return DrainOutcome::MigrationBlocked { reason };
+                    return (DrainOutcome::MigrationBlocked { reason }, None);
                 }
                 Err(error) => {
                     // No usable answer at all: not a decision, and not a
@@ -771,12 +790,15 @@ async fn observe_retiring_runtime_with_grace(
                     ui.emit(HandoffEvent::MigrationFailed {
                         reason: error.to_string(),
                     });
-                    return DrainOutcome::MigrationBlocked {
-                        reason: format!(
-                            "the previous runtime did not answer the atomic retirement question: \
+                    return (
+                        DrainOutcome::MigrationBlocked {
+                            reason: format!(
+                                "the previous runtime did not answer the atomic retirement question: \
                              {error}"
-                        ),
-                    };
+                            ),
+                        },
+                        None,
+                    );
                 }
             }
         }
@@ -811,11 +833,14 @@ async fn observe_retiring_runtime_with_grace(
                 && started.elapsed() >= budget
                 && !ui.interactive()
             {
-                return DrainOutcome::Undecided {
-                    waited: started.elapsed(),
-                    active_turns: turns,
-                    active_background_tasks: background,
-                };
+                return (
+                    DrainOutcome::Undecided {
+                        waited: started.elapsed(),
+                        active_turns: turns,
+                        active_background_tasks: background,
+                    },
+                    None,
+                );
             }
         }
         if let Some(deadline) = grace_deadline
@@ -867,54 +892,79 @@ async fn observe_retiring_runtime_with_grace(
 /// Settle a retirement end to end: obtain the runtime's authoritative decision
 /// (unless a caller already obtained it), then wait for the endpoint to be
 /// released. One loop, so the decision, its reporting and the wait can never
-/// disagree about what this client is waiting for.
+/// disagree about what this client is waiting for. Returns `true` when the old
+/// generation drained, or `false` when its atomic Busy answer allowed reuse.
 #[cfg(any(unix, windows))]
 async fn retire_runtime(
     client: &LocalSocketRuntimeClient,
     socket_path: &Path,
     reason: RestartReason,
     ui: &dyn HandoffUi,
-) -> anyhow::Result<()> {
+    reuse_busy_config: Option<&str>,
+) -> anyhow::Result<bool> {
     let observed_pid = LocalRuntimeService::runtime_info(client)
         .await
         .ok()
         .map(|info| info.pid);
-    let outcome = observe_retiring_runtime_with_grace(
+    let (outcome, reusable) = observe_retiring_runtime_with_grace(
         client,
         socket_path,
         observed_pid,
         HANDOVER_STATUS_INTERVAL,
         HANDOVER_CANCEL_GRACE,
         ui,
-        Some(reason),
+        Some((reason, reuse_busy_config)),
     )
     .await;
-    match outcome {
-        DrainOutcome::Drained => Ok(()),
-        DrainOutcome::Deferred {
-            active_turns,
-            active_background_tasks,
-        } => Err(EnsureError::RetireBlocked {
+    match (outcome, reusable) {
+        (DrainOutcome::Drained, _) => Ok(true),
+        (DrainOutcome::Deferred { .. }, Some(observed)) => {
+            // The atomic Busy answer left the serving runtime unchanged.
+            // Only a configuration-matching build mismatch can use it.
+            let info = LocalRuntimeService::runtime_info(client).await?;
+            if info.pid == observed.pid
+                && info.build == observed.build
+                && info.config_fingerprint.as_deref() == reuse_busy_config
+                && !info.health.shutting_down
+                && info.health.retiring_reason.is_none()
+            {
+                Ok(false)
+            } else {
+                Err(EnsureError::UnknownGeneration.into())
+            }
+        }
+        (
+            DrainOutcome::Deferred {
+                active_turns,
+                active_background_tasks,
+            },
+            _,
+        ) => Err(EnsureError::RetireBlocked {
             waited_secs: 0,
             active_turns,
             active_background_tasks,
         }
         .into()),
-        DrainOutcome::Undecided {
-            waited,
-            active_turns,
-            active_background_tasks,
-        } => Err(EnsureError::RetireBlocked {
+        (
+            DrainOutcome::Undecided {
+                waited,
+                active_turns,
+                active_background_tasks,
+            },
+            _,
+        ) => Err(EnsureError::RetireBlocked {
             waited_secs: waited.as_secs(),
             active_turns,
             active_background_tasks,
         }
         .into()),
-        DrainOutcome::MigrationBlocked { reason } => Err(EnsureError::LegacyMigrationRefused {
-            socket: socket_path.to_path_buf(),
-            reason,
+        (DrainOutcome::MigrationBlocked { reason }, _) => {
+            Err(EnsureError::LegacyMigrationRefused {
+                socket: socket_path.to_path_buf(),
+                reason,
+            }
+            .into())
         }
-        .into()),
     }
 }
 
@@ -963,8 +1013,8 @@ pub async fn connect_global_task_runtime(
 ///
 /// Returned outcomes, all of them from the existing lifecycle vocabulary:
 ///
-/// - `Ok(Some(client))` — a runtime of this generation is serving the endpoint;
-///   attach to it.
+/// - `Ok(Some(client))` — this generation, or a compatible busy previous build
+///   with the current configuration, is serving the endpoint; attach to it.
 /// - `Ok(None)` — nothing of this generation owns the endpoint any more. Either
 ///   nothing was listening, or a different generation handed over atomically.
 ///   The caller may start one.
@@ -994,8 +1044,16 @@ pub async fn reconcile_runtime_generation(
                 expected = %expected.short(),
                 "local runtime is a different build; asking it to retire"
             );
-            retire_runtime(&client, socket_path, RestartReason::BuildMismatch, ui).await?;
-            Ok(None)
+            let config = expected_config_fingerprint(layout)?;
+            let retired = retire_runtime(
+                &client,
+                socket_path,
+                RestartReason::BuildMismatch,
+                ui,
+                Some(&config),
+            )
+            .await?;
+            Ok((!retired).then_some(client))
         }
         RuntimeConsistency::ConfigChanged => {
             // A same-build runtime serving an older configuration generation is
@@ -1010,7 +1068,7 @@ pub async fn reconcile_runtime_generation(
                 return Ok(Some(client));
             }
             tracing::info!("runtime cannot reload configuration in place; asking it to retire");
-            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui).await?;
+            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui, None).await?;
             Ok(None)
         }
     }
@@ -1275,4 +1333,388 @@ fn configure_detached_runtime(command: &mut tokio::process::Command) {
     // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: do not share the caller's
     // console lifetime or console control events. Handles remain explicit.
     command.creation_flags(0x0000_0008 | 0x0000_0200);
+}
+
+#[cfg(all(test, unix))]
+mod generation_attach_tests {
+    use super::*;
+    use leveler_client_protocol::{
+        ClientError, RetireDecision, RetireRequest, RuntimeEvent, UiSessionSnapshot,
+    };
+    use leveler_local_transport::{CreateSessionRequest, LocalSocketServer, SessionBootstrap};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::{Notify, broadcast};
+
+    struct Runtime {
+        info: RuntimeInfo,
+        decision: RetireDecision,
+        retire_calls: AtomicUsize,
+        retire_before_confirmation: AtomicBool,
+        commands: AtomicUsize,
+        events: broadcast::Sender<RuntimeEvent>,
+        retired: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for Runtime {
+        async fn send(&self, _command: ClientCommand) -> Result<(), ClientError> {
+            self.commands.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+            self.events.subscribe()
+        }
+        async fn snapshot(&self, _session: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+            Err(ClientError::Runtime("unused snapshot".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LocalRuntimeService for Runtime {
+        async fn create_session(
+            &self,
+            _request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            Err(ClientError::Runtime("unused creation".into()))
+        }
+        async fn runtime_info(&self) -> Result<RuntimeInfo, ClientError> {
+            let mut info = self.info.clone();
+            if self.retire_before_confirmation.load(Ordering::SeqCst)
+                && self.retire_calls.load(Ordering::SeqCst) > 0
+            {
+                // Retirement closes admission before process shutdown starts.
+                info.health.retiring_reason = Some(RestartReason::BuildMismatch);
+            }
+            Ok(info)
+        }
+        async fn try_retire_if_idle(
+            &self,
+            request: RetireRequest,
+        ) -> Result<RetireDecision, ClientError> {
+            assert_eq!(request.expected_build, self.info.build);
+            assert_eq!(request.expected_pid, self.info.pid);
+            self.retire_calls.fetch_add(1, Ordering::SeqCst);
+            if self.decision.admits_replacement() {
+                self.retired.notify_one();
+            }
+            Ok(self.decision)
+        }
+    }
+
+    #[derive(Default)]
+    struct Ui(std::sync::Mutex<Vec<HandoffEvent>>);
+    impl HandoffUi for Ui {
+        fn emit(&self, event: HandoffEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+        fn input(&self) -> Option<UnboundedReceiver<HandoffAction>> {
+            None
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    fn layout(dir: &Path) -> Layout {
+        let repo = dir.join("repo");
+        let config = dir.join("configs");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        Layout::from_parts(repo, config, dir.join("state"))
+    }
+
+    async fn runtime(
+        layout: &Layout,
+        build: leveler_core::BuildIdentity,
+        decision: RetireDecision,
+    ) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        let runtime = Arc::new(Runtime {
+            info: RuntimeInfo {
+                runtime_id: leveler_core::RuntimeId::new("generation-test"),
+                version: build.version.clone(),
+                build,
+                config_fingerprint: Some(expected_config_fingerprint(layout).unwrap()),
+                pid: std::process::id(),
+                health: RuntimeHealth {
+                    accepting_work: true,
+                    active_background_tasks: if matches!(
+                        decision,
+                        RetireDecision::Busy { .. } | RetireDecision::Unsupported
+                    ) {
+                        1
+                    } else {
+                        0
+                    },
+                    ..Default::default()
+                },
+            },
+            decision,
+            retire_calls: AtomicUsize::new(0),
+            retire_before_confirmation: AtomicBool::new(false),
+            commands: AtomicUsize::new(0),
+            events: broadcast::channel(8).0,
+            retired: Arc::new(Notify::new()),
+        });
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = LocalSocketServer::bind(&socket, runtime.clone())
+            .await
+            .unwrap();
+        let retired = runtime.retired.clone();
+        let serving = tokio::spawn(async move {
+            tokio::select! {
+                _ = server.serve(Default::default()) => {},
+                _ = retired.notified() => {},
+            }
+        });
+        (runtime, serving)
+    }
+
+    fn previous_build() -> leveler_core::BuildIdentity {
+        leveler_core::BuildIdentity {
+            version: "previous".into(),
+            revision: "previous".into(),
+            fingerprint: "previous".into(),
+            dirty: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_client_attaches_to_a_compatible_busy_previous_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(
+            &layout,
+            previous_build(),
+            RetireDecision::Busy {
+                active_turns: 0,
+                active_background_tasks: 1,
+            },
+        )
+        .await;
+        let first = LocalSocketRuntimeClient::connect(&layout.socket_path())
+            .await
+            .unwrap();
+        let ui = Ui::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            reconcile_runtime_generation(&layout.socket_path(), &layout, &ui),
+        )
+        .await;
+        let client = result
+            .expect("a busy compatible generation must not hold the second TUI in an upgrade wait")
+            .unwrap()
+            .expect("reuse the serving generation");
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
+        assert!(runtime.info.health.accepting_work);
+        // Both clients continue through the same serving authority.
+        first.send(ClientCommand::RequestSessionList).await.unwrap();
+        client
+            .send(ClientCommand::RequestSessionList)
+            .await
+            .unwrap();
+        assert_eq!(runtime.commands.load(Ordering::SeqCst), 2);
+        let events = ui.0.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [HandoffEvent::UpgradeDeferred {
+                active_background_tasks: 1,
+                ..
+            }]
+        ));
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_current_busy_generation_is_reused_without_requesting_retirement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(
+            &layout,
+            leveler_core::BuildIdentity::current(),
+            RetireDecision::Busy {
+                active_turns: 0,
+                active_background_tasks: 1,
+            },
+        )
+        .await;
+        let client = reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default())
+            .await
+            .unwrap();
+        assert!(client.is_some());
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 0);
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn an_idle_previous_generation_still_retires_before_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(&layout, previous_build(), RetireDecision::Accepted).await;
+        let client = tokio::time::timeout(
+            Duration::from_secs(8),
+            reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default()),
+        )
+        .await
+        .expect("accepted retirement releases its endpoint")
+        .unwrap();
+        assert!(
+            client.is_none(),
+            "an accepted retirement must not be attached to"
+        );
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_busy_previous_build_with_different_configuration_is_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(
+            &layout,
+            previous_build(),
+            RetireDecision::Busy {
+                active_turns: 0,
+                active_background_tasks: 1,
+            },
+        )
+        .await;
+        std::fs::create_dir_all(layout.providers_dir()).unwrap();
+        std::fs::write(layout.providers_dir().join("changed.yaml"), "id: changed\n").unwrap();
+        let ui = NonInteractiveHandoffUi::new();
+        let error = reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref())
+            .await
+            .err()
+            .expect("configuration mismatch must not be hidden by reuse");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::RetireBlocked { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_known_identity_is_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(
+            &layout,
+            leveler_core::BuildIdentity::default(),
+            RetireDecision::Busy {
+                active_turns: 0,
+                active_background_tasks: 1,
+            },
+        )
+        .await;
+        let error = reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default())
+            .await
+            .err()
+            .expect("unknown generation cannot be reused");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::UnknownGeneration)
+            ),
+            "{error}"
+        );
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 0);
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_atomic_retirement_is_not_a_busy_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) =
+            runtime(&layout, previous_build(), RetireDecision::Unsupported).await;
+        let error = reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default())
+            .await
+            .err()
+            .expect("unsupported must not authorize reuse");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::RetireBlocked { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn an_incompatible_wire_major_is_rejected_before_generation_reuse() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = stream.read_u32().await.unwrap();
+            let mut request = vec![0; len as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            let mut response =
+                leveler_client_protocol::ProtocolEnvelope::wrap(serde_json::json!({"type": "ack"}));
+            response.protocol.major += 1;
+            let bytes = serde_json::to_vec(&response).unwrap();
+            stream.write_u32(bytes.len() as u32).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let error = reconcile_runtime_generation(&socket, &layout, &Ui::default())
+            .await
+            .err()
+            .expect("major mismatch is never a reusable peer");
+        assert!(
+            matches!(
+                error.downcast_ref::<TransportError>(),
+                Some(TransportError::Protocol(_))
+            ),
+            "{error}"
+        );
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_busy_generation_that_started_retiring_before_confirmation_is_not_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(
+            &layout,
+            previous_build(),
+            RetireDecision::Busy {
+                active_turns: 0,
+                active_background_tasks: 1,
+            },
+        )
+        .await;
+        runtime
+            .retire_before_confirmation
+            .store(true, Ordering::SeqCst);
+        let result =
+            reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default()).await;
+        serving.abort();
+        let error = result
+            .err()
+            .expect("a runtime that closed admission after Busy cannot be reused");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::UnknownGeneration)
+            ),
+            "{error}"
+        );
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
+        let info = runtime.runtime_info().await.unwrap();
+        assert!(!info.health.shutting_down);
+        assert_eq!(
+            info.health.retiring_reason,
+            Some(RestartReason::BuildMismatch)
+        );
+    }
 }

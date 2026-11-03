@@ -845,6 +845,10 @@ impl Application {
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
+        // Background results that finished while no client was attached (a
+        // headless run, a resume after a crash) become durable evidence here,
+        // before the model is asked to judge the task.
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
         let result = run_collaboration_turn(
             &engine,
             execution,
@@ -857,6 +861,9 @@ impl Application {
             cancellation,
         )
         .await;
+        // And once more at the turn boundary, so a task that exited during this
+        // turn is in the log before the next window reads it.
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
 
         match result {
             Ok(report) => report_to_result(report),

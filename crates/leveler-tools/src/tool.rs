@@ -55,6 +55,12 @@ pub struct ToolContext {
     /// Where a command call sends its live output while it runs. Set per call
     /// by the host that shows it; `None` runs the command without streaming.
     pub output: Option<tokio::sync::mpsc::Sender<leveler_execution::OutputChunk>>,
+    /// This call's attention signal, cancelled when new user input is waiting
+    /// for the turn. It is NOT cancellation: a long observation (`wait_task`)
+    /// returns what it already saw and lets the turn answer the user, instead
+    /// of holding the round for its whole bound. Only observation-only tools
+    /// read it; a mutating call must never stop halfway because someone typed.
+    pub yield_now: Option<CancellationToken>,
 }
 
 /// Process-wide execution and write-safety infrastructure. Every handle is an
@@ -401,6 +407,7 @@ impl ToolContext {
             writer_scope: None,
             command_lease: None,
             output: None,
+            yield_now: None,
         }
     }
 
@@ -475,6 +482,13 @@ impl ToolContext {
     /// Bind this context to a session identity (browser page/ref isolation).
     pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
         self.session_scope = Some(scope.into());
+        self
+    }
+
+    /// Attach this call's attention signal. The host stamps this from the
+    /// steering source; a tool never creates one on its own.
+    pub fn with_yield_now(mut self, yield_now: CancellationToken) -> Self {
+        self.yield_now = Some(yield_now);
         self
     }
 
@@ -722,6 +736,12 @@ pub trait Tool: Send + Sync {
         Ok(None)
     }
 
+    /// An external catalog (an MCP server) reported that its tool list changed.
+    /// The host rebuilds that server before the next turn. Default is false.
+    fn catalog_changed(&self) -> bool {
+        false
+    }
+
     /// Whether this tool is a pure, read-only lookup that is safe to run
     /// concurrently with other parallel-safe tools requested in the same round.
     /// Defaults to `false` (serialized). Any tool with side effects — edits,
@@ -769,6 +789,22 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether crash recovery may close an interrupted call of this tool
+    /// WITHOUT human confirmation, by recording that it was not replayed.
+    ///
+    /// A different question from [`Self::replay_is_side_effect_free`]: that one
+    /// answers "re-running is harmless", this one answers "NOT re-running is
+    /// harmless". An observer that only reads runtime state is the second kind:
+    /// the crash destroyed the tool's ANSWER, the state it would have read is
+    /// still there, and the model can ask again. Halting a whole session to
+    /// reconcile that protects nothing and makes the session unusable.
+    ///
+    /// Stays `false` for anything whose interrupted call may leave a workspace,
+    /// process or external effect unresolved: those need a person.
+    fn recovery_is_skippable(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with already-schema-validated arguments.
     async fn execute(
         &self,
@@ -776,6 +812,24 @@ pub trait Tool: Send + Sync {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError>;
+}
+
+/// A host-owned source of tools that can appear AFTER a turn's model surface
+/// was composed.
+///
+/// The ordinary case is an external catalog (an MCP server) that is not up when
+/// the turn starts and comes up while the turn runs — one user request can be
+/// thirty minutes long, so "next turn" is not a recovery path the user asked
+/// for. The agent asks this source once per model request; a source must be
+/// cheap when nothing changed and must not reconnect anything on its own
+/// schedule (backoff belongs to the source, and only the agent's cadence drives
+/// it).
+///
+/// Returning a tool here does not grant it: the caller applies its own
+/// capability/permission filtering and de-duplicates by name.
+#[async_trait]
+pub trait ToolDiscovery: Send + Sync {
+    async fn discovered(&self) -> Vec<Arc<dyn Tool>>;
 }
 
 #[cfg(test)]

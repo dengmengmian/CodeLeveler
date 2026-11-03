@@ -14,17 +14,17 @@ async fn mcp_process_does_not_inherit_credential_like_environment() {
     unsafe {
         std::env::set_var("LVTEST_MCP_API_KEY", "must-not-leak");
     }
-    let config = McpServerConfig {
-        name: "env-probe".to_string(),
-        command: "/bin/sh".to_string(),
-        args: vec![
+    let config = McpServerConfig::stdio(
+        "env-probe",
+        "/bin/sh",
+        vec![
             "-c".to_string(),
             "printf %s \"$LVTEST_MCP_API_KEY\" > \"$1\"; exit 1".to_string(),
             "sh".to_string(),
             captured.display().to_string(),
         ],
-        env: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     let _ = McpClient::connect(&config).await;
     let leaked = std::fs::read_to_string(&captured).unwrap();

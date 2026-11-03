@@ -1333,7 +1333,7 @@ impl TranscriptState {
                 continue;
             };
             for call in &mut group.calls {
-                if call.status != ToolStatus::Ok || !shell_detached(call) {
+                if call.status != ToolStatus::Ok || !runs_detached(call) {
                     continue;
                 }
                 let Some(preview) = call.preview.as_mut() else {
@@ -1348,6 +1348,103 @@ impl TranscriptState {
                     *preview = stamped;
                     changed = true;
                 }
+            }
+        }
+        if changed {
+            self.bump();
+        }
+        matched
+    }
+
+    /// Record readiness that the runtime OBSERVED for a still-running task on
+    /// the command row that started it.
+    ///
+    /// The row is the only place a detached command's progress is visible
+    /// without opening the jobs page, so the fact is written onto the starter's
+    /// preview exactly like the exit stamp is. It says the task announced a
+    /// readiness signal; it never says the task finished.
+    pub fn note_background_ready(&mut self, task_id: &str, evidence: &str) -> bool {
+        let evidence = evidence.trim();
+        if evidence.is_empty() {
+            return false;
+        }
+        self.update_background_starter(task_id, |call| {
+            let Some(preview) = call.preview.as_deref() else {
+                return false;
+            };
+            let stamped = stamp_detached_preview(preview, "ready", evidence);
+            if stamped == preview {
+                return false;
+            }
+            call.preview = Some(stamped);
+            true
+        })
+    }
+
+    /// Append live output from a background registry task to the command row
+    /// that started it, and record when this client last saw output.
+    ///
+    /// Bounded exactly like a foreground call's streamed output, and marked
+    /// truncated when the head is dropped, so a collapsed row never presents a
+    /// tail as the whole history.
+    pub fn append_background_output(
+        &mut self,
+        task_id: &str,
+        chunk: &str,
+        now_elapsed_secs: u64,
+    ) -> bool {
+        if chunk.is_empty() {
+            return false;
+        }
+        self.update_background_starter(task_id, |call| {
+            call.output.push_str(chunk);
+            if call.output.len() > TOOL_OUTPUT_CAP {
+                let cut = call.output.len() - TOOL_OUTPUT_CAP;
+                let cut = leveler_core::ceil_char_boundary(&call.output, cut);
+                call.output.drain(..cut);
+                call.output_truncated = true;
+            }
+            if let Some(preview) = call.preview.as_deref() {
+                call.preview = Some(stamp_detached_preview(
+                    preview,
+                    "last_output_secs",
+                    &now_elapsed_secs.to_string(),
+                ));
+            }
+            true
+        })
+    }
+
+    /// Visit every shell call that started `task_id` in the background. The
+    /// match is one whole `task_id:` line, so `t-ab` cannot stamp `t-abc`.
+    fn update_background_starter(
+        &mut self,
+        task_id: &str,
+        mut update: impl FnMut(&mut ToolCallBlock) -> bool,
+    ) -> bool {
+        if task_id.is_empty() || task_id.contains(['\n', '\r']) {
+            return false;
+        }
+        let task_line = format!("task_id: {task_id}");
+        let mut matched = false;
+        let mut changed = false;
+        for item in &mut self.items {
+            let TranscriptItem::ToolGroup(group) = item else {
+                continue;
+            };
+            for call in &mut group.calls {
+                if call.status != ToolStatus::Ok || !runs_detached(call) {
+                    continue;
+                }
+                let is_starter = call
+                    .preview
+                    .as_deref()
+                    .is_some_and(|preview| preview.lines().any(|line| line.trim() == task_line));
+                if !is_starter {
+                    continue;
+                }
+                matched = true;
+                changed |= update(call);
             }
         }
         if changed {
@@ -2204,6 +2301,33 @@ fn shell_detached(call: &ToolCallBlock) -> bool {
             .unwrap_or(false)
 }
 
+/// The background registry task this call's execution continues as, if any.
+///
+/// Read from the runtime's own result, which names the task in a whole
+/// `task_id:` line. A caller can ask for that (`background: true`) or the
+/// runtime can hand a slow foreground run over after its window — both are the
+/// same lifecycle, and the row must know either way. The arguments alone would
+/// miss the handoff and let the row keep claiming the start was the result.
+pub(crate) fn detached_task_id(call: &ToolCallBlock) -> Option<String> {
+    if !matches!(call.name.as_str(), "run_command" | "shell_command") {
+        return None;
+    }
+    let preview = call.preview.as_deref()?;
+    let id = preview.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("task_id:")
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
+    })?;
+    Some(id.to_string())
+}
+
+/// Whether this call's execution continues as a background task, whether the
+/// caller asked for it or the runtime moved it there.
+pub(crate) fn runs_detached(call: &ToolCallBlock) -> bool {
+    shell_detached(call) || detached_task_id(call).is_some()
+}
+
 /// Replace the runtime's `status: running` line and record the process facts
 /// beside it. Other preview lines stay as the runtime wrote them.
 fn rewrite_detached_preview(
@@ -2243,6 +2367,53 @@ fn rewrite_detached_preview(
         lines.push(format!("exit_code: {code}"));
     }
     lines.join("\n")
+}
+
+/// Set one `key: value` line on a detached starter's preview, replacing an
+/// existing one in place. Used for projection facts this client observed (a
+/// readiness signal, the age of the last output chunk) so the collapsed row can
+/// read them without a second store. The runtime's own lines are untouched.
+fn stamp_detached_preview(preview: &str, key: &str, value: &str) -> String {
+    let prefix = format!("{key}:");
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in preview.lines() {
+        if line.trim().starts_with(&prefix) {
+            lines.push(format!("{key}: {value}"));
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push(format!("{key}: {value}"));
+    }
+    lines.join("\n")
+}
+
+/// The readiness evidence stamped on a detached starter's preview, if any.
+pub(crate) fn detached_ready(call: &ToolCallBlock) -> Option<String> {
+    let preview = call.preview.as_deref()?;
+    preview.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("ready:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// The turn-clock second at which this client last saw output for the task this
+/// call started. A projection freshness clock, not a process fact.
+pub(crate) fn detached_last_output_secs(call: &ToolCallBlock) -> Option<u64> {
+    let preview = call.preview.as_deref()?;
+    preview.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("last_output_secs:")?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 fn compact_summary(text: String, max_chars: usize) -> Option<String> {

@@ -9,6 +9,61 @@ use sqlx::{Pool, Sqlite};
 /// Embedded migrations, applied at startup.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// The exact migration shipped in v1.0.22 before historical event bodies were
+/// preserved. It is only selected to validate an already-applied migration;
+/// fresh and pre-retirement stores must never execute this definition.
+fn released_retirement_migration() -> sqlx::migrate::Migration {
+    sqlx::migrate::Migration::new(
+        47,
+        "retire memory".into(),
+        sqlx::migrate::MigrationType::Simple,
+        include_str!("../migration_compat/0047_retire_memory_v1_0_22.sql").into(),
+        false,
+    )
+}
+
+async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), StorageError> {
+    let has_history: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_history {
+        let checksum: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=47 AND success=TRUE",
+        )
+        .fetch_optional(pool)
+        .await?;
+        let released = released_retirement_migration();
+        if checksum.as_deref() == Some(released.checksum.as_ref()) {
+            // The two published definitions have identical schema effects.
+            // Match the actual applied SQL without rewriting its audit record
+            // or rerunning the obsolete body-erasing UPDATE. SQLx still checks
+            // every other migration, missing version, and dirty migration.
+            let migrations = MIGRATOR
+                .iter()
+                .map(|migration| {
+                    if migration.version == released.version {
+                        released.clone()
+                    } else {
+                        migration.clone()
+                    }
+                })
+                .collect();
+            let compatible = sqlx::migrate::Migrator {
+                migrations: std::borrow::Cow::Owned(migrations),
+                ignore_missing: MIGRATOR.ignore_missing,
+                locking: MIGRATOR.locking,
+                no_tx: MIGRATOR.no_tx,
+            };
+            compatible.run(pool).await?;
+            return Ok(());
+        }
+    }
+    MIGRATOR.run(pool).await?;
+    Ok(())
+}
+
 /// Storage-layer errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -50,7 +105,7 @@ impl Database {
             .connect_with(options.clone().foreign_keys(false))
             .await?;
         let result = async {
-            MIGRATOR.run(&migration_pool).await?;
+            run_migrations(&migration_pool).await?;
             if !sqlx::query("PRAGMA foreign_key_check")
                 .fetch_all(&migration_pool)
                 .await?
@@ -81,7 +136,7 @@ impl Database {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        MIGRATOR.run(&pool).await?;
+        run_migrations(&pool).await?;
         sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
         Ok(Self { pool })
     }
@@ -375,16 +430,6 @@ mod tests {
         );
     }
 
-    fn released_retirement_migration() -> sqlx::migrate::Migration {
-        sqlx::migrate::Migration::new(
-            47,
-            "retire memory".into(),
-            sqlx::migrate::MigrationType::Simple,
-            include_str!("../migration_compat/0047_retire_memory_v1_0_22.sql").into(),
-            false,
-        )
-    }
-
     #[tokio::test]
     async fn released_retirement_migration_reopens_without_rewriting_history_or_checksum() {
         use sqlx::migrate::Migrate;
@@ -392,6 +437,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.db");
         let legacy = released_retirement_migration();
+        assert_eq!(
+            legacy
+                .checksum
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "15afca964fa925b065b23cadc0bdaf2fd5f61d62bd7885b89b62ff7de0e0f681c9c321a260193e3d89d25599872ad57b",
+            "the compatibility definition must remain byte-identical to the released SQL"
+        );
         let before;
         {
             let mut conn = create_legacy_database(&path, 47).await;
@@ -412,15 +466,28 @@ mod tests {
         let db = Database::connect(&path).await.unwrap();
         let after = sqlx::query_as::<_, (Vec<u8>, String, bool, i64)>("SELECT checksum,installed_on,success,execution_time FROM _sqlx_migrations WHERE version=47")
             .fetch_one(db.pool()).await.unwrap();
-        assert_eq!(after, before, "compatibility must not rewrite migration history");
+        assert_eq!(
+            after, before,
+            "compatibility must not rewrite migration history"
+        );
         let body: String = sqlx::query_scalar("SELECT payload FROM events WHERE id='kept-event'")
-            .fetch_one(db.pool()).await.unwrap();
-        assert_eq!(body, r#"{"type":"memory_changed","payload":{"history":true}}"#);
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            r#"{"type":"memory_changed","payload":{"history":true}}"#
+        );
         let goal: String = sqlx::query_scalar("SELECT goal FROM sessions WHERE id='kept'")
-            .fetch_one(db.pool()).await.unwrap();
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(goal, "keep plan");
-        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_messages WHERE session_id='kept'")
-            .fetch_one(db.pool()).await.unwrap();
+        let messages: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_messages WHERE session_id='kept'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(messages, 1);
         db.pool.close().await;
         // Every later startup must accept the same immutable legacy record.
@@ -438,11 +505,16 @@ mod tests {
                 let mut conn = create_legacy_database(&path, 47).await;
                 conn.apply(&released_retirement_migration()).await.unwrap();
                 sqlx::query("UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=?")
-                    .bind(version).execute(&mut conn).await.unwrap();
+                    .bind(version)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
             }
             let error = Database::connect(&path).await.unwrap_err();
-            assert!(matches!(error, StorageError::Migrate(sqlx::migrate::MigrateError::VersionMismatch(rejected)) if rejected == version),
-                "unknown migration {version} must still fail closed: {error}");
+            assert!(
+                matches!(error, StorageError::Migrate(sqlx::migrate::MigrateError::VersionMismatch(rejected)) if rejected == version),
+                "unknown migration {version} must still fail closed: {error}"
+            );
         }
     }
 

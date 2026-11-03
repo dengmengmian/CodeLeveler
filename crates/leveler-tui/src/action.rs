@@ -16,6 +16,8 @@ use crate::state::PendingInteraction;
 /// latency from blocking terminal input or runtime events.
 #[derive(Debug, Clone)]
 pub enum EffectCompletion {
+    /// Explicit client exit waits until its session has stopped executing.
+    QuitFinished(Result<(), String>),
     CommandDelivered,
     /// The runtime answered with an error: it is reachable, and it did not
     /// accept the command.

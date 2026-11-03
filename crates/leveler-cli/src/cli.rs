@@ -477,19 +477,31 @@ pub enum McpCommand {
     /// List configured MCP servers.
     List,
 
-    /// Add a stdio MCP server: `leveler mcp add <name> [--env K=V]... -- <command> [args...]`.
+    /// Add an MCP server.
     ///
-    /// `--env` stores environment **name references** only (never secret values).
-    /// Use `KEY=KEY`, `KEY=`, or `KEY=$OTHER_ENV`; cleartext tokens are rejected.
+    /// Stdio: `leveler mcp add <name> [--env K=V]... -- <command> [args...]`.
+    /// Streamable HTTP: `leveler mcp add <name> --url <url> [--header Name=ENV]... [--bearer-env ENV]`.
+    ///
+    /// Env and header values are environment **name references** only (never secret values).
     Add {
         /// Name for the server (its tools appear as `mcp__<name>__*`).
         name: String,
-        /// Env var name references to forward into the server process (repeatable).
+        /// Streamable HTTP endpoint (`http://` or `https://`). Omit for a stdio server.
+        #[arg(long)]
+        url: Option<String>,
+        /// Request header whose value is an env-name reference (repeatable).
+        /// Example: `--header X-API-Key=DEVORDER_MCP_API_KEY`.
+        #[arg(long, value_parser = parse_env_pair, value_name = "NAME=ENV")]
+        header: Vec<(String, String)>,
+        /// Environment variable holding a bearer token. The `Bearer ` prefix is added at request time.
+        #[arg(long, value_name = "ENV")]
+        bearer_env: Option<String>,
+        /// Env var name references to forward into a stdio server process (repeatable).
         /// Value must be an env **name** (`KEY=KEY`, `KEY=`, or `KEY=$OTHER`), not a secret.
         #[arg(long, value_parser = parse_env_pair, value_name = "KEY=VALUE")]
         env: Vec<(String, String)>,
-        /// The launch command and its arguments, after `--`.
-        #[arg(last = true, required = true, value_name = "COMMAND")]
+        /// The launch command and its arguments, after `--`. Omit when `--url` is set.
+        #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
 
@@ -923,10 +935,20 @@ mod tests {
             "server",
         ]);
         match cli.command {
-            Some(Command::Mcp(McpCommand::Add { name, env, command })) => {
+            Some(Command::Mcp(McpCommand::Add {
+                name,
+                env,
+                command,
+                url,
+                header,
+                bearer_env,
+            })) => {
                 assert_eq!(name, "fs");
                 assert_eq!(env, vec![("TOKEN".to_string(), "abc".to_string())]);
                 assert_eq!(command, vec!["npx", "-y", "server"]);
+                assert!(url.is_none());
+                assert!(header.is_empty());
+                assert!(bearer_env.is_none());
             }
             other => panic!("expected Mcp Add, got {other:?}"),
         }

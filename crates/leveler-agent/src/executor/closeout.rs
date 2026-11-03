@@ -94,6 +94,10 @@ pub enum CloseoutReason {
     TaskUnregistered,
     /// The model ended with an empty answer.
     EmptyAnswer,
+    /// The goal is settled and the model has not written the person's
+    /// delivery yet. Unlike [`Self::GoalUnresolved`] nothing is unresolved:
+    /// the only missing thing is the user-facing answer.
+    GoalSettledDelivery,
 }
 
 impl CloseoutReason {
@@ -105,6 +109,7 @@ impl CloseoutReason {
             Self::PlanUnresolved => "plan_unresolved",
             Self::TaskUnregistered => "task_unregistered",
             Self::EmptyAnswer => "empty_answer",
+            Self::GoalSettledDelivery => "goal_settled_delivery",
         }
     }
 
@@ -114,6 +119,7 @@ impl CloseoutReason {
             "plan_unresolved" => Some(Self::PlanUnresolved),
             "task_unregistered" => Some(Self::TaskUnregistered),
             "empty_answer" => Some(Self::EmptyAnswer),
+            "goal_settled_delivery" => Some(Self::GoalSettledDelivery),
             _ => None,
         }
     }

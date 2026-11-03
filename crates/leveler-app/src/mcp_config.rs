@@ -18,12 +18,23 @@ pub struct McpEntry {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// `stdio` or `streamable_http`.
+    pub transport: String,
+    /// Streamable HTTP endpoint. `None` for stdio.
+    pub url: Option<String>,
     /// Destination env keys forwarded into the MCP process (display only).
     pub env_keys: Vec<String>,
     /// Source env var names corresponding to [`Self::env_keys`] (same order).
     /// Doctor checks these; values are never displayed.
     pub env_sources: Vec<String>,
-    /// Whether `command` is found on `PATH`.
+    /// Configured request-header names. Values are never displayed.
+    pub header_names: Vec<String>,
+    /// Environment variable names those headers resolve from (same order).
+    pub header_sources: Vec<String>,
+    /// Environment variable holding the bearer token, if configured.
+    pub bearer_token_env: Option<String>,
+    /// Stdio: `command` is on `PATH`. HTTP: the URL is a valid http(s) endpoint.
+    /// This is not a live connection probe.
     pub available: bool,
 }
 
@@ -48,6 +59,14 @@ pub enum McpConfigError {
     InvalidSource { key: String },
     #[error("MCP env key `{0}` is not a valid UPPER_SNAKE environment variable name")]
     InvalidKey(String),
+    #[error("set Authorization with --bearer-env, not --header")]
+    AuthorizationHeader,
+    #[error("{0}")]
+    InvalidUrl(String),
+    #[error(
+        "stdio MCP servers take --env and a command; HTTP servers take --url, --header and --bearer-env"
+    )]
+    MixedTransport,
     #[error("io error: {0}")]
     Io(String),
 }
@@ -93,15 +112,49 @@ pub fn list_at(path: &std::path::Path) -> Result<Vec<McpEntry>, McpConfigError> 
                         .collect()
                 })
                 .unwrap_or_default();
+            let url = table
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let transport = table
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if url.is_some() {
+                    "streamable_http"
+                } else {
+                    "stdio"
+                })
+                .to_string();
             let (env_keys, env_sources) =
                 table.get("env").map(extract_env_pairs).unwrap_or_default();
-            let available = command_available(&command);
+            let (header_names, header_sources) = table
+                .get("headers")
+                .map(extract_env_pairs)
+                .unwrap_or_default();
+            let bearer_token_env = table
+                .get("bearer_token_env")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let available = if url.is_some() {
+                url.as_deref().is_some_and(|url| {
+                    leveler_tools::mcp::validate_streamable_http_url(url).is_ok()
+                })
+            } else {
+                command_available(&command)
+            };
             out.push(McpEntry {
                 name,
                 command,
                 args,
+                transport,
+                url,
                 env_keys,
                 env_sources,
+                header_names,
+                header_sources,
+                bearer_token_env,
                 available,
             });
         }
@@ -197,6 +250,74 @@ pub fn add_at(
 
     write_document(path, &doc)?;
     Ok(path.to_path_buf())
+}
+
+/// Add a Streamable HTTP MCP server. Header values and `bearer_env` are
+/// environment variable **names**. The URL is stored as given after it passes
+/// the http(s) check; credentials in the URL are rejected.
+pub fn add_streamable_http(
+    name: &str,
+    url: &str,
+    headers: &[(String, String)],
+    bearer_env: Option<&str>,
+) -> Result<PathBuf, McpConfigError> {
+    add_streamable_http_at(&config_path()?, name, url, headers, bearer_env)
+}
+
+/// [`add_streamable_http`] against an explicit config file.
+pub fn add_streamable_http_at(
+    path: &std::path::Path,
+    name: &str,
+    url: &str,
+    headers: &[(String, String)],
+    bearer_env: Option<&str>,
+) -> Result<PathBuf, McpConfigError> {
+    leveler_tools::mcp::validate_streamable_http_url(url).map_err(McpConfigError::InvalidUrl)?;
+    let mut doc = document_at(path)?;
+    if !doc.contains_key("mcp_servers") {
+        doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let servers = doc["mcp_servers"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| McpConfigError::Parse("`mcp_servers` is not an array of tables".into()))?;
+    if servers
+        .iter()
+        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+    {
+        return Err(McpConfigError::Exists(name.to_string()));
+    }
+    let mut table = Table::new();
+    table["name"] = value(name);
+    table["transport"] = value("streamable_http");
+    table["url"] = value(url);
+    if !headers.is_empty() {
+        let mut header_tab = InlineTable::new();
+        for (key, raw) in headers {
+            if key.eq_ignore_ascii_case("authorization") {
+                return Err(McpConfigError::AuthorizationHeader);
+            }
+            if !is_header_name(key) {
+                return Err(McpConfigError::InvalidKey(key.clone()));
+            }
+            let source = normalize_env_ref(key, raw)?;
+            header_tab.insert(key, Value::from(source.as_str()));
+        }
+        table["headers"] = value(header_tab);
+    }
+    if let Some(raw) = bearer_env {
+        let source = normalize_env_ref("bearer_token_env", raw)?;
+        table["bearer_token_env"] = value(source.as_str());
+    }
+    servers.push(table);
+    write_document(path, &doc)?;
+    Ok(path.to_path_buf())
+}
+
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Remove an MCP server by name.
@@ -540,6 +661,51 @@ mod tests {
         // Mixed / lowercase bare names are not UPPER_SNAKE refs.
         assert!(normalize_env_ref("API_KEY", "GithubToken").is_err());
         assert!(normalize_env_ref("API_KEY", "$other").is_err());
+    }
+
+    #[test]
+    fn add_streamable_http_stores_refs_not_secret_values() {
+        let dir = std::env::temp_dir().join(format!("leveler-mcpcfg-http-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        add_streamable_http_at(
+            &cfg,
+            "devorder",
+            "http://127.0.0.1:8081/mcp",
+            &[("X-API-Key".into(), "DEVORDER_MCP_API_KEY".into())],
+            Some("DEVORDER_MCP_TOKEN"),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("streamable_http"));
+        assert!(text.contains("DEVORDER_MCP_API_KEY"));
+        assert!(!text.contains("sk-"));
+        let server = list_at(&cfg).unwrap().pop().unwrap();
+        assert_eq!(server.transport, "streamable_http");
+        assert_eq!(server.url.as_deref(), Some("http://127.0.0.1:8081/mcp"));
+        assert_eq!(server.header_names, vec!["X-API-Key"]);
+        assert_eq!(server.header_sources, vec!["DEVORDER_MCP_API_KEY"]);
+        assert_eq!(
+            server.bearer_token_env.as_deref(),
+            Some("DEVORDER_MCP_TOKEN")
+        );
+        assert!(server.available);
+        let secret = "sk-do-not-write-this-http-key";
+        let err = add_streamable_http_at(
+            &cfg,
+            "other",
+            "https://example.com/mcp",
+            &[("X-API-Key".into(), secret.into())],
+            None,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains(secret));
+        assert!(
+            !std::fs::read_to_string(&cfg).unwrap().contains(secret),
+            "rejected header secret must not be written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

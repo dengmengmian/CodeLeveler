@@ -1269,6 +1269,11 @@ impl Host {
                 );
             }
         }
+        // The local registry uses Runtime to avoid recursive hosting. The host
+        // owns the public contract, including records archived by older hosts.
+        for task in records.values_mut() {
+            task.snapshot.lifetime = task.lifetime;
+        }
         let mut out = records.values().cloned().collect::<Vec<_>>();
         out.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
         Ok(out)
@@ -1443,6 +1448,7 @@ impl Host {
                         Some(&owner),
                         &writer,
                         BackgroundTaskLifetime::Runtime,
+                        None,
                     )
                     .await
                 {
@@ -1523,6 +1529,11 @@ impl Host {
                     .registry
                     .kill_authorized(&local, &owner, unrestricted)
                     .await?;
+                t.lifetime = persisted
+                    .iter()
+                    .find(|task| task.snapshot.id == id)
+                    .ok_or("missing hosted process fact")?
+                    .lifetime;
                 t.id = id;
                 self.persist().await?;
                 Ok(Reply::Task(t))
@@ -1606,6 +1617,11 @@ impl Host {
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await?;
+                t.snapshot.lifetime = persisted
+                    .iter()
+                    .find(|task| task.snapshot.id == id)
+                    .ok_or("missing hosted process fact")?
+                    .lifetime;
                 t.snapshot.id = id;
                 self.persist().await?;
                 Ok(Reply::Observation(t))
@@ -2007,6 +2023,7 @@ mod tests {
         );
         let snapshot = registry.get_authorized(&id, "foreign", true).await.unwrap();
         assert_eq!(snapshot.owner_scope.as_deref(), Some("owner-session"));
+        assert_eq!(snapshot.lifetime, BackgroundTaskLifetime::Persistent);
         let observed = registry
             .observe_authorized(
                 &id,
@@ -2020,10 +2037,15 @@ mod tests {
             .await
             .unwrap();
         assert!(observed.snapshot.log.contains("admin-log"));
-        registry
+        assert_eq!(
+            observed.snapshot.lifetime,
+            BackgroundTaskLifetime::Persistent
+        );
+        let stopped = registry
             .kill_authorized(&id, "foreign", true)
             .await
             .unwrap();
+        assert_eq!(stopped.lifetime, BackgroundTaskLifetime::Persistent);
         let snapshot = registry
             .wait_authorized(
                 &id,
@@ -2308,6 +2330,7 @@ mod tests {
                 Some("writer-session"),
                 "child",
                 BackgroundTaskLifetime::Persistent,
+                None,
             )
             .await
             .unwrap();
@@ -2556,6 +2579,7 @@ mod tests {
                 Some("session-1"),
                 "parent",
                 BackgroundTaskLifetime::Runtime,
+                None,
             )
             .await
             .unwrap();
@@ -2673,6 +2697,7 @@ mod tests {
                 Some("session-1"),
                 "parent",
                 BackgroundTaskLifetime::Runtime,
+                None,
             )
             .await
             .unwrap();
@@ -2759,6 +2784,32 @@ mod tests {
             "log_end": 0,
             "log_prefix_len": 0
         })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archived_lifetime_uses_the_host_owned_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        secure_dir(&config.state_dir).unwrap();
+        let mut record = task_record(&config, "host-archived", "Exited", 0);
+        record["snapshot"]["lifetime"] = serde_json::json!("Runtime");
+        atomic_json(&config.state_dir.join("tasks.json"), &vec![record]).unwrap();
+        let server = tokio::spawn(serve(config.clone()));
+        let client = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(client) = ExecutionHostClient::connect(config.clone()).await {
+                    break client;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = client.get_owned("host-archived", "session").await.unwrap();
+        server.abort();
+        assert_eq!(snapshot.status, BackgroundTaskStatus::Exited);
+        assert_eq!(snapshot.lifetime, BackgroundTaskLifetime::Persistent);
     }
 
     fn write_archive(config: &ExecutionHostConfig, status: &str, pid: u32) {

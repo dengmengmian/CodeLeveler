@@ -68,9 +68,34 @@ impl ModelRuntime for MockRuntime {
         _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
-        })
+        let request = _request;
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| {
+                // The runtime's delivery round after a resolution: the goal is
+                // already recorded, so a real model answers the person.
+                let delivering = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::User)
+                    .is_some_and(|message| {
+                        message
+                            .text_content()
+                            .contains("this round is the delivery")
+                    });
+                delivering.then(|| ModelResponse {
+                    request_id: RequestId::generate(),
+                    message: Message::text(Role::Assistant, "the goal is resolved and reported"),
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::default(),
+                })
+            })
+            .ok_or_else(|| {
+                ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
+            })
     }
 
     async fn stream(
@@ -260,6 +285,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     SessionRepository::new(&db).create(&record).await.unwrap();
     let session = SessionId::new(record.id);
     let factory = ExecutorFactory {
+        tool_discovery: None,
         resource_grants: std::sync::Arc::new(leveler_storage::MemoryResourceGrantStore::default()),
         runtime: Arc::new(MockRuntime::new(responses)),
         registry: Arc::new(default_registry()),

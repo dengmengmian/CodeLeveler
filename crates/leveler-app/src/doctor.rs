@@ -405,28 +405,42 @@ fn check_mcp_env_refs_at(path: &std::path::Path) -> Vec<CheckResult> {
     let mut out = Vec::new();
     for s in servers {
         for (key, source) in s.env_keys.iter().zip(s.env_sources.iter()) {
-            let name = format!("mcp env: {} / {}", s.name, key);
-            // Never interpolate untrusted config values. Only print source when
-            // it is a safe UPPER_SNAKE name reference.
-            if !crate::mcp_config::is_env_name_ref(source)
-                || crate::mcp_config::looks_like_secret_token(source)
-            {
-                out.push(CheckResult::fail(
-                    &name,
-                    format!("env `{key}` is not a valid name reference — replace with {key}={key}"),
-                ));
-                continue;
-            }
-            match std::env::var(source) {
-                Ok(_) => out.push(CheckResult::ok(&name, format!("set via ${source}"))),
-                Err(_) => out.push(CheckResult::warn(
-                    &name,
-                    format!("environment variable ${source} is not set"),
-                )),
-            }
+            push_mcp_ref(&mut out, &s.name, "env", key, source);
+        }
+        for (key, source) in s.header_names.iter().zip(s.header_sources.iter()) {
+            push_mcp_ref(&mut out, &s.name, "header", key, source);
+        }
+        if let Some(source) = &s.bearer_token_env {
+            push_mcp_ref(&mut out, &s.name, "bearer", "bearer_token_env", source);
         }
     }
     out
+}
+
+fn push_mcp_ref(out: &mut Vec<CheckResult>, server: &str, kind: &str, key: &str, source: &str) {
+    let name = format!("mcp {kind}: {server} / {key}");
+    // Never interpolate untrusted config values. Only print source when
+    // it is a safe UPPER_SNAKE name reference.
+    if !crate::mcp_config::is_env_name_ref(source)
+        || crate::mcp_config::looks_like_secret_token(source)
+    {
+        let detail = if kind == "env" {
+            format!("env `{key}` is not a valid name reference — replace with {key}={key}")
+        } else {
+            format!(
+                "`{key}` is not a valid name reference — replace the value with an UPPER_SNAKE env name"
+            )
+        };
+        out.push(CheckResult::fail(&name, detail));
+        return;
+    }
+    match std::env::var(source) {
+        Ok(_) => out.push(CheckResult::ok(&name, format!("set via ${source}"))),
+        Err(_) => out.push(CheckResult::warn(
+            &name,
+            format!("environment variable ${source} is not set"),
+        )),
+    }
 }
 
 /// Whether any check failed.

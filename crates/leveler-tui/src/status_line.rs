@@ -1874,6 +1874,7 @@ mod tests {
                 last_output_at: None,
                 output: String::new(),
                 unknown: false,
+                ready: None,
             },
         );
         let text = status_text(&state);

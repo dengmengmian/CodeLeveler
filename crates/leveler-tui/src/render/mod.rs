@@ -913,10 +913,15 @@ fn activity_status_text(
     };
     match id {
         ActivityId::Background(task_id) => {
-            if let Some(chrome) = crate::activity::background_chrome(state, task_id)
-                && let Some(code) = chrome.exit_code
-            {
-                text.push_str(&format!(" · exit {code}"));
+            if let Some(chrome) = crate::activity::background_chrome(state, task_id) {
+                // Readiness observed while the process keeps running. It is a
+                // separate fact from the outcome, and it never replaces it.
+                if chrome.is_ready() {
+                    text.push_str(&format!(" · {}", t.background_status_ready));
+                }
+                if let Some(code) = chrome.exit_code {
+                    text.push_str(&format!(" · exit {code}"));
+                }
             }
         }
         ActivityId::Team => {}
@@ -2654,6 +2659,7 @@ mod tests {
                 last_output_at: None,
                 output: "Compiling leveler-core ...\ntest result: ok\n".into(),
                 unknown: false,
+                ready: None,
             },
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
@@ -2690,6 +2696,7 @@ mod tests {
                 last_output_at: None,
                 output: "test result: ok. 428 passed\n".into(),
                 unknown: false,
+                ready: None,
             },
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
@@ -2783,6 +2790,7 @@ mod tests {
                 last_output_at: None,
                 output: "Compiling leveler-tui\n".into(),
                 unknown: false,
+                ready: None,
             },
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
@@ -2892,6 +2900,7 @@ mod tests {
                     last_output_at: None,
                     output: "a line of output that is much wider than the terminal\n".into(),
                     unknown: false,
+                    ready: None,
                 },
             );
             bg.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));

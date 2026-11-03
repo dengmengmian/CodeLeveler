@@ -433,6 +433,21 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
             RequirementKind::Tests,
             RequirementSource::Objective,
         ));
+    } else {
+        // A demand the runtime cannot enumerate must not be silently dropped,
+        // and it must not be replaced by a narrower mechanical one. The
+        // subject stays in the requirement set: the acceptance list has to
+        // name it and the completion account has to cover it, while the record
+        // states that the coverage is the model's account, not proof.
+        for text in std::iter::once(objective).chain(amendments.iter().map(String::as_str)) {
+            if let Some(subject) = verification_subject(text) {
+                collected.push((
+                    subject,
+                    RequirementKind::Named,
+                    RequirementSource::Objective,
+                ));
+            }
+        }
     }
 
     let mut requirements: Vec<Requirement> = Vec::new();
@@ -706,11 +721,11 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
                         crate::executor::goal_verification::is_test_command(&run.label)
                     })
                 else {
-                    refusals.push(
+                    refusals.push(format!(
                         "the user explicitly requires the tests to pass, but no test command ran \
-                         in this task"
-                            .to_string(),
-                    );
+                         to completion in this task ({})",
+                        crate::executor::goal_verification::test_command_guidance()
+                    ));
                     continue;
                 };
                 if !fresh.ok {
@@ -1318,9 +1333,9 @@ fn collect_backticks(
             continue;
         }
         // A backticked command the user asked to run is mechanical evidence,
-        // not a named deliverable. A test command is already the Tests
-        // requirement; a non-test command must have run.
-        if crate::executor::goal_verification::is_test_command(span) {
+        // not a named deliverable. The standard test runner is already the
+        // Tests requirement; a non-test command must have run.
+        if crate::executor::goal_verification::is_runner_named_test_command(span) {
             continue;
         }
         if command_text(span) {
@@ -1452,7 +1467,7 @@ fn collect_enumerations(
             continue;
         }
         if is_test_phrase(&text)
-            || crate::executor::goal_verification::is_test_command(&text)
+            || crate::executor::goal_verification::is_runner_named_test_command(&text)
             || command_text(&text)
         {
             continue;
@@ -1997,9 +2012,6 @@ fn test_demanded(text: &str) -> bool {
             "运行",
             "执行",
             "跑",
-            "全部",
-            "所有",
-            "完整",
             "必须",
             "需要",
             "确保",
@@ -2012,7 +2024,6 @@ fn test_demanded(text: &str) -> bool {
             "更新",
             "pass",
             "run",
-            "all",
             "must",
             "should",
             "suite",
@@ -2028,6 +2039,97 @@ fn test_demanded(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Words that ask for verification of something rather than name a deliverable.
+const VERIFY_WORDS: &[&str] = &["测试", "实测", "验证", "检验", "检查", "test", "verify"];
+
+/// The breadth quantifiers that introduce the subject of such a demand.
+const SUBJECT_QUANTIFIERS: &[&str] = &[
+    "全部",
+    "所有",
+    "每个",
+    "每一个",
+    "完整",
+    "整个",
+    "all",
+    "every",
+];
+
+/// Characters that end the noun a quantifier introduces. They are particles,
+/// adverbs and verbs — none of them can continue a noun phrase the user means
+/// the runtime to cover.
+const SUBJECT_STOP: &[char] = &[
+    '的', '地', '得', '都', '也', '再', '又', '要', '需', '必', '先', '后', '上', '下', '过', '一',
+    '遍', '真', '实', '全', '每', '和', '与', '及', '并', '在', '把', '对', '给', '请', '逐', '分',
+    '从', '到', '里', '中', '吗', '呢', '了', '么',
+];
+
+/// The subject of a verification demand the runtime cannot enumerate.
+///
+/// `把全部功能真实地测试下` asks for verification of a SET. No file, no command
+/// and no suite names it, so the runtime can never prove it — and the project's
+/// own suite passing is not that proof. The runtime's only honest options are
+/// to drop the demand (silently narrowing the user's scope) or to keep its
+/// subject visible. It keeps the subject: the acceptance list must name it, the
+/// completion account must cover it, and the record says the coverage is the
+/// model's account, not runtime evidence.
+///
+/// The reading is structural and project-independent: a verification word and a
+/// breadth quantifier in the same clause, followed by the noun the quantifier
+/// counts. It never reads business meaning, never names a product and never
+/// decides how much testing is enough.
+/// Clauses of one segment, split on the punctuation that separates them.
+///
+/// Deliberately not [`request_clauses`]: that filter answers "does this clause
+/// name work the user wants", and a clause that asks for verification names
+/// nothing the extractor recognises as work — which is exactly the clause this
+/// reader exists for.
+fn split_clauses(segment: &str) -> Vec<&str> {
+    segment
+        .split(['，', ',', '。', '；', ';', '\n'])
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect()
+}
+
+fn verification_subject(segment: &str) -> Option<String> {
+    // A clause is the unit: `把全部功能测试下，重点关注 MCP 有没有问题` states a
+    // demand and then asks a question, and only the question is not a demand.
+    for clause in split_clauses(segment) {
+        if !has_any(&clause.to_lowercase(), VERIFY_WORDS) {
+            continue;
+        }
+        // A waiver removes the demand, and a question is not a demand.
+        if is_waiver(&clause) || segment_is_negated(&clause) || question_form(&clause) {
+            continue;
+        }
+        let lower = clause.to_lowercase();
+        for quantifier in SUBJECT_QUANTIFIERS {
+            let Some(at) = lower.find(quantifier) else {
+                continue;
+            };
+            let rest = &clause[at + quantifier.len()..];
+            let noun: String = rest
+                .chars()
+                .take_while(|c| {
+                    !SUBJECT_STOP.contains(c)
+                        && !c.is_whitespace()
+                        && !matches!(
+                            c,
+                            '，' | ',' | '。' | '；' | ';' | '：' | ':' | '、' | '！' | '!'
+                        )
+                })
+                .take(8)
+                .collect();
+            // Two characters is the shortest noun that names something: a
+            // one-character subject would be covered by almost any account.
+            if noun.chars().count() >= 2 {
+                return Some(format!("{quantifier}{noun}"));
+            }
+        }
+    }
+    None
 }
 
 fn segment_is_negated(segment: &str) -> bool {
@@ -2158,9 +2260,33 @@ fn interpreter_flag(token: &str) -> bool {
         && chars.next().is_none()
 }
 
+/// Whether a token is a `NAME=value` environment assignment.
+///
+/// The value may look like a path (`CONFIG=internal/config/probe.yaml`), but
+/// the token names a VARIABLE handed to a command, not a file. The program that
+/// reads it resolves the path — often against a subproject directory, not this
+/// workspace — so demanding the literal `NAME=value` exist refused a real
+/// completion whose work was done: a DevOrder goal could never satisfy
+/// `CONFIG=internal/config/config.probe.local.yaml`, a file that exists one
+/// directory down and was never a deliverable in the first place.
+fn env_assignment(token: &str) -> bool {
+    let Some((name, value)) = token.split_once('=') else {
+        return false;
+    };
+    !value.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn path_like(token: &str) -> bool {
     let token = clean_token(token);
     if token.is_empty() || looks_like_url(&token) || token.contains("//") || glob_pattern(&token) {
+        return false;
+    }
+    if env_assignment(&token) {
         return false;
     }
     // A separator between two tokens (`count=`/`total=`) is punctuation, not
@@ -2482,6 +2608,34 @@ mod tests {
             &recorded,
             "确认，继续阶段 2。"
         ));
+    }
+
+    #[test]
+    /// The real DevOrder objective. `CONFIG=internal/config/probe.yaml` was
+    /// extracted as an artifact, so the completion gate demanded that a path
+    /// literally named `CONFIG=internal/config/config.probe.local.yaml` exist —
+    /// a file that cannot exist and that the user never named. The goal was
+    /// unsatisfiable and the run ended incomplete with the work done.
+    #[test]
+    fn an_environment_assignment_is_not_a_deliverable_path() {
+        let requirements = extract(
+            "本地启动后全面真实测试下。环境：用 CONFIG=internal/config/config.probe.local.yaml \
+             RUN_DIR=tmp/run-agent-probe API_PORT=18080 MCP_PORT=18081 PORTAL_PORT=13010 启动，\
+             数据库已隔离为 devorder_agent_probe_20261031；不要改业务代码，发现问题如实报告。",
+            &[],
+        );
+        assert!(
+            requirements
+                .iter()
+                .all(|requirement| !requirement.text.starts_with("CONFIG=")),
+            "a variable assignment is not a path: {requirements:?}"
+        );
+        assert!(
+            requirements
+                .iter()
+                .all(|requirement| !matches!(requirement.kind, RequirementKind::Artifact { .. })),
+            "the objective names no deliverable file: {requirements:?}"
+        );
     }
 
     #[test]
@@ -2814,6 +2968,103 @@ mod tests {
         );
     }
 
+    /// The real Dogfood objective. `把全部功能真实的测试下` asks to exercise the
+    /// product; it does not ask that the project's own suite passes. The
+    /// runtime read the breadth words as a `tests` requirement, told the model
+    /// its single explicit deliverable was `tests`, and then accepted the
+    /// completion because one package's test command had passed — while 19
+    /// operator tools were returning a generic internal failure and had never
+    /// been called. Both halves are refused here: no `tests` requirement, and
+    /// the demand's subject stays visible as something the runtime cannot
+    /// prove mechanically.
+    #[test]
+    fn an_open_ended_verification_demand_is_not_a_passing_suite() {
+        let requirements = extract(
+            "本地启动项目，然后把全部功能真实在的测试下，重点关注 MCP 有没有问题。",
+            &[],
+        );
+        assert!(
+            !requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "testing the product is not a demand that the suite passes: {requirements:?}"
+        );
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.text == "全部功能"),
+            "the subject of the demand must stay visible: {requirements:?}"
+        );
+    }
+
+    /// The other side of the same reading: a demand that the tests PASS, or a
+    /// named test runner, is still a mechanical requirement.
+    #[test]
+    fn a_demand_that_the_tests_pass_is_still_a_tests_requirement() {
+        for objective in [
+            "确保全部测试通过",
+            "把测试跑一遍",
+            "跑 cargo test",
+            "所有测试必须通过",
+            "实现全部接口，并通过完整测试。",
+        ] {
+            let requirements = extract(objective, &[]);
+            assert!(
+                requirements
+                    .iter()
+                    .any(|requirement| requirement.kind == RequirementKind::Tests),
+                "{objective} demands passing tests: {requirements:?}"
+            );
+        }
+    }
+
+    /// A subject the runtime cannot enumerate is honest scope with honest
+    /// evidence: the acceptance list must name it, the completion account must
+    /// cover it, and the record says the coverage rests on that account.
+    #[test]
+    fn an_unenumerable_verification_subject_is_accounted_and_not_proven() {
+        let requirements = vec![req("全部功能", RequirementKind::Named)];
+        assert_eq!(
+            uncovered(&requirements, &["make up 成功".to_string()]),
+            vec!["全部功能".to_string()],
+            "an acceptance list that never names the subject does not cover it"
+        );
+        assert!(
+            uncovered(
+                &requirements,
+                &["全部功能实测：门户页面、运营接口、MCP 工具".to_string()]
+            )
+            .is_empty()
+        );
+        let done = [account("全部功能", AccountStatus::Done, "实测了三个域")];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&done),
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        match decision {
+            ScopeDecision::Accept { warnings } => assert!(
+                warnings.iter().any(|warning| warning.contains("全部功能")
+                    && warning.contains("no mechanical check")),
+                "coverage of an unenumerable subject is a boundary, not proof: {warnings:?}"
+            ),
+            other => panic!("expected an accepted completion with a boundary, got {other:?}"),
+        }
+        let missing = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: None,
+            runs: &[],
+            mutation_ops: 0,
+            artifact: &|_| ArtifactState::Unknown,
+        });
+        assert!(
+            matches!(missing, ScopeDecision::Refuse(_)),
+            "a completion that never accounts for the subject is refused: {missing:?}"
+        );
+    }
+
     fn base_requirements(objective: &str) -> Vec<Requirement> {
         extract(objective, &[])
     }
@@ -2988,6 +3239,28 @@ mod tests {
                 requirement.text.contains("unittest") && requirement.kind == RequirementKind::Named
             }),
             "the test command must not also become a named deliverable: {tests:?}"
+        );
+    }
+
+    /// A repository's own suite name is recognised when it answers a test
+    /// demand, but it does not swallow the command requirement when the user
+    /// only named the command. `` `make regression` `` without "the tests" is
+    /// work to run, not a Tests requirement.
+    #[test]
+    fn a_project_suite_span_stays_a_command_requirement_when_no_tests_are_demanded() {
+        let requirements = extract("先 `make up`，然后跑一下 `make regression`。", &[]);
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.text == "make regression"
+                    && requirement.kind == RequirementKind::Command
+            }),
+            "the command the user named must stay a mechanical requirement: {requirements:?}"
+        );
+        assert!(
+            !requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "naming a command is not demanding the test suite: {requirements:?}"
         );
     }
 
@@ -3661,6 +3934,58 @@ mod tests {
                 "{warnings:?}"
             ),
             other => panic!("expected an accepted boundary, got {other:?}"),
+        }
+    }
+
+    /// The user asked to run the tests; the repository's suite is
+    /// `make regression`, not `make test`. The runtime recorded that command
+    /// and it passed after the last change, so the requirement is met — the
+    /// refusal that greeted this exact record (session `1c3bf9aa`, 2026-10-30)
+    /// said no test command had run.
+    #[test]
+    fn a_project_suite_named_regression_satisfies_a_test_requirement() {
+        let requirements = vec![req("tests", RequirementKind::Tests)];
+        let present = |_: &str| ArtifactState::Present;
+        let runs = vec![
+            run(
+                "bash -lc make regression > tmp/run/regression.log 2>&1; echo \"regression 退出码: $?\"",
+                true,
+                5,
+                0,
+            ),
+            run("make regression", true, 25, 0),
+        ];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&[account(
+                "tests",
+                AccountStatus::Done,
+                "make regression（前台，exit 0）：13 组用例，191 条断言通过",
+            )]),
+            runs: &runs,
+            mutation_ops: 0,
+            artifact: &present,
+        });
+        assert!(
+            matches!(decision, ScopeDecision::Accept { .. }),
+            "{decision:?}"
+        );
+
+        // Starting the services is not running the suite, and the refusal
+        // says which names a test run needs.
+        let only_started = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: None,
+            runs: &[run("make up", true, 3, 0), run("make status", true, 4, 0)],
+            mutation_ops: 0,
+            artifact: &present,
+        });
+        match only_started {
+            ScopeDecision::Refuse(message) => {
+                assert!(message.contains("no test command ran"), "{message}");
+                assert!(message.contains("regression"), "{message}");
+            }
+            other => panic!("expected refusal, got {other:?}"),
         }
     }
 

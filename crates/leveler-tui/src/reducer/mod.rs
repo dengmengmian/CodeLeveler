@@ -101,13 +101,25 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if grouped {
         state.composer.end_edit_group();
     }
-    if let Some(advance) = drain_pending_input(state) {
+    if !effects.contains(&Effect::Quit)
+        && let Some(advance) = drain_pending_input(state)
+    {
         effects.push(advance);
     }
     effects
 }
 
 fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
+    // Do not admit another local input while an explicit exit settles this
+    // session. Runtime events and cleanup completion remain responsive.
+    if state.quit_pending
+        && matches!(
+            &action,
+            Action::Key(_) | Action::Mouse(_) | Action::Paste(_) | Action::TextInput(_)
+        )
+    {
+        return Vec::new();
+    }
     // Search owns all text, including terminal paste/burst events. A query
     // that resembles a file path must not stage an attachment behind it.
     if state.overlay.is_none()
@@ -405,7 +417,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         Action::UpdateFinished(outcome) => {
             if let Some(view) = state.update.as_mut() {
                 view.finish(outcome);
-                if view.wants_restart() {
+                if view.wants_restart() && !state.quit_pending {
                     // The binary on disk is already the new one; the CLI will
                     // replace this process after the terminal is restored.
                     state.restart_requested = true;
@@ -502,6 +514,19 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
 
 fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
     match completion {
+        EffectCompletion::QuitFinished(result) => {
+            state.quit_pending = false;
+            match result {
+                Ok(()) => state.running = false,
+                Err(message) => {
+                    state.disarm_ctrlc();
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Error,
+                        message: state.t().quit_stop_failed.replace("{}", &message),
+                    });
+                }
+            }
+        }
         EffectCompletion::CommandDelivered => {}
         EffectCompletion::CommandRejected {
             command,
@@ -783,11 +808,48 @@ fn screen_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     }
 }
 
+/// Mouse on the side thread: the wheel scrolls that thread, and the header
+/// `←` is Esc. The composer keeps the wheel, the same way the main composer does.
+fn btw_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        return Vec::new();
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if point_in_rect(mouse.column, mouse.row, state.input_rect) {
+                return Vec::new();
+            }
+            // `scroll` counts lines up from the live bottom, so wheel-up
+            // (older) increases it. Three lines matches the main transcript.
+            if mouse.kind == MouseEventKind::ScrollUp {
+                state.btw.scroll = state.btw.scroll.saturating_add(3);
+            } else {
+                state.btw.scroll = state.btw.scroll.saturating_sub(3);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((row, x0, x1)) = state.back_hit
+                && mouse.row == row
+                && (x0..x1).contains(&mouse.column)
+            {
+                leave_btw(state);
+            }
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
 /// Mouse: wheel scrolls Conversation; drag selects text with edge auto-scroll; release copies.
 ///
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
 /// when mouse capture is not fully exclusive.
 fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    // The side thread owns the viewport. Its wheel and its back glyph must not
+    // fall through to the main transcript, whose last rect still overlaps.
+    if state.surface == SurfaceFocus::Btw && state.active_screen == Screen::Conversation {
+        return btw_mouse(state, mouse);
+    }
     // An approval or clarification sits in the composer slot and asks about the
     // conversation above it. A wheel over that viewport still scrolls it. The
     // wheel over the prompt itself, and every click, stay with the prompt.

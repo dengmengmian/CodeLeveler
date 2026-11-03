@@ -602,6 +602,7 @@ fn reconnect_rebuilds_only_registry_active_background_tasks() {
         args: vec!["test".into()],
         elapsed_ms: 4_000,
         pid: None,
+        ready_evidence: None,
     }];
 
     reduce(
@@ -647,6 +648,7 @@ fn lifecycle_lag_reconciliation_replaces_stale_active_background_tasks() {
                 args: vec!["check".into()],
                 elapsed_ms: 2_000,
                 pid: None,
+                ready_evidence: None,
             }],
         }),
     );
@@ -758,6 +760,7 @@ fn switching_sessions_drops_the_previous_activity_detail() {
         args: vec!["test".into()],
         elapsed_ms: 1_000,
         pid: None,
+        ready_evidence: None,
     }];
     reduce(
         &mut s,

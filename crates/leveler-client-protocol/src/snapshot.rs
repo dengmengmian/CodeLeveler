@@ -602,6 +602,11 @@ pub struct UiActiveBackgroundTask {
     /// decode it as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Readiness evidence observed for this still-running task, when a caller
+    /// waited for a real signal in its output. Additive; absent means no signal
+    /// has been observed, never that the service is not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_evidence: Option<String>,
 }
 
 /// One live background task that is keeping a runtime from becoming idle.

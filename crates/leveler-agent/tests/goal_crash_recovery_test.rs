@@ -190,7 +190,35 @@ impl ModelRuntime for Runtime {
                 usage: usage(),
             }));
         }
-        let status = scripted.unwrap_or_else(|| *self.status.lock().unwrap());
+        let status = match scripted {
+            Some(status) => status,
+            None => {
+                // The runtime's delivery round: the goal is already recorded, so
+                // a real model answers the person instead of resolving it again.
+                let delivering = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::User)
+                    .is_some_and(|message| {
+                        message
+                            .text_content()
+                            .contains("this round is the delivery")
+                    });
+                if delivering {
+                    return Ok(leveler_model::stream_from_response(ModelResponse {
+                        request_id: RequestId::generate(),
+                        message: Message::text(
+                            Role::Assistant,
+                            "the goal is resolved and reported",
+                        ),
+                        finish_reason: FinishReason::Stop,
+                        usage: usage(),
+                    }));
+                }
+                *self.status.lock().unwrap()
+            }
+        };
         let message = Message::from_parts(
             Role::Assistant,
             vec![ContentPart::ToolCall {
@@ -298,6 +326,7 @@ fn coding_runtime(
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: Arc::new(leveler_storage::MemoryResourceGrantStore::default()),
             runtime,
             registry: Arc::new(registry),
@@ -450,7 +479,9 @@ async fn a_goal_without_its_turn_recovers_the_original_objective() {
         .load_for_session(&fx.session)
         .await
         .unwrap();
-    assert_eq!(bodies.len(), 1, "the failed start bought no model call");
+    // The successful attempt's resolution and its delivery round; the failed
+    // start bought none.
+    assert_eq!(bodies.len(), 2, "the failed start bought no model call");
 }
 
 /// A crash after the turn WAL and goal bind, but before its terminal: the

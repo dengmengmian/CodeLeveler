@@ -125,6 +125,7 @@ pub struct MockServer {
     request_count: Arc<AtomicUsize>,
     request_bodies: Arc<Mutex<Vec<String>>>,
     request_heads: Arc<Mutex<Vec<String>>>,
+    queue: Arc<Mutex<VecDeque<MockResponse>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -148,12 +149,13 @@ impl MockServer {
         let count = request_count.clone();
         let bodies = request_bodies.clone();
         let heads = request_heads.clone();
+        let accept_queue = queue.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                let queue = queue.clone();
+                let queue = accept_queue.clone();
                 let count = count.clone();
                 let bodies = bodies.clone();
                 let heads = heads.clone();
@@ -184,6 +186,7 @@ impl MockServer {
             request_count,
             request_bodies,
             request_heads,
+            queue,
             handle,
         }
     }
@@ -191,6 +194,15 @@ impl MockServer {
     /// Convenience: start with a single response repeated for all connections.
     pub async fn start_one(response: MockResponse) -> Self {
         Self::start(vec![response]).await
+    }
+
+    /// Append a response for a later connection.
+    ///
+    /// A test whose reply depends on a fact only the running runtime produces
+    /// (the id of the background task it just started) pushes the script after
+    /// that fact exists instead of predicting it.
+    pub async fn push(&self, response: MockResponse) {
+        self.queue.lock().await.push_back(response);
     }
 
     /// The base URL to point a provider at, e.g. `http://127.0.0.1:54321`.

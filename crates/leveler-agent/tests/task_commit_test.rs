@@ -203,7 +203,18 @@ struct Fixture {
     task_cancel: Arc<AtomicBool>,
 }
 
+/// Append the answer a real model must write after it resolves its goal: the
+/// runtime takes one delivery round when the resolving round carried no text.
+fn with_delivery(mut script: Vec<Scripted>) -> Vec<Scripted> {
+    let resolves_without_text = matches!(script.last(), Some(Scripted::Tool("update_goal", _)));
+    if resolves_without_text {
+        script.push(Scripted::Text("已完成，这是给用户的最终说明。"));
+    }
+    script
+}
+
 async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
+    let script = with_delivery(script);
     let dir = tempfile::tempdir().unwrap();
     write_test_runner(dir.path());
     let db = Database::connect_in_memory().await.unwrap();
@@ -247,6 +258,7 @@ async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: Arc::new(leveler_storage::MemoryResourceGrantStore::default()),
             runtime: runtime.clone(),
             registry: Arc::new(registry),
@@ -352,9 +364,11 @@ async fn a_chat_delegation_commits_the_task_and_continues_past_a_stage_summary()
 
     let report = chat(&fx).await;
 
+    // commit + stage summary + the tests the stage ran + the resolution + its
+    // delivery round: the stage summary still buys its round inside this turn.
     assert_eq!(
         fx.runtime.calls.load(Ordering::SeqCst),
-        4,
+        5,
         "the stage summary must buy another round inside the same turn"
     );
     {
@@ -413,6 +427,61 @@ async fn a_chat_delegation_commits_the_task_and_continues_past_a_stage_summary()
             .map(|row| row.budget_scope.clone())
             .collect::<Vec<_>>()
     );
+}
+
+/// A repository names its own suite. DevOrder's is `make regression`: the
+/// runtime recorded it, it passed, and the goal still refused to close because
+/// the runner's name was not in the test vocabulary (session `1c3bf9aa`). The
+/// suite the user demanded has to be the suite the runtime recognises.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_suite_named_in_the_repositorys_own_words_resolves_the_goal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture(
+        vec![
+            Scripted::commit(),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({
+                    "program": "bin/make",
+                    "args": ["regression"],
+                    "reason": "run the suite the user required"
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "本地全套已启动，13 组真实回归全过",
+                    "verification": {"status": "passed", "detail": "bin/make regression"},
+                    "requirements": [
+                        {"requirement": "tests", "status": "done",
+                         "evidence": "bin/make regression 退出码 0：13 组用例、191 条断言通过"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let bin = fx.dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let suite = bin.join("make");
+    std::fs::write(&suite, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&suite, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = chat(&fx).await;
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "{report:?}"
+    );
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "exactly one durable task");
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
 }
 
 #[tokio::test]
@@ -2390,5 +2459,73 @@ async fn an_authorized_window_is_not_cut_short_as_paused() {
         "the authorized window must not re-pause the goal: {goals:?}"
     );
     assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// An accepted completion can still have a boundary the runtime could not
+/// verify. That boundary was stated only on the terminal, so the model wrote
+/// the delivery without it and could claim more than the record held. The
+/// acceptance the model reads must carry the runtime's own facts.
+#[tokio::test]
+async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
+    // "把全部功能真实测试一遍" names no file, no command and no suite: the
+    // runtime can hold the model to naming the subject, but it can never prove
+    // the coverage. That is a boundary, and it must reach the model.
+    let objective = "本地启动项目，把全部功能真实测试一遍。";
+    let fx = fixture(
+        vec![
+            commit_with(vec!["全部功能实测完成", "make up 成功"], objective),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "全部功能实测完成",
+                    "verification": {"status": "not_applicable", "detail": "只做了验证，没有改文件"},
+                    "requirements": [
+                        {"requirement": "全部功能", "status": "done",
+                         "evidence": "门户页面、运营接口与 MCP 工具都实测过"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, objective),
+            vec![ContentPart::Text {
+                text: objective.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let receipt = events
+        .iter()
+        .find_map(|event| match event {
+            leveler_engine::EngineEvent::ToolCallFinished {
+                name,
+                is_error,
+                preview,
+                ..
+            } if name == "update_goal" && !is_error => Some(preview.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the accepted completion has no tool result: {events:?}"));
+    assert!(
+        receipt.contains("全部功能") && receipt.contains("no mechanical check"),
+        "the receipt must carry the boundary the runtime computed: {receipt}"
+    );
+    assert_ne!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Failed,
+        "an accepted completion with a boundary is still a completion: {report:?}"
+    );
     std::fs::remove_dir_all(fx.dir.path()).ok();
 }

@@ -175,6 +175,7 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),

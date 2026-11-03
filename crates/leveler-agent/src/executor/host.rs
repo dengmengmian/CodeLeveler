@@ -236,7 +236,7 @@ impl Executor {
                 arguments: super::dispatch::compact_json(&call.arguments),
                 // The harness owns the registry, so it stamps the risk the
                 // engine records.
-                risk: self.registry.get(&call.name).map(|tool| tool.risk()),
+                risk: self.tool(&call.name).map(|tool| tool.risk()),
             });
         }
         // Side-effect barrier, first wait: the announcing `ToolCallStarted`
@@ -492,11 +492,10 @@ impl Executor {
         }
 
         let risk = self
-            .registry
-            .get(&call.name)
+            .tool(&call.name)
             .map(|t| t.risk())
             .unwrap_or(RiskLevel::Safe);
-        let approval_reason = if let Some(tool) = self.registry.get(&call.name) {
+        let approval_reason = if let Some(tool) = self.tool(&call.name) {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return deny("cancelled".into()),
@@ -661,7 +660,7 @@ impl Executor {
         let network_resource = if risk == RiskLevel::Network
             && !matches!(network_scope, leveler_execution::NetworkScope::None)
         {
-            if let Some(tool) = self.registry.get(&call.name) {
+            if let Some(tool) = self.tool(&call.name) {
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return deny("cancelled".into()),
@@ -859,7 +858,7 @@ impl Executor {
         ctx: &ToolContext,
     ) -> Result<Option<leveler_core::GrantRequest>, String> {
         use leveler_core::GrantRequest;
-        let Some(tool) = self.registry.get(&call.name) else {
+        let Some(tool) = self.tool(&call.name) else {
             return Ok(None);
         };
         // A command resolves its own typed target (a Git remote effect); other
@@ -1286,19 +1285,23 @@ impl Executor {
         // This call's own cancellation: a child of the turn's, handed to the
         // host so a user can stop this one call without stopping the turn.
         let call_cancel = cancellation.child_token();
+        // And this call's attention signal. It is separate on purpose: yielding
+        // is not being cancelled, and only a call that can report what it
+        // observed (a wait) is allowed to listen to it.
+        let yield_now = call_cancel.child_token();
         if let Some(host) = &self.steering {
-            host.tool_call_started(call.id.as_str(), call_cancel.clone());
+            host.tool_call_started(call.id.as_str(), call_cancel.clone(), yield_now.clone());
         }
         let mut ctx = admitted.execution_context().clone();
         ctx.tool_call_scope = Some(call.id.as_str().into());
+        ctx.yield_now = Some(yield_now);
         ctx.output = output;
         let started = std::time::Instant::now();
         if let Some(barrier) = &self.event_barrier {
             barrier.record_tool_timing(call.id.as_str(), self.agent_id.as_deref(), started, false);
         }
         let executed = self
-            .registry
-            .execute(&call.name, call.arguments.clone(), ctx, call_cancel)
+            .execute_tool(&call.name, call.arguments.clone(), ctx, call_cancel)
             .await;
         if let Some(barrier) = &self.event_barrier {
             barrier.record_tool_timing(call.id.as_str(), self.agent_id.as_deref(), started, true);

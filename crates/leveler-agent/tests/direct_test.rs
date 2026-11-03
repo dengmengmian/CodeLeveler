@@ -36,8 +36,47 @@ struct MockRuntime {
     requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
 
+/// Append the answer a real model must write after it resolves its goal.
+///
+/// The runtime takes one delivery round after `update_goal` when the resolving
+/// round carried no text: resolving a goal settles it, but the person still has
+/// to be told what happened. A script that ends on the `update_goal` call is
+/// exactly that shape, so the scripted model says what it summarized — the
+/// fixture states the contract instead of relying on the turn ending on a tool
+/// call.
+fn with_delivery(mut responses: Vec<ModelResponse>) -> Vec<ModelResponse> {
+    let summary = responses.last().and_then(|response| {
+        if !response.message.text_content().trim().is_empty() {
+            return None;
+        }
+        response.message.content.iter().find_map(|part| match part {
+            ContentPart::ToolCall { call } if call.name == "update_goal" => {
+                call.arguments.get("status").is_some().then(|| {
+                    call.arguments
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                })
+            }
+            _ => None,
+        })
+    });
+    if let Some(summary) = summary {
+        let answer = if summary.is_empty() {
+            "Done: the goal is resolved and reported.".to_string()
+        } else {
+            summary
+        };
+        responses.push(text(&answer));
+    }
+    responses
+}
+
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
+        let responses = with_delivery(responses);
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
             requests: Arc::new(Mutex::new(Vec::new())),
@@ -226,6 +265,7 @@ async fn harness_with_overrides(
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -1343,7 +1383,9 @@ async fn top_level_goal_runs_until_terminal_past_the_old_model_round_budget() {
         .unwrap();
 
     assert_eq!(report.stop_reason, StopReason::Completed);
-    assert_eq!(report.model_steps, 4);
+    // The resolving round carried no sentence, so the delivery round is one
+    // more model step than the work rounds alone.
+    assert_eq!(report.model_steps, 5);
 }
 
 #[tokio::test]
@@ -1677,6 +1719,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -2142,6 +2185,9 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added the login entry point"),
     ];
     // The reviewer's first move is to "fix" what it is reviewing.
     responses.push(tool_call(
@@ -2362,6 +2408,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -2461,6 +2508,8 @@ async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "login added"}),
         ),
+        // The parent's delivery round answers before the reviewer starts.
+        text("login added"),
     ];
     // The reviewer voices a finding in its first round, then wanders: reads
     // forever without concluding. Without a bound it would consume every
@@ -2570,6 +2619,9 @@ async fn a_reviewer_finding_is_adopted_without_gating_the_closure() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added the login entry point"),
         // Reviewer child rounds: one typed blocking finding, then prose.
         tool_call(
             "rf1",
@@ -2636,6 +2688,9 @@ async fn a_reviewer_observation_does_not_refuse_the_closure() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added the login entry point"),
         tool_call(
             "rf1",
             "report_finding",
@@ -2686,6 +2741,9 @@ async fn persisted_findings_reload_without_duplication() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added login"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added login"),
         tool_call(
             "rf1",
             "report_finding",
@@ -2745,6 +2803,9 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added the login entry point"),
         tool_call(
             "rf1",
             "report_finding",
@@ -2821,6 +2882,9 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added the login entry point"),
     ];
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
@@ -2963,6 +3027,9 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "added the login entry point"}),
         ),
+        // The parent resolved without a sentence, so its delivery round writes
+        // one before the reviewer child runs.
+        text("added the login entry point"),
     ];
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
@@ -3247,6 +3314,380 @@ async fn a_goal_task_longer_than_a_small_step_count_still_completes() {
     );
 }
 
+/// P1-B: resolving the goal is not delivering to the person.
+///
+/// The dogfood run ended with `Goal: completed` / `Runtime: completed` and the
+/// TUI's `⚠ 执行已结束，但未提交最终回答`, because the model's last action was the
+/// `update_goal` call itself. The goal still settles; the turn now spends one
+/// delivery round so the person gets an answer in the model's own words.
+#[tokio::test]
+async fn a_resolution_without_a_sentence_gets_one_delivery_round() {
+    let h = harness(vec![
+        read_call_named("c1", "src/lib.rs"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "read the library"}),
+        ),
+        text("I read src/lib.rs; the function is unchanged and needs no edit."),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    assert!(
+        report
+            .final_text
+            .contains("the function is unchanged and needs no edit"),
+        "the person gets the model's own answer, not the goal summary: {:?}",
+        report.final_text
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "an answer was delivered, so there is nothing to warn about: {:?}",
+        report.completion_warnings
+    );
+}
+
+/// The fallback stays honest: a model that never writes the answer leaves the
+/// goal summary as the delivery, and the terminal says so instead of pretending.
+#[tokio::test]
+async fn a_resolution_that_never_produces_an_answer_is_reported_as_such() {
+    let h = harness(vec![
+        read_call_named("c1", "src/lib.rs"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "read the library"}),
+        ),
+        text(""),
+        text(""),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert_eq!(report.final_text, "read the library");
+    assert!(
+        report
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("wrote no final answer")),
+        "the terminal must state that the answer is missing: {:?}",
+        report.completion_warnings
+    );
+}
+
+fn prose_and_tools(prose: &str, calls: Vec<(&str, &str, serde_json::Value)>) -> ModelResponse {
+    let mut content = Vec::new();
+    if !prose.is_empty() {
+        content.push(ContentPart::Text {
+            text: prose.to_string(),
+        });
+    }
+    for (id, name, arguments) in calls {
+        content.push(ContentPart::ToolCall {
+            call: ToolCall {
+                id: ToolCallId::new(id),
+                name: name.to_string(),
+                arguments,
+            },
+        });
+    }
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content,
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
+/// A tool round after the goal is accepted is wrap-up, not the delivery.
+///
+/// The observed failure spent both post-acceptance rounds on checks. The turn
+/// then ended on the second tool result, so the model never saw those results
+/// in a request that could still write the answer. The answer after that
+/// second check is the delivery.
+#[tokio::test]
+async fn a_second_post_settlement_tool_round_still_gets_a_delivery() {
+    let h = harness(vec![
+        read_call_named("c1", "src/lib.rs"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "read the library"}),
+        ),
+        read_call_named("c2", "src/lib.rs"),
+        read_call_named("c3", "src/lib.rs"),
+        text("完整结论：库已读过，没有需要改的地方。"),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    assert!(
+        report.final_text.contains("完整结论"),
+        "the answer written after the wrap-up checks is the delivery: {:?}",
+        report.final_text
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "an answer was delivered: {:?}",
+        report.completion_warnings
+    );
+    let persisted = MessageRepository::new(&h.db).load(&session).await.unwrap();
+    let notice_at = persisted
+        .iter()
+        .position(|payload| payload.contains("this round is the delivery"));
+    let answer_at = persisted
+        .iter()
+        .position(|payload| payload.contains("完整结论"));
+    assert!(
+        answer_at.is_some_and(|answer| notice_at.is_some_and(|notice| answer > notice)),
+        "two wrap-up checks still leave the answer in session_messages after the delivery notice; answer={answer_at:?} notice={notice_at:?} rows={}",
+        persisted.len()
+    );
+}
+
+/// One check between acceptance and the answer still delivers, and does not
+/// spend a second model request after the answer itself.
+#[tokio::test]
+async fn one_post_settlement_check_then_the_answer_is_the_delivery() {
+    let h = harness(vec![
+        read_call_named("c1", "src/lib.rs"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "read the library"}),
+        ),
+        read_call_named("c2", "src/lib.rs"),
+        text("完整结论：再读了一次，函数没变。"),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert!(
+        report.final_text.contains("完整结论"),
+        "one wrap-up check must not consume the delivery: {:?}",
+        report.final_text
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "{:?}",
+        report.completion_warnings
+    );
+    let requests = h.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        4,
+        "read, resolve, one check, the answer — no extra request: {}",
+        requests.len()
+    );
+    let notice = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(Message::text_content)
+        .find(|text| text.contains("this round is the delivery"))
+        .unwrap_or_default();
+    assert!(
+        notice.contains("still owed after that result returns"),
+        "a check after acceptance must not be described as the same round as the answer: {notice}"
+    );
+    assert!(
+        !notice.contains("run it in this round and then answer"),
+        "the notice must not tell the model to answer before the check returns: {notice}"
+    );
+    assert!(
+        !notice.contains("nohup does not"),
+        "the notice must not send the model to rewrite process groups: {notice}"
+    );
+    // The live turn can show the answer while session_messages still ends on
+    // the delivery notice. Resume reloads the sink, so the answer has to be
+    // the row after that notice.
+    let persisted = MessageRepository::new(&h.db).load(&session).await.unwrap();
+    let notice_at = persisted
+        .iter()
+        .position(|payload| payload.contains("this round is the delivery"));
+    let answer_at = persisted
+        .iter()
+        .position(|payload| payload.contains("完整结论"));
+    assert!(
+        answer_at.is_some_and(|answer| notice_at.is_some_and(|notice| answer > notice)),
+        "the answer after acceptance must be stored after the delivery notice; answer={answer_at:?} notice={notice_at:?} rows={}",
+        persisted.len()
+    );
+}
+
+/// Prose written before a tool call is progress. When the post-acceptance
+/// checks never turn into an answer, the goal summary is the fallback and the
+/// terminal says the answer is missing. The progress sentence is not that answer.
+#[tokio::test]
+async fn a_process_sentence_is_not_the_final_answer_when_tools_follow() {
+    let h = harness(vec![
+        prose_and_tools(
+            "先看一下文件，还没结论。",
+            vec![("c1", "read_file", serde_json::json!({"path": "src/lib.rs"}))],
+        ),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "read the library"}),
+        ),
+        read_call_named("c2", "src/lib.rs"),
+        read_call_named("c3", "src/lib.rs"),
+        read_call_named("c4", "src/lib.rs"),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert_eq!(
+        report.final_text, "read the library",
+        "the goal summary is the fallback, not the process sentence: {:?}",
+        report.final_text
+    );
+    assert!(
+        !report.final_text.contains("先看一下"),
+        "progress prose must not be reported as the answer: {:?}",
+        report.final_text
+    );
+    assert!(
+        report
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("wrote no final answer")),
+        "the terminal must say the answer is missing: {:?}",
+        report.completion_warnings
+    );
+}
+
+/// An answer in the same round as `update_goal`, with no later work tool, is
+/// the delivery. The turn ends on it.
+#[tokio::test]
+async fn an_answer_beside_update_goal_is_the_delivery() {
+    let h = harness(vec![
+        read_call_named("c1", "src/lib.rs"),
+        prose_and_tools(
+            "完整结论：库已读过，函数没变。",
+            vec![(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "read the library"}),
+            )],
+        ),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert!(
+        report.final_text.contains("完整结论"),
+        "the answer written with the resolution is the delivery: {:?}",
+        report.final_text
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "{:?}",
+        report.completion_warnings
+    );
+    let requests = h.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the resolution round already answered, so no delivery request follows: {}",
+        requests.len()
+    );
+}
+
+/// Process prose beside `update_goal` and a real tool is not the delivery.
+/// The tool result has to come back, and the later answer is what the person gets.
+#[tokio::test]
+async fn prose_beside_a_work_tool_does_not_end_the_turn() {
+    let h = harness(vec![
+        prose_and_tools(
+            "先核对一下再收尾。",
+            vec![
+                (
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({"status": "complete", "summary": "read the library"}),
+                ),
+                ("c1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+            ],
+        ),
+        text("完整结论：核对过了，函数没变。"),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert!(
+        report.final_text.contains("完整结论"),
+        "the post-check answer is the delivery, not the process sentence: {:?}",
+        report.final_text
+    );
+    assert!(
+        !report.final_text.contains("先核对"),
+        "{:?}",
+        report.final_text
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "{:?}",
+        report.completion_warnings
+    );
+}
+
 /// §G + §E end-to-end: the safety ceiling ends a drive honestly (resumable,
 /// `TurnLimitReached`, not a resource budget), and a resume continues the
 /// task's spend while getting a fresh per-drive step counter.
@@ -3299,6 +3740,7 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -3391,6 +3833,10 @@ async fn harness_reviewer_uses_parent_residual_token_budget() {
             0,
             20,
         ),
+        // The resolution ran without a sentence, so the delivery round answers
+        // here; it is also the round whose spend must fit the parent's residual
+        // budget instead of a fresh cap.
+        with_usage(text("added login"), 0, 0, 0),
         with_usage(
             tool_call(
                 "inspect",
@@ -3425,8 +3871,9 @@ async fn harness_reviewer_uses_parent_residual_token_budget() {
         .unwrap();
     assert_eq!(
         h.requests.lock().unwrap().len(),
-        3,
-        "reviewer must stop after consuming the remaining 50,000 tokens, rather than receive a fresh 200,000-token cap"
+        4,
+        "the parent's edit, its resolution, its delivery round, and then ONE \
+         reviewer round under the remaining 50,000 tokens — not a fresh 200,000 cap"
     );
     let rows = leveler_storage::ModelRequestRepository::new(&h.db)
         .load_for_session(&session)
@@ -3434,7 +3881,7 @@ async fn harness_reviewer_uses_parent_residual_token_budget() {
         .unwrap();
     assert_eq!(
         rows.len(),
-        3,
+        4,
         "every actual request must be durable exactly once"
     );
     assert_eq!(rows.iter().filter(|r| r.agent_id.is_some()).count(), 1);
@@ -3446,7 +3893,13 @@ async fn harness_reviewer_uses_parent_residual_token_budget() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(ledger.cumulative_model_tokens, 210_000);
+    // The sum of the fixture's own reported usage, including the reviewer
+    // round that fit inside the parent's remaining budget. Two prompt facts
+    // lengthen the projection and nothing else: the acceptance receipt states
+    // the unverified boundary, and the post-acceptance delivery notice tells
+    // the model the answer is still owed. The figure tracks that wording, not
+    // a budget change. Request count above is the budget contract.
+    assert_eq!(ledger.cumulative_model_tokens, 225_133);
 }
 
 #[tokio::test]
@@ -3513,8 +3966,8 @@ async fn a_multimodal_goal_requires_resolution_and_keeps_its_original_wal_conten
         let requests = h.requests.lock().unwrap();
         assert_eq!(
             requests.len(),
-            3,
-            "two continued quiet rounds, then the resolving call"
+            4,
+            "two continued quiet rounds, the resolving call, and the delivery round"
         );
         assert!(
             requests[0]
@@ -3744,6 +4197,9 @@ async fn progressive_resume_restores_pack_and_new_goal_starts_small() {
             "update_goal",
             serde_json::json!({"status":"complete","summary":"done"}),
         ),
+        // The resumed goal resolved without a sentence: its delivery round
+        // answers before the new goal starts.
+        text("done"),
         tool_call(
             "new_done",
             "update_goal",
@@ -3784,7 +4240,9 @@ async fn progressive_resume_restores_pack_and_new_goal_starts_small() {
         .await
         .unwrap();
     let requests = h.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
+    // Five requests: the enabling round, the resumed drive's resolution and its
+    // delivery round, then the new goal's resolution and its delivery round.
+    assert_eq!(requests.len(), 5);
     assert!(
         !requests[0]
             .tools
@@ -3798,10 +4256,11 @@ async fn progressive_resume_restores_pack_and_new_goal_starts_small() {
             .any(|tool| tool.name == "load_skill")
     );
     assert!(
-        !requests[2]
+        !requests[3]
             .tools
             .iter()
-            .any(|tool| tool.name == "load_skill")
+            .any(|tool| tool.name == "load_skill"),
+        "a new goal starts from the small pack again"
     );
 }
 
@@ -3886,15 +4345,23 @@ async fn a_completion_that_cites_an_unrun_command_is_refused_then_not_applicable
     let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut intercepted = Vec::new();
+    let mut refused = Vec::new();
     let report = h
         .engine
         .run(
             &session,
             &s,
-            &mut |event| {
-                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+            &mut |event| match event {
+                leveler_engine::EngineEvent::GoalIntercepted { kind, detail } => {
                     intercepted.push((kind, detail));
                 }
+                leveler_engine::EngineEvent::ToolCallFinished {
+                    name,
+                    is_error: true,
+                    preview,
+                    ..
+                } if name == "update_goal" => refused.push(preview),
+                _ => {}
             },
             CancellationToken::new(),
         )
@@ -3913,6 +4380,14 @@ async fn a_completion_that_cites_an_unrun_command_is_refused_then_not_applicable
         report.completion_warnings[0].contains("without executable verification"),
         "{:?}",
         report.completion_warnings
+    );
+    // The UI projects this same refusal: the preview names the gate, so a
+    // client can state the reason without re-reading the model-facing prose.
+    assert!(
+        refused
+            .iter()
+            .any(|preview| preview.starts_with("[goal_refused:verification_refused]")),
+        "the refusal preview must name its gate: {refused:?}"
     );
 }
 
@@ -4012,15 +4487,23 @@ async fn a_goal_turn_cannot_complete_part_of_an_enumerated_scope() {
     s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt。".to_string();
     let session = h.engine.create_task(&s).await.unwrap();
     let mut intercepted = Vec::new();
+    let mut refused = Vec::new();
     let report = h
         .engine
         .run(
             &session,
             &s,
-            &mut |event| {
-                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+            &mut |event| match event {
+                leveler_engine::EngineEvent::GoalIntercepted { kind, detail } => {
                     intercepted.push((kind, detail));
                 }
+                leveler_engine::EngineEvent::ToolCallFinished {
+                    name,
+                    is_error: true,
+                    preview,
+                    ..
+                } if name == "update_goal" => refused.push(preview),
+                _ => {}
             },
             CancellationToken::new(),
         )
@@ -4037,6 +4520,12 @@ async fn a_goal_turn_cannot_complete_part_of_an_enumerated_scope() {
             kind == "requirements_refused" && detail.contains("stage-2.txt")
         }),
         "{intercepted:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|preview| preview.starts_with("[goal_refused:requirements_refused]")),
+        "the refusal preview must name its gate: {refused:?}"
     );
 }
 
@@ -4303,6 +4792,114 @@ async fn repeated_refused_completions_are_bounded() {
         h.requests.lock().unwrap().len(),
         2,
         "the third scripted completion is never requested"
+    );
+}
+
+/// GR-07: a requirements refusal is feedback the model can answer. When the
+/// NEXT completion is judged differently, the model is correcting itself, not
+/// "only repeating refused calls" — the turn must not hard-stop after two such
+/// rounds while a satisfiable accounting is still one call away.
+///
+/// The real DevOrder run died here: the first refusal was answered with a more
+/// precise accounting, the second verdict changed too, and the no-progress
+/// bound ended the turn anyway.
+#[tokio::test]
+async fn a_changing_requirements_verdict_keeps_the_goal_recoverable() {
+    let accounting = |ids: &[&str], summary: &str| {
+        let entries: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "requirement": id,
+                    "status": "done",
+                    "evidence": format!("{id} created and verified")
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "status": "complete",
+            "summary": summary,
+            "verification": {"status": "not_applicable", "detail": "fixture"},
+            "requirements": entries
+        })
+    };
+    let h = harness(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+        ),
+        tool_call(
+            "w2",
+            "write_file",
+            serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
+        ),
+        tool_call(
+            "w3",
+            "write_file",
+            serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
+        ),
+        // First attempt: one of three deliverables accounted.
+        tool_call("g1", "update_goal", accounting(&["stage-1.txt"], "part 1")),
+        // Second attempt: the model took the refusal seriously and accounted
+        // one more. Different verdict, still incomplete.
+        tool_call(
+            "g2",
+            "update_goal",
+            accounting(&["stage-1.txt", "stage-2.txt"], "parts 1-2"),
+        ),
+        // Third attempt: complete accounting. This must be reachable.
+        tool_call(
+            "g3",
+            "update_goal",
+            accounting(
+                &["stage-1.txt", "stage-2.txt", "stage-3.txt"],
+                "all three stages",
+            ),
+        ),
+    ])
+    .await;
+    let mut s = spec(&h);
+    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt。".to_string();
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut refusals = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "requirements_refused"
+                {
+                    refusals.push(detail);
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        refusals.len(),
+        2,
+        "both incomplete completions are refused: {refusals:?}"
+    );
+    assert_ne!(
+        refusals[0], refusals[1],
+        "the verdict changed because the model changed the accounting"
+    );
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Completed,
+        "a corrected accounting must be reachable: {report:?}"
+    );
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    assert_eq!(
+        h.requests.lock().unwrap().len(),
+        7,
+        "every scripted round ran (with the delivery round after the accepted \
+         completion): the third completion was not cut off"
     );
 }
 
@@ -4676,6 +5273,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),

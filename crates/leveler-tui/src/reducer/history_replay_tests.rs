@@ -571,7 +571,11 @@ fn open_process_receipts(s: &mut AppState) {
         })
         .collect();
     for (item, id) in groups {
-        if !s.conv.process_fold_expanded(&id) {
+        // Ensure OPEN: a live background run is already open by default, so a
+        // blind toggle would close the very run this helper exists to reveal.
+        let open = crate::conversation::build::process_run_open(s, item)
+            .unwrap_or_else(|| s.conv.process_fold_expanded(&id));
+        if !open {
             crate::conversation::interaction::toggle_fold(s, item);
         }
     }
@@ -1241,6 +1245,10 @@ fn a_background_command_row_settles_when_the_process_exits() {
                 output: String::new(),
             }),
         );
+        // A settled run collapses back to its receipt by default; the reader
+        // opens it to read how it ended. That is the same drawer the user has
+        // after a finished command.
+        open_process_receipts(&mut live);
         let settled = conversation_rows(&live);
         let row = settled
             .iter()
@@ -1452,5 +1460,83 @@ fn a_replayed_goal_declaration_reads_the_same_as_the_live_one() {
     assert!(
         !live_rows.iter().any(|row| row.contains("委托")),
         "committing a goal is never delegation: {live_rows:#?}"
+    );
+}
+
+/// A refused closeout carries its gate in the result preview. A restored
+/// session must read that tag the same way the live turn did: the same
+/// localized reason, and the runtime's model-facing account still behind the
+/// fold rather than in the body.
+#[test]
+fn a_replayed_closeout_refusal_names_the_same_gate() {
+    let events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "把 DevOrder 全套服务起来并跑完回归"),
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("g1"),
+            name: "update_goal".into(),
+            arguments: r#"{"status":"complete","summary":"全部完成"}"#.into(),
+            parallel: false,
+            model_step: Some(9),
+            answer_effect: None,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("g1"),
+            ok: false,
+            preview: "[goal_refused:requirements_refused]\nupdate_goal(complete) was refused: \
+                      the user's stated scope is not fully accounted for.\n- `b.txt` is named in \
+                      the user's request, but your completion did not account for it"
+                .into(),
+            duration_ms: 40,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+    ];
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(
+        &mut replayed,
+        vec![message(UiRole::User, "把 DevOrder 全套服务起来并跑完回归")],
+    );
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let live_rows = conversation_rows(&live);
+    assert_eq!(
+        live_rows,
+        conversation_rows(&replayed),
+        "a restored session must not describe the same refusal differently"
+    );
+    assert!(
+        live_rows
+            .iter()
+            .any(|row| row.contains("用户要求的条件尚未全部满足")),
+        "{live_rows:#?}"
+    );
+    assert!(
+        !live_rows
+            .iter()
+            .any(|row| row.contains("not fully accounted for") || row.contains("[goal_refused:")),
+        "model-facing prose and the tag stay out of the body: {live_rows:#?}"
     );
 }

@@ -121,6 +121,9 @@ pub struct UiText {
     pub suggestion_continue: &'static str,
     pub cancel: &'static str,
     pub quit: &'static str,
+    pub quit_stopping: &'static str,
+    pub quit_stop_failed: &'static str,
+    pub quit_input_paused: &'static str,
     pub jump_bottom: &'static str,
     pub waiting_model: &'static str,
     pub finalizing_dependencies: &'static str,
@@ -169,6 +172,9 @@ pub struct UiText {
     pub approval_pending: &'static str,
     pub title_awaiting_input: &'static str,
     pub title_waiting_background: &'static str,
+    /// The same wait, when the in-flight call is waiting for a readiness
+    /// signal rather than for the process to exit.
+    pub title_waiting_background_ready: &'static str,
     /// "等待 3 个后台任务" / "waiting for 3 background tasks"
     pub waiting_background_n: &'static str,
     pub waiting_child: &'static str,
@@ -304,13 +310,32 @@ pub struct UiText {
     /// Shown instead of the internal validation error when an update_plan is
     /// rejected (e.g. an empty plan).
     pub plan_update_rejected: &'static str,
-    /// Shown instead of the internal validation error when an `update_goal` is
-    /// rejected (a resolution with no status, a close while children still run).
+    /// Cause-neutral fallback for a refused `update_goal` whose gate the
+    /// runtime did not name (a session recorded before the tag existed).
     ///
     /// Replaces `observe_denied` ("已跳过：重复的检查无需再次执行"), which named
     /// an observe-dedup guard the runtime no longer has — so the sentence
     /// described nothing and was being applied to unrelated search failures.
+    ///
+    /// The tagged kinds below state the gate's own reason; this one says only
+    /// what it knows. "需先说明状态" named one of several refusals and was
+    /// shown for all — the user read a cause that had not been checked.
     pub goal_update_rejected: &'static str,
+    /// The closeout waited for delegated sub-agents that were still running.
+    pub goal_refused_children: &'static str,
+    /// The user paused the goal at the boundary they stated.
+    pub goal_refused_pause: &'static str,
+    /// `update_goal` carried no `status`.
+    pub goal_refused_status: &'static str,
+    /// The verification / requirement fields could not be parsed.
+    pub goal_refused_malformed: &'static str,
+    /// A cited command did not run, failed, or predates the last change.
+    pub goal_refused_evidence: &'static str,
+    /// Affordance for a folded closeout refusal. The runtime's own reason sits
+    /// one keypress away; a bare line count does not say that.
+    pub goal_refusal_expand_hint: &'static str,
+    /// The user's enumerated requirements are not all accounted for.
+    pub goal_refused_scope: &'static str,
     /// `commit_task` while the runtime is binding the declaration. Committing a
     /// goal is not delegation: no sub-agent exists at any point.
     pub goal_commit_running: &'static str,
@@ -935,11 +960,16 @@ pub struct UiText {
     /// cleanup. Distinct from failure; the runtime's `Killed` state is the
     /// authority.
     pub background_task_stopped: &'static str,
+    /// A still-running task announced readiness in its own output. Not a
+    /// completion: the process keeps running.
+    pub background_task_ready: &'static str,
     pub background_task_unknown: &'static str,
     /// Fallback when no label was recorded (e.g. exit after a reconnect).
     pub background_task_generic: &'static str,
     /// Footer aggregation: "后台 {}" (count) for two or more running tasks.
     pub background_running_count: &'static str,
+    /// Same cell, the subset that announced readiness: "就绪 {}".
+    pub background_ready_count: &'static str,
     /// Issue indicator when one kind is active: "后台失败 {}".
     pub background_failed_only: &'static str,
     /// Issue page title.
@@ -970,6 +1000,13 @@ pub struct UiText {
     pub background_status_completed: &'static str,
     pub background_status_failed: &'static str,
     pub background_status_stopped: &'static str,
+    /// Readiness observed for a task that is still running.
+    pub background_status_ready: &'static str,
+    /// Collapsed row facts for a ready service that keeps running.
+    pub background_ready_running: &'static str,
+    /// "no new output for {}s" on a running task's row. A freshness fact, never
+    /// a liveness or health claim.
+    pub background_quiet_for: &'static str,
     pub background_meta_status: &'static str,
     pub background_meta_exit: &'static str,
     pub background_meta_elapsed: &'static str,
@@ -1297,6 +1334,9 @@ static ZH: UiText = UiText {
     suggestion_continue: "继续",
     cancel: "取消",
     quit: "退出",
+    quit_stopping: "正在停止本会话任务，完成后退出…",
+    quit_stop_failed: "尚未确认本会话任务已停止，未退出：{}",
+    quit_input_paused: "退出请求已暂停自动发送；可手动发送或删除",
     jump_bottom: "回底",
     waiting_model: "等待模型",
     finalizing_dependencies: "正在收尾",
@@ -1337,6 +1377,7 @@ static ZH: UiText = UiText {
     approval_pending: "等待批准",
     title_awaiting_input: "等待输入",
     title_waiting_background: "等待后台任务",
+    title_waiting_background_ready: "等待服务就绪",
     waiting_background_n: "等待 {} 个后台任务",
     waiting_child: "等待子 Agent",
     waiting_child_n: "等待 {} 个子 Agent",
@@ -1435,7 +1476,14 @@ static ZH: UiText = UiText {
     unsupported_task_action: "委派（不支持）",
     unsupported_task_hint: "不支持 task，请改用 spawn_agent",
     plan_update_rejected: "计划未更新",
-    goal_update_rejected: "目标未更新：需先说明状态",
+    goal_update_rejected: "目标未更新：收尾被运行时拒绝",
+    goal_refused_children: "目标未更新：子任务仍在运行，结果到齐后才能收尾",
+    goal_refused_pause: "目标未更新：目标已暂停，等你授权继续",
+    goal_refused_status: "目标未更新：缺少状态（complete 或 blocked）",
+    goal_refused_malformed: "目标未更新：提交的验收说明无法解析",
+    goal_refused_evidence: "目标未更新：验收证据不成立",
+    goal_refusal_expand_hint: "▸ 查看具体原因 · Ctrl+O",
+    goal_refused_scope: "目标未更新：用户要求的条件尚未全部满足",
     goal_commit_running: "提交目标",
     goal_commit_done: "目标已提交",
     goal_commit_refused: "目标未提交",
@@ -1534,7 +1582,7 @@ static ZH: UiText = UiText {
     key_redo: "重做输入编辑",
     key_yank: "恢复最近删掉的文字",
     key_newline: "换行",
-    key_cancel_quit: "取消 / 退出",
+    key_cancel_quit: "取消 / 确认退出并停止本会话后台任务",
     key_screens: "Diff/工具/会话",
     key_expand: "展开/收起最新工具组或命令",
     key_turn_nav: "跳转用户轮次",
@@ -1993,9 +2041,11 @@ static ZH: UiText = UiText {
     background_task_done: "后台任务已完成:{}",
     background_task_failed: "后台任务失败:{}",
     background_task_stopped: "后台任务已停止:{}",
+    background_task_ready: "后台任务已就绪:{}",
     background_task_unknown: "后台任务状态未知:{}",
     background_task_generic: "后台任务",
     background_running_count: "后台 {}",
+    background_ready_count: "就绪 {}",
     background_failed_only: "后台失败 {}",
     issue_page_title: "问题",
     issue_page_hint: "↑↓ 选择 · Enter 展开/收起 · Esc 返回",
@@ -2014,6 +2064,9 @@ static ZH: UiText = UiText {
     background_status_completed: "已完成",
     background_status_failed: "失败",
     background_status_stopped: "已停止",
+    background_status_ready: "服务就绪",
+    background_ready_running: "服务就绪 · 持续运行",
+    background_quiet_for: "已 {} 秒无新输出",
     background_meta_status: "状态",
     background_meta_exit: "退出码",
     background_meta_elapsed: "用时",
@@ -2142,6 +2195,9 @@ static EN: UiText = UiText {
     suggestion_continue: "Continue",
     cancel: "cancel",
     quit: "quit",
+    quit_stopping: "Stopping this session’s work before exiting…",
+    quit_stop_failed: "This session’s work is not confirmed stopped; stayed open: {}",
+    quit_input_paused: "Exit paused automatic sending; send manually or delete",
     jump_bottom: "bottom",
     waiting_model: "waiting for model",
     finalizing_dependencies: "finalizing",
@@ -2182,6 +2238,7 @@ static EN: UiText = UiText {
     approval_pending: "awaiting approval",
     title_awaiting_input: "awaiting input",
     title_waiting_background: "waiting for background task",
+    title_waiting_background_ready: "waiting for service readiness",
     waiting_background_n: "waiting for {} background tasks",
     waiting_child: "waiting for child agent",
     waiting_child_n: "waiting for {} child agents",
@@ -2280,7 +2337,14 @@ static EN: UiText = UiText {
     unsupported_task_action: "Delegation (unsupported)",
     unsupported_task_hint: "task is unsupported; use spawn_agent",
     plan_update_rejected: "plan not updated",
-    goal_update_rejected: "goal unchanged: state it explicitly",
+    goal_update_rejected: "goal not updated: closeout refused by the runtime",
+    goal_refused_children: "goal not updated: sub-agents are still running; their results must land first",
+    goal_refused_pause: "goal not updated: the goal is paused until you authorize continuation",
+    goal_refused_status: "goal not updated: no status given (complete or blocked)",
+    goal_refused_malformed: "goal not updated: the verification fields could not be parsed",
+    goal_refused_evidence: "goal not updated: the verification evidence does not hold",
+    goal_refusal_expand_hint: "▸ see the reason · Ctrl+O",
+    goal_refused_scope: "goal not updated: the user's stated requirements are not all met",
     goal_commit_running: "Committing goal",
     goal_commit_done: "Goal committed",
     goal_commit_refused: "Goal not committed",
@@ -2379,7 +2443,7 @@ static EN: UiText = UiText {
     key_redo: "redo input edit",
     key_yank: "restore recently killed text",
     key_newline: "newline",
-    key_cancel_quit: "cancel / quit",
+    key_cancel_quit: "cancel / confirmed quit stops this session’s background tasks",
     key_screens: "diff/tools/sessions",
     key_expand: "expand/collapse latest tool group or command",
     key_turn_nav: "jump user turns",
@@ -2838,9 +2902,11 @@ static EN: UiText = UiText {
     background_task_done: "Background task finished: {}",
     background_task_failed: "Background task failed: {}",
     background_task_stopped: "Background task stopped: {}",
+    background_task_ready: "Background task ready: {}",
     background_task_unknown: "background task state unknown: {}",
     background_task_generic: "background task",
     background_running_count: "{} jobs",
+    background_ready_count: "{} ready",
     background_failed_only: "background failed {}",
     issue_page_title: "Issues",
     issue_page_hint: "↑↓ select · Enter expand/collapse · Esc back",
@@ -2859,6 +2925,9 @@ static EN: UiText = UiText {
     background_status_completed: "Completed",
     background_status_failed: "Failed",
     background_status_stopped: "Stopped",
+    background_status_ready: "service ready",
+    background_ready_running: "ready · still running",
+    background_quiet_for: "no output for {}s",
     background_meta_status: "Status",
     background_meta_exit: "Exit code",
     background_meta_elapsed: "Elapsed",

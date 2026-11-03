@@ -18,8 +18,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::{
-    ArtifactStore, BackgroundTaskLifetime, BackgroundTaskRegistry, MutationBaseline,
-    ProcessRequest, WorkspaceSnapshot,
+    AdoptedTaskSpec, ArtifactStore, BackgroundTaskLifetime, BackgroundTaskRegistry,
+    MutationBaseline, OutputChunk, ProcessHandoff, ProcessOutput, ProcessRequest, StreamOutcome,
+    WorkspaceSnapshot,
 };
 
 use crate::tool::{ToolContext, ToolError, ToolOutput};
@@ -167,19 +168,31 @@ impl CommandExecution {
                 Some(context.session_scope()),
                 context.writer_scope(),
                 lifetime,
+                context.tool_call_scope.as_deref().map(str::to_string),
             )
             .await
         {
-            Ok(task_id) => Ok(ToolOutput::ok(format!(
-                "background task started\ntask_id: {task_id}\nprogram: {program}\nargs: {args:?}\n\
-             status: running\nlifetime: {}\nUse get_task/wait_task/kill_task with this task_id.",
-                match lifetime {
-                    BackgroundTaskLifetime::Goal => "goal",
-                    BackgroundTaskLifetime::Runtime => "runtime",
-                    BackgroundTaskLifetime::Session => "session",
-                    BackgroundTaskLifetime::Persistent => "persistent",
-                }
-            ))),
+            Ok(task_id) => {
+                Ok(ToolOutput::ok(format!(
+                    "background task started\ntask_id: {task_id}\nprogram: {program}\n\
+                     args: {args:?}\nstatus: running\nlifetime: {} (stopped when {})\n\
+                     execution deadline: none (background hosting owns the process lifetime; \
+                     kill_task stops it and its lifetime ends it)\n\
+                     Use get_task/wait_task/kill_task with this task_id.",
+                    lifetime.as_str(),
+                    lifetime.stop_condition(),
+                ))
+                // The task identity is a structured fact, not only prose: the
+                // executor links this start to the task whose terminal result
+                // will become this goal's evidence.
+                .with_metadata(serde_json::json!({
+                    "task_id": task_id,
+                    "status": "running",
+                    "background": true,
+                    "lifetime": lifetime.as_str(),
+                    "stops_when": lifetime.stop_condition(),
+                })))
+            }
             Err(e) => Ok(ToolOutput::error(format!("background spawn failed: {e}"))),
         }
     }
@@ -232,14 +245,60 @@ impl CommandExecution {
         req
     }
 
-    /// Run a program to completion in the foreground: the shared path both
-    /// command tools take once they have decoded their own arguments.
+    /// Run a program in the foreground: the shared path both command tools take
+    /// once they have decoded their own arguments.
+    ///
+    /// When the process is still the foreground driver's after
+    /// [`FOREGROUND_HANDOFF_AFTER`] and this call is not bounded below that
+    /// window, the same process moves to the background registry and this call
+    /// returns while it runs.
+    ///
+    /// Two durations are kept apart there:
+    ///
+    /// - The caller's `timeout_seconds` is an EXECUTION deadline. It follows the
+    ///   process into the registry, still counted from process start.
+    /// - [`DEFAULT_TIMEOUT_SECS`] is only this call's WAIT budget when the caller
+    ///   set no deadline. It bounds how long one tool call blocks, not how long
+    ///   the process may live: a 20-minute service is not killed at 2 minutes.
+    ///
+    /// A credential-bearing Git command stays here until it exits, so the staged
+    /// secret is not left on disk.
+    /// Run one command in the foreground with the default cleanup boundary for
+    /// anything the handoff moves to the background.
     pub async fn run_foreground(
         &self,
         program: &str,
         args: Vec<String>,
         cwd_rel: Option<&str>,
         timeout_seconds: Option<u64>,
+        context: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.run_foreground_with_lifetime(
+            program,
+            args,
+            cwd_rel,
+            timeout_seconds,
+            None,
+            context,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Run one command in the foreground, keeping the caller's own cleanup
+    /// boundary if the wait budget moves it to the background.
+    ///
+    /// The boundary is the caller's decision: a command that a tool call
+    /// happens to outlive must not be silently reclassified as goal-owned work,
+    /// which is what happened when every handoff was adopted as `Goal`.
+    pub async fn run_foreground_with_lifetime(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        cwd_rel: Option<&str>,
+        timeout_seconds: Option<u64>,
+        handoff_lifetime: Option<BackgroundTaskLifetime>,
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
@@ -270,8 +329,14 @@ impl CommandExecution {
 
         let scope = context.write_scope();
         let mut request = ProcessRequest::new(program, args, cwd);
-        let timeout = resolve_timeout(timeout_seconds);
-        request.timeout = timeout;
+        // A deadline the CALLER stated, as opposed to this call's own wait
+        // budget. Only the former may outlive the call it was written on.
+        let caller_deadline = caller_deadline(timeout_seconds);
+        // What one call may block for. This is the caller's deadline when they
+        // stated one, and the default budget otherwise — never "the process may
+        // run forever".
+        request.timeout = resolve_timeout(timeout_seconds);
+        let foreground_timeout = request.timeout;
         let network_scope = context.policy.network_scope();
         let network_denied = matches!(network_scope, leveler_execution::NetworkScope::None);
         request.network_scope = network_scope.clone();
@@ -350,15 +415,58 @@ impl CommandExecution {
         };
 
         let sandboxed = request.write_scope.confines();
-        let output = match context.output.clone() {
-            Some(chunks) => {
-                context
-                    .execution
-                    .runner
-                    .run_streaming(request, cancellation, chunks)
-                    .await?
+        // The handoff is a transfer of this driver, not a second liveness check.
+        // A timeout at or under the threshold kills on the original path, and a
+        // staged Git credential never leaves this call.
+        let handoff = request.timeout > FOREGROUND_HANDOFF_AFTER
+            && !isolation
+                .as_ref()
+                .is_some_and(|iso| iso.carries_credential());
+        let output = if handoff {
+            let shown_program = request.program.clone();
+            let shown_args = request.args.clone();
+            let baseline = snapshot.as_ref().map(|id| MutationBaseline {
+                snapshot: id.clone(),
+                workspace_root: root.clone(),
+                write_scope: request.write_scope.clone(),
+            });
+            match self
+                .hand_off_if_still_running(
+                    request,
+                    caller_deadline,
+                    handoff_lifetime,
+                    cancellation,
+                    context.output.clone(),
+                    baseline,
+                    &context,
+                )
+                .await?
+            {
+                ForegroundDrive::Finished(output) => output,
+                ForegroundDrive::StillRunning(task_id) => {
+                    if let Some(iso) = isolation {
+                        let _ = iso.keep();
+                    }
+                    return Ok(foreground_handoff_output(
+                        &shown_program,
+                        &shown_args,
+                        &task_id,
+                        caller_deadline,
+                        handoff_lifetime.unwrap_or(BackgroundTaskLifetime::Goal),
+                    ));
+                }
             }
-            None => context.execution.runner.run(request, cancellation).await?,
+        } else {
+            match context.output.clone() {
+                Some(chunks) => {
+                    context
+                        .execution
+                        .runner
+                        .run_streaming(request, cancellation, chunks)
+                        .await?
+                }
+                None => context.execution.runner.run(request, cancellation).await?,
+            }
         };
 
         // Detect what the command changed so scope checks and budgets see
@@ -440,7 +548,15 @@ impl CommandExecution {
         if output.timed_out {
             // Name the limit that fired: the model can't tell a too-tight timeout
             // from a genuinely hung command without it.
-            body.push_str(&format!("[timed out after {}s]\n", timeout.as_secs()));
+            let source = if caller_deadline.is_some() {
+                "the execution deadline this call set"
+            } else {
+                "this call's default wait budget"
+            };
+            body.push_str(&format!(
+                "[timed out after {}s] ({source})\n",
+                foreground_timeout.as_secs()
+            ));
         }
         body.push_str(&format!(
             "exit: {}\n",
@@ -527,6 +643,215 @@ impl CommandExecution {
         };
         Ok(out)
     }
+
+    /// Drive one foreground command that may be adopted at [`FOREGROUND_HANDOFF_AFTER`].
+    ///
+    /// The driver's own select decides the race: process exit and cancellation
+    /// beat the handoff. This function does not probe the process and then adopt.
+    async fn hand_off_if_still_running(
+        &self,
+        request: ProcessRequest,
+        caller_deadline: Option<Duration>,
+        handoff_lifetime: Option<BackgroundTaskLifetime>,
+        cancellation: CancellationToken,
+        live: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
+        baseline: Option<MutationBaseline>,
+        context: &ToolContext,
+    ) -> Result<ForegroundDrive, ToolError> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let handoff = CancellationToken::new();
+        let timer = {
+            let handoff = handoff.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(FOREGROUND_HANDOFF_AFTER).await;
+                handoff.cancel();
+            })
+        };
+        let runner = context.execution.runner.clone();
+        let run_cancel = cancellation.clone();
+        let mut run = tokio::spawn(async move {
+            runner
+                .run_streaming_handoff(request, run_cancel, tx, handoff)
+                .await
+        });
+        let mut initial_output = String::new();
+        let joined = loop {
+            tokio::select! {
+                joined = &mut run => break joined,
+                chunk = rx.recv() => match chunk {
+                    Some(chunk) => {
+                        forward_live(&live, &chunk);
+                        push_output_tail(&mut initial_output, &chunk.text);
+                    }
+                    None => break run.await,
+                },
+            }
+        };
+        timer.abort();
+        let outcome =
+            joined.map_err(|error| ToolError::Io(format!("command driver failed: {error}")))?;
+        match outcome {
+            StreamOutcome::Completed(result) => {
+                while let Some(chunk) = rx.recv().await {
+                    forward_live(&live, &chunk);
+                }
+                Ok(ForegroundDrive::Finished(result?))
+            }
+            StreamOutcome::HandedOff(parts) => {
+                if cancellation.is_cancelled() {
+                    let output = finish_foreground_handoff(
+                        &context.execution.runner,
+                        *parts,
+                        &mut rx,
+                        cancellation,
+                        &live,
+                    )
+                    .await?;
+                    return Ok(ForegroundDrive::Finished(output));
+                }
+                let started = parts.started;
+                let spec = AdoptedTaskSpec {
+                    owner_scope: Some(context.session_scope().to_string()),
+                    writer_scope: context.writer_scope().to_string(),
+                    // The call that is being handed over: its result is still
+                    // the START, so the eventual exit has to be attributable to
+                    // it for the goal's evidence.
+                    origin_call_id: context.tool_call_scope.as_deref().map(str::to_string),
+                    program: parts.request.program.clone(),
+                    args: parts.request.args.clone(),
+                    cwd: parts.request.cwd.clone(),
+                    write_scope: parts.request.write_scope.clone(),
+                    // The caller's boundary survives the handoff; the default
+                    // stays `Goal` for a command that expressed none.
+                    lifetime: handoff_lifetime.unwrap_or(BackgroundTaskLifetime::Goal),
+                    started,
+                    // Only a deadline the caller stated follows the execution
+                    // here; the call's own wait budget ended with the call.
+                    deadline: caller_deadline,
+                    initial_output,
+                    observer: None,
+                    on_adopted: None,
+                    mutation_baseline: baseline,
+                };
+                match self
+                    .background_tasks
+                    .adopt(*parts, rx, spec, CancellationToken::new())
+                    .await
+                {
+                    Ok(task_id) => Ok(ForegroundDrive::StillRunning(task_id)),
+                    Err(error) => {
+                        let mut chunks = error.chunks;
+                        let output = finish_foreground_handoff(
+                            &context.execution.runner,
+                            error.handoff,
+                            &mut chunks,
+                            cancellation,
+                            &live,
+                        )
+                        .await?;
+                        Ok(ForegroundDrive::Finished(output))
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum ForegroundDrive {
+    Finished(ProcessOutput),
+    StillRunning(String),
+}
+
+fn foreground_handoff_output(
+    program: &str,
+    args: &[String],
+    task_id: &str,
+    deadline: Option<Duration>,
+    lifetime: BackgroundTaskLifetime,
+) -> ToolOutput {
+    // The consequence is stated by the layer that decides it: a caller who
+    // asked for a 600s limit must be told the service ends at 600s, and a
+    // caller who set no limit must not be told the tool call's own wait budget
+    // is still running.
+    let (lifetime_line, deadline_secs) = match deadline {
+        Some(deadline) => (
+            format!(
+                "execution deadline: timeout_seconds={} set by this call; the process and its \
+                 process group will be terminated {}s after it started.\n\
+                 For a service that must keep running, start it with background=true (or stop it \
+                 explicitly with kill_task).\n",
+                deadline.as_secs(),
+                deadline.as_secs(),
+            ),
+            Some(deadline.as_secs()),
+        ),
+        None => (
+            "execution deadline: none. This call set no timeout_seconds, so the process is now \
+             owned by its task lifecycle. It keeps running until it exits, kill_task stops it, \
+             or the boundary above ends it.\n"
+                .to_string(),
+            None,
+        ),
+    };
+    ToolOutput::ok(format!(
+        "foreground command moved to the background after {}s\n\
+         task_id: {task_id}\n\
+         program: {program}\n\
+         args: {args:?}\n\
+         status: running\n\
+         lifetime: {} (stopped when {})\n\
+         The process is still running. This is not a successful exit.\n\
+         {lifetime_line}\
+         Use wait_task to read the final result, get_task to observe it, or kill_task to stop it.\n",
+        FOREGROUND_HANDOFF_AFTER.as_secs(),
+        lifetime.as_str(),
+        lifetime.stop_condition(),
+    ))
+    .with_metadata(serde_json::json!({
+        "task_id": task_id,
+        "status": "running",
+        "background": true,
+        "lifetime": lifetime.as_str(),
+        "deadline_seconds": deadline_secs,
+    }))
+}
+
+fn forward_live(live: &Option<tokio::sync::mpsc::Sender<OutputChunk>>, chunk: &OutputChunk) {
+    if let Some(live) = live {
+        let _ = live.try_send(chunk.clone());
+    }
+}
+
+fn push_output_tail(buf: &mut String, text: &str) {
+    buf.push_str(text);
+    if buf.len() <= HANDOFF_OUTPUT_TAIL {
+        return;
+    }
+    let start = leveler_core::ceil_char_boundary(buf, buf.len() - HANDOFF_OUTPUT_TAIL);
+    buf.drain(..start);
+}
+
+async fn finish_foreground_handoff(
+    runner: &leveler_execution::CommandRunner,
+    handoff: ProcessHandoff,
+    chunks: &mut tokio::sync::mpsc::Receiver<OutputChunk>,
+    cancellation: CancellationToken,
+    live: &Option<tokio::sync::mpsc::Sender<OutputChunk>>,
+) -> Result<ProcessOutput, ToolError> {
+    let mut finish = Box::pin(runner.finish_handoff(handoff, cancellation));
+    let result = loop {
+        tokio::select! {
+            result = &mut finish => break result,
+            chunk = chunks.recv() => match chunk {
+                Some(chunk) => forward_live(live, &chunk),
+                None => break finish.await,
+            },
+        }
+    };
+    while let Some(chunk) = chunks.recv().await {
+        forward_live(live, &chunk);
+    }
+    Ok(result?)
 }
 
 /// Show at most `MAX_OUTPUT` bytes, keeping head AND tail (build/test errors
@@ -568,6 +893,15 @@ pub(super) fn truncate_or_spill(
 /// Default command timeout, and the ceiling we clamp any request to.
 pub(super) const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub(super) const MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// How long an agent foreground command stays on the tool call before the same
+/// process is adopted by the background registry. This is not a timeout and
+/// not a failure: the execution timeout still starts at process spawn.
+const FOREGROUND_HANDOFF_AFTER: Duration = Duration::from_secs(15);
+
+/// Output already streamed before a handoff, kept so the background log does
+/// not start after the transfer. Only the tail is retained.
+const HANDOFF_OUTPUT_TAIL: usize = 64 * 1024;
 
 #[cfg(test)]
 mod exit_taxonomy_tests {
@@ -774,11 +1108,19 @@ mod exit_taxonomy_tests {
 /// is clamped so a stray huge value can't wedge the agent forever — use
 /// `background=true` for genuinely long-lived processes.
 pub(super) fn resolve_timeout(timeout_seconds: Option<u64>) -> Duration {
-    let secs = timeout_seconds
-        .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
-        .min(MAX_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+    caller_deadline(timeout_seconds).unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+}
+
+/// The execution deadline the CALLER stated, if any.
+///
+/// `None` (or zero, which cannot mean "expire immediately") is not a deadline:
+/// it is the absence of one. [`resolve_timeout`] turns that absence into this
+/// call's own wait budget, which is a different thing — a wait budget ends with
+/// the call, an execution deadline follows the process.
+fn caller_deadline(timeout_seconds: Option<u64>) -> Option<Duration> {
+    timeout_seconds
+        .filter(|&secs| secs > 0)
+        .map(|secs| Duration::from_secs(secs.min(MAX_TIMEOUT_SECS)))
 }
 
 #[cfg(test)]
@@ -956,5 +1298,369 @@ mod grant_tests {
         );
         assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "elevated");
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod foreground_handoff_tests {
+    use super::*;
+    use crate::tool::{Tool, ToolContext};
+    use crate::tools::{GetTaskTool, WaitTaskTool};
+    use leveler_execution::{
+        BackgroundTaskLifetime, BackgroundTaskRegistry, BackgroundTaskStatus, PermissionProfile,
+        Workspace,
+    };
+    use leveler_test_support::git::scratch_repo;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    fn harness(
+        dir: &std::path::Path,
+    ) -> (ToolContext, Arc<BackgroundTaskRegistry>, CommandExecution) {
+        let ws = Workspace::new(dir).unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        ));
+        let reg = Arc::new(BackgroundTaskRegistry::with_environment(
+            environment.clone(),
+        ));
+        let commands = CommandExecution::new(reg.clone(), None);
+        let ctx = ToolContext::with_environment(ws, PermissionProfile::Assisted, environment);
+        (ctx, reg, commands)
+    }
+
+    fn task_id_of(content: &str) -> Option<String> {
+        content
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_short_command_still_returns_its_exit_and_registers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg, commands) = harness(dir.path());
+        let started = Instant::now();
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "echo hi".into()],
+                Some("."),
+                Some(60),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.content.contains("exit: 0"), "{out:?}");
+        assert!(task_id_of(&out.content).is_none(), "{out:?}");
+        assert!(
+            reg.active_snapshots().await.is_empty(),
+            "a finished command must not become a background task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_timeout_kills_before_the_foreground_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg, commands) = harness(dir.path());
+        let started = Instant::now();
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                Some("."),
+                Some(2),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.metadata["timed_out"], true, "{out:?}");
+        assert!(out.content.contains("[timed out after 2s]"), "{out:?}");
+        assert!(
+            reg.active_snapshots().await.is_empty(),
+            "a timeout must kill the command, not move it to the background: {out:?}"
+        );
+    }
+
+    /// `setsid` leaves the sleep outside the shell's process group. The shell
+    /// itself exits at once, so the command is not handed off, and the orphan
+    /// is not registered as its own task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_that_exits_does_not_register_a_detached_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg, commands) = harness(dir.path());
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "setsid sleep 40 >/dev/null 2>&1 </dev/null & echo $!".into(),
+                ],
+                Some("."),
+                Some(30),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let orphan = out
+            .content
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .next();
+        assert!(out.content.contains("exit: 0"), "{out:?}");
+        assert!(reg.active_snapshots().await.is_empty(), "{out:?}");
+        if let Some(pid) = orphan {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
+
+    /// The caller's cleanup boundary survives the handoff. A command the tool
+    /// call outlives must not be silently reclassified as goal-owned work: that
+    /// is what let a service the model asked to keep running be stopped when the
+    /// goal settled.
+    #[tokio::test]
+    async fn a_handed_off_command_keeps_the_lifetime_the_caller_chose() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = harness(dir.path());
+        let out = commands
+            .run_foreground_with_lifetime(
+                "sh",
+                vec!["-c".into(), "sleep 16".into()],
+                Some("."),
+                Some(60),
+                Some(BackgroundTaskLifetime::Session),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        let task_id = task_id_of(&out.content).expect("task id");
+        assert!(
+            out.content.contains("lifetime: session"),
+            "the result states the caller's own boundary: {out:?}"
+        );
+        let snap = reg.get(&task_id).await.expect("registered");
+        assert_eq!(
+            snap.lifetime,
+            BackgroundTaskLifetime::Session,
+            "the adopted task must keep the boundary the call chose"
+        );
+        let _ = reg.kill(&task_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_command_still_running_after_15s_is_handed_to_the_existing_registry() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = harness(dir.path());
+        let started = Instant::now();
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "echo before; sleep 16; echo hi > created.txt".into(),
+                ],
+                Some("."),
+                Some(60),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the tool call must return at the handoff, not when the command exits: {elapsed:?}"
+        );
+        assert!(!out.is_error, "{out:?}");
+        assert!(
+            out.content.contains("status: running"),
+            "running is not an exit: {out:?}"
+        );
+        assert!(
+            !out.content.contains("exit:"),
+            "a handoff must not report an exit code: {out:?}"
+        );
+        let task_id = task_id_of(&out.content).expect("task id");
+        let snap = reg.get(&task_id).await.expect("registered");
+        assert_eq!(snap.status, BackgroundTaskStatus::Running);
+        let pid = snap.pid.expect("the adopted process keeps its pid");
+        let probe = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .status()
+            .expect("ps");
+        assert!(
+            probe.success(),
+            "pid {pid} must be the still-running process"
+        );
+
+        let wait = WaitTaskTool::new(reg.clone())
+            .execute(
+                serde_json::json!({"task_id": task_id, "timeout_seconds": 20}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!wait.is_error, "the command then exits 0: {}", wait.content);
+        let modified: Vec<String> = wait
+            .metadata
+            .get("modified_files")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            modified.iter().any(|path| path == "created.txt"),
+            "settlement still belongs to the adopted task: {modified:?} {}",
+            wait.content
+        );
+    }
+    /// LT-02 on the adopted path: a `timeout_seconds` the caller set is an
+    /// execution deadline, and the move to the background does not extend it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_caller_deadline_still_ends_an_adopted_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg, commands) = harness(dir.path());
+        let started = Instant::now();
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "sleep 60".into()],
+                Some("."),
+                // Longer than the 15s handoff, short enough to observe.
+                Some(17),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content
+                .contains("execution deadline: timeout_seconds=17"),
+            "the handoff must state the consequence of the deadline: {out:?}"
+        );
+        let task_id = task_id_of(&out.content).expect("task id");
+        assert_eq!(out.metadata["deadline_seconds"], 17, "{out:?}");
+        let wait = WaitTaskTool::new(reg.clone())
+            .execute(
+                serde_json::json!({"task_id": task_id, "timeout_seconds": 20}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the deadline must fire on schedule: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            wait.content.contains("timeout_seconds=17"),
+            "the terminal result must name the deadline that ended it: {wait:?}"
+        );
+        assert!(
+            reg.active_snapshots().await.is_empty(),
+            "an execution deadline ends the task: {wait:?}"
+        );
+    }
+
+    /// LT-04/LT-05: no caller deadline means no process deadline. The call's
+    /// own wait budget ends with the call; the process keeps running and stays
+    /// observable until its owner stops it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_with_no_caller_deadline_keeps_running_after_the_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg, commands) = harness(dir.path());
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "echo serving; sleep 60".into()],
+                Some("."),
+                None,
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("execution deadline: none"),
+            "a hosted execution must not be described as deadline-bound: {out:?}"
+        );
+        assert!(
+            out.metadata["deadline_seconds"].is_null(),
+            "no deadline is a fact, not a number: {out:?}"
+        );
+        let task_id = task_id_of(&out.content).expect("task id");
+        // Past the handoff, observed again later: the call's budget is gone,
+        // the process is not.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let still = reg.get(&task_id).await.expect("registered");
+        assert_eq!(still.status, BackgroundTaskStatus::Running, "{still:?}");
+        let get = GetTaskTool::new(reg.clone())
+            .execute(
+                serde_json::json!({"task_id": task_id}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            get.content.contains("status: running"),
+            "the service must stay observable: {get:?}"
+        );
+        reg.kill(&task_id).await.expect("stop it explicitly");
+    }
+
+    /// LT-04: `background=true` is the explicit hosting path, and it reports a
+    /// structured task identity so a start can be linked to its result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_explicit_background_command_reports_its_task_and_has_no_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg, commands) = harness(dir.path());
+        let out = commands
+            .start_background(
+                "sh",
+                vec!["-c".into(), "sleep 20".into()],
+                Some("."),
+                BackgroundTaskLifetime::Goal,
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        let task_id = task_id_of(&out.content).expect("task id");
+        assert_eq!(out.metadata["task_id"], task_id);
+        assert_eq!(out.metadata["status"], "running");
+        assert!(out.content.contains("execution deadline: none"), "{out:?}");
+        reg.kill(&task_id).await.expect("stop it explicitly");
     }
 }

@@ -108,6 +108,10 @@ pub enum ProtocolRepairKind {
     /// refused the declaration for missing acceptance coverage. The user's
     /// request is still outstanding; the refusal settled the contract only.
     TaskRegistrationRefused,
+    /// A goal turn settled its goal and has not yet written anything for the
+    /// person. The goal is resolved — this is the delivery round, not a
+    /// continuation, and nothing about it reopens the goal.
+    GoalSettledDelivery,
 }
 
 /// A harness notice written into the transcript under the user transport role.
@@ -457,6 +461,7 @@ mod tests {
             ProtocolRepairKind::GoalUnresolved,
             ProtocolRepairKind::PlanUnresolved,
             ProtocolRepairKind::TaskRegistrationRefused,
+            ProtocolRepairKind::GoalSettledDelivery,
         ] {
             let class =
                 classify_transcript_origin(Some(&TranscriptOrigin::ProtocolRepair { repair }));

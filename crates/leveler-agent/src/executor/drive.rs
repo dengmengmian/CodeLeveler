@@ -43,7 +43,10 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::{goal_continuation_nudge, plan_unresolved_nudge, task_unregistered_nudge};
+use crate::nudges::{
+    goal_continuation_nudge, goal_settled_delivery_nudge, plan_unresolved_nudge,
+    task_unregistered_nudge,
+};
 
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
@@ -131,6 +134,21 @@ const MAX_LENGTH_CONTINUATIONS: u32 = 2;
 /// run the check again. Three lets that correction land, then stops.
 /// A round that executes a tool resets the count.
 const MAX_VERIFICATION_RECOVERY_ROUNDS: u32 = 3;
+
+/// Tool rounds the drive may run AFTER `update_goal` resolved the goal, before
+/// it owes one delivery request that already contains those tool results.
+///
+/// Accepting a resolution settles the goal, not the delivery. A round that
+/// runs a tool is wrap-up: ending the turn on its result drops the answer,
+/// because the model has not seen that result yet. This bound limits the
+/// wrap-up. Reaching it schedules one more model request. If that request
+/// runs tools again, those tools execute and the turn ends honestly — the
+/// follow-up was the delivery, and spending it on more tools does not buy
+/// another one.
+const MAX_SETTLED_DELIVERY_ROUNDS: u32 = 2;
+/// How many started-but-unresolved commands the completion gate remembers.
+/// Feedback only: the newest starts are the ones a completion can cite.
+const MAX_PENDING_COMMANDS: usize = 16;
 
 /// How often the goal gate may return the SAME refusal before the run stops.
 ///
@@ -230,6 +248,13 @@ pub(crate) struct Drive<'a> {
     /// of these facts, and a failed test/build is hard evidence against
     /// `update_goal(complete)`.
     verification_runs: Vec<super::goal_verification::VerificationRun>,
+    /// Commands this drive STARTED and has not seen a result for, newest last.
+    ///
+    /// Not evidence — a running process proves nothing yet — but a fact the
+    /// completion gate must read, so a citation of it is refused for the true
+    /// reason (no result yet) and names the task to wait on. Bounded: this is
+    /// feedback, not a ledger.
+    pending_commands: Vec<super::goal_verification::PendingCommand>,
     /// Consecutive rounds with no executed tool call in which a
     /// goal-verification refusal arrived, including a round that also refused
     /// another call before it ran. Not the generic no-progress streak: the
@@ -242,6 +267,12 @@ pub(crate) struct Drive<'a> {
     /// returned unchanged. Set to the gate's own message when the bound is
     /// reached, so the round can stop after its results are durable.
     repeated_gate_refusal: Option<(String, u32)>,
+    /// The last acceptance-scope refusal text this drive returned.
+    ///
+    /// Kept apart from [`Self::repeated_gate_refusal`] on purpose: that slot is
+    /// shared with the verification gate, which clears it on a pass, so reading
+    /// it here made every requirements refusal look new.
+    requirements_refusal: Option<String>,
     /// The last `commit_task` scope refusal. A deterministic refusal changes
     /// nothing when retried with the same objective and acceptance, so the
     /// model is told it is repeating itself instead of being left to guess.
@@ -256,6 +287,25 @@ pub(crate) struct Drive<'a> {
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
     completion_warnings: Vec<String>,
+    /// The resolution accepted this drive (`update_goal` completed/blocked) and
+    /// its summary.
+    ///
+    /// Accepting a resolution settles the GOAL; it does not write anything for
+    /// the person. The run therefore keeps going for a delivery round instead
+    /// of ending on the tool call, and this remembers what the terminal must
+    /// report when it eventually stops.
+    settled_goal: Option<(StopReason, String)>,
+    /// Tool rounds spent AFTER the goal settled. A quiet answer does not
+    /// count: the bound limits wrap-up, not the delivery itself.
+    settled_rounds: u32,
+    /// Prose the turn can end on. Set when a round speaks and does not run a
+    /// work tool; cleared when a later work tool runs. A process sentence
+    /// that a tool call followed is not this, and neither is [`Self::last_text`].
+    terminal_answer: Option<String>,
+    /// The one model request issued after wrap-up tool results, so the model
+    /// can write the answer it has not written yet. A further tool round does
+    /// not schedule another one.
+    delivery_followup_issued: bool,
     decode_retries: u32,
     length_continuations: u32,
     continued_text: String,
@@ -288,6 +338,78 @@ pub(crate) struct Drive<'a> {
     /// by what the failed fold would have reclaimed; the hard bound always
     /// retries, because there the fold is mandatory.
     soft_fold_retry_at: Option<u64>,
+}
+
+/// What the delivery round is told once `update_goal` resolved the goal.
+///
+/// Facts only: the resolution is recorded, the person has not been answered,
+/// and these background tasks are still running under the lifetime they were
+/// started with. A running task is not unfinished goal work. The model decides
+/// what to say; the runtime never writes the answer.
+fn settled_delivery_notice(reason: StopReason, running: &[String]) -> String {
+    let resolution = match reason {
+        StopReason::Blocked => "blocked",
+        _ => "complete",
+    };
+    let mut notice = format!(
+        "update_goal(status=\"{resolution}\") was accepted and is recorded for this goal. \
+         Nothing has been said to the person who asked yet: this round is the delivery, not \
+         more goal work.\n\n\
+         Write the answer for them now, from what actually happened: what you did, which checks \
+         really ran and what they returned, what is still true afterwards, and anything that did \
+         not work. Do not describe a step as verified unless its result is in this \
+         conversation. Do not call update_goal again.\n"
+    );
+    if !running.is_empty() {
+        notice.push_str(&format!(
+            "\nBackground tasks still running:\n- {}\n\
+             A task that is still running is not unfinished goal work, and the answer does not \
+             wait for it to exit. Report the lifetime already recorded for each one. Do not stop \
+             or restart a service unless the person asked for that.\n",
+            running.join("\n- ")
+        ));
+    }
+    notice.push_str(
+        "\nIf a check is still required, run it. Its result comes back before the answer is \
+         due, and the answer is still owed after that result returns.\n",
+    );
+    notice
+}
+
+/// The one request after wrap-up tool results. The checks have already run;
+/// this states that fact and that the answer is still missing.
+fn delivery_followup_notice() -> String {
+    "The checks requested after the goal was accepted have returned and are in this \
+     conversation. The person still has no answer: this round is the delivery. Write it now \
+     from those results. Do not call update_goal again.\n"
+        .to_string()
+}
+
+/// `update_goal` and `update_plan` record a decision. They do not act on the
+/// prose in front of them, so they do not spend a delivery round and do not
+/// erase an answer.
+fn is_goal_bookkeeping(name: &str) -> bool {
+    name == UPDATE_GOAL_TOOL || name == "update_plan"
+}
+
+/// Summarize one running task for a delivery notice: its id and what it runs.
+fn task_line(task: &leveler_execution::BackgroundTaskSnapshot) -> String {
+    let line = if task.args.is_empty() {
+        task.program.clone()
+    } else {
+        format!("{} {}", task.program, task.args.join(" "))
+    };
+    let mut shown = line;
+    if shown.chars().count() > 120 {
+        shown = shown.chars().take(117).collect::<String>();
+        shown.push_str("...");
+    }
+    format!(
+        "{} ({}; stops when {})",
+        task.id,
+        shown,
+        task.lifetime.stop_condition()
+    )
 }
 
 struct CompactionObserver<'a, 'b> {
@@ -405,8 +527,26 @@ fn log_compaction_summary_failure(
 }
 
 impl Executor {
-    pub(crate) fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
+    /// The tool table this executor would ask a model for, before capability
+    /// exposure filtering.
+    ///
+    /// Two consumers: [`Self::request_tool_definitions`] (what the model sees)
+    /// and [`Self::unexposed_pack_inventory`] (what enabling a pack would add).
+    /// They must come from one list, or the stated size of a pack becomes a
+    /// second opinion about the tool table.
+    fn candidate_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = self.projected_tool_registry().definitions();
+        // Tools discovered during this turn (an external catalog that came up
+        // mid-turn) join the surface before capability filtering below, so an
+        // unexposed pack stays unexposed.
+        if self.depth == 0 {
+            let discovered = self
+                .discovered
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .definitions();
+            tools.extend(discovered);
+        }
         // A child clarifier is unattended. Only the top-level turn can ask
         // the user. `ask_user` remains a parser alias of this tool.
         if self.depth == 0
@@ -465,6 +605,43 @@ impl Executor {
         if self.goal_mode() {
             tools.push(update_goal_tool_definition());
         }
+        tools
+    }
+
+    /// Packs that are on offer on this request, with how many tools enabling
+    /// each one would add to the surface.
+    ///
+    /// This is the host fact a model cannot observe: an unexposed pack's tools
+    /// are absent from the tool table, so nothing in the conversation says the
+    /// pack exists or how much is behind it. "Some capabilities are available
+    /// on demand" is not an inventory — a model told to check a connected
+    /// external surface has no way to learn that the surface is callable at
+    /// all, and goes around the harness instead.
+    ///
+    /// Counts, never tool names: the pack is the unit the model enables.
+    fn unexposed_pack_inventory(&self) -> Vec<(crate::capability::CapabilityId, usize)> {
+        use crate::capability::tool_capability;
+        let Some(state) = &self.capabilities else {
+            return Vec::new();
+        };
+        let mut counts: std::collections::BTreeMap<crate::capability::CapabilityId, usize> =
+            std::collections::BTreeMap::new();
+        for tool in self.candidate_tool_definitions() {
+            let Some(id) = tool_capability(&tool.name) else {
+                continue;
+            };
+            // Only a pack the host can really give the model: availability and
+            // permission are host facts, exposure belongs to this request.
+            if !state.available(id) || !state.is_permitted(id) || state.exposed(id) {
+                continue;
+            }
+            *counts.entry(id).or_default() += 1;
+        }
+        counts.into_iter().filter(|(_, count)| *count > 0).collect()
+    }
+
+    pub(crate) fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut tools = self.candidate_tool_definitions();
 
         if let Some(state) = &self.capabilities {
             // Exposure is the same in every permission mode: FullAccess
@@ -475,6 +652,24 @@ impl Executor {
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
+    }
+
+    /// Ask the host catalog once, before the turn's opening surface is
+    /// composed, and record the availability of every pack whose tools arrived.
+    ///
+    /// Ownership, exposure and permission are untouched: this only makes the
+    /// catalog's existence a fact the first request can state.
+    async fn absorb_initial_catalog(&self) {
+        use crate::capability::tool_capability;
+        let added = self.absorb_discovered_tools().await;
+        if added.is_empty() {
+            return;
+        }
+        if let Some(state) = &self.capabilities {
+            for id in added.iter().filter_map(|name| tool_capability(name)) {
+                state.note_available(id);
+            }
+        }
     }
 
     /// Run the CodeLeveler coding harness over the generic agent kernel.
@@ -492,16 +687,31 @@ impl Executor {
         cancellation: CancellationToken,
         aborted: &mut AbortedFacts,
     ) -> Result<AgentOutcome, DriveAborted> {
+        // A host catalog that is already reachable is part of the FIRST
+        // request's surface. Absorbing it only from round two meant the opening
+        // tool table was composed from a host fact the runtime had not asked
+        // for yet: the pack looked empty, so the request could not say what was
+        // on offer even though the server had been up since before the turn.
+        // A catalog that comes up later is still absorbed per round
+        // (`on_round_start`) and announced as a growth.
+        self.absorb_initial_catalog().await;
         let tools = self.request_tool_definitions();
         if let Some(state) = &self.capabilities {
-            tracing::info!(event="capability_available",catalog_tokens=leveler_model::estimate_text(&state.catalog().to_string()),catalog=%state.catalog());
+            // The pack inventory is a host fact the model receives on every
+            // request; recording it makes "the request stated what was on
+            // offer" checkable offline instead of inferred.
+            let on_offer = self.unexposed_pack_inventory();
+            tracing::info!(event="capability_available",catalog_tokens=leveler_model::estimate_text(&state.catalog().to_string()),catalog=%state.catalog(),packs_on_offer=?on_offer.iter().map(|(id, n)| format!("{}:{n}", id.as_str())).collect::<Vec<_>>());
             tracing::info!(event="tool_surface_changed",reason="initial",active_capabilities=?state.active(),tool_count=tools.len(),schema_tokens=leveler_model::estimate_tool_definitions(&tools),tool_names=?tools.iter().map(|tool|&tool.name).collect::<Vec<_>>());
         }
         if self.capabilities.is_some() {
             control_context.blocks.push(PromptSegment::control(
-                "capability_discovery", PromptSource::ExecutionState,
-                PromptAuthority::CoreContract, SegmentLifecycle::SessionPrefix, true,
-                "Additional capabilities are available on demand. Use capability(action=\"list\") to discover them, then capability(action=\"enable\", id=...) when needed. Enabled tools appear on the following request.",
+                "capability_discovery",
+                PromptSource::ExecutionState,
+                PromptAuthority::CoreContract,
+                SegmentLifecycle::SessionPrefix,
+                true,
+                capability_discovery_fact(&self.unexposed_pack_inventory()),
             ));
         }
         // Legacy sessions contain System rows. Recover only their source
@@ -677,11 +887,17 @@ impl Executor {
             // mechanism (goal resolution, empty answer).
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
             verification_runs: self.seeded_verification_runs.clone(),
+            pending_commands: Vec::new(),
             goal_gate_recovery_rounds: 0,
             repeated_gate_refusal: None,
+            requirements_refusal: None,
             commit_refusal: None,
             registration_refused: None,
             completion_warnings: Vec::new(),
+            settled_goal: None,
+            settled_rounds: 0,
+            terminal_answer: None,
+            delivery_followup_issued: false,
             decode_retries: 0,
             length_continuations: 0,
             continued_text: String::new(),
@@ -1339,6 +1555,93 @@ impl<'a> Drive<'a> {
         Ok(())
     }
 
+    /// Record a delivery repair and give the model another request.
+    async fn inject_settled_delivery(
+        &mut self,
+        messages: &mut Vec<Message>,
+        model_steps: u32,
+        text: String,
+    ) -> Result<(), AgentError> {
+        let message = Message::user(
+            text,
+            TranscriptOrigin::ProtocolRepair {
+                repair: ProtocolRepairKind::GoalSettledDelivery,
+            },
+        );
+        self.sink.append(&[message.clone()]).await?;
+        messages.push(message);
+        (self.observer)(AgentEvent::AdvisoryStarted {
+            kind: AdvisoryKind::CloseoutNudge(CloseoutReason::GoalSettledDelivery),
+        });
+        (self.observer)(AgentEvent::runtime_injection(
+            crate::executor::RuntimeInjectionKind::CloseoutNudge(
+                CloseoutReason::GoalSettledDelivery,
+            ),
+            model_steps.saturating_add(1),
+        ));
+        Ok(())
+    }
+
+    /// Publish the terminal for a goal whose resolution this drive accepted.
+    ///
+    /// The person's answer is the model's own final text; the goal summary is
+    /// the fallback that already existed and is never dressed up as an answer.
+    /// When neither exists the terminal carries that fact as a warning instead
+    /// of pretending a delivery happened.
+    async fn finish_settled_goal(
+        &mut self,
+        rt: &mut LoopContext,
+        messages: &mut Vec<Message>,
+        model_steps: u32,
+    ) -> Result<Flow<AgentOutcome>, AgentError> {
+        let Some((reason, summary)) = self.settled_goal.take() else {
+            return Err(AgentError::ContextManagementFailure(
+                "settled goal terminal requested without a resolution".to_string(),
+            ));
+        };
+        let delivered = self
+            .terminal_answer
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty());
+        let final_text = if delivered {
+            self.terminal_answer.clone().unwrap_or_default()
+        } else {
+            summary
+        };
+        // Epoch terminal: next Content turn must not inherit Closing state.
+        if matches!(reason, StopReason::Completed | StopReason::Blocked) {
+            self.progress.enter_closed();
+            (self.observer)(AgentEvent::ProgressUpdated {
+                ledger: self.progress.clone(),
+            });
+        }
+        (self.observer)(AgentEvent::Finished(final_text.clone()));
+        self.enter_finalization();
+        self.flush_epoch(rt);
+
+        self.settle_finalization_dependencies(rt, messages).await?;
+        let mut outcome = AgentOutcome::drive_result(
+            final_text,
+            model_steps,
+            self.modified_files.clone(),
+            reason,
+            None,
+            &self.progress,
+            &self.objective,
+        );
+        if !delivered {
+            outcome.completion_warnings.push(
+                "the goal was resolved but the model wrote no final answer for the user; the \
+                 goal summary is all that was delivered"
+                    .to_string(),
+            );
+        }
+        outcome
+            .completion_warnings
+            .extend(std::mem::take(&mut self.completion_warnings));
+        Ok(Flow::Stop(outcome))
+    }
+
     /// A progress watchdog giving up: mark the ledger terminal, publish it,
     /// report the model's own last words (or `fallback` when it went quiet),
     /// and flush the epoch before returning.
@@ -1380,6 +1683,104 @@ impl<'a> Drive<'a> {
 }
 
 impl Drive<'_> {
+    /// Drop the "you can enable this" hint once nothing it mentions is still
+    /// unexposed. A hint that outlives its fact is worse than none.
+    fn retract_surface_growth_notice(&mut self) {
+        let Some(state) = &self.executor.capabilities else {
+            return;
+        };
+        use crate::capability::tool_capability;
+        let still_hidden = self
+            .executor
+            .discovered_names()
+            .iter()
+            .filter_map(|name| tool_capability(name))
+            .any(|id| !state.exposed(id));
+        if !still_hidden {
+            self.control_context
+                .blocks
+                .retain(|block| block.name != "tool_surface_grew");
+        }
+    }
+
+    /// Tell the model that this request gained tools it did not start with.
+    ///
+    /// The fact belongs to the harness: a host catalog that came up mid-turn is
+    /// invisible in the conversation, and a model that cannot see it either
+    /// invents a workaround or claims the capability was never there. This is a
+    /// request-epoch observation, not an instruction about what to test.
+    fn note_surface_growth(&mut self, added: &[String]) {
+        use crate::capability::{CapabilityId, tool_capability};
+        // Whether the tools are ON the request's surface is a different fact
+        // from whether the catalog grew. A discovered tool whose pack is still
+        // unexposed is refused if the model calls it; saying it "is now part of
+        // your surface" made a real agent believe the pack had already been
+        // enabled — it called, was refused, called again, and the turn ended on
+        // the no-progress guard without ever enabling the pack.
+        let exposed = |id: CapabilityId| -> bool {
+            match self.executor.capabilities.as_ref() {
+                Some(state) => state.exposed(id),
+                // No disclosure means no pack gating: every discovered tool is
+                // callable, so nothing is "waiting for an enable".
+                None => true,
+            }
+        };
+        let mut usable: Vec<String> = Vec::new();
+        let mut gated: std::collections::BTreeMap<CapabilityId, usize> =
+            std::collections::BTreeMap::new();
+        for name in added {
+            match tool_capability(name) {
+                Some(id) if exposed(id) => usable.push(name.clone()),
+                Some(id) => *gated.entry(id).or_default() += 1,
+                // A discovered tool outside every pack is already callable:
+                // there is nothing to enable.
+                None => usable.push(name.clone()),
+            }
+        }
+        let mut text = String::new();
+        if !usable.is_empty() {
+            text.push_str(&format!(
+                "Tools became available during this request and are now part of your surface: {}.",
+                usable.join(", ")
+            ));
+        }
+        if !gated.is_empty() {
+            let packs: Vec<String> = gated
+                .iter()
+                .map(|(id, count)| {
+                    let noun = if *count == 1 { "tool" } else { "tools" };
+                    format!("{} ({count} {noun})", id.as_str())
+                })
+                .collect();
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&format!(
+                "The host catalog offered more tools during this request, but they are NOT on your \
+                 surface yet because their optional pack is disabled: {}. A call to those tools is \
+                 refused until you call capability(action=\"enable\", id=<pack>); enabling puts them \
+                 on the following request.",
+                packs.join(", ")
+            ));
+        }
+        if text.is_empty() {
+            return;
+        }
+        self.control_context
+            .blocks
+            .retain(|block| block.name != "tool_surface_grew");
+        self.control_context
+            .blocks
+            .push(crate::executor::PromptSegment::control(
+                "tool_surface_grew",
+                crate::executor::PromptSource::ExecutionState,
+                crate::executor::PromptAuthority::RuntimeFact,
+                crate::executor::SegmentLifecycle::RequestEphemeral,
+                false,
+                text,
+            ));
+    }
+
     fn refresh_capability_surface(&mut self, reason: &str) {
         let Some(state) = &self.executor.capabilities else {
             return;
@@ -1434,6 +1835,7 @@ impl Drive<'_> {
                 multi_agent_steer_hint(),
             ));
         }
+        self.retract_surface_growth_notice();
         tracing::info!(event="tool_surface_changed",reason,active_capabilities=?state.active(),tool_count=self.tools.len(),schema_tokens=leveler_model::estimate_tool_definitions(&self.tools),loaded_schema_tokens=leveler_model::estimate_tool_definitions(&self.tools).saturating_sub(previous_schema_tokens),tool_names=?self.tools.iter().map(|tool|&tool.name).collect::<Vec<_>>());
     }
 
@@ -1831,6 +2233,42 @@ impl AgentHarness for Drive<'_> {
         rt: &mut LoopContext,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
+        // A host-owned catalog (an MCP server) can come up while this turn is
+        // running. Ask it once per request so one long turn is not stuck with
+        // the surface it started with, then re-derive exposure from the
+        // turn's own permission facts.
+        let discovered = self.executor.absorb_discovered_tools().await;
+        if !discovered.is_empty() {
+            if let Some(state) = &self.executor.capabilities {
+                // Availability follows the pack each new tool belongs to; the
+                // capability mapping stays the single owner of that decision.
+                for id in discovered
+                    .iter()
+                    .filter_map(|name| crate::capability::tool_capability(name))
+                {
+                    state.note_available(id);
+                }
+            }
+            // The surface is rebuilt from host facts, so exposure is decided
+            // once (permission/capability filtering inside).
+            let tools = self.executor.request_tool_definitions();
+            let grew = tools != self.tools;
+            if grew {
+                self.tools = tools;
+            }
+            // The model is told either way: a discovered tool whose pack is
+            // still unexposed does NOT change the visible table, and that is
+            // exactly the case where it would otherwise never learn that a
+            // catalog came up and can be enabled.
+            tracing::info!(
+                event = "tool_surface_grew",
+                reason = "catalog_became_available",
+                added = ?discovered,
+                visible = grew,
+                tool_count = self.tools.len(),
+            );
+            self.note_surface_growth(&discovered);
+        }
         self.refresh_capability_surface("model_requested");
         // A `/goal <task>` declared while this turn already ran. The runtime
         // has already persisted the axis; this is the in-flight half. Inject
@@ -2255,6 +2693,57 @@ impl AgentHarness for Drive<'_> {
             // re-emits a premature summary exhausts it. Past the bound the goal
             // ends `Stalled` — never as a success.
             let has_final_text = !self.last_text.trim().is_empty();
+            // A goal this drive already resolved: this quiet round IS the
+            // delivery the person was waiting for. Publishing here — instead of
+            // at the `update_goal` call — is what makes the turn end with the
+            // model's answer rather than with a bare tool call. A silent round
+            // still gets one request for that answer, then the turn ends with
+            // the facts it has.
+            if self.settled_goal.is_some() {
+                // This quiet round's own prose is the answer. `last_text` is
+                // not: a process sentence from before a tool call stays there,
+                // and the turn did not end on it.
+                let prose = assistant.text_content();
+                if !prose.trim().is_empty() {
+                    self.terminal_answer = Some(if self.continued_text.is_empty() {
+                        prose.trim().to_string()
+                    } else {
+                        self.last_text.trim().to_string()
+                    });
+                }
+                if self.terminal_answer.is_none()
+                    && self.settled_rounds == 0
+                    && !self.delivery_followup_issued
+                {
+                    self.settled_rounds = self.settled_rounds.saturating_add(1);
+                    let nudge = Message::user(
+                        goal_settled_delivery_nudge(),
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::GoalSettledDelivery,
+                        },
+                    );
+                    self.sink.append(&[assistant, nudge.clone()]).await?;
+                    messages.push(nudge);
+                    (self.observer)(AgentEvent::AdvisoryStarted {
+                        kind: AdvisoryKind::CloseoutNudge(CloseoutReason::GoalSettledDelivery),
+                    });
+                    (self.observer)(AgentEvent::runtime_injection(
+                        crate::executor::RuntimeInjectionKind::CloseoutNudge(
+                            CloseoutReason::GoalSettledDelivery,
+                        ),
+                        model_steps.saturating_add(1),
+                    ));
+                    return Ok(Flow::NextRound);
+                }
+                // The kernel already holds this assistant in memory. Resume
+                // reloads the sink, so a settled quiet round has to be written
+                // before the turn ends. Skipping it leaves session_messages on
+                // the delivery notice after the live event already showed the
+                // answer. Do not push it again: on_quiet is called after that
+                // in-memory push.
+                self.sink.append(&[assistant]).await?;
+                return self.finish_settled_goal(rt, messages, model_steps).await;
+            }
             // The model's OWN latest plan, and only when it declared one: a
             // host-implicit single step is the harness's shell, not a promise
             // the model made, so it can never buy a continuation.
@@ -2462,6 +2951,12 @@ impl AgentHarness for Drive<'_> {
                             repair: ProtocolRepairKind::EmptyAnswer,
                         },
                     ),
+                    CloseoutReason::GoalSettledDelivery => Message::user(
+                        goal_settled_delivery_nudge(),
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::GoalSettledDelivery,
+                        },
+                    ),
                 };
                 // Persist BOTH the quiet-round assistant text and the nudge:
                 // an engine continuation reloads the transcript from the
@@ -2596,6 +3091,11 @@ impl AgentHarness for Drive<'_> {
         // may finish out of order, but the model must receive their results
         // in the original call order — providers reject reordered results.
         let mut results: Vec<Option<ContentPart>> = (0..calls.len()).map(|_| None).collect();
+        // Whether this round's assistant message said anything to the person.
+        // A round that resolved the goal without a word is the case the delivery
+        // round exists for.
+        let round_prose = assistant.text_content();
+        let round_spoke = !round_prose.trim().is_empty();
         // Goal mode: set when the model calls update_goal this round; the run
         // ends (Completed/Blocked) once this round's tool results are recorded.
         let mut goal_resolution: Option<(StopReason, String)> = None;
@@ -2622,6 +3122,12 @@ impl AgentHarness for Drive<'_> {
         // feedback is recoverable, and it has its own bound.
         let mut denied_calls_this_round: usize = 0;
         let mut verification_refusals_this_round: usize = 0;
+        // A requirements refusal whose verdict is DIFFERENT from the previous
+        // one is the model acting on the feedback, not repeating itself. It is
+        // bounded by the same recovery budget as a citation correction, so an
+        // accounting the gate can satisfy is never stopped by a streak that
+        // said "only repeated refused calls".
+        let mut gate_verdict_advanced_this_round = false;
         // User cancel observed inside this batch. The batch stops, but the
         // round is still committed (results + spend) before Cancelled
         // surfaces — completed tools' side effects are already on disk.
@@ -3178,7 +3684,7 @@ impl AgentHarness for Drive<'_> {
                         id: call.id.as_str().to_string(),
                         name: UPDATE_GOAL_TOOL.to_string(),
                         is_error: true,
-                        preview: preview(&feedback),
+                        preview: goal_refusal_preview("outstanding_children", &feedback),
                         applied_diff: None,
                     });
                     results[index] = Some(ContentPart::ToolResult {
@@ -3217,7 +3723,7 @@ impl AgentHarness for Drive<'_> {
                             id: call.id.as_str().to_string(),
                             name: UPDATE_GOAL_TOOL.to_string(),
                             is_error: true,
-                            preview: preview(&feedback),
+                            preview: goal_refusal_preview("invalid_status", &feedback),
                             applied_diff: None,
                         });
                         results[index] = Some(ContentPart::ToolResult {
@@ -3262,7 +3768,7 @@ impl AgentHarness for Drive<'_> {
                             id: call.id.as_str().to_string(),
                             name: UPDATE_GOAL_TOOL.to_string(),
                             is_error: true,
-                            preview: preview(&message),
+                            preview: goal_refusal_preview("user_pause_boundary", &message),
                             applied_diff: None,
                         });
                         results[index] = Some(ContentPart::ToolResult {
@@ -3297,7 +3803,7 @@ impl AgentHarness for Drive<'_> {
                                 id: call.id.as_str().to_string(),
                                 name: UPDATE_GOAL_TOOL.to_string(),
                                 is_error: true,
-                                preview: preview(&message),
+                                preview: goal_refusal_preview("invalid_verification", &message),
                                 applied_diff: None,
                             });
                             results[index] = Some(ContentPart::ToolResult {
@@ -3315,6 +3821,7 @@ impl AgentHarness for Drive<'_> {
                     match super::goal_verification::decide(
                         &claim,
                         &self.verification_runs,
+                        &self.pending_commands,
                         self.ledger.total_mutation_ops,
                         modified,
                     ) {
@@ -3338,7 +3845,7 @@ impl AgentHarness for Drive<'_> {
                                 id: call.id.as_str().to_string(),
                                 name: UPDATE_GOAL_TOOL.to_string(),
                                 is_error: true,
-                                preview: preview(&message),
+                                preview: goal_refusal_preview("verification_refused", &message),
                                 applied_diff: None,
                             });
                             results[index] = Some(ContentPart::ToolResult {
@@ -3387,7 +3894,10 @@ impl AgentHarness for Drive<'_> {
                                         id: call.id.as_str().to_string(),
                                         name: UPDATE_GOAL_TOOL.to_string(),
                                         is_error: true,
-                                        preview: preview(&message),
+                                        preview: goal_refusal_preview(
+                                            "invalid_requirements",
+                                            &message,
+                                        ),
                                         applied_diff: None,
                                     });
                                     results[index] = Some(ContentPart::ToolResult {
@@ -3415,10 +3925,22 @@ impl AgentHarness for Drive<'_> {
                                 goal_scope::ScopeDecision::Accept { warnings } => {
                                     self.completion_warnings.extend(warnings);
                                     self.repeated_gate_refusal = None;
+                                    self.requirements_refusal = None;
                                 }
                                 goal_scope::ScopeDecision::Refuse(message) => {
                                     denied_calls_this_round += 1;
+                                    // A DIFFERENT verdict after an earlier one is
+                                    // the model answering the feedback. The first
+                                    // refusal of a drive has nothing to answer yet,
+                                    // so it stays an ordinary refused round.
+                                    let advanced = self
+                                        .requirements_refusal
+                                        .as_deref()
+                                        .is_some_and(|previous| previous != message);
+                                    self.requirements_refusal = Some(message.clone());
                                     note_gate_refusal(&mut self.repeated_gate_refusal, &message);
+                                    gate_verdict_advanced_this_round =
+                                        gate_verdict_advanced_this_round || advanced;
                                     (self.observer)(AgentEvent::GoalIntercepted {
                                         kind: "requirements_refused".to_string(),
                                         detail: message.clone(),
@@ -3430,7 +3952,10 @@ impl AgentHarness for Drive<'_> {
                                         id: call.id.as_str().to_string(),
                                         name: UPDATE_GOAL_TOOL.to_string(),
                                         is_error: true,
-                                        preview: preview(&message),
+                                        preview: goal_refusal_preview(
+                                            "requirements_refused",
+                                            &message,
+                                        ),
                                         applied_diff: None,
                                     });
                                     results[index] = Some(ContentPart::ToolResult {
@@ -3460,10 +3985,21 @@ impl AgentHarness for Drive<'_> {
                         });
                     }
                 }
+                // An accepted completion is not "nothing to say": whatever the
+                // runtime could not verify mechanically is a boundary of THIS
+                // completion, and the model writing the delivery is the one
+                // party that must not present it as verified.
+                // An accepted completion is not "nothing to say": whatever the
+                // runtime could not verify mechanically is a boundary of THIS
+                // completion, and the model writing the delivery is the one
+                // party that must not present it as verified.
                 let receipt = if reason == StopReason::Blocked {
-                    "Goal blocked."
+                    crate::injected_tools::completion_receipt("Goal blocked", &[])
                 } else {
-                    "Goal completed."
+                    crate::injected_tools::completion_receipt(
+                        "Goal completed",
+                        &self.completion_warnings,
+                    )
                 };
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
@@ -4438,18 +4974,78 @@ impl AgentHarness for Drive<'_> {
             // Mechanical verification fact. Recorded after the call's own
             // mutation note, so "passed after the last change" compares the
             // right sequence number.
+            //
+            // A command that only STARTED (a background task, or a foreground
+            // run handed to the background) reported no execution status: its
+            // result does not exist yet. Recording it as a pass would accept a
+            // goal on a suite still running, and recording it as a failure
+            // would block one that later passes. So a start is not a result and
+            // is not evidence either way. A flagged failure stays a failed run:
+            // the command did not pass, whatever stopped it before it ran.
             if let Some(label) =
                 super::goal_verification::command_label(&call.name, &call.arguments)
             {
-                self.verification_runs
-                    .push(super::goal_verification::VerificationRun {
-                        label,
-                        ok: !is_error,
-                        model_step: model_steps,
-                        mutation_ops: self.ledger.total_mutation_ops,
-                    });
-                if self.verification_runs.len() > 64 {
-                    self.verification_runs.remove(0);
+                if command_facts.execution_status.is_some() || is_error {
+                    self.verification_runs
+                        .push(super::goal_verification::VerificationRun {
+                            label: label.clone(),
+                            ok: !is_error,
+                            model_step: model_steps,
+                            mutation_ops: self.ledger.total_mutation_ops,
+                        });
+                    if self.verification_runs.len() > 64 {
+                        self.verification_runs.remove(0);
+                    }
+                    // The command now HAS a result; it is no longer pending.
+                    self.pending_commands
+                        .retain(|pending| !pending.label.eq_ignore_ascii_case(&label));
+                } else {
+                    // A start is not evidence, but it is a fact: the completion
+                    // gate must not call this command "never ran" while it is
+                    // running, and must be able to name the task to wait on.
+                    self.pending_commands
+                        .push(super::goal_verification::PendingCommand {
+                            label,
+                            task_id: command_facts.started_task.clone(),
+                        });
+                    if self.pending_commands.len() > MAX_PENDING_COMMANDS {
+                        self.pending_commands.remove(0);
+                    }
+                }
+            }
+            // The REAL result of a command whose call only reported a start:
+            // `wait_task`/`get_task` observed the task's terminal state, and the
+            // lifecycle tools attached it as a structured fact. Without this a
+            // test handed to the background after 15 seconds could pass and
+            // still leave `update_goal(complete)` with no evidence to cite.
+            //
+            // Observed twice is one result, not two runs: the same task's
+            // repeated terminal reads collapse into the run it already added.
+            if let Some(result) = command_facts.background_result.as_ref()
+                && let Some(label) = super::goal_verification::background_command_label(
+                    &result.program,
+                    &result.args,
+                )
+            {
+                // The task produced its result: it is no longer a pending
+                // start, whatever label the process reports.
+                self.pending_commands
+                    .retain(|pending| pending.task_id.as_deref() != Some(result.task_id.as_str()));
+                let duplicate = self
+                    .verification_runs
+                    .last()
+                    .is_some_and(|last| last.label == label && last.ok == result.ok);
+                if !duplicate {
+                    self.verification_runs
+                        .push(super::goal_verification::VerificationRun {
+                            label,
+                            ok: result.ok,
+                            model_step: model_steps,
+                            mutation_ops: self.ledger.total_mutation_ops,
+                        });
+                    if self.verification_runs.len() > 64 {
+                        self.verification_runs.remove(0);
+                    }
                 }
             }
 
@@ -5146,14 +5742,29 @@ impl AgentHarness for Drive<'_> {
                 == call_snapshot.len();
         let citation_refused = verification_refusals_this_round > 0;
         if all_refused {
-            if citation_refused {
+            // Recoverable gate feedback: a refused citation, or a requirements
+            // refusal whose verdict CHANGED (the model acted on the previous
+            // one). Both are bounded here; neither is "no progress" while the
+            // verdict keeps moving. An unchanged requirements verdict is a
+            // repeat and stays on the denial streak.
+            if citation_refused || gate_verdict_advanced_this_round {
+                if gate_verdict_advanced_this_round {
+                    // The gate's verdict moved because the model changed its
+                    // answer: that clears the no-progress streak, exactly like
+                    // an executed tool would. It is still bounded by the
+                    // recovery budget below.
+                    self.progress.note_progress(model_steps);
+                    (self.observer)(AgentEvent::ProgressUpdated {
+                        ledger: self.progress.clone(),
+                    });
+                }
                 self.goal_gate_recovery_rounds = self.goal_gate_recovery_rounds.saturating_add(1);
                 // A nested goal drive (a host-built sub-goal) has the same
                 // bound; the counter and the stop stay on that drive.
                 if self.goal_gate_recovery_rounds >= MAX_VERIFICATION_RECOVERY_ROUNDS {
                     let detail = format!(
-                        "goal verification refused {} times in a row without a corrected \
-                         citation or a new command",
+                        "the goal gate refused {} times in a row without a corrected \
+                         citation, a newly accounted requirement, or a new command",
                         self.goal_gate_recovery_rounds
                     );
                     return Ok(Flow::Stop(
@@ -5201,37 +5812,89 @@ impl AgentHarness for Drive<'_> {
             ));
         }
 
-        // Goal mode: an explicit update_goal this round ends the run now that
-        // its result is committed.
-        if let Some((reason, summary)) = goal_resolution {
-            let final_text = if summary.is_empty() {
-                self.last_text.clone()
-            } else {
-                summary
-            };
-            // Epoch terminal: next Content turn must not inherit Closing state.
-            if matches!(reason, StopReason::Completed | StopReason::Blocked) {
-                self.progress.enter_closed();
-                (self.observer)(AgentEvent::ProgressUpdated {
-                    ledger: self.progress.clone(),
-                });
-            }
-            (self.observer)(AgentEvent::Finished(final_text.clone()));
-            self.enter_finalization();
-            self.flush_epoch(rt);
+        // Prose a work tool followed is progress, not the answer. Bookkeeping
+        // (`update_goal`, `update_plan`) does not erase an answer the round
+        // already wrote.
+        let work_executed = call_snapshot
+            .iter()
+            .any(|call| !is_goal_bookkeeping(&call.name));
+        if work_executed {
+            self.terminal_answer = None;
+        } else if round_spoke {
+            self.terminal_answer = Some(round_prose.trim().to_string());
+        }
 
-            self.settle_finalization_dependencies(rt, messages).await?;
-            let mut outcome = AgentOutcome::drive_result(
-                final_text,
-                model_steps,
-                self.modified_files.clone(),
-                reason,
-                None,
-                &self.progress,
-                &self.objective,
-            );
-            outcome.completion_warnings = std::mem::take(&mut self.completion_warnings);
-            return Ok(Flow::Stop(outcome));
+        // Goal mode: an explicit update_goal resolved the goal, and its result
+        // is committed. Resolving the goal is not delivering to the person: the
+        // turn used to end right here, so a model whose last action was the
+        // `update_goal` call (the common shape — the call IS the last action)
+        // produced a completed goal with no answer at all. The drive therefore
+        // keeps a delivery request that sees any tool results from this round.
+        if let Some((reason, summary)) = goal_resolution {
+            let already_settled = self.settled_goal.is_some();
+            self.settled_goal = Some((reason, summary));
+            // A blocked goal still owes the work itself, and its resolution is
+            // a report, so its round ends exactly as before.
+            if reason != StopReason::Completed {
+                return self.finish_settled_goal(rt, messages, model_steps).await;
+            }
+            // The answer and the resolution landed together, and nothing acted
+            // on that prose. That is the delivery.
+            if self.terminal_answer.is_some() && !already_settled {
+                return self.finish_settled_goal(rt, messages, model_steps).await;
+            }
+            // Resolving a goal this turn already resolved, without doing any
+            // new work, is the model still not answering. It counts against
+            // the wrap-up bound so it cannot spin.
+            if already_settled && !work_executed {
+                self.settled_rounds = self.settled_rounds.saturating_add(1);
+                if self.settled_rounds >= MAX_SETTLED_DELIVERY_ROUNDS
+                    || self.delivery_followup_issued
+                {
+                    return self.finish_settled_goal(rt, messages, model_steps).await;
+                }
+            }
+            if !already_settled && self.terminal_answer.is_none() {
+                let running: Vec<String> = match self.executor.background_tasks.as_ref() {
+                    Some(tasks) => tasks
+                        .active_snapshots_for_scope(self.executor.tool_context.session_scope())
+                        .await
+                        .into_iter()
+                        .map(|task| task_line(&task))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                self.inject_settled_delivery(
+                    messages,
+                    model_steps,
+                    settled_delivery_notice(reason, &running),
+                )
+                .await?;
+                return Ok(Flow::NextRound);
+            }
+        }
+
+        // A tool round after the goal settled is wrap-up. Its results are not
+        // an answer, so the turn does not end here: the model still has to see
+        // them. Past the bound, exactly one follow-up request carries that
+        // duty. Spending the follow-up on more tools ends the turn honestly.
+        if self.settled_goal.is_some() && work_executed {
+            self.settled_rounds = self.settled_rounds.saturating_add(1);
+            if self.delivery_followup_issued {
+                self.completion_warnings.push(
+                    "the goal was resolved and the runtime spent its remaining delivery rounds \
+                     waiting for the user-facing answer; the recorded goal summary is what the \
+                     user received"
+                        .to_string(),
+                );
+                return self.finish_settled_goal(rt, messages, model_steps).await;
+            }
+            if self.settled_rounds >= MAX_SETTLED_DELIVERY_ROUNDS {
+                self.delivery_followup_issued = true;
+                self.inject_settled_delivery(messages, model_steps, delivery_followup_notice())
+                    .await?;
+                return Ok(Flow::NextRound);
+            }
         }
 
         // A step limit tripped this round: results are committed, stop now.
@@ -5713,6 +6376,23 @@ impl AgentHarness for Drive<'_> {
     ) -> Result<AgentOutcome, AgentError> {
         let model_steps = stop.model_steps;
         let mut messages = stop.messages;
+        // The goal was already resolved this turn and only the delivery round is
+        // missing. A mechanical limit firing now must not replace a resolved
+        // goal with "limit reached": publish the settled terminal, which carries
+        // the facts (and the warning that no answer was written) instead.
+        if self.settled_goal.is_some() && !matches!(stop.reason, KernelStop::Cancelled) {
+            match self
+                .finish_settled_goal(rt, &mut messages, model_steps)
+                .await?
+            {
+                Flow::Stop(outcome) => return Ok(outcome),
+                Flow::Continue | Flow::NextRound => {
+                    return Err(AgentError::ContextManagementFailure(
+                        "settled goal terminal did not publish".to_string(),
+                    ));
+                }
+            }
+        }
         match stop.reason {
             KernelStop::Cancelled => {
                 // Flush epoch spend before Cancelled so resume/event-log keep
@@ -6084,6 +6764,40 @@ pub(crate) fn model_step_note(used: u32, ceiling: u32, already_sent: bool) -> Op
     ))
 }
 
+/// The capability-discovery fact for one request's session prefix.
+///
+/// Two shapes, because they answer different questions. With nothing on offer
+/// it is the old sentence: a catalog exists and can be listed. With something
+/// on offer it is an inventory — which packs, and how many tools each would
+/// add — because a model cannot enumerate an unexposed pack's tools from the
+/// tool table it was given, and "some capabilities exist" does not tell it that
+/// the surface it was asked about is reachable through the harness at all.
+///
+/// Neither shape names a task, a repository or a server: the pack ids and the
+/// counts are host facts.
+fn capability_discovery_fact(inventory: &[(crate::capability::CapabilityId, usize)]) -> String {
+    const NO_INVENTORY: &str = "Additional capabilities are available on demand. \
+         Use capability(action=\"list\") to discover them, then \
+         capability(action=\"enable\", id=...) when needed. Enabled tools appear on the \
+         following request.";
+    if inventory.is_empty() {
+        return NO_INVENTORY.to_string();
+    }
+    let mut text = String::from(
+        "Optional capability packs are on offer in this session. Enabling one adds its tools to \
+         your surface on the following request:\n",
+    );
+    for (id, count) in inventory {
+        let noun = if *count == 1 { "tool" } else { "tools" };
+        text.push_str(&format!("- {} ({count} {noun})\n", id.as_str()));
+    }
+    text.push_str(
+        "capability(action=\"list\") says what each pack is and why one is not on offer; \
+         capability(action=\"enable\", id=<pack>) activates one when it is needed.",
+    );
+    text
+}
+
 /// How often to emit a [`AgentEvent::CommandProgress`] heartbeat while a command
 /// tool is still running. Short enough to prove liveness, long enough to be quiet.
 const COMMAND_HEARTBEAT_SECS: u64 = 3;
@@ -6112,6 +6826,22 @@ fn command_progress_label(registry: &ToolRegistry, call: &ToolCall) -> Option<St
 /// An absolute path, a `..` escape, a missing workspace, or an unresolvable
 /// path is `Unknown`; the completion gate then records an honest unverified
 /// boundary rather than guessing.
+/// Prefix that names the gate which refused an `update_goal`, in the result's
+/// UI/JSONL preview.
+///
+/// The preview is the projection a client renders; the model reads `content`,
+/// which keeps its own model-facing prose. A client localizes the refusal from
+/// this tag, so the user reads the runtime's own reason instead of a guess,
+/// and the model-facing English guidance never becomes the conversation body.
+/// Same shape as the `commit_task` scope tag.
+pub(crate) const GOAL_REFUSAL_TAG: &str = "[goal_refused:";
+
+/// The preview for a refused `update_goal`: the refusing gate, then the
+/// runtime's own account for audit.
+fn goal_refusal_preview(kind: &str, message: &str) -> String {
+    format!("{GOAL_REFUSAL_TAG}{kind}]\n{}", preview(message))
+}
+
 /// Record one goal-gate refusal against the previous one.
 fn note_gate_refusal(slot: &mut Option<(String, u32)>, message: &str) {
     let count = match &*slot {

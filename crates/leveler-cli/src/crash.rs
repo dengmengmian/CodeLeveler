@@ -35,8 +35,47 @@ pub(crate) fn install(version: &str) {
         if let Some(dir) = crash_dir() {
             let _ = write_record(&dir, &render(info, &version));
         }
-        previous(info);
+        // A second panic while this hook is running aborts the process.
+        // `catch_unwind` does not intercept it: the runtime aborts as soon as
+        // the nested panic starts. The default printer uses `eprintln!`, and
+        // that panics when stderr is a closed PTY (EIO). Skip the printer
+        // only in that case. The crash record already has the original
+        // message, and a live stderr still gets the normal panic print.
+        if stderr_accepts_a_write() {
+            previous(info);
+        }
     }));
+}
+
+/// Print a fatal error from the process entry point.
+///
+/// `eprintln!` panics when stderr returns an error. A TUI whose PTY master has
+/// already closed makes that write return `EIO`, so the error report itself
+/// becomes a panic and the hook then panics again trying to print it. A failed
+/// write is copied into the crash directory so the original text is not lost.
+pub(crate) fn report_fatal(prefix: &str, detail: &str) {
+    let body = format!("{prefix}\n  {detail}\n");
+    if write_stderr(&body).is_err() {
+        if let Some(dir) = crash_dir() {
+            let _ = write_record(
+                &dir,
+                &format!("leveler fatal report\nstderr: unavailable\n{body}"),
+            );
+        }
+    }
+}
+
+/// `eprintln!` panics on a broken stderr. This write returns the error instead.
+fn write_stderr(text: &str) -> std::io::Result<()> {
+    let mut err = std::io::stderr();
+    err.write_all(text.as_bytes())?;
+    err.flush()
+}
+
+/// `write_all(&[])` returns `Ok` without a syscall. An empty `write` still
+/// calls `write(2)`, and a PTY whose master is already closed returns `EIO`.
+fn stderr_accepts_a_write() -> bool {
+    std::io::stderr().write(&[]).is_ok()
 }
 
 /// The record body. Kept as a pure function so its content — and what it must
@@ -217,5 +256,161 @@ mod tests {
         // Whatever else changes, the record must stay a diagnosis, not a dump.
         assert!(!rendered.contains("api_key"), "{rendered}");
         assert!(!rendered.contains("sk-"), "{rendered}");
+    }
+
+    /// A normal stderr still receives the fatal report.
+    #[test]
+    fn a_fatal_report_is_printed_when_stderr_is_open() {
+        const CHILD: &str = "LEVELER_TEST_FATAL_REPORT_OPEN_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            report_fatal("error:", "ordinary-failure");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash::tests::a_fatal_report_is_printed_when_stderr_is_open",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "status {:?}", output.status);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains("ordinary-failure"), "{err}");
+    }
+
+    /// The production failure: stderr is a PTY slave whose master is already
+    /// gone, so the write returns EIO. Reporting that must not panic, and the
+    /// original text must still land in the crash directory.
+    #[test]
+    fn a_fatal_report_is_kept_when_the_pty_stderr_is_already_closed() {
+        const CHILD: &str = "LEVELER_TEST_FATAL_REPORT_CLOSED_PTY";
+        if std::env::var_os(CHILD).is_some() {
+            report_fatal("error:", "original-model-error");
+            return;
+        }
+        let home = tmp("fatal-pty");
+        let output = on_closed_pty(
+            "crash::tests::a_fatal_report_is_kept_when_the_pty_stderr_is_already_closed",
+            "2",
+            &[("LEVELER_HOME", home.to_str().unwrap()), (CHILD, "1")],
+        );
+        assert!(
+            output.status.success(),
+            "closed stderr must not panic the reporter: status {:?} stderr {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recorded = crash_text(&home);
+        assert!(
+            recorded.contains("original-model-error"),
+            "the original error must be recorded, got {recorded}"
+        );
+    }
+
+    /// The panic hook itself must not panic when stderr is a closed PTY.
+    /// A second panic aborts the process and drops the original message.
+    #[test]
+    fn a_panic_hook_records_the_original_panic_when_stderr_is_a_closed_pty() {
+        const CHILD: &str = "LEVELER_TEST_PANIC_HOOK_CLOSED_PTY";
+        if std::env::var_os(CHILD).is_some() {
+            // The default printer panics when stderr returns EIO. Stand in for
+            // it here: this crate cannot install the real default hook after
+            // the test harness has replaced it.
+            std::panic::set_hook(Box::new(|_| panic!("stderr-printer")));
+            install("test-version");
+            panic!("sentinel-original-panic");
+        }
+        let home = tmp("hook-pty");
+        let output = on_closed_pty(
+            "crash::tests::a_panic_hook_records_the_original_panic_when_stderr_is_a_closed_pty",
+            "2",
+            &[("LEVELER_HOME", home.to_str().unwrap()), (CHILD, "1")],
+        );
+        assert!(
+            output.status.code() == Some(101),
+            "the original panic must unwind instead of aborting inside the hook: status {:?}",
+            output.status
+        );
+        let recorded = crash_text(&home);
+        assert!(
+            recorded.contains("sentinel-original-panic"),
+            "crash record lost the original panic: {recorded}"
+        );
+    }
+
+    /// A live stderr must still reach the previous printer. Skipping it
+    /// whenever the hook runs would hide ordinary panics.
+    #[test]
+    fn a_panic_hook_still_prints_when_stderr_is_open() {
+        const CHILD: &str = "LEVELER_TEST_PANIC_HOOK_OPEN_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            std::panic::set_hook(Box::new(|_| {
+                let _ = write_stderr("printer-was-called\n");
+            }));
+            install("test-version");
+            panic!("sentinel-open-stderr");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash::tests::a_panic_hook_still_prints_when_stderr_is_open",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "an ordinary panic must still fail the process: {:?}",
+            output.status
+        );
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            err.contains("printer-was-called"),
+            "open stderr must still reach the previous printer: {err}"
+        );
+    }
+
+    fn crash_text(home: &std::path::Path) -> String {
+        let dir = home.join("logs").join("crash");
+        let mut out = String::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            if let Ok(body) = std::fs::read_to_string(entry.path()) {
+                out.push_str(&body);
+            }
+        }
+        out
+    }
+
+    /// Re-exec this test on a PTY slave whose master is already closed.
+    /// The helper is Python so this crate can keep `forbid(unsafe_code)`.
+    fn on_closed_pty(test: &str, fds: &str, env: &[(&str, &str)]) -> std::process::Output {
+        let script = r#"
+import os, pty, sys
+master, slave = pty.openpty()
+os.close(master)
+for fd in os.environ["LEVELER_TEST_PTY_FDS"].split(","):
+    os.dup2(slave, int(fd))
+os.close(slave)
+os.execv(sys.argv[1], sys.argv[1:])
+"#;
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c")
+            .arg(script)
+            .arg(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test)
+            .arg("--nocapture")
+            .env("LEVELER_TEST_PTY_FDS", fds);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("python pty helper")
     }
 }

@@ -59,12 +59,32 @@ impl ModelRuntime for Script {
         request: ModelRequest,
         _: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
+        let delivering = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .is_some_and(|message| {
+                message
+                    .text_content()
+                    .contains("this round is the delivery")
+            });
         self.requests.lock().unwrap().push(request);
         let response = self
             .responses
             .lock()
             .unwrap()
             .pop_front()
+            .or_else(|| {
+                // The runtime's delivery round after the goal resolves: this
+                // inventory only needs the answer to exist.
+                delivering.then(|| ModelResponse {
+                    request_id: RequestId::generate(),
+                    message: Message::text(Role::Assistant, "done"),
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::default(),
+                })
+            })
             .expect("script exhausted");
         Ok(leveler_model::stream_from_response(response))
     }

@@ -604,6 +604,8 @@ async fn scenario_goal(n: usize) -> Vec<ScenarioResult> {
                 "summary": format!("goal {i} done")
             }),
         ));
+        // The resolution carried no sentence: its delivery round answers.
+        responses.push(text_round(&format!("goal {i} done")));
     }
     let (_tmp, server, _app, client, session_id) = setup_app(responses).await;
     let before = server.request_count();

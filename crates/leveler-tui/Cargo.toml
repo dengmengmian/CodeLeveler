@@ -38,6 +38,7 @@ tempfile = "3"
 
 [dev-dependencies]
 async-trait = { workspace = true }
+libc = { workspace = true }
 leveler-client-protocol = { workspace = true, features = ["testing"] }
 leveler-tools = { workspace = true }
 tempfile = "3"

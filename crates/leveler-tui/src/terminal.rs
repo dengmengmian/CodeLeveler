@@ -64,7 +64,12 @@ impl Drop for TerminalGuard {
 }
 
 /// Best-effort restore, used both by the guard and the panic hook.
-fn restore_terminal() {
+///
+/// A closed PTY makes these writes return `EIO`. That must stay an error,
+/// not a panic: the panic hook calls this before the process prints the
+/// original crash.
+#[doc(hidden)]
+pub fn restore_terminal() {
     let _ = disable_raw_mode();
     // Leave the alternate screen in case an overlay was open; harmless if not.
     let _ = execute!(

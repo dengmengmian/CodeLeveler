@@ -68,6 +68,10 @@ pub fn profile_step_limits(profile: &TurnProfile) -> StepLimits {
 pub struct ExecutorFactory {
     pub runtime: Arc<dyn ModelRuntime>,
     pub registry: Arc<ToolRegistry>,
+    /// Host-owned source of tools that can appear while a turn is running (an
+    /// external catalog whose server started late). `None` for hosts that have
+    /// no such catalog.
+    pub tool_discovery: Option<Arc<dyn leveler_tools::tool::ToolDiscovery>>,
     pub capabilities: Option<Arc<crate::capability::CapabilityDisclosure>>,
     pub tool_context: ToolContext,
     pub model: ModelRef,
@@ -151,6 +155,7 @@ impl ExecutorFactory {
             0,
         )
         .with_capabilities(self.capabilities.clone())
+        .with_tool_discovery_opt(self.tool_discovery.clone())
         .with_background_tasks(self.background_tasks.clone())
         .with_continuation_policy(continuation)
         .with_max_output_tokens(resolved.max_output_tokens)

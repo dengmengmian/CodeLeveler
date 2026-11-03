@@ -217,6 +217,38 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
     }
 }
 
+/// The tool result the model reads when a Goal resolution was accepted.
+///
+/// An accepted completion can still carry boundaries the runtime could not
+/// verify: a requirement the user stated that no command, file or record can
+/// prove. Those boundaries are already shown to the user, and before this they
+/// existed only there — the model wrote the delivery without them and could
+/// claim more than the record held. This states the runtime's own facts on the
+/// acceptance, which is not extra work and costs nothing when there is no
+/// boundary.
+pub(crate) fn completion_receipt(resolution: &str, warnings: &[String]) -> String {
+    let mut receipt = format!("{resolution}.");
+    if warnings.is_empty() {
+        return receipt;
+    }
+    receipt.push_str(
+        "\nUnverified boundaries of this completion — the runtime could not check these \
+         mechanically, so they rest on your account, not on evidence:",
+    );
+    for warning in warnings.iter().take(6) {
+        receipt.push_str("\n- ");
+        receipt.push_str(warning);
+    }
+    if warnings.len() > 6 {
+        receipt.push_str(&format!("\n- …and {} more", warnings.len() - 6));
+    }
+    receipt.push_str(
+        "\nYour answer must not present these as verified. Say which parts you verified and \
+         which parts you did not.",
+    );
+    receipt
+}
+
 /// The name of the injected task-commitment tool (Chat turns only).
 ///
 /// This is the goal-commitment entry, not a delegation entry: the model
@@ -1613,5 +1645,46 @@ mod tests {
             tools[0].input_schema["properties"].get("cmd").is_some(),
             "augmenting the schema must not drop the tool's own fields"
         );
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    /// The no-warning receipt is unchanged: an ordinary completion keeps one
+    /// short line, and every existing UI contract that reads it stays valid.
+    #[test]
+    fn an_unqualified_completion_keeps_its_one_line_receipt() {
+        assert_eq!(
+            super::completion_receipt("Goal completed", &[]),
+            "Goal completed."
+        );
+        assert_eq!(
+            super::completion_receipt("Goal blocked", &[]),
+            "Goal blocked."
+        );
+    }
+
+    /// A boundary the runtime computed reaches the model that writes the
+    /// answer, in the same words the user sees.
+    #[test]
+    fn a_boundary_is_stated_on_the_acceptance() {
+        let warnings = vec![
+            "requirement `全部功能` is reported done but has no mechanical check; the completion \
+             rests on the model's account, not runtime evidence"
+                .to_string(),
+        ];
+        let receipt = super::completion_receipt("Goal completed", &warnings);
+        assert!(receipt.starts_with("Goal completed."), "{receipt}");
+        assert!(receipt.contains("全部功能"), "{receipt}");
+        assert!(receipt.contains("not on evidence"), "{receipt}");
+        assert!(
+            receipt.contains("must not present these as verified"),
+            "{receipt}"
+        );
+        // Bounded: a long completion cannot turn its receipt into a wall.
+        let many: Vec<String> = (0..9).map(|i| format!("boundary {i}")).collect();
+        let receipt = super::completion_receipt("Goal completed", &many);
+        assert!(receipt.contains("…and 3 more"), "{receipt}");
+        assert!(!receipt.contains("boundary 6"), "{receipt}");
     }
 }

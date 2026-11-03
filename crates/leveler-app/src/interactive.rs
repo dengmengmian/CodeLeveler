@@ -539,6 +539,11 @@ pub struct InProcessRuntimeClient {
     /// The cancellation handle of every tool call executing in a session's
     /// turn, by call id, so a user can stop one command without the turn.
     tool_call_cancels: ChildCancels,
+    /// The attention handle of every tool call executing in a session's turn.
+    /// Cancelling one is not a stop: it asks an observation-only call
+    /// (`wait_task`) to return what it has so the user's message is answered
+    /// now instead of after the wait's own bound.
+    tool_call_yields: ChildCancels,
     /// Optional prompt/recap generation, cancelled before a real turn starts.
     auxiliary_assists: Arc<AuxiliaryAssists>,
     /// Highest configuration generation whose effects (session refresh,
@@ -719,6 +724,31 @@ struct SessionSteering {
     goal: Arc<Mutex<GoalSteer>>,
     children: ChildCancels,
     tool_calls: ChildCancels,
+    /// Paired with `tool_calls`: the same call ids, holding the "hand the round
+    /// back" handle instead of the "stop this call" handle.
+    tool_yields: ChildCancels,
+}
+
+impl SessionSteering {
+    /// Whether this session already holds user input the next round will
+    /// consume. Read-only on purpose: it must not take the text, only tell a
+    /// newly started observation call that there is nothing to wait for.
+    fn input_is_waiting(&self) -> bool {
+        let queued = self
+            .queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.session_id)
+            .is_some_and(|queue| !queue.is_empty());
+        queued
+            || self
+                .goal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .first()
+                .is_some()
+    }
 }
 
 impl leveler_agent::SteeringSource for SessionSteering {
@@ -763,17 +793,30 @@ impl leveler_agent::SteeringSource for SessionSteering {
         release_cancel(&self.children, &self.session_id, id);
     }
 
-    fn tool_call_started(&self, id: &str, cancel: CancellationToken) {
-        self.tool_calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(self.session_id.clone())
-            .or_default()
-            .insert(id.to_string(), cancel);
+    fn tool_call_started(&self, id: &str, cancel: CancellationToken, yield_now: CancellationToken) {
+        for (handles, token) in [
+            (&self.tool_calls, cancel),
+            (&self.tool_yields, yield_now.clone()),
+        ] {
+            handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(self.session_id.clone())
+                .or_default()
+                .insert(id.to_string(), token);
+        }
+        // Input that arrived BEFORE this call registered is not lost: the
+        // message is answered at the top of the next round whether or not the
+        // call was already running, so an observation call that starts here
+        // has nothing left to observe for.
+        if self.input_is_waiting() {
+            yield_now.cancel();
+        }
     }
 
     fn tool_call_ended(&self, id: &str) {
         release_cancel(&self.tool_calls, &self.session_id, id);
+        release_cancel(&self.tool_yields, &self.session_id, id);
     }
 }
 
@@ -821,6 +864,124 @@ async fn append_user_shell_chunk(
             forward,
         )
         .await;
+}
+
+/// Persist the terminal result of a background process task as a durable engine
+/// fact.
+///
+/// The starting call's own `ToolCallFinished` recorded only that the process
+/// STARTED. When the task finally exits, that result has to be attributable to
+/// the same call — otherwise a test moved to the background after 15 seconds
+/// runs, passes, and is invisible to `update_goal(complete)` both live and after
+/// a resume. The registry owns the task→call link; this writes the fact that
+/// call_id, the argv, and the exit decided.
+///
+/// Only a natural exit is recorded. A stopped or unobservable task produced no
+/// result, and recording one would let a cancel or a lost process count as
+/// evidence. Recording is idempotent per task id, so the live bridge and the
+/// turn-boundary reconcile can both call it without double-counting.
+pub(crate) async fn persist_background_task_finished(
+    app: &Application,
+    session_id: SessionId,
+    task: leveler_execution::BackgroundTaskSnapshot,
+) {
+    if task.status != leveler_execution::BackgroundTaskStatus::Exited {
+        return;
+    }
+    let Some(call_id) = app.background_tasks().origin_call_id_of(&task.id).await else {
+        // Started by a caller that recorded no tool call (a user shell, an
+        // internal service): there is no call to attribute the result to.
+        return;
+    };
+    let Ok(db) = app.open_database().await else {
+        return;
+    };
+    use leveler_storage::EventStore as _;
+    let Ok(rows) = db
+        .load_by_types(&session_id, &["background_task_finished"])
+        .await
+    else {
+        return;
+    };
+    let already = rows.iter().any(|row| {
+        serde_json::from_str::<serde_json::Value>(&row.payload)
+            .ok()
+            .map(|value| {
+                let body = value.get("payload").cloned().unwrap_or(value);
+                body.get("task_id").and_then(serde_json::Value::as_str) == Some(task.id.as_str())
+            })
+            .unwrap_or(false)
+    });
+    if already {
+        return;
+    }
+    let event = leveler_engine::EngineEvent::BackgroundTaskFinished {
+        call_id,
+        task_id: task.id,
+        program: task.program,
+        args: task.args,
+        // A zero exit is the only pass. An exit whose code could not be
+        // established is not a pass either.
+        is_error: task.exit_code != Some(0),
+        exit_code: task.exit_code,
+    };
+    // The result belongs to the call that started it, not to whichever turn
+    // happens to be open now; the goal reader scopes by call identity.
+    append_durable_session_event(app, session_id, None, event).await;
+}
+
+/// Record background results that finished while nothing was watching.
+///
+/// A client-attached session gets these facts live from the lifecycle bridge. A
+/// headless run, or a runtime that was busy elsewhere, has no such stream, so
+/// the turn boundary is where the durable record catches up — including the
+/// turn that RESUMES after a crash. Idempotent: an already-recorded task is
+/// skipped, so a result is never counted twice.
+pub(crate) async fn reconcile_background_evidence(app: &Application, session_id: &SessionId) {
+    let Ok(snapshots) = app.background_tasks().try_all_snapshots().await else {
+        return;
+    };
+    for task in snapshots
+        .into_iter()
+        .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
+    {
+        persist_background_task_finished(app, session_id.clone(), task).await;
+    }
+}
+
+/// Append one durable engine event to a session's log as this runtime, without
+/// claiming a turn it does not own.
+///
+/// A live turn from this runtime already owns the session: its token is reused.
+/// An idle session has no writer, so the unowned epoch is acquired briefly and
+/// released after the append. A foreign owner means this runtime must not write;
+/// the live event remains the only delivery.
+async fn append_durable_session_event(
+    app: &Application,
+    session_id: SessionId,
+    turn_id: Option<leveler_core::TurnId>,
+    event: leveler_engine::EngineEvent,
+) {
+    let Ok(db) = app.open_database().await else {
+        return;
+    };
+    let Ok(engine) = app.task_engine(&db) else {
+        return;
+    };
+    let (token, acquired) = match engine.current_ownership(&session_id).await {
+        Ok(Some(token)) => (token, false),
+        Ok(None) => match engine.acquire_if_unowned(&session_id).await {
+            Ok(Some(token)) => (token, true),
+            Ok(None) | Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    let log = leveler_engine::EventLog::new_owned(&db, session_id, token.clone());
+    let mut forward = |_event: leveler_engine::EngineEvent| {};
+    let _ = log.append(turn_id.as_ref(), event, &mut forward).await;
+    if acquired {
+        let _ = engine.release_ownership(&token).await;
+    }
 }
 
 /// Persist the terminal fact for an execution that completed in the background.
@@ -1083,6 +1244,7 @@ impl InProcessRuntimeClient {
             goal_steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
             tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
+            tool_call_yields: Arc::new(Mutex::new(HashMap::new())),
             auxiliary_assists: Arc::new(AuxiliaryAssists::default()),
             config_announced: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
@@ -1479,6 +1641,21 @@ impl InProcessRuntimeClient {
                         let _ = background_sender
                             .send(RuntimeEvent::BackgroundTaskOutput { task_id, chunk });
                     }
+                    // Readiness observed while the process keeps running. It is
+                    // forwarded as its own fact so the client can collapse the
+                    // log without ever treating the task as finished.
+                    Ok(leveler_execution::BackgroundTaskEvent::Ready {
+                        owner_scope,
+                        task_id,
+                        evidence,
+                        elapsed_ms,
+                    }) if owner_scope.as_deref() == Some(background_session_id.as_str()) => {
+                        let _ = background_sender.send(RuntimeEvent::BackgroundTaskReady {
+                            task_id,
+                            evidence,
+                            elapsed_ms,
+                        });
+                    }
                     Ok(leveler_execution::BackgroundTaskEvent::Exited { owner_scope, task })
                         if owner_scope.as_deref() == Some(background_session_id.as_str()) =>
                     {
@@ -1590,6 +1767,18 @@ impl InProcessRuntimeClient {
                                 });
                             }
                         }
+                        // The durable result, for `update_goal(complete)` and for
+                        // resume. A stop or an unobservable task produced no
+                        // result, so only a natural exit is recorded.
+                        if task.status == leveler_execution::BackgroundTaskStatus::Exited
+                            && let Some(app) = background_app.upgrade()
+                        {
+                            let session = background_session_id.clone();
+                            let terminal = task.clone();
+                            tokio::spawn(async move {
+                                persist_background_task_finished(&app, session, terminal).await;
+                            });
+                        }
                         if task.status == leveler_execution::BackgroundTaskStatus::Unknown {
                             let _ = background_sender.send(RuntimeEvent::BackgroundTaskUnknown {
                                 task_id: task.id,
@@ -1636,6 +1825,7 @@ impl InProcessRuntimeClient {
                                 args: task.args,
                                 elapsed_ms: task.duration_ms,
                                 pid: task.pid,
+                                ready_evidence: task.ready.map(|ready| ready.evidence),
                             })
                             .collect();
                         let _ = background_sender
@@ -2380,6 +2570,7 @@ impl InProcessRuntimeClient {
                                 });
                                 *link_slot.lock().unwrap() = moved;
                             });
+                        let shell_deadline = parts.request.timeout;
                         let spec = AdoptedTaskSpec {
                             owner_scope: Some(session_id.as_str().to_string()),
                             writer_scope: "user-shell".to_string(),
@@ -2392,9 +2583,18 @@ impl InProcessRuntimeClient {
                             write_scope: shell_write_scope,
                             lifetime: BackgroundTaskLifetime::Runtime,
                             started,
+                            // A user shell that left the foreground keeps the
+                            // execution window its own request carried; the
+                            // handoff adds no second budget and removes none.
+                            deadline: Some(shell_deadline),
                             initial_output: initial_output.clone(),
                             observer: Some(observer),
                             on_adopted: Some(on_adopted),
+                            mutation_baseline: None,
+                            // A user shell is not a tool call: it has its own
+                            // execution record and never enters the model's
+                            // verification evidence.
+                            origin_call_id: None,
                         };
                         match app
                             .background_tasks()
@@ -2656,6 +2856,114 @@ impl InProcessRuntimeClient {
         Ok(admission)
     }
 
+    /// Input the user typed while a turn ran and that no round consumed.
+    ///
+    /// A steer is accepted the moment the client sends it and is consumed at
+    /// the top of the next model round. Text that arrives in the window between
+    /// the final round's start and the turn's settle has no round left, and
+    /// dropping it would lose something the person actually typed. The turn is
+    /// over, so this is exactly the situation the client's own steer fallback
+    /// describes: deliver it as an ordinary message.
+    ///
+    /// A `/goal` declared in that same window is delivered as the goal turn it
+    /// asked for; its durable axis is already written, so nothing is lost if
+    /// this race is lost too.
+    async fn deliver_unconsumed_input(&self, session_id: &SessionId) {
+        // Read the slot without creating one: a session that never declared a
+        // goal must not gain an empty entry just because a turn ended.
+        let declaration = {
+            let slots = self
+                .goal_steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.get(session_id).and_then(|slot| {
+                let mut goal = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if goal.pending.is_empty() {
+                    return None;
+                }
+                goal.requested = true;
+                Some(goal.pending.remove(0))
+            })
+        };
+        if let Some(task) = declaration {
+            let result = Box::pin(self.send(ClientCommand::RunGoal {
+                session_id: session_id.clone(),
+                content: task.clone(),
+            }))
+            .await;
+            if result.is_err() {
+                let slot = self
+                    .goal_steering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(session_id)
+                    .cloned();
+                if let Some(slot) = slot {
+                    let mut goal = slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    goal.pending.insert(0, task);
+                    goal.requested = true;
+                }
+            }
+            return;
+        }
+        let pending = self
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+            .unwrap_or_default();
+        let text = pending
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            return;
+        }
+        let result = Box::pin(self.send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: text,
+            attachments: Vec::new(),
+        }))
+        .await;
+        if result.is_err() {
+            // A turn is already running again: hand the text back so that turn
+            // consumes it at its next round instead of losing it.
+            self.steering
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(session_id.clone())
+                .or_default()
+                .extend(pending);
+        }
+    }
+
+    /// New user input is waiting for a session's running turn.
+    ///
+    /// The text itself is consumed at the top of the next model round, so the
+    /// only thing that has to happen NOW is that an observation call gives the
+    /// round back. A `wait_task` watching a live service returns what it has
+    /// instead of holding the turn for its own bound; the process is untouched.
+    /// The queue is written before this runs, so an input that arrives between
+    /// the call returning and the next round is still seen.
+    fn signal_pending_input(&self, session_id: &SessionId) {
+        let tokens: Vec<CancellationToken> = self
+            .tool_call_yields
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|calls| calls.values().cloned().collect())
+            .unwrap_or_default();
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
     /// Steering for one session. Cloned into the executor, which drains it at
     /// the top of every round.
     /// Remove a session that was created but never handed to a client, so a
@@ -2684,6 +2992,7 @@ impl InProcessRuntimeClient {
             goal: self.goal_state_for(session_id),
             children: self.child_cancels.clone(),
             tool_calls: self.tool_call_cancels.clone(),
+            tool_yields: self.tool_call_yields.clone(),
         })
     }
 
@@ -3178,6 +3487,13 @@ impl InProcessRuntimeClient {
                 {
                     let _ = tx.send(Err(turn_rejection(&result)));
                 }
+                // A cancel is the user saying stop: pending text is not
+                // delivered as a new turn. Every other ending owes the person
+                // an answer to what they typed.
+                let user_cancelled = matches!(
+                    &result,
+                    Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
+                );
                 // TaskFinished is the normal path's one terminal authority and
                 // EventBridge projects it immediately. Only failures that never
                 // reached that commit need the wrapper fallback.
@@ -3193,6 +3509,9 @@ impl InProcessRuntimeClient {
                 client
                     .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
+                if !user_cancelled {
+                    client.deliver_unconsumed_input(&session_id).await;
+                }
                 // Session-owned background reap moved to the engine's terminal
                 // settlement (finish_from_result) so chat-routed continuations
                 // are covered too — one reap site, not one per spawn function
@@ -3269,6 +3588,7 @@ impl InProcessRuntimeClient {
             goal.requested = true;
             goal.pending.push(task);
         }
+        self.signal_pending_input(&session_id);
         let events = self.events_for(&session_id);
         if let Ok(session) = self.snapshot(&session_id).await {
             let _ = events.send(RuntimeEvent::SessionUpdated { session });
@@ -3732,6 +4052,13 @@ impl InProcessRuntimeClient {
                 {
                     let _ = tx.send(Err(turn_rejection(&result)));
                 }
+                // A cancel is the user saying stop: pending text is not
+                // delivered as a new turn. Every other ending owes the person
+                // an answer to what they typed.
+                let user_cancelled = matches!(
+                    &result,
+                    Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
+                );
                 if !bridge.terminal_published() {
                     active.finish_with(&admission, || {
                         let _ = events.send(turn_runtime_event(result));
@@ -3743,6 +4070,9 @@ impl InProcessRuntimeClient {
                 client
                     .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
+                if !user_cancelled {
+                    client.deliver_unconsumed_input(&session_id).await;
+                }
             });
         });
         accepted_rx
@@ -4536,6 +4866,13 @@ impl InProcessRuntimeClient {
                 {
                     let _ = tx.send(Err(turn_rejection(&result)));
                 }
+                // A cancel is the user saying stop: pending text is not
+                // delivered as a new turn. Every other ending owes the person
+                // an answer to what they typed.
+                let user_cancelled = matches!(
+                    &result,
+                    Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
+                );
                 if !bridge.terminal_published() {
                     active.finish_with(&admission, || {
                         let _ = events.send(turn_runtime_event(result));
@@ -4550,6 +4887,9 @@ impl InProcessRuntimeClient {
                 client
                     .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
+                if !user_cancelled {
+                    client.deliver_unconsumed_input(&session_id).await;
+                }
             });
         });
         accepted_rx
@@ -5119,6 +5459,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         .entry(session_id.clone())
                         .or_default()
                         .push(content);
+                    self.signal_pending_input(&session_id);
                     return Ok(());
                 }
                 // The turn ended between the client deciding to steer and this
@@ -6287,6 +6628,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 args: task.args,
                 elapsed_ms: task.duration_ms,
                 pid: task.pid,
+                ready_evidence: task.ready.map(|ready| ready.evidence),
             })
             .collect();
 
@@ -7307,6 +7649,7 @@ async fn compact_conversation(
                 args: task.args,
                 elapsed_ms: task.duration_ms,
                 pid: task.pid,
+                ready_evidence: task.ready.map(|ready| ready.evidence),
             })
             .collect();
         let task_projection = match db.session_facts_for(session_id).await {
@@ -7686,6 +8029,7 @@ mod child_cancel_tests {
             goal: Arc::new(Mutex::new(GoalSteer::default())),
             children: children.clone(),
             tool_calls: Arc::new(Mutex::new(HashMap::new())),
+            tool_yields: Arc::new(Mutex::new(HashMap::new())),
         };
         let running = CancellationToken::new();
         steering.child_started("c1", running.clone());

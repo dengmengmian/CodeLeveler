@@ -40,11 +40,34 @@ pub(crate) fn extract_applied_diff(metadata: &serde_json::Value) -> Option<Strin
 /// machine-readable execution status, and — when it was cancelled — whether its
 /// process tree was confirmed gone. `execution_status: timed_out` is the
 /// timeout signal; there is no separate boolean to disagree with it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CommandFacts {
     pub exit_code: Option<i32>,
     pub stop: Option<leveler_execution::CommandStop>,
     pub execution_status: Option<leveler_execution::ToolExecutionStatus>,
+    /// The real result of a command that had been moved to the background and
+    /// was observed to finish. Distinct from the call's own outcome: the call
+    /// reported a START, and this is the result the start did not have yet.
+    pub background_result: Option<BackgroundResultFacts>,
+    /// The task id a command call reported when it only STARTED the process.
+    ///
+    /// A start is neither a pass nor a failure, so it is never evidence. It is
+    /// still a fact: a completion that cites that command has to be told the
+    /// process is running and unnamed-not-failed, instead of "it never ran".
+    pub started_task: Option<String>,
+}
+
+/// A terminated background task, as `wait_task`/`get_task` observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundResultFacts {
+    /// The process the task ran (argv). Labelled by the same rule as a command
+    /// call, so a citation of that command matches this result.
+    pub program: String,
+    pub args: Vec<String>,
+    pub task_id: String,
+    /// The task reached this result: any exit but zero is a failure.
+    pub ok: bool,
+    pub exit_code: Option<i32>,
 }
 
 pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFacts {
@@ -60,10 +83,47 @@ pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFact
     let execution_status = metadata
         .get("execution_status")
         .and_then(|status| serde_json::from_value(status.clone()).ok());
+    // The background task's terminal result, attached by the lifecycle tools
+    // that read it from the registry. Absent for a start, for a still-running
+    // task, and for every non-command tool.
+    let background_result = metadata.get("background_result").and_then(|value| {
+        Some(BackgroundResultFacts {
+            program: value.get("program")?.as_str()?.to_string(),
+            args: value
+                .get("args")
+                .and_then(|args| args.as_array())
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            task_id: value.get("task_id")?.as_str()?.to_string(),
+            ok: value.get("ok")?.as_bool()?,
+            exit_code: value
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok()),
+        })
+    });
+    // A start reports `task_id` and no execution status; a terminal
+    // observation of the same task reports both. The start keeps its id so the
+    // executor can name the task a citation is waiting on.
+    let started_task = background_result.as_ref().map_or_else(
+        || {
+            metadata
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        },
+        |_| None,
+    );
     CommandFacts {
         exit_code,
         stop,
         execution_status,
+        background_result,
+        started_task,
     }
 }
 
@@ -763,5 +823,74 @@ mod output_lines_tests {
             .expect("a whole line");
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(text.contains("red"));
+    }
+}
+
+#[cfg(test)]
+mod background_result_tests {
+    use super::*;
+
+    /// The lifecycle tools attach a background task's terminal result as a
+    /// structured fact. It must be readable without parsing their prose, and it
+    /// must be absent for a start, a cancel, or a non-command tool.
+    #[test]
+    fn a_terminal_background_result_is_extracted() {
+        let metadata = serde_json::json!({
+            "background_result": {
+                "program": "cargo",
+                "args": ["test", "--lib"],
+                "task_id": "bg-7",
+                "ok": true,
+                "exit_code": 0
+            }
+        });
+        let facts = extract_command_facts(&metadata);
+        let result = facts.background_result.expect("result");
+        assert_eq!(result.program, "cargo");
+        assert_eq!(result.args, vec!["test".to_string(), "--lib".to_string()]);
+        assert_eq!(result.task_id, "bg-7");
+        assert!(result.ok);
+        assert_eq!(result.exit_code, Some(0));
+        // The call itself is still a start: no execution status is invented.
+        assert!(facts.execution_status.is_none());
+        assert!(
+            facts.started_task.is_none(),
+            "a terminal result is not a pending start"
+        );
+    }
+
+    /// A start reports the task id and nothing else: no exit, no status. The id
+    /// is what lets the completion gate name the task a cited command is
+    /// waiting on instead of claiming the command never ran.
+    #[test]
+    fn a_started_command_reports_its_task_and_no_result() {
+        let metadata = serde_json::json!({
+            "task_id": "bg-3",
+            "status": "running",
+            "background": true,
+            "lifetime": "goal"
+        });
+        let facts = extract_command_facts(&metadata);
+        assert_eq!(facts.started_task.as_deref(), Some("bg-3"));
+        assert!(facts.execution_status.is_none());
+        assert!(facts.exit_code.is_none());
+        assert!(facts.background_result.is_none());
+    }
+
+    #[test]
+    fn a_start_or_a_cancel_carries_no_background_result() {
+        let started = serde_json::json!({
+            "execution_status": "running",
+        });
+        assert!(extract_command_facts(&started).background_result.is_none());
+        let cancelled = serde_json::json!({
+            "background_result": serde_json::Value::Null,
+        });
+        assert!(
+            extract_command_facts(&cancelled)
+                .background_result
+                .is_none(),
+            "a cancelled task is not a result"
+        );
     }
 }

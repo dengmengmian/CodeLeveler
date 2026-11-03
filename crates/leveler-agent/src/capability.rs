@@ -7,7 +7,7 @@
 //! packs from the session's shared cell. A goal contributes its durable
 //! activations to that cell; it never removes one, because exposure is not
 //! authority and losing it silently is what made the model contradict itself.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use leveler_core::GoalId;
@@ -164,7 +164,17 @@ struct GoalBinding {
 
 pub struct CapabilityDisclosure {
     available: BTreeSet<CapabilityId>,
+    /// Packs that became available DURING this turn — an external catalog whose
+    /// server started while the turn was running. Availability is a host fact
+    /// that can change mid-turn; the turn's surface must be able to say so
+    /// without pretending the pack was offered from the beginning.
+    late_available: RwLock<BTreeSet<CapabilityId>>,
     permitted: BTreeSet<CapabilityId>,
+    /// Why a pack is not available on THIS turn, in the host's words. A pack
+    /// whose tools could not be reached (an MCP server that is not up yet) looks
+    /// identical to one that was never configured unless the difference is
+    /// stated; the model must be able to tell "not offered" from "not ready".
+    unavailable: RwLock<BTreeMap<CapabilityId, String>>,
     /// Capabilities that are part of the product's first-round surface. They
     /// are exposed without an enable round trip and are never persisted as a
     /// grant, so a goal restore cannot take them away.
@@ -187,7 +197,9 @@ impl CapabilityDisclosure {
         }
         Ok(Self {
             available,
+            late_available: RwLock::new(BTreeSet::new()),
             permitted,
+            unavailable: RwLock::new(BTreeMap::new()),
             default_active: BTreeSet::new(),
             active: SharedCapabilityActivation::new(active),
             binding: RwLock::new(None),
@@ -208,12 +220,21 @@ impl CapabilityDisclosure {
     ) -> Self {
         Self {
             available: available.into_iter().collect(),
+            late_available: RwLock::new(BTreeSet::new()),
             permitted: permitted.into_iter().collect(),
+            unavailable: RwLock::new(BTreeMap::new()),
             default_active: BTreeSet::new(),
             active: activation,
             binding: RwLock::new(None),
             enable_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Record, for this turn only, why an otherwise-offered pack has nothing to
+    /// offer. It never changes availability or permission.
+    pub fn with_unavailable(self, reasons: BTreeMap<CapabilityId, String>) -> Self {
+        *self.unavailable.write().expect("capability lock") = reasons;
+        self
     }
 
     /// Mark capabilities as part of the product's default surface.
@@ -222,7 +243,7 @@ impl CapabilityDisclosure {
     /// exposure, not authority, so it can never widen what the host supports.
     pub fn with_default_active(mut self, defaults: Vec<CapabilityId>) -> Result<Self, String> {
         for id in defaults {
-            if !self.available.contains(&id) || !self.permitted.contains(&id) {
+            if !self.available(id) || !self.permitted.contains(&id) {
                 return Err(format!(
                     "default capability unavailable or not permitted: {}",
                     id.as_str()
@@ -235,6 +256,43 @@ impl CapabilityDisclosure {
 
     pub fn available(&self, id: CapabilityId) -> bool {
         self.available.contains(&id)
+            || self
+                .late_available
+                .read()
+                .expect("capability lock")
+                .contains(&id)
+    }
+
+    /// Whether this host permits the pack at all.
+    ///
+    /// Distinct from [`Self::available`] (the tools exist) and from
+    /// [`Self::exposed`] (they are on this request's surface): only the
+    /// conjunction of the three is a pack the model could obtain right now.
+    pub fn is_permitted(&self, id: CapabilityId) -> bool {
+        self.permitted.contains(&id)
+    }
+
+    /// A pack whose tools arrived during this turn. It is offered from now on;
+    /// the operator (permission) fact does not change.
+    pub fn note_available(&self, id: CapabilityId) {
+        if self.available.contains(&id) {
+            return;
+        }
+        self.unavailable
+            .write()
+            .expect("capability lock")
+            .remove(&id);
+        if self
+            .late_available
+            .write()
+            .expect("capability lock")
+            .insert(id)
+        {
+            tracing::info!(
+                capability = id.as_str(),
+                event = "capability_became_available"
+            );
+        }
     }
 
     pub async fn enable_with_authority(
@@ -263,11 +321,11 @@ impl CapabilityDisclosure {
         self.active
             .ids()
             .into_iter()
-            .filter(|id| self.available.contains(id) && self.permitted.contains(id))
+            .filter(|id| self.available(*id) && self.permitted.contains(id))
             .collect()
     }
     pub fn exposed(&self, id: CapabilityId) -> bool {
-        self.available.contains(&id)
+        self.available(id)
             && self.permitted.contains(&id)
             && (self.default_active.contains(&id) || self.active.contains(id))
     }
@@ -290,7 +348,9 @@ impl CapabilityDisclosure {
             .collect();
         Self {
             available: self.available.intersection(&offered).copied().collect(),
+            late_available: RwLock::new(BTreeSet::new()),
             permitted: self.permitted.intersection(&offered).copied().collect(),
+            unavailable: RwLock::new(self.unavailable.read().expect("capability lock").clone()),
             default_active: self
                 .default_active
                 .intersection(&offered)
@@ -303,7 +363,17 @@ impl CapabilityDisclosure {
     }
     pub fn fresh(&self) -> Self {
         Self::new(
-            self.available.iter().copied().collect(),
+            self.available
+                .iter()
+                .copied()
+                .chain(
+                    self.late_available
+                        .read()
+                        .expect("capability lock")
+                        .iter()
+                        .copied(),
+                )
+                .collect(),
             self.permitted.iter().copied().collect(),
             vec![],
         )
@@ -322,18 +392,29 @@ impl CapabilityDisclosure {
         serde_json::json!(Self::catalog_entries(self))
     }
     fn catalog_entries(&self) -> Vec<serde_json::Value> {
-        CapabilityId::ALL.into_iter().map(|id| serde_json::json!({
-            "id": id.as_str(), "description": id.description(),
-            "available": self.available.contains(&id), "permitted": self.permitted.contains(&id),
-            "exposed": self.exposed(id),
-        })).collect()
+        CapabilityId::ALL
+            .into_iter()
+            .map(|id| {
+                let mut entry = serde_json::json!({
+                    "id": id.as_str(), "description": id.description(),
+                    "available": self.available(id),
+                    "permitted": self.permitted.contains(&id),
+                    "exposed": self.exposed(id),
+                });
+                let unavailable = self.unavailable.read().expect("capability lock");
+                if let Some(reason) = unavailable.get(&id) {
+                    entry["detail"] = serde_json::Value::String(reason.clone());
+                }
+                entry
+            })
+            .collect()
     }
     pub async fn enable(&self, id: CapabilityId) -> Result<bool, String> {
         tracing::info!(
             capability = id.as_str(),
             event = "capability_enable_requested"
         );
-        if !self.available.contains(&id) {
+        if !self.available(id) {
             return Err(format!("capability unavailable: {}", id.as_str()));
         }
         if !self.permitted.contains(&id) {
@@ -375,7 +456,19 @@ impl CapabilityDisclosure {
             .filter(|id| id.as_str() != "memory")
             .map(|id| CapabilityId::parse(id))
             .collect::<Result<_, _>>()?;
-        if !active.is_subset(&self.available) || !active.is_subset(&self.permitted) {
+        let available: BTreeSet<_> = self
+            .available
+            .iter()
+            .copied()
+            .chain(
+                self.late_available
+                    .read()
+                    .expect("capability lock")
+                    .iter()
+                    .copied(),
+            )
+            .collect();
+        if !active.is_subset(&available) || !active.is_subset(&self.permitted) {
             return Err("restored capability unavailable or not permitted".into());
         }
         // The bound goal's durable activations replace the previous goal's, so

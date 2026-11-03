@@ -134,9 +134,29 @@ impl ModelRuntime for SleepyRuntime {
             .pop_front()
             .unwrap_or(self.default_delay);
         tokio::time::sleep(delay).await;
-        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-            ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
-        })?;
+        let response = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| {
+                // The runtime's delivery round after a resolution: the goal is
+                // already recorded, so a real model answers the person.
+                let delivering = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::User)
+                    .is_some_and(|message| {
+                        message
+                            .text_content()
+                            .contains("this round is the delivery")
+                    });
+                delivering.then(|| assistant_text("the goal is resolved and reported"))
+            })
+            .ok_or_else(|| {
+                ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
+            })?;
         let mut events: Vec<Result<ModelEvent, ModelError>> =
             vec![Ok(ModelEvent::MessageStarted {
                 request_id: response.request_id.clone(),
@@ -4540,16 +4560,37 @@ impl ModelRuntime for RoutedRuntime {
                 .push(request.messages.clone());
         }
         let queue = if is_child { &self.child } else { &self.parent };
-        let response = queue.lock().unwrap().pop_front().ok_or_else(|| {
-            ModelError::new(
-                leveler_model::ModelErrorKind::Other,
-                if is_child {
-                    "child queue exhausted"
-                } else {
-                    "parent queue exhausted"
-                },
-            )
-        })?;
+        let response = queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| {
+                // The runtime's delivery round after a resolution: the goal is
+                // already recorded, so a real model answers the person instead of
+                // resolving it again. Only the parent takes one.
+                let delivering = !is_child
+                    && request
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == Role::User)
+                        .is_some_and(|message| {
+                            message
+                                .text_content()
+                                .contains("this round is the delivery")
+                        });
+                delivering.then(|| assistant_text("the goal is resolved and reported"))
+            })
+            .ok_or_else(|| {
+                ModelError::new(
+                    leveler_model::ModelErrorKind::Other,
+                    if is_child {
+                        "child queue exhausted"
+                    } else {
+                        "parent queue exhausted"
+                    },
+                )
+            })?;
         let mut events: Vec<Result<ModelEvent, ModelError>> =
             vec![Ok(ModelEvent::MessageStarted {
                 request_id: response.request_id.clone(),

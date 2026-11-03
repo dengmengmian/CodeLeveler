@@ -53,6 +53,10 @@ pub(crate) struct WaitView {
     /// Authoritative count (may exceed [`WaitTarget`]s actually disclosed).
     pub count: usize,
     pub targets: Vec<WaitTarget>,
+    /// The in-flight wait is for a readiness signal, not for the process to
+    /// exit. Read from the call's own arguments, so the headline names what the
+    /// runtime is actually waiting for.
+    pub readiness: bool,
 }
 
 /// Derive the wait, if Main is actually blocked.
@@ -83,6 +87,7 @@ pub(crate) fn project(state: &AppState) -> Option<WaitView> {
             wait_secs: state.elapsed_secs,
             count: 1,
             targets: Vec::new(),
+            readiness: false,
         });
     }
     None
@@ -97,6 +102,7 @@ fn project_approval(state: &AppState) -> Option<WaitView> {
         wait_secs: 0,
         count: 1,
         targets: Vec::new(),
+        readiness: false,
     })
 }
 
@@ -144,11 +150,15 @@ fn project_background_wait(state: &AppState, running: &[&ToolCallBlock]) -> Opti
         .unwrap_or(0);
     let count = targets.len();
     targets.truncate(MAX_TARGETS);
+    let readiness = waits
+        .iter()
+        .any(|call| waits_for_readiness(&call.arguments));
     Some(WaitView {
         kind: WaitKind::BackgroundTask,
         wait_secs,
         count,
         targets,
+        readiness,
     })
 }
 
@@ -209,6 +219,7 @@ fn project_child_wait(state: &AppState, running: &[&ToolCallBlock]) -> Option<Wa
         wait_secs,
         count,
         targets,
+        readiness: false,
     })
 }
 
@@ -227,6 +238,21 @@ fn running_tools(state: &AppState) -> Vec<&ToolCallBlock> {
         }
     }
     Vec::new()
+}
+
+/// Whether a `wait_task` call is observing for a readiness/output criterion
+/// rather than waiting for the task to exit. Anything but the default `exit`
+/// mode is a live observation of a task that is expected to keep running.
+fn waits_for_readiness(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("until")
+                .and_then(serde_json::Value::as_str)
+                .map(|until| until != "exit")
+        })
+        .unwrap_or(false)
 }
 
 fn wait_task_id(arguments: &str) -> Option<String> {
@@ -265,6 +291,11 @@ pub(crate) fn headline(view: &WaitView, t: &UiText) -> String {
     let reason = match (view.kind, view.count) {
         (WaitKind::BackgroundTask, n) if n > 1 => {
             t.waiting_background_n.replace("{}", &n.to_string())
+        }
+        // Waiting for a service to announce itself is a different dependency
+        // from waiting for a finite command's exit, and it resolves differently.
+        (WaitKind::BackgroundTask, _) if view.readiness => {
+            t.title_waiting_background_ready.to_string()
         }
         (WaitKind::BackgroundTask, _) => t.title_waiting_background.to_string(),
         (WaitKind::ChildAgent, n) if n > 1 => t.waiting_child_n.replace("{}", &n.to_string()),
@@ -658,6 +689,62 @@ mod tests {
         assert!(text.contains("npm run dev"), "{text}");
     }
 
+    /// BG-14 in the status line: a wait for readiness is not a wait for the
+    /// process to exit, and the headline says which one the runtime is doing.
+    #[test]
+    fn a_readiness_wait_names_readiness_not_exit() {
+        let mut s = test_state();
+        s.status = RuntimeStatus::Busy;
+        s.elapsed_secs = 20;
+        s.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("w1"),
+            "wait_task".into(),
+            serde_json::json!({
+                "task_id": "t-1",
+                "until": "match",
+                "pattern": "listening on"
+            })
+            .to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+        live_background(&mut s, "t-1", "make up", 0);
+        let view = project(&s).expect("wait");
+        assert!(view.readiness, "the call is observing for readiness");
+        let t = s.t();
+        let headline = headline(&view, t);
+        assert!(
+            headline.contains(t.title_waiting_background_ready),
+            "{headline}"
+        );
+        assert!(!headline.contains(t.title_waiting_background), "{headline}");
+    }
+
+    /// Waiting for an exit keeps the original wording: the two waits resolve
+    /// differently and must not be renamed into each other.
+    #[test]
+    fn an_exit_wait_keeps_the_exit_wording() {
+        let mut s = test_state();
+        s.status = RuntimeStatus::Busy;
+        s.elapsed_secs = 20;
+        s.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("w1"),
+            "wait_task".into(),
+            serde_json::json!({ "task_id": "t-1" }).to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+        live_background(&mut s, "t-1", "cargo test", 0);
+        let view = project(&s).expect("wait");
+        assert!(!view.readiness);
+        let t = s.t();
+        assert!(headline(&view, t).contains(t.title_waiting_background));
+    }
+
     #[test]
     fn english_copy_is_translated() {
         let t = crate::i18n::Locale::En.text();
@@ -671,6 +758,7 @@ mod tests {
                 running_secs: Some(10),
                 lifecycle: TargetLifecycle::Running,
             }],
+            readiness: false,
         };
         let text = render_plain(&view, t, 80);
         assert!(text.contains("waiting for background task"), "{text}");

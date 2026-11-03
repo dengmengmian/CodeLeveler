@@ -184,6 +184,10 @@ pub struct BackgroundTaskChrome {
     pub last_output_at: Option<std::time::Instant>,
     /// Output retained from authoritative events. Empty means none arrived.
     pub output: String,
+    /// Readiness evidence the runtime observed in this task's own output while
+    /// it kept running. Never inferred from the command line, the clock, or the
+    /// exit code: it is absent until a caller waited for a real signal.
+    pub ready: Option<String>,
 }
 
 impl BackgroundTaskChrome {
@@ -199,7 +203,14 @@ impl BackgroundTaskChrome {
             pid: None,
             last_output_at: None,
             output: String::new(),
+            ready: None,
         }
+    }
+
+    /// Readiness was observed and the process is still running. A ready task is
+    /// NOT a completed one: only `ok` says how it ended.
+    pub fn is_ready(&self) -> bool {
+        self.is_running() && self.ready.is_some()
     }
 
     pub fn is_running(&self) -> bool {
@@ -661,6 +672,8 @@ pub struct AppState {
     /// resume vs. chat from this flag.
     pub resumable_task: bool,
     pub quit_armed: bool,
+    /// An explicit exit is awaiting runtime-owned session cleanup.
+    pub quit_pending: bool,
 
     /// Monotonic frame counter driving the busy spinner animation.
     pub tick: u64,
@@ -852,6 +865,7 @@ impl AppState {
             cancel_repeat_armed: false,
             resumable_task: false,
             quit_armed: false,
+            quit_pending: false,
             tick: 0,
             motion_clock: std::time::Duration::ZERO,
             live_animation: crate::motion::live_animation_enabled(),

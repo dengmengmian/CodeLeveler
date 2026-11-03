@@ -22,15 +22,15 @@ async fn connects_to_real_mcp_server_and_calls_a_tool() {
         return;
     }
 
-    let config = McpServerConfig {
-        name: "everything".to_string(),
-        command: "npx".to_string(),
-        args: vec![
+    let config = McpServerConfig::stdio(
+        "everything",
+        "npx",
+        vec![
             "-y".to_string(),
             "@modelcontextprotocol/server-everything".to_string(),
         ],
-        env: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     // 1) Connect + tools/list through our client.
     let tools = connect_all(std::slice::from_ref(&config)).await;

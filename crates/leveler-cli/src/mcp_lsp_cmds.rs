@@ -27,7 +27,10 @@ pub(crate) fn cmd_mcp(command: McpCommand) -> anyhow::Result<std::process::ExitC
             let servers = mcp_config::list().map_err(|e| anyhow::anyhow!("{e}"))?;
             if servers.is_empty() {
                 println!("{}", Line::warn("No MCP servers configured."));
-                println!("  Add one: leveler mcp add <name> -- <command> [args...]");
+                println!("  Add stdio: leveler mcp add <name> -- <command> [args...]");
+                println!(
+                    "  Add HTTP:  leveler mcp add <name> --url <http(s)://host/mcp> [--header Name=ENV] [--bearer-env ENV]"
+                );
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             println!(
@@ -40,30 +43,68 @@ pub(crate) fn cmd_mcp(command: McpCommand) -> anyhow::Result<std::process::ExitC
                 } else {
                     console::style("✗").red()
                 };
-                let cmd = std::iter::once(s.command.clone())
-                    .chain(s.args.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!("  {mark} {}  →  {cmd}", s.name);
-                if !s.env_keys.is_empty() {
-                    // Keys only — never print resolved values (secrets-never-persist).
-                    println!("      env: {}", s.env_keys.join(", "));
-                }
-                if !s.available {
-                    println!(
-                        "      {}",
-                        console::style("(command not found on PATH)").dim()
-                    );
+                if s.url.is_some() {
+                    let url = s.url.as_deref().unwrap_or("");
+                    println!("  {mark} {}  →  streamable_http {url}", s.name);
+                    if !s.header_names.is_empty() {
+                        println!("      headers: {}", s.header_names.join(", "));
+                    }
+                    if let Some(source) = &s.bearer_token_env {
+                        println!("      bearer: ${source}");
+                    }
+                    if !s.available {
+                        println!(
+                            "      {}",
+                            console::style("(URL is not a valid http(s) endpoint)").dim()
+                        );
+                    }
+                } else {
+                    let cmd = std::iter::once(s.command.clone())
+                        .chain(s.args.clone())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("  {mark} {}  →  stdio {cmd}", s.name);
+                    if !s.env_keys.is_empty() {
+                        // Keys only — never print resolved values (secrets-never-persist).
+                        println!("      env: {}", s.env_keys.join(", "));
+                    }
+                    if !s.available {
+                        println!(
+                            "      {}",
+                            console::style("(command not found on PATH)").dim()
+                        );
+                    }
                 }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        McpCommand::Add { name, env, command } => {
-            let (cmd, args) = command
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("no launch command provided after `--`"))?;
-            let path =
-                mcp_config::add(&name, cmd, args, &env).map_err(|e| anyhow::anyhow!("{e}"))?;
+        McpCommand::Add {
+            name,
+            env,
+            command,
+            url,
+            header,
+            bearer_env,
+        } => {
+            let path = if let Some(url) = url {
+                if !command.is_empty() || !env.is_empty() {
+                    anyhow::bail!(
+                        "HTTP MCP uses --url, --header and --bearer-env; do not also pass --env or a command"
+                    );
+                }
+                mcp_config::add_streamable_http(&name, &url, &header, bearer_env.as_deref())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            } else {
+                if !header.is_empty() || bearer_env.is_some() {
+                    anyhow::bail!(
+                        "stdio MCP uses --env and a command; --header and --bearer-env require --url"
+                    );
+                }
+                let (cmd, args) = command
+                    .split_first()
+                    .ok_or_else(|| anyhow::anyhow!("no launch command provided after `--`"))?;
+                mcp_config::add(&name, cmd, args, &env).map_err(|e| anyhow::anyhow!("{e}"))?
+            };
             println!(
                 "{}",
                 Line::ok(&format!("Added MCP server `{name}` to {}", path.display()))

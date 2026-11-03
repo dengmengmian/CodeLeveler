@@ -138,6 +138,14 @@ impl ToolRegistry {
             .is_some_and(|t| t.replay_is_side_effect_free())
     }
 
+    /// Whether an interrupted call of this tool may be closed by recovery
+    /// without human confirmation. An UNKNOWN tool answers `false`.
+    pub fn recovery_is_skippable(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|t| t.recovery_is_skippable())
+    }
+
     pub fn runs_command(&self, name: &str) -> bool {
         self.tools.get(name).is_some_and(|t| t.runs_command())
     }
@@ -418,7 +426,18 @@ fn validate_schema(
 
     let errors: Vec<String> = validator
         .iter_errors(instance)
-        .map(|e| format!("{} (at {})", e, e.instance_path))
+        // A violation of the instance itself has an empty JSON pointer. Printing
+        // the location unconditionally produced `(at )`, which reads as a
+        // truncated message: the model that hit it spent a turn guessing instead
+        // of fixing the argument. Name the path only when there is one.
+        .map(|e| {
+            let path = e.instance_path.to_string();
+            if path.is_empty() {
+                e.to_string()
+            } else {
+                format!("{} (at {})", e, path)
+            }
+        })
         .collect();
 
     if errors.is_empty() {
@@ -1082,6 +1101,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    /// The model-visible shape a real session produced (2026-11-01 dogfood):
+    /// `shell_command` was called with `command` instead of `cmd`, and the reply
+    /// was `"cmd" is a required property (at )`. The blank location reads as a
+    /// truncated message — the model spent a turn guessing what the parenthesis
+    /// meant. A root-level violation has no JSON pointer, so it must not print one.
+    #[test]
+    fn a_root_schema_error_does_not_render_a_blank_location() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"]
+        });
+        let err = validate_schema(
+            "shell_command",
+            &schema,
+            &serde_json::json!({"command": "ls -l"}),
+        )
+        .unwrap_err();
+        let ToolError::InvalidArguments { message, .. } = err else {
+            panic!("expected InvalidArguments, got {err:?}");
+        };
+        assert!(
+            message.contains("cmd"),
+            "the missing parameter must still be named: {message}"
+        );
+        assert!(
+            !message.contains("(at )"),
+            "a root violation must not render an empty location: {message}"
+        );
+    }
+
+    /// The same formatter still has to point at a nested field: dropping the
+    /// location entirely would make a deep violation harder to fix than before.
+    #[test]
+    fn a_nested_schema_error_still_names_its_path() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "args": {"type": "array", "items": {"type": "string"}}
+            }
+        });
+        let err = validate_schema(
+            "run_command",
+            &schema,
+            &serde_json::json!({"args": ["ok", 7]}),
+        )
+        .unwrap_err();
+        let ToolError::InvalidArguments { message, .. } = err else {
+            panic!("expected InvalidArguments, got {err:?}");
+        };
+        assert!(
+            message.contains("/args/1"),
+            "the offending element must be addressed: {message}"
+        );
     }
 
     #[tokio::test]

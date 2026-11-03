@@ -1222,9 +1222,10 @@ pub(crate) async fn cmd_tui(
             Some(crate::clean_cmd::clean_host()),
             boot,
         )
-        .await?;
-        // Stop the TUI-owned HTTP server; the local daemon keeps running.
+        .await;
+        // Stop the TUI-owned HTTP server on errors too; the daemon keeps running.
         web_shutdown.cancel();
+        let exit = exit?;
         // `/update` installed a new binary: replace this process, preserving
         // the original invocation. The daemon keeps serving either way.
         if exit == leveler_tui::TuiExit::Restart {
@@ -1378,22 +1379,17 @@ pub(crate) async fn cmd_tui(
         Some(crate::clean_cmd::clean_host()),
         boot,
     )
-    .await?;
+    .await;
     web_shutdown.cancel();
-    if exit == leveler_tui::TuiExit::Restart {
-        // The idle `/update` path: shut the in-process runtime down so its
-        // background work is not abandoned mid-flight, then replace the
-        // process. The new binary starts a fresh runtime.
-        let _ = quit_client
-            .send(leveler_client_protocol::ClientCommand::Quit)
-            .await;
-        crate::upgrade_cmd::restart_after_update();
-    }
-    // Drop-based reapers never run past `std::process::exit`; shut the
-    // runtime down explicitly (background tasks + browser tree, R004 F7).
+    // Terminal loss is not an explicit session stop, but this process owns
+    // the runtime. Shut it down on both success and terminal I/O failure.
     let _ = quit_client
         .send(leveler_client_protocol::ClientCommand::Quit)
         .await;
+    let exit = exit?;
+    if exit == leveler_tui::TuiExit::Restart {
+        crate::upgrade_cmd::restart_after_update();
+    }
     // The TUI owns the only runtime, and an in-process `/web` server is spawned
     // detached on a token it never cancels (it serves "until the process
     // exits"). Falling through to a normal return would drop the runtime with

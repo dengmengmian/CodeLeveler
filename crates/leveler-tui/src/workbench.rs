@@ -720,6 +720,7 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     // Facts, each from its owner.
     let running = crate::activity::running_background_count(state);
+    let ready = crate::activity::ready_background_count(state);
     let issues = crate::issue::issue_summary(state);
     let indicator = state
         .plan
@@ -799,7 +800,7 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // 4. Background entry (running tasks only): an entry, not a report.
     if running > 0 {
         claim(
-            background_strip(state, running),
+            background_strip(state, running, ready),
             &mut committed,
             &mut claimed,
         );
@@ -886,15 +887,27 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
 ///
 /// The keyboard focus reads the same as the plan's: reversed while
 /// `WorkbenchFocus::Background` owns the keys (Enter opens the jobs list).
-fn background_strip(state: &AppState, running: usize) -> StripItem {
+fn background_strip(state: &AppState, running: usize, ready: usize) -> StripItem {
     let mut ink = Style::default().fg(state.theme.accent.primary);
     if state.workbench_focus == crate::state::WorkbenchFocus::Background {
         ink = ink.add_modifier(Modifier::REVERSED);
     }
-    let label = state
+    let mut label = state
         .t()
         .background_running_count
         .replace("{}", &running.to_string());
+    // Readiness is a fact about a task that is still running, so it belongs in
+    // the same cell rather than in a second count that could be read as a
+    // different set of tasks.
+    if ready > 0 {
+        label.push_str(" \u{b7} ");
+        label.push_str(
+            &state
+                .t()
+                .background_ready_count
+                .replace("{}", &ready.to_string()),
+        );
+    }
     let text = format!("{label}{STRIP_ARROW}");
     let width = UnicodeWidthStr::width(text.as_str());
     StripItem {
@@ -2432,6 +2445,11 @@ mod tests {
 
     fn status_fixture(collaboration: &str, busy: bool) -> AppState {
         let mut state = test_state();
+        // The empty-session card paints one rotating tip, seeded from the wall
+        // clock at startup. These tests read the AXIS chip out of the whole
+        // frame, and the card's `/goal` tip is not that chip: an unpinned tip
+        // turned the chat assertion below into a coin flip. Pin it.
+        state.welcome_tip = crate::splash::tip_index(1);
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.thinking = Some(leveler_client_protocol::UiThinkingState {
             configured: leveler_model::ThinkingLevel::Max,
@@ -5054,6 +5072,7 @@ mod tests {
             last_output_at: None,
             output: String::new(),
             unknown: false,
+            ready: None,
         }
     }
 
@@ -5145,6 +5164,45 @@ mod tests {
         );
         let strip = row_of(&lines, "后台 1");
         assert!(lines[strip].contains('↗'), "{all}");
+    }
+
+    /// A ready service is still a RUNNING task, so readiness is named inside
+    /// the background cell instead of inventing a second set of tasks.
+    #[test]
+    fn a_ready_task_shows_inside_the_background_cell() {
+        let mut ready = bg_running("npm run dev", 0);
+        ready.ready = Some("listening on :8080".into());
+        let lines = render_background_case(
+            100,
+            30,
+            vec![("bg-1", bg_running("make up", 0)), ("bg-2", ready)],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let strip = lines.join("\n");
+        assert!(strip.contains("后台 2"), "{strip}");
+        assert!(strip.contains("就绪 1"), "{strip}");
+        assert!(strip.contains('\u{2197}'), "{strip}");
+    }
+
+    /// The same cell on a narrow terminal: whatever does not fit is dropped by
+    /// the claim, never truncated into a misleading count.
+    #[test]
+    fn a_ready_task_never_truncates_the_strip_into_a_wrong_count() {
+        let mut ready = bg_running("npm run dev", 0);
+        ready.ready = Some("listening on :8080".into());
+        let lines = render_background_case(
+            48,
+            20,
+            vec![("bg-1", ready)],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let strip = lines.join("\n");
+        assert!(
+            !strip.contains("后台 就绪") && !strip.contains("就绪 0"),
+            "no half-written count: {strip}"
+        );
     }
 
     /// Several running tasks aggregate into one count; no task is ever named.

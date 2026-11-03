@@ -108,21 +108,42 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         }
     }
     if state.is_busy() {
+        let text = state.composer.take().trim().to_string();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        // A turn blocked on a background wait is not going to reach its
+        // terminal event on its own: the model asked to wait, and the bound may
+        // be minutes away. Queueing here would answer "现在进展怎么样了？" only
+        // after the wait expires. Enter therefore steers: the runtime hands the
+        // round back, the model answers from the task's real state, and the
+        // goal continues. Nothing about the observed process changes.
+        if crate::wait_status::project(state)
+            .is_some_and(|view| view.kind == crate::wait_status::WaitKind::BackgroundTask)
+        {
+            state.transcript.push_user_if_new(text.clone());
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: state.t().steering_sent.to_string(),
+            });
+            let command = ClientCommand::SteerCurrentTurn {
+                session_id: state.session_id.clone(),
+                content: text,
+            };
+            return submit_turn_input(state, command);
+        }
         // Hold it in 待发送 rather than sending it: the user decides which
         // input steers the running turn, and when. Nothing unsent is shown in
         // the conversation. Once this turn reaches its terminal event and the
         // runtime is ready again, `drain_pending_input` sends it as the next
         // turn — the queue is a continuation queue, not a draft box.
-        let text = state.composer.take().trim().to_string();
-        if !text.is_empty() {
-            state
-                .pending_inputs
-                .push(crate::pending_inputs::PendingInput::queued(
-                    text,
-                    state.session_id.clone(),
-                ));
-            state.pending_selected = state.pending_inputs.len() - 1;
-        }
+        state
+            .pending_inputs
+            .push(crate::pending_inputs::PendingInput::queued(
+                text,
+                state.session_id.clone(),
+            ));
+        state.pending_selected = state.pending_inputs.len() - 1;
         return Vec::new();
     }
     // Vision gate: block sending images to a non-vision model until the user
@@ -324,7 +345,7 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
 /// the queue until the user decides, because retrying it automatically would
 /// loop and skipping past it would reorder the user's own messages.
 pub(super) fn drain_pending_input(state: &mut AppState) -> Option<Effect> {
-    if !state.runtime_connected || state.is_busy() {
+    if state.quit_pending || !state.runtime_connected || state.is_busy() {
         return None;
     }
     // A question the runtime is blocked on means it is not ready for a new

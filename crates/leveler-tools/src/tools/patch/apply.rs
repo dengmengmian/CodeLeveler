@@ -189,12 +189,30 @@ fn hunk_not_found(file: &[String], chunk: &UpdateChunk, start: usize) -> String 
         }
         // The anchor is nowhere in the file: the hunk targets content that does
         // not exist. That is a different failure, and it needs a different fix.
-        None => format!(
-            "{head}None of those lines exist in the file. Read the file before patching it.\n\
-             --- file content near line {} ---\n{}",
-            start + 1,
-            file_excerpt(file, start),
-        ),
+        None => {
+            // One cause of "these lines do not exist" is the runtime itself:
+            // tool output replaces credential values with a placeholder, and a
+            // model that copies that output back into a patch is patching text
+            // that was never in the file. Naming it here is the difference
+            // between the model re-reading and it dropping the edit.
+            let redaction_note = if wanted.contains(leveler_core::secret::SECRET_PLACEHOLDER) {
+                format!(
+                    "\nNote: this hunk contains `{}`. Tool output replaces secret values with \
+                     that placeholder, so this line as written does not exist in the file. \
+                     Patch around the secret instead: anchor on a nearby line that has no \
+                     secret in it, or change a different line.\n",
+                    leveler_core::secret::SECRET_PLACEHOLDER
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{head}None of those lines exist in the file. Read the file before patching it.\
+                 {redaction_note}\n--- file content near line {} ---\n{}",
+                start + 1,
+                file_excerpt(file, start),
+            )
+        }
     }
 }
 
@@ -565,6 +583,26 @@ mod tests {
         assert!(
             err.contains("42\u{2502} \tlog.Panicln(u)"),
             "and it must show the lines the hunk got wrong; got:\n{err}"
+        );
+    }
+
+    /// The dogfood case: the model copied a line out of tool output, which
+    /// replaces a credential with a placeholder, so the hunk anchors on text
+    /// that was never in the file. "Read the file" is the wrong advice there —
+    /// the model did read it. Naming the redaction is what lets it patch around
+    /// the secret instead of silently dropping the edit.
+    #[test]
+    fn a_hunk_that_copied_a_redacted_value_says_so() {
+        let content = "database:\n  dsn: host=127.0.0.1 user=develop password=hunter2 \
+                       dbname=orders\n";
+        let c = chunk(
+            &["  dsn: host=127.0.0.1 user=develop password=[REDACTED] dbname=orders"],
+            &["  dsn: host=127.0.0.1 user=develop password=[REDACTED] dbname=orders_test"],
+        );
+        let err = apply_update(&content, &[c]).unwrap_err();
+        assert!(
+            err.contains("password=[REDACTED]") && err.contains("Tool output replaces secret"),
+            "a failed hunk that carries a redacted value must name that cause; got:\n{err}"
         );
     }
 }

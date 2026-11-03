@@ -1697,7 +1697,13 @@ impl CodingRuntime {
         // may be admitted as soon as TaskFinished is projected; a later
         // session-wide lookup could otherwise kill processes owned by that new
         // turn.
-        let mut cleanup_ticket = if explicit_task_cancel || (!interrupted && !goal_continues) {
+        //
+        // The target SET is detached from the pre-terminal scope (so a turn
+        // admitted right after the terminal cannot be included), but whether
+        // it is settled is decided below from the goal's own final state: a
+        // goal that still owes work keeps its services, and a settled goal has
+        // no window that could still use them.
+        let mut cleanup_ticket = if explicit_task_cancel || !interrupted {
             match self.factory.tool_context.session_scope.as_deref() {
                 Some(scope) => Some(self.factory.background_tasks.detach_cleanup(scope).await),
                 None => None,
@@ -1738,6 +1744,15 @@ impl CodingRuntime {
         // follow it up).
         settle_goal_from_terminal(&mut terminal, decided);
         end_session_goal_route(&mut terminal, goal_session);
+        // The goal's own settle decision is the authority on whether any window
+        // can still follow, so it is read from the FINAL terminal above and
+        // used by the post-terminal cleanup gate below.
+        let mut reap_now = explicit_task_cancel
+            || (!interrupted
+                && terminal
+                    .goal
+                    .as_ref()
+                    .map_or(!goal_continues, |goal| goal.settle));
         let mut settled = self
             .engine
             .finish_task(token, session_id, terminal.clone(), observer)
@@ -1763,6 +1778,7 @@ impl CodingRuntime {
             // a decision, not a fault.
             settle_goal_from_terminal(&mut terminal, true);
             end_session_goal_route(&mut terminal, goal_session);
+            reap_now = true;
             settled = self
                 .engine
                 .finish_task(token, session_id, terminal, observer)
@@ -1780,7 +1796,12 @@ impl CodingRuntime {
         // TaskReport and the TaskFinished observer has already made the durable
         // outcome visible. Interrupted and continuing work windows retain their
         // processes exactly as before.
+        //
+        // The goal's final settle decision owns its services' lifetime. A
+        // recoverable provider failure leaves the goal open even though no
+        // TaskReport exists; a settled goal has no window that could use them.
         if settled.is_ok()
+            && reap_now
             && let Some(ticket) = cleanup_ticket
             && !ticket.is_empty()
         {
@@ -2720,6 +2741,23 @@ impl CodingRuntime {
             }
 
             if !is_auto_replayable(&self.factory.registry, &call.name, call.risk) {
+                // An observation the runtime can simply read again is not an
+                // unresolved side effect: the crash destroyed its answer, not
+                // the state it would have returned. Say exactly that and let
+                // the model re-drive. Halting here made a whole session
+                // unusable after an interrupted `wait_task`.
+                if self.factory.registry.recovery_is_skippable(&call.name) {
+                    self.engine
+                        .record_recovery_skip(
+                            log,
+                            &call,
+                            turn_ref,
+                            "interrupted observation; not replayed",
+                            observer,
+                        )
+                        .await?;
+                    continue;
+                }
                 // Risk classification must precede argument parsing. Corrupt
                 // arguments do not make a mutating/unknown call safe: its side
                 // effect may already have happened before the crash.

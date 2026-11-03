@@ -995,10 +995,14 @@ impl EventBridge {
                 let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
             }
 
-            EngineEvent::GoalIntercepted { kind, detail } => {
-                // Surface as activity label; full tool error remains the model path.
+            EngineEvent::GoalIntercepted { .. } => {
+                // Surface as a localized activity label; the gate's kind and the
+                // model-facing English account ride the tool result's preview
+                // (tagged), where the client states the reason in the user's
+                // language. Neither field is interpolated here: the detail is
+                // guidance written for the model.
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
-                    label: format!("gate refused {kind}: {detail}"),
+                    label: "目标校验未通过，等待模型修正".to_string(),
                 });
             }
             EngineEvent::DelegationStage { action, detail } => {
@@ -1097,6 +1101,10 @@ impl EventBridge {
                     status,
                 });
             }
+            // Durable evidence fact for the goal gate and for resume. The live
+            // exit already reached the client as `BackgroundTaskExited`, so this
+            // adds no second surface here.
+            EngineEvent::BackgroundTaskFinished { .. } => {}
             EngineEvent::AdvisoryStarted { kind } => {
                 // Closeout round trips that happen after the visible answer.
                 // Label them so the status line does not read "等待模型" with no
@@ -1113,6 +1121,7 @@ impl EventBridge {
                             "催办:任务登记被拒绝但用户目标仍未完成,再询一轮"
                         }
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
+                        CloseoutReason::GoalSettledDelivery => "目标已结算,补充最终回答",
                     },
                 };
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
@@ -3609,10 +3618,12 @@ mod projection_equivalence {
     #[test]
     fn goal_interception_surfaces_as_activity() {
         let shapes = project(vec![EngineEvent::GoalIntercepted {
-            kind: "complete".into(),
-            detail: "checks failing".into(),
+            kind: "verification_refused".into(),
+            detail: "`make regression` was cited as verification but never ran in this task".into(),
         }]);
-        assert_eq!(shapes, ["activity:gate refused complete: checks failing"]);
+        // The user reads a localized fact; the model-facing English account is
+        // not interpolated into the status line.
+        assert_eq!(shapes, ["activity:目标校验未通过，等待模型修正"]);
     }
 
     #[test]

@@ -370,6 +370,9 @@ impl RuntimeInjectionKind {
                 "closeout_task_unregistered"
             }
             Self::CloseoutNudge(closeout::CloseoutReason::EmptyAnswer) => "closeout_empty_answer",
+            Self::CloseoutNudge(closeout::CloseoutReason::GoalSettledDelivery) => {
+                "closeout_goal_settled_delivery"
+            }
             Self::ProtocolRepair => "protocol_repair",
             Self::LengthContinuation => "length_continuation",
             Self::Finalization => "finalization",
@@ -429,6 +432,7 @@ impl AdvisoryKind {
                 closeout::CloseoutReason::PlanUnresolved => "nudge_plan_unresolved",
                 closeout::CloseoutReason::TaskUnregistered => "nudge_task_unregistered",
                 closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
+                closeout::CloseoutReason::GoalSettledDelivery => "nudge_goal_settled_delivery",
             },
         }
     }
@@ -1202,7 +1206,20 @@ pub trait SteeringSource: Send + Sync {
     /// command, its whole process tree) without cancelling the turn. A host
     /// that lets its user stop one command keeps the handle until
     /// [`Self::tool_call_ended`].
-    fn tool_call_started(&self, _id: &str, _cancel: CancellationToken) {}
+    ///
+    /// `yield_now` is the call's attention signal, and it is NOT cancellation.
+    /// A host cancels it when new user input is waiting for this turn, so an
+    /// observation-only call — `wait_task` above all — can hand the round back
+    /// instead of holding it for its own bound. The call reports what it
+    /// observed and the turn continues; nothing about the observed process
+    /// changes.
+    fn tool_call_started(
+        &self,
+        _id: &str,
+        _cancel: CancellationToken,
+        _yield_now: CancellationToken,
+    ) {
+    }
 
     /// The call finished executing; its cancellation handle is spent.
     fn tool_call_ended(&self, _id: &str) {}
@@ -1305,6 +1322,14 @@ pub struct Executor {
     steering: Option<Arc<dyn SteeringSource>>,
     runtime: Arc<dyn ModelRuntime>,
     registry: Arc<ToolRegistry>,
+    /// Tools that became available after this turn's surface was composed (an
+    /// MCP server that started mid-turn), held as a copy-on-write registry so
+    /// dispatch reuses the SAME validation/normalization path as the shared
+    /// registry. The catalog that produced them stays the single owner of
+    /// their authority.
+    discovered: std::sync::RwLock<Arc<ToolRegistry>>,
+    /// Host-provided source consulted once per model request.
+    tool_discovery: Option<Arc<dyn leveler_tools::tool::ToolDiscovery>>,
     capabilities: Option<Arc<crate::capability::CapabilityDisclosure>>,
     tool_context: ToolContext,
     model: ModelRef,
@@ -1457,6 +1482,8 @@ impl Executor {
             commit_co_author: true,
             runtime,
             registry,
+            discovered: std::sync::RwLock::new(Arc::new(ToolRegistry::default())),
+            tool_discovery: None,
             capabilities: None,
             tool_context,
             model,
@@ -1618,6 +1645,118 @@ impl Executor {
     ) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Attach the host's source of late-appearing tools (external catalogs).
+    pub fn with_tool_discovery(
+        mut self,
+        discovery: Arc<dyn leveler_tools::tool::ToolDiscovery>,
+    ) -> Self {
+        self.tool_discovery = Some(discovery);
+        self
+    }
+
+    /// Builder form for a caller that may have no such source.
+    pub fn with_tool_discovery_opt(
+        mut self,
+        discovery: Option<Arc<dyn leveler_tools::tool::ToolDiscovery>>,
+    ) -> Self {
+        self.tool_discovery = discovery;
+        self
+    }
+
+    /// Ask the host for tools this turn did not have when its surface was
+    /// composed, and return the names it actually added.
+    ///
+    /// Only the top-level executor grows this way: a delegated child runs a
+    /// bounded read/write scope and never receives the external catalog.
+    pub(crate) async fn absorb_discovered_tools(&self) -> Vec<String> {
+        let Some(source) = &self.tool_discovery else {
+            return Vec::new();
+        };
+        if self.depth > 0 {
+            return Vec::new();
+        }
+        let offered = source.discovered().await;
+        if offered.is_empty() {
+            return Vec::new();
+        }
+        let current = Arc::clone(
+            &self
+                .discovered
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut next: Option<ToolRegistry> = None;
+        let mut added = Vec::new();
+        for tool in offered {
+            let name = tool.name().to_string();
+            if self.registry.get(&name).is_some() || current.get(&name).is_some() {
+                continue;
+            }
+            // Exposure is not authority: a pack the turn may not see yet is
+            // still recorded, so enabling it later in the same turn exposes
+            // the tool it already discovered.
+            next.get_or_insert_with(|| (*current).clone())
+                .register(tool);
+            added.push(name);
+        }
+        if let Some(registry) = next {
+            *self
+                .discovered
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(registry);
+        }
+        added
+    }
+
+    /// Dispatch through the registry, falling back to this turn's discovered
+    /// tools. Both paths are the registry's own `execute` (same schema
+    /// validation and normalization), never a second implementation.
+    pub(crate) async fn execute_tool(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: ToolContext,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<leveler_tools::tool::ToolOutput, leveler_tools::tool::ToolError> {
+        if self.registry.get(name).is_some() {
+            return self
+                .registry
+                .execute(name, input, context, cancellation)
+                .await;
+        }
+        let overlay = Arc::clone(
+            &self
+                .discovered
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        overlay.execute(name, input, context, cancellation).await
+    }
+
+    /// Names of the tools this turn discovered after its surface was composed.
+    pub(crate) fn discovered_names(&self) -> Vec<String> {
+        self.discovered
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()
+    }
+
+    /// The executor's own view of one tool: the shared registry, then the
+    /// tools discovered during this turn.
+    pub(crate) fn tool(&self, name: &str) -> Option<Arc<dyn leveler_tools::tool::Tool>> {
+        if let Some(tool) = self.registry.get(name) {
+            return Some(Arc::clone(tool));
+        }
+        self.discovered
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     /// Whether a capability reaches the model on this request.
@@ -1938,6 +2077,10 @@ impl Executor {
             runtime: self.runtime.clone(),
             capabilities: self.capabilities.clone(),
             registry,
+            // A child executor never grows the external catalog: its scope is
+            // the subset its parent handed it.
+            discovered: std::sync::RwLock::new(Arc::new(ToolRegistry::default())),
+            tool_discovery: None,
             tool_context: self.tool_context.clone(),
             model: model_override.unwrap_or_else(|| self.model.clone()),
             continuation: match profile.max_rounds() {

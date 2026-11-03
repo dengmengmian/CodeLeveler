@@ -323,11 +323,25 @@ impl Default for GlobalVcs {
 #[serde(deny_unknown_fields)]
 struct GlobalMcpServer {
     name: String,
-    command: String,
+    /// Stdio launch program. Absent for a Streamable HTTP server.
+    #[serde(default)]
+    command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// `stdio` (default when `command` is set) or `streamable_http` / `http`.
+    #[serde(default)]
+    transport: Option<String>,
+    /// Streamable HTTP endpoint. Absent for a stdio server.
+    #[serde(default)]
+    url: Option<String>,
+    /// Header name → environment variable name. Values are resolved at load.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    /// Environment variable holding a bearer token, without the `Bearer ` prefix.
+    #[serde(default)]
+    bearer_token_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +560,8 @@ pub enum GlobalConfigError {
         "global config MCP server `{server}` env `{key}` must be a string UPPER_SNAKE environment variable name reference (e.g. `{key} = \"{key}\"`)"
     )]
     McpEnvNotString { server: String, key: String },
+    #[error("global config MCP server `{server}`: {reason}")]
+    McpInvalid { server: String, reason: String },
     #[error("{0}")]
     Write(String),
 }
@@ -625,6 +641,7 @@ impl GlobalConfig {
         let value: toml::Value =
             toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
         reject_mcp_env_secrets(&value)?;
+        reject_mcp_transport(&value)?;
         let cfg: Self =
             toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
         cfg.validate_browser()?;
@@ -1322,14 +1339,26 @@ impl GlobalConfig {
             .mcp_servers
             .into_iter()
             .map(|s| {
-                let env = resolve_mcp_env_refs(&s.name, s.env);
-                McpServerConfig {
-                    name: s.name,
-                    command: s.command,
-                    args: s.args,
-                    // Config stores env-name *references*; resolve to real values
-                    // from the process environment (secrets never live in the file).
-                    env,
+                if mcp_server_is_http(&s) {
+                    let headers = resolve_mcp_env_refs(&s.name, s.headers);
+                    let bearer_token = s.bearer_token_env.as_deref().and_then(|source| {
+                        resolve_mcp_env_refs(
+                            &s.name,
+                            BTreeMap::from([("bearer_token".to_string(), source.to_string())]),
+                        )
+                        .into_iter()
+                        .next()
+                        .map(|(_, value)| value)
+                    });
+                    McpServerConfig::streamable_http(
+                        s.name,
+                        s.url.unwrap_or_default(),
+                        headers,
+                        bearer_token,
+                    )
+                } else {
+                    let env = resolve_mcp_env_refs(&s.name, s.env);
+                    McpServerConfig::stdio(s.name, s.command.unwrap_or_default(), s.args, env)
                 }
             })
             .collect();
@@ -1364,6 +1393,125 @@ fn default_search_key_env(provider: SearchProviderKind) -> &'static str {
         SearchProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
         SearchProviderKind::Tavily => "LEVELER_SEARCH_API_KEY",
     }
+}
+
+fn mcp_server_is_http(server: &GlobalMcpServer) -> bool {
+    server.url.is_some()
+        || matches!(
+            server.transport.as_deref(),
+            Some("streamable_http" | "http")
+        )
+}
+
+fn mcp_ref_rejected(raw: &str) -> bool {
+    crate::mcp_config::looks_like_secret_token(raw) || !crate::mcp_config::is_env_name_ref(raw)
+}
+
+/// Reject a Streamable HTTP block that is not a plain `http`/`https` URL, or
+/// that mixes stdio fields into an HTTP server. Never echoes secret values.
+fn reject_mcp_transport(value: &toml::Value) -> Result<(), GlobalConfigError> {
+    let Some(servers) = value.get("mcp_servers").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for server in servers {
+        let name = server
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>");
+        let invalid = |reason: String| GlobalConfigError::McpInvalid {
+            server: name.to_string(),
+            reason,
+        };
+        let command = server
+            .get("command")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let url = server
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let transport = server.get("transport").and_then(|v| v.as_str());
+        let http = url.is_some() || matches!(transport, Some("streamable_http" | "http"));
+        let stdio = command.is_some() || matches!(transport, Some("stdio") | None) && !http;
+        if let Some(transport) = transport
+            && !matches!(transport, "stdio" | "streamable_http" | "http")
+        {
+            return Err(invalid(format!(
+                "unknown transport `{transport}`; use `stdio` or `streamable_http`"
+            )));
+        }
+        if command.is_some() && url.is_some() {
+            return Err(invalid(
+                "set either `command` (stdio) or `url` (Streamable HTTP), not both".into(),
+            ));
+        }
+        if http {
+            let Some(url) = url else {
+                return Err(invalid(
+                    "Streamable HTTP requires `url` and does not use `command`".into(),
+                ));
+            };
+            if command.is_some() || server.get("args").is_some() || server.get("env").is_some() {
+                return Err(invalid(
+                    "Streamable HTTP does not use `command`, `args`, or `env`".into(),
+                ));
+            }
+            if let Err(reason) = leveler_tools::mcp::validate_streamable_http_url(url) {
+                return Err(invalid(reason));
+            }
+            if let Some(headers) = server.get("headers").and_then(|v| v.as_table()) {
+                for (key, val) in headers {
+                    if key.eq_ignore_ascii_case("authorization") {
+                        return Err(invalid(
+                            "set Authorization with `bearer_token_env`, not `headers`".into(),
+                        ));
+                    }
+                    let Some(raw) = val.as_str() else {
+                        return Err(GlobalConfigError::McpEnvNotString {
+                            server: name.to_string(),
+                            key: key.clone(),
+                        });
+                    };
+                    if mcp_ref_rejected(raw) {
+                        return Err(GlobalConfigError::McpSecretInConfig {
+                            server: name.to_string(),
+                            key: key.clone(),
+                        });
+                    }
+                }
+            } else if server.get("headers").is_some() {
+                return Err(invalid(
+                    "`headers` must be a table of env-name references".into(),
+                ));
+            }
+            if let Some(source) = server.get("bearer_token_env") {
+                let Some(raw) = source.as_str() else {
+                    return Err(GlobalConfigError::McpEnvNotString {
+                        server: name.to_string(),
+                        key: "bearer_token_env".into(),
+                    });
+                };
+                if mcp_ref_rejected(raw) {
+                    return Err(GlobalConfigError::McpSecretInConfig {
+                        server: name.to_string(),
+                        key: "bearer_token_env".into(),
+                    });
+                }
+            }
+        } else if stdio {
+            if command.is_none() {
+                return Err(invalid(
+                    "stdio MCP requires `command`; Streamable HTTP requires `url`".into(),
+                ));
+            }
+            if server.get("headers").is_some() || server.get("bearer_token_env").is_some() {
+                return Err(invalid(
+                    "stdio MCP does not use `headers` or `bearer_token_env`".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject MCP `env` map values that are not UPPER_SNAKE name references.
@@ -2235,7 +2383,7 @@ completion_judge_timeout_seconds = 180
         assert_eq!(cfg.mcp_servers.len(), 1);
         let s = &cfg.mcp_servers[0];
         assert_eq!(s.name, "fs");
-        assert_eq!(s.command, "npx");
+        assert_eq!(s.command.as_deref(), Some("npx"));
         assert_eq!(s.args.len(), 3);
         assert_eq!(
             s.env.get("FOO").map(String::as_str),
@@ -2318,6 +2466,72 @@ completion_judge_timeout_seconds = 180
                 "must never echo the literal in: {err}"
             );
         }
+    }
+
+    #[test]
+    fn streamable_http_mcp_resolves_header_refs_and_rejects_secrets() {
+        let toml = r#"
+            [[mcp_servers]]
+            name = "devorder"
+            transport = "streamable_http"
+            url = "http://127.0.0.1:8081/mcp"
+            headers = { "X-API-Key" = "DEVORDER_MCP_API_KEY" }
+            bearer_token_env = "DEVORDER_MCP_TOKEN"
+        "#;
+        let cfg = GlobalConfig::from_toml_str(toml).unwrap();
+        let server = &cfg.mcp_servers[0];
+        assert_eq!(server.url.as_deref(), Some("http://127.0.0.1:8081/mcp"));
+        assert_eq!(
+            server.headers.get("X-API-Key").map(String::as_str),
+            Some("DEVORDER_MCP_API_KEY")
+        );
+        assert_eq!(
+            server.bearer_token_env.as_deref(),
+            Some("DEVORDER_MCP_TOKEN")
+        );
+        let bundle = GlobalConfig::from_toml_str(toml).unwrap().into_bundle();
+        let resolved = &bundle.mcp_servers[0];
+        assert!(resolved.is_streamable_http());
+        assert!(resolved.headers.is_empty(), "unset env refs are omitted");
+        assert!(resolved.bearer_token.is_none());
+
+        let secret = "sk-http-mcp-must-not-echo";
+        let bad = format!(
+            r#"
+            [[mcp_servers]]
+            name = "devorder"
+            url = "https://example.com/mcp"
+            headers = {{ "X-API-Key" = "{secret}" }}
+            "#
+        );
+        let err = GlobalConfig::from_toml_str(&bad).unwrap_err();
+        assert!(
+            matches!(err, GlobalConfigError::McpSecretInConfig { .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains(secret));
+
+        let both = r#"
+            [[mcp_servers]]
+            name = "mixed"
+            command = "npx"
+            url = "http://127.0.0.1/mcp"
+        "#;
+        assert!(matches!(
+            GlobalConfig::from_toml_str(both),
+            Err(GlobalConfigError::McpInvalid { .. })
+        ));
+        let creds = r#"
+            [[mcp_servers]]
+            name = "creds"
+            url = "http://user:pass@127.0.0.1/mcp"
+        "#;
+        let err = GlobalConfig::from_toml_str(creds).unwrap_err();
+        assert!(
+            matches!(err, GlobalConfigError::McpInvalid { .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("pass"));
     }
 
     #[test]

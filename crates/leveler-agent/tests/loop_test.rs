@@ -104,8 +104,49 @@ impl ModelRuntime for UnterminatedRuntime {
     }
 }
 
+/// Append the answer a real model must write after it resolves its goal.
+///
+/// The runtime takes one delivery round after `update_goal` when that round
+/// carried no text: resolving a goal settles it, but the person still has to be
+/// told what happened. A script that ends on the `update_goal` call is exactly
+/// that shape, so the scripted model answers it — the fixture states the
+/// contract instead of relying on the turn ending on a tool call.
+fn with_delivery(mut responses: Vec<ModelResponse>) -> Vec<ModelResponse> {
+    let summary = responses.last().and_then(|response| {
+        let textless = response.message.text_content().trim().is_empty();
+        if !textless {
+            return None;
+        }
+        response.message.content.iter().find_map(|part| match part {
+            ContentPart::ToolCall { call } if call.name == "update_goal" => {
+                call.arguments.get("status").is_some().then(|| {
+                    call.arguments
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                })
+            }
+            _ => None,
+        })
+    });
+    if let Some(summary) = summary {
+        // The scripted model says what it summarized; a fixture that asserts on
+        // the goal summary therefore still reads the delivery it expects.
+        let answer = if summary.is_empty() {
+            "Done: the goal is resolved and reported.".to_string()
+        } else {
+            summary
+        };
+        responses.push(assistant_text(&answer));
+    }
+    responses
+}
+
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
+        let responses = with_delivery(responses);
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
             requests: Mutex::new(Vec::new()),
@@ -657,6 +698,8 @@ async fn renamed_plan_steps_replace_the_declared_list_before_blocked_closeout() 
         final_plan, revised,
         "the full list must be exactly the model declaration"
     );
+    // Two work rounds plus the blocked resolution. A blocked goal still owes
+    // the work itself, so it takes no delivery round: its report is its answer.
     assert_eq!(runtime.recorded_requests().len(), 3);
     assert!(
         !runtime.recorded_requests()[2]
@@ -1028,12 +1071,12 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
         "final text is the update_goal summary: {}",
         outcome.final_text
     );
-    // Two model requests: the quiet round was re-prompted, then it resolved.
-    // No hidden call follows the resolution.
+    // Three model requests: the quiet round was re-prompted, it resolved, and
+    // the resolution's delivery round wrote the answer. Nothing else follows.
     assert_eq!(
         runtime.recorded_requests().len(),
-        2,
-        "quiet round was re-prompted"
+        3,
+        "quiet round was re-prompted, then the resolution and its delivery round"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1098,11 +1141,19 @@ async fn goal_mode_read_only_first_round_is_not_followed_by_a_harness_edit_deman
     // Structural: no harness-authored message entered the conversation on this
     // read→resolve path.
     let observed = events.lock().unwrap();
-    assert!(
-        observed
-            .iter()
-            .all(|event| !matches!(event, AgentEvent::RuntimeInjection { .. })),
-        "a plain read→resolve goal run must not report a harness injection: {observed:?}"
+    // The only injection is the delivery round: the model resolved without a
+    // sentence, so the runtime asks for the answer. Nothing asks for an edit.
+    let injections: Vec<&str> = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RuntimeInjection { kind, .. } => Some(kind.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        injections,
+        vec!["closeout_goal_settled_delivery"],
+        "a read→resolve goal run must not be told to edit; only the delivery is asked for"
     );
     drop(observed);
 
@@ -1192,12 +1243,17 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::AssistantText { text, .. } if !text.trim().is_empty()))
         .count();
-    assert_eq!(summaries, 1, "exactly one summary block: {events:?}");
-    // 无冗余验证轮: revert + summary + resolve — nothing extra, and no hidden
-    // judge call after the resolution.
+    // Two: the progress sentence, then the delivery round's answer to the
+    // person (the resolving call itself carried no text).
+    assert_eq!(
+        summaries, 2,
+        "one progress summary and one delivery, never nudge spam: {events:?}"
+    );
+    // 无冗余验证轮: revert + summary + resolve + delivery — nothing extra, and no
+    // hidden judge call after the resolution.
     assert_eq!(
         runtime.recorded_requests().len(),
-        3,
+        4,
         "no redundant verification rounds"
     );
     let commands = events
@@ -1232,13 +1288,15 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
             _ => None,
         })
         .collect();
-    // Two entries, in order: the coordination hint (step 1, not a forced
-    // round) and the goal nudge (a round the model did not ask for).
+    // Three entries, in order: the coordination hint (step 1, not a forced
+    // round), the goal nudge (a round the model did not ask for), and the
+    // delivery round the resolution's missing answer earns.
     assert_eq!(
         injections,
         vec![
             ("multi_agent_hint", "control", false),
             ("closeout_goal_unresolved", "user", true),
+            ("closeout_goal_settled_delivery", "user", true),
         ],
         "the injection stream is named and attributed: {events:?}"
     );
@@ -3350,7 +3408,7 @@ async fn goal_mode_continuation_resumes_real_work_and_still_requires_a_terminal(
 
     assert_eq!(outcome.stop_reason, StopReason::Completed);
     assert_eq!(
-        outcome.model_steps, 4,
+        outcome.model_steps, 5,
         "each premature summary bought one continuation; the tool round reset the bound"
     );
     assert!(
@@ -3359,8 +3417,8 @@ async fn goal_mode_continuation_resumes_real_work_and_still_requires_a_terminal(
     );
     assert_eq!(
         runtime.recorded_requests().len(),
-        4,
-        "no hidden request follows the terminal"
+        5,
+        "no hidden request follows the terminal beyond its delivery round"
     );
     assert_eq!(
         outcome.progress.no_progress_streak, 0,
@@ -3536,11 +3594,12 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    // malformed attempt, then the retried resolution.
+    // malformed attempt, the retried resolution, and its delivery round.
     assert_eq!(
         runtime.recorded_requests().len(),
-        2,
-        "the malformed resolution must be fed back for a retry"
+        3,
+        "the malformed resolution must be fed back for a retry, then the retried \
+         resolution's delivery round"
     );
     assert!(
         events.iter().any(|event| matches!(
@@ -4832,8 +4891,9 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    // Exactly the resolution: no hidden completion judge follows it.
-    assert_eq!(runtime.requests.lock().unwrap().len(), 1);
+    // Exactly the resolution and its delivery round: no hidden completion judge
+    // follows it.
+    assert_eq!(runtime.requests.lock().unwrap().len(), 2);
     let plan_events: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::PlanUpdated { .. }))
@@ -5803,23 +5863,9 @@ async fn goal_completion_does_not_require_plan_reconciliation() {
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "implemented only"}),
         ),
-        assistant_tool_calls(vec![
-            (
-                "p2",
-                "update_plan",
-                serde_json::json!({
-                    "plan": [
-                        {"step": "implement", "status": "completed"},
-                        {"step": "publish", "status": "pending"}
-                    ]
-                }),
-            ),
-            (
-                "g2",
-                "update_goal",
-                serde_json::json!({"status": "complete", "summary": "implemented only"}),
-            ),
-        ]),
+        // The resolution round carried no sentence, so the delivery round writes
+        // the answer and no second reconciliation round is needed.
+        assistant_text("implemented only"),
     ]));
     let executor = Executor::new(
         runtime.clone(),
@@ -5843,8 +5889,8 @@ async fn goal_completion_does_not_require_plan_reconciliation() {
     assert_eq!(outcome.stop_reason, StopReason::Completed);
     assert_eq!(
         runtime.requests.lock().unwrap().len(),
-        3,
-        "the first update_goal closes the goal; no reconciliation round is forced"
+        4,
+        "the first update_goal closes the goal; only the delivery round follows it"
     );
     assert!(events.iter().any(|event| {
         matches!(event, AgentEvent::ToolResult { id, is_error: false, .. } if id == "g1")
@@ -7435,7 +7481,7 @@ async fn goal_gate_recovery_stops_after_repeated_citation_refusals() {
     assert_ne!(outcome.stop_reason, StopReason::Completed);
     let detail = outcome.stop_detail.as_deref().unwrap_or("");
     assert!(
-        detail.contains("verification refused"),
+        detail.contains("the goal gate refused"),
         "the incomplete reason must name the exhausted recovery: {detail}"
     );
     assert_eq!(
@@ -7520,7 +7566,7 @@ async fn a_mixed_citation_and_denial_round_is_not_progress() {
     );
     let detail = outcome.stop_detail.as_deref().unwrap_or("");
     assert!(
-        detail.contains("verification refused"),
+        detail.contains("the goal gate refused"),
         "the incomplete reason must name the exhausted bound: {detail}"
     );
     assert_eq!(
@@ -7593,8 +7639,8 @@ async fn executed_work_resets_the_verification_recovery_count() {
     );
     assert_eq!(
         runtime.recorded_requests().len(),
-        6,
-        "every scripted round ran; the bound did not fire"
+        7,
+        "every scripted round ran (plus the delivery round); the bound did not fire"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -7635,7 +7681,8 @@ async fn goal_gate_recovery_accepts_the_recorded_command_after_two_refusals() {
         StopReason::Completed,
         "citing the recorded command after two refusals must complete: {outcome:?}"
     );
-    assert_eq!(runtime.recorded_requests().len(), 4);
+    // Four work rounds plus the delivery round after the textless resolution.
+    assert_eq!(runtime.recorded_requests().len(), 5);
     let refusals = events
         .iter()
         .filter(|event| {
@@ -7879,7 +7926,7 @@ async fn mixed_refusal_keeps_the_verification_recovery_count() {
     assert_eq!(outcome.stop_reason, StopReason::Incomplete);
     let detail = outcome.stop_detail.as_deref().unwrap_or("");
     assert!(
-        detail.contains("verification refused"),
+        detail.contains("the goal gate refused"),
         "a mixed round must not replace the recovery stop: {detail}"
     );
     assert!(
@@ -7932,6 +7979,8 @@ async fn mixed_refusal_does_not_stop_on_the_no_progress_bound() {
         StopReason::Blocked,
         "a correctable mixed refusal must not become Incomplete at the denial bound: {outcome:?}"
     );
+    // Three work rounds plus the blocked resolution, which needs no delivery
+    // round: nothing was completed to report.
     assert_eq!(runtime.recorded_requests().len(), 3);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -7969,7 +8018,7 @@ async fn mixed_refusal_does_not_clear_a_pre_execution_streak() {
         "pure pre-execution refusals keep their own stop: {detail}"
     );
     assert!(
-        !detail.contains("verification refused"),
+        !detail.contains("the goal gate refused"),
         "a denial stop must not be reported as a citation failure: {detail}"
     );
     assert_eq!(
@@ -8051,7 +8100,7 @@ async fn goal_gate_recovery_stops_a_nested_drive() {
     assert_eq!(outcome.stop_reason, StopReason::Incomplete);
     let detail = outcome.stop_detail.as_deref().unwrap_or("");
     assert!(
-        detail.contains("verification refused"),
+        detail.contains("the goal gate refused"),
         "the nested stop must keep the recovery reason: {detail}"
     );
     assert_eq!(
@@ -10730,8 +10779,9 @@ async fn a_fix_bug_goal_may_complete_without_mutation_when_the_model_says_so() {
             .any(|e| matches!(e, AgentEvent::GoalIntercepted { .. })),
         "no gate may refuse a completion the runtime has no mechanical reason to refuse: {events:?}"
     );
-    // Exactly the two visible rounds: no contract derivation, no judge.
-    assert_eq!(runtime.recorded_requests().len(), 2);
+    // Exactly the visible round and its delivery round: no contract derivation,
+    // no judge.
+    assert_eq!(runtime.recorded_requests().len(), 3);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -10877,7 +10927,8 @@ async fn a_long_novel_exploration_is_not_interrupted_by_a_progress_heuristic() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Completed, "{outcome:?}");
-    assert_eq!(outcome.model_steps as usize, ROUNDS + 1);
+    // The work rounds, the resolution, and its delivery round.
+    assert_eq!(outcome.model_steps as usize, ROUNDS + 2);
     let injected: Vec<String> = runtime
         .recorded_requests()
         .iter()

@@ -247,7 +247,19 @@ impl GoalStore for Database {
         if amendment.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool().begin().await.map_err(StorageError::from)?;
+        // BEGIN IMMEDIATE, not a deferred BEGIN: this transaction reads and
+        // then writes, and the runtime's other lanes (command receipts, the
+        // event log) write to the same database while a user message is being
+        // taken in. A deferred BEGIN takes a read lock first, and the UPDATE
+        // that follows then has to upgrade it; SQLite answers a losing upgrade
+        // with SQLITE_BUSY immediately and does not retry (deadlock avoidance),
+        // which aborted the whole turn over a user's own message. Taking the
+        // write lock at BEGIN makes the wait happen where SQLite does retry.
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)?;
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT goals.amendments, goals.state FROM goals \
              JOIN tasks ON tasks.id = goals.task_id \
@@ -1202,6 +1214,59 @@ mod tests {
             .await
             .unwrap();
         (task, token)
+    }
+
+    /// A user message that arrives mid-turn is appended to the goal while the
+    /// runtime is writing elsewhere (a command receipt, the event log of
+    /// another lane). The amendment is a read-then-write: it must take the
+    /// write lock at BEGIN and wait for the other writer. A deferred BEGIN
+    /// reads first, and the following UPDATE then fails immediately with
+    /// SQLITE_BUSY — which surfaced as "persistence error: database is locked"
+    /// and killed the whole turn the user had just typed into.
+    #[tokio::test]
+    async fn an_amendment_waits_for_a_concurrent_writer_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let db = Database::connect(&path).await.unwrap();
+        let (_, token) = seeded_task(&db).await;
+        let goal = db
+            .open(&token, "ship the feature", leveler_core::now())
+            .await
+            .unwrap();
+
+        // A second connection, as the runtime's own receipt/log writers are.
+        let other = Database::connect(&path).await.unwrap();
+        let pool = other.pool().clone();
+        let session = SessionId::new(
+            sqlx::query_scalar::<_, String>("SELECT id FROM sessions LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+        );
+        let holder_session = session.clone();
+        let holder = tokio::spawn(async move {
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("UPDATE sessions SET updated_at = updated_at WHERE id = ?1")
+                .bind(holder_session.as_str())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            tx.commit().await.unwrap();
+        });
+        // Let the holder acquire the write lock before the amendment reads.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let result = db.append_amendment(&token, &goal, "先不要动配置").await;
+        holder.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "a concurrent writer must not abort the user's amendment: {result:?}"
+        );
+        assert_eq!(
+            db.get(&goal).await.unwrap().unwrap().amendments,
+            vec!["先不要动配置".to_string()]
+        );
     }
 
     #[tokio::test]

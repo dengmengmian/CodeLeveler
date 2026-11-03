@@ -41,7 +41,8 @@ pub enum PendingInputState {
     /// deleted until the runtime answers. This is the only "状态未知" state:
     /// a delivery was attempted and its outcome cannot be determined.
     DeliveryUnknown(CommandId),
-    /// The runtime refused it. Still unsent: the user may send or delete it.
+    /// Unsent and paused for a user decision, either after a runtime refusal
+    /// or an explicit exit. The user may send or delete it.
     Failed(String),
 }
 

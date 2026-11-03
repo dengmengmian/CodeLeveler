@@ -1221,6 +1221,8 @@ async fn after_a_goal_completes_ordinary_messages_are_chat_turns() {
 
     let (_tmp, server, app, client) = harness(vec![
         goal_complete_tool_call(),
+        // The resolution carried no sentence: its delivery round says it.
+        text("已经推上去了，远端分支与本地一致。"),
         text("已经推上去了，远端分支与本地一致。"),
         text("没有可继续的任务。"),
     ])
@@ -1267,8 +1269,12 @@ async fn after_a_goal_completes_ordinary_messages_are_chat_turns() {
     wait_terminal(&mut rx).await;
 
     let bodies = server.request_bodies().await;
-    assert_eq!(bodies.len(), 3, "goal, question, continuation: {bodies:?}");
-    for body in &bodies[1..] {
+    assert_eq!(
+        bodies.len(),
+        4,
+        "goal, its delivery round, the question, the continuation: {bodies:?}"
+    );
+    for body in &bodies[2..] {
         let tools = tool_names(body);
         assert!(
             !tools.iter().any(|name| name == "update_goal"),
@@ -1284,9 +1290,9 @@ async fn after_a_goal_completes_ordinary_messages_are_chat_turns() {
         );
     }
     assert!(
-        bodies[1].contains("确定都推上去了吗？"),
+        bodies[2].contains("确定都推上去了吗？"),
         "the question reaches the model verbatim: {}",
-        bodies[1]
+        bodies[2]
     );
     assert_eq!(
         goals_of(&app, &session).await.len(),

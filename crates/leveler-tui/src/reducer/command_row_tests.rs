@@ -122,7 +122,11 @@ fn open_groups(s: &mut AppState) {
         })
         .collect();
     for (item, id) in groups {
-        if !s.conv.process_fold_expanded(&id) {
+        // Ensure OPEN, not "toggle": a live background run is already open by
+        // default, and toggling it would close it.
+        let open = crate::conversation::build::process_run_open(s, item)
+            .unwrap_or_else(|| s.conv.process_fold_expanded(&id));
+        if !open {
             crate::conversation::interaction::toggle_fold(s, item);
         }
     }
@@ -1366,6 +1370,7 @@ fn background_command_identity_is_complete_live_and_restored() {
         args,
         elapsed_ms: 90_000,
         pid: Some(42),
+        ready_evidence: None,
     }];
     let mut restored = state();
     reduce(
@@ -1490,4 +1495,319 @@ fn long_edits_remain_complete_by_default_and_fold_on_request() {
         Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
     );
     assert_eq!(plain(&s), rows, "and one more press restores it");
+}
+
+/// A foreground command the runtime hands to the background after its window
+/// reported a START, not a result. The row must say so — and must not claim the
+/// 15 seconds it spent in the foreground were a successful completion.
+#[test]
+fn a_handed_off_command_reads_as_running_in_the_background() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("ho"),
+            name: "run_command".into(),
+            // No `background: true`: the runtime moved it, the caller did not.
+            arguments: r#"{"program":"make","args":["e2e"]}"#.into(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("ho"),
+            ok: true,
+            preview: "moved to the background\ntask_id: t-ho\nstatus: running".into(),
+            duration_ms: 15_000,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+    open_groups(&mut s);
+    let rows = plain(&s);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("make e2e"))
+        .unwrap_or_else(|| panic!("row missing: {rows:#?}"));
+    assert!(
+        row.contains("后台运行"),
+        "the handoff is not a finished command: {row}"
+    );
+    assert!(row.contains('\u{2197}'), "{row}");
+    assert!(
+        !row.contains('\u{2713}') && !row.contains("已完成"),
+        "a start is not a success: {row}"
+    );
+}
+
+/// BG-01/BG-02 for the handoff: the real result still lands on the same row, so
+/// a 15-second command that later succeeds settles to ✓ instead of staying at
+/// its start clock forever.
+#[test]
+fn a_handed_off_command_settles_when_its_task_exits() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("ho"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"make","args":["e2e"]}"#.into(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("ho"),
+            ok: true,
+            preview: "moved to the background\ntask_id: t-ho\nstatus: running".into(),
+            duration_ms: 15_000,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "t-ho".into(),
+            exit_code: Some(0),
+            duration_ms: 17_000,
+            ok: true,
+            stopped: false,
+            output: String::new(),
+        }),
+    );
+    open_groups(&mut s);
+    let rows = plain(&s);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("make e2e"))
+        .unwrap_or_else(|| panic!("row missing: {rows:#?}"));
+    assert!(
+        row.contains('\u{2713}') && !row.contains("后台运行"),
+        "the real result replaces the start: {row}"
+    );
+    assert!(row.contains("17.0s"), "{row}");
+}
+
+/// BG-05 in the UI: the runtime observed a readiness signal while the process
+/// keeps running. The row says ready-and-running, never completed, and the
+/// readiness is a runtime fact, not something this client inferred.
+#[test]
+fn a_ready_background_task_reads_as_ready_and_still_running() {
+    let mut s = start_detached("make up", "t-ready");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskReady {
+            task_id: "t-ready".into(),
+            evidence: "listening on :8080".into(),
+            elapsed_ms: 1_400,
+        }),
+    );
+    open_groups(&mut s);
+    let chrome = s.background_task_labels.get("t-ready").expect("chrome");
+    assert!(chrome.is_ready(), "readiness is recorded on the task");
+    assert!(chrome.is_running(), "a ready service is NOT a finished one");
+    assert_eq!(chrome.ready.as_deref(), Some("listening on :8080"));
+    let rows = plain(&s);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("make up"))
+        .unwrap_or_else(|| panic!("row missing: {rows:#?}"));
+    assert!(row.contains('\u{2713}'), "{row}");
+    assert!(row.contains("服务就绪"), "{row}");
+    assert!(!row.contains("已完成"), "ready is not completed: {row}");
+}
+
+/// BG-03 in the UI: registry output chunks reach the command row that started
+/// the task, so the conversation shows the process working without any polling
+/// and without opening the jobs page.
+#[test]
+fn background_output_reaches_the_starting_row() {
+    let mut s = start_detached("npm run dev", "t-tail");
+    for chunk in ["booting\n", "compiling server\n"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskOutput {
+                task_id: "t-tail".into(),
+                chunk: chunk.into(),
+            }),
+        );
+    }
+    let rows = plain(&s);
+    assert!(
+        rows.iter().any(|row| row.contains("compiling server")),
+        "the tail is on the row without opening anything: {rows:#?}"
+    );
+    let block = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::ToolGroup(group) => group.calls.first(),
+            _ => None,
+        })
+        .expect("call");
+    assert_eq!(block.output, "booting\ncompiling server\n");
+}
+
+/// UI-06: the reader's choice beats the "a live background run is open by
+/// default" rule. Closing it must survive the next output chunk.
+#[test]
+fn a_reader_can_close_a_live_background_run_and_it_stays_closed() {
+    let mut s = start_detached("make up", "t-close");
+    assert!(
+        plain(&s).iter().any(|row| row.contains("make up")),
+        "a live background run is open by default"
+    );
+    // Close it through the same path a click takes.
+    let expanded = crate::conversation::build::toggle_process_fold(&mut s, 0);
+    assert_eq!(expanded, Some(false), "the receipt owns the toggle");
+    assert!(
+        !plain(&s).iter().any(|row| row.contains("make up")),
+        "the reader closed it"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskOutput {
+            task_id: "t-close".into(),
+            chunk: "more output\n".into(),
+        }),
+    );
+    assert!(
+        !plain(&s).iter().any(|row| row.contains("more output")),
+        "new output must not reopen a run the reader closed"
+    );
+}
+
+/// P1-1: a service that keeps running without a readiness signal must stop
+/// holding the page open once it is no longer new — and the reader can still
+/// open it by hand, which then stays open.
+#[test]
+fn a_silent_long_running_task_folds_and_the_reader_can_reopen_it() {
+    let mut s = start_detached("make up", "t-silent");
+    s.status = RuntimeStatus::Busy;
+    // Past the grace window: the aggregate receipt is the default.
+    s.elapsed_secs = crate::activity_stream::BACKGROUND_RUN_ATTENTION_SECS + 120;
+    let rows = plain(&s);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("正在执行") || row.contains("执行了")),
+        "the receipt still states the run: {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.trim_start().starts_with('›') && row.contains("make up")),
+        "a silent task is not permanently expanded: {rows:#?}"
+    );
+    assert_eq!(
+        crate::conversation::build::toggle_process_fold(&mut s, 0),
+        Some(true),
+        "the receipt owns the toggle"
+    );
+    assert!(
+        plain(&s).iter().any(|row| row.contains("make up")),
+        "the reader's own open is honored"
+    );
+}
+
+/// BG-12: a reconnect projects the runtime's own readiness fact. A task the
+/// runtime reports without evidence is running, NOT ready — the client never
+/// reconstructs readiness from the command line.
+#[test]
+fn reconcile_carries_readiness_and_never_invents_it() {
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTasksReconciled {
+            tasks: vec![
+                leveler_client_protocol::UiActiveBackgroundTask {
+                    task_id: "t-ready".into(),
+                    program: "make".into(),
+                    args: vec!["up".into()],
+                    elapsed_ms: 5_000,
+                    pid: None,
+                    ready_evidence: Some("listening on :8080".into()),
+                },
+                leveler_client_protocol::UiActiveBackgroundTask {
+                    task_id: "t-silent".into(),
+                    program: "npm".into(),
+                    args: vec!["run".into(), "dev".into()],
+                    elapsed_ms: 5_000,
+                    pid: None,
+                    ready_evidence: None,
+                },
+            ],
+        }),
+    );
+    assert!(
+        s.background_task_labels
+            .get("t-ready")
+            .is_some_and(|chrome| chrome.is_ready())
+    );
+    let silent = s
+        .background_task_labels
+        .get("t-silent")
+        .expect("silent task");
+    assert!(
+        silent.is_running() && !silent.is_ready(),
+        "no evidence means running, not ready"
+    );
+}
+
+/// Start a detached command call and its managed task, in the shape the runtime
+/// produces: the call completes immediately with a task id and the process
+/// keeps running.
+fn start_detached(command: &str, task_id: &str) -> AppState {
+    let mut s = state();
+    let mut parts = command.split(' ');
+    let program = parts.next().unwrap_or(command);
+    let args: Vec<&str> = parts.collect();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("bg"),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "program": program,
+                "args": args,
+                "background": true,
+            })
+            .to_string(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("bg"),
+            ok: true,
+            preview: format!("background task started\ntask_id: {task_id}\nstatus: running"),
+            duration_ms: 12,
+            applied_diff: None,
+            exit_code: Some(0),
+            stop: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: task_id.into(),
+            program: program.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            pid: None,
+        }),
+    );
+    s
 }

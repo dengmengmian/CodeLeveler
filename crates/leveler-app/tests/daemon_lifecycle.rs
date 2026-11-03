@@ -889,6 +889,48 @@ async fn cancel_background_task_command_stops_the_owned_task() {
         RuntimeEvent::BackgroundTaskStarted { .. }
     ));
 
+    let owned = runtime.snapshot(&session_id).await.unwrap();
+    let owned_pid = owned
+        .active_background_tasks
+        .iter()
+        .find(|task| task.task_id == spawned_id)
+        .unwrap()
+        .pid
+        .unwrap();
+    let sibling = app
+        .create_session(&ModelRef::new("mock", "m"), "keep sibling service")
+        .await
+        .unwrap();
+    let sibling_task = app
+        .background_tasks()
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".into()],
+                tmp.path().to_path_buf(),
+            ),
+            None,
+            Some(sibling.as_str()),
+        )
+        .await
+        .unwrap();
+    let sibling_snapshot = runtime.snapshot(&sibling).await.unwrap();
+    let sibling_pid = sibling_snapshot
+        .active_background_tasks
+        .iter()
+        .find(|task| task.task_id == sibling_task)
+        .unwrap()
+        .pid
+        .unwrap();
+    assert!(
+        process_alive(owned_pid),
+        "the owned process existed before stop"
+    );
+    assert!(
+        process_alive(sibling_pid),
+        "the other session's process existed before stop"
+    );
+
     // The command the TUI's `x` sends. The runtime owns the kill.
     runtime
         .send(ClientCommand::CancelBackgroundTask {
@@ -916,6 +958,40 @@ async fn cancel_background_task_command_stops_the_owned_task() {
     );
     let terminal = runtime.snapshot(&session_id).await.expect("snapshot");
     assert!(terminal.active_background_tasks.is_empty());
+    assert!(
+        !process_alive(owned_pid),
+        "the terminal must reflect a real process exit"
+    );
+    assert!(
+        process_alive(sibling_pid),
+        "stopping this session must preserve another session's process"
+    );
+    assert!(
+        runtime
+            .snapshot(&sibling)
+            .await
+            .unwrap()
+            .active_background_tasks
+            .iter()
+            .any(|task| task.task_id == sibling_task)
+    );
+    // Reclaim the test's surviving service through the same execution authority.
+    runtime
+        .send(ClientCommand::CancelBackgroundTask {
+            session_id: sibling.clone(),
+            task_id: sibling_task.clone(),
+        })
+        .await
+        .unwrap();
+    app.background_tasks()
+        .wait_owned(
+            &sibling_task,
+            sibling.as_str(),
+            Some(std::time::Duration::from_secs(5)),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 }
 
 /// A background task's stdout reaches the owning session's structured stream

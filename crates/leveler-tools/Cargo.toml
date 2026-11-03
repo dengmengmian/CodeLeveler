@@ -34,6 +34,14 @@ jsonschema = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 fs2 = { workspace = true }
+http = "1"
+# Official MCP SDK. HTTP only: stdio stays the in-tree client. reqwest 0.13
+# is internal to rmcp and is not shared with this crate's reqwest 0.12.
+rmcp = { version = "3.8.0", default-features = false, features = [
+    "client",
+    "reqwest",
+    "transport-streamable-http-client-reqwest",
+] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
@@ -47,3 +55,4 @@ leveler-test-support = { workspace = true }
 image = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+axum = { workspace = true }

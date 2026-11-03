@@ -191,6 +191,14 @@ pub struct ConversationView {
     /// and an unopened run is simply collapsed.
     pub(crate) process_folds:
         std::cell::RefCell<std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
+    /// Runs the reader explicitly CLOSED.
+    ///
+    /// A running background task's run is open by default, because its progress
+    /// is the point of showing it. Without this set, closing it would fall back
+    /// to that default and reopen on the next frame — the reader's choice has to
+    /// beat the default, and the default has to beat nothing.
+    pub(crate) process_folds_closed:
+        std::cell::RefCell<std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
 }
 
 impl Default for ConversationView {
@@ -213,6 +221,7 @@ impl Default for ConversationView {
             cache: std::cell::RefCell::new(None),
             item_cache: std::cell::RefCell::new(ItemLineCache::default()),
             process_folds: std::cell::RefCell::new(std::collections::HashSet::new()),
+            process_folds_closed: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 }

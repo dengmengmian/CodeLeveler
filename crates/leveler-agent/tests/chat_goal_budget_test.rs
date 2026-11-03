@@ -198,7 +198,17 @@ struct Fixture {
     dir: tempfile::TempDir,
 }
 
+/// Append the answer a real model writes after resolving its goal: the runtime
+/// takes one delivery round when the resolving round carried no text.
+fn with_delivery(mut script: Vec<Scripted>) -> Vec<Scripted> {
+    if matches!(script.last(), Some(Scripted::Tool("update_goal", _))) {
+        script.push(Scripted::Text);
+    }
+    script
+}
+
 async fn fixture(schedule: Vec<Option<&str>>, script: Vec<Scripted>, declare: bool) -> Fixture {
+    let script = with_delivery(script);
     let dir = tempfile::tempdir().unwrap();
     let db = Database::connect_in_memory().await.unwrap();
     let record = SessionRecord::new(
@@ -243,6 +253,7 @@ async fn fixture(schedule: Vec<Option<&str>>, script: Vec<Scripted>, declare: bo
             },
         },
         factory: ExecutorFactory {
+            tool_discovery: None,
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
@@ -342,6 +353,8 @@ async fn pre_upgrade_spend_counts_against_the_resumed_goal_budget() {
         leveler_agent::StopReason::Blocked,
         "the upgraded window ends on the model's declaration: {first:?}"
     );
+    // The Chat round and the upgraded Goal round that ends blocked: a blocked
+    // goal owes the work itself, so it takes no delivery round.
     assert_eq!(fx.runtime.calls.load(Ordering::SeqCst), 2);
 
     let goals = goal_records(&fx).await;
@@ -358,7 +371,7 @@ async fn pre_upgrade_spend_counts_against_the_resumed_goal_budget() {
     assert!(
         rows.iter()
             .all(|row| row.budget_scope.as_deref() == Some(goal.id.as_str())),
-        "both pre- and post-bind calls must be attributed to the goal: {:?}",
+        "every pre- and post-bind call must be attributed to the goal: {:?}",
         rows.iter()
             .map(|row| row.budget_scope.clone())
             .collect::<Vec<_>>()
@@ -441,6 +454,7 @@ async fn a_second_declaration_never_double_counts_or_replaces_the_objective() {
     .await;
     let report = chat(&fx, StepLimits::default()).await;
     assert_eq!(report.stop_reason, leveler_agent::StopReason::Blocked);
+    // plan, plan, and the blocked resolution, which needs no delivery round.
     assert_eq!(fx.runtime.calls.load(Ordering::SeqCst), 3);
 
     let goals = goal_records(&fx).await;
@@ -460,7 +474,8 @@ async fn a_second_declaration_never_double_counts_or_replaces_the_objective() {
     assert_eq!(
         spent,
         CALL_TOKENS * 3,
-        "three calls, counted once each: no duplication, no omission"
+        "four calls (plan, plan, blocked resolution, delivery), counted once each: \
+         no duplication, no omission"
     );
     assert!(
         rows.iter()

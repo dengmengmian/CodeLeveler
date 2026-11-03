@@ -36,6 +36,9 @@ use crate::terminal::TerminalGuard;
 use crate::theme::Theme;
 
 enum DeliveryJob {
+    Quit {
+        session_id: SessionId,
+    },
     Command {
         session_id: SessionId,
         command: ClientCommand,
@@ -70,6 +73,7 @@ fn observed_command_version(
 }
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const QUIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pause between re-deliveries of a submission that got no answer. Grows to
 /// the cap so a runtime that stays away costs a connection attempt every few
 /// seconds, not a busy loop.
@@ -179,6 +183,15 @@ pub async fn run(
     tokio::spawn(async move {
         while let Some(job) = delivery_rx.recv().await {
             let completion = match job {
+                DeliveryJob::Quit { session_id } => {
+                    let result = stop_session_before_quit(
+                        &delivery_client,
+                        &session_id,
+                        QUIT_CLEANUP_TIMEOUT,
+                    )
+                    .await;
+                    EffectCompletion::QuitFinished(result)
+                }
                 DeliveryJob::Command {
                     session_id,
                     command,
@@ -330,7 +343,15 @@ pub async fn run(
         } else {
             tokio::select! {
                 maybe = term_events.next() => {
-                if let Some(Ok(ev)) = maybe {
+                let ev = match maybe {
+                    Some(Ok(event)) => event,
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "terminal input closed",
+                    ).into()),
+                };
+                {
                     if let CtEvent::Resize(c, r) = ev {
                         state.size = (c, r);
                     }
@@ -341,7 +362,7 @@ pub async fn run(
                             &mut term_events,
                             &mut pending_terminal_actions,
                         )
-                        .await;
+                        .await?;
                         effects = reduce(&mut state, action);
                     }
                     paint_now = true;
@@ -615,6 +636,100 @@ fn session_exit_hint(session_id: &str) -> String {
          Reopen:  leveler resume {session_id}\x1b[K\n\
          (or `leveler resume` to pick from recent sessions)\x1b[J"
     )
+}
+
+/// Stop through the existing session-scoped authority, then observe actual
+/// settlement. A client disconnect never calls this explicit-exit path.
+async fn stop_session_before_quit(
+    client: &Arc<dyn InteractiveRuntimeClient>,
+    session_id: &SessionId,
+    timeout: Duration,
+) -> Result<(), String> {
+    // Drop the observation at the deadline so it can never issue new stops
+    // after the UI has reported failure and accepted another user action.
+    tokio::time::timeout(timeout, observe_session_cleanup(client, session_id))
+        .await
+        .map_err(|_| "timed out waiting for the runtime to confirm cleanup".to_string())?
+}
+
+async fn issue_quit_command(
+    client: &Arc<dyn InteractiveRuntimeClient>,
+    session_id: &SessionId,
+    command: ClientCommand,
+) -> Result<(), String> {
+    let client = Arc::clone(client);
+    let session_id = session_id.clone();
+    // Only an already-issued authority operation may outlive observation.
+    // Never drop an in-process stop halfway through process reclamation.
+    tokio::spawn(async move { client.issue(session_id, command).await })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+async fn observe_session_cleanup(
+    client: &Arc<dyn InteractiveRuntimeClient>,
+    session_id: &SessionId,
+) -> Result<(), String> {
+    // Subscribe before inspecting or cancelling so a fast terminal is not lost.
+    let mut events = client.subscribe_session(session_id);
+    let mut turn_cancelled = false;
+    let mut requested = std::collections::HashSet::new();
+    loop {
+        let snapshot = client
+            .snapshot(session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if snapshot.id != *session_id {
+            return Err("runtime returned a snapshot for a different session".into());
+        }
+        if snapshot.status == "running" {
+            // A cancelling turn may still launch a final background process;
+            // let its lifecycle settle before enumerating what must be stopped.
+            if !turn_cancelled {
+                issue_quit_command(
+                    client,
+                    session_id,
+                    ClientCommand::CancelCurrentTurn {
+                        session_id: session_id.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                turn_cancelled = true;
+            }
+        } else if snapshot.active_background_tasks.is_empty() {
+            return Ok(());
+        } else {
+            let mut issued = false;
+            for task in snapshot.active_background_tasks {
+                if requested.insert(task.task_id.clone()) {
+                    issue_quit_command(
+                        client,
+                        session_id,
+                        ClientCommand::CancelBackgroundTask {
+                            session_id: session_id.clone(),
+                            task_id: task.task_id,
+                        },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    issued = true;
+                }
+            }
+            if issued {
+                // An ACK only confirms dispatch. Re-read the registry before
+                // deciding whether a terminal event is still owed.
+                continue;
+            }
+        }
+        match events.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => {
+                return Err("runtime disconnected before cleanup was confirmed".into());
+            }
+        }
+    }
 }
 
 /// A delivery attempt runs as its own task: a timeout here abandons only the
@@ -945,7 +1060,34 @@ fn dispatch_effects(
                     let _ = tx.send(Action::UpdateFinished(outcome));
                 });
             }
-            Effect::Quit => state.running = false,
+            Effect::Quit => {
+                if !state.quit_pending {
+                    state.quit_pending = true;
+                    let paused = state.t().quit_input_paused.to_string();
+                    for input in &mut state.pending_inputs {
+                        if input.session_id == state.session_id && input.is_queued() {
+                            input.state =
+                                crate::pending_inputs::PendingInputState::Failed(paused.clone());
+                        }
+                    }
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Info,
+                        message: state.t().quit_stopping.to_string(),
+                    });
+                    if delivery_tx
+                        .send(DeliveryJob::Quit {
+                            session_id: state.session_id.clone(),
+                        })
+                        .is_err()
+                    {
+                        let _ = completion_tx.send(Action::EffectCompleted(
+                            EffectCompletion::QuitFinished(Err(
+                                "runtime command queue is closed".into()
+                            )),
+                        ));
+                    }
+                }
+            }
             Effect::StartCleanScan => {
                 let tx = completion_tx.clone();
                 match clean_host.clone() {
@@ -1252,19 +1394,19 @@ async fn maybe_coalesce_text_input(
     state: &AppState,
     term_events: &mut EventStream,
     pending: &mut VecDeque<Action>,
-) -> Action {
+) -> io::Result<Action> {
     let Action::Key(key) = first else {
-        return first;
+        return Ok(first);
     };
     let Some(first_char) = plain_text_char(&key) else {
-        return Action::Key(key);
+        return Ok(Action::Key(key));
     };
     // A coalesced burst ends in the composer. Only the composer may claim an
     // ordinary character: another workbench focus binds letters itself (the
     // Command focus stops with `x`), and turning that key into text before
     // the reducer ran swallowed the binding.
     if !coalescing_owns_key(state) {
-        return Action::Key(key);
+        return Ok(Action::Key(key));
     }
     // `!` on an empty Normal composer is a mode transition, not text. The
     // reducer must see the key itself before any following characters are
@@ -1273,15 +1415,23 @@ async fn maybe_coalesce_text_input(
         && state.composer.is_empty()
         && state.input_mode == crate::shell_mode::InputMode::Normal
     {
-        return Action::Key(key);
+        return Ok(Action::Key(key));
     }
 
     let mut text = String::new();
     text.push(first_char);
     loop {
         let next = tokio::time::timeout(INPUT_BURST_WINDOW, term_events.next()).await;
-        let Ok(Some(Ok(event))) = next else {
-            break;
+        let event = match next {
+            Err(_) => break,
+            Ok(Some(Ok(event))) => event,
+            Ok(Some(Err(error))) => return Err(error),
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal input closed",
+                ));
+            }
         };
         let Some(action) = map_terminal_event(event) else {
             continue;
@@ -1301,7 +1451,7 @@ async fn maybe_coalesce_text_input(
             }
         }
     }
-    Action::TextInput(text)
+    Ok(Action::TextInput(text))
 }
 
 /// Whether this surface currently treats ordinary characters as composer
@@ -1378,6 +1528,221 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn explicit_quit_waits_for_runtime_cleanup_instead_of_disconnecting() {
+        let mut s = state();
+        let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+        let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        dispatch_effects(
+            &mut s,
+            vec![Effect::Quit],
+            &completion_tx,
+            &delivery_tx,
+            &None,
+            &None,
+            &None,
+            &None,
+            &mut None,
+            &mut io::stdout(),
+        );
+        assert!(
+            s.running,
+            "a quit intent must wait for authoritative cleanup"
+        );
+        assert!(
+            delivery_rx.try_recv().is_ok(),
+            "the runtime must own cleanup"
+        );
+    }
+
+    struct QuitRuntime {
+        inner: leveler_client_protocol::mock::MockRuntimeClient,
+        command_seen: tokio::sync::Notify,
+        observed_after_stop: tokio::sync::Notify,
+        snapshots: std::sync::atomic::AtomicUsize,
+        fail_stop: bool,
+    }
+
+    impl QuitRuntime {
+        fn new(snapshot: UiSessionSnapshot, fail_stop: bool) -> Arc<Self> {
+            let inner = leveler_client_protocol::mock::MockRuntimeClient::new(snapshot.id.clone());
+            inner.set_snapshot(snapshot);
+            Arc::new(Self {
+                inner,
+                command_seen: tokio::sync::Notify::new(),
+                observed_after_stop: tokio::sync::Notify::new(),
+                snapshots: std::sync::atomic::AtomicUsize::new(0),
+                fail_stop,
+            })
+        }
+        fn publish(&self, snapshot: UiSessionSnapshot) {
+            self.inner.set_snapshot(snapshot.clone());
+            self.inner
+                .emit(RuntimeEvent::SessionOpened { session: snapshot });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveRuntimeClient for QuitRuntime {
+        async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+            self.inner.send(command).await?;
+            self.command_seen.notify_one();
+            if self.fail_stop {
+                Err(ClientError::Runtime("permission denied".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
+            self.inner.subscribe()
+        }
+        async fn snapshot(&self, session: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+            let snapshot = self.inner.snapshot(session).await?;
+            if self
+                .snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                self.observed_after_stop.notify_one();
+            }
+            Ok(snapshot)
+        }
+    }
+
+    async fn quit_snapshot() -> UiSessionSnapshot {
+        let inner = leveler_client_protocol::mock::MockRuntimeClient::new(SessionId::new("s1"));
+        let mut snapshot = inner.snapshot(&SessionId::new("s1")).await.unwrap();
+        snapshot
+            .active_background_tasks
+            .push(leveler_client_protocol::UiActiveBackgroundTask {
+                task_id: "bg-owned".into(),
+                program: "sleep".into(),
+                args: vec!["30".into()],
+                elapsed_ms: 1,
+                pid: Some(100),
+                ready_evidence: None,
+            });
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn explicit_quit_waits_beyond_the_stop_ack_for_the_owned_background_terminal() {
+        let snapshot = quit_snapshot().await;
+        let runtime = QuitRuntime::new(snapshot.clone(), false);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+        let work = tokio::spawn(async move {
+            stop_session_before_quit(&client, &SessionId::new("s1"), QUIT_CLEANUP_TIMEOUT).await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.observed_after_stop.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !work.is_finished(),
+            "a stop ACK does not prove the process has gone"
+        );
+        assert!(
+            matches!(runtime.inner.commands().as_slice(), [ClientCommand::CancelBackgroundTask {session_id, task_id}] if session_id.as_str()=="s1" && task_id=="bg-owned")
+        );
+        let mut terminal = snapshot;
+        terminal.active_background_tasks.clear();
+        runtime.publish(terminal);
+        tokio::time::timeout(Duration::from_secs(1), work)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_quit_waits_for_the_turn_then_stops_its_late_background_task() {
+        let mut snapshot = quit_snapshot().await;
+        snapshot.status = "running".into();
+        snapshot.active_background_tasks.clear();
+        let runtime = QuitRuntime::new(snapshot.clone(), false);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+        let work = tokio::spawn(async move {
+            stop_session_before_quit(&client, &SessionId::new("s1"), QUIT_CLEANUP_TIMEOUT).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), runtime.command_seen.notified())
+            .await
+            .unwrap();
+        assert!(
+            matches!(runtime.inner.commands().as_slice(), [ClientCommand::CancelCurrentTurn {session_id}] if session_id.as_str()=="s1")
+        );
+        let mut late = quit_snapshot().await;
+        late.active_background_tasks[0].task_id = "bg-late".into();
+        runtime.publish(late.clone());
+        tokio::time::timeout(Duration::from_secs(1), runtime.command_seen.notified())
+            .await
+            .unwrap();
+        assert!(
+            matches!(runtime.inner.commands().as_slice(), [ClientCommand::CancelCurrentTurn {..}, ClientCommand::CancelBackgroundTask {session_id, task_id}] if session_id.as_str()=="s1" && task_id=="bg-late")
+        );
+        late.active_background_tasks.clear();
+        runtime.publish(late);
+        tokio::time::timeout(Duration::from_secs(1), work)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_quit_cleanup_error_keeps_the_client_open_for_retry() {
+        let runtime = QuitRuntime::new(quit_snapshot().await, true);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime;
+        let result =
+            stop_session_before_quit(&client, &SessionId::new("s1"), QUIT_CLEANUP_TIMEOUT).await;
+        assert!(result.as_ref().unwrap_err().contains("permission denied"));
+        let mut s = state();
+        s.quit_pending = true;
+        reduce(
+            &mut s,
+            Action::EffectCompleted(EffectCompletion::QuitFinished(result)),
+        );
+        assert!(s.running);
+        assert!(!s.quit_pending);
+        assert!(
+            s.notification
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("permission denied")
+        );
+        assert_eq!(
+            s.notification.as_ref().unwrap().level,
+            NotificationLevel::Error
+        );
+    }
+
+    #[test]
+    fn explicit_quit_blocks_late_input_and_exits_only_on_successful_cleanup() {
+        let mut s = state();
+        s.quit_pending = true;
+        assert!(reduce(&mut s, Action::TextInput("new work".into())).is_empty());
+        assert!(
+            reduce(
+                &mut s,
+                Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            )
+            .is_empty()
+        );
+        assert!(
+            s.composer.is_empty(),
+            "no new submission may follow the exit intent"
+        );
+        assert!(s.running);
+        reduce(
+            &mut s,
+            Action::EffectCompleted(EffectCompletion::QuitFinished(Ok(()))),
+        );
+        assert!(!s.running);
+        assert!(!s.quit_pending);
+    }
 
     /// A plain letter is composer text only while the composer owns the keys.
     /// The Command focus binds `x` to stop; coalescing it into `TextInput`

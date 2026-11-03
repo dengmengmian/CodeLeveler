@@ -928,6 +928,370 @@ async fn verification_facts_survive_the_next_work_window() {
     );
 }
 
+/// Session `1c3bf9aa`'s shape, at resume level: the user demanded the tests,
+/// window 1 ran the repository's own suite (`make regression`) and stopped at
+/// its round budget, and window 2 cites that run. The rebuilt record must read
+/// the suite by the repository's own name, so the goal settles on the evidence
+/// the task actually produced instead of demanding a pointless re-run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_named_suite_survives_the_next_work_window() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "s1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": "bin/make",
+                        "args": ["regression"],
+                        "reason": "run the suite the user required"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "本地全套已启动，13 组真实回归全过",
+                        "verification": {"status": "passed", "detail": "bin/make regression"},
+                        "requirements": [{
+                            "requirement": "tests",
+                            "status": "done",
+                            "evidence": "bin/make regression 退出码 0：13 组用例、191 条断言通过"
+                        }]
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    let bin = f._tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let suite = bin.join("make");
+    std::fs::write(&suite, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&suite, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let model = ModelRef::new("mock", "m");
+    let run = |rounds: u32| {
+        let app = f.app.clone();
+        let session = f.session.clone();
+        let model = model.clone();
+        async move {
+            app.run_in_session_bounded(
+                &session,
+                &model,
+                PermissionProfile::Assisted,
+                "跑通全部测试并确认通过",
+                Arc::new(AutoApprove),
+                false,
+                &mut |_| {},
+                CancellationToken::new(),
+                rounds,
+                None,
+            )
+            .await
+        }
+    };
+
+    let first = run(1).await.expect("the first window stops at its budget");
+    assert!(
+        matches!(
+            first.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "the first window must really be a budget stop: {first:?}"
+    );
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let owed = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].state, GoalState::Running);
+    let goal_id = owed[0].id.clone();
+    drop(db);
+
+    let second = run(8).await.expect("the second window completes the goal");
+    assert_eq!(
+        second.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the suite the previous window ran is evidence for this goal: {second:?}"
+    );
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let goal = stores.goals.get(&goal_id).await.unwrap().unwrap();
+    assert_eq!(goal.state, GoalState::Settled);
+    let rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+    assert!(
+        rows.iter().all(|row| row.event_type != "goal_intercepted"),
+        "no gate may refuse a suite the task really ran: {rows:#?}"
+    );
+}
+
+/// The companion of `a_started_command_is_not_rebuilt_as_a_pass`: a command
+/// that was moved to the background, then really EXITED 0, is evidence for the
+/// next window. Before the runtime recorded background results, this case was
+/// indistinguishable from a start and the goal was refused for a suite that
+/// had actually passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_background_command_is_evidence_after_resume() {
+    let (script_name, script) = if cfg!(windows) {
+        ("run-tests.cmd", "exit /b 0\r\n")
+    } else {
+        ("run-tests.sh", "exit 0\n")
+    };
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/c", script_name])
+    } else {
+        ("sh", vec![script_name])
+    };
+    let cited = format!("{program} {}", args.join(" "));
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "b1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": program,
+                        "args": args,
+                        "background": true,
+                        "reason": "run the suite the user required"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "the suite passed",
+                        "verification": {"status": "passed", "detail": cited},
+                        "requirements": [{
+                            "requirement": "tests",
+                            "status": "done",
+                            "evidence": cited
+                        }]
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
+
+    let model = ModelRef::new("mock", "m");
+    let run = |rounds: u32| {
+        let app = f.app.clone();
+        let session = f.session.clone();
+        let model = model.clone();
+        async move {
+            app.run_in_session_bounded(
+                &session,
+                &model,
+                PermissionProfile::Assisted,
+                "跑通全部测试并确认通过",
+                Arc::new(AutoApprove),
+                false,
+                &mut |_| {},
+                CancellationToken::new(),
+                rounds,
+                None,
+            )
+            .await
+        }
+    };
+
+    let first = run(1).await.expect("the first window stops at its budget");
+    assert!(
+        matches!(
+            first.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "the first window must really be a budget stop: {first:?}"
+    );
+    // The task really finished during (or just after) the first window, so its
+    // result is durable before the next window reads the record.
+    let db = f.app.open_database().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut rows = Vec::new();
+    while std::time::Instant::now() < deadline {
+        rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+        if rows
+            .iter()
+            .any(|row| row.event_type == "background_task_finished")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    drop(db);
+    assert!(
+        rows.iter()
+            .any(|row| row.event_type == "background_task_finished"),
+        "the exited background command must leave a durable result: {rows:#?}"
+    );
+
+    let second = run(8).await.expect("the second window settles");
+    assert_eq!(
+        second.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "a backgrounded command that exited 0 is evidence: {second:?}"
+    );
+}
+
+/// A recorded START is not a recorded RESULT. Window 1 starts a suite in the
+/// background and stops at its round budget while the suite is STILL RUNNING;
+/// the durable log then holds that start's successful tool result (no exit
+/// code) and no result. Window 2 cites it. The rebuilt record must not turn
+/// the start into a pass: a resumed goal may not close on a suite whose
+/// outcome never reached the record.
+///
+/// A suite that has really EXITED is a different fact — see
+/// `a_finished_background_command_is_evidence_after_resume`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_started_command_is_not_rebuilt_as_a_pass() {
+    let (script_name, script) = if cfg!(windows) {
+        ("run-tests.cmd", "ping -n 60 127.0.0.1 >NUL\r\n")
+    } else {
+        ("run-tests.sh", "sleep 60\nexit 0\n")
+    };
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/c", script_name])
+    } else {
+        ("sh", vec![script_name])
+    };
+    let cited = format!("{program} {}", args.join(" "));
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "b1",
+                    "run_command",
+                    serde_json::json!({
+                        "program": program,
+                        "args": args,
+                        "background": true,
+                        "reason": "run the suite the user required"
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            sse(vec![
+                tool_call_frame(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "the suite passed",
+                        "verification": {"status": "passed", "detail": cited},
+                        "requirements": [{
+                            "requirement": "tests",
+                            "status": "done",
+                            "evidence": cited
+                        }]
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
+
+    let model = ModelRef::new("mock", "m");
+    let run = |rounds: u32| {
+        let app = f.app.clone();
+        let session = f.session.clone();
+        let model = model.clone();
+        async move {
+            app.run_in_session_bounded(
+                &session,
+                &model,
+                PermissionProfile::Assisted,
+                "跑通全部测试并确认通过",
+                Arc::new(AutoApprove),
+                false,
+                &mut |_| {},
+                CancellationToken::new(),
+                rounds,
+                None,
+            )
+            .await
+        }
+    };
+
+    let first = run(1).await.expect("the first window stops at its budget");
+    assert!(
+        matches!(
+            first.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "the first window must really be a budget stop: {first:?}"
+    );
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let owed = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].state, GoalState::Running);
+    drop(db);
+
+    let second = run(8).await.expect("the second window settles");
+    assert_ne!(
+        second.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "a background start has no result to close the goal on: {second:?}"
+    );
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let terminal = stores
+        .events
+        .load_last_by_type(&f.session, "task_finished", None)
+        .await
+        .unwrap()
+        .expect("the second window wrote a terminal");
+    assert!(
+        !terminal.payload.contains("\"outcome\":\"completed\""),
+        "the start must not become a completed goal: {}",
+        terminal.payload
+    );
+    let rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+    assert!(
+        rows.iter().any(|row| {
+            row.event_type == "goal_intercepted" && row.payload.contains("verification_refused")
+        }),
+        "the citation must be refused on the record: {rows:#?}"
+    );
+}
+
 /// A failed acceptance check is a fact about the GOAL, not about one window.
 /// The retry may not forget it: a premature `complete` is refused until the
 /// check actually passes, and the refusal is the same mechanical answer a live

@@ -79,8 +79,7 @@ async fn main() -> std::process::ExitCode {
     match run(args).await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("{}", output::error_prefix());
-            eprintln!("  {}", render_error_chain(&e));
+            crash::report_fatal(&output::error_prefix(), &render_error_chain(&e));
             std::process::ExitCode::FAILURE
         }
     }

@@ -386,12 +386,241 @@ fn combine_independent_review(
     }
 }
 
+/// The process-lived MCP connection cache, owned by the application and shared
+/// with each turn's tool-discovery adapter.
+///
+/// It is a separate type from `Application` so a turn can hold it for its whole
+/// life: the tools a turn may grow into are the same connections every other
+/// turn uses, not a second copy.
+pub(crate) struct McpToolSource {
+    cache: tokio::sync::Mutex<Option<McpToolCache>>,
+    environment: leveler_core::EnvSnapshot,
+    has_workspace: bool,
+}
+
+impl McpToolSource {
+    fn new(environment: leveler_core::EnvSnapshot, has_workspace: bool) -> Self {
+        Self {
+            cache: tokio::sync::Mutex::new(None),
+            environment,
+            has_workspace,
+        }
+    }
+    /// Tools of the configured MCP servers, connecting at most once per
+    /// generation. A reload diffs the server set: unchanged servers keep their
+    /// live connection, only a changed/added server is connected again, and a
+    /// removed server's tools simply drop out (its child is reaped with them).
+    ///
+    /// A failed attempt is retried on a later request with backoff, so a server
+    /// that starts after CodeLeveler is discovered without a config change.
+    async fn tools(
+        &self,
+        snapshot: &ConfigSnapshot,
+        mode: PermissionProfile,
+    ) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
+        if !self.has_workspace || snapshot.loaded.mcp_servers.is_empty() {
+            // A generation that removed every server ends the connections the
+            // previous generation held; an unused connection is not a cache.
+            self.cache.lock().await.take();
+            return Vec::new();
+        }
+        let unrestricted = mode == PermissionProfile::FullAccess;
+        let desired: std::collections::BTreeMap<String, String> = snapshot
+            .loaded
+            .mcp_servers
+            .iter()
+            .map(|server| (server.name.clone(), mcp_server_digest(server)))
+            .collect();
+        let mut guard = self.cache.lock().await;
+        // A server that reported tools/list_changed is rebuilt even when its
+        // config digest is unchanged. Other servers keep their live connection.
+        let catalog_refresh: std::collections::BTreeSet<String> = guard
+            .as_ref()
+            .map(|cache| {
+                snapshot
+                    .loaded
+                    .mcp_servers
+                    .iter()
+                    .filter(|server| {
+                        let prefix = format!("mcp__{}__", server.name);
+                        cache
+                            .tools
+                            .iter()
+                            .any(|tool| tool.name().starts_with(&prefix) && tool.catalog_changed())
+                    })
+                    .map(|server| server.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A server whose last attempt failed is due once its backoff elapsed.
+        // Turn boundaries are the only trigger, so a session that sends no
+        // request never retries.
+        let now = std::time::Instant::now();
+        let due: std::collections::BTreeSet<String> = guard
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .retry
+                    .iter()
+                    .filter(|(_, retry)| retry.next_attempt <= now)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rebuild = guard
+            .as_ref()
+            .is_none_or(|cache| cache.unrestricted != unrestricted || cache.servers != desired)
+            || !catalog_refresh.is_empty()
+            || !due.is_empty();
+        if rebuild {
+            let previous = guard.take();
+            let (kept, previous_servers, mut retry) = match previous {
+                Some(cache) => (cache.tools, cache.servers, cache.retry),
+                None => (Vec::new(), Default::default(), Default::default()),
+            };
+            // A server that is no longer configured keeps no schedule.
+            retry.retain(|server, _| desired.contains_key(server));
+            // Keep every tool whose server is unchanged: its connection, its
+            // child process and its handshake stay exactly as they were.
+            let mut tools: Vec<Arc<dyn leveler_tools::tool::Tool>> = kept
+                .into_iter()
+                .filter(|tool| {
+                    previous_servers.iter().any(|(server, digest)| {
+                        desired.get(server) == Some(digest)
+                            && !catalog_refresh.contains(server)
+                            && !due.contains(server)
+                            && tool.name().starts_with(&format!("mcp__{server}__"))
+                    })
+                })
+                .collect();
+            for server in &snapshot.loaded.mcp_servers {
+                let unchanged = previous_servers.get(&server.name) == desired.get(&server.name);
+                if unchanged
+                    && !catalog_refresh.contains(&server.name)
+                    && !due.contains(&server.name)
+                {
+                    continue;
+                }
+                for connection in leveler_tools::mcp::connect_all_detailed(
+                    std::slice::from_ref(server),
+                    &self.environment,
+                    unrestricted,
+                )
+                .await
+                {
+                    tools.extend(connection.tools);
+                    match connection.error {
+                        // Connected (even with a legitimately empty catalog):
+                        // this server owes no retry.
+                        None => {
+                            retry.remove(&connection.server);
+                        }
+                        Some(reason) => {
+                            let failures = retry
+                                .get(&connection.server)
+                                .map(|retry| retry.failures)
+                                .unwrap_or(0)
+                                + 1;
+                            tracing::warn!(
+                                server = %connection.server,
+                                attempt = failures,
+                                retry_in_seconds = mcp_retry_delay(failures).as_secs(),
+                                error = %reason,
+                                "MCP server not connected; will retry on a later turn"
+                            );
+                            retry.insert(
+                                connection.server,
+                                McpRetry {
+                                    failures,
+                                    next_attempt: now + mcp_retry_delay(failures),
+                                    reason,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            *guard = Some(McpToolCache {
+                unrestricted,
+                servers: desired,
+                retry,
+                tools,
+            });
+        }
+        guard
+            .as_ref()
+            .map(|cache| cache.tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// Why the external-tool pack has nothing to offer right now, if a
+    /// configured server could not be reached.
+    async fn unavailable_reason(&self) -> Option<String> {
+        let guard = self.cache.lock().await;
+        let cache = guard.as_ref()?;
+        let mut reasons: Vec<String> = cache
+            .retry
+            .iter()
+            .map(|(server, retry)| format!("{server}: {}", retry.reason))
+            .collect();
+        if reasons.is_empty() {
+            return None;
+        }
+        reasons.sort();
+        Some(format!(
+            "configured MCP server(s) not reachable on this request; retrying on later turns — {}",
+            reasons.join("; ")
+        ))
+    }
+}
+
+/// Bridges the host's MCP cache into a running turn, so an external catalog
+/// that becomes reachable mid-turn joins this turn's surface instead of waiting
+/// for the next user message.
+struct McpDiscovery {
+    source: Arc<McpToolSource>,
+    snapshot: Arc<ConfigSnapshot>,
+    mode: PermissionProfile,
+}
+
+#[async_trait::async_trait]
+impl leveler_tools::tool::ToolDiscovery for McpDiscovery {
+    async fn discovered(&self) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
+        self.source.tools(&self.snapshot, self.mode).await
+    }
+}
+
 struct McpToolCache {
     unrestricted: bool,
     /// Per-server input digest. An unchanged server keeps its live connection;
     /// only a changed/added server is reconnected.
     servers: std::collections::BTreeMap<String, String>,
+    /// Servers whose last attempt did not produce a catalog. A failed attempt is
+    /// not a connection: the server stays configured and is retried with
+    /// backoff, because an MCP server commonly starts after CodeLeveler does.
+    retry: std::collections::BTreeMap<String, McpRetry>,
     tools: Vec<Arc<dyn leveler_tools::tool::Tool>>,
+}
+
+/// One server's retry schedule after a failed connection attempt, and the
+/// reason the last attempt failed (shown to the model for this turn only).
+struct McpRetry {
+    failures: u32,
+    next_attempt: std::time::Instant,
+    reason: String,
+}
+
+/// First retry delay, and the cap a persistently unreachable server backs off
+/// to. The trigger is a turn boundary, never a timer loop: an idle session
+/// makes no attempt at all.
+const MCP_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+const MCP_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn mcp_retry_delay(failures: u32) -> std::time::Duration {
+    let exponent = failures.saturating_sub(1).min(8);
+    MCP_RETRY_INITIAL
+        .saturating_mul(1 << exponent)
+        .min(MCP_RETRY_MAX)
 }
 
 /// A fully-assembled application.
@@ -402,7 +631,7 @@ pub struct Application {
     /// state for the process lifetime.
     config: Arc<ConfigManager>,
     /// MCP tools cached under the credential inheritance authority of their launch.
-    mcp_tools: Arc<tokio::sync::Mutex<Option<McpToolCache>>>,
+    mcp_tools: Arc<McpToolSource>,
     /// The session database pool, opened once per process.
     database: Arc<tokio::sync::Mutex<Option<Database>>>,
     /// When set, overrides the resolved execution policy on every execution
@@ -625,10 +854,11 @@ impl Application {
             layout.browser_profile_dir(),
             snapshot.loaded.browser_default,
         ));
+        let has_workspace = layout.primary_workspace().is_some();
         Ok(Self {
             layout,
             config,
-            mcp_tools: Arc::new(tokio::sync::Mutex::new(None)),
+            mcp_tools: Arc::new(McpToolSource::new((*environment).clone(), has_workspace)),
             database: Arc::new(tokio::sync::Mutex::new(None)),
 
             execution_overrides: None,
@@ -956,74 +1186,21 @@ impl Application {
         limits
     }
 
-    /// Connect to the configured MCP servers once and cache their tools, so
-    /// every turn reuses the same connections instead of respawning processes.
-    ///
-    /// A reload diffs the server set: unchanged servers keep their live
-    /// connection, only a changed/added server is connected again, and a
-    /// removed server's tools simply drop out (its child is reaped with them).
+    /// Connect to the configured MCP servers once and cache their tools.
     async fn mcp_tools(
         &self,
         snapshot: &ConfigSnapshot,
         mode: PermissionProfile,
     ) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
-        if self.layout.primary_workspace().is_none() || snapshot.loaded.mcp_servers.is_empty() {
-            // A generation that removed every server ends the connections the
-            // previous generation held; an unused connection is not a cache.
-            self.mcp_tools.lock().await.take();
-            return Vec::new();
-        }
-        let unrestricted = mode == PermissionProfile::FullAccess;
-        let desired: std::collections::BTreeMap<String, String> = snapshot
-            .loaded
-            .mcp_servers
-            .iter()
-            .map(|server| (server.name.clone(), mcp_server_digest(server)))
-            .collect();
-        let mut guard = self.mcp_tools.lock().await;
-        let rebuild = guard
-            .as_ref()
-            .is_none_or(|cache| cache.unrestricted != unrestricted || cache.servers != desired);
-        if rebuild {
-            let previous = guard.take();
-            let (kept, previous_servers) = match previous {
-                Some(cache) => (cache.tools, cache.servers),
-                None => (Vec::new(), Default::default()),
-            };
-            // Keep every tool whose server is unchanged: its connection, its
-            // child process and its handshake stay exactly as they were.
-            let mut tools: Vec<Arc<dyn leveler_tools::tool::Tool>> = kept
-                .into_iter()
-                .filter(|tool| {
-                    previous_servers.iter().any(|(server, digest)| {
-                        desired.get(server) == Some(digest)
-                            && tool.name().starts_with(&format!("mcp__{server}__"))
-                    })
-                })
-                .collect();
-            for server in &snapshot.loaded.mcp_servers {
-                if previous_servers.get(&server.name) == desired.get(&server.name) {
-                    continue;
-                }
-                tools.extend(
-                    leveler_tools::mcp::connect_all_with_authority(
-                        std::slice::from_ref(server),
-                        &self.environment,
-                        unrestricted,
-                    )
-                    .await,
-                );
-            }
-            *guard = Some(McpToolCache {
-                unrestricted,
-                servers: desired,
-                tools,
-            });
-        }
-        guard
-            .as_ref()
-            .map(|cache| cache.tools.clone())
-            .unwrap_or_default()
+        self.mcp_tools.tools(snapshot, mode).await
+    }
+
+    /// Why the external-tool pack has nothing to offer on this turn, if a
+    /// configured MCP server could not be reached. Read after `mcp_tools` for
+    /// the same turn, so the reason and the (empty) tool set describe the same
+    /// attempt.
+    async fn mcp_unavailable_reason(&self) -> Option<String> {
+        self.mcp_tools.unavailable_reason().await
     }
 
     /// Compose one turn's model-visible tool surface from what this host can
@@ -1309,9 +1486,14 @@ impl Application {
                 available.push(id);
             }
         }
-        let permitted = available
-            .iter()
-            .copied()
+        // Permission is an AUTHORITY fact about this host and mode; it must not
+        // be derived from which tools happen to exist right now. A pack whose
+        // catalog starts late (an MCP server that comes up mid-turn) is still
+        // permitted, and the model must be able to tell "not allowed" from
+        // "not reachable yet" — deriving permission from availability made
+        // `capability enable` answer "not permitted" for a mode that permits it.
+        let permitted = CapabilityId::ALL
+            .into_iter()
             .filter(|id| {
                 unrestricted
                     || match id {
@@ -1324,6 +1506,17 @@ impl Application {
                     }
             })
             .collect();
+        // A configured MCP server that is not up yet leaves the pack with no
+        // tools; say so instead of presenting the gap as "nothing configured".
+        let mut unavailable = std::collections::BTreeMap::new();
+        if !registry
+            .definitions()
+            .iter()
+            .any(|tool| tool.name.starts_with("mcp__"))
+            && let Some(reason) = self.mcp_unavailable_reason().await
+        {
+            unavailable.insert(CapabilityId::ExternalTools, reason);
+        }
         let capabilities = Arc::new(
             CapabilityDisclosure::for_session(
                 available,
@@ -1331,7 +1524,8 @@ impl Application {
                 self.capability_activation_for(session_scope),
             )
             .with_default_active(Vec::new())
-            .map_err(AppError::Engine)?,
+            .map_err(AppError::Engine)?
+            .with_unavailable(unavailable),
         );
         // The global home root (never a cwd-relative `.leveler`, which would
         // read/write user config inside whatever directory we launched from).
@@ -1363,6 +1557,13 @@ impl Application {
             factory: leveler_agent::coding::ExecutorFactory {
                 runtime,
                 registry: Arc::new(registry),
+                // A turn outlives the moment its surface was composed; the
+                // catalog it grows into is the application's one MCP cache.
+                tool_discovery: Some(Arc::new(McpDiscovery {
+                    source: Arc::clone(&self.mcp_tools),
+                    snapshot: Arc::clone(&snapshot),
+                    mode: tool_context.policy.mode(),
+                })),
                 tool_context,
                 model: model.clone(),
                 commit_co_author: snapshot.loaded.vcs_co_author,
@@ -1566,18 +1767,34 @@ fn resolve_search_provider(
 /// or env reconnects only that server.
 fn mcp_server_digest(server: &leveler_tools::mcp::McpServerConfig) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(server.command.as_bytes());
-    for arg in &server.args {
-        hasher.update(b"\0");
-        hasher.update(arg.as_bytes());
-    }
-    for (key, value) in &server.env {
-        hasher.update(b"\0");
-        hasher.update(key.as_bytes());
-        hasher.update(b"=");
-        // The value is a resolved credential; hash it so the digest itself
-        // can never be printed as a secret.
-        hasher.update(Sha256::digest(value.as_bytes()));
+    if server.is_streamable_http() {
+        hasher.update(b"streamable_http\0");
+        hasher.update(server.url.as_deref().unwrap_or("").as_bytes());
+        for (key, value) in &server.headers {
+            hasher.update(b"\0h\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"=");
+            hasher.update(Sha256::digest(value.as_bytes()));
+        }
+        if let Some(token) = &server.bearer_token {
+            hasher.update(b"\0bearer\0");
+            hasher.update(Sha256::digest(token.as_bytes()));
+        }
+    } else {
+        hasher.update(b"stdio\0");
+        hasher.update(server.command.as_bytes());
+        for arg in &server.args {
+            hasher.update(b"\0");
+            hasher.update(arg.as_bytes());
+        }
+        for (key, value) in &server.env {
+            hasher.update(b"\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"=");
+            // The value is a resolved credential; hash it so the digest itself
+            // can never be printed as a secret.
+            hasher.update(Sha256::digest(value.as_bytes()));
+        }
     }
     format!("sha256:{:x}", hasher.finalize())
 }

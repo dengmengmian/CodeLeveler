@@ -5,10 +5,10 @@ use leveler_tools::mcp::{McpClient, McpServerConfig};
 
 #[tokio::test]
 async fn server_tool_error_is_not_reported_as_success() {
-    let config = McpServerConfig {
-        name: "tool-error".to_string(),
-        command: "/bin/sh".to_string(),
-        args: vec![
+    let config = McpServerConfig::stdio(
+        "tool-error",
+        "/bin/sh",
+        vec![
             "-c".to_string(),
             r#"read -r init
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}'
@@ -19,8 +19,8 @@ read -r done
 "#
             .to_string(),
         ],
-        env: Vec::new(),
-    };
+        Vec::new(),
+    );
     let client = McpClient::connect(&config).await.unwrap();
     let result = client
         .call_tool("agent_status", serde_json::json!({"task_id":"missing"}))

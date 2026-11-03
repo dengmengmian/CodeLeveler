@@ -667,6 +667,19 @@ pub enum RuntimeEvent {
     /// unknown type. The final [`Self::BackgroundTaskExited`] log stays
     /// authoritative.
     BackgroundTaskOutput { task_id: String, chunk: String },
+    /// A still-running background task printed a readiness signal that a caller
+    /// was waiting for (its own output matched an explicit pattern). `evidence`
+    /// is the line that matched. This is an OBSERVATION, not a health check and
+    /// not an exit: the process keeps running, and the terminal event still
+    /// follows whenever it ends. Additive; older clients ignore the unknown
+    /// type and keep showing the task as running.
+    BackgroundTaskReady {
+        task_id: String,
+        evidence: String,
+        /// Milliseconds from process start to the observation.
+        #[serde(default)]
+        elapsed_ms: u64,
+    },
     /// A background task's state could not be established (for example its
     /// adopted driver failed). This is not a natural exit and not a stop: the
     /// UI must show unknown, never Running, failed, or stopped.

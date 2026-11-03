@@ -760,6 +760,79 @@ pub(crate) fn is_goal_scope_refusal(block: &ToolCallBlock) -> bool {
             .is_some_and(|preview| preview.contains(ACCEPTANCE_REFUSAL_TAG))
 }
 
+/// Marker the runtime prefixes to a refused `update_goal` preview, naming the
+/// gate that refused it. The rest of the preview is the runtime's own account.
+pub(crate) const GOAL_REFUSAL_TAG: &str = "[goal_refused:";
+
+/// A refusal the runtime recorded for one `update_goal` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GoalRefusal<'a> {
+    /// The gate's own kind (`verification_refused`, `requirements_refused`, …).
+    pub(crate) kind: &'a str,
+    /// The runtime's account, still model-facing prose: shown only expanded.
+    pub(crate) detail: &'a str,
+}
+
+/// The runtime's refusal attached to this call, if any.
+///
+/// Only the runtime states why a closeout was refused; the client reads the
+/// kind off the result it recorded, so a replayed session reaches the same
+/// conclusion without a second state machine.
+pub(crate) fn goal_refusal(block: &ToolCallBlock) -> Option<GoalRefusal<'_>> {
+    if block.name != "update_goal" || block.status != ToolStatus::Failed {
+        return None;
+    }
+    let rest = block.preview.as_deref()?.strip_prefix(GOAL_REFUSAL_TAG)?;
+    let (kind, rest) = rest.split_once(']')?;
+    if kind.is_empty() {
+        return None;
+    }
+    Some(GoalRefusal {
+        kind,
+        detail: rest.strip_prefix('\n').unwrap_or(rest).trim_end(),
+    })
+}
+
+/// Localized one-line statement of the gate's own reason.
+///
+/// The runtime refuses a closeout for several distinct reasons; each one tells
+/// the user something different (wait, authorize, fix the evidence, fill a
+/// gap). An unrecognised kind still states the fact without inventing a cause.
+pub(crate) fn goal_refusal_note(kind: &str, t: &crate::i18n::UiText) -> &'static str {
+    match kind {
+        "outstanding_children" => t.goal_refused_children,
+        "user_pause_boundary" => t.goal_refused_pause,
+        "invalid_status" => t.goal_refused_status,
+        "invalid_verification" | "invalid_requirements" => t.goal_refused_malformed,
+        "verification_refused" => t.goal_refused_evidence,
+        "requirements_refused" => t.goal_refused_scope,
+        _ => t.goal_update_rejected,
+    }
+}
+
+/// The localized note for this call's refusal, if it has one.
+pub(crate) fn goal_refusal_note_for<'a>(
+    block: &ToolCallBlock,
+    t: &'a crate::i18n::UiText,
+) -> Option<&'a str> {
+    goal_refusal(block).map(|refusal| goal_refusal_note(refusal.kind, t))
+}
+
+/// The body a refused closeout shows: the localized statement first (the
+/// collapsed row), the runtime's own account after it (expansion).
+///
+/// Several requirements can fail at once; the detail keeps every one of them,
+/// so the fold never reduces a list to a single invented cause.
+pub(crate) fn goal_refusal_body(block: &ToolCallBlock, t: &crate::i18n::UiText) -> Option<String> {
+    let refusal = goal_refusal(block)?;
+    let note = goal_refusal_note(refusal.kind, t);
+    Some(if refusal.detail.is_empty() {
+        note.to_string()
+    } else {
+        format!("{note}\n{}", refusal.detail)
+    })
+}
+
 /// The head label for one call, including the states that are not a failed
 /// action.
 ///
@@ -919,22 +992,28 @@ pub(crate) fn tool_lines(
     }
 
     // Prefer the structured goal summary over the runtime's lifecycle receipt
-    // so expand shows what the model actually wrote.
-    let goal_body = if block.name == "update_goal" {
+    // so expand shows what the model actually wrote. A refusal is not a
+    // summary: the runtime's own reason owns the body, localized.
+    let refusal_body = goal_refusal_body(block, t);
+    let goal_body = if block.name == "update_goal" && refusal_body.is_none() {
         update_goal_summary_from_arguments(&block.arguments, t)
     } else {
         String::new()
     };
-    let Some(raw_preview) = (if !goal_body.is_empty() {
-        Some(goal_body.as_str())
-    } else {
-        block.preview.as_deref().filter(|p| !p.trim().is_empty())
-    }) else {
+    let Some(raw_preview) = refusal_body
+        .as_deref()
+        .or_else(|| (!goal_body.is_empty()).then_some(goal_body.as_str()))
+        .or_else(|| block.preview.as_deref().filter(|p| !p.trim().is_empty()))
+    else {
         return;
     };
     let actionable_preview;
     let refusal_reason;
-    let preview = if guard_denial {
+    let preview = if refusal_body.is_some() {
+        // The localized statement is already the first line; the runtime's
+        // own account follows it and stays reachable by expanding.
+        raw_preview
+    } else if guard_denial {
         // Guard denials carry internal English guidance for the model
         // (skip-complete, closeout, loop-guard). Users just need to know the
         // action was turned down, not the raw guard text.
@@ -996,15 +1075,17 @@ pub(crate) fn tool_lines(
         let one = truncate_display(first, preview_w);
         let more = lines.len().saturating_sub(1);
         let long = lines.len() >= LONG_THRESHOLD || more > 0;
-        let hint = if long {
-            if more > 0 {
-                format!(
-                    "  {}",
-                    t.fold_more_lines_short.replace("{}", &more.to_string())
-                )
-            } else {
-                String::new()
-            }
+        // A refused closeout is not just more output: the runtime wrote the
+        // reason the goal stayed open, and the person has to be able to see it.
+        // Name the affordance instead of a bare line count.
+        let refusal = goal_refusal(block).is_some();
+        let hint = if refusal {
+            format!("  {}", t.goal_refusal_expand_hint)
+        } else if long && more > 0 {
+            format!(
+                "  {}",
+                t.fold_more_lines_short.replace("{}", &more.to_string())
+            )
         } else {
             String::new()
         };
@@ -3056,12 +3137,132 @@ mod tests {
         assert!(goal.contains("目标未更新"), "{goal}");
         assert!(goal.contains('⚠') && !goal.contains('✗'), "{goal}");
 
+        // The note states what the row knows and nothing more. Four refusal
+        // kinds produce four different runtime sentences, and only one of them
+        // is about a missing status / account; naming that one for all of them
+        // told the user a cause the runtime never checked.
+        for refusal in [
+            "a resolution requires an explicit status",
+            "the user explicitly requires the tests to pass, but no test command ran in this task",
+            "`make up` was cited as verification but never ran in this task",
+            "update_goal(complete) was not accepted: delegated sub-agent(s) x were still running",
+        ] {
+            let row = render("update_goal", refusal);
+            assert!(row.contains("目标未更新：收尾被运行时拒绝"), "{row}");
+            assert!(!row.contains("需先说明状态"), "{row}");
+            assert!(!row.contains(refusal), "{row}");
+        }
+
         // list_files: a real failure, reported as itself and marked ✗.
         let listing = render("list_files", "backend: no such directory");
         assert!(listing.contains("no such directory"), "{listing}");
         assert!(
             listing.contains('✗'),
             "a real failure is a failure: {listing}"
+        );
+    }
+
+    /// The runtime names the gate that refused a closeout in the result
+    /// preview. The collapsed row states that gate in Chinese; the runtime's
+    /// model-facing account (`everything after [goal_refused:<kind>]`) is
+    /// hidden until the user expands it.
+    #[test]
+    fn a_refused_closeout_names_the_gate_that_refused_it() {
+        let render = |preview: String, expanded: bool| {
+            let block = ToolCallBlock {
+                timing: None,
+                exit_code: None,
+                output: String::new(),
+                output_truncated: false,
+                expanded: false,
+                stop: Default::default(),
+                id: leveler_client_protocol::ToolCallId::new("g1"),
+                name: "update_goal".to_string(),
+                arguments: r#"{"status":"complete"}"#.to_string(),
+                status: ToolStatus::Failed,
+                preview: Some(preview),
+                duration_ms: None,
+                parallel: false,
+                batch: None,
+                started_elapsed_secs: 0,
+                applied_diff: None,
+            };
+            let mut out = Vec::new();
+            tool_lines(
+                &block,
+                &Theme::no_color(),
+                80,
+                expanded,
+                crate::i18n::Locale::Zh.text(),
+                &mut out,
+            );
+            out.iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Each runtime kind keeps its own reason, and no row silently reuses
+        // another kind's sentence.
+        for (kind, expected) in [
+            ("outstanding_children", "子任务仍在运行"),
+            ("user_pause_boundary", "目标已暂停"),
+            ("invalid_status", "缺少状态"),
+            ("invalid_verification", "无法解析"),
+            ("invalid_requirements", "无法解析"),
+            ("verification_refused", "验收证据不成立"),
+            ("requirements_refused", "尚未全部满足"),
+        ] {
+            let detail = format!("runtime account for {kind}");
+            let row = render(format!("[goal_refused:{kind}]\n{detail}"), false);
+            assert!(row.contains(expected), "{kind}: {row}");
+            assert!(
+                row.contains('⚠') && !row.contains('✗'),
+                "a refusal is a warning, not a failed action: {row}"
+            );
+            assert!(
+                !row.contains(&detail) && !row.contains(GOAL_REFUSAL_TAG),
+                "model-facing prose stays out of the collapsed body: {row}"
+            );
+        }
+
+        // Every failing requirement is reachable: expansion keeps the whole
+        // runtime list, so a multi-item refusal is never reduced to one cause.
+        let multi = "[goal_refused:requirements_refused]\nupdate_goal(complete) was refused: the \
+                     user's stated scope is not fully accounted for.\n- `b.txt` is not covered\n- \
+                     `c.txt` is not covered";
+        let collapsed = render(multi.to_string(), false);
+        assert!(collapsed.contains("尚未全部满足"), "{collapsed}");
+        assert!(
+            !collapsed.contains("`b.txt` is not covered")
+                && !collapsed.contains("`c.txt` is not covered"),
+            "collapsed: {collapsed}"
+        );
+        // The collapsed row names the affordance rather than a line count: the
+        // gate's own reason is what the person needs, and it is one keypress
+        // away.
+        assert!(
+            collapsed.contains(crate::i18n::Locale::Zh.text().goal_refusal_expand_hint),
+            "the collapsed row must say the refusal reason is behind the fold: {collapsed}"
+        );
+        let expanded = render(multi.to_string(), true);
+        assert!(expanded.contains("尚未全部满足"), "{expanded}");
+        assert!(
+            expanded.contains("`b.txt` is not covered")
+                && expanded.contains("`c.txt` is not covered"),
+            "both failing requirements survive expansion: {expanded}"
+        );
+        assert!(!expanded.contains(GOAL_REFUSAL_TAG), "{expanded}");
+
+        // An unknown kind is still a refusal, and still does not claim a cause
+        // the runtime never reported.
+        let unknown = render(
+            "[goal_refused:future_gate]\nnew runtime reason".to_string(),
+            false,
+        );
+        assert!(
+            unknown.contains("目标未更新：收尾被运行时拒绝"),
+            "{unknown}"
         );
     }
 

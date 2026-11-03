@@ -270,6 +270,16 @@ pub(crate) fn activity_glyph(status: ActivityStatus) -> &'static str {
     }
 }
 
+/// Running background tasks that announced readiness. A subset of the running
+/// count, never a separate lifecycle: the process is still up.
+pub(crate) fn ready_background_count(state: &AppState) -> usize {
+    state
+        .background_task_labels
+        .values()
+        .filter(|c| c.is_ready())
+        .count()
+}
+
 pub(crate) fn running_background_count(state: &AppState) -> usize {
     state
         .background_task_labels
@@ -1211,6 +1221,7 @@ second line ignored"
                 last_output_at: None,
                 output: String::new(),
                 unknown: false,
+                ready: None,
             },
         );
         state.background_task_labels.insert(
@@ -1581,6 +1592,7 @@ second line ignored"
                 last_output_at: None,
                 output: "test result: ok\n".into(),
                 unknown: false,
+                ready: None,
             },
         );
         assert_eq!(running_background_count(&state), 0);
@@ -1615,6 +1627,7 @@ second line ignored"
                 last_output_at: None,
                 output: String::new(),
                 unknown: false,
+                ready: None,
             },
         );
         // `bound_terminal_background` is the only pruning left, and it keeps
@@ -1646,6 +1659,7 @@ second line ignored"
                     last_output_at: None,
                     output: String::new(),
                     unknown: false,
+                    ready: None,
                 },
             );
         }
@@ -1680,6 +1694,7 @@ second line ignored"
             last_output_at: None,
             output: String::new(),
             unknown: false,
+            ready: None,
         }
     }
 

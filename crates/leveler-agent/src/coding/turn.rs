@@ -457,9 +457,30 @@ pub(crate) async fn load_goal_verification_runs(
     let rows = stores.events.load(session_id).await?;
     let mut calls: std::collections::HashMap<String, (String, serde_json::Value, u32)> =
         std::collections::HashMap::new();
+    // The starting call of every command in this goal, kept for the goal's
+    // whole window: a background task's RESULT arrives later, keyed by that
+    // call, and must be labelled by the call rather than by the process.
+    let mut started: std::collections::HashMap<String, (String, serde_json::Value, u32)> =
+        std::collections::HashMap::new();
     let mut mutation_ops = 0u64;
     let mut runs = Vec::new();
     for row in rows {
+        let Ok(event) = EngineEvent::from_payload(&row.payload) else {
+            continue;
+        };
+        // A background task's RESULT is written when it exits, which can be
+        // long after its turn closed and under no turn at all. It is attributed
+        // by the CALL that started it, so it is scoped by that call's presence
+        // in this goal rather than by the row's own turn.
+        if let EngineEvent::BackgroundTaskFinished {
+            call_id, is_error, ..
+        } = &event
+        {
+            if let Some(run) = background_result_run(&started, call_id, *is_error, mutation_ops) {
+                runs.push(run);
+            }
+            continue;
+        }
         if !row
             .turn_id
             .as_deref()
@@ -467,9 +488,6 @@ pub(crate) async fn load_goal_verification_runs(
         {
             continue;
         }
-        let Ok(event) = EngineEvent::from_payload(&row.payload) else {
-            continue;
-        };
         match event {
             EngineEvent::ToolCallStarted {
                 call_id,
@@ -478,16 +496,28 @@ pub(crate) async fn load_goal_verification_runs(
                 model_step,
                 ..
             } => {
-                if let Ok(arguments) = serde_json::from_str(&arguments) {
-                    calls.insert(call_id, (name, arguments, model_step.unwrap_or(0)));
+                if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                    let step = model_step.unwrap_or(0);
+                    started.insert(call_id.clone(), (name.clone(), arguments.clone(), step));
+                    calls.insert(call_id, (name, arguments, step));
                 }
             }
             EngineEvent::ToolCallFinished {
-                call_id, is_error, ..
+                call_id,
+                is_error,
+                exit_code,
+                ..
             } => {
                 if let Some((name, arguments, model_step)) = calls.remove(&call_id)
                     && let Some(label) =
                         crate::executor::goal_verification::command_label(&name, &arguments)
+                    // A successful result with no exit code is a command that
+                    // only STARTED (a background task, or a foreground run
+                    // handed to the background). The live collector skips the
+                    // same shape (`execution_status` absent); a resumed window
+                    // must not turn that start into a pass. A failed start
+                    // stays a failed run — it really did fail.
+                    && (is_error || exit_code.is_some())
                 {
                     runs.push(crate::executor::goal_verification::VerificationRun {
                         label,
@@ -509,6 +539,28 @@ pub(crate) async fn load_goal_verification_runs(
         runs.drain(..runs.len() - 64);
     }
     Ok(runs)
+}
+
+/// The evidence run for one durable background-task result.
+///
+/// The result names the call that started the task; the call's own name and
+/// arguments — recorded in this goal's window — are what label it. A result for
+/// a call this goal never started is not this goal's evidence, and a call that
+/// is not a command has no label at all: neither can justify completion.
+fn background_result_run(
+    started: &std::collections::HashMap<String, (String, serde_json::Value, u32)>,
+    call_id: &str,
+    is_error: bool,
+    mutation_ops: u64,
+) -> Option<crate::executor::goal_verification::VerificationRun> {
+    let (name, arguments, model_step) = started.get(call_id)?;
+    let label = crate::executor::goal_verification::command_label(name, arguments)?;
+    Some(crate::executor::goal_verification::VerificationRun {
+        label,
+        ok: !is_error,
+        model_step: *model_step,
+        mutation_ops,
+    })
 }
 
 struct CodingTurnSeeds {
@@ -987,5 +1039,76 @@ mod outstanding_child_tests {
         let settled = reconcile_outstanding_children(&mut outstanding, &[fact("c9", true)]);
         assert!(settled.is_empty());
         assert_eq!(outstanding, vec!["c1|Worker|worker|".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod background_result_run_tests {
+    use super::*;
+
+    fn started(
+        entries: &[(&str, &str, serde_json::Value, u32)],
+    ) -> std::collections::HashMap<String, (String, serde_json::Value, u32)> {
+        entries
+            .iter()
+            .map(|(call, name, arguments, step)| {
+                (
+                    call.to_string(),
+                    (name.to_string(), arguments.clone(), *step),
+                )
+            })
+            .collect()
+    }
+
+    /// A test that was moved to the background and then passed appears in the
+    /// goal's runs, so citing it can close the goal.
+    #[test]
+    fn a_background_result_for_this_goals_call_becomes_a_run() {
+        let calls = started(&[(
+            "call-1",
+            "run_command",
+            serde_json::json!({"program":"cargo","args":["test"]}),
+            7,
+        )]);
+        let run = background_result_run(&calls, "call-1", false, 3).expect("run");
+        assert_eq!(run.label, "cargo test");
+        assert!(run.ok);
+        assert_eq!(run.model_step, 7);
+        assert_eq!(run.mutation_ops, 3);
+    }
+
+    /// A failed background command is a failed run, so the gate can refuse a
+    /// completion that leans on it.
+    #[test]
+    fn a_failed_background_result_is_a_failed_run() {
+        let calls = started(&[(
+            "call-1",
+            "shell_command",
+            serde_json::json!({"cmd":"make e2e"}),
+            2,
+        )]);
+        let run = background_result_run(&calls, "call-1", true, 0).expect("run");
+        assert_eq!(run.label, "make e2e");
+        assert!(!run.ok);
+    }
+
+    /// A result belonging to another goal's call is not this goal's evidence.
+    #[test]
+    fn another_goals_background_result_is_not_evidence() {
+        let calls = started(&[(
+            "call-1",
+            "run_command",
+            serde_json::json!({"program":"cargo","args":["test"]}),
+            1,
+        )]);
+        assert!(background_result_run(&calls, "call-other", false, 0).is_none());
+    }
+
+    /// A non-command call has no command label, so a result attributed to it
+    /// cannot enter the command evidence.
+    #[test]
+    fn a_non_command_call_has_no_run() {
+        let calls = started(&[("call-1", "read_file", serde_json::json!({"path":"a"}), 1)]);
+        assert!(background_result_run(&calls, "call-1", false, 0).is_none());
     }
 }
