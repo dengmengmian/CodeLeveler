@@ -932,9 +932,13 @@ async fn cancel_task_leaves_another_sessions_turn_running() {
         .unwrap();
     settled(&f.app, &f.session).await;
 
+    let other_turns = {
+        let db = f.app.open_database().await.unwrap();
+        TurnRepository::new(&db).list(&other).await.unwrap()
+    };
     assert!(
         f.client.has_live_turn(&other),
-        "cancelling one session's logical task must not end another session's turn"
+        "cancelling one session's logical task must not end another session's turn; other turns: {other_turns:?}"
     );
 
     // Cleanup through the ordinary cooperative cancel.

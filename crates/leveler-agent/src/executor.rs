@@ -1710,31 +1710,6 @@ impl Executor {
         added
     }
 
-    /// Dispatch through the registry, falling back to this turn's discovered
-    /// tools. Both paths are the registry's own `execute` (same schema
-    /// validation and normalization), never a second implementation.
-    pub(crate) async fn execute_tool(
-        &self,
-        name: &str,
-        input: serde_json::Value,
-        context: ToolContext,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<leveler_tools::tool::ToolOutput, leveler_tools::tool::ToolError> {
-        if self.registry.get(name).is_some() {
-            return self
-                .registry
-                .execute(name, input, context, cancellation)
-                .await;
-        }
-        let overlay = Arc::clone(
-            &self
-                .discovered
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        overlay.execute(name, input, context, cancellation).await
-    }
-
     /// Names of the tools this turn discovered after its surface was composed.
     pub(crate) fn discovered_names(&self) -> Vec<String> {
         self.discovered

@@ -181,8 +181,11 @@ impl Fixture {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no model request ever carried {needle:?}: {}",
-                bodies.len()
+                "no model request ever carried {needle:?}: {} bodies; last={:?}",
+                bodies.len(),
+                bodies
+                    .last()
+                    .map(|body| &body[body.len().saturating_sub(600)..])
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

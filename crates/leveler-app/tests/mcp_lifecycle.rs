@@ -94,10 +94,9 @@ fn external_tools_entry(catalog: &serde_json::Value) -> serde_json::Value {
         .unwrap()
 }
 
-fn server_config(name: &str, script: &std::path::Path) -> String {
+fn server_config(name: &str, script: &std::path::Path, python: &str) -> String {
     format!(
-        "[[mcp_servers]]\nname = \"{name}\"\ncommand = \"{}\"\nargs = [\"-u\", \"{}\"]\n",
-        python(),
+        "[[mcp_servers]]\nname = \"{name}\"\ncommand = \"{python}\"\nargs = [\"-u\", \"{}\"]\n",
         script.display()
     )
 }
@@ -107,13 +106,17 @@ fn server_config(name: &str, script: &std::path::Path) -> String {
 #[tokio::test]
 async fn a_server_that_starts_after_the_first_turn_is_discovered_later() {
     let _env = env_lock().await;
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python interpreter is available");
+        return;
+    };
     let home = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     isolate_global_config(home.path());
     let script = home.path().join("late-server.py");
     std::fs::write(
         home.path().join("config.toml"),
-        server_config("late", &script),
+        server_config("late", &script, &python),
     )
     .unwrap();
     let app = Application::assemble(layout(&tmp)).unwrap();
@@ -152,6 +155,10 @@ async fn a_server_that_starts_after_the_first_turn_is_discovered_later() {
 #[tokio::test]
 async fn an_available_server_is_not_reconnected_every_turn() {
     let _env = env_lock().await;
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python interpreter is available");
+        return;
+    };
     let home = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     isolate_global_config(home.path());
@@ -159,7 +166,7 @@ async fn an_available_server_is_not_reconnected_every_turn() {
     std::fs::write(&script, STDIO_SERVER).unwrap();
     std::fs::write(
         home.path().join("config.toml"),
-        server_config("up", &script),
+        server_config("up", &script, &python),
     )
     .unwrap();
     let app = Application::assemble(layout(&tmp)).unwrap();
@@ -174,11 +181,21 @@ async fn an_available_server_is_not_reconnected_every_turn() {
     );
 }
 
-fn python() -> String {
-    for candidate in ["/usr/bin/python3", "/opt/homebrew/bin/python3"] {
-        if std::path::Path::new(candidate).exists() {
-            return candidate.to_string();
-        }
-    }
-    panic!("python3 is required for this test");
+/// The first interpreter that actually runs. Windows CI has no `/usr/bin`,
+/// and a host without Python skips these tests instead of failing the suite.
+fn python() -> Option<String> {
+    [
+        "/usr/bin/python3",
+        "/opt/homebrew/bin/python3",
+        "python3",
+        "python",
+    ]
+    .into_iter()
+    .find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+    .map(str::to_string)
 }

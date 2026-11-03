@@ -13,6 +13,7 @@
 //! concurrency constraints, and result feedback order. It cannot execute.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
@@ -164,6 +165,36 @@ pub(crate) enum AdmitError {
     /// The host itself failed (the durability barrier could not commit). The
     /// run aborts before the tool executes — never a fake success.
     Fatal(AgentError),
+}
+
+impl Executor {
+    /// Dispatch through the registry, falling back to this turn's discovered
+    /// tools. Both paths are the registry's own `execute` (same schema
+    /// validation and normalization), never a second implementation.
+    ///
+    /// This is the execution entry, so it lives with the host boundary: the
+    /// architecture tripwire allows `registry.execute` only in this file.
+    pub(crate) async fn execute_tool(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<leveler_tools::tool::ToolOutput, ToolError> {
+        if self.registry.get(name).is_some() {
+            return self
+                .registry
+                .execute(name, input, context, cancellation)
+                .await;
+        }
+        let overlay = Arc::clone(
+            &self
+                .discovered
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        overlay.execute(name, input, context, cancellation).await
+    }
 }
 
 impl Executor {

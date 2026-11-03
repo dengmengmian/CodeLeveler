@@ -808,6 +808,7 @@ async fn a_status_question_inside_a_paused_goal_adds_no_scope() {
 
 /// Chat-sourced goal A: committed, stage 1 delivered, stopped at the user's
 /// own boundary.
+#[cfg(unix)]
 fn committed_pause_turn() -> Vec<MockResponse> {
     vec![
         sse(vec![
@@ -857,12 +858,14 @@ fn committed_pause_turn() -> Vec<MockResponse> {
     ]
 }
 
+#[cfg(unix)]
 const SECOND_OBJECTIVE: &str = "创建 export-b1.txt，然后运行 sh ./verify.sh 验收。\
      一次做完，中间不要停下来等我确认。";
 
 /// A goal B turn whose FIRST model call is slow, so the test can observe the
 /// session while goal B is genuinely executing. The slow response is a plain
 /// answer: the goal contract then drives the next round, which does the work.
+#[cfg(unix)]
 fn running_second_goal() -> Vec<MockResponse> {
     vec![
         MockResponse::SilentThenJson {
@@ -910,6 +913,9 @@ fn running_second_goal() -> Vec<MockResponse> {
     ]
 }
 
+/// The fixed turn speaks `sh` and `./verify.sh`; the pause boundary it checks is
+/// the product's, but this fixture only runs on a POSIX host.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
     let mut responses = committed_pause_turn();
