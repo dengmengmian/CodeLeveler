@@ -54,8 +54,19 @@ POST_RELEASE_SCHEMA (all fields optional; a missing field is NOT_VERIFIED):
       "notes": []
     },
     "known_issues": ["..."],
-    "not_verified": ["..."]
+    "not_verified": ["..."],
+    "performance": {
+      "method": "same machine, fresh HOME per sample, 120x32 PTY, 14 samples",
+      "rows": [
+        {"metric": "TUI first frame", "previous": "492 ms", "current": "638 ms",
+         "delta": "+29.7%", "verdict": "REGRESSED"}
+      ]
+    }
   }
+
+`performance` is operator-recorded measurement of the two released artifacts,
+not a gate verdict; the page labels it as such so it can never be read as the
+gate's own comparison.
 """
 
 from __future__ import annotations
@@ -775,6 +786,27 @@ def render_version(record):
             '<p class="note">Not comparable: %s. Current values are the candidate run only; no previous-version claim is made.</p>'
             % esc(reason)
         )
+    measured = (record.get("post_release") or {}).get("performance") or {}
+    measured_rows = measured.get("rows") or []
+    if measured_rows:
+        parts.append("<h3>Measured on the released artifacts</h3>")
+        parts.append(
+            table(
+                ["Metric", "Previous", "Current", "Delta", "Verdict"],
+                [
+                    (
+                        esc(text(row.get("metric"))),
+                        esc(text(row.get("previous"))),
+                        esc(text(row.get("current"))),
+                        esc(text(row.get("delta"))),
+                        ("badge", row.get("verdict")),
+                    )
+                    for row in measured_rows
+                ],
+            )
+        )
+        if measured.get("method"):
+            parts.append('<p class="note">%s</p>' % esc(text(measured.get("method"))))
 
     # Artifacts
     parts.append("<h2>Release artifacts</h2>")
@@ -853,6 +885,9 @@ def render_version(record):
     if release_url:
         links.append(("GitHub Release", release_url))
     links.append(("Changelog", "../../../CHANGELOG.md"))
+    # When the change list is a tree difference, the notes are where the
+    # user-facing changes are named; the page must reach them directly.
+    links.append(("Release notes", "../../RELEASE.md"))
     links.append(("Release history", "../index.html"))
     parts.append(
         "<ul>%s</ul>"

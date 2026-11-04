@@ -157,5 +157,43 @@ class RewrittenHistoryTest(unittest.TestCase):
         self.assertEqual(dashboard.change_rows(record)["Features"]["total"], 0)
 
 
+class MeasuredPerformanceTest(unittest.TestCase):
+    def test_operator_measurements_render_beside_the_gate_comparison(self):
+        # The gate records "not comparable" when its lab baseline has no L4
+        # evidence, but the released artifacts were still measured. The page
+        # must show those numbers, clearly labelled as operator measurements.
+        record = record_with()
+        record["state"].update(
+            {
+                "version": "1.0.22",
+                "release_id": "v1.0.22",
+                "candidate_sha": "a" * 40,
+            }
+        )
+        record["comparison"] = {"status": "NOT_COMPARABLE", "reason": "no baseline"}
+        record["post_release"] = {
+            "fresh_install": {"status": "PASS"},
+            "upgrade": {"status": "PASS"},
+            "performance": {
+                "method": "same machine, 14 samples, 120x32 PTY",
+                "rows": [
+                    {
+                        "metric": "TUI first frame",
+                        "previous": "492 ms",
+                        "current": "638 ms",
+                        "delta": "+29.7%",
+                        "verdict": "REGRESSED",
+                    }
+                ],
+            },
+        }
+        page = dashboard.render_version(record)
+        self.assertIn("Measured on the released artifacts", page)
+        self.assertIn("TUI first frame", page)
+        self.assertIn("14 samples", page)
+        self.assertIn("REGRESSED", page)
+        self.assertIn("Not comparable: no baseline", page)
+
+
 if __name__ == "__main__":
     unittest.main()
