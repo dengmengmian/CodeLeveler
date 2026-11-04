@@ -10,3 +10,7 @@ Source retained at the locked version under its MIT license. Only production cha
 - `src/event/stream.rs`: the background waiter wakes its consumer on a read error, rather than retrying forever.
 
 No dependency version upgrade. Remove this patch when upstream provides equivalent hangup handling.
+
+The manifest also allows the crate's pre-existing `unexpected_cfgs`,
+`dead_code` and `unused_parens` lints. Registry consumers never see them
+because Cargo caps dependency lints; a path patch does not.

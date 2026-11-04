@@ -200,3 +200,11 @@ features = [
     "winerror",
 ]
 optional = true
+
+# Upstream ships these lints uncapped for registry consumers. This path patch
+# is compiled as a local dependency, so its pre-existing warnings would
+# otherwise appear in every build log.
+[lints.rust]
+unexpected_cfgs = "allow"
+dead_code = "allow"
+unused_parens = "allow"
