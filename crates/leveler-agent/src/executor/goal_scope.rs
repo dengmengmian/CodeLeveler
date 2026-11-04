@@ -1072,17 +1072,27 @@ fn covering_accounts<'a>(
 ) -> Option<Vec<&'a RequirementAccount>> {
     let need = normalize(requirement);
     let names = |account: &RequirementAccount, wanted: &str| {
-        // Containment cannot match a one-character requirement: every account
-        // contains it. Exact identity is the only honest match.
-        if wanted.chars().count() < 2 {
-            return normalize(&account.requirement) == wanted;
+        let label = normalize(&account.requirement);
+        // A single letter in prose could be an article or pronoun. Require
+        // an exact label or explicit identifier syntax in the label itself.
+        if wanted.chars().count() == 1 {
+            let raw = &account.requirement;
+            let name = clean_token(requirement);
+            return label == wanted
+                || raw.contains(&format!("`{name}`"))
+                || raw.match_indices('=').any(|(index, _)| {
+                    raw[..index]
+                        .trim_end()
+                        .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                        == Some(name.as_str())
+                });
         }
-        covers(&normalize(&account.requirement), wanted)
-            || covers(&normalize(&account.evidence), wanted)
-            || strip_counted_summary(wanted).is_some_and(|stem| {
-                covers(&normalize(&account.requirement), stem)
-                    || covers(&normalize(&account.evidence), stem)
-            })
+        let evidence = normalize(&account.evidence);
+        covers(&label, wanted)
+            || covers(&evidence, wanted)
+            || strip_counted_summary(wanted)
+                .is_some_and(|stem| covers(&label, stem) || covers(&evidence, stem))
     };
     let direct: Vec<&RequirementAccount> = accounts
         .iter()
@@ -4094,11 +4104,10 @@ mod tests {
         );
     }
 
-    /// A one-character requirement must be accountable: the matcher used to
-    /// require two characters, so a correct account could never satisfy it and
-    /// the goal could never complete.
+    /// RC3 used `N=` in a requirement sentence. Single letters in plain
+    /// prose or longer identifiers must not stand in for the requested name.
     #[test]
-    fn a_one_character_requirement_is_matched_only_exactly() {
+    fn a_one_character_requirement_matches_an_explicit_identifier() {
         let requirements = extract(
             "Keep following `NEXT` until it says `NEXT=END`, summing every `N` value you pass.",
             &[],
@@ -4123,21 +4132,34 @@ mod tests {
             "an exact account must satisfy a one-character requirement: {accept:?}"
         );
 
-        let refuse = decide(&ScopeFacts {
-            requirements: std::slice::from_ref(n),
-            accounting: Some(&[account(
-                "N values",
-                AccountStatus::Done,
-                "summed every N value to 296",
-            )]),
-            runs: &[],
-            mutation_ops: 0,
-            artifact: &|_| ArtifactState::Unknown,
-        });
-        assert!(
-            matches!(refuse, ScopeDecision::Refuse(_)),
-            "a longer account must not stand in for the exact requirement: {refuse:?}"
-        );
+        let a = req("A", RequirementKind::Named);
+        let i = req("I", RequirementKind::Named);
+        for (requirement, label, expected) in [
+            (n, "Read the N= integer line in each file", true),
+            (n, "Read the N = integer line in each file", true),
+            (n, "Sum every `N` value", true),
+            (n, "Sum every N value", false),
+            (n, "Read the COUNT_N= field", false),
+            (&a, "Read a file", false),
+            (&i, "I read the file", false),
+        ] {
+            let decision = decide(&ScopeFacts {
+                requirements: std::slice::from_ref(requirement),
+                accounting: Some(&[account(
+                    label,
+                    AccountStatus::Done,
+                    "summed every N value to 296",
+                )]),
+                runs: &[],
+                mutation_ops: 0,
+                artifact: &|_| ArtifactState::Unknown,
+            });
+            assert_eq!(
+                matches!(decision, ScopeDecision::Accept { .. }),
+                expected,
+                "{label}: {decision:?}"
+            );
+        }
     }
 
     /// A prohibition the user stated is a constraint, not a deliverable. It
