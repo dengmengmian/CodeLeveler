@@ -330,6 +330,13 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
+            "acknowledge_crash_window",
+            ClientCommand::AcknowledgeCrashWindow {
+                session_id: session(),
+            },
+            false,
+        ),
+        (
             "btw",
             ClientCommand::Btw {
                 session_id: session(),
