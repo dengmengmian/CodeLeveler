@@ -114,6 +114,8 @@ async fn a_scheduled_shell_runs_and_calls_no_model() {
             // The definition itself carries no model: the run is deterministic.
             model: None,
             timeout: Duration::from_secs(15),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         })
         .await
         .unwrap();

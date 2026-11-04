@@ -220,6 +220,8 @@ async fn fixture(runtime: &ScriptedRuntime, timeout: Duration) -> Fixture {
             mode: PermissionProfile::Assisted,
             model: None,
             timeout,
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         })
         .await
         .unwrap();

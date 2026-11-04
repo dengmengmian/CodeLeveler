@@ -9,11 +9,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Row, Sqlite};
 
 use crate::{
-    NewScheduleDefinition, Occurrence, OccurrenceId, OccurrenceState, RunId, RunState, ScheduleDefinition,
-    ScheduleError, ScheduleId, ScheduleRun, ScheduleTrigger, parse_timestamp, timestamp,
+    DispatchSummary, MisfirePolicy, NewScheduleDefinition, Occurrence, OccurrenceId,
+    OccurrenceState, RunId, RunState, ScheduleDefinition, ScheduleError, ScheduleId, ScheduleRun,
+    ScheduleTrigger, WakeRecord, WakeSource, parse_timestamp, timestamp,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Dispatch-pass observations older than this are pruned when a new pass
+/// starts. A minute-cadence wake writes ~1,440 rows per day; the recent window
+/// is what diagnostics and the misfire story need.
+const WAKE_RETENTION_DAYS: i64 = 30;
 
 /// A definition plus one atomically claimed occurrence and its new run.
 #[derive(Debug, Clone)]
@@ -147,8 +153,9 @@ impl ScheduleStore {
         sqlx::query(
             "INSERT INTO schedule_definitions \
              (id, name, workspace, action, command, trigger_kind, once_at, anchor_at, every_secs, \
-              permission_mode, model, timeout_secs, session_id, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, 'shell', ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)",
+              permission_mode, model, timeout_secs, misfire_policy, misfire_grace_secs, \
+              session_id, enabled, created_at, updated_at) \
+             VALUES (?, ?, ?, 'shell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)",
         )
         .bind(id.as_str())
         .bind(new.name.trim())
@@ -161,6 +168,8 @@ impl ScheduleStore {
         .bind(new.mode.as_str())
         .bind(new.model.as_ref().map(|model| model.to_string()))
         .bind(new.timeout.as_secs() as i64)
+        .bind(new.misfire.as_str())
+        .bind(new.misfire_grace.as_secs() as i64)
         .bind(timestamp(now))
         .bind(timestamp(now))
         .execute(&mut *tx)
@@ -185,7 +194,8 @@ impl ScheduleStore {
     pub async fn definitions(&self) -> Result<Vec<ScheduleDefinition>, ScheduleError> {
         let rows = sqlx::query(
             "SELECT id, name, workspace, action, command, trigger_kind, once_at, anchor_at, \
-             every_secs, permission_mode, model, timeout_secs, session_id, enabled, created_at \
+             every_secs, permission_mode, model, timeout_secs, misfire_policy, \
+             misfire_grace_secs, session_id, enabled, created_at \
              FROM schedule_definitions ORDER BY created_at, id",
         )
         .fetch_all(&self.pool)
@@ -200,7 +210,8 @@ impl ScheduleStore {
     ) -> Result<Option<ScheduleDefinition>, ScheduleError> {
         let row = sqlx::query(
             "SELECT id, name, workspace, action, command, trigger_kind, once_at, anchor_at, \
-             every_secs, permission_mode, model, timeout_secs, session_id, enabled, created_at \
+             every_secs, permission_mode, model, timeout_secs, misfire_policy, \
+             misfire_grace_secs, session_id, enabled, created_at \
              FROM schedule_definitions WHERE id = ?",
         )
         .bind(id.as_str())
@@ -345,14 +356,31 @@ impl ScheduleStore {
                 tx.rollback().await?;
                 continue;
             }
+            // Say which fact was lost: a claim whose delivery was never
+            // acknowledged is a different risk from an execution the runtime
+            // had already started. Both remain unknown; neither is retried.
+            let facts: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT delivered_at, execution_id FROM schedule_runs \
+                 WHERE occurrence_id = ? AND state IN ('dispatching', 'running')",
+            )
+            .bind(&occurrence_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let lost = match facts {
+                Some((_, Some(_))) => "the runtime had already started this action",
+                Some((Some(_), None)) => {
+                    "the runtime acknowledged delivery but never reported the execution"
+                }
+                _ => "delivery was never acknowledged",
+            };
             sqlx::query(
                 "UPDATE schedule_runs SET state = 'unknown', error = ?, finished_at = ? \
                  WHERE occurrence_id = ? AND state IN ('dispatching', 'running')",
             )
-            .bind(
+            .bind(format!(
                 "the dispatcher's lease expired before the run reported a terminal state; \
-                 the action's effect is unknown and it was not retried",
-            )
+                 {lost}; the action's effect is unknown and it was not retried"
+            ))
             .bind(timestamp(now))
             .bind(&occurrence_id)
             .execute(&mut *tx)
@@ -389,6 +417,171 @@ impl ScheduleStore {
         Ok(())
     }
 
+    /// Apply the definition's misfire policy to pending slots whose time has
+    /// passed by more than its grace.
+    ///
+    /// `Skip` marks the slot `missed`; `RunOnceOnRecovery` leaves it pending so
+    /// the same dispatch pass may claim and execute it once. Only `pending`
+    /// slots are candidates: a completed, interrupted or already claimed run
+    /// is a terminal fact and is never rewritten by policy.
+    pub async fn reconcile_misfires(&self, now: DateTime<Utc>) -> Result<usize, ScheduleError> {
+        let candidates: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT o.id, o.definition_id, o.scheduled_for, d.misfire_policy, \
+             d.misfire_grace_secs FROM schedule_occurrences o \
+             JOIN schedule_definitions d ON d.id = o.definition_id \
+             WHERE o.state = 'pending' AND o.scheduled_for <= ? AND d.enabled = 1",
+        )
+        .bind(timestamp(now))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut missed = 0;
+        for (occurrence_id, definition_id, scheduled_for, policy, grace_secs) in candidates {
+            let policy = MisfirePolicy::parse(&policy).ok_or_else(|| {
+                ScheduleError::Invalid(format!("unsupported misfire policy `{policy}`"))
+            })?;
+            if policy != MisfirePolicy::Skip {
+                continue;
+            }
+            let scheduled_for = parse_timestamp(&scheduled_for)?;
+            let grace = chrono::Duration::seconds(grace_secs.max(0));
+            if now - scheduled_for <= grace {
+                continue;
+            }
+            let mut tx = self.pool.begin().await?;
+            let updated = sqlx::query(
+                "UPDATE schedule_occurrences SET state = 'missed' \
+                 WHERE id = ? AND state = 'pending'",
+            )
+            .bind(&occurrence_id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+            tx.commit().await?;
+            missed += 1;
+            if let Some(definition) = self
+                .definition(&ScheduleId::from(definition_id))
+                .await?
+            {
+                self.ensure_next_occurrence(&definition, now).await?;
+            }
+        }
+        Ok(missed)
+    }
+
+    /// Record the start of one dispatch pass. The row is finished by
+    /// [`Self::finish_wake`] or [`Self::fail_wake`]; an unfinished row is the
+    /// honest record of a driver that started and never reached a verdict.
+    pub async fn begin_wake(&self, source: WakeSource) -> Result<i64, ScheduleError> {
+        let now = leveler_core::now();
+        let result = sqlx::query(
+            "INSERT INTO schedule_wakeups (source, started_at) VALUES (?, ?)",
+        )
+        .bind(source.as_str())
+        .bind(timestamp(now))
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM schedule_wakeups WHERE started_at < ?")
+            .bind(timestamp(now - chrono::Duration::days(WAKE_RETENTION_DAYS)))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Finish a wake record with the pass's observed counts.
+    pub async fn finish_wake(
+        &self,
+        id: i64,
+        summary: &DispatchSummary,
+    ) -> Result<(), ScheduleError> {
+        sqlx::query(
+            "UPDATE schedule_wakeups SET finished_at = ?, recovered = ?, missed = ?, \
+             claimed = ?, succeeded = ?, failed = ?, unknown = ?, error = NULL WHERE id = ?",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(summary.recovered as i64)
+        .bind(summary.missed as i64)
+        .bind(summary.claimed as i64)
+        .bind(summary.succeeded as i64)
+        .bind(summary.failed as i64)
+        .bind(summary.unknown as i64)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Finish a wake record with a failure. The counts stay at their defaults
+    /// and the error names what prevented a verdict.
+    pub async fn fail_wake(&self, id: i64, error: &str) -> Result<(), ScheduleError> {
+        sqlx::query(
+            "UPDATE schedule_wakeups SET finished_at = ?, error = ? WHERE id = ?",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Dispatch-pass history, newest first.
+    pub async fn wakes(&self, limit: usize) -> Result<Vec<WakeRecord>, ScheduleError> {
+        let rows = sqlx::query(
+            "SELECT id, source, started_at, finished_at, recovered, missed, claimed, \
+             succeeded, failed, unknown, error FROM schedule_wakeups \
+             ORDER BY started_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(wake_from_row).collect()
+    }
+
+    /// The most recent OS-started dispatch pass, if any.
+    pub async fn last_os_wake(&self) -> Result<Option<WakeRecord>, ScheduleError> {
+        let row = sqlx::query(
+            "SELECT id, source, started_at, finished_at, recovered, missed, claimed, \
+             succeeded, failed, unknown, error FROM schedule_wakeups \
+             WHERE source = 'os' ORDER BY started_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(wake_from_row).transpose()
+    }
+
+    /// Pending slots whose time has already passed. Used by diagnostics to
+    /// distinguish "nothing due" from "due and nobody woke the dispatcher".
+    pub async fn overdue_pending(&self, now: DateTime<Utc>) -> Result<usize, ScheduleError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedule_occurrences o \
+             JOIN schedule_definitions d ON d.id = o.definition_id \
+             WHERE o.state = 'pending' AND o.scheduled_for <= ? AND d.enabled = 1",
+        )
+        .bind(timestamp(now))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Record that the runtime acknowledged the command envelope. `false`
+    /// means the run was already settled (or never existed); the caller must
+    /// not treat the delivery as its own.
+    pub async fn mark_delivered(&self, run_id: &RunId) -> Result<bool, ScheduleError> {
+        let result = sqlx::query(
+            "UPDATE schedule_runs SET delivered_at = ? \
+             WHERE id = ? AND state = 'dispatching' AND delivered_at IS NULL",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(run_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Record that the runtime started the exact command this run delivered.
     pub async fn mark_running(
         &self,
@@ -396,10 +589,11 @@ impl ScheduleStore {
         execution_id: &str,
     ) -> Result<bool, ScheduleError> {
         let result = sqlx::query(
-            "UPDATE schedule_runs SET state = 'running', execution_id = ? \
+            "UPDATE schedule_runs SET state = 'running', execution_id = ?, running_at = ? \
              WHERE id = ? AND state = 'dispatching'",
         )
         .bind(execution_id)
+        .bind(timestamp(leveler_core::now()))
         .bind(run_id.as_str())
         .execute(&self.pool)
         .await?;
@@ -477,9 +671,11 @@ impl ScheduleStore {
         let rows = match definition_id {
             Some(id) => {
                 sqlx::query(
-                    "SELECT id, occurrence_id, definition_id, state, session_id, execution_id, \
-                     exit_code, error, started_at, finished_at FROM schedule_runs \
-                     WHERE definition_id = ? ORDER BY started_at DESC, id DESC LIMIT ?",
+                    "SELECT r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
+                     r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, \
+                     r.delivered_at, r.running_at, r.finished_at FROM schedule_runs r \
+                     JOIN schedule_occurrences o ON o.id = r.occurrence_id \
+                     WHERE r.definition_id = ? ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
                 )
                 .bind(id.as_str())
                 .bind(limit as i64)
@@ -488,9 +684,11 @@ impl ScheduleStore {
             }
             None => {
                 sqlx::query(
-                    "SELECT id, occurrence_id, definition_id, state, session_id, execution_id, \
-                     exit_code, error, started_at, finished_at FROM schedule_runs \
-                     ORDER BY started_at DESC, id DESC LIMIT ?",
+                    "SELECT r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
+                     r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, \
+                     r.delivered_at, r.running_at, r.finished_at FROM schedule_runs r \
+                     JOIN schedule_occurrences o ON o.id = r.occurrence_id \
+                     ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -545,8 +743,10 @@ impl ScheduleStore {
     /// One run by id.
     pub async fn run(&self, id: &RunId) -> Result<Option<ScheduleRun>, ScheduleError> {
         let row = sqlx::query(
-            "SELECT id, occurrence_id, definition_id, state, session_id, execution_id, \
-             exit_code, error, started_at, finished_at FROM schedule_runs WHERE id = ?",
+            "SELECT r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
+             r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, \
+             r.delivered_at, r.running_at, r.finished_at FROM schedule_runs r \
+             JOIN schedule_occurrences o ON o.id = r.occurrence_id WHERE r.id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -657,6 +857,13 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
         None => None,
     };
     let timeout_secs: i64 = row.try_get("timeout_secs")?;
+    let misfire_policy: String = row.try_get("misfire_policy")?;
+    let misfire = MisfirePolicy::parse(&misfire_policy).ok_or_else(|| {
+        ScheduleError::Invalid(format!(
+            "unsupported misfire policy `{misfire_policy}`"
+        ))
+    })?;
+    let misfire_grace_secs: i64 = row.try_get("misfire_grace_secs")?;
     let session: Option<String> = row.try_get("session_id")?;
     let created_at: String = row.try_get("created_at")?;
     Ok(ScheduleDefinition {
@@ -668,6 +875,8 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
         mode,
         model,
         timeout: Duration::from_secs(timeout_secs.max(1) as u64),
+        misfire,
+        misfire_grace: Duration::from_secs(misfire_grace_secs.max(0) as u64),
         session_id: session.map(SessionId::from),
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         created_at: parse_timestamp(&created_at)?,
@@ -693,6 +902,7 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleRun, ScheduleEr
         id: RunId::from(row.try_get::<String, _>("id")?),
         occurrence_id: OccurrenceId::from(row.try_get::<String, _>("occurrence_id")?),
         definition_id: ScheduleId::from(row.try_get::<String, _>("definition_id")?),
+        scheduled_for: parse_timestamp(&row.try_get::<String, _>("scheduled_for")?)?,
         state: RunState::parse(&state).ok_or_else(|| {
             ScheduleError::Invalid(format!("unsupported run state `{state}`"))
         })?,
@@ -701,12 +911,44 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleRun, ScheduleEr
         exit_code: row.try_get("exit_code")?,
         error: row.try_get("error")?,
         started_at: parse_timestamp(&row.try_get::<String, _>("started_at")?)?,
-        finished_at: row
-            .try_get::<Option<String>, _>("finished_at")?
-            .as_deref()
-            .map(parse_timestamp)
-            .transpose()?,
+        delivered_at: optional_timestamp(row, "delivered_at")?,
+        running_at: optional_timestamp(row, "running_at")?,
+        finished_at: optional_timestamp(row, "finished_at")?,
     })
+}
+
+fn wake_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<WakeRecord, ScheduleError> {
+    let source: String = row.try_get("source")?;
+    Ok(WakeRecord {
+        id: row.try_get("id")?,
+        source: WakeSource::parse(&source).ok_or_else(|| {
+            ScheduleError::Invalid(format!("unsupported wake source `{source}`"))
+        })?,
+        started_at: parse_timestamp(&row.try_get::<String, _>("started_at")?)?,
+        finished_at: optional_timestamp(row, "finished_at")?,
+        recovered: usize_of(row, "recovered")?,
+        missed: usize_of(row, "missed")?,
+        claimed: usize_of(row, "claimed")?,
+        succeeded: usize_of(row, "succeeded")?,
+        failed: usize_of(row, "failed")?,
+        unknown: usize_of(row, "unknown")?,
+        error: row.try_get("error")?,
+    })
+}
+
+fn optional_timestamp(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<Option<DateTime<Utc>>, ScheduleError> {
+    row.try_get::<Option<String>, _>(column)?
+        .as_deref()
+        .map(parse_timestamp)
+        .transpose()
+}
+
+fn usize_of(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<usize, ScheduleError> {
+    let value: i64 = row.try_get(column)?;
+    Ok(value.max(0) as usize)
 }
 
 fn lease_until(now: DateTime<Utc>, lease: Duration) -> DateTime<Utc> {
@@ -733,6 +975,8 @@ mod tests {
             mode: PermissionProfile::Assisted,
             model: None,
             timeout: Duration::from_secs(60),
+            misfire: MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         }
     }
 
@@ -964,5 +1208,308 @@ mod tests {
         assert!(store.remove_definition(&created.id).await.unwrap());
         assert!(store.definition(&created.id).await.unwrap().is_none());
         assert!(store.runs(Some(&created.id), 10).await.unwrap().is_empty());
+    }
+
+    fn definition_with_misfire(
+        trigger: ScheduleTrigger,
+        misfire: MisfirePolicy,
+        grace: Duration,
+    ) -> NewScheduleDefinition {
+        NewScheduleDefinition {
+            misfire,
+            misfire_grace: grace,
+            ..definition(trigger)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missed_slot_is_recorded_once_and_never_executed() {
+        let store = store().await;
+        let now = leveler_core::now();
+        let created = store
+            .create_definition(definition_with_misfire(
+                ScheduleTrigger::Every {
+                    anchor: now - chrono::Duration::seconds(3600),
+                    every: Duration::from_secs(60),
+                },
+                MisfirePolicy::Skip,
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(store.reconcile_misfires(now).await.unwrap(), 1);
+        assert!(
+            store
+                .claim_due(now, Duration::from_secs(60), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a skipped slot was claimed"
+        );
+        assert!(store.runs(Some(&created.id), 10).await.unwrap().is_empty());
+
+        let occurrences = store.occurrences(&created.id, 10).await.unwrap();
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(
+            occurrences
+                .iter()
+                .filter(|occurrence| occurrence.state == OccurrenceState::Missed)
+                .count(),
+            1
+        );
+        let pending = occurrences
+            .iter()
+            .find(|occurrence| occurrence.state == OccurrenceState::Pending)
+            .expect("a recurring definition keeps a future slot");
+        assert!(pending.scheduled_for > now);
+
+        // The missed row is a terminal fact: policy never rewrites it.
+        assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
+        assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_once_on_recovery_leaves_exactly_one_overdue_slot_for_this_pass() {
+        let store = store().await;
+        let now = leveler_core::now();
+        let created = store
+            .create_definition(definition_with_misfire(
+                ScheduleTrigger::Every {
+                    anchor: now - chrono::Duration::seconds(3600),
+                    every: Duration::from_secs(60),
+                },
+                MisfirePolicy::RunOnceOnRecovery,
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
+        let claims = store
+            .claim_due(now, Duration::from_secs(60), 10)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1, "the one overdue slot must be claimable");
+        assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
+
+        let occurrences = store.occurrences(&created.id, 10).await.unwrap();
+        assert_eq!(
+            occurrences
+                .iter()
+                .filter(|occurrence| occurrence.state == OccurrenceState::Pending)
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_inside_the_grace_is_not_missed() {
+        let store = store().await;
+        let now = leveler_core::now();
+        let created = store
+            .create_definition(definition_with_misfire(
+                ScheduleTrigger::Once {
+                    at: now - chrono::Duration::seconds(10),
+                },
+                MisfirePolicy::Skip,
+                Duration::from_secs(300),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .claim_due(now, Duration::from_secs(60), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let occurrences = store.occurrences(&created.id, 10).await.unwrap();
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].state, OccurrenceState::Claimed);
+    }
+
+    /// One wake row per minute is cheap to write but unbounded over a year.
+    /// History beyond the retention window is removed when a new pass starts;
+    /// the current pass is never a candidate.
+    #[tokio::test]
+    async fn wake_history_is_pruned_beyond_the_retention_window() {
+        let store = store().await;
+        let old = store.begin_wake(WakeSource::Os).await.unwrap();
+        sqlx::query("UPDATE schedule_wakeups SET started_at = ? WHERE id = ?")
+            .bind(timestamp(
+                leveler_core::now() - chrono::Duration::days(WAKE_RETENTION_DAYS + 1),
+            ))
+            .bind(old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let current = store.begin_wake(WakeSource::Manual).await.unwrap();
+        let wakes = store.wakes(10).await.unwrap();
+        assert_eq!(wakes.len(), 1, "the old wake was not pruned: {wakes:?}");
+        assert_eq!(wakes[0].id, current);
+    }
+
+    #[tokio::test]
+    async fn wake_records_show_started_unfinished_and_finished_passes() {
+        let store = store().await;
+        let os = store.begin_wake(WakeSource::Os).await.unwrap();
+        let wakes = store.wakes(10).await.unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].id, os);
+        assert_eq!(wakes[0].source, WakeSource::Os);
+        assert!(wakes[0].finished_at.is_none(), "the pass is still running");
+        assert_eq!(store.last_os_wake().await.unwrap().unwrap().id, os);
+
+        let summary = DispatchSummary {
+            recovered: 1,
+            missed: 2,
+            claimed: 3,
+            succeeded: 4,
+            failed: 5,
+            unknown: 6,
+        };
+        store.finish_wake(os, &summary).await.unwrap();
+        let finished = &store.wakes(10).await.unwrap()[0];
+        assert!(finished.finished_at.is_some());
+        assert_eq!(
+            (
+                finished.recovered,
+                finished.missed,
+                finished.claimed,
+                finished.succeeded,
+                finished.failed,
+                finished.unknown
+            ),
+            (1, 2, 3, 4, 5, 6)
+        );
+
+        let manual = store.begin_wake(WakeSource::Manual).await.unwrap();
+        store.fail_wake(manual, "database unavailable").await.unwrap();
+        let failed = &store.wakes(10).await.unwrap()[0];
+        assert_eq!(failed.error.as_deref(), Some("database unavailable"));
+        assert!(failed.finished_at.is_some());
+        // The OS record remains the latest OS wake even after a newer manual
+        // pass; the two facts are not conflated.
+        assert_eq!(store.last_os_wake().await.unwrap().unwrap().id, os);
+    }
+
+    #[tokio::test]
+    async fn lease_recovery_names_how_far_the_run_got() {
+        let store = store().await;
+        let now = leveler_core::now();
+        let created = store
+            .create_definition(definition(ScheduleTrigger::Every {
+                anchor: now,
+                every: Duration::from_secs(60),
+            }))
+            .await
+            .unwrap();
+        let claims = store
+            .claim_due(now, Duration::from_secs(5), 10)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let run_id = claims[0].run_id.clone();
+
+        assert!(store.mark_delivered(&run_id).await.unwrap());
+        let delivered = store.run(&run_id).await.unwrap().unwrap();
+        assert!(delivered.delivered_at.is_some());
+        assert!(delivered.running_at.is_none());
+        assert_eq!(delivered.scheduled_for, claims[0].occurrence.scheduled_for);
+
+        assert!(store.mark_running(&run_id, "ush-1").await.unwrap());
+        let running = store.run(&run_id).await.unwrap().unwrap();
+        assert_eq!(running.state, RunState::Running);
+        assert!(running.running_at.is_some());
+
+        let recovered = store
+            .recover_expired(now + chrono::Duration::seconds(6))
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        let unknown = store.run(&run_id).await.unwrap().unwrap();
+        assert_eq!(unknown.state, RunState::Unknown);
+        assert!(
+            unknown
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("already started"),
+            "{:?}",
+            unknown.error
+        );
+
+        let occurrences = store.occurrences(&created.id, 10).await.unwrap();
+        assert!(
+            occurrences
+                .iter()
+                .any(|occurrence| occurrence.state == OccurrenceState::Interrupted)
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_recovery_distinguishes_delivered_without_an_execution() {
+        let store = store().await;
+        let now = leveler_core::now();
+        store
+            .create_definition(definition(ScheduleTrigger::Every {
+                anchor: now,
+                every: Duration::from_secs(60),
+            }))
+            .await
+            .unwrap();
+        let claims = store
+            .claim_due(now, Duration::from_secs(5), 10)
+            .await
+            .unwrap();
+        assert!(store.mark_delivered(&claims[0].run_id).await.unwrap());
+        store
+            .recover_expired(now + chrono::Duration::seconds(6))
+            .await
+            .unwrap();
+        let run = store.run(&claims[0].run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Unknown);
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("acknowledged delivery"),
+            "{:?}",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_recovery_says_when_delivery_was_never_acknowledged() {
+        let store = store().await;
+        let now = leveler_core::now();
+        store
+            .create_definition(definition(ScheduleTrigger::Every {
+                anchor: now,
+                every: Duration::from_secs(60),
+            }))
+            .await
+            .unwrap();
+        let claims = store
+            .claim_due(now, Duration::from_secs(5), 10)
+            .await
+            .unwrap();
+        store
+            .recover_expired(now + chrono::Duration::seconds(6))
+            .await
+            .unwrap();
+        let run = store.run(&claims[0].run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Unknown);
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("delivery was never acknowledged"),
+            "{:?}",
+            run.error
+        );
     }
 }

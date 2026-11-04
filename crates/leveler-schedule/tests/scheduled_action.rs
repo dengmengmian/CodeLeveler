@@ -132,6 +132,8 @@ async fn a_due_schedule_runs_its_action_once_without_a_model() {
             mode: PermissionProfile::Assisted,
             model: Some(ModelRef::new("mock", "m")),
             timeout: Duration::from_secs(20),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -245,6 +247,8 @@ async fn a_recurring_definition_keeps_one_future_slot_after_a_run() {
             mode: PermissionProfile::Assisted,
             model: None,
             timeout: Duration::from_secs(20),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         })
         .await
         .unwrap();

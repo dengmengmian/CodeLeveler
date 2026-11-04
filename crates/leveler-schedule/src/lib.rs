@@ -37,6 +37,9 @@ use serde::{Deserialize, Serialize};
 
 pub use dispatch::{DispatchSummary, Dispatcher, RuntimeConnector};
 pub use store::{Claim, Recovered, RunOutcome, ScheduleStore};
+pub use wakeup::{WakeupError, WakeupRegistration, WakeupSpec, WakeupStatus};
+
+pub mod wakeup;
 
 /// Longest shell command a definition may carry.
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -133,6 +136,83 @@ impl ScheduleTrigger {
     }
 }
 
+/// What to do with a pending slot whose time passed while no dispatcher was
+/// available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MisfirePolicy {
+    /// Record the slot as missed and move on. No catch-up execution.
+    Skip,
+    /// Execute the one pending slot once on recovery, then move on.
+    RunOnceOnRecovery,
+}
+
+impl MisfirePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::RunOnceOnRecovery => "run-once",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "skip" => Some(Self::Skip),
+            "run-once" => Some(Self::RunOnceOnRecovery),
+            _ => None,
+        }
+    }
+}
+
+/// Who started one dispatch pass. Diagnostics only: the store never treats a
+/// self-declared source as authority for an execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeSource {
+    /// An operating-system registration (launchd, Task Scheduler, ...).
+    Os,
+    /// A human ran `leveler schedule dispatch`.
+    Manual,
+    /// The resident `leveler schedule serve` driver.
+    Serve,
+}
+
+impl WakeSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::Manual => "manual",
+            Self::Serve => "serve",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "os" => Some(Self::Os),
+            "manual" => Some(Self::Manual),
+            "serve" => Some(Self::Serve),
+            _ => None,
+        }
+    }
+}
+
+/// One observed dispatch pass. An unfinished row means the driver started and
+/// did not reach a verdict; an absent row means no driver was observed.
+#[derive(Debug, Clone)]
+pub struct WakeRecord {
+    pub id: i64,
+    pub source: WakeSource,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub recovered: usize,
+    pub missed: usize,
+    pub claimed: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub unknown: usize,
+    pub error: Option<String>,
+}
+
 /// A definition before it is persisted.
 #[derive(Debug, Clone)]
 pub struct NewScheduleDefinition {
@@ -143,6 +223,8 @@ pub struct NewScheduleDefinition {
     pub mode: PermissionProfile,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
+    pub misfire: MisfirePolicy,
+    pub misfire_grace: Duration,
 }
 
 impl NewScheduleDefinition {
@@ -191,6 +273,11 @@ impl NewScheduleDefinition {
                 "the run timeout may not exceed seven days".into(),
             ));
         }
+        if self.misfire_grace > Duration::from_secs(7 * 24 * 60 * 60) {
+            return Err(ScheduleError::Invalid(
+                "the misfire grace may not exceed seven days".into(),
+            ));
+        }
         self.trigger.validate()
     }
 }
@@ -207,6 +294,8 @@ pub struct ScheduleDefinition {
     pub mode: PermissionProfile,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
+    pub misfire: MisfirePolicy,
+    pub misfire_grace: Duration,
     pub session_id: Option<SessionId>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
@@ -229,6 +318,9 @@ pub enum OccurrenceState {
     /// A claim's lease expired without a terminal run. The occurrence is not
     /// retried; the run records why its effect is unknown.
     Interrupted,
+    /// The slot's time passed without a dispatcher and the definition's
+    /// misfire policy says not to run it. Never executed, never retried.
+    Missed,
     Cancelled,
 }
 
@@ -239,6 +331,7 @@ impl OccurrenceState {
             Self::Claimed => "claimed",
             Self::Completed => "completed",
             Self::Interrupted => "interrupted",
+            Self::Missed => "missed",
             Self::Cancelled => "cancelled",
         }
     }
@@ -249,6 +342,7 @@ impl OccurrenceState {
             "claimed" => Some(Self::Claimed),
             "completed" => Some(Self::Completed),
             "interrupted" => Some(Self::Interrupted),
+            "missed" => Some(Self::Missed),
             "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
@@ -271,7 +365,8 @@ pub enum RunState {
     /// The occurrence is claimed and the command has not been observed
     /// starting yet.
     Dispatching,
-    /// The runtime reported `UserShellStarted` for this run's command.
+    /// The runtime reported an execution carrying this run's delivery
+    /// identity.
     Running,
     Succeeded,
     Failed,
@@ -309,12 +404,21 @@ pub struct ScheduleRun {
     pub id: RunId,
     pub occurrence_id: OccurrenceId,
     pub definition_id: ScheduleId,
+    /// The slot this run answers, joined from its occurrence. The occurrence
+    /// remains the authority; this is the same fact projected for evidence.
+    pub scheduled_for: DateTime<Utc>,
     pub state: RunState,
     pub session_id: Option<SessionId>,
     pub execution_id: Option<String>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    /// When the occurrence was claimed and the run row was created.
     pub started_at: DateTime<Utc>,
+    /// When the runtime acknowledged the command envelope. `None` means
+    /// delivery was never acknowledged, not that nothing ran.
+    pub delivered_at: Option<DateTime<Utc>>,
+    /// When the runtime reported the execution carrying this run's identity.
+    pub running_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
 }
 

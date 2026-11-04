@@ -172,6 +172,8 @@ async fn a_run_never_adopts_another_clients_identical_command() {
             mode: PermissionProfile::Assisted,
             model: None,
             timeout: Duration::from_secs(1),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -440,6 +442,8 @@ async fn identical_text_from_two_clients_and_a_schedule_keeps_three_identities()
             mode: PermissionProfile::Assisted,
             model: Some(ModelRef::new("mock", "m")),
             timeout: Duration::from_secs(10),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
         })
         .await
         .unwrap();

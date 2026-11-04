@@ -379,17 +379,21 @@ controlled account/recipient after consent is resolved.
 
 ### Verdict
 
-**PARTIAL — the macOS schedule core is verified end to end; Windows, OS
-autostart and native-action scheduling are NOT_VERIFIED.** A deterministic
-shell action was scheduled, persisted, claimed exactly once, executed through
-the existing runtime, observed to a terminal record, deduplicated on a second
-dispatch, and recovered after a real dispatcher kill as `unknown` without a
-retry. The provider server saw zero requests in every run. Both candidate
-drivers were measured on this host; neither creates a second runtime.
+**PARTIAL — macOS OS wakeup is verified end to end; Windows, real Linux,
+real sleep/logout/login and native-action scheduling are NOT_VERIFIED.** A
+per-user LaunchAgent wakes the ordinary short-lived `schedule dispatch` every
+60 s with no Desktop or TUI and no resident scheduler. Real runs were observed
+from the OS start through claim, delivery, runtime start and terminal exit,
+plus a duplicate trigger, a dispatcher crash, missed slots under both misfire
+policies, uninstall, and the independence of definitions from the OS record.
+The store remains the only schedule authority: the OS record is an
+opportunity to be started, never an execution fact.
 
-Baseline: `99880bab8a53fea5b28cc5004d43c721b6e2df1e` plus the uncommitted
-Phase 1–3 worktree, `aarch64-apple-darwin`, macOS 26.5, debug build. Windows and
-real mail sending remain blocked by the same conditions recorded in Phase 2.
+Baseline: `bf19f8b` (the committed schedule foundation) plus `224712a`
+(deterministic runtime and execution identity) and this commit,
+`aarch64-apple-darwin`, macOS 26.5, debug build. Windows,
+real Linux execution, real sleep/logout/login and real mail sending remain
+blocked by the same conditions recorded in Phase 2.
 
 ### Domain freeze
 
@@ -422,58 +426,170 @@ The first run resolves the definition's session with a stable
 `CommandId("schedule-session-{id}")` and adopts the winner if two dispatchers
 race. A definition is bound once; a different stored session is a hard error,
 never a silent rebind. The action itself is the existing
-`ClientCommand::RunUserShell` with `CommandId("schedule-run-{run_id}")`; the
-dispatcher observes the terminal `UserShellExited` record by polling the session
-snapshot, because a socket event subscription attaches asynchronously while a
-fast action can finish before it is live. The snapshot merges live records with
-the durable user-shell history, so a completed fast action is still observed.
+`ClientCommand::RunUserShell`, delivered through a `CommandEnvelope` whose
+`CommandId` is `schedule-run-{run_id}`. The runtime persists that id on the
+started fact (`UserShellStarted.origin_command_id`) and projects it into
+`UiUserShell.origin_command_id`; the dispatcher selects exactly the execution
+carrying its own id and never matches command text. Identity is what keeps two
+clients running identical text in one session distinguishable, and the runtime's
+command receipts deduplicate a retransmitted envelope onto the same execution.
+The dispatcher observes the terminal `UserShellFinished` record by polling the
+session snapshot, because a socket event subscription attaches asynchronously
+while a fast action can finish before it is live. The snapshot merges live
+records with the durable user-shell history, so a completed fast action is
+still observed, including its persisted origin.
 The client is dropped after every claim, leaving no attached waiter, and the
 daemon's existing idle eviction remains in force. The dispatcher owns no
 runtime, session DB, engine, approval system or process lifecycle.
 
+### Phase 3.2 — OS wakeup (2026-11-04)
+
+**Contract.** `schedule enable` writes an opt-in, per-user OS record whose only
+job is to start the ordinary `schedule dispatch --source os` command;
+`disable` removes the record; `status` reports the observed OS state beside
+the definition count, next occurrence, overdue slots and last OS wake;
+`doctor` compares platform support, registration, executable, exact arguments,
+interval, environment, overdue slots and the last wake, and exits non-zero only
+on failed checks; `uninstall` removes the record and keeps every definition,
+occurrence and run. Adding a definition never registers the service. The OS
+record carries no schedule content and no secret, so every dispatch rereads the
+store and a definition change needs no OS update.
+
+**macOS.** A `~/Library/LaunchAgents` LaunchAgent with a deterministic
+FNV-1a label `com.leveler.schedule.<16 hex>`, `StartInterval=60`,
+`RunAtLoad`, `ThrottleInterval=10`, `ProcessType=Background` and
+`AbandonProcessGroup`, loaded into `gui/<uid>`. Enable is idempotent
+(`bootout` → `enable` → `bootstrap`, with half-registration cleanup); disable
+boots out, removes the plist and verifies the job is gone; status parses
+`launchctl print`, including last exit code and run count. `RunAtLoad` is the
+login path; launchd decides when a woken or sleeping machine runs the job, and
+the misfire policy decides whether the overdue slot still runs. The exact
+executable path, arguments, working directory and home are stored, including
+spaces and CJK text; environment is limited to non-secret `PATH`, `HOME`,
+`TMPDIR`, `LEVELER_HOME` and the idle-timeout override. Real sleep, wake and
+logout/login behavior were not exercised and remain **NOT_VERIFIED**.
+
+**Windows.** A per-user Task Scheduler XML task with `InteractiveToken` (runs
+only in that user's interactive session) and `LeastPrivilege` (no
+administrator, no stored password), `IgnoreNew`, `StartWhenAvailable`, a
+one-minute repetition and a UTF-16LE BOM. `schtasks.exe` is the registration
+authority: `/Create /F` is the idempotent update, `/Query /TN ... /XML` is the
+observed state, `/Delete /F` is disable, a failed create removes a possible
+half registration, and stdout/stderr are decoded from UTF-16 or UTF-8. This
+was compile-checked only; a real Windows host is **NOT_VERIFIED**, including
+dialogs, session availability, launch failures, duplicates and the actual GUI
+session.
+
+**Linux.** The backend is an explicit, typed `unsupported` result; no systemd
+unit was added. A cross-compile check could not run because the host lacks the
+Linux C toolchain needed by `libsqlite3-sys`, so Linux compilation is
+**NOT_VERIFIED**.
+
+**Misfire and recovery.** Default is `skip` with a 300 s grace. A pending slot
+older than its grace is recorded `missed`, is never executed and never
+backfilled; a recurring definition still gets exactly one future slot.
+`run-once` leaves the single overdue slot claimable for this pass only. Policy
+only rewrites `pending` rows: claimed, completed, interrupted and missed rows
+are terminal facts. A claim has a 120 s lease renewed every 40 s. If the
+dispatcher dies, the next pass recovers the expired claim as `unknown` with
+`interrupted`, using whether delivery and runtime start had been observed to
+say "never acknowledged", "acknowledged but never reported" or "already
+started; effect unknown"; it never retries. A wake record is written for every
+pass, including passes that claim nothing and passes that die before a verdict
+(kept 30 days). Driver states remain distinguishable: not woken (no row),
+woken but claimed nothing, claimed but never delivered, delivered but never
+started, started with unknown effect, and succeeded/failed.
+
+**Identity and authorization.** Delivery is the existing
+`ClientCommand::RunUserShell` with `CommandId("schedule-run-<run_id>")` as both
+command id and `origin_command_id`; the schedule occurrence is claimed by a
+compare-and-set and the session is bound once. A duplicate OS start therefore
+claims 0 in the second dispatcher. There is no approval prompt in this path and
+no upgrade of a one-off tool approval into unattended authorization; the
+definition's stored permission profile is the only authorization input.
+
+**CLI surface.** `schedule add/list/remove/runs/dispatch/serve/enable/disable/
+status/doctor/uninstall`; schedule subcommands accept the hidden global
+`--home` so a registration, a dispatch and `doctor` can address the same
+isolated home on every platform (Windows Task Scheduler cannot set an
+environment map).
+
+#### Real evidence (macOS, same worktree)
+
+| Test | Observed |
+|---|---|
+| DF-S321 real OS wake | slot `13:00:12Z`; launchd started `schedule dispatch` at `13:00:46.218Z`; claim at `.218`; delivered `.527`; runtime running `.775`; finished `13:00:47.089Z`, exit 0; wake #2 `claimed=1 succeeded=1`, provider requests 0 |
+| DF-S322b runtime restart and idle eviction | no daemon before the slot; slot `13:06:25Z`; wake/claim `13:06:39.508Z`; delivered `.600`; running `.626`; finished `13:06:45.114Z` (5.606 s incl. the 5 s action); dispatch RSS 34.4 MB; runtime RSS 46.4–47.0 MB; runtime last seen `13:06:52Z`, gone `13:06:53Z` with a 10 s idle override |
+| DF-S323 duplicate trigger | two dispatchers in the same second: `dup-a claimed=1 succeeded=1`, `dup-b claimed=0`; exactly one effect-file line |
+| DF-S324 dispatcher crash | claim `13:10:42.660Z`, delivered `.784`, running `.840`, `SIGKILL` at `13:10:43Z`; lease deadline `13:12:42.660Z`; next OS wake `13:12:43.095Z` recovered the claim; run `unknown` at `.096` with "the dispatcher's lease expired ... the action's effect is unknown and it was not retried"; occurrence `interrupted`; effect file written exactly once; `runs_count=1` |
+| DF-S325 missed trigger | service disabled `13:13:19Z`–`13:14:04Z`: 0 wakes, 0 runs, no files; `skip` slot `13:13:49Z` → `missed` and no run; `run-once` slot → exactly one `succeeded` run and one file line; recurring definition → exactly one future `pending` slot; wake #18 `missed=1 claimed=1 succeeded=1` |
+| DF-S326 delete ≠ delete service, uninstall | removing one definition left `registered=true loaded=true`, plist present and `launchctl print` exit 0; `uninstall` → `registered=false loaded=false`, plist gone, `launchctl print` exit 113; 7 definitions and 19 wake rows retained; 90 s later 0 new wakes, 0 new runs, no leveler processes |
+| Opt-in | with the service uninstalled, `schedule add` left `registered=false loaded=false` and created no plist; removing it restored the definition count |
+| Spaces and CJK paths | `/tmp/leveler-s32 spaced 中文/{bin,leveler-home,config dir}`: enable/status/doctor/uninstall all exit 0; the plist preserved the exact arguments, `WorkingDirectory` and `LEVELER_HOME`; after uninstall the plist was gone and `launchctl print` exited 113 |
+
+Commands: `cargo test -p leveler-schedule` (23 lib + 13 integration tests, all
+passed) and `cargo test -p leveler-cli --bin leveler schedule_subcommands_parse`
+(passed). Windows compile only:
+`CC_x86_64_pc_windows_gnu=... cargo check -p leveler-schedule --target
+x86_64-pc-windows-gnu` and the same for `leveler-cli` (both succeeded). The
+E2E scripts and logs are in `/tmp/leveler-s32-e2e/`; the launchd label used for
+the real tests was `com.leveler.schedule.85433d029b31a693` (plus the isolated
+CJK label), and both were uninstalled and verified gone.
+
 ### Driver comparison
 
 Method: debug `leveler` binary on this macOS host; short `/private/tmp` home so
-the runtime socket fits `SUN_LEN`; a local probe provider pointed at a loopback
-HTTP sink, whose request log stayed empty. The short-lived arm was invoked at
-the due second by an external `sleep` loop (an OS timer was not installed). The
-persistent arm ran `leveler schedule serve --poll-secs 30` across two 15 s
-slots, with the daemon's idle timeout at 60 s to keep it warm. Absolute values
-are debug-build figures; only the two arms are comparable.
+the runtime socket fits `SUN_LEN`; model requests stayed at 0. Phase 3.1
+measured both arms with an external `sleep` loop; Phase 3.2 replaced that timer
+with a real launchd LaunchAgent and repeated the short-lived arm. A is the OS
+registration plus `schedule dispatch --source os`; B is a resident
+`schedule serve --poll-secs 1`, measured idle on an empty store. Absolute
+values are debug-build figures.
 
-| Metric | Short-lived `dispatch`, first run (cold daemon) | Short-lived `dispatch`, second run (warm daemon, reused session) | Persistent `serve`, run 1 / run 2 |
-|---|---|---|---|
-| driver wall time | 0.51 s | 0.34 s | resident |
-| due → claim | 22 ms | 63 ms | 3 ms / 3 ms |
-| due → finished | 517 ms | 390 ms | 437 ms / 336 ms |
-| driver max RSS | 36.1 MB | 35.7 MB | 26.3 MB idle → 38.8 MB after runs |
-| driver CPU | 0.01 s user + 0.01 s sys | 0.01 s + 0.01 s | 0.03 s cumulative over ~30 s |
-| model requests | 0 | 0 | 0 |
-| runtime daemons | 1 (spawned, then idle-evicted) | 1 | 1 |
+| Metric | A: OS wake + short-lived dispatch | B: resident `serve` |
+|---|---|---|
+| resident process | none between slots | one process |
+| idle RSS | 0 | 26.0–26.6 MB |
+| idle CPU | 0 | 0.0 %; 0.04 s CPU over 15 s |
+| per-pass cost with no due slot | 0.01 s wall, 26.3 MB max RSS | n/a (resident) |
+| claim → finished, real slot | 5.606 s including the 5 s action (0.61 s dispatcher/runtime overhead, cold runtime) | 0.34–0.44 s with a warm daemon for a quick action (Phase 3.1) |
+| due → claim | 14.5 s in DF-S322b and 34 s in DF-S321, set by the 60 s OS interval | 3 ms (Phase 3.1) |
+| dynamic definition change | next pass rereads the store; no OS update | next poll rereads the store |
+| duplicate trigger | one claim, one effect (DF-S323) | one claim (same store compare-and-set) |
+| dispatcher crash | expired lease recovered by the next OS wake (DF-S324) | process death stops every pass until manually restarted |
+| login / reboot | `RunAtLoad` starts it at login | not started automatically; foreground only |
+| binary upgrade | next wake executes the current binary at that path | old binary until the process is restarted |
+| uninstall | `bootout` plus plist removal, no process left (DF-S326) | must stop the process; no OS record to remove |
+| extra runtime | none | none; the same runtime daemon is used when work exists |
 
-With a warm daemon both drivers finish a scheduled action in well under a
-second. The persistent host removes the per-slot process start (about
-0.2–0.3 s in this debug build) and otherwise does not reduce execution latency;
-its claim is a few milliseconds earlier because the process is already resident.
-It costs one resident process at ~26 MB idle, with no measurable idle CPU. The
-short-lived path leaves no process behind: with
-`LEVELER_DAEMON_IDLE_TIMEOUT_SECS=5`, the daemon exited 5.1 s after the dispatch
-released its client. Both arms use exactly one runtime daemon per workspace.
-The persistent host is therefore the better default only when slot granularity
-is fine; for ordinary intervals the short-lived driver is simpler and already
-sub-second.
+Decision: **A**. Claim timing is bounded by the OS minute interval, but a
+scheduled action is minute-granular anyway; the cold-start overhead above the
+action's own duration was 0.61 s, and A leaves no process resident. B removes
+roughly 0.2–0.3 s of process start and returns a claim in 3 ms, but pays one
+resident 26 MB process that does not survive logout and has no supervisor. B
+does not solve sleep or login either: a suspended process misses slots exactly
+like A, and a logged-out user has no session for either arm; B would still need
+the same OS registration plus a resident process. A is therefore the simpler
+reliable default; B remains available for sub-minute polling only.
 
 ### Real evidence
 
-- `cargo test -p leveler-schedule` — 6 store tests + 2 socket E2E tests passed.
-  The store tests lock atomic claim-once, one-slot recurrence, no `Once`
-  successor, expired-lease recovery, non-rebinding session identity and cascade
-  removal. The E2E tests run a real `Application`, `LocalSocketServer`,
+- `cargo test -p leveler-schedule` — 36 tests passed (23 lib tests, including
+  9 wakeup tests, plus 13 integration tests). They lock atomic claim-once,
+  one-slot recurrence, no `Once` successor, expired-lease recovery,
+  non-rebinding session identity, cascade removal, the `skip` and `run-once`
+  misfire policies, the terminal-row invariant, wake retention, launchd plist
+  round-trip and launchctl parsing, and the Windows XML round-trip. The E2E
+  tests run a real `Application`, `LocalSocketServer`,
   `LocalSocketRuntimeClient` and `Dispatcher`, assert one succeeded run with a
   bound session and execution id, assert the second dispatch claims nothing,
   assert one future slot for a recurring definition, assert
   `provider.request_count() == 0`, and assert `LocalWaiters == 0` after the
   dispatcher drops its client.
+- `cargo test -p leveler-storage migration_0048_keeps_legacy_sessions_and_admits_no_model_free_turn`
+  — passed (0.06 s): a legacy database upgrades without losing sessions and
+  the nullable model column admits a model-free session without a half
+  migration.
 - `cargo test -p leveler-app --test deterministic_action_run` — 1 passed: the
   real socket runtime executed `printf 'leveler-action-ok'` for a session with
   zero provider requests, and the workspace gained no file.
@@ -481,21 +597,26 @@ sub-second.
   including the two automation-probe regressions below.
 - `cargo test -p leveler-cli --bin leveler schedule_subcommands_parse` — passed;
   `cargo check -p leveler-cli` passed.
-- Real macOS CLI run: `schedule add` → `dispatch` produced one `succeeded` run
-  (exit 0, `session_id` and `execution_id` recorded), the action's file was
-  written, a second dispatch claimed 0, and the loopback sink logged 0 requests.
-- Real crash window: the action was `sleep 12; printf 'crash-ok' > …`. The
-  dispatcher was `SIGKILL`ed 2 s after the claim while the run was `running`;
-  the shell still completed and its file existed. At the 120 s lease expiry the
-  next dispatch reported `recovered=1`, the run became `unknown` with
+- Phase 3.1 real macOS CLI run: `schedule add` → `dispatch` produced one
+  `succeeded` run (exit 0, `session_id` and `execution_id` recorded), the
+  action's file was written, a second dispatch claimed 0, and the loopback sink
+  logged 0 requests. Phase 3.2 repeats this through a real launchd wake; see
+  the DF-S321–DF-S326 table above.
+- Phase 3.1 real crash window: the action was `sleep 12; printf 'crash-ok' > …`.
+  The dispatcher was `SIGKILL`ed 2 s after the claim while the run was
+  `running`; the shell still completed and its file existed. At the 120 s lease
+  expiry the next dispatch reported `recovered=1`, the run became `unknown` with
   `"the dispatcher's lease expired before the run reported a terminal state; the
   action's effect is unknown and it was not retried"`, the occurrence became
   `interrupted`, and the following dispatch claimed 0. The recorded outcome is
-  deliberately unknown even though the side effect happened.
+  deliberately unknown even though the side effect happened. DF-S324 repeats
+  this against a real OS-dispatched run.
 - Idle eviction: with the 5 s override, the runtime daemon exited 5.1 s after
-  the dispatch client was dropped; no process remained between slots.
+  the dispatch client was dropped; no process remained between slots. DF-S322b
+  repeats it with the 10 s override and an OS-started dispatcher.
 - Windows compile only: `cargo check --target x86_64-pc-windows-gnu -p
-  leveler-schedule -p leveler-cli` passed. No Windows host ran the schedule.
+  leveler-schedule -p leveler-cli` passed (with the host's mingw `CC`).
+  No Windows host ran the schedule.
 
 ### Authorization and permission
 
@@ -523,27 +644,57 @@ and `mail.sent.check` remains read-only.
 
 - At-most-once is intentional. A crash after delivery leaves `unknown`; there
   is no retry, and recurring missed slots are not backfilled.
-- The dispatcher identifies its run by a newly appeared `UiUserShell` with the
-  exact command text in the definition's session. Another client running the
-  same command concurrently in that session could be mistaken for the run. The
-  session is dedicated by its goal, but exclusivity is not enforced.
-- The runtime refuses to start without at least one configured model, even
-  though a shell schedule never calls one; observed live as a startup failure
-  (`no models configured`). Schedules cannot run on a model-less install.
+- Correlation is by delivery identity, never command text.
+  `origin_command_id` is additive and absent on executions recorded before the
+  field existed, so a schedule cannot adopt a pre-upgrade execution; it waits
+  for its own and settles `unknown` on timeout rather than guessing from text.
+  The session is dedicated by its goal, but even two clients and a schedule
+  sharing one session keep three separate identities (locked by a real-socket
+  concurrency test).
+- A model-free install is supported: the daemon starts with no configured
+  model, `!command` and scheduled shells execute, and provider requests stay at
+  0. A deterministic-only session stores `model = NULL`; an agent turn or goal
+  on it fails with an explicit configuration error instead of inventing a
+  model. Model-backed sessions are unaffected.
 - A long `LEVELER_HOME` path exceeds the macOS `SUN_LEN` socket limit and
   produces a typed failed run (`path must be shorter than SUN_LEN`). The failure
   was recorded honestly, but no run is possible in such a home.
-- `serve` is foreground-only. No launchd or Task Scheduler integration was
-  installed or tested, so real OS wakeup after sleep/login and its timing remain
-  **NOT_VERIFIED**; the short-lived arm was simulated by an external timer.
+- The registration is opt-in and never enabled by adding a schedule. `enable`
+  installs a per-user record; `disable` and `uninstall` remove it. No permanent
+  background service is installed by default, and no second execution engine is
+  introduced: the record only starts the ordinary dispatcher.
+- macOS wake timing is launchd minute-granularity. A slot may start up to
+  roughly one interval late, and launchd may coalesce or skip a wake while the
+  machine sleeps. The misfire policy, not the OS, decides whether the slot then
+  runs. Real sleep/wake and logout/login transitions were not exercised on this
+  host and remain **NOT_VERIFIED**.
+- `serve` is still foreground-only. It is not a supervisor and does not survive
+  logout; the OS registration is what makes either arm start again at login.
+- Windows registration is compile-checked only. A real Windows host has not
+  confirmed the interactive-session restriction, login behavior, duplicate
+  handling, launch failure reporting or `schtasks` output parsing; verbose
+  output is locale-sensitive, so only `Last Result` is consumed when present.
+  The real Windows result is **NOT_VERIFIED**.
+- Linux has an explicit unsupported backend and no systemd unit. A Linux
+  compile check could not run because the host lacks the Linux C toolchain
+  required by `libsqlite3-sys`; Linux compilation is **NOT_VERIFIED**.
+- The OS record can be edited or removed outside CodeLeveler. `doctor` reports
+  the drift (executable, exact arguments, interval, environment, overdue
+  slots) but does not silently repair it; re-running `enable` is explicit.
+- On macOS, `launchctl enable` leaves an inert `<label> => enabled` entry in
+  launchd's root-owned override database even after `uninstall` removes the
+  plist and boots the job out. The entry cannot start anything without a plist
+  and launchd exposes no unprivileged way to delete it; `disable` does not
+  remove it either.
 - There is no TUI or Desktop schedule surface yet; only the CLI exists.
 - Windows runtime behavior, shell execution and daemon supervision remain
   **NOT_VERIFIED** beyond the compile check.
 
 ### Next step
 
-Windows host acceptance; an OS autostart integration only with explicit
-authorization and sleep/login wake tests; native-action and real-mail schedules
-only after their separate authorization and consent gates. Phase 1 stays
-**PARTIAL** and Phase 2 stays **PARTIAL / NA-02 BLOCKED**; this phase does not
-promote any of their items.
+Windows host acceptance of the registered task (interactive session, login,
+duplicates, uninstall); real macOS sleep/wake and logout/login transitions; a
+Linux compile environment with the C toolchain; native-action and real-mail
+schedules only after their separate authorization and consent gates. Phase 1
+stays **PARTIAL** and Phase 2 stays **PARTIAL / NA-02 BLOCKED**; this phase does
+not promote any of their items.

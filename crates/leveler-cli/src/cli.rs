@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// CodeLeveler — a model-agnostic coding agent CLI.
 #[derive(Debug, Parser)]
@@ -20,6 +20,13 @@ pub struct Cli {
     /// Config bundle directory (defaults to $LEVELER_CONFIG_DIR or <repo>/configs).
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
+
+    /// Override the CodeLeveler home (`$LEVELER_HOME`) for this invocation.
+    ///
+    /// Internal: OS wakeup registrations use it so the job names the exact home
+    /// it was enabled for instead of inheriting an ambient environment.
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    pub home: Option<PathBuf>,
 
     /// Increase log verbosity (-v, -vv).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -806,6 +813,28 @@ pub enum NativeCommand {
     },
 }
 
+/// What a scheduled slot does when no dispatcher reached it in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScheduleMisfire {
+    /// Record the slot as missed and do not execute it.
+    Skip,
+    /// Keep one overdue slot and execute it once on the next wake.
+    #[value(name = "run-once")]
+    RunOnce,
+}
+
+/// Who started one dispatch pass. Recorded with the wake, never treated as
+/// execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScheduleSource {
+    /// A human ran `leveler schedule dispatch`.
+    Manual,
+    /// An operating-system registration (launchd, Task Scheduler).
+    Os,
+    /// The resident `leveler schedule serve` driver.
+    Serve,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ScheduleCommand {
     /// Add a user-global scheduled action.
@@ -839,6 +868,13 @@ pub enum ScheduleCommand {
         /// seconds; the run becomes unknown rather than retried.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// What to do with a slot no dispatcher reached in time.
+        #[arg(long, value_enum, default_value = "skip")]
+        misfire: ScheduleMisfire,
+        /// Seconds a due slot may wait for a dispatcher before the misfire
+        /// policy applies.
+        #[arg(long, default_value_t = 300)]
+        misfire_grace: u64,
         /// Print the created definition as JSON.
         #[arg(long)]
         json: bool,
@@ -865,12 +901,16 @@ pub enum ScheduleCommand {
         /// Definition id.
         id: String,
     },
-    /// Run one dispatch pass: recover expired leases, then execute due
-    /// occurrences. This is the short-lived path an OS timer can invoke.
+    /// Run one dispatch pass: apply the misfire policy, recover expired
+    /// leases, then execute due occurrences. This is the short-lived path an
+    /// OS timer invokes.
     Dispatch {
         /// Maximum occurrences to execute in this pass.
         #[arg(long, default_value_t = 4)]
         max: usize,
+        /// Who started this pass. Recorded with the wake.
+        #[arg(long, value_enum, default_value = "manual")]
+        source: ScheduleSource,
         /// Print the summary as JSON.
         #[arg(long)]
         json: bool,
@@ -884,6 +924,38 @@ pub enum ScheduleCommand {
         /// Longest sleep between passes, in seconds.
         #[arg(long, default_value_t = 30)]
         poll_secs: u64,
+    },
+    /// Register this user's OS wakeup for scheduled actions. Opt-in: it is
+    /// never enabled by adding a schedule.
+    Enable {
+        /// Print the observed OS registration as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the OS wakeup without touching schedule definitions or history.
+    Disable {
+        /// Print the observed OS registration as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the OS wakeup registration. Schedule data is kept.
+    Uninstall {
+        /// Print the observed OS registration as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the OS registration and schedule counts side by side.
+    Status {
+        /// Print the state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check that schedule data, the OS registration and the executable
+    /// agree. Read-only; exits non-zero on a failed check.
+    Doctor {
+        /// Print the checks as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -983,8 +1055,107 @@ mod tests {
         let dispatch = parse(&["leveler", "schedule", "dispatch", "--max", "2", "--json"]);
         assert!(matches!(
             dispatch.command,
-            Some(Command::Schedule(ScheduleCommand::Dispatch { max: 2, json: true }))
+            Some(Command::Schedule(ScheduleCommand::Dispatch {
+                max: 2,
+                source: ScheduleSource::Manual,
+                json: true
+            }))
         ));
+
+        let os_dispatch = parse(&[
+            "leveler",
+            "schedule",
+            "dispatch",
+            "--source",
+            "os",
+        ]);
+        assert!(matches!(
+            os_dispatch.command,
+            Some(Command::Schedule(ScheduleCommand::Dispatch {
+                source: ScheduleSource::Os,
+                ..
+            }))
+        ));
+
+        for argv in [
+            vec![
+                "leveler",
+                "--home",
+                "/tmp/leveler home",
+                "schedule",
+                "dispatch",
+                "--source",
+                "os",
+            ],
+            vec![
+                "leveler",
+                "schedule",
+                "dispatch",
+                "--source",
+                "os",
+                "--home",
+                "/tmp/leveler home",
+            ],
+        ] {
+            let parsed = parse(&argv);
+            assert_eq!(parsed.home, Some(PathBuf::from("/tmp/leveler home")));
+            assert!(matches!(
+                parsed.command,
+                Some(Command::Schedule(ScheduleCommand::Dispatch {
+                    source: ScheduleSource::Os,
+                    ..
+                }))
+            ));
+        }
+
+        for (name, expected) in [
+            ("enable", "enable"),
+            ("disable", "disable"),
+            ("uninstall", "uninstall"),
+            ("status", "status"),
+            ("doctor", "doctor"),
+        ] {
+            let parsed = parse(&["leveler", "schedule", name, "--json"]);
+            let matched = match parsed.command {
+                Some(Command::Schedule(command)) => match (name, command) {
+                    ("enable", ScheduleCommand::Enable { json: true })
+                    | ("disable", ScheduleCommand::Disable { json: true })
+                    | ("uninstall", ScheduleCommand::Uninstall { json: true })
+                    | ("status", ScheduleCommand::Status { json: true })
+                    | ("doctor", ScheduleCommand::Doctor { json: true }) => true,
+                    _ => false,
+                },
+                _ => false,
+            };
+            assert!(matched, "{expected} must parse");
+        }
+
+        let add_misfire = parse(&[
+            "leveler",
+            "schedule",
+            "add",
+            "--name",
+            "x",
+            "--command",
+            "true",
+            "--at",
+            "2026-01-01T00:00:00Z",
+            "--misfire",
+            "run-once",
+            "--misfire-grace",
+            "60",
+        ]);
+        match add_misfire.command {
+            Some(Command::Schedule(ScheduleCommand::Add {
+                misfire,
+                misfire_grace,
+                ..
+            })) => {
+                assert_eq!(misfire, ScheduleMisfire::RunOnce);
+                assert_eq!(misfire_grace, 60);
+            }
+            other => panic!("expected Schedule::Add, got {other:?}"),
+        }
 
         let serve = parse(&["leveler", "schedule", "serve", "--poll-secs", "5"]);
         assert!(matches!(

@@ -33,7 +33,7 @@ use leveler_local_transport::{
 use tokio::time::Instant;
 
 use crate::{
-    RunOutcome, RunState, ScheduleDefinition, ScheduleError, ScheduleStore,
+    RunOutcome, RunState, ScheduleDefinition, ScheduleError, ScheduleStore, WakeSource,
 };
 
 /// Opens the runtime that owns a schedule's workspace.
@@ -51,6 +51,8 @@ pub trait RuntimeConnector: Send + Sync {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DispatchSummary {
     pub recovered: usize,
+    /// Overdue slots classified as missed by policy. They were not executed.
+    pub missed: usize,
     pub claimed: usize,
     pub succeeded: usize,
     pub failed: usize,
@@ -85,15 +87,51 @@ impl Dispatcher {
         self
     }
 
-    /// Recover expired claims, then execute up to `max` due occurrences.
-    /// Occurrences are handled one at a time: a busy runtime must not turn one
-    /// dispatch pass into uncontrolled concurrency.
+    /// Recover expired claims, apply the misfire policy, then execute up to
+    /// `max` due occurrences. Occurrences are handled one at a time: a busy
+    /// runtime must not turn one dispatch pass into uncontrolled concurrency.
+    ///
+    /// This is a manual pass for tests and for `schedule dispatch` without an
+    /// explicit source. A pass records itself as a manual wake.
     pub async fn dispatch_due(&self, max: usize) -> Result<DispatchSummary, ScheduleError> {
+        self.dispatch_due_with_source(max, WakeSource::Manual).await
+    }
+
+    /// A dispatch pass with an explicit wake source. The wake record is an
+    /// observation of the driver, not execution authority: it is written even
+    /// when nothing is due and stays unfinished if this process is killed.
+    pub async fn dispatch_due_with_source(
+        &self,
+        max: usize,
+        source: WakeSource,
+    ) -> Result<DispatchSummary, ScheduleError> {
+        let wake = self.store.begin_wake(source).await?;
+        match self.dispatch_pass(max).await {
+            Ok(summary) => {
+                self.store.finish_wake(wake, &summary).await?;
+                Ok(summary)
+            }
+            Err(error) => {
+                if let Err(record_error) = self.store.fail_wake(wake, &error.to_string()).await {
+                    tracing::warn!(
+                        %record_error,
+                        wake,
+                        "could not record a failed dispatch pass"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn dispatch_pass(&self, max: usize) -> Result<DispatchSummary, ScheduleError> {
         let now = leveler_core::now();
+        let missed = self.store.reconcile_misfires(now).await?;
         let recovered = self.store.recover_expired(now).await?;
         let claims = self.store.claim_due(now, self.lease, max).await?;
         let mut summary = DispatchSummary {
             recovered: recovered.len(),
+            missed,
             claimed: claims.len(),
             ..DispatchSummary::default()
         };
@@ -168,6 +206,10 @@ impl Dispatcher {
             let outcome = delivery_failure(error);
             return self.settle(&claim.run_id, outcome).await;
         }
+        // The runtime accepted the envelope. Record that fact before waiting:
+        // if this process dies now, lease recovery can distinguish "delivered,
+        // outcome lost" from "never delivered".
+        self.store.mark_delivered(&claim.run_id).await?;
 
         let deadline = Instant::now() + definition.timeout;
         let renew_every = (self.lease / 3).max(Duration::from_secs(1));

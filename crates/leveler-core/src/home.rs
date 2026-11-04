@@ -188,6 +188,11 @@ impl LevelerHome {
         self.logs_dir().join("daemon")
     }
 
+    /// OS-wakeup driver logs: `logs/schedule/`.
+    pub fn schedule_logs_dir(&self) -> PathBuf {
+        self.logs_dir().join("schedule")
+    }
+
     /// One project's daemon log: `logs/daemon/<project_id>.log`.
     pub fn daemon_log(&self, project_id: &str) -> PathBuf {
         self.daemon_logs_dir().join(format!("{project_id}.log"))

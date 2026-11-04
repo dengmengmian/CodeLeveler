@@ -59,15 +59,23 @@ use sessions_cmd::cmd_sessions;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    let args = Cli::parse();
+    let mut values: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    if let Some(home) = args.home.as_ref() {
+        values.retain(|(key, _)| key != "LEVELER_HOME");
+        values.push((
+            std::ffi::OsString::from("LEVELER_HOME"),
+            home.as_os_str().to_owned(),
+        ));
+    }
     let _ = leveler_core::install_environment(leveler_core::EnvSnapshot::new(
-        std::env::vars_os(),
+        values,
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         std::env::temp_dir(),
     ));
     // Record panics before anything else can install a hook — the TUI's
     // terminal-restore hook chains to this one.
     crash::install(env!("CARGO_PKG_VERSION"));
-    let args = Cli::parse();
     if args.version {
         println!("{}", build_provenance());
         return std::process::ExitCode::SUCCESS;
@@ -324,9 +332,11 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Doctor => cmd_doctor(layout),
         Command::Native(command) => Ok(native_cmd::cmd_native(command).await),
-        Command::Schedule(command) => schedule_cmd::cmd_schedule(layout, schedule_config_dir, command)
-            .await
-            .map(|()| std::process::ExitCode::SUCCESS),
+        Command::Schedule(command) => {
+            schedule_cmd::cmd_schedule(layout, schedule_config_dir, command)
+                .await
+                .map(|()| std::process::ExitCode::SUCCESS)
+        }
         Command::Permissions(pc) => cmd_permissions(layout, pc),
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,
