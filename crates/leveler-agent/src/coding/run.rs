@@ -1438,7 +1438,7 @@ impl CodingRuntime {
                     .as_ref()
                     .map(|root| root.display().to_string()),
                 goal: spec.runtime.goal.clone(),
-                model: self.factory.model.to_string(),
+                model: Some(self.factory.model.to_string()),
                 mode: mode_str(spec.coding.mode).to_string(),
                 sandbox: spec.coding.sandbox,
                 kind: spec.runtime.kind,

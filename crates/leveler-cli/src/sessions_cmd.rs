@@ -117,7 +117,7 @@ async fn render_session_show(
 
     println!("{}", Line::heading(&format!("Session {}", session.id)));
     println!("  goal:    {}", session.goal);
-    println!("  model:   {}", session.model);
+    println!("  model:   {}", session.model.as_deref().unwrap_or("—"));
     println!(
         "  status:  {}  state: {}",
         session.status.as_str(),
@@ -292,7 +292,7 @@ pub(crate) async fn cmd_sessions(
                         s.id,
                         session_list_status(&db, &s).await?,
                         s.goal,
-                        s.model
+                        s.model.as_deref().unwrap_or("—")
                     );
                 }
             }

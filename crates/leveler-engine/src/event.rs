@@ -344,6 +344,12 @@ pub enum EngineEvent {
     /// side effect.
     UserShellStarted {
         execution_id: leveler_core::UserShellId,
+        /// Delivery identity of the command that started this execution, when
+        /// it arrived through a `CommandEnvelope`. Persisted so a resumed
+        /// runtime can still say which request this execution answers.
+        /// Additive: absent on events written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_command_id: Option<String>,
         command: String,
         cwd: String,
     },

@@ -12,6 +12,12 @@
 //! The snapshot carries the runtime's live user-shell records plus the ones
 //! rebuilt from the durable event log, so the same code observes a fast
 //! command, a slow one, and one whose runtime restarted mid-run.
+//!
+//! Correlation is by delivery identity, never by command text. The envelope's
+//! `CommandId` is the idempotency key the runtime already deduplicates on;
+//! the runtime records it on the execution it admitted, and this dispatcher
+//! selects exactly the execution carrying this run's identity. Two clients
+//! running identical text in one session therefore stay distinguishable.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -144,27 +150,12 @@ impl Dispatcher {
         };
         self.store.mark_session(&claim.run_id, &session).await?;
 
-        let before = match client.snapshot(&session).await {
-            Ok(snapshot) => snapshot
-                .user_shells
-                .into_iter()
-                .map(|shell| shell.id)
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                return self
-                    .settle(
-                        &claim.run_id,
-                        RunOutcome::Failed {
-                            exit_code: None,
-                            error: format!("could not read the scheduled session before delivery: {error}"),
-                        },
-                    )
-                    .await;
-            }
-        };
-
+        // The delivery identity is the run's identity: it is what the
+        // runtime's command receipts deduplicate on, what the execution
+        // records, and the only thing this dispatcher matches against.
+        let origin = CommandId::new(format!("schedule-run-{}", claim.run_id));
         let envelope = CommandEnvelope {
-            command_id: CommandId::new(format!("schedule-run-{}", claim.run_id)),
+            command_id: origin.clone(),
             session_id: session.clone(),
             expected_version: None,
             issued_at: leveler_core::now().to_rfc3339(),
@@ -202,9 +193,7 @@ impl Dispatcher {
             let shell = snapshot
                 .user_shells
                 .into_iter()
-                .find(|shell| {
-                    shell.command == definition.command.trim() && !before.contains(&shell.id)
-                });
+                .find(|shell| shell.origin_command_id.as_ref() == Some(&origin));
             if let Some(shell) = shell {
                 if execution.as_ref() != Some(&shell.id) {
                     execution = Some(shell.id.clone());
@@ -287,17 +276,22 @@ impl Dispatcher {
                         );
                     }
                 }
-                return self
-                    .settle(
-                        &claim.run_id,
-                        RunOutcome::Unknown {
-                            error: format!(
-                                "the action did not report a terminal state within {}s; \
-                                 its effect is unknown and it was not retried",
-                                definition.timeout.as_secs()
-                            ),
-                        },
+                let error = if execution.is_some() {
+                    format!(
+                        "the action did not report a terminal state within {}s; \
+                         its effect is unknown and it was not retried",
+                        definition.timeout.as_secs()
                     )
+                } else {
+                    format!(
+                        "the runtime never reported an execution carrying this run's \
+                         delivery identity within {}s; its effect is unknown and it \
+                         was not retried",
+                        definition.timeout.as_secs()
+                    )
+                };
+                return self
+                    .settle(&claim.run_id, RunOutcome::Unknown { error })
                     .await;
             }
 

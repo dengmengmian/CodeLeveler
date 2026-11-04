@@ -1079,6 +1079,7 @@ impl EventBridge {
                 execution_id,
                 command,
                 cwd,
+                ..
             } => {
                 let _ = self.events.send(RuntimeEvent::UserShellStarted {
                     execution_id,
@@ -3724,6 +3725,7 @@ mod projection_equivalence {
         let shapes = project(vec![
             EngineEvent::UserShellStarted {
                 execution_id: id.clone(),
+                origin_command_id: None,
                 command: "cargo test".into(),
                 cwd: "/repo".into(),
             },

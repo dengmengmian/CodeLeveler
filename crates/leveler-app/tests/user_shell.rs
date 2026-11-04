@@ -1268,6 +1268,7 @@ async fn a_terminal_fact_wins_over_a_late_backgrounded_fact_in_cold_restore() {
     for event in [
         EngineEvent::UserShellStarted {
             execution_id: id.clone(),
+            origin_command_id: None,
             command: "echo ORDER".into(),
             cwd: "/repo".into(),
         },

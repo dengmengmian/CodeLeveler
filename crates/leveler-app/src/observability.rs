@@ -276,7 +276,9 @@ pub async fn query_observability(
             created_at: session.created_at,
             updated_at: session.updated_at,
             status: session.status.as_str().to_string(),
-            model: session.model,
+            // A deterministic-only session has no model; the observability row
+            // shows that as empty rather than naming one it never used.
+            model: session.model.unwrap_or_default(),
             work_profile: crate::canonical_work_profile(&session.work_profile),
             collaboration: session.collaboration,
             last_sequence: latest,

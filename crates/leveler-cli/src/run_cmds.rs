@@ -34,7 +34,8 @@ use leveler_runtime_host::{
 use crate::cli::{OutputFormat, RunMode};
 use crate::common::{
     build_approver, map_mode, project_default_mode, resolve_mode, resolve_model,
-    resolve_model_with_notice, spawn_interrupt_handler, wire_mode,
+    resolve_model_with_notice, resolve_optional_model_with_notice, spawn_interrupt_handler,
+    wire_mode,
 };
 use crate::output::Line;
 use crate::render::{emit_jsonl, render_event};
@@ -1413,7 +1414,9 @@ pub(crate) async fn cmd_serve(
 ) -> anyhow::Result<std::process::ExitCode> {
     let socket_path = socket.unwrap_or_else(|| layout.socket_path());
     let app = Arc::new(Application::assemble(layout)?);
-    let (model_ref, model_notice) = resolve_model_with_notice(app.as_ref(), model)?;
+    // The daemon hosts deterministic executions too. A model is required by an
+    // agent turn, not by the runtime itself.
+    let (model_ref, model_notice) = resolve_optional_model_with_notice(app.as_ref(), model)?;
     // The daemon's own stderr goes to `daemon.log`, which nobody reads. Keep the
     // fact on the application instead so the next created session can hand it to
     // its client with the bootstrap — the one channel a client is guaranteed to
@@ -1431,13 +1434,21 @@ pub(crate) async fn cmd_serve(
     // the daemon's idle eviction reads exactly what the transport counts.
     let local_waiters = leveler_local_transport::LocalWaiters::new();
     let runtime = Arc::new(
-        InProcessRuntimeClient::new_with_options(
-            app.clone(),
-            model_ref.clone(),
-            default_mode,
-            sandbox,
-            auto_approve,
-        )
+        match &model_ref {
+            Some(model) => InProcessRuntimeClient::new_with_options(
+                app.clone(),
+                model.clone(),
+                default_mode,
+                sandbox,
+                auto_approve,
+            ),
+            None => InProcessRuntimeClient::new_without_model(
+                app.clone(),
+                default_mode,
+                sandbox,
+                auto_approve,
+            ),
+        }
         .with_process_shutdown(shutdown.clone())
         .with_client_presence(local_waiters.clone()),
     );
@@ -1467,7 +1478,12 @@ pub(crate) async fn cmd_serve(
         // external client authenticates. Not logged elsewhere.
         println!("  token: {token}");
     }
-    println!("  model: {model_ref}");
+    match &model_ref {
+        Some(model) => println!("  model: {model}"),
+        None => println!(
+            "  model: none (deterministic tasks only; run `leveler init` and /model to add one)"
+        ),
+    }
     println!("  runtime: {runtime_id}");
     println!("  press Ctrl+C to stop the daemon");
 

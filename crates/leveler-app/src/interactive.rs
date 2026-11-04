@@ -1121,7 +1121,9 @@ fn release_cancel(handles: &ChildCancels, session_id: &SessionId, id: &str) {
 
 #[derive(Debug, Clone)]
 struct SessionRuntimeConfig {
-    model: ModelRef,
+    /// `None` is a deterministic-only session: host commands run, agent turns
+    /// fail with a clear configuration error. Never a placeholder model.
+    model: Option<ModelRef>,
     mode: PermissionProfile,
     sandbox: bool,
     collaboration: String,
@@ -1149,6 +1151,27 @@ fn install_persisted_config(
     }
     configs.insert(session_id.clone(), config.clone());
     config
+}
+
+/// Why an agent turn cannot start on a session that has no model.
+///
+/// A deterministic session is legitimate: `!command` and scheduled shell
+/// actions are real host executions that never call a model. Only the agent
+/// surfaces require one, and they say so instead of inventing a default.
+fn no_model_message(session_id: &SessionId) -> String {
+    format!(
+        "session {session_id} has no model configured; host commands still run, but an agent turn needs a provider and model — run `leveler init`, then choose one with /model"
+    )
+}
+
+fn require_model(
+    config: &SessionRuntimeConfig,
+    session_id: &SessionId,
+) -> Result<ModelRef, ClientError> {
+    config
+        .model
+        .clone()
+        .ok_or_else(|| ClientError::Runtime(no_model_message(session_id)))
 }
 
 impl InProcessRuntimeClient {
@@ -1248,6 +1271,31 @@ impl InProcessRuntimeClient {
     pub fn new_with_options(
         app: Arc<Application>,
         model: ModelRef,
+        mode: PermissionProfile,
+        sandbox: bool,
+        auto_approve: bool,
+    ) -> Self {
+        Self::build(app, Some(model), mode, sandbox, auto_approve)
+    }
+
+    /// Build a runtime with no default model.
+    ///
+    /// Deterministic execution (`RunUserShell`, scheduled actions) never
+    /// consults a model, so the runtime that serves it does not require one.
+    /// Creating a session is still a legitimate operation; every agent turn on
+    /// such a session fails with an accurate model-configuration error.
+    pub fn new_without_model(
+        app: Arc<Application>,
+        mode: PermissionProfile,
+        sandbox: bool,
+        auto_approve: bool,
+    ) -> Self {
+        Self::build(app, None, mode, sandbox, auto_approve)
+    }
+
+    fn build(
+        app: Arc<Application>,
+        model: Option<ModelRef>,
         mode: PermissionProfile,
         sandbox: bool,
         auto_approve: bool,
@@ -1572,7 +1620,8 @@ impl InProcessRuntimeClient {
 
     /// Session settings are read from the same durable authority as snapshots.
     async fn session_model(&self, session_id: &SessionId) -> Result<ModelRef, ClientError> {
-        Ok(self.runtime_config(session_id).await?.model)
+        let config = self.runtime_config(session_id).await?;
+        require_model(&config, session_id)
     }
 
     async fn save_agent(
@@ -2030,21 +2079,26 @@ impl InProcessRuntimeClient {
         configured_default: Option<ModelRef>,
     ) -> Result<SessionRuntimeConfig, ClientError> {
         let record = &settings.session;
-        let stored = ModelRef::parse(&record.model).ok_or_else(|| {
-            ClientError::Runtime(format!(
-                "session {session_id} stores invalid model reference `{}`",
-                record.model
-            ))
-        })?;
+        let stored = match record.model.as_deref() {
+            Some(raw) => Some(ModelRef::parse(raw).ok_or_else(|| {
+                ClientError::Runtime(format!(
+                    "session {session_id} stores invalid model reference `{raw}`"
+                ))
+            })?),
+            // A deterministic-only session. It has no model to inherit: a
+            // later default must not turn it into an agent session behind the
+            // user's back.
+            None => None,
+        };
         // An explicit `/model` choice is durable and wins. Otherwise the session
         // INHERITS the current configured default, so editing `default_model`
         // reaches the next turn without a restart. A default this environment
         // cannot resolve leaves the session on the model it already had — an
         // unusable global default must never strand a working session.
-        let model = if settings.model_pinned {
-            stored
-        } else {
-            configured_default.unwrap_or(stored)
+        let model = match (stored, settings.model_pinned) {
+            (Some(stored), true) => Some(stored),
+            (Some(stored), false) => Some(configured_default.unwrap_or(stored)),
+            (None, _) => None,
         };
         let mode = crate::session::mode_from_str(&settings.mode).ok_or_else(|| {
             ClientError::Runtime(format!(
@@ -2289,10 +2343,15 @@ impl InProcessRuntimeClient {
         {
             return Err(ClientError::SessionNotFound(session_id.clone()));
         }
-        sessions
-            .update_model(session_id, &config.model.to_string(), leveler_core::now())
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        // A deterministic-only session has no model to persist. Writing `NULL`
+        // over an existing model would also erase an explicit choice; the row
+        // already says what it is.
+        if let Some(model) = &config.model {
+            sessions
+                .update_model(session_id, &model.to_string(), leveler_core::now())
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        }
         sessions
             .set_execution(
                 session_id,
@@ -2390,6 +2449,7 @@ impl InProcessRuntimeClient {
         &self,
         session_id: SessionId,
         command: String,
+        origin: Option<CommandId>,
     ) -> Result<(), ClientError> {
         let trimmed = command.trim();
         if trimmed.is_empty() {
@@ -2439,6 +2499,7 @@ impl InProcessRuntimeClient {
             id.clone(),
             trimmed.to_string(),
             cwd_display.clone(),
+            origin.clone(),
             cancel.clone(),
             handoff.clone(),
         );
@@ -2501,7 +2562,12 @@ impl InProcessRuntimeClient {
                 let _ = log
                     .append(
                         None,
-                        crate::user_shell::started_event(&id, &command_text, &cwd_display),
+                        crate::user_shell::started_event(
+                            &id,
+                            &command_text,
+                            &cwd_display,
+                            origin.as_ref(),
+                        ),
                         &mut forward,
                     )
                     .await;
@@ -3409,7 +3475,9 @@ impl InProcessRuntimeClient {
                 task_status: Some(task_status),
                 task_terminal: terminal,
                 declaration,
-                model: r.model,
+                // Display-only list projection: empty means no model. The
+                // authoritative snapshot carries the `None`.
+                model: r.model.unwrap_or_default(),
                 updated_at: facts.last_activity_at,
                 repository: r.repository,
             });
@@ -3443,6 +3511,7 @@ impl InProcessRuntimeClient {
         attachments: Vec<AttachmentRef>,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
+        model: ModelRef,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let parts = match self.content_parts(&content, &attachments) {
             Ok(parts) => parts,
@@ -3455,7 +3524,7 @@ impl InProcessRuntimeClient {
                 return rx;
             }
         };
-        self.spawn_content_turn(session_id, parts, admission, config)
+        self.spawn_content_turn(session_id, parts, admission, config, model)
     }
 
     fn spawn_goal_turn(
@@ -3464,10 +3533,11 @@ impl InProcessRuntimeClient {
         content: String,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
+        model: ModelRef,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         // Single interactive path: direct goal loop (update_goal + tools +
         // spawn_agent). Orchestrate is not used for sessions.
-        self.spawn_direct_goal_turn(session_id, content, admission, config)
+        self.spawn_direct_goal_turn(session_id, content, admission, config, model)
     }
 
     fn spawn_direct_goal_turn(
@@ -3476,13 +3546,13 @@ impl InProcessRuntimeClient {
         content: String,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
+        model: ModelRef,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
         let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
-        self.active.note_model(&session_id, &config.model);
-        let model = config.model;
+        self.active.note_model(&session_id, &model);
         let mode = config.mode;
         let sandbox = config.sandbox;
         let axis_at_start = config.collaboration.clone();
@@ -3599,6 +3669,10 @@ impl InProcessRuntimeClient {
             return self.steer_into_goal(session_id, content).await;
         }
         let config = self.runtime_config(&session_id).await?;
+        // A Goal turn is an agent turn. Refuse before the declaration is
+        // persisted: a deterministic session must not be given a goal it can
+        // never execute.
+        require_model(&config, &session_id)?;
         let axis_changed =
             config.collaboration != leveler_lifecycle::CollaborationMode::Goal.as_str();
         // The axis and the declaration are one durable fact. Writing the axis
@@ -3612,8 +3686,9 @@ impl InProcessRuntimeClient {
                 .send(RuntimeEvent::SessionUpdated { session });
         }
         let config = self.runtime_config(&session_id).await?;
+        let model = require_model(&config, &session_id)?;
         let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
-        let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
+        let accepted = self.spawn_goal_turn(session_id, content, cancel, config, model);
         await_turn_acceptance(accepted).await
     }
 
@@ -3731,6 +3806,9 @@ impl InProcessRuntimeClient {
             };
         }
         let config = self.runtime_config(&session_id).await?;
+        // Every route below runs a model. A session that exists only for
+        // deterministic host commands says so here, before it stages a turn.
+        let model = require_model(&config, &session_id)?;
         // A paused goal is waiting for the user's authorization, and the user
         // just gave it. A Chat session keeps its axis after a committed task,
         // so this continuation would otherwise be a fresh conversation and the
@@ -3755,8 +3833,7 @@ impl InProcessRuntimeClient {
         // staging and sending — arrives here, and here the answer is the same:
         // a model that cannot read an image is told so, never handed the text
         // with the picture removed.
-        self.refuse_unreadable_images(&config.model, &attachments)
-            .await?;
+        self.refuse_unreadable_images(&model, &attachments).await?;
         let cancel = self
             .stage_turn(&session_id, &content, true, image_count(&attachments))
             .await?;
@@ -3767,12 +3844,12 @@ impl InProcessRuntimeClient {
             if !attachments.is_empty() {
                 // The content entry resolves the same session-owned Goal
                 // profile while preserving every attachment.
-                self.spawn_turn(session_id, content, attachments, cancel, config)
+                self.spawn_turn(session_id, content, attachments, cancel, config, model)
             } else {
-                self.spawn_goal_turn(session_id, content, cancel, config)
+                self.spawn_goal_turn(session_id, content, cancel, config, model)
             }
         } else {
-            self.spawn_turn(session_id, content, attachments, cancel, config)
+            self.spawn_turn(session_id, content, attachments, cancel, config, model)
         };
         await_turn_acceptance(accepted).await
     }
@@ -3842,6 +3919,10 @@ impl InProcessRuntimeClient {
         content: String,
     ) -> Result<(), ClientError> {
         let instruction = Message::user_input(content.clone());
+        // Resuming runs the agent on the session's stored model. A session
+        // without one has nothing to resume.
+        let config = self.runtime_config(&session_id).await?;
+        require_model(&config, &session_id)?;
         let axis_at_start = self
             .app
             .session_product_axes(&session_id)
@@ -3856,7 +3937,7 @@ impl InProcessRuntimeClient {
         // live view reports what is actually running.
         if let Ok(db) = self.app.open_database().await
             && let Ok(Some(record)) = SessionRepository::new(&db).get(&session_id).await
-            && let Some(model) = ModelRef::parse(&record.model)
+            && let Some(model) = record.model.as_deref().and_then(ModelRef::parse)
         {
             self.active.note_model(&session_id, &model);
         }
@@ -4146,10 +4227,9 @@ impl InProcessRuntimeClient {
     /// first with a hard timeout; any failure degrades to a structured-only
     /// checkpoint with a deterministic display — never a lost checkpoint,
     /// never "recap unavailable".
-    fn spawn_recap(&self, session_id: SessionId, config: SessionRuntimeConfig) {
+    fn spawn_recap(&self, session_id: SessionId, model: ModelRef) {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
-        let model = config.model;
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
@@ -4305,10 +4385,15 @@ impl InProcessRuntimeClient {
     /// never appends to `MessageRepository`. Each round re-reads the main
     /// transcript so a follow-up sees the main run's current state, while the
     /// side thread's own earlier turns carry the side conversation.
-    fn spawn_btw(&self, session_id: SessionId, question: String, config: SessionRuntimeConfig) {
+    fn spawn_btw(
+        &self,
+        session_id: SessionId,
+        question: String,
+        config: SessionRuntimeConfig,
+        model: ModelRef,
+    ) {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
-        let model = config.model;
         // The session axes the read-only side surface is composed from. Read
         // before the side thread starts, so a later profile switch cannot make
         // the tool composition and the recorded turn disagree.
@@ -4851,13 +4936,13 @@ impl InProcessRuntimeClient {
         parts: Vec<ContentPart>,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
+        model: ModelRef,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
         let client = self.clone();
         let events = self.events_for(&session_id);
         let active = self.active.clone();
-        self.active.note_model(&session_id, &config.model);
-        let model = config.model;
+        self.active.note_model(&session_id, &model);
         let mode = config.mode;
         let sandbox = config.sandbox;
         let axis_at_start = config.collaboration.clone();
@@ -5082,7 +5167,21 @@ impl InProcessRuntimeClient {
                 return Ok(());
             }
         };
-        let model = config.model;
+        // Compaction summarizes through a model. A deterministic-only session
+        // has none, and the failure is the same surfaced shape.
+        let model = match require_model(&config, &session_id) {
+            Ok(model) => model,
+            Err(error) => {
+                self.active.finish(&admission);
+                let _ = events.send(RuntimeEvent::TurnFailed {
+                    error: format!("压缩失败：{error}"),
+                    failure: None,
+                    recovery: None,
+                });
+                self.notify_error(&session_id, format!("压缩失败：{error}"));
+                return Ok(());
+            }
+        };
         let active = self.active.clone();
         let checkpoints = self.checkpoints.clone();
         let live_views = self.live_views.clone();
@@ -5220,6 +5319,16 @@ impl InProcessRuntimeClient {
                 content,
             } => {
                 self.handle_resume_task(session_id, content, Some(origin))
+                    .await
+            }
+            // The execution must carry the delivery identity that admitted
+            // it; it is the only evidence that distinguishes this run from
+            // another client's identical command in the same session.
+            ClientCommand::RunUserShell {
+                session_id,
+                command,
+            } => {
+                self.handle_run_user_shell(session_id, command, Some(origin.clone()))
                     .await
             }
 
@@ -5485,10 +5594,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 } else {
                     content
                 };
-                self.persist_goal_declaration(&session_id, &goal).await?;
+                // Fail before the declaration is written: a confirmed plan
+                // needs an execution model.
                 let config = self.runtime_config(&session_id).await?;
+                let model = require_model(&config, &session_id)?;
+                self.persist_goal_declaration(&session_id, &goal).await?;
                 let cancel = self.stage_turn(&session_id, &goal, false, 0).await?;
-                let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
+                let accepted = self.spawn_goal_turn(session_id, goal, cancel, config, model);
                 await_turn_acceptance(accepted).await
             }
 
@@ -5608,11 +5720,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let new_model = self
                     .app
                     .configured_default_model()
-                    .unwrap_or_else(|| config.model.clone());
+                    .or_else(|| config.model.clone());
                 match self
                     .app
                     .create_daemon_session(
-                        &new_model,
+                        new_model.as_ref(),
                         PLACEHOLDER_GOAL,
                         config.mode,
                         // `/clear` opens a sibling conversation under the
@@ -5634,6 +5746,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         // client never switched to. Roll it back rather than
                         // leaving an orphan in the session list.
                         let prepared = async {
+                            config.model = new_model;
                             self.persist_runtime_config(&session_id, config).await?;
                             self.snapshot(&session_id).await
                         }
@@ -5838,7 +5951,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 question,
             } => {
                 let config = self.runtime_config(&session_id).await?;
-                self.spawn_btw(session_id, question, config);
+                let model = require_model(&config, &session_id)?;
+                self.spawn_btw(session_id, question, config, model);
                 Ok(())
             }
             ClientCommand::CancelBtw { session_id } => {
@@ -5970,7 +6084,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::RunUserShell {
                 session_id,
                 command,
-            } => self.handle_run_user_shell(session_id, command).await,
+            } => self.handle_run_user_shell(session_id, command, None).await,
             ClientCommand::BackgroundUserShell {
                 session_id,
                 execution_id,
@@ -6117,7 +6231,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
             ClientCommand::Recap { session_id } => {
                 let config = self.runtime_config(&session_id).await?;
-                self.spawn_recap(session_id, config);
+                let model = require_model(&config, &session_id)?;
+                self.spawn_recap(session_id, model);
                 Ok(())
             }
             ClientCommand::ListUnfinishedGoals {
@@ -6598,11 +6713,16 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // A live turn keeps the model it started with, even when a reload has
         // already changed the session's NEXT model. Reporting the next model as
         // if it were executing would name a model that is sending nothing.
+        // `None` is a deterministic-only session: the snapshot says so rather
+        // than naming a model nobody configured.
         let model = self
             .active
             .run_model(session_id)
-            .unwrap_or_else(|| config.model.clone());
-        let profile = self.app.registry().profile(&model).await.ok();
+            .or_else(|| config.model.clone());
+        let profile = match model.as_ref() {
+            Some(model) => self.app.registry().profile(model).await.ok(),
+            None => None,
+        };
         // Whether the current model accepts images (spec §42).
         let vision = profile
             .as_ref()
@@ -6781,7 +6901,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             task_status: Some(task_status),
             task_terminal,
             goal: record.goal,
-            model: Some(model),
+            model,
             mode: protocol_mode(config.mode),
             branch: self
                 .app
@@ -7330,18 +7450,21 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 .map_err(|e| ClientError::Runtime(e.to_string()))?
             {
                 let session = self.snapshot(&session_id).await?;
-                let model = session
-                    .model
-                    .as_ref()
-                    .ok_or_else(|| ClientError::Runtime("created session has no model".into()))?;
-                let context_window = self
-                    .app
-                    .registry()
-                    .profile(model)
-                    .await
-                    .map_err(|e| ClientError::Runtime(e.to_string()))?
-                    .limits
-                    .context_window;
+                // A deterministic-only session has no model and therefore no
+                // context window. Zero is the wire's absent value; clients
+                // already treat it as unknown.
+                let context_window = match session.model.as_ref() {
+                    Some(model) => {
+                        self.app
+                            .registry()
+                            .profile(model)
+                            .await
+                            .map_err(|e| ClientError::Runtime(e.to_string()))?
+                            .limits
+                            .context_window
+                    }
+                    None => 0,
+                };
                 return Ok(leveler_local_transport::SessionBootstrap {
                     session,
                     context_window,
@@ -7363,7 +7486,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                         "model `{explicit}` is not configured"
                     )));
                 }
-                explicit
+                Some(explicit)
             }
             None => {
                 // A session created NOW starts on the configuration in force
@@ -7371,18 +7494,26 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 let preferred = self
                     .app
                     .configured_default_model()
-                    .unwrap_or_else(|| self.default_runtime.model.clone());
-                if self.app.model_refs().contains(&preferred) {
-                    preferred
-                } else {
-                    let fallback = self.app.fallback_default_model().ok_or_else(|| {
-                        ClientError::Runtime(format!(
-                            "model `{preferred}` is not configured, and this environment has no\
-                             other configured model to fall back to"
-                        ))
-                    })?;
-                    substitution = Some((fallback.clone(), preferred));
-                    fallback
+                    .or_else(|| self.default_runtime.model.clone());
+                match preferred {
+                    Some(preferred) if self.app.model_refs().contains(&preferred) => {
+                        Some(preferred)
+                    }
+                    Some(preferred) => {
+                        let fallback = self.app.fallback_default_model().ok_or_else(|| {
+                            ClientError::Runtime(format!(
+                                "model `{preferred}` is not configured, and this environment has no\
+                                 other configured model to fall back to"
+                            ))
+                        })?;
+                        substitution = Some((fallback.clone(), preferred));
+                        Some(fallback)
+                    }
+                    // No model exists anywhere in this environment. That is a
+                    // legitimate deterministic execution context, not a
+                    // reason to block the runtime: the session is created
+                    // with model = NULL and agent turns fail loudly.
+                    None => None,
                 }
             }
         };
@@ -7414,7 +7545,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                             .primary_workspace()
                             .map(|root| root.display().to_string()),
                         goal: request.goal.clone(),
-                        model: model.to_string(),
+                        model: model.as_ref().map(ToString::to_string),
                         mode: execution_mode(request.mode).as_str().to_string(),
                         sandbox: self.default_runtime.sandbox,
                         kind: leveler_engine::ExecutionKind::Direct,
@@ -7433,7 +7564,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             (
                 self.app
                     .create_daemon_session(
-                        &model,
+                        model.as_ref(),
                         &request.goal,
                         execution_mode(request.mode),
                         request.collaboration,
@@ -7467,17 +7598,18 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             }
         }
         let session = self.snapshot(&session_id).await?;
-        let context_window =
-            self.app
+        // No model means no context window. Zero is the wire's absent value;
+        // clients already treat it as unknown.
+        let context_window = match session.model.as_ref() {
+            Some(model) => self
+                .app
                 .registry()
-                .profile(
-                    session.model.as_ref().ok_or_else(|| {
-                        ClientError::Runtime("created session has no model".into())
-                    })?,
-                )
+                .profile(model)
                 .await
                 .map(|profile| profile.limits.context_window)
-                .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                .map_err(|error| ClientError::Runtime(error.to_string()))?,
+            None => 0,
+        };
         Ok(leveler_local_transport::SessionBootstrap {
             session,
             context_window,
@@ -8052,7 +8184,10 @@ async fn compact_conversation(
             .collect();
         let mut available_models = app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
-        let profile = app.registry().profile(&model).await.ok();
+        let profile = match model.as_ref() {
+            Some(model) => app.registry().profile(model).await.ok(),
+            None => None,
+        };
         let vision = profile
             .as_ref()
             .map(|p| p.capabilities.vision)
@@ -8125,7 +8260,7 @@ async fn compact_conversation(
                 task_status: Some(task_status),
                 task_terminal,
                 goal: record.goal,
-                model: Some(model.clone()),
+                model: model.clone(),
                 mode: protocol_mode(mode),
                 branch: app.layout.primary_workspace().and_then(detect_branch_label),
                 status: session_status_wire(record.status, task_status).into(),
@@ -8570,7 +8705,7 @@ mod approval_policy_tests {
         use std::sync::Barrier;
         let session_id = SessionId::new("concurrent-policy");
         let initial = SessionRuntimeConfig {
-            model: ModelRef::new("mock", "m"),
+            model: Some(ModelRef::new("mock", "m")),
             mode: PermissionProfile::Assisted,
             sandbox: false,
             collaboration: "chat".into(),
@@ -8587,7 +8722,7 @@ mod approval_policy_tests {
             let attached = attached.clone();
             std::thread::spawn(move || {
                 let mut hydrated = configs.lock().unwrap()[&session_id].clone();
-                hydrated.model = ModelRef::new("mock", "selected");
+                hydrated.model = Some(ModelRef::new("mock", "selected"));
                 durable_read.wait();
                 attached.wait();
                 install_persisted_config(&configs, &session_id, hydrated)
@@ -8608,7 +8743,10 @@ mod approval_policy_tests {
             stored[&session_id].approval_policy,
             ApprovalPolicy::AutoApprove
         );
-        assert_eq!(stored[&session_id].model, ModelRef::new("mock", "selected"));
+        assert_eq!(
+            stored[&session_id].model,
+            Some(ModelRef::new("mock", "selected"))
+        );
     }
 
     use super::should_auto_approve;
@@ -9683,6 +9821,7 @@ mod session_stream_tests {
             leveler_core::UserShellId::new("shell"),
             "echo test".into(),
             "/repo".into(),
+            None,
             shell_cancel.clone(),
             CancellationToken::new(),
         );

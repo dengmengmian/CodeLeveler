@@ -25,6 +25,7 @@ tracing = { workspace = true }
 leveler-app = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-project = { workspace = true }
+leveler-storage = { workspace = true }
 leveler-test-support = { workspace = true }
 tempfile = "3"
 tokio-util = { workspace = true }

@@ -111,7 +111,7 @@ impl Application {
             .create_task(&NewSession {
                 workspace: Some(repo_root.display().to_string()),
                 goal: task.to_string(),
-                model: model.to_string(),
+                model: Some(model.to_string()),
                 mode: mode_str(mode).to_string(),
                 sandbox,
                 kind: ExecutionKind::Parallel,

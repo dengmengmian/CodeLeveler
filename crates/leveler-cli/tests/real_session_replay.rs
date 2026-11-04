@@ -143,7 +143,7 @@ async fn replay_a_recorded_session() {
         "replaying {} events from session {} ({} model)",
         records.len(),
         session.id,
-        session.model
+        session.model.as_deref().unwrap_or("no")
     );
 
     // The same projection a live client consumed.
@@ -158,7 +158,7 @@ async fn replay_a_recorded_session() {
                 &session.id,
                 &session.goal,
                 session.repository.as_deref(),
-                &session.model,
+                session.model.as_deref().unwrap_or_default(),
             ),
         }),
     );

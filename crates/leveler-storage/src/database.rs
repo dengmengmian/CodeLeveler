@@ -834,6 +834,126 @@ mod tests {
         );
     }
 
+    /// 0048 makes `sessions.model` nullable. An upgraded database must keep
+    /// every session and child row, keep the retired memory triggers retired,
+    /// and let model-free and model-backed sessions coexist in one table.
+    #[tokio::test]
+    async fn migration_0048_keeps_legacy_sessions_and_admits_no_model_free_turn() {
+        use crate::{SessionRecord, SessionRepository, TurnRepository};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let mut conn = create_legacy_database(&path, 48).await;
+            sqlx::query(
+                "INSERT INTO sessions (id, repository, goal, status, model, state, \
+                 created_at, updated_at) VALUES ('legacy','/r','g','completed', \
+                 'provider/model','complete','t','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, \
+                 created_at) VALUES ('legacy-turn','legacy',1,'user', \
+                 '{\"initiating_message\":{\"text\":\"hi\"}}','completed','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO tasks (id, session_id, created_at) VALUES \
+                 ('legacy-task','legacy','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO session_messages (session_id, ordinal, payload, created_at) \
+                 VALUES ('legacy', 1, '{}', 't')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let db = Database::connect(&path).await.unwrap();
+        let (model, collaboration, kind): (Option<String>, String, String) = sqlx::query_as(
+            "SELECT model, collaboration, kind FROM sessions WHERE id = 'legacy'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(model.as_deref(), Some("provider/model"));
+        assert_eq!(collaboration, "goal");
+        assert_eq!(kind, "direct");
+        for table in ["turns", "tasks", "session_messages"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "migration 0048 dropped a row from {table}");
+        }
+
+        let not_null: i64 = sqlx::query_scalar(
+            "SELECT \"notnull\" FROM pragma_table_info('sessions') WHERE name = 'model'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(not_null, 0, "sessions.model is still NOT NULL");
+
+        // Retired memory triggers must stay dropped across the table rebuild.
+        for trigger in [
+            "admit_fresh_turn_to_memory_inbox",
+            "admit_fresh_turn_to_experience_inbox",
+            "admit_continuation_to_experience_inbox",
+        ] {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(trigger)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "migration 0048 resurrected trigger {trigger}");
+        }
+
+        let record = SessionRecord::new_with_optional_model(
+            Some("/r".into()),
+            "deterministic",
+            None,
+            leveler_core::now(),
+        );
+        let id = leveler_core::SessionId::new(record.id.clone());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let turn = TurnRepository::new(&db)
+            .start(
+                &id,
+                "user",
+                Some(r#"{"initiating_message":{"text":"hi"}}"#),
+                leveler_core::now(),
+            )
+            .await;
+        assert!(
+            turn.is_ok(),
+            "a model-free session must accept a turn: {:?}",
+            turn.err()
+        );
+
+        // A model-backed session still coexists in the same table.
+        let backed = SessionRecord::new("/r", "chat", "provider/model", leveler_core::now());
+        let backed_id = leveler_core::SessionId::new(backed.id.clone());
+        SessionRepository::new(&db).create(&backed).await.unwrap();
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT model FROM sessions WHERE id = ?1")
+                .bind(backed_id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("provider/model"));
+    }
+
     #[tokio::test]
     async fn peek_repository_reads_latest_row_without_migrating() {
         let dir = std::env::temp_dir().join(format!(

@@ -565,6 +565,14 @@ pub struct UiInterruptedToolCall {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiUserShell {
     pub id: leveler_core::UserShellId,
+    /// The delivery identity of the command that produced this execution, when
+    /// it arrived through a `CommandEnvelope`. It is the runtime's record of
+    /// *which request* this execution answers, so a caller that owns the
+    /// command id can find its own execution without matching command text.
+    /// Absent for a raw `send` and for executions recorded before the field
+    /// existed; never inferred from the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_command_id: Option<leveler_core::CommandId>,
     pub command: String,
     pub cwd: String,
     /// `running | background | success | failed | cancelled | unknown`.

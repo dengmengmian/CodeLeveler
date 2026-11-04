@@ -45,6 +45,26 @@ pub(crate) fn resolve_model_with_notice(
     Ok((chosen, notice))
 }
 
+/// [`resolve_model_with_notice`], for a runtime that can also host
+/// deterministic work.
+///
+/// A daemon is a runtime, not an agent invocation: `!command` and scheduled
+/// shell actions are real host executions that never call a model. With no
+/// model configured the runtime starts and this returns `None`; the first
+/// agent turn reports the missing model from the session, where the person can
+/// act on it. An explicit `--model` is still the user's intent and a bad value
+/// still fails here.
+pub(crate) fn resolve_optional_model_with_notice(
+    app: &Application,
+    model: Option<String>,
+) -> anyhow::Result<(Option<ModelRef>, Option<String>)> {
+    if model.is_none() && app.model_refs().is_empty() {
+        return Ok((None, None));
+    }
+    let (chosen, notice) = resolve_model_with_notice(app, model)?;
+    Ok((Some(chosen), notice))
+}
+
 fn choose_model(
     app: &Application,
     model: Option<String>,

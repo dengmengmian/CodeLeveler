@@ -2402,6 +2402,7 @@ dependencies = [
  "leveler-execution",
  "leveler-local-transport",
  "leveler-project",
+ "leveler-storage",
  "leveler-test-support",
  "serde",
  "serde_json",

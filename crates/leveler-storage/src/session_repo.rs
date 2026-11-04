@@ -87,7 +87,9 @@ pub struct SessionRecord {
     /// persisted value fails the read rather than defaulting.
     pub status: SessionStatus,
     /// Model reference (`provider/model`) the session was started with.
-    pub model: String,
+    /// `None` is a deterministic-only session: it can execute shell actions
+    /// but no agent turn runs on it. Never filled with a placeholder model.
+    pub model: Option<String>,
     /// Agent state, with the same strict decoding as [`Self::status`].
     pub state: AgentState,
     /// Creation time as RFC 3339 text. Unlike other tables this stays a
@@ -112,7 +114,7 @@ pub(crate) struct SessionRow {
     repository: Option<String>,
     goal: String,
     status: String,
-    model: String,
+    model: Option<String>,
     state: String,
     created_at: String,
     updated_at: String,
@@ -683,13 +685,23 @@ impl SessionRecord {
         model: impl Into<String>,
         now: Timestamp,
     ) -> Self {
-        Self::new_with_workspace(Some(repository.into()), goal, model, now)
+        Self::new_with_workspace(Some(repository.into()), goal, Some(model.into()), now)
+    }
+
+    /// Build a record whose session may have no model.
+    pub fn new_with_optional_model(
+        repository: Option<String>,
+        goal: impl Into<String>,
+        model: Option<String>,
+        now: Timestamp,
+    ) -> Self {
+        Self::new_with_workspace(repository, goal, model, now)
     }
 
     fn new_with_workspace(
         repository: Option<String>,
         goal: impl Into<String>,
-        model: impl Into<String>,
+        model: Option<String>,
         now: Timestamp,
     ) -> Self {
         let ts = now.to_rfc3339();
@@ -698,7 +710,7 @@ impl SessionRecord {
             repository,
             goal: goal.into(),
             status: SessionStatus::Created,
-            model: model.into(),
+            model,
             state: AgentState::Understand,
             created_at: ts.clone(),
             updated_at: ts,
@@ -716,7 +728,7 @@ impl SessionRecord {
         model: impl Into<String>,
         now: Timestamp,
     ) -> Self {
-        Self::new_with_workspace(None, goal, model, now)
+        Self::new_with_workspace(None, goal, Some(model.into()), now)
     }
 
     /// Set collaboration before insert. The legacy profile argument is ignored.
@@ -852,7 +864,7 @@ mod tests {
         );
         let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
         assert_eq!(snapshot.sequence, Some(1));
-        assert_eq!(snapshot.session.model, "m");
+        assert_eq!(snapshot.session.model.as_deref(), Some("m"));
         assert_eq!(
             repo.edit_at_version(
                 &id,
@@ -879,7 +891,7 @@ mod tests {
             .await
             .unwrap();
         let merged = repo.settings_snapshot(&id).await.unwrap().unwrap();
-        assert_eq!(merged.session.model, "selected");
+        assert_eq!(merged.session.model.as_deref(), Some("selected"));
         assert_eq!(merged.mode, "full_access");
         assert_eq!(merged.session.collaboration, "goal");
         assert_eq!(merged.sequence, Some(4));
@@ -1048,7 +1060,7 @@ mod tests {
         let record = SessionRecord::new("/repo", "goal", "model", now);
         assert_eq!(record.repository.as_deref(), Some("/repo"));
         assert_eq!(record.goal, "goal");
-        assert_eq!(record.model, "model");
+        assert_eq!(record.model.as_deref(), Some("model"));
         assert_eq!(record.status, SessionStatus::Created);
         assert_eq!(record.state, AgentState::Understand);
         assert_eq!(record.created_at, now.to_rfc3339());

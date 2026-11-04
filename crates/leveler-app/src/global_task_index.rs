@@ -127,7 +127,10 @@ pub async fn query_global_tasks(home: &LevelerHome, include_archived: bool) -> U
                 last_activity_at: facts.last_activity_at,
                 archived_at: facts.archived_at,
                 status,
-                model: facts.session.model,
+                // Display-only projection: a deterministic session has no
+                // model, and an empty label is honest. The authoritative
+                // snapshot carries `None`.
+                model: facts.session.model.unwrap_or_default(),
             });
         }
     }

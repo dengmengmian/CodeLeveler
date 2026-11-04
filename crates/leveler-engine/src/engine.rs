@@ -167,7 +167,10 @@ pub struct NewSession {
     /// The workspace the session is about, as it should be persisted.
     pub workspace: Option<String>,
     pub goal: String,
-    pub model: String,
+    /// The model the session starts with. `None` is a deterministic-only
+    /// session: the runtime can execute host commands for it, and every agent
+    /// turn fails with a configuration error instead of inventing a model.
+    pub model: Option<String>,
     /// The permission mode's wire string.
     pub mode: String,
     pub sandbox: bool,
@@ -574,17 +577,12 @@ impl TaskEngine {
         identity: Option<(&leveler_core::CommandId, &str)>,
     ) -> Result<(SessionId, bool), EngineError> {
         let now = leveler_core::now();
-        let mut record = match &session.workspace {
-            Some(workspace) => SessionRecord::new(
-                workspace.clone(),
-                session.goal.clone(),
-                session.model.clone(),
-                now,
-            ),
-            None => {
-                SessionRecord::without_workspace(session.goal.clone(), session.model.clone(), now)
-            }
-        };
+        let mut record = SessionRecord::new_with_optional_model(
+            session.workspace.clone(),
+            session.goal.clone(),
+            session.model.clone(),
+            now,
+        );
         record.model_pinned = session.model_pinned;
         if let Some(axes) = &session.axes {
             record = record.with_axes(&axes.collaboration, "single");

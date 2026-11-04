@@ -487,7 +487,7 @@ impl Application {
         // transport's `create_session`, which states `model_pinned: false`;
         // an explicit `/model` pins through `SessionEdit::Model`; a resume
         // keeps the row's stored model.
-        self.insert_session(&db, model, goal, mode, collaboration, true)
+        self.insert_session(&db, Some(model), goal, mode, collaboration, true)
             .await
     }
 
@@ -550,7 +550,7 @@ impl Application {
     /// from one decision.
     pub(crate) async fn create_daemon_session(
         &self,
-        model: &ModelRef,
+        model: Option<&ModelRef>,
         goal: &str,
         mode: PermissionProfile,
         collaboration: leveler_lifecycle::CollaborationMode,
@@ -564,7 +564,7 @@ impl Application {
     async fn insert_session(
         &self,
         db: &leveler_storage::Database,
-        model: &ModelRef,
+        model: Option<&ModelRef>,
         goal: &str,
         mode: PermissionProfile,
         collaboration: leveler_lifecycle::CollaborationMode,
@@ -577,7 +577,7 @@ impl Application {
                     .primary_workspace()
                     .map(|root| root.display().to_string()),
                 goal: goal.to_string(),
-                model: model.to_string(),
+                model: model.map(ToString::to_string),
                 mode: mode.as_str().to_string(),
                 sandbox: false,
                 kind: ExecutionKind::Direct,
@@ -1151,8 +1151,13 @@ impl Application {
             .get(session_id)
             .await?
             .ok_or_else(|| AppError::NotFound(session_id.to_string()))?;
-        let model = ModelRef::parse(&record.model)
-            .ok_or_else(|| AppError::NotFound(format!("model `{}`", record.model)))?;
+        let model = record
+            .model
+            .as_deref()
+            .and_then(ModelRef::parse)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("session {session_id} has no model configured"))
+            })?;
         let (mode, sandbox, kind, _) = repo
             .execution(session_id)
             .await?

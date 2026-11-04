@@ -285,7 +285,7 @@ async fn replay_session(
         session: session.id.clone(),
         repository: session.repository.clone().unwrap_or_default(),
         goal: session.goal.chars().take(120).collect(),
-        model: session.model.clone(),
+        model: session.model.clone().unwrap_or_default(),
         events: records.len(),
         ..Default::default()
     };
@@ -300,7 +300,7 @@ async fn replay_session(
                 &session.id,
                 &session.goal,
                 session.repository.as_deref(),
-                &session.model,
+                session.model.as_deref().unwrap_or_default(),
             ),
         }),
     );

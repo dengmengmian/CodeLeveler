@@ -197,6 +197,8 @@ struct ActiveShell {
     id: UserShellId,
     command: String,
     cwd: String,
+    /// Delivery identity of the command that started this execution.
+    origin_command_id: Option<leveler_core::CommandId>,
     started: Instant,
     cancel: CancellationToken,
     /// Cancelled to ask the streaming driver to hand the same process over.
@@ -278,6 +280,7 @@ impl UserShellStore {
         id: UserShellId,
         command: String,
         cwd: String,
+        origin_command_id: Option<leveler_core::CommandId>,
         cancel: CancellationToken,
         handoff: CancellationToken,
     ) {
@@ -287,6 +290,7 @@ impl UserShellStore {
             id,
             command,
             cwd,
+            origin_command_id,
             started: Instant::now(),
             cancel,
             handoff,
@@ -398,6 +402,7 @@ impl UserShellStore {
         shells.background.push(BackgroundShell {
             shell: UiUserShell {
                 id: active.id,
+                origin_command_id: active.origin_command_id,
                 command: active.command,
                 cwd: active.cwd,
                 status: "background".to_string(),
@@ -465,6 +470,7 @@ impl UserShellStore {
         let (output_tail, output_truncated) = tail.snapshot();
         let shell = UiUserShell {
             id: background.shell.id,
+            origin_command_id: background.shell.origin_command_id,
             command: background.shell.command,
             cwd: background.shell.cwd,
             status: status.to_string(),
@@ -531,6 +537,7 @@ impl UserShellStore {
             let (output_tail, output_truncated) = tail.snapshot();
             shells.history.push_back(UiUserShell {
                 id: active.id,
+                origin_command_id: active.origin_command_id,
                 command: active.command,
                 cwd: active.cwd,
                 status: status.to_string(),
@@ -579,6 +586,7 @@ impl UserShellStore {
             let (output_tail, output_truncated) = background.tail.snapshot();
             out.push(UiUserShell {
                 id: background.shell.id.clone(),
+                origin_command_id: background.shell.origin_command_id.clone(),
                 command: background.shell.command.clone(),
                 cwd: background.shell.cwd.clone(),
                 status: "background".to_string(),
@@ -594,6 +602,7 @@ impl UserShellStore {
             let (output_tail, output_truncated) = active.tail.snapshot();
             out.push(UiUserShell {
                 id: active.id.clone(),
+                origin_command_id: active.origin_command_id.clone(),
                 command: active.command.clone(),
                 cwd: active.cwd.clone(),
                 status: "running".to_string(),
@@ -640,12 +649,14 @@ pub(crate) async fn restore_from_events(
         match event {
             leveler_engine::EngineEvent::UserShellStarted {
                 execution_id,
+                origin_command_id,
                 command,
                 cwd,
             } => {
                 index.insert(execution_id.clone(), ordered.len());
                 ordered.push(UiUserShell {
                     id: execution_id,
+                    origin_command_id: origin_command_id.map(leveler_core::CommandId::new),
                     command,
                     cwd,
                     // Internal placeholder until a terminal fact is applied;
@@ -753,9 +764,15 @@ pub(crate) fn authoritative_tail(output: &ProcessOutput) -> String {
 }
 
 /// Canonical started fact.
-pub(crate) fn started_event(id: &UserShellId, command: &str, cwd: &str) -> EngineEvent {
+pub(crate) fn started_event(
+    id: &UserShellId,
+    command: &str,
+    cwd: &str,
+    origin_command_id: Option<&leveler_core::CommandId>,
+) -> EngineEvent {
     EngineEvent::UserShellStarted {
         execution_id: id.clone(),
+        origin_command_id: origin_command_id.map(|origin| origin.as_str().to_string()),
         command: command.to_string(),
         cwd: cwd.to_string(),
     }
@@ -796,6 +813,7 @@ mod tests {
             id.clone(),
             "seq 1 2000".into(),
             "/repo".into(),
+            None,
             CancellationToken::new(),
             CancellationToken::new(),
         );
@@ -832,6 +850,7 @@ mod tests {
             id.clone(),
             "echo one".into(),
             "/repo".into(),
+            None,
             CancellationToken::new(),
             CancellationToken::new(),
         );
@@ -852,6 +871,7 @@ mod tests {
             old.clone(),
             "sleep 1".into(),
             "/repo".into(),
+            None,
             CancellationToken::new(),
             CancellationToken::new(),
         );
@@ -861,6 +881,7 @@ mod tests {
             new.clone(),
             "sleep 2".into(),
             "/repo".into(),
+            None,
             CancellationToken::new(),
             CancellationToken::new(),
         );
@@ -878,6 +899,7 @@ mod tests {
             a.clone(),
             "echo one".into(),
             "/repo".into(),
+            None,
             CancellationToken::new(),
             CancellationToken::new(),
         );
@@ -889,6 +911,7 @@ mod tests {
             b.clone(),
             "sleep 9".into(),
             "/repo".into(),
+            None,
             CancellationToken::new(),
             CancellationToken::new(),
         );
