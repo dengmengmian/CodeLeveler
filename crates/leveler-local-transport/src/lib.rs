@@ -1999,19 +1999,19 @@ mod transport {
                     Err(error) => {
                         if matches!(error, TransportError::NoAnswer { .. }) {
                             tracing::warn!(%error, "local runtime did not answer; retrying without reviving");
-                        } else if let Some(reviver) = reviver.get() {
-                            if let Err(error) = reviver.revive().await {
-                                tracing::warn!(%error, "local runtime revival failed; retrying");
-                                // A refusal can be based on a real observation
-                                // of the runtime that answered (a different
-                                // build). Report that fact even though the
-                                // attach stays refused; otherwise the client
-                                // knows something is wrong and tells the user
-                                // nothing.
-                                if let Some(runtime_build) = reviver.observed_build() {
-                                    let _ = events
-                                        .send(RuntimeEvent::RuntimeBuildObserved { runtime_build });
-                                }
+                        } else if let Some(reviver) = reviver.get()
+                            && let Err(error) = reviver.revive().await
+                        {
+                            tracing::warn!(%error, "local runtime revival failed; retrying");
+                            // A refusal can be based on a real observation
+                            // of the runtime that answered (a different
+                            // build). Report that fact even though the
+                            // attach stays refused; otherwise the client
+                            // knows something is wrong and tells the user
+                            // nothing.
+                            if let Some(runtime_build) = reviver.observed_build() {
+                                let _ = events
+                                    .send(RuntimeEvent::RuntimeBuildObserved { runtime_build });
                             }
                         }
                         tokio::select! {

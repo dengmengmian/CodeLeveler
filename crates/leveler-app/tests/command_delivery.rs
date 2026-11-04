@@ -1120,19 +1120,40 @@ async fn socket_clients_receive_only_their_session_events_body() {
         .await
         .unwrap();
 
+    // Each subscription reports the connection-level facts of its own stream
+    // (which build serves it) on establishment. Those belong to this
+    // subscriber's connection, not to another session, so they are not
+    // cross-session delivery and must not fail the isolation check below.
+    let first_session_event = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), first_events.recv()).await {
+            Ok(Ok(
+                RuntimeEvent::RuntimeBuildObserved { .. } | RuntimeEvent::RuntimeReconnected { .. },
+            )) => {}
+            Ok(Ok(event)) => break event,
+            Ok(Err(error)) => panic!("the first subscription closed: {error}"),
+            Err(_) => panic!("the first subscription was never served"),
+        }
+    };
     assert!(matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), first_events.recv())
-            .await
-            .unwrap()
-            .unwrap(),
+        first_session_event,
         RuntimeEvent::SessionUpdated { .. }
     ));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), second_events.recv())
-            .await
-            .is_err(),
-        "a socket subscriber must not receive another session's event"
-    );
+
+    // Nothing session-scoped may reach the second subscriber; only the facts
+    // its own stream establishes for its own connection are allowed.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        match tokio::time::timeout_at(deadline, second_events.recv()).await {
+            Ok(Ok(
+                RuntimeEvent::RuntimeBuildObserved { .. } | RuntimeEvent::RuntimeReconnected { .. },
+            )) => {}
+            Ok(Ok(event)) => {
+                panic!("a socket subscriber received another session's event: {event:?}")
+            }
+            Ok(Err(error)) => panic!("the second subscription closed: {error}"),
+            Err(_) => break,
+        }
+    }
 
     shutdown.cancel();
     task.await.unwrap().unwrap();
