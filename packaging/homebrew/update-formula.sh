@@ -30,7 +30,6 @@ cat > "$HERE/leveler.rb" <<EOF
 class Leveler < Formula
   desc "Local-first coding agent CLI: terminal UI, typed tools, resumable sessions"
   homepage "https://github.com/dengmengmian/CodeLeveler"
-  version "${VER}"
   license "Apache-2.0"
 
   livecheck do
@@ -40,10 +39,10 @@ class Leveler < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-aarch64-apple-darwin.tar.gz"
       sha256 "${SHA_ARM_MAC}"
     else
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-x86_64-apple-darwin.tar.gz"
       sha256 "${SHA_X86_MAC}"
     end
   end
@@ -54,11 +53,11 @@ class Leveler < Formula
       # platform branch and rejects the tap when one has no URL, so this branch
       # names the artifact it would use; \`fetch\` then fails there with a plain
       # 404 instead of taking the whole tap down.
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-aarch64-unknown-linux-gnu.tar.gz"
       sha256 :no_check
     end
     on_intel do
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "${SHA_X86_LINUX}"
     end
   end
