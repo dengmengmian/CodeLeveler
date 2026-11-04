@@ -29,8 +29,8 @@ pub struct UpdateState {
     /// here, so an offline period never counts as "recently checked".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_unix_secs: Option<u64>,
-    /// When a check was last *attempted*, successful or not — the anti-hammer
-    /// guard for a product that is restarted often.
+    /// When a check was last *attempted*, successful or not — used to back off
+    /// after a failure, so restarting in a loop cannot hammer the API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt_unix_secs: Option<u64>,
 }
@@ -38,17 +38,21 @@ pub struct UpdateState {
 impl UpdateState {
     /// Whether a start-up check is due at `now`.
     ///
-    /// Due when the successful check is older than `interval_hours` (clamped to
-    /// at least one hour) and the previous attempt is older than the retry
-    /// backoff.
+    /// A zero interval means every start is due. A positive interval only
+    /// repeats a successful check once it is older than that many hours. A
+    /// failed attempt is retried after the backoff rather than suppressed.
     pub fn is_due(&self, interval_hours: u64, now: u64) -> bool {
-        let interval = interval_hours.max(1) * 3600;
-        let success_fresh = self
-            .last_success_unix_secs
-            .is_some_and(|t| now.saturating_sub(t) < interval);
-        let retry_too_soon = self
-            .last_attempt_unix_secs
-            .is_some_and(|t| now.saturating_sub(t) < RETRY_BACKOFF_SECS);
+        let interval = interval_hours.saturating_mul(3600);
+        let success_fresh = interval > 0
+            && self
+                .last_success_unix_secs
+                .is_some_and(|t| now.saturating_sub(t) < interval);
+        let retry_too_soon = match (self.last_attempt_unix_secs, self.last_success_unix_secs) {
+            (Some(attempt), success) if success.is_none_or(|success| attempt > success) => {
+                now.saturating_sub(attempt) < RETRY_BACKOFF_SECS
+            }
+            _ => false,
+        };
         !success_fresh && !retry_too_soon
     }
 
@@ -132,13 +136,23 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_interval_is_clamped_to_one_hour() {
+    fn a_zero_interval_checks_on_every_start() {
         let state = UpdateState {
             last_success_unix_secs: Some(1_000_000),
             last_attempt_unix_secs: Some(1_000_000),
         };
+        // A successful check one second ago does not suppress the next start.
+        assert!(state.is_due(0, 1_000_000 + 1));
+    }
+
+    #[test]
+    fn a_zero_interval_still_backs_off_after_a_failed_attempt() {
+        let state = UpdateState {
+            last_success_unix_secs: None,
+            last_attempt_unix_secs: Some(1_000_000),
+        };
         assert!(!state.is_due(0, 1_000_000 + 60));
-        assert!(state.is_due(0, 1_000_000 + 3600));
+        assert!(state.is_due(0, 1_000_000 + RETRY_BACKOFF_SECS));
     }
 
     #[test]

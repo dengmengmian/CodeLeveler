@@ -107,10 +107,10 @@ pub(crate) async fn run_manual<S: ReleaseSource>(
 /// The best-effort start-up check.
 ///
 /// Returns nothing and never fails: an unreachable GitHub, a bad checksum, or
-/// a read-only install directory must leave the current version running. A
-/// successful check is recorded so the interval is measured from real contact,
-/// and a failed attempt is backstopped so restarting in a loop cannot hammer
-/// the API.
+/// a read-only install directory must leave the current version running. With
+/// the default interval every start checks; a successful check is recorded so
+/// an explicit interval is measured from real contact, and a failed attempt is
+/// backstopped so restarting in a loop cannot hammer the API.
 pub(crate) async fn run_startup_update() {
     if running_from_homebrew() {
         // The formula owns this file; a self-replacement would contradict it.
@@ -144,8 +144,9 @@ pub(crate) async fn run_startup_update() {
 
     let release = match service.check().await {
         Ok(release) => {
-            // A completed query counts even when it found nothing: the next
-            // check is an interval away.
+            // A completed query counts even when it found nothing: with a zero
+            // interval the next start checks again, and an explicit interval
+            // waits for that many hours.
             state.mark_success(now);
             leveler_update::state::save(&state);
             release

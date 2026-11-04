@@ -32,7 +32,7 @@
 //!
 //! [update]
 //! auto_update = true           # optional; check + install stable releases at start-up
-//! check_interval_hours = 1     # optional; hours between successful checks
+//! check_interval_hours = 0     # optional; 0 = check on every start
 //!
 //! [providers.deepseek]
 //! base_url = "https://api.deepseek.com"
@@ -152,7 +152,7 @@ struct GlobalUpdate {
     /// Check for (and install) a newer stable release at start-up.
     #[serde(default = "default_true")]
     auto_update: bool,
-    /// Hours between successful checks (clamped to at least one).
+    /// Hours between successful checks; `0` checks on every start.
     #[serde(default = "default_check_interval_hours")]
     check_interval_hours: u64,
 }
@@ -161,13 +161,13 @@ impl Default for GlobalUpdate {
     fn default() -> Self {
         Self {
             auto_update: true,
-            check_interval_hours: 1,
+            check_interval_hours: 0,
         }
     }
 }
 
 fn default_check_interval_hours() -> u64 {
-    1
+    0
 }
 
 /// `[web]`. Today one child: the search backend.
@@ -849,9 +849,9 @@ impl GlobalConfig {
         self.update.auto_update
     }
 
-    /// `[update].check_interval_hours`, clamped to at least one.
+    /// `[update].check_interval_hours`; `0` means every start checks.
     pub fn update_check_interval_hours(&self) -> u64 {
-        self.update.check_interval_hours.max(1)
+        self.update.check_interval_hours
     }
 
     /// `[storage].tool_cache_max_bytes` — the tool-cache size budget, when set.
@@ -882,7 +882,7 @@ pub fn render_init_config(
     doc["default_model"] = value(format!("{provider_id}/{model_id}"));
     let mut update = toml_edit::Table::new();
     update["auto_update"] = value(true);
-    update["check_interval_hours"] = value(1);
+    update["check_interval_hours"] = value(0);
     doc["update"] = toml_edit::Item::Table(update);
     let mut provider = toml_edit::Table::new();
     provider["base_url"] = value(base_url);
@@ -1003,8 +1003,8 @@ fn annotate_generated_config(doc: &mut DocumentMut) {
         annotate_table_field(
             update,
             "check_interval_hours",
-            "成功检查更新后的最短检查间隔（小时，最小为 1）。",
-            "Minimum hours between successful update checks (minimum 1).",
+            "成功检查更新后的最短检查间隔（小时）；0 表示每次启动都检查。",
+            "Minimum hours between successful update checks; 0 checks on every start.",
         );
     }
 
@@ -1916,10 +1916,10 @@ mod tests {
             Some("deepseek/deepseek-chat")
         );
         assert!(parsed.update_auto(), "a first-run config enables updates");
-        assert_eq!(parsed.update_check_interval_hours(), 1);
+        assert_eq!(parsed.update_check_interval_hours(), 0);
         let doc: DocumentMut = text.parse().unwrap();
         assert_eq!(doc["update"]["auto_update"].as_bool(), Some(true));
-        assert_eq!(doc["update"]["check_interval_hours"].as_integer(), Some(1));
+        assert_eq!(doc["update"]["check_interval_hours"].as_integer(), Some(0));
         let bundle = parsed.into_bundle();
         assert_eq!(bundle.providers.len(), 1, "one provider: {text}");
         assert_eq!(bundle.providers[0].id, "deepseek");
@@ -2613,7 +2613,7 @@ completion_judge_timeout_seconds = 180
     fn the_update_section_is_on_by_default_and_configurable() {
         let default = GlobalConfig::from_toml_str("").unwrap();
         assert!(default.update_auto());
-        assert_eq!(default.update_check_interval_hours(), 1);
+        assert_eq!(default.update_check_interval_hours(), 0);
 
         let on = GlobalConfig::from_toml_str("[update]\nauto_update = true\n").unwrap();
         assert!(on.update_auto());
@@ -2624,9 +2624,9 @@ completion_judge_timeout_seconds = 180
         let hourly = GlobalConfig::from_toml_str("[update]\ncheck_interval_hours = 6\n").unwrap();
         assert_eq!(hourly.update_check_interval_hours(), 6);
 
-        // A zero interval is clamped rather than becoming a check per start.
+        // Zero is the default: every start checks.
         let zero = GlobalConfig::from_toml_str("[update]\ncheck_interval_hours = 0\n").unwrap();
-        assert_eq!(zero.update_check_interval_hours(), 1);
+        assert_eq!(zero.update_check_interval_hours(), 0);
     }
 
     #[test]
