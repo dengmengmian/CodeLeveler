@@ -52,7 +52,9 @@ fn snapshot(goal: &str, status: &str) -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),
@@ -383,6 +385,7 @@ fn completion_turns_green_and_fails_stay() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "internal invariant violated".into(),
             failure: None,
+            recovery: None,
         }),
     );
     let goal = failed.active_goal.as_ref().unwrap();
@@ -426,6 +429,7 @@ fn a_paused_turn_states_the_phase_and_drops_the_live_marker() {
                 summary: "模型服务暂时不可用。".to_string(),
                 detail: String::new(),
             }),
+            recovery: None,
         }),
     );
     let goal = state.active_goal.as_ref().unwrap();

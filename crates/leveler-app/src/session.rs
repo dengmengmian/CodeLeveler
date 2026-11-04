@@ -275,11 +275,9 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         // producing agent and the capacity is that they reach the user.
         error @ (EngineError::EventBufferOverloaded { .. }
         | EngineError::DuplicateChildSettlement { .. }) => AppError::Engine(error.to_string()),
-        EngineError::RecoveryConfirmationRequired { call_id, tool } => AppError::Engine(format!(
-            "crash recovery halted: an interrupted `{tool}` (call {call_id}) may already have \
-             run; inspect the workspace, then resume with --confirm-recovery to acknowledge \
-             and continue"
-        )),
+        EngineError::RecoveryConfirmationRequired { call_id, tool } => {
+            AppError::RecoveryConfirmationRequired { call_id, tool }
+        }
         // Ownership failures stay loud and named: the user (or a supervising
         // layer) must know this was a fencing decision, not a storage fault.
         error @ (EngineError::Ownership(_) | EngineError::OwnershipConflict { .. }) => {

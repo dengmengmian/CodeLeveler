@@ -48,6 +48,10 @@ pub enum Overlay {
     /// Confirm deleting a stored session. Deleting is irreversible, so it takes
     /// an explicit choice rather than firing on the first `d`.
     ConfirmSessionDelete(Box<SelectionModel>),
+    /// Review the tool calls a crashed runtime left without an outcome, then
+    /// acknowledge that their result is unknown. Acknowledging never replays
+    /// them; it only releases the recovery gate the runtime holds.
+    ConfirmRecovery(Box<SelectionModel>),
     /// `/thinking` — the session's Thinking Level, listing only the levels this
     /// model can actually distinguish.
     ThinkingPicker(Box<SelectionModel>),
@@ -72,6 +76,7 @@ impl Overlay {
             | Overlay::CollabPicker(_)
             | Overlay::CheckpointPicker(_)
             | Overlay::ConfirmSessionDelete(_)
+            | Overlay::ConfirmRecovery(_)
             | Overlay::ThinkingPicker(_) => None,
         }
     }
@@ -96,7 +101,8 @@ impl Overlay {
             | Overlay::CollabPicker(m)
             | Overlay::UnsupportedMedia(m)
             | Overlay::CheckpointPicker(m)
-            | Overlay::ConfirmSessionDelete(m) => {
+            | Overlay::ConfirmSessionDelete(m)
+            | Overlay::ConfirmRecovery(m) => {
                 if !m.is_searchable() {
                     return false;
                 }
@@ -309,6 +315,7 @@ fn build_content(
         | Overlay::UnsupportedMedia(model)
         | Overlay::CheckpointPicker(model)
         | Overlay::ConfirmSessionDelete(model)
+        | Overlay::ConfirmRecovery(model)
         | Overlay::ThinkingPicker(model) => selection_content(model, theme, width, locale),
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),

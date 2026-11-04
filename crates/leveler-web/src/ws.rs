@@ -369,6 +369,7 @@ fn error_frame(error: &ClientError, command_id: Option<String>) -> DownstreamMes
         ClientError::SessionNotFound(_) => "session_not_found",
         ClientError::Runtime(_) => "runtime_error",
         ClientError::OutcomeUnknown(_) => "outcome_unknown",
+        ClientError::RecoveryRequired(_) => "recovery_required",
         ClientError::Unresolvable(_) => "outcome_unresolvable",
         ClientError::OwnershipConflict(_) => "ownership_conflict",
     };

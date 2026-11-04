@@ -1156,6 +1156,10 @@ pub struct DaemonReviver {
     layout: Layout,
     launch: DetachedRuntimeLaunch,
     ui: Arc<dyn HandoffUi>,
+    /// The build observed while a revival failed. Kept only long enough for the
+    /// transport to report it: the attach stays refused, but a known-different
+    /// generation is a fact the user needs in order to restart.
+    observed_build: std::sync::Mutex<Option<leveler_client_protocol::BuildIdentity>>,
     /// One revival at a time. The request path and the event-stream reconnect
     /// path revive the same runtime, and `ensure_default_runtime` only probes
     /// the endpoint once at its start: two concurrent revivals each spawn a
@@ -1172,6 +1176,7 @@ impl DaemonReviver {
             layout,
             launch,
             ui,
+            observed_build: std::sync::Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
         }
     }
@@ -1182,16 +1187,39 @@ impl DaemonReviver {
 impl RuntimeReviver for DaemonReviver {
     async fn revive(&self) -> Result<(), String> {
         let _gate = self.gate.lock().await;
-        ensure_default_runtime(&self.layout, &self.launch, self.ui.clone())
-            .await
-            .map(|_probe_client| ())
-            .map_err(|error| {
-                error
-                    .downcast_ref::<EnsureError>()
-                    .map(|host| self.ui.render_ensure_error(host))
-                    .unwrap_or_else(|| error.to_string())
-            })
+        let result = ensure_default_runtime(&self.layout, &self.launch, self.ui.clone()).await;
+        // A failed revival can leave a runtime that is answering but is a
+        // different build. Observe it now, while it is still the process that
+        // answered the failed ensure: the transport reports the identity and
+        // the UI can tell the user to restart. Success clears any stale
+        // observation, so only the current attempt can be reported.
+        let observed = match &result {
+            Ok(_) => None,
+            Err(_) => observe_runtime_build(&self.layout).await,
+        };
+        *self.observed_build.lock().unwrap() = observed;
+        result.map(|_probe_client| ()).map_err(|error| {
+            error
+                .downcast_ref::<EnsureError>()
+                .map(|host| self.ui.render_ensure_error(host))
+                .unwrap_or_else(|| error.to_string())
+        })
     }
+
+    fn observed_build(&self) -> Option<leveler_client_protocol::BuildIdentity> {
+        self.observed_build.lock().unwrap().clone()
+    }
+}
+
+/// Ask the endpoint for the build it is serving, without attaching or sending
+/// a command. `None` means nothing was proven.
+#[cfg(any(unix, windows))]
+async fn observe_runtime_build(layout: &Layout) -> Option<leveler_client_protocol::BuildIdentity> {
+    let client = probe_default_runtime(&layout.socket_path()).await.ok()??;
+    LocalRuntimeService::runtime_info(&client)
+        .await
+        .ok()
+        .map(|info| info.build)
 }
 
 #[cfg(all(test, unix))]

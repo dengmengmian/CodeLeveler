@@ -1,11 +1,11 @@
 //! The contextual prompt suggestion: the structured next step the runtime
-//! already produced, offered as ghost text the user accepts with Tab.
+//! already produced, offered as ghost text the user accepts with Tab or `→`.
 //!
 //! It is **presentation state, never input**. It lives beside the composer, not
 //! inside it, so it can never reach `canonical_text()`, the persisted draft,
 //! the input history, the `$EDITOR` seed, slash/`@file` parsing, or a
 //! `UserMessage`. Only [`accept`] turns it into real text, and only because the
-//! user pressed Tab.
+//! user pressed a key that [`is_visible`] allowed to mean *accept*.
 
 use leveler_client_protocol::RuntimeStatus;
 use unicode_segmentation::UnicodeSegmentation;
@@ -83,10 +83,19 @@ pub fn offer_generated(state: &mut AppState, text: &str) {
 
 /// The single definition of "the ghost is on screen".
 ///
-/// Both the reducer (Tab / Esc) and the renderer read this, so there is exactly
-/// one answer to whether Tab means *accept* or *switch focus*.
+/// Both the reducer (Tab / `→` / Esc) and the renderer read this, so there is
+/// exactly one answer to whether Tab means *accept* or *switch focus*, and one
+/// answer to whether `→` means *accept* or *move the caret*. Every predicate
+/// here is one the painter needs, including the input mode: Shell Mode paints a
+/// command, never a suggestion, so nothing may accept one there.
+///
+/// A terminal reports composed IME text only after the IME commits it, so there
+/// is no composition event to consult here: while a candidate window is open the
+/// terminal owns the arrow keys, and if a terminal forwards `→` anyway this
+/// predicate cannot tell it apart from a plain caret move.
 pub fn is_visible(state: &AppState) -> bool {
     state.prompt_suggestion.is_some()
+        && state.input_mode == crate::shell_mode::InputMode::Normal
         && state.active_screen == Screen::Conversation
         && state.status == RuntimeStatus::Idle
         && state.runtime_connected
@@ -100,7 +109,7 @@ pub fn is_visible(state: &AppState) -> bool {
         && crate::screen::visible_file_popup(state).is_empty()
 }
 
-/// Tab: move the suggestion into the real buffer and stop there.
+/// Tab / `→`: move the suggestion into the real buffer and stop there.
 ///
 /// No command, no submission, no history entry — the user still has to press
 /// Enter, and until they do this is an ordinary draft they can edit or erase.

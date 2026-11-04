@@ -102,6 +102,21 @@ pub(crate) fn decide(
                     ));
                 };
                 if !last.ok {
+                    // A later successful compound line can contain this exact
+                    // command as one segment (`cmd; next`). That is not this
+                    // command's own record, but the earlier failure is no longer
+                    // the current state. Reporting "last run failed (step N)"
+                    // points the model at a stale step and invites a rerun that
+                    // cannot fix it. Name the real record instead.
+                    if let Some(later) = later_compound_pass(runs, last.model_step, cited) {
+                        return VerificationDecision::Refuse(format!(
+                            "`{cited}` last ran on its own at step {} and failed. It also appears \
+                             inside the later command `{}` (step {}), which passed as a compound \
+                             line; a subcommand is not its own execution record. Cite that command \
+                             in full, or run `{cited}` on its own again.",
+                            last.model_step, later.label, later.model_step
+                        ));
+                    }
                     return VerificationDecision::Refuse(format!(
                         "`{cited}` was cited as verification but its last run failed (step {}).",
                         last.model_step
@@ -310,6 +325,25 @@ fn closest_recorded_command<'a>(
 
 fn is_shell_separator(rest: &str) -> bool {
     !rest.is_empty() && rest.chars().all(|c| matches!(c, ';' | '&' | '|'))
+}
+
+/// A later successful record in which the cited command is one segment of a
+/// compound shell line.
+///
+/// The segment is deliberately not accepted as the cited command's own record:
+/// `a; b` may still report `a`'s failure through `b`'s success. It is returned
+/// only so a refusal can name the record that made the earlier failure stale.
+fn later_compound_pass<'a>(
+    runs: &'a [VerificationRun],
+    after_step: u32,
+    cited: &str,
+) -> Option<&'a VerificationRun> {
+    runs.iter().rev().find(|run| {
+        run.ok
+            && run.model_step > after_step
+            && closest_recorded_command(cited, std::slice::from_ref(*run))
+                .is_some_and(|partial| partial.glued)
+    })
 }
 
 /// Passing commands the model may copy. The closest record is included even
@@ -866,6 +900,70 @@ mod tests {
                 !reports_no_tests(output),
                 "a real mixed run must stay evidence: {output:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_citation_shadowed_by_a_later_compound_pass_names_the_real_record() {
+        // T10: `gofmt -l cmd pkg/yqlib` failed on its own at step 8, then ran
+        // inside a compound line that passed at step 54. "last run failed"
+        // pointed the model back at step 8 and invited a rerun that could not
+        // change the outcome.
+        let runs = vec![
+            run("gofmt -l cmd pkg/yqlib", false, 8, 1),
+            run(
+                "gofmt -l cmd pkg/yqlib; echo gofmt-done vet-ok",
+                true,
+                54,
+                2,
+            ),
+        ];
+        match decide(
+            &VerificationClaim::Passed(vec!["gofmt -l cmd pkg/yqlib".into()]),
+            &runs,
+            &[],
+            2,
+            true,
+        ) {
+            VerificationDecision::Refuse(message) => {
+                assert!(
+                    message.contains("appears inside the later command"),
+                    "{message}"
+                );
+                assert!(message.contains("(step 54)"), "{message}");
+                assert!(!message.contains("its last run failed"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_later_compound_line_does_not_hide_the_failure() {
+        // The same citation, but the later compound line failed too. No stale
+        // step exists, so the plain failure is the honest answer.
+        let runs = vec![
+            run("gofmt -l cmd pkg/yqlib", false, 8, 1),
+            run(
+                "gofmt -l cmd pkg/yqlib; echo gofmt-done vet-ok",
+                false,
+                54,
+                2,
+            ),
+        ];
+        match decide(
+            &VerificationClaim::Passed(vec!["gofmt -l cmd pkg/yqlib".into()]),
+            &runs,
+            &[],
+            2,
+            true,
+        ) {
+            VerificationDecision::Refuse(message) => {
+                assert!(
+                    !message.contains("appears inside the later command"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

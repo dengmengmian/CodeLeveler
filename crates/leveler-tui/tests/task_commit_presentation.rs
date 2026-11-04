@@ -81,7 +81,9 @@ fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),
@@ -245,6 +247,7 @@ fn a_hard_failure_clears_the_task_badge() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "internal invariant violated".into(),
             failure: None,
+            recovery: None,
         }),
     );
 

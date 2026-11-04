@@ -990,6 +990,8 @@ mod tests {
         assert_min(t.muted, s.canvas, 4.5, "muted/canvas");
         assert_min(t.muted, s.input, 4.5, "muted/input");
         assert_min(theme.plan.primary, s.canvas, 4.5, "plan.primary/canvas");
+        // The composer paints slash commands in this ink on the input surface.
+        assert_min(theme.plan.primary, s.input, 4.5, "plan.primary/input");
         assert_min(theme.status.success, s.canvas, 4.5, "success/canvas");
         assert_min(theme.status.warning, s.canvas, 4.5, "warning/canvas");
         assert_min(theme.status.error, s.canvas, 4.5, "error/canvas");

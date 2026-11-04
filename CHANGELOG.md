@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- `→` accepts the inline next-step suggestion, exactly like Tab: the ghost becomes editable input with the caret at its end and nothing is sent until Enter. With no suggestion showing — an empty popup, Shell Mode, a completion menu, a non-empty draft — it stays an ordinary caret move.
+
 ## [1.0.22] - 2026-11-04
 
 - Streamable HTTP MCP. `[[mcp_servers]]` accepts `url` (and optional `transport = "streamable_http"`, `headers`, `bearer_token_env`) in addition to the existing stdio `command` / `args` / `env` form. Header and bearer values are environment-variable names. The client negotiates MCP `2026-07-28` and falls back through the Streamable HTTP versions still used by older servers. A tool call whose result is unknown after a timeout or a dropped session is not sent again. OAuth 2.1 is not implemented. Existing stdio servers keep working without a config change.

@@ -55,6 +55,11 @@ impl NativeMascot {
         })
     }
 
+    /// Source pixel dimensions, so layout can match the illustration's aspect.
+    pub(crate) fn aspect(&self) -> (u32, u32) {
+        (self.source.width(), self.source.height())
+    }
+
     /// An alternate screen reset invalidates Kitty's transmitted-image cache.
     pub(crate) fn reset(&mut self) {
         self.protocol = self.picker.new_resize_protocol(self.source.clone());
@@ -110,7 +115,7 @@ mod tests {
     #[test]
     fn source_png_keeps_its_transparent_pixels() {
         let image = NativeMascot::new(ProtocolType::Iterm2, (10, 20)).unwrap();
-        assert_eq!((image.source.width(), image.source.height()), (1536, 1024));
+        assert_eq!((image.source.width(), image.source.height()), (1312, 1199));
         assert_eq!(image.source.to_rgba8().get_pixel(0, 0)[3], 0);
         assert_eq!(image.protocol.background_color().0, [0, 0, 0, 0]);
     }

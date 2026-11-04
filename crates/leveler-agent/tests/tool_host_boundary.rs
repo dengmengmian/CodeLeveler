@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 const HOST_FILE: &str = "executor/host.rs";
 
 /// Other crates that must never reach the execution entry at all. The engine
-/// is here because it was NOT here before: its crash-recovery replay called
-/// `registry.execute` directly, and a tripwire that only scanned this crate
-/// could never have seen it. It now goes through `leveler_agent::reconcile`,
-/// so ZERO occurrences is the bar — not "only in one file".
+/// is here because it was NOT here before: its crash-recovery replay once
+/// called `registry.execute` directly, and a tripwire that only scanned this
+/// crate could never have seen it. Recovery now replays nothing at all, but
+/// the bar stays ZERO occurrences — not "only in one file".
 const NO_EXECUTION_CRATES: &[&str] = &["../leveler-engine/src", "../leveler-app/src"];
 
 /// Patterns that mark the host-only entries. Textual on purpose: cheap,
@@ -76,10 +76,10 @@ fn tool_execution_is_confined_to_the_host_boundary() {
 
 /// The boundary is one place in the SYSTEM, not one place per crate.
 ///
-/// The engine and the app compose tools but must never run one: recovery goes
-/// through `leveler_agent::reconcile`, which lands in the same host file as
-/// every other execution. Any `registry.execute` outside `host.rs` — in any
-/// of these crates — is a second, ungated path.
+/// The engine and the app compose tools but must never run one: every
+/// execution goes through the ToolHost pipeline in `host.rs`. Any
+/// `registry.execute` outside `host.rs` — in any of these crates — is a
+/// second, ungated path.
 #[test]
 fn no_other_crate_executes_a_tool() {
     let base = Path::new(env!("CARGO_MANIFEST_DIR"));

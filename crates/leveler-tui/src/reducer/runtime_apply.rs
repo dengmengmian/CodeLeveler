@@ -9,11 +9,114 @@ use crate::overlay::clarification::ClarificationOverlay;
 use crate::state::{AppState, Notification, PendingInteraction};
 use crate::transcript::TurnEndStatus;
 
+/// Record which build is serving this client. Only two KNOWN identities can
+/// disagree: an unknown one proves nothing and must neither raise nor clear a
+/// version anomaly, so the last confirmed answer stands.
+fn observe_runtime_build(state: &mut AppState, build: &leveler_client_protocol::BuildIdentity) {
+    let expected = leveler_client_protocol::BuildIdentity::current();
+    if build.is_known() && expected.is_known() {
+        state.runtime_build = Some(build.clone());
+        state.runtime_version_mismatch = !expected.matches(build);
+    }
+}
+
+/// A previously shown version warning is no longer true once a matching build
+/// answers. Only that exact notice is dismissed; another risk on the row stays.
+fn clear_resolved_version_notice(state: &mut AppState) {
+    if !state.runtime_version_mismatch
+        && state.notification.as_ref().is_some_and(|notice| {
+            notice.level == NotificationLevel::Warning
+                && notice.message == state.t().runtime_version_mismatch
+        })
+    {
+        state.notification = None;
+    }
+}
+
 pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
     match event {
         RuntimeEvent::GlobalTasksLoaded { .. } => {}
         RuntimeEvent::RuntimeReady => {}
+        RuntimeEvent::RuntimeBuildObserved { runtime_build } => {
+            let was_mismatched = state.runtime_version_mismatch;
+            observe_runtime_build(state, &runtime_build);
+            clear_resolved_version_notice(state);
+            // A session subscription re-observes the same build. Only the
+            // transition earns a new warning; the issue row is the durable
+            // reminder, and repeats must not reset its clock.
+            if state.runtime_version_mismatch && !was_mismatched {
+                let message = state.t().runtime_version_mismatch.to_string();
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message,
+                });
+            }
+        }
+        RuntimeEvent::RuntimeReconnected {
+            runtime_build,
+            runtime_restarted,
+        } => {
+            // The transport reports facts; the wording is decided here, where
+            // the turn state lives. Only work that was actually at risk earns
+            // a warning: a turn must have been running, and the process must
+            // have been replaced or been unverifiable. `Some(false)` proves
+            // the process never changed, so its running work is untouched.
+            let t = state.t();
+            observe_runtime_build(state, &runtime_build);
+            clear_resolved_version_notice(state);
+            let work_at_risk = if state.is_busy() {
+                match runtime_restarted {
+                    Some(false) => None,
+                    Some(true) => Some((
+                        NotificationLevel::Warning,
+                        t.reconnect_work_may_have_stopped,
+                    )),
+                    None => Some((NotificationLevel::Warning, t.reconnect_work_state_unknown)),
+                }
+            } else {
+                None
+            };
+            // A different KNOWN build means this client is still served by a
+            // generation other than the one installed — only a restart
+            // switches. Unknown proves nothing, so it is not a version change.
+            // The mismatch itself lives on the issue row; this notice is the
+            // one-time alert and may be outranked by work that was at risk.
+            let version_changed = state
+                .runtime_version_mismatch
+                .then_some((NotificationLevel::Warning, t.runtime_version_mismatch));
+            if let Some((level, message)) = work_at_risk.or(version_changed) {
+                state.notification = Some(Notification {
+                    level,
+                    message: message.to_string(),
+                });
+            }
+        }
         RuntimeEvent::SessionOpened { session } => apply_session(state, session),
+        // The runtime states what it closed; the snapshot that follows is the
+        // authority for the session's new state. The count is the runtime's
+        // own fact, so the copy can name it without guessing.
+        RuntimeEvent::CrashWindowAcknowledged { closed, .. } => {
+            let message = state
+                .t()
+                .recovery_acknowledged
+                .replacen("{}", &closed.to_string(), 1);
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message,
+            });
+        }
+        // The stream is back but the session could not be re-read. The view may
+        // still show pre-break state, so say so; input stays locked because no
+        // snapshot has re-established authority. The transport logs the raw
+        // failure; it is diagnostic, not user copy.
+        RuntimeEvent::SessionResyncFailed { error } => {
+            tracing::warn!(%error, "session resync failed after reconnect");
+            let message = state.t().reconnect_resync_failed.to_string();
+            state.notification = Some(Notification {
+                level: NotificationLevel::Error,
+                message,
+            });
+        }
         RuntimeEvent::SessionHistoryLoaded {
             query_id,
             session_id,
@@ -556,7 +659,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             finish_turn(state, TurnEndStatus::Incomplete, Some(reason));
             state.notification = None;
         }
-        RuntimeEvent::TurnFailed { error, failure } => {
+        RuntimeEvent::TurnFailed {
+            error,
+            failure,
+            recovery,
+        } => {
             note_turn_settled(state);
             state.status = RuntimeStatus::Error;
             state.finalization_stage = None;
@@ -596,8 +703,21 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // failure text.
             let block = {
                 let t = state.t();
-                match &failure {
-                    Some(f) => crate::transcript::FailureBlock {
+                match (&failure, &recovery) {
+                    // A recovery stop is not a tool failure: the interrupted
+                    // call's outcome is unknown and the runtime will not guess.
+                    // The next step is the user's, so state it instead of
+                    // forwarding the engine's diagnostic.
+                    (_, Some(stop)) => crate::transcript::FailureBlock {
+                        display: crate::fold::DisplayMode::Collapsed,
+                        title: t.recovery_title.to_string(),
+                        summary: t.recovery_paused.to_string(),
+                        subtitle: Some(t.recovery_next_step.to_string()),
+                        // The raw engine message and the call evidence stay
+                        // available for diagnosis; they are not the prompt.
+                        detail: format!("{} · {}\n{}", stop.tool, stop.call_id, error),
+                    },
+                    (Some(f), None) => crate::transcript::FailureBlock {
                         display: crate::fold::DisplayMode::Collapsed,
                         title: t.failure_title.to_string(),
                         summary: failure_summary(f, t),
@@ -609,7 +729,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     },
                     // A failure the runtime could not type (legacy event, or a
                     // non-provider failure): show the string as the summary.
-                    None => crate::transcript::FailureBlock {
+                    (None, None) => crate::transcript::FailureBlock {
                         display: crate::fold::DisplayMode::Collapsed,
                         title: t.failure_title.to_string(),
                         summary: error.clone(),
@@ -1040,17 +1160,34 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 &serde_json::json!({ "program": program, "args": args }).to_string(),
             )
             .unwrap_or_else(|| program.clone());
-            state.background_task_labels.insert(
-                task_id.clone(),
-                crate::state::BackgroundTaskChrome {
-                    pid,
-                    ..crate::state::BackgroundTaskChrome::running(label.clone(), state.elapsed_secs)
-                },
-            );
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message: state.t().background_task_started.replace("{}", &label),
-            });
+            // A repeated Started for the same id is a reconnect/replay fact,
+            // not a new task: it refreshes the live entry silently. It never
+            // turns a settled task back into a running one — a reused id is
+            // an identity conflict, not a resurrection.
+            match state.background_task_labels.get_mut(&task_id) {
+                Some(chrome) => {
+                    if chrome.is_running() {
+                        chrome.pid = pid;
+                        chrome.label = label;
+                    }
+                }
+                None => {
+                    state.background_task_labels.insert(
+                        task_id.clone(),
+                        crate::state::BackgroundTaskChrome {
+                            pid,
+                            ..crate::state::BackgroundTaskChrome::running(
+                                label.clone(),
+                                state.elapsed_secs,
+                            )
+                        },
+                    );
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Info,
+                        message: state.t().background_task_started.replace("{}", &label),
+                    });
+                }
+            }
         }
         RuntimeEvent::ContextUsage { accounting } => {
             // A live push from the runtime; always the freshest truth. Never a
@@ -1263,7 +1400,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             });
         }
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
-            replace_active_background_tasks(state, &tasks);
+            // This live correction names only what is still running. It
+            // carries no durable record, so a vanished entry keeps an open
+            // state; the next snapshot resolves it from the log.
+            replace_active_background_tasks(state, &tasks, &[]);
         }
     }
 }
@@ -1589,23 +1729,86 @@ fn cap_background_output(output: &mut String) {
     *output = leveler_core::truncate_tail_bytes(output, BACKGROUND_OUTPUT_CAP, &marker);
 }
 
+fn background_label(program: &str, args: &[String]) -> String {
+    crate::tool_cell::command_detail(
+        "run_command",
+        &serde_json::json!({ "program": program, "args": args }).to_string(),
+    )
+    .unwrap_or_else(|| program.to_string())
+}
+
+/// Apply a durable record's state to a chrome entry. Only the record's own
+/// evidence is used: an absent terminal never becomes success or failure.
+fn apply_background_record(
+    chrome: &mut crate::state::BackgroundTaskChrome,
+    record: &leveler_client_protocol::UiBackgroundTaskRecord,
+) {
+    use leveler_client_protocol::UiBackgroundTaskState as State;
+    chrome.stopped = false;
+    chrome.unknown = false;
+    chrome.lost = false;
+    chrome.conflict = false;
+    match record.state {
+        State::Running => chrome.ok = None,
+        State::Completed => chrome.ok = Some(true),
+        State::Failed => chrome.ok = Some(false),
+        State::Cancelled => {
+            chrome.ok = Some(false);
+            chrome.stopped = true;
+        }
+        State::Lost => {
+            chrome.ok = Some(false);
+            chrome.lost = true;
+        }
+        State::Conflict => {
+            chrome.ok = Some(false);
+            chrome.conflict = true;
+        }
+        State::Unknown => {
+            chrome.ok = Some(false);
+            chrome.unknown = true;
+        }
+    }
+    chrome.exit_code = record.exit_code;
+    if !record.output.is_empty() {
+        chrome.output = record.output.clone();
+        cap_background_output(&mut chrome.output);
+    }
+}
+
 fn replace_active_background_tasks(
     state: &mut AppState,
     tasks: &[leveler_client_protocol::UiActiveBackgroundTask],
+    records: &[leveler_client_protocol::UiBackgroundTaskRecord],
 ) {
+    use leveler_client_protocol::UiBackgroundTaskState;
+    let records_by_id: std::collections::HashMap<
+        &str,
+        &leveler_client_protocol::UiBackgroundTaskRecord,
+    > = records
+        .iter()
+        .map(|record| (record.task_id.as_str(), record))
+        .collect();
     let still_active = |id: &str| tasks.iter().any(|task| task.task_id == id);
-    // The runtime is authoritative for what is still running: a running entry
-    // it no longer lists is gone (its exit was lost in the lag), so drop it.
-    // Terminal entries are the TUI's own retained history and stay.
-    state
-        .background_task_labels
-        .retain(|id, chrome| !chrome.is_running() || still_active(id));
+
+    // A running entry the runtime no longer lists has ended somewhere. The
+    // durable projection says how when it can prove it; otherwise the entry
+    // stays with an open state instead of disappearing from view. Terminal
+    // entries are the TUI's own retained history and stay.
+    for (id, chrome) in state.background_task_labels.iter_mut() {
+        if !chrome.is_running() || still_active(id) {
+            continue;
+        }
+        match records_by_id.get(id.as_str()) {
+            Some(record) => apply_background_record(chrome, record),
+            None => {
+                chrome.ok = Some(false);
+                chrome.unknown = true;
+            }
+        }
+    }
     for task in tasks {
-        let label = crate::tool_cell::command_detail(
-            "run_command",
-            &serde_json::json!({ "program": task.program, "args": task.args }).to_string(),
-        )
-        .unwrap_or_else(|| task.program.clone());
+        let label = background_label(&task.program, &task.args);
         // Carry the already-retained output across a reconcile: the runtime's
         // snapshot names the task, not its log, and re-inserting a blank entry
         // would silently drop everything the detail page had shown.
@@ -1628,9 +1831,42 @@ fn replace_active_background_tasks(
                 .transcript
                 .note_background_ready(&task.task_id, evidence);
         }
+        // A live entry whose id also carries ambiguous durable history keeps
+        // that history: a reused id is a conflict, never a fresh running task.
+        if let Some(record) = records_by_id.get(task.task_id.as_str())
+            && record.state != UiBackgroundTaskState::Running
+        {
+            apply_background_record(&mut chrome, record);
+        }
         state
             .background_task_labels
             .insert(task.task_id.clone(), chrome);
+    }
+    // Restore the unresolved records this view never saw (a TUI started after
+    // the runtime that hosted them ended). Terminal records are history the
+    // live view already kept; they are not replayed as new activity.
+    for record in records {
+        if state.background_task_labels.contains_key(&record.task_id) {
+            continue;
+        }
+        if matches!(
+            record.state,
+            UiBackgroundTaskState::Lost
+                | UiBackgroundTaskState::Unknown
+                | UiBackgroundTaskState::Conflict
+        ) {
+            let mut chrome = crate::state::BackgroundTaskChrome::running(
+                background_label(&record.program, &record.args),
+                state.elapsed_secs,
+            );
+            // No start was observed here, so the run time is unknown rather
+            // than the zero a fabricated clock would imply.
+            chrome.started_known = false;
+            apply_background_record(&mut chrome, record);
+            state
+                .background_task_labels
+                .insert(record.task_id.clone(), chrome);
+        }
     }
     let known = |id: &str| state.background_task_labels.contains_key(id);
     if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(id)) if !known(id))
@@ -1941,6 +2177,24 @@ fn apply_session_with(
     // token state intact.
     let switching = state.session_id != session.id;
     apply_meta(state, &session);
+    // The runtime's own crash-window evidence, not a client-side guess. An
+    // empty list means this session holds no recovery gate right now.
+    state.interrupted_tool_calls = session.interrupted_tool_calls.clone();
+    // A snapshot is the runtime's own answer. Whatever broke the event stream
+    // or left a command's outcome unknown, the client can see canonical state
+    // again — the reconnect authority the disconnected state was waiting for.
+    state.runtime_connected = true;
+    // A snapshot is the recovery authority for the view-integrity errors the
+    // transport reported: they were true only while no canonical state could
+    // be read. A lost connection has no snapshot and keeps its sticky error.
+    let t = state.t();
+    if state.notification.as_ref().is_some_and(|notice| {
+        notice.level == NotificationLevel::Error
+            && (notice.message == t.reconnect_resync_failed
+                || notice.message == t.stream_resync_failed)
+    }) {
+        state.notification = None;
+    }
     if switching {
         // Input mode and candidate requests are session-scoped: a recall or
         // scan from the previous session must not land in the new draft.
@@ -2112,7 +2366,11 @@ fn apply_session_with(
     // projection. Its entries come from the process registry, so terminal
     // records retained by the registry or replayed transcript events cannot
     // resurrect here.
-    replace_active_background_tasks(state, &session.active_background_tasks);
+    replace_active_background_tasks(
+        state,
+        &session.active_background_tasks,
+        &session.background_tasks,
+    );
     state.team.restore(&session.children, state.elapsed_secs);
 
     // A confirmation keeps the view it confirmed; only an empty one has

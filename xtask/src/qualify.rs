@@ -1,206 +1,76 @@
+//! Facts the release gate publishes that the harness must read without guessing.
+//!
+//! These are the lab-facing primitives shared by every qualification entry
+//! (`./dev pre-release`, `./dev release`, `./dev dogfood`, `./dev publish`):
+//! where the baseline commit lives, whether the candidate is in the lab clone,
+//! and which run directory the gate actually wrote. The driving logic is *not*
+//! here — it is one stage machine in [`crate::pipeline`], so a local
+//! qualification and a publish cannot disagree about what a stage means.
+
 use std::path::Path;
 
-use crate::error::{Fail, Report};
-use crate::exec::{self, CommandSpec, Host, ProcessOut};
-use crate::git::{self, Snapshot};
-use crate::root::{self, Env, GateOpts, Lab};
-use crate::version;
+use crate::error::Fail;
+use crate::exec::{self, Host};
 
-#[derive(Debug)]
-pub(crate) struct Qualification {
-    pub exit_code: i32,
-    pub release_exit: i32,
-    pub rc_exit: Option<i32>,
-    pub run: Option<String>,
-    pub baseline: String,
-    pub notes: Vec<String>,
-}
-
-pub fn run_pre_release(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    opts: &GateOpts,
-) -> Result<Report, Fail> {
-    let snap = git::snapshot(host, repo)?;
-    git::require_clean(&snap)?;
-    run_pre_release_locked(host, repo, env, opts, &snap)
-}
-
-pub fn run_dogfood(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    opts: &GateOpts,
-) -> Result<Report, Fail> {
-    let snap = git::snapshot(host, repo)?;
-    git::require_clean(&snap)?;
-    let qual = run_dogfood_locked(host, repo, env, opts, &snap)?;
-    Ok(format_dogfood(&snap.head, &qual))
-}
-
-pub(crate) fn run_pre_release_locked(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    opts: &GateOpts,
-    locked: &Snapshot,
-) -> Result<Report, Fail> {
-    git::confirm(host, repo, locked)?;
-    let local = version::read_local(repo)?;
-    version::require_local(&local)?;
-    let lab = root::resolve_lab(repo, opts, env)?;
-    let baseline = read_baseline(&lab.root)?;
-    let mut notes = Vec::new();
-    if let Some(note) = ensure_in_lab(host, repo, &lab.root, &locked.head)? {
-        notes.push(note);
-    }
-    let out = host.run(&release_cmd(
-        &lab,
-        &locked.head,
-        &baseline,
-        Some("L0,L1,L2"),
-    ))?;
-    git::confirm(host, repo, locked)?;
-    let body = judge_pre_release(&lab.root, &combined(&out), out.status)?;
-    let mut lines = vec![
-        format!("Candidate: {}", locked.head),
-        "Pre-release: PASS".to_string(),
-        body,
-    ];
-    lines.extend(notes);
-    Ok(Report::ok(lines.join("\n")))
-}
-
-pub(crate) fn run_dogfood_locked(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    opts: &GateOpts,
-    locked: &Snapshot,
-) -> Result<Qualification, Fail> {
-    git::confirm(host, repo, locked)?;
-    let local = version::read_local(repo)?;
-    version::require_local(&local)?;
-    let lab = root::resolve_lab(repo, opts, env)?;
-    let baseline = read_baseline(&lab.root)?;
-    let mut notes = Vec::new();
-    if let Some(note) = ensure_in_lab(host, repo, &lab.root, &locked.head)? {
-        notes.push(note);
-    }
-    let out = host.run(&release_cmd(&lab, &locked.head, &baseline, None))?;
-    git::confirm(host, repo, locked)?;
-    let runs = find_release_runs(&combined(&out));
-    let release_exit = normalize_exit(out.status);
-    if release_exit != 0 && release_exit != 2 {
-        return Ok(Qualification {
-            exit_code: dogfood_exit(release_exit, None),
-            release_exit,
-            rc_exit: None,
-            run: optional_run(&runs)?,
-            baseline,
-            notes,
-        });
-    }
-    let run = require_run(&runs)?;
-    let rc = host.run(&rc_cmd(&lab, &locked.head, &run))?;
-    git::confirm(host, repo, locked)?;
-    let rc_exit = normalize_exit(rc.status);
-    Ok(Qualification {
-        exit_code: dogfood_exit(release_exit, Some(rc_exit)),
-        release_exit,
-        rc_exit: Some(rc_exit),
-        run: Some(run),
-        baseline,
-        notes,
-    })
-}
-
-pub(crate) fn dogfood_exit(release_exit: i32, rc_exit: Option<i32>) -> i32 {
-    if release_exit != 0 && release_exit != 2 {
-        return if release_exit > 0 { release_exit } else { 1 };
-    }
-    match rc_exit {
-        Some(0) if release_exit == 0 => 0,
-        Some(0) | Some(2) => 2,
-        Some(code) if code > 0 => code,
-        _ => 1,
-    }
-}
-
-pub(crate) fn verdict(code: i32) -> &'static str {
-    match code {
-        0 => "PASS",
-        2 => "CONDITIONAL PASS",
-        3 => "NOT_STARTED",
-        4 => "RC_INCOMPLETE",
-        _ => "FAIL",
-    }
-}
-
-pub(crate) fn judge_pre_release(lab: &Path, output: &str, status: i32) -> Result<String, Fail> {
-    if status == 3 {
-        return Err(Fail::new("NOT_STARTED", "release gate returned NOT_STARTED (exit 3)").exit(3));
-    }
-    let run = require_run(&find_release_runs(output))?;
-    let mut lines = Vec::new();
-    for layer in ["L0", "L1", "L2"] {
-        let path = lab.join(&run).join(format!("{layer}.json"));
-        let json = std::fs::read_to_string(&path).map_err(|_| {
-            Fail::new(
-                "PRE_RELEASE_FAILED",
-                format!("{layer}.json is missing from {run}"),
-            )
-        })?;
-        let layer_status = first_status(&json).ok_or_else(|| {
-            Fail::new(
-                "GATE_REPORT_MISMATCH",
-                format!("{layer}.json has no layer status"),
-            )
-        })?;
-        if layer == "L0" {
-            judge_fmt(&json)?;
-        }
-        if layer_status != "PASS" && layer_status != "WARN" {
-            return Err(Fail::new(
-                "PRE_RELEASE_FAILED",
-                format!("{layer} status is {layer_status}"),
-            ));
-        }
-        lines.push(format!("{layer}: {layer_status}"));
-    }
-    lines.push(format!("Release run: {run}"));
-    Ok(lines.join("\n"))
-}
-
-fn judge_fmt(json: &str) -> Result<(), Fail> {
-    match check_status(json, "fmt") {
-        Some(status) if status == "PASS" || status == "WARN" => Ok(()),
-        Some(_) => Err(Fail::new(
-            "FMT_CHECK_FAIL",
-            "L0 fmt check failed; ./dev does not run rustfmt on a release candidate",
-        )),
-        None => Err(Fail::new(
-            "GATE_REPORT_MISMATCH",
-            "L0.json has no fmt check",
-        )),
-    }
-}
-
+/// Run directories the gate WROTE, preferring them over ones it merely named.
+///
+/// `release_check` ends with a `written:` section listing exactly the files this
+/// invocation produced. Every other run path in the output belongs to somebody
+/// else's run — a reuse note, a precondition naming the release run — and those
+/// contain `eval/release/` too, in absolute paths from paths this run does not
+/// own. Only the written section says which run this is. A gate that died before
+/// writing one still falls back to the named runs, which is what the early-exit
+/// paths report.
 pub(crate) fn find_release_runs(text: &str) -> Vec<String> {
-    let marker = "eval/release/";
+    let written = collect_runs(text, Scope::Written);
+    if !written.is_empty() {
+        return written;
+    }
+    collect_runs(text, Scope::Everything)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Only the paths under `written:`.
+    Written,
+    /// Every run path in the text, written or merely named.
+    Everything,
+}
+
+fn collect_runs(text: &str, scope: Scope) -> Vec<String> {
     let mut out = Vec::new();
-    for (index, _) in text.match_indices(marker) {
-        let rest = &text[index + marker.len()..];
+    let mut in_written = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("written:") {
+            in_written = true;
+            push_runs(rest, &mut out);
+            continue;
+        }
+        if in_written && trimmed.is_empty() {
+            in_written = false;
+            continue;
+        }
+        if scope == Scope::Written && !in_written {
+            continue;
+        }
+        push_runs(line, &mut out);
+    }
+    out
+}
+
+fn push_runs(line: &str, out: &mut Vec<String>) {
+    let marker = "eval/release/";
+    for (index, _) in line.match_indices(marker) {
+        let rest = &line[index + marker.len()..];
         let Some(id) = take_run_id(rest) else {
             continue;
         };
-        let full = format!("eval/release/{id}");
+        let full = format!("{marker}{id}");
         if !out.contains(&full) {
             out.push(full);
         }
     }
-    out
 }
 
 fn take_run_id(rest: &str) -> Option<&str> {
@@ -221,105 +91,6 @@ fn take_run_id(rest: &str) -> Option<&str> {
     } else {
         None
     }
-}
-
-fn first_status(json: &str) -> Option<String> {
-    json_string_field(json, "status")
-}
-
-fn check_status(json: &str, id: &str) -> Option<String> {
-    let want = format!("\"{id}\"");
-    let mut rest = json;
-    while let Some(index) = rest.find("\"id\"") {
-        let tail = &rest[index + 4..];
-        let trimmed = trim_ws_colon(tail);
-        if let Some(after) = trimmed.strip_prefix(&want) {
-            let end = after.find("\"id\"").unwrap_or(after.len());
-            return json_string_field(&after[..end], "status");
-        }
-        rest = tail;
-    }
-    None
-}
-
-fn json_string_field(text: &str, key: &str) -> Option<String> {
-    let marker = format!("\"{key}\"");
-    let index = text.find(&marker)?;
-    let rest = trim_ws_colon(&text[index + marker.len()..]);
-    let rest = rest.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.next() {
-                out.push(next);
-            }
-            continue;
-        }
-        if ch == '"' {
-            return Some(out);
-        }
-        out.push(ch);
-    }
-    None
-}
-
-fn trim_ws_colon(text: &str) -> &str {
-    let text = text.trim_start();
-    text.strip_prefix(':').map(str::trim_start).unwrap_or(text)
-}
-
-fn release_cmd(lab: &Lab, sha: &str, baseline: &str, layers: Option<&str>) -> CommandSpec {
-    let mut args = vec![
-        "eval/scripts/release_check.py".to_string(),
-        "--codeleveler-sha".to_string(),
-        sha.to_string(),
-        "--baseline-sha".to_string(),
-        baseline.to_string(),
-        "--model".to_string(),
-        lab.model.clone(),
-    ];
-    // A restricted layer set (the pre-release check) still runs every gate the
-    // full dogfood later REUSES: the reuse key for L2 is the same whether or not
-    // PTY actually ran, so a `--no-pty` pre-release would hand the dogfood L2
-    // evidence with no PTY gates and trip H9. Run L2 whole here so the reused
-    // evidence is complete.
-    if let Some(layers) = layers {
-        args.push("--layers".to_string());
-        args.push(layers.to_string());
-    }
-    // The machine-busy preflight exists so a loaded HOST cannot be read as a
-    // product failure (`MACHINE_BUSY` is NOT_STARTED, never FAIL). Passing it
-    // here would make the check unusable in its own pipeline: the L0-L2 run
-    // that precedes dogfood is itself what pushes the one-minute average past
-    // 90% of the CPU count, so without this the dogfood stage could never start
-    // on a machine that had just finished its own pre-release.
-    args.push("--force".to_string());
-    eprintln!("PROBE release_cmd: {:?}", args);
-    CommandSpec::new("python3", args, &lab.root).env("DOGFOOD_ROOT", lab.root.display().to_string())
-}
-
-fn rc_cmd(lab: &Lab, sha: &str, run: &str) -> CommandSpec {
-    CommandSpec::new(
-        "python3",
-        [
-            "eval/scripts/rc_check.py",
-            "--candidate-sha",
-            sha,
-            "--release-run",
-            run,
-            "--model",
-            lab.model.as_str(),
-            // Same reason as the release stage: this gate runs immediately
-            // after a full build and its own L3 evaluation, so the host's load
-            // reflects the qualification itself. `MACHINE_BUSY` is a statement
-            // about the host, never a product verdict, so it must not stop the
-            // stage that just produced the load.
-            "--force",
-        ],
-        &lab.root,
-    )
-    .env("DOGFOOD_ROOT", lab.root.display().to_string())
 }
 
 pub(crate) fn ensure_in_lab(
@@ -391,55 +162,4 @@ pub(crate) fn read_baseline(lab: &Path) -> Result<String, Fail> {
         ));
     }
     Ok(line.to_string())
-}
-
-fn optional_run(runs: &[String]) -> Result<Option<String>, Fail> {
-    match runs.len() {
-        0 => Ok(None),
-        1 => Ok(Some(runs[0].clone())),
-        _ => Err(ambiguous(runs)),
-    }
-}
-
-fn require_run(runs: &[String]) -> Result<String, Fail> {
-    match runs.len() {
-        0 => Err(Fail::new(
-            "RELEASE_RUN_NOT_FOUND",
-            "release gate output has no eval/release/<timestamp>-<sha> directory",
-        )),
-        1 => Ok(runs[0].clone()),
-        _ => Err(ambiguous(runs)),
-    }
-}
-
-fn ambiguous(runs: &[String]) -> Fail {
-    Fail::new(
-        "RELEASE_RUN_AMBIGUOUS",
-        format!("release gate named multiple runs: {}", runs.join(", ")),
-    )
-}
-
-fn combined(out: &ProcessOut) -> String {
-    format!("{}{}", out.stdout, out.stderr)
-}
-
-fn normalize_exit(status: i32) -> i32 {
-    if status < 0 { 1 } else { status }
-}
-
-fn format_dogfood(sha: &str, qual: &Qualification) -> Report {
-    let rc = qual.rc_exit.map(verdict).unwrap_or("NOT_STARTED");
-    let mut lines = vec![
-        format!("Candidate: {sha}"),
-        format!("Baseline: {}", qual.baseline),
-        format!("Release qualification: {}", verdict(qual.release_exit)),
-        format!(
-            "Release run: {}",
-            qual.run.as_deref().unwrap_or("not found")
-        ),
-        format!("RC Qualification: {rc}"),
-        format!("Dogfood: {}", verdict(qual.exit_code)),
-    ];
-    lines.extend(qual.notes.iter().cloned());
-    Report::with_code(qual.exit_code, lines.join("\n"))
 }

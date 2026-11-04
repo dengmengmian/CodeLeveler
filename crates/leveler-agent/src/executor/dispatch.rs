@@ -56,6 +56,19 @@ pub(crate) struct CommandFacts {
     /// still a fact: a completion that cites that command has to be told the
     /// process is running and unnamed-not-failed, instead of "it never ran".
     pub started_task: Option<String>,
+    /// The structured start of a background task, when this call started one.
+    /// The tool's prose names the id too, but only this record is complete
+    /// enough to survive the registry: the argv and the promised lifetime.
+    pub started_background: Option<BackgroundStartFacts>,
+}
+
+/// A background task a tool call started, as its spawn metadata reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundStartFacts {
+    pub task_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub lifetime: String,
 }
 
 /// A terminated background task, as `wait_task`/`get_task` observed it.
@@ -119,6 +132,33 @@ pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFact
         },
         |_| None,
     );
+    // Only a spawn reports `background: true`. The task id alone is not enough:
+    // every lifecycle tool also names a task, and none of them started one.
+    let started_background = (metadata
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true))
+    .then(|| {
+        Some(BackgroundStartFacts {
+            task_id: metadata.get("task_id")?.as_str()?.to_string(),
+            program: metadata.get("program")?.as_str()?.to_string(),
+            args: metadata
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            lifetime: metadata
+                .get("lifetime")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("goal")
+                .to_string(),
+        })
+    })
+    .flatten();
     CommandFacts {
         exit_code,
         stop,
@@ -129,6 +169,7 @@ pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFact
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         started_task,
+        started_background,
     }
 }
 

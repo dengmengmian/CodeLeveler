@@ -16,7 +16,8 @@ use crate::exec::{CommandSpec, FakeHost, ProcessOut};
 use crate::json::Json;
 use crate::root::Env;
 use crate::tests::{
-    BASELINE, SHA_A, SHA_B, Tmp, args, point_config, process, text, write_lab, write_versions,
+    BASELINE, SHA_A, SHA_B, Tmp, arg_after, args, point_config, process, text, write_lab,
+    write_versions,
 };
 
 /// The commit the version bump creates. Everything after it qualifies this SHA.
@@ -105,6 +106,10 @@ struct Script {
     /// The fake RC writes no `rc_evidence.json` into the release run: the
     /// defect this round fixes, kept reachable so the guard is testable.
     skip_rc_registration: bool,
+    /// HEAD moves after this many gate invocations: a commit landing mid-run.
+    head_moves_after: Option<usize>,
+    /// The gate refuses to start: the host stayed busy past the wait limit.
+    gate_not_started: bool,
     /// The fake gate answers the final coverage audit with this phase instead
     /// of the one it was asked for, to prove the pipeline notices.
     coverage_phase_override: Option<String>,
@@ -156,6 +161,8 @@ impl Script {
             project_fetched: false,
             omit_layers: Vec::new(),
             skip_rc_registration: false,
+            head_moves_after: None,
+            gate_not_started: false,
             coverage_phase_override: None,
             reuse_from: None,
             reuse_suites: Vec::new(),
@@ -515,18 +522,31 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
                 .unwrap_or_default();
             std::fs::create_dir_all(&run_dir).unwrap();
             script.layer_invocations += 1;
-            for layer in requested.split(',') {
-                if layer.is_empty() {
-                    continue;
-                }
-                if script.omit_layers.iter().any(|name| name == layer) {
-                    continue;
-                }
+            if script.head_moves_after == Some(script.layer_invocations as usize) {
+                script.head = CANDIDATE.to_string();
+            }
+            // A host that never went idle: the gate writes only the preflight
+            // document and answers NOT_STARTED, exactly like the real one.
+            if script.gate_not_started {
                 std::fs::write(
-                    run_dir.join(format!("{layer}.json")),
-                    layer_document(&script, layer),
+                    run_dir.join("machine_preflight.json"),
+                    "{\"decision\":\"MACHINE_BUSY\",\"wait_timed_out\":true,\"reasons\":[\"a cargo test --workspace is running\"]}",
                 )
                 .unwrap();
+            } else {
+                for layer in requested.split(',') {
+                    if layer.is_empty() {
+                        continue;
+                    }
+                    if script.omit_layers.iter().any(|name| name == layer) {
+                        continue;
+                    }
+                    std::fs::write(
+                        run_dir.join(format!("{layer}.json")),
+                        layer_document(&script, layer),
+                    )
+                    .unwrap();
+                }
             }
             // The real gate names the run as a repo-relative path with `/`
             // separators (`eval/release/<id>`), and the pipeline reads exactly
@@ -541,8 +561,9 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
                 .collect::<Vec<_>>()
                 .join("/");
             let slowest = script.status("L0") != "PASS";
-            let exit = if slowest || script.status("L1") != "PASS" || script.status("L2") != "PASS"
-            {
+            let exit = if script.gate_not_started {
+                3
+            } else if slowest || script.status("L1") != "PASS" || script.status("L2") != "PASS" {
                 1
             } else {
                 0
@@ -2661,4 +2682,132 @@ fn release_qualifies_the_current_commit_without_bumping_or_pushing() {
         !world.repo.join(".dev/release/CURRENT").exists(),
         "./dev release must not open a publish transaction"
     );
+}
+
+#[test]
+fn dogfood_is_the_release_machinery_and_refuses_unregistered_rc_evidence() {
+    // `./dev dogfood` used to decide on two process exit codes alone, so a
+    // qualification whose RC verdict was never registered with the release run
+    // reported PASS here while `./dev publish` refused the same evidence. Both
+    // commands now drive the same stages, so the stricter check is the only
+    // check either of them can report.
+    let world = World::new();
+    world.set(|script| script.skip_rc_registration = true);
+    let (code, rendered, log) = world.run(&["dogfood"]);
+    assert_eq!(code, 1, "{rendered}");
+    assert!(
+        rendered.contains("RC_EVIDENCE_NOT_REGISTERED"),
+        "{rendered}"
+    );
+    // The stage the command exists for still ran, with the arguments it needs:
+    // the matcher cannot be told a host is idle, and RC is asked about the run
+    // this very stage produced.
+    let gate = log
+        .iter()
+        .find(|spec| {
+            spec.args.iter().any(|arg| arg.contains("release_check.py"))
+                && spec.args.windows(2).any(|pair| pair[1] == "L3,L4")
+        })
+        .expect("stage 3 asked the gate for L3,L4");
+    assert!(
+        !gate.args.iter().any(|arg| arg == "--force"),
+        "a busy host is waited for, not overridden: {gate:?}"
+    );
+    let rc = log
+        .iter()
+        .find(|spec| spec.args.iter().any(|arg| arg.contains("rc_check.py")))
+        .expect("the dogfood stage runs RC");
+    assert_eq!(arg_after(rc, "--release-run").as_deref(), Some(RELEASE_RUN));
+    assert_eq!(arg_after(rc, "--candidate-sha").as_deref(), Some(SHA_A));
+    assert!(!rc.args.iter().any(|arg| arg == "--force"), "{rc:?}");
+    // Re-deciding from artifacts runs nothing, so it cannot need the override.
+    for spec in log
+        .iter()
+        .filter(|spec| spec.args.iter().any(|arg| arg == "--from-artifacts"))
+    {
+        assert!(!spec.args.iter().any(|arg| arg == "--force"), "{spec:?}");
+    }
+}
+
+#[test]
+fn pre_release_runs_the_first_two_stages_and_never_the_dogfood_stage() {
+    // The check is no longer its own driver: it asks the same stage machinery
+    // `./dev release` uses, so the layers it accepts are the layers a later
+    // release or publish reuses, and stage 3/RC never starts.
+    let world = World::new();
+    let (code, rendered, log) = world.run(&["pre-release"]);
+    assert_eq!(code, 0, "{rendered}");
+    let layers: Vec<String> = log
+        .iter()
+        .filter(|spec| spec.args.iter().any(|arg| arg.contains("release_check.py")))
+        .map(|spec| {
+            spec.args
+                .windows(2)
+                .find(|pair| pair[0] == "--layers")
+                .map(|pair| pair[1].clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(layers, vec!["L0".to_string(), "L1,L2".to_string()]);
+    // The baseline and the model are the lab's facts, not defaults of the check.
+    for spec in log
+        .iter()
+        .filter(|spec| spec.args.iter().any(|arg| arg.contains("release_check.py")))
+    {
+        assert_eq!(arg_after(spec, "--baseline-sha").as_deref(), Some(BASELINE));
+        assert_eq!(arg_after(spec, "--model").as_deref(), Some("example/model"));
+        assert_eq!(arg_after(spec, "--codeleveler-sha").as_deref(), Some(SHA_A));
+    }
+    assert!(
+        !log.iter()
+            .any(|spec| spec.args.iter().any(|arg| arg.contains("rc_check.py"))),
+        "a pre-release check never runs RC"
+    );
+    assert!(
+        !rendered.contains("stage 3"),
+        "the dogfood stage belongs to ./dev release: {rendered}"
+    );
+}
+
+#[test]
+fn a_qualification_command_refuses_to_publish() {
+    // `--stop-after 4` on a qualification command would reach the publish
+    // stage: a local check must not be able to push, tag or release.
+    let world = World::new();
+    for command in ["release", "pre-release", "dogfood"] {
+        let (code, rendered, log) = world.run(&[command, "--stop-after", "4"]);
+        assert_eq!(code, 2, "{command}: {rendered}");
+        assert!(
+            rendered.contains("PUBLISH_MODE_CONFLICT"),
+            "{command}: {rendered}"
+        );
+        assert!(!pushed(&log), "{command}: pushed");
+    }
+}
+
+#[test]
+fn a_qualification_whose_head_moved_mid_run_is_not_a_pass() {
+    // The evidence is about the commit the run started with; reporting PASS
+    // while the checkout has moved describes a tree nobody is looking at.
+    let world = World::new();
+    world.set(|script| script.head_moves_after = Some(1));
+    let (code, rendered, _) = world.run(&["release"]);
+    assert_eq!(code, 1, "{rendered}");
+    assert!(rendered.contains("CANDIDATE_CHANGED"), "{rendered}");
+}
+
+#[test]
+fn a_host_that_never_went_idle_is_not_started_not_a_missing_layer() {
+    // Waiting for an idle host is not the same as guessing: when the gate
+    // reports NOT_STARTED the operator must read the host's reason, not
+    // "L0.json is missing from the run", which is what the pipeline used to do.
+    let world = World::new();
+    world.set(|script| script.gate_not_started = true);
+    let (code, rendered, _) = world.run(&["release"]);
+    assert_eq!(code, 3, "{rendered}");
+    assert!(rendered.contains("NOT_STARTED"), "{rendered}");
+    assert!(!rendered.contains("GATE_REPORT_MISMATCH"), "{rendered}");
+    assert!(!rendered.contains("LAYER_FAILED"), "{rendered}");
+    // It is not a failure to fix and resume: the same command runs it again.
+    assert!(!rendered.contains("--resume"), "{rendered}");
 }

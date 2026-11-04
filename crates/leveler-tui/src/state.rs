@@ -162,6 +162,10 @@ pub struct RemoteState {
 pub struct BackgroundTaskChrome {
     pub label: String,
     pub started_elapsed_secs: u64,
+    /// Whether this view observed the start, so the elapsed time is real. A
+    /// record materialized from a durable snapshot has no start clock; its
+    /// duration is shown as unknown rather than invented.
+    pub started_known: bool,
     /// `None` while Running. `Some(true)` completed ok; `Some(false)` failed or
     /// was stopped — read [`Self::stopped`] to tell those apart.
     pub ok: Option<bool>,
@@ -172,6 +176,13 @@ pub struct BackgroundTaskChrome {
     /// The runtime could not establish the terminal state. Never rendered as
     /// running, failed, or stopped.
     pub unknown: bool,
+    /// The task started, but the boot that hosted it is gone and no terminal
+    /// record exists. The process may have died with that runtime; nothing
+    /// here claims either completion or failure.
+    pub lost: bool,
+    /// Two durable starts share this task id, so neither the live process nor
+    /// a terminal record can be attributed to one of them safely.
+    pub conflict: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     /// The process-group leader's OS pid, from the runtime's start/reconcile
@@ -195,9 +206,12 @@ impl BackgroundTaskChrome {
         Self {
             label: label.into(),
             started_elapsed_secs,
+            started_known: true,
             ok: None,
             stopped: false,
             unknown: false,
+            lost: false,
+            conflict: false,
             exit_code: None,
             duration_ms: None,
             pid: None,
@@ -233,11 +247,21 @@ pub enum BackgroundOutcome {
     Completed,
     Failed,
     Stopped,
+    /// The hosting boot ended with no terminal fact. Never read as completed.
+    Lost,
+    /// The task id matches more than one durable start. Never attributed.
+    Conflict,
     Unknown,
 }
 
 impl BackgroundTaskChrome {
     pub fn outcome(&self) -> BackgroundOutcome {
+        if self.conflict {
+            return BackgroundOutcome::Conflict;
+        }
+        if self.lost {
+            return BackgroundOutcome::Lost;
+        }
         if self.unknown {
             return BackgroundOutcome::Unknown;
         }
@@ -291,6 +315,13 @@ pub struct AppState {
     /// False once the event subscription closes. Commands stay disabled until
     /// the user exits and reconnects, avoiding a write-only UI.
     pub runtime_connected: bool,
+    /// The connected runtime is a known-different build. This is a persistent
+    /// fact with its own issue row: a dismissing notice must not erase it, and
+    /// only observing a matching build clears it.
+    pub runtime_version_mismatch: bool,
+    /// The last known build serving this client, for the mismatch row's
+    /// diagnostic line. `None` until a known identity is observed.
+    pub runtime_build: Option<leveler_client_protocol::BuildIdentity>,
     /// Version of metadata actually rendered from a runtime snapshot.
     pub snapshot_version: Option<i64>,
     /// Turn-terminal events this client has applied. A command confirmation
@@ -314,6 +345,11 @@ pub struct AppState {
     /// set excludes them, and the whole map is cleared on session switch.
     /// Presentation-only; the runtime remains the lifecycle authority.
     pub background_task_labels: HashMap<String, BackgroundTaskChrome>,
+    /// The crash window's evidence, straight from the runtime snapshot. Empty
+    /// means the runtime holds no recovery gate for this session. Presentation
+    /// only: the runtime enforces the gate, and releasing it takes this
+    /// client's explicit `AcknowledgeCrashWindow` command.
+    pub interrupted_tool_calls: Vec<leveler_client_protocol::UiInterruptedToolCall>,
     /// Multi-agent view model: what each child is for and what the parent did
     /// with what it produced. Built from events, never from prose.
     pub team: crate::multi_agent::TaskTeamView,
@@ -436,6 +472,10 @@ pub struct AppState {
     /// a transport-retry of the same decision reuses the envelope id and hits
     /// runtime command-receipt dedup instead of double-dispatching.
     pub interaction_command_ids: HashMap<String, CommandId>,
+    /// The interaction whose delivery outcome is unknown and whose error is
+    /// currently the sticky notification. Cleared only when that same key is
+    /// delivered, or when a synced outcome proves the choice was handled.
+    pub uncertain_interaction_key: Option<String>,
     /// Turn inputs sent but not yet answered by the runtime, oldest first.
     pub pending_submissions: Vec<PendingSubmission>,
     /// 待发送: inputs written while a turn runs, not yet admitted by the
@@ -726,6 +766,8 @@ impl AppState {
                     .map_or(0, |d| d.as_millis() as u64),
             ),
             runtime_connected: true,
+            runtime_version_mismatch: false,
+            runtime_build: None,
             snapshot_version: None,
             settled_turns: 0,
             session_id: boot.session_id.clone(),
@@ -733,6 +775,7 @@ impl AppState {
             surface: crate::btw::SurfaceFocus::Main,
             btw: crate::btw::BtwThread::default(),
             background_task_labels: std::collections::HashMap::new(),
+            interrupted_tool_calls: Vec::new(),
             team: crate::multi_agent::TaskTeamView::default(),
             unfinished_goals: Vec::new(),
             composer: Composer::new(),
@@ -779,6 +822,7 @@ impl AppState {
             overlay: None,
             pending_interactions: VecDeque::new(),
             interaction_command_ids: HashMap::new(),
+            uncertain_interaction_key: None,
             pending_submissions: Vec::new(),
             pending_inputs: Vec::new(),
             pending_selected: 0,

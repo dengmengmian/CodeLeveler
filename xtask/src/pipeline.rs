@@ -195,6 +195,10 @@ pub struct Context<'a> {
     /// `./dev publish` holds the publish lock; `./dev release` cannot publish and
     /// therefore does not take it.
     pub holds_lock: bool,
+    /// A qualification of the current commit (`release`, `dogfood`,
+    /// `pre-release`) rather than a publish transaction. The stage machinery is
+    /// the same one; only the horizon and the "what next" hint differ.
+    pub qualification: bool,
 }
 
 pub fn run(host: &dyn Host, repo: &Path, env: &Env, args: &[String]) -> Result<Report, Fail> {
@@ -224,23 +228,55 @@ pub fn run(host: &dyn Host, repo: &Path, env: &Env, args: &[String]) -> Result<R
     }
 }
 
-/// `./dev release`: stages 1-3 on the commit that is checked out, with no
-/// version bump, no push and no tag. It is the same stage machinery as publish,
-/// stopped before stage 4, so a local qualification cannot disagree with a
-/// release about what a stage means.
+/// `./dev release` and `./dev dogfood`: stages 1-3 on the commit that is checked
+/// out, with no version bump, no push and no tag. It is the same stage machinery
+/// as publish, stopped before stage 4, so a local qualification cannot disagree
+/// with a release about what a stage means.
 pub fn qualify_only(
     host: &dyn Host,
     repo: &Path,
     env: &Env,
     args: &[String],
 ) -> Result<Report, Fail> {
-    let mut parsed = vec!["--stop-after".to_string(), "3".to_string()];
+    qualification(host, repo, env, args, STAGE_DOGFOOD, "qualify")
+}
+
+/// `./dev pre-release`: stages 1-2, check only. The same stages publish runs, on
+/// the same evidence, stopping before the dogfood stage and RC.
+pub fn pre_release_only(
+    host: &dyn Host,
+    repo: &Path,
+    env: &Env,
+    args: &[String],
+) -> Result<Report, Fail> {
+    qualification(host, repo, env, args, STAGE_TESTS, "pre")
+}
+
+fn qualification(
+    host: &dyn Host,
+    repo: &Path,
+    env: &Env,
+    args: &[String],
+    stages: u8,
+    prefix: &str,
+) -> Result<Report, Fail> {
+    // The horizon is the command's meaning. A caller-supplied `--stop-after`
+    // used to be able to move it — `./dev release --stop-after 4` reached the
+    // publish stage and pushed — so the flag belongs to `./dev publish` alone.
+    if args.iter().any(|arg| arg == "--stop-after") {
+        return Err(Fail::new(
+            "PUBLISH_MODE_CONFLICT",
+            "--stop-after belongs to ./dev publish; ./dev release qualifies stages 1-3 and ./dev pre-release stops after stage 2",
+        )
+        .exit(2));
+    }
+    let mut parsed = vec!["--stop-after".to_string(), stages.to_string()];
     parsed.extend(args.iter().cloned());
     let opts = parse_args(&parsed)?;
     if opts.mode != Mode::Run {
         return Err(Fail::new(
             "PUBLISH_MODE_CONFLICT",
-            "--resume/--status/--report/--dry-run belong to ./dev publish; ./dev release always qualifies the current commit",
+            "--resume/--status/--report/--dry-run belong to ./dev publish; a qualification always qualifies the current commit",
         ));
     }
     let snap = git::snapshot(host, repo)?;
@@ -268,12 +304,13 @@ pub fn qualify_only(
         opts: opts.clone(),
         baseline_sha,
         holds_lock: false,
+        qualification: true,
     };
     // The transaction is named for what it is: a qualification of one commit,
     // not a version. It deliberately does not take the publish lock or the
     // CURRENT pointer, because it cannot publish anything.
     let mut transaction = Transaction::new(
-        format!("qualify-v{current}-{}", state::short_sha(&snap.head)),
+        format!("{prefix}-v{current}-{}", state::short_sha(&snap.head)),
         current.to_string(),
         snap.head.clone(),
         crate::clock::now(),
@@ -283,6 +320,17 @@ pub fn qualify_only(
     let release_id = transaction.release_id.clone();
     state::save_state(repo, &transaction)?;
     let outcome = drive(repo, &context, transaction, Vec::new());
+    // A qualification reports on the commit it started with. A commit or edit
+    // that lands mid-run is not a detail to absorb: the evidence would describe
+    // a tree the operator is no longer looking at. A failed run reports its own
+    // failure, which is the actionable one.
+    let outcome = match outcome {
+        Ok(report) if report.code == 0 => {
+            git::confirm(host, repo, &snap)?;
+            Ok(report)
+        }
+        other => other,
+    };
     let report_path = state::state_dir(repo, &release_id).join("RELEASE_REPORT.md");
     outcome.map(|report| {
         Report::with_code(
@@ -722,6 +770,7 @@ fn start(host: &dyn Host, repo: &Path, env: &Env, opts: &PublishOpts) -> Result<
         opts: opts.clone(),
         baseline_sha: baseline,
         holds_lock: true,
+        qualification: false,
     };
     state::write_current(repo, &transaction.release_id)?;
     state::save_state(repo, &transaction)?;
@@ -1025,6 +1074,7 @@ fn load_in_progress<'a>(
         opts: opts.clone(),
         baseline_sha,
         holds_lock: true,
+        qualification: false,
     };
     Ok((transaction, context))
 }
@@ -1216,6 +1266,38 @@ fn drive(
                 let status = if reused { Status::Reused } else { Status::Pass };
                 (status, detail, reused)
             }
+            Err(err) if err.code == "NOT_STARTED" => {
+                // Nothing ran, so nothing failed: the stage stays pending and
+                // the same command runs it again. Recording it as FAIL would
+                // send the operator to fix a cause that does not exist.
+                {
+                    let record = transaction.stage_record_mut(stage);
+                    record.status = Status::Pending;
+                    record.finished_at = Some(finished);
+                    record.seconds = finished - started;
+                    record.failure_reason = Some(err.detail.trim().to_string());
+                }
+                transaction.status = Status::Pending;
+                transaction.finished_at = None;
+                transaction.clear_current_failure();
+                transaction.note_attempt(stage, Status::Pending, Some(err.code.clone()), finished);
+                state::save_state(repo, &transaction)?;
+                let paths = report::write(context, &transaction)?;
+                let mut lines = vec![
+                    format!("release:   {}", transaction.release_id),
+                    format!("candidate: {}", transaction.candidate_sha),
+                    format!(
+                        "stage {stage} {}: NOT_STARTED (not a FAIL)",
+                        state::stage_name(stage)
+                    ),
+                ];
+                lines.extend(err.detail.trim_end().lines().map(str::to_string));
+                lines.push(format!("report:    {}", paths.markdown.display()));
+                lines.push(
+                    "next:      run the same command again once the host is idle".to_string(),
+                );
+                return Ok(Report::with_code(3, lines.join("\n")));
+            }
             Err(err) => {
                 let reason = format!("{}: {}", err.code, first_line(&err.detail));
                 {
@@ -1315,10 +1397,14 @@ fn drive(
         ];
         lines.extend(summary);
         lines.push(format!("report: {}", paths.markdown.display()));
-        lines.push(format!(
-            "next:   ./dev publish --resume  (continues at stage {})",
-            first_undecided(&transaction)
-        ));
+        lines.push(if context.qualification {
+            "next:   ./dev release  (stages 1-2 are reused from the evidence cache)".to_string()
+        } else {
+            format!(
+                "next:   ./dev publish --resume  (continues at stage {})",
+                first_undecided(&transaction)
+            )
+        });
         return Ok(Report::ok(lines.join("\n")));
     }
 
@@ -1562,11 +1648,10 @@ fn dogfood_cmd(context: &Context, sha: &str, layers: &str, run_id: Option<&str>)
         args.push("--run-id".to_string());
         args.push(run_id.to_string());
     }
-    // The machine-busy preflight protects a manually started run from a host
-    // that cannot give it a fair measurement. This pipeline runs its own stages
-    // back to back, so the load it observes is its own; `--force` says "the host
-    // load is a statement about the host, not a product verdict".
-    args.push("--force".to_string());
+    // No `--force`: the gate waits for an idle host. Refusing on a busy machine
+    // threw the cycle away, and forcing it measured the product while its own
+    // earlier stages — or somebody else's work — held the CPU. Wait is the
+    // decision; the wait limit is the gate's policy, not this call site's.
     CommandSpec::new("python3", args, &context.lab.root)
         .env("DOGFOOD_ROOT", context.lab.root.display().to_string())
 }
@@ -1613,6 +1698,19 @@ fn run_layers(
         ),
         &text,
     );
+    // `NOT_STARTED` is the gate saying the host could not give this cycle a
+    // fair run. Reading it as "the run id is missing" or "L0.json is missing"
+    // blames the evidence for a statement about the machine.
+    if out.status == 3 {
+        return Err(Fail::new(
+            "NOT_STARTED",
+            format!(
+                "the gate did not start: the host stayed busy past its wait limit\n{}",
+                exec::tail(&text, 20)
+            ),
+        )
+        .exit(3));
+    }
     let runs = qualify::find_release_runs(&text);
     let run_id = match runs.len() {
         0 => {
@@ -1912,7 +2010,6 @@ fn dogfood_verdict(context: &Context, run_id: &str, when: &str) -> Result<Verdic
             &format!("{}/{run_id}", state::RELEASE_RUN_KIND),
             "--coverage-phase",
             phase,
-            "--force",
         ],
         &context.lab.root,
     ))?;
@@ -2038,7 +2135,6 @@ fn run_rc(
         format!("{}/{release_run}", state::RELEASE_RUN_KIND),
         "--model".to_string(),
         context.lab.model.clone(),
-        "--force".to_string(),
     ];
     if let Some(reuse_from) = &reuse_from {
         args.push("--reuse-from".to_string());

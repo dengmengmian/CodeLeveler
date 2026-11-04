@@ -5066,6 +5066,21 @@ impl AgentHarness for Drive<'_> {
                 }
             }
 
+            // The start of a background task is a durable fact in its own
+            // right: the registry that hosts it is process state and dies with
+            // a crash, so this row is what lets a later snapshot say the task
+            // existed, which call started it and what it ran. It says nothing
+            // about the outcome — that is the task's own terminal record.
+            if !is_error && let Some(start) = command_facts.started_background.as_ref() {
+                (self.observer)(AgentEvent::BackgroundTaskStarted {
+                    call_id: call.id.as_str().to_string(),
+                    task_id: start.task_id.clone(),
+                    program: start.program.clone(),
+                    args: start.args.clone(),
+                    lifetime: start.lifetime.clone(),
+                });
+            }
+
             (self.observer)(AgentEvent::ToolResult {
                 exit_code: command_facts.exit_code,
                 stop: command_facts.stop,

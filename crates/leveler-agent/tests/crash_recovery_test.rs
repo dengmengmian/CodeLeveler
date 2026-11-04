@@ -3,9 +3,10 @@
 //! A process that dies mid tool-execution leaves a `ToolCallStarted` with no
 //! matching `ToolCallFinished` in the event log. On `resume`, the engine's
 //! `recover_crash_window` reconciles every such dangling call BEFORE re-driving
-//! the model: a read-only (idempotent) tool is auto-replayed; a mutating,
-//! unknown, or approval-pending tool blocks resume for explicit reconciliation
-//! without replaying the call or continuing the model.
+//! the model. Nothing is replayed — the crash left the call's outcome unknown.
+//! A pure runtime observation may be closed as explicitly interrupted; every
+//! other call blocks the turn until the user acknowledges the crash window, and
+//! the acknowledgement records it as unresolved rather than as a result.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -42,6 +43,9 @@ fn default_registry() -> leveler_tools::ToolRegistry {
 
 struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
+    /// Every request the runtime actually sent, in order. A test that asserts
+    /// what the MODEL can see must read this, not the event log.
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
 
 /// Append the answer a real model writes after resolving its goal: the runtime
@@ -60,10 +64,11 @@ fn with_delivery(mut responses: Vec<ModelResponse>) -> Vec<ModelResponse> {
 }
 
 impl MockRuntime {
-    fn new(responses: Vec<ModelResponse>) -> Self {
+    fn capturing(responses: Vec<ModelResponse>, requests: Arc<Mutex<Vec<ModelRequest>>>) -> Self {
         let responses = with_delivery(responses);
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
+            requests,
         }
     }
 }
@@ -72,9 +77,10 @@ impl MockRuntime {
 impl ModelRuntime for MockRuntime {
     async fn generate(
         &self,
-        _request: ModelRequest,
+        request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
         })
@@ -165,6 +171,20 @@ async fn harness(
     approver: Arc<dyn Approver>,
     responses: Vec<ModelResponse>,
 ) -> (CodingRuntime, Database, tempfile::TempDir) {
+    let (engine, db, dir, _) = harness_captured(approver, responses).await;
+    (engine, db, dir)
+}
+
+async fn harness_captured(
+    approver: Arc<dyn Approver>,
+    responses: Vec<ModelResponse>,
+) -> (
+    CodingRuntime,
+    Database,
+    tempfile::TempDir,
+    Arc<Mutex<Vec<ModelRequest>>>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
@@ -186,7 +206,7 @@ async fn harness(
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
-            runtime: Arc::new(MockRuntime::new(responses)),
+            runtime: Arc::new(MockRuntime::capturing(responses, Arc::clone(&requests))),
             registry: Arc::new(default_registry()),
             tool_context,
             model: ModelRef::new("mock", "m"),
@@ -207,7 +227,7 @@ async fn harness(
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    (engine, db, dir)
+    (engine, db, dir, requests)
 }
 
 fn direct_spec(dir: &Path) -> TaskSpec {
@@ -352,10 +372,12 @@ async fn crashed_turn(
         .unwrap()
 }
 
-/// A read-only tool that crashed mid-execution is idempotent, so resume just
-/// re-runs it and records the fresh result — no approval prompt.
+/// No dangling call is replayed — not even a read-only one. Re-running it
+/// would record a fresh answer for a call whose real outcome the crash left
+/// unknown. Resume stops until the user acknowledges the crash window; the
+/// acknowledgement records the call as explicitly unresolved.
 #[tokio::test]
-async fn safe_dangling_read_tool_is_auto_replayed_on_resume() {
+async fn a_dangling_read_tool_stops_resume_until_acknowledged() {
     let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
@@ -369,28 +391,64 @@ async fn safe_dangling_read_tool_is_auto_replayed_on_resume() {
     )
     .await;
 
-    engine
+    let err = engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
-        .unwrap();
-
+        .expect_err("an interrupted call's outcome is unknown, so resume must stop");
+    assert!(
+        matches!(
+            &err,
+            EngineError::RecoveryConfirmationRequired { call_id, tool }
+                if call_id == "c1" && tool == "read_file"
+        ),
+        "unexpected error: {err:?}"
+    );
     let events = recorded_events(&db, &session).await;
-    let replayed = events.iter().find_map(|e| match e {
-        EngineEvent::ToolCallFinished {
-            call_id, is_error, ..
-        } if call_id == "c1" => Some(*is_error),
-        _ => None,
-    });
-    assert_eq!(
-        replayed,
-        Some(false),
-        "the safe dangling read must be reconciled with a successful ToolCallFinished for c1"
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallFinished { call_id, .. } if call_id == "c1"
+        )),
+        "recovery must not replay the call: {events:?}"
     );
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, EngineEvent::ApprovalRequested { .. })),
-        "a read-only replay must never ask for approval"
+        "recovery must not route a replay through approval"
+    );
+
+    assert_eq!(engine.acknowledge_crash_window(&session).await.unwrap(), 1);
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("resume proceeds after acknowledgement");
+
+    let events = recorded_events(&db, &session).await;
+    let finishes: Vec<(&str, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ToolCallFinished {
+                call_id,
+                is_error,
+                preview,
+                ..
+            } if call_id == "c1" => Some((preview.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finishes.len(),
+        1,
+        "the acknowledged call gets exactly one honest marker: {events:?}"
+    );
+    assert!(
+        finishes[0].1,
+        "acknowledgement is not success: {finishes:?}"
+    );
+    assert!(
+        finishes[0].0.contains("user-acknowledged crash recovery"),
+        "the marker must say the outcome is unknown: {finishes:?}"
     );
 }
 
@@ -582,28 +640,40 @@ async fn corrupt_arguments_on_mutating_call_still_require_confirmation() {
     );
 }
 
-/// Safe tools may be inspected further after risk classification. Invalid JSON
-/// cannot be replayed, so it is recorded as an errored completion and resume may
-/// continue without executing a side effect.
+/// Unreadable arguments cannot excuse a replay. Since no call is replayed, they
+/// also cannot make recovery decide differently: the interrupted call still
+/// has an unknown outcome and waits for the user's acknowledgement.
 #[tokio::test]
-async fn corrupt_arguments_on_safe_call_are_recorded_without_replay() {
+async fn corrupt_arguments_on_a_read_call_still_stop_for_acknowledgement() {
     let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     seed_transcript(&db, &session).await;
     seed_dangling_call(&db, &engine, &session, "read_file", "not valid json".into()).await;
 
-    engine
+    // Arguments are not parsed any more: recovery never replays a call, so a
+    // corrupt payload changes nothing about the unknown outcome.
+    let err = engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
-        .unwrap();
+        .expect_err("the interrupted call still needs the user's acknowledgement");
+    assert!(
+        matches!(
+            &err,
+            EngineError::RecoveryConfirmationRequired { call_id, tool }
+                if call_id == "c1" && tool == "read_file"
+        ),
+        "unexpected error: {err:?}"
+    );
 
     let events = recorded_events(&db, &session).await;
-    assert!(events.iter().any(|e| matches!(
-        e,
-        EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
-            if call_id == "c1" && preview.contains("corrupt arguments for safe tool")
-    )));
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallFinished { call_id, .. } if call_id == "c1"
+        )),
+        "recovery must not record a result for the unreadable call: {events:?}"
+    );
 }
 
 /// Old ToolCallStarted payloads have no persisted risk. Even if today's
@@ -689,6 +759,72 @@ async fn acknowledged_crash_window_unblocks_resume() {
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .expect("resume must proceed after explicit acknowledgement");
+}
+
+/// The model must see the recovery fact, not just the user. The interrupted
+/// call's tool result was never persisted, so without this notice the next
+/// turn re-drives the same request blind — and may repeat a side effect the
+/// crash already executed. The notice states the outcome is unknown and that
+/// nothing was replayed; it claims neither success nor failure.
+#[tokio::test]
+async fn the_turn_after_acknowledgement_tells_the_model_the_call_was_not_replayed() {
+    let (engine, db, dir, requests) =
+        harness_captured(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(
+        &db,
+        &engine,
+        &session,
+        "run_command",
+        serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "echo start >> ran.txt; sleep 8; echo end >> ran.txt"]
+        })
+        .to_string(),
+    )
+    .await;
+
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("the unacknowledged call blocks resume");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a gated turn must not reach the model"
+    );
+    assert_eq!(engine.acknowledge_crash_window(&session).await.unwrap(), 1);
+
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("resume must proceed after explicit acknowledgement");
+
+    let requests = requests.lock().unwrap();
+    assert!(
+        !requests.is_empty(),
+        "the resumed turn must reach the model"
+    );
+    let seen = requests[0]
+        .messages
+        .iter()
+        .map(|message| message.text_content())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "Recovered after an interruption",
+        "run_command",
+        "c1",
+        "outcome unknown",
+        "not replayed",
+    ] {
+        assert!(seen.contains(needle), "missing {needle:?} in:\n{seen}");
+    }
+    assert!(
+        !seen.contains("Recovered after an interruption") || !seen.contains("was replayed"),
+        "the notice must never present the call as replayed:\n{seen}"
+    );
 }
 
 /// Acknowledging is finite recovery, not an execution: once the markers are
@@ -803,11 +939,13 @@ async fn chat_blocks_on_a_mutating_dangling_call_until_acknowledged() {
         .expect("chat proceeds after acknowledgement");
 }
 
-/// A dangling READ-ONLY call is idempotent: interactive chat reconciles it in
-/// place (recorded finish, no prompt, no block) — same policy as resume.
+/// Interactive chat applies the same rule as resume: a dangling call stops the
+/// turn before the model runs, and the user's message is not consumed. After
+/// acknowledgement the chat proceeds and the call is never replayed.
 #[tokio::test]
-async fn chat_auto_replays_a_safe_dangling_read_tool() {
-    let (engine, db, dir) = harness(Arc::new(AutoApprove), vec![text("继续。")]).await;
+async fn chat_stops_a_dangling_read_tool_until_acknowledged() {
+    let (engine, db, dir, requests) =
+        harness_captured(Arc::new(AutoApprove), vec![text("继续。")]).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     seed_transcript(&db, &session).await;
@@ -820,26 +958,91 @@ async fn chat_auto_replays_a_safe_dangling_read_tool() {
     )
     .await;
 
-    engine
+    let ask = || {
+        vec![leveler_model::ContentPart::Text {
+            text: "继续".into(),
+        }]
+    };
+    let err = engine
         .chat(
             &session,
             &spec,
-            vec![leveler_model::ContentPart::Text {
-                text: "继续".into(),
-            }],
+            ask(),
             &mut |_| {},
             CancellationToken::new(),
         )
         .await
-        .expect("a safe dangling read must not block chat");
+        .expect_err("a dangling read must stop chat until the user acknowledges it");
+    assert!(
+        matches!(
+            &err,
+            EngineError::RecoveryConfirmationRequired { call_id, tool }
+                if call_id == "c1" && tool == "read_file"
+        ),
+        "unexpected error: {err:?}"
+    );
 
     let events = recorded_events(&db, &session).await;
     assert!(
-        events.iter().any(|e| matches!(
+        !events.iter().any(|e| matches!(
             e,
-            EngineEvent::ToolCallFinished { call_id, is_error: false, .. } if call_id == "c1"
+            EngineEvent::ToolCallFinished { call_id, .. } if call_id == "c1"
         )),
-        "the dangling read must be reconciled with a recorded finish: {events:?}"
+        "chat must not replay the dangling read: {events:?}"
+    );
+
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "the gated chat must not reach the model"
+    );
+    engine.acknowledge_crash_window(&session).await.unwrap();
+    engine
+        .chat(
+            &session,
+            &spec,
+            ask(),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat proceeds after acknowledgement");
+    let requests = requests.lock().unwrap();
+    let seen = requests[0]
+        .messages
+        .iter()
+        .map(|message| message.text_content())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        seen.contains("Recovered after an interruption") && seen.contains("(call c1)"),
+        "interactive chat must carry the recovery context to the model:\n{seen}"
+    );
+
+    let events = recorded_events(&db, &session).await;
+    let finishes: Vec<(&str, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ToolCallFinished {
+                call_id,
+                is_error,
+                preview,
+                ..
+            } if call_id == "c1" => Some((preview.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finishes.len(),
+        1,
+        "the acknowledged call gets exactly one honest marker: {events:?}"
+    );
+    assert!(
+        finishes[0].1,
+        "acknowledgement is not success: {finishes:?}"
+    );
+    assert!(
+        finishes[0].0.contains("user-acknowledged crash recovery"),
+        "the marker must say the outcome is unknown: {finishes:?}"
     );
 }
 
@@ -877,11 +1080,10 @@ async fn a_safe_tool_with_side_effects_is_not_auto_replayed() {
     );
 }
 
-/// The other half of the same rule: a tool that DOES declare itself
-/// replay-safe still replays, so tightening the gate did not turn recovery
-/// into "always ask".
+/// Declaring itself replay-safe does not authorize recovery to re-run a tool:
+/// `read_file` is the strongest case, and it still stops for confirmation.
 #[tokio::test]
-async fn a_declared_replay_safe_tool_still_replays() {
+async fn a_declared_replay_safe_tool_is_not_replayed() {
     let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
     let spec = direct_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
@@ -895,18 +1097,26 @@ async fn a_declared_replay_safe_tool_still_replays() {
     )
     .await;
 
-    engine
+    let err = engine
         .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
-        .expect("a declared replay-safe read must still be reconciled automatically");
+        .expect_err("no tool may be replayed without the user's acknowledgement");
+    assert!(
+        matches!(
+            &err,
+            EngineError::RecoveryConfirmationRequired { call_id, tool }
+                if call_id == "c1" && tool == "read_file"
+        ),
+        "unexpected error: {err:?}"
+    );
 
     let events = recorded_events(&db, &session).await;
     assert!(
-        events.iter().any(|e| matches!(
+        !events.iter().any(|e| matches!(
             e,
-            EngineEvent::ToolCallFinished { call_id, is_error: false, .. } if call_id == "c1"
+            EngineEvent::ToolCallFinished { call_id, .. } if call_id == "c1"
         )),
-        "the safe read must be replayed and recorded: {events:?}"
+        "the declared replay-safe read must not be re-run: {events:?}"
     );
 }
 

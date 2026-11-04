@@ -523,6 +523,10 @@ struct ComposerVisRow {
     /// the painted content area** — the wrapper's prompt indent is already
     /// counted, so the caller must not add the prompt width again.
     caret_col: Option<usize>,
+    /// Byte range of the leading slash command inside `text`, when this is the
+    /// buffer's first row and the whole token fits on it. Presentation only:
+    /// the row's characters are unchanged.
+    command: Option<std::ops::Range<usize>>,
     /// Empty-buffer placeholder (visual only).
     placeholder: bool,
     /// Slash-arg ghost after caret (visual only).
@@ -550,6 +554,12 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
     // decorations below belong to this box.
     let prompt = composer_prompt(state);
     let cont = composer_cont(state);
+    // Resolved once per frame from the live registry; rows only slice the
+    // range they can actually paint. Shell Mode owns its text entirely, so a
+    // `/` there is a path, not a command.
+    let command = (state.input_mode == crate::shell_mode::InputMode::Normal)
+        .then(|| crate::screen::highlighted_slash_command(state.composer.text()))
+        .flatten();
     let (rows, _) = wrap_with_caret(
         state.composer.text(),
         caret,
@@ -565,7 +575,10 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             // The ghost owns the empty first row when it is showing; the
             // first-run hint stands down rather than stacking behind it.
             let shell = state.input_mode == crate::shell_mode::InputMode::Shell;
-            let suggestion = (first_row && !shell && crate::suggestion::is_visible(state))
+            // `is_visible` is the whole answer, including Shell Mode: it is
+            // what the reducer gates Tab / `→` on, so the painter must not add
+            // a second condition that would accept text nobody can see.
+            let suggestion = (first_row && crate::suggestion::is_visible(state))
                 .then(|| state.prompt_suggestion.clone())
                 .flatten();
             let placeholder = first_row
@@ -581,11 +594,17 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             } else {
                 None
             };
+            let command = first_row
+                .then_some(command.as_ref())
+                .flatten()
+                .filter(|range| range.end <= row.text.len())
+                .cloned();
             ComposerVisRow {
                 prompt: if first_row { prompt } else { cont },
                 text: row.text,
                 caret_col: row.caret_col,
                 placeholder,
+                command,
                 ghost,
                 suggestion,
             }
@@ -599,6 +618,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             caret_col: Some(0),
             placeholder: show_placeholder
                 || state.input_mode == crate::shell_mode::InputMode::Shell,
+            command: None,
             ghost: None,
             suggestion: None,
         });
@@ -691,12 +711,34 @@ pub(crate) fn composer_box_lines(
         let room = content_w.saturating_sub(used);
         let piece = truncate_display(&row.text, room);
         used += UnicodeWidthStr::width(piece.as_str());
-        spans.push(Span::styled(
-            piece,
-            Style::default()
-                .fg(theme.text.primary)
-                .bg(theme.surface.input),
-        ));
+        let body = Style::default()
+            .fg(theme.text.primary)
+            .bg(theme.surface.input);
+        // Only a command the row paints whole is split: a token the wrapper
+        // cut across rows has no complete command to mark on either one.
+        match row
+            .command
+            .as_ref()
+            .filter(|range| range.end <= piece.len())
+        {
+            Some(range) => {
+                let (before, rest) = piece.split_at(range.start);
+                let (command, argument) = rest.split_at(range.end - range.start);
+                if !before.is_empty() {
+                    spans.push(Span::styled(before.to_string(), body));
+                }
+                spans.push(Span::styled(
+                    command.to_string(),
+                    Style::default()
+                        .fg(theme.plan.primary)
+                        .bg(theme.surface.input),
+                ));
+                if !argument.is_empty() {
+                    spans.push(Span::styled(argument.to_string(), body));
+                }
+            }
+            None => spans.push(Span::styled(piece, body)),
+        }
 
         if row.placeholder {
             let room = content_w.saturating_sub(used);
@@ -1037,6 +1079,121 @@ mod p1_tests {
             .iter()
             .map(crate::selection::line_to_plain)
             .collect()
+    }
+
+    fn composer_spans(s: &AppState, width: usize) -> Vec<(String, Style)> {
+        let (lines, _) = composer_box_lines(s, width);
+        lines
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| (span.content.into_owned(), span.style))
+            .collect()
+    }
+
+    fn span_with<'a>(spans: &'a [(String, Style)], text: &str) -> Option<&'a (String, Style)> {
+        spans.iter().find(|(content, _)| content == text)
+    }
+
+    fn assert_ink(spans: &[(String, Style)], text: &str, ink: ratatui::style::Color) {
+        let (content, style) =
+            span_with(spans, text).unwrap_or_else(|| panic!("no painted span {text:?}: {spans:?}"));
+        assert_eq!(
+            style.fg,
+            Some(ink),
+            "{content:?} must paint with the command ink: {spans:?}"
+        );
+    }
+
+    /// Spans that paint the editable text — the same background as the input
+    /// surface. Chrome (border, prompt) and the ghost hint are not body text.
+    fn body_spans<'a>(s: &AppState, spans: &'a [(String, Style)]) -> Vec<(String, Style)> {
+        spans
+            .iter()
+            .filter(|(_, style)| style.bg == Some(s.theme.surface.input))
+            .cloned()
+            .collect()
+    }
+
+    /// A slash command reads as a command before Enter: the token takes the
+    /// soft violet the Plan indicator already owns, the argument after it stays
+    /// prose, and the row's background is unchanged.
+    #[test]
+    fn a_slash_command_token_uses_the_soft_violet_and_its_argument_stays_prose() {
+        let mut s = state();
+        s.theme = Theme::dark();
+        s.composer.replace("/model deepseek-v4.1");
+        let spans = composer_spans(&s, 60);
+        assert_ink(&spans, "/model", s.theme.plan.primary);
+        assert_ink(&spans, " deepseek-v4.1", s.theme.text.primary);
+        let command = span_with(&spans, "/model").expect("command span");
+        assert_eq!(
+            command.1.bg,
+            Some(s.theme.surface.input),
+            "the command span must not punch a hole in the input surface"
+        );
+        assert_eq!(
+            s.composer.text(),
+            "/model deepseek-v4.1",
+            "highlighting must never rewrite the buffer"
+        );
+    }
+
+    /// The argument hint is not input: it keeps the muted grey it had before
+    /// the command token earned its color.
+    #[test]
+    fn the_slash_argument_ghost_stays_muted_behind_a_colored_command() {
+        let mut s = state();
+        s.theme = Theme::dark();
+        s.composer.replace("/btw ");
+        let spans = composer_spans(&s, 60);
+        assert_ink(&spans, "/btw", s.theme.plan.primary);
+        assert_ink(&spans, " ", s.theme.text.primary);
+        assert_ink(&spans, "<问题>", s.theme.text.muted);
+        assert_eq!(s.composer.text(), "/btw ", "the ghost is not the buffer");
+    }
+
+    #[test]
+    fn unknown_commands_and_ordinary_text_keep_the_prose_ink() {
+        for text in ["/unknown-command", "这个项目怎么本地跑起来？", "/hlep me"] {
+            let mut s = state();
+            s.theme = Theme::dark();
+            s.composer.replace(text);
+            let spans = composer_spans(&s, 60);
+            assert!(
+                spans
+                    .iter()
+                    .all(|(_, style)| style.fg != Some(s.theme.plan.primary)),
+                "{text:?} must not borrow the command ink: {spans:?}"
+            );
+            assert_ink(&spans, text, s.theme.text.primary);
+        }
+    }
+
+    /// A wrapper that splits the token across rows leaves no complete command
+    /// on either row, so no half command is colored as one.
+    #[test]
+    fn a_command_split_by_the_wrapper_is_not_partially_highlighted() {
+        let mut s = state();
+        s.theme = Theme::dark();
+        s.composer.replace("/model");
+        let spans = body_spans(&s, &composer_spans(&s, 10));
+        assert!(
+            spans
+                .iter()
+                .all(|(_, style)| style.fg != Some(s.theme.plan.primary)),
+            "no partial command may claim the command ink: {spans:?}"
+        );
+    }
+
+    /// Shell Mode's `/` is a filesystem path, not the command namespace.
+    #[test]
+    fn shell_mode_never_highlights_a_command_token() {
+        let mut s = state();
+        s.theme = Theme::dark();
+        s.input_mode = crate::shell_mode::InputMode::Shell;
+        s.composer.replace("/model");
+        let spans = body_spans(&s, &composer_spans(&s, 60));
+        assert_ink(&spans, "/model", s.theme.text.primary);
     }
 
     /// The idle footer surfaces BOTH composer entry points: `/` for commands

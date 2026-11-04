@@ -559,15 +559,25 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                     .transcript
                     .set_tool_stop(call_id, crate::transcript::StopRequest::Uncertain);
             }
-            let message = if resynced {
-                state.t().command_outcome_unknown_synced
-            } else {
+            let is_stop = matches!(
+                command,
+                ClientCommand::CancelTask { .. }
+                    | ClientCommand::CancelCurrentTurn { .. }
+                    | ClientCommand::CancelToolCall { .. }
+                    | ClientCommand::CancelChild { .. }
+            );
+            let message = match (is_stop, resynced) {
+                (true, true) => state.t().stop_outcome_unknown_synced,
+                (true, false) => state.t().stop_outcome_unknown_unreachable,
+                (false, true) => state.t().command_outcome_unknown_synced,
+                (false, false) => state.t().command_outcome_unknown_unreachable,
+            };
+            if !resynced {
                 // Delivery is uncertain: the runtime may already be executing.
                 // Fail closed until reconnect/snapshot establishes authority;
                 // never expose Idle and permit a duplicate turn.
                 state.runtime_connected = false;
-                state.t().command_outcome_unknown_unreachable
-            };
+            }
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
                 message: message.to_string(),
@@ -670,6 +680,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
         EffectCompletion::SubmissionRejected {
             command_id,
             message,
+            recovery,
             snapshot,
         } => {
             let Some(pending) = take_pending_submission(state, &command_id) else {
@@ -695,19 +706,46 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             }
             // A refused 待发送 item stays where the user left it, still unsent;
             // any other turn input goes back to the composer.
-            match pending_input_for(state, &command_id) {
+            let restored_to_composer = match pending_input_for(state, &command_id) {
                 Some(item) => {
                     item.state = crate::pending_inputs::PendingInputState::Failed(message.clone());
+                    false
                 }
-                None => submit::restore_turn_input(state, pending.command),
-            }
+                None => {
+                    submit::restore_turn_input(state, pending.command);
+                    true
+                }
+            };
+            // The copy names where the input actually is. A recovery stop also
+            // names its own next step; the runtime's raw diagnostic would bury
+            // it and is not user copy, but it stays in the log.
+            tracing::warn!(reason = %message, recovery, "submission rejected");
+            let text = if recovery {
+                state.t().recovery_submission_rejected.to_string()
+            } else if restored_to_composer {
+                state.t().submission_rejected.to_string()
+            } else {
+                state.t().submission_rejected_queued.to_string()
+            };
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
-                message: format!("{}：{message}", state.t().submission_rejected),
+                message: text,
             });
         }
         EffectCompletion::InteractionDelivered { key } => {
             state.interaction_command_ids.remove(&key);
+            // The sticky uncertainty is resolved only by this same key being
+            // delivered; a different interaction's delivery proves nothing
+            // about the one still waiting.
+            if state.uncertain_interaction_key.as_deref() == Some(key.as_str()) {
+                state.uncertain_interaction_key = None;
+                let copy = state.t().interaction_uncertain_pending;
+                if state.notification.as_ref().is_some_and(|notice| {
+                    notice.level == NotificationLevel::Error && notice.message == copy
+                }) {
+                    state.notification = None;
+                }
+            }
             overlay_keys::advance_overlay(state);
         }
         EffectCompletion::InteractionUncertain {
@@ -720,17 +758,20 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 .is_none_or(|snap| snapshot_awaits_interaction(snap, &key));
             if still_pending {
                 overlay_keys::restore_interaction_overlay(state, restore);
+                state.uncertain_interaction_key = Some(key);
                 state.notification = Some(Notification {
                     level: NotificationLevel::Error,
-                    message: "交付状态未知，审批/澄清仍在等待，请重试（将复用同一命令）"
-                        .to_string(),
+                    message: state.t().interaction_uncertain_pending.to_string(),
                 });
             } else {
                 state.interaction_command_ids.remove(&key);
+                if state.uncertain_interaction_key.as_deref() == Some(key.as_str()) {
+                    state.uncertain_interaction_key = None;
+                }
                 overlay_keys::advance_overlay(state);
                 state.notification = Some(Notification {
                     level: NotificationLevel::Info,
-                    message: "连接异常，但运行时已处理该审批/澄清，已同步状态".to_string(),
+                    message: state.t().interaction_uncertain_synced.to_string(),
                 });
             }
         }
@@ -2400,6 +2441,17 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             navigate_user_turn(state, 1);
         }
         KeyCode::Left => state.composer.move_left(),
+        // A visible next-step ghost claims `→` exactly like Tab: `accept` is the
+        // one function that turns it into real text, so the two keys can never
+        // produce different edits. This arm sits above the plain caret move and
+        // below Alt+→, which stays readline word motion. Popups, overlays and
+        // history browse are already decided above, and `is_visible` refuses
+        // any state where the ghost is not painted — so the fallback is always
+        // the ordinary grapheme step.
+        KeyCode::Right if !btw && crate::suggestion::is_visible(state) => {
+            crate::suggestion::accept(state);
+            touch_slash_filter(state);
+        }
         KeyCode::Right => state.composer.move_right(),
         KeyCode::Home => state.composer.move_to_line_start(),
         // Empty composer: End jumps to the live bottom (Approach A). With text,

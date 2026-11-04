@@ -183,6 +183,17 @@ pub enum ClientCommand {
         session_id: SessionId,
         call_id: ToolCallId,
     },
+    /// Acknowledge the session's crash window: close every tool call that
+    /// started but never recorded an outcome with an explicit
+    /// "outcome unknown, not replayed" marker, so the next turn may run.
+    ///
+    /// This is the interactive counterpart of `run --resume
+    /// --confirm-recovery`. It asserts only that the user inspected the
+    /// workspace; it never turns an unknown result into success, never
+    /// replays a call, and is refused while a turn is executing. The runtime
+    /// answers with [`crate::RuntimeEvent::CrashWindowAcknowledged`] and a
+    /// fresh snapshot.
+    AcknowledgeCrashWindow { session_id: SessionId },
     /// Resolve a pending permission request .
     ApprovalDecision {
         request_id: ApprovalId,
@@ -523,6 +534,7 @@ impl ClientCommand {
             | ClientCommand::CancelTask { session_id }
             | ClientCommand::CancelChild { session_id, .. }
             | ClientCommand::CancelToolCall { session_id, .. }
+            | ClientCommand::AcknowledgeCrashWindow { session_id }
             | ClientCommand::SelectModel { session_id, .. }
             | ClientCommand::SetDefaultModel { session_id, .. }
             | ClientCommand::SetPermissionProfile { session_id, .. }

@@ -5,9 +5,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
     AnswerEffect, ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId,
-    PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest,
-    UiCheckpoint, UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole, UiSessionSnapshot,
-    UiThinkingAccess, UiThinkingState,
+    NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall,
+    UiApprovalRequest, UiCheckpoint, UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole,
+    UiSessionSnapshot, UiThinkingAccess, UiThinkingState,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::btw::{BtwToolState, BtwTurnState, SurfaceFocus};
@@ -124,7 +124,9 @@ fn snapshot() -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),
@@ -171,6 +173,35 @@ fn ctrl(c: char) -> Action {
 
 fn raw_char(c: char) -> Action {
     Action::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+}
+
+/// A command whose delivery stayed uncertain after a failed resync sets
+/// `runtime_connected = false` to fail closed — "until reconnect/snapshot
+/// establishes authority". The reconnect snapshot IS that authority: once it
+/// is applied, the TUI must accept and submit the user's input again instead
+/// of refusing every command for the rest of the process's life.
+#[test]
+fn a_snapshot_after_a_disconnect_restores_command_authority() {
+    let mut state = opened();
+    state.runtime_connected = false;
+    typed(&mut state, "继续");
+    let held = reduce(&mut state, key(KeyCode::Enter));
+    assert!(
+        !matches!(held.as_slice(), [Effect::Submit { .. }]),
+        "a disconnected client must not submit: {held:?}"
+    );
+
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+    let effects = reduce(&mut state, key(KeyCode::Enter));
+    assert!(
+        matches!(effects.as_slice(), [Effect::Submit { .. }]),
+        "the reconnect snapshot re-establishes delivery authority: {effects:?}"
+    );
 }
 
 #[test]
@@ -1658,6 +1689,7 @@ fn turn_failed_records_error_and_status() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "boom".into(),
             failure: None,
+            recovery: None,
         }),
     );
     assert_eq!(s.status, RuntimeStatus::Error);
@@ -1711,6 +1743,7 @@ fn terminal_failure_detail_uses_the_existing_safe_provider_text_projection() {
                 summary: "无法连接模型服务。".into(),
                 detail: "connection closed sk-supersecret-value".into(),
             }),
+            recovery: None,
         }),
     );
     let failure = s
@@ -1802,6 +1835,7 @@ fn an_exhausted_failure_states_how_many_retries_were_spent() {
                 summary: "无法连接模型服务。".into(),
                 detail: "connection closed".into(),
             }),
+            recovery: None,
         }),
     );
     let failure = s
@@ -1845,6 +1879,7 @@ fn a_local_configuration_failure_is_a_continuation_point_not_a_dead_task() {
                     .into(),
                 detail: "unknown provider `deepseek`".into(),
             }),
+            recovery: None,
         }),
     );
     assert!(
@@ -2379,6 +2414,7 @@ fn a_failing_outcome_is_not_rewritten_by_the_missing_answer_rule() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "provider closed".into(),
             failure: None,
+            recovery: None,
         }),
     );
     assert_eq!(last_turn_end(&s).status, TurnEndStatus::Failed);
@@ -3279,6 +3315,7 @@ fn approval_retry_reuses_the_same_command_id() {
 fn uncertain_interaction_completion_restores_overlay_and_sticky_id() {
     let mut s = opened();
     let request = approval_req();
+    let request_key = format!("a:{}", request.id.as_str());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ApprovalRequested {
@@ -3293,17 +3330,52 @@ fn uncertain_interaction_completion_restores_overlay_and_sticky_id() {
     reduce(
         &mut s,
         Action::EffectCompleted(EffectCompletion::InteractionUncertain {
-            key: format!("a:{}", request.id.as_str()),
+            key: request_key.clone(),
             restore: PendingInteraction::Approval(request),
             snapshot: None,
         }),
     );
     assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+    // The notice says what is actually known: the choice may have arrived and
+    // is still waiting, so it is sticky until that exact choice resolves.
+    let notice = s.notification.as_ref().expect("uncertainty is shown");
+    assert_eq!(notice.level, NotificationLevel::Error);
+    assert_eq!(notice.message, s.t().interaction_uncertain_pending);
+    assert_eq!(
+        s.uncertain_interaction_key.as_deref(),
+        Some(request_key.as_str())
+    );
+
+    // A different interaction's delivery proves nothing about this one.
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::InteractionDelivered {
+            key: "a:other".to_string(),
+        }),
+    );
+    assert!(
+        s.notification.is_some(),
+        "another choice's delivery must not clear a live risk"
+    );
+
     let retry = reduce(&mut s, key(KeyCode::Enter));
     assert!(matches!(
         &retry[0],
         Effect::SendInteraction { command_id: retry_id, .. } if retry_id == &command_id
     ));
+
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::InteractionDelivered {
+            key: request_key.clone(),
+        }),
+    );
+    assert!(
+        s.notification.is_none(),
+        "delivering this exact choice resolves the error: {:?}",
+        s.notification
+    );
+    assert!(s.uncertain_interaction_key.is_none());
 }
 
 #[test]
@@ -5325,6 +5397,7 @@ fn a_failed_turn_is_a_blocking_issue_with_a_way_back() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "provider rejected the request".into(),
             failure: None,
+            recovery: None,
         }),
     );
     let workbench = rendered(&mut s, 140, 30);
@@ -6444,6 +6517,81 @@ fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
     let msg = s.notification.as_ref().unwrap().message.clone();
     assert!(!msg.contains("bg-unknown"), "{msg}");
     assert!(msg.contains("后台任务"), "generic but truthful: {msg}");
+}
+
+/// The reconnect snapshot is the runtime's answer to "what is still running?".
+/// A running task the snapshot no longer lists stops counting as running, but
+/// it is NOT deleted: with no durable record the snapshot cannot say how it
+/// ended, so the row stays with an open (unknown) state. A task the snapshot
+/// does list stays live, and terminal history survives either way.
+#[test]
+fn a_reconnect_snapshot_is_authoritative_for_background_tasks() {
+    let mut s = opened();
+    for id in ["bg-kept", "bg-gone", "bg-done"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+                task_id: id.into(),
+                program: "sleep".into(),
+                args: vec!["600".into()],
+                pid: Some(1),
+            }),
+        );
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-done".into(),
+            exit_code: Some(0),
+            duration_ms: 2_000,
+            ok: true,
+            stopped: false,
+            output: String::new(),
+        }),
+    );
+
+    let mut snap = snapshot();
+    snap.status = "running".into();
+    snap.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {
+        task_id: "bg-kept".into(),
+        program: "sleep".into(),
+        args: vec!["600".into()],
+        elapsed_ms: 12_000,
+        pid: Some(1),
+        ready_evidence: None,
+        lifetime: Some("runtime".into()),
+    }];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+
+    assert!(
+        s.background_task_labels
+            .get("bg-kept")
+            .is_some_and(|chrome| chrome.is_running()),
+        "a task the runtime still reports stays live"
+    );
+    assert!(
+        s.background_task_labels
+            .get("bg-gone")
+            .is_some_and(|chrome| {
+                !chrome.is_running()
+                    && chrome.outcome() == leveler_tui::state::BackgroundOutcome::Unknown
+            }),
+        "a vanished running task keeps an open state instead of disappearing"
+    );
+    assert!(
+        s.background_task_labels
+            .get("bg-done")
+            .is_some_and(|chrome| !chrome.is_running() && chrome.ok == Some(true)),
+        "the TUI's own terminal history is not discarded by a reconnect"
+    );
+    let frame = rendered(&mut s, 120, 30);
+    assert!(
+        frame.contains("后台 1"),
+        "only the runtime-confirmed running task is counted:\n{frame}"
+    );
 }
 
 /// Live output is appended to the same projection the detail page reads, so a
@@ -8518,6 +8666,7 @@ fn a_rejected_submission_returns_the_text_and_reopens_the_composer() {
         Action::EffectCompleted(EffectCompletion::SubmissionRejected {
             command_id: first_id.clone(),
             message: "session already has an active turn".into(),
+            recovery: false,
             snapshot: Some(Box::new(snapshot())),
         }),
     );
@@ -8529,9 +8678,9 @@ fn a_rejected_submission_returns_the_text_and_reopens_the_composer() {
         .as_ref()
         .map(|n| n.message.as_str())
         .unwrap_or("");
-    assert!(
-        note.contains("active turn"),
-        "the runtime's own words: {note}"
+    assert_eq!(
+        note, "消息未被接受，内容已恢复到输入框。",
+        "the user is told where the input is, not the runtime's diagnostic"
     );
 
     let (_, second_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
@@ -8578,6 +8727,7 @@ fn an_answer_for_an_untracked_command_is_ignored() {
         Action::EffectCompleted(EffectCompletion::SubmissionRejected {
             command_id: leveler_client_protocol::CommandId::new("cmd-stale"),
             message: "busy".into(),
+            recovery: false,
             snapshot: None,
         }),
     );
@@ -12725,5 +12875,352 @@ fn a_quiet_provider_only_reload_stays_quiet() {
 }
 
 // ---------------------------------------------------------------------------
+// Transport reconnects: the transport states what it observed, the view
+// decides what the user must hear. A stream reset on a live runtime lost no
+// work; a replaced runtime may have; an unreadable identity proves neither.
+// Nothing was running means nothing was lost, so the view stays silent.
+// ---------------------------------------------------------------------------
+
+fn reconnect(
+    s: &mut AppState,
+    restarted: Option<bool>,
+) -> Option<leveler_tui::state::Notification> {
+    s.notification = None;
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::RuntimeReconnected {
+            runtime_build: Default::default(),
+            runtime_restarted: restarted,
+        }),
+    );
+    s.notification.clone()
+}
+
+fn running(s: &mut AppState) {
+    let mut snapshot = snapshot();
+    snapshot.status = "running".to_string();
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
+}
+
+#[test]
+fn a_stream_reset_on_the_same_process_is_silent() {
+    let mut s = opened();
+    running(&mut s);
+
+    assert!(
+        reconnect(&mut s, Some(false)).is_none(),
+        "the process never changed, so its running work was not stopped"
+    );
+}
+
+#[test]
+fn a_reconnect_with_nothing_running_is_silent() {
+    let mut s = opened();
+
+    assert!(
+        reconnect(&mut s, Some(true)).is_none(),
+        "a replaced runtime cannot have stopped work that never started"
+    );
+}
+
+#[test]
+fn a_reconnect_after_a_restart_warns_that_work_may_have_stopped() {
+    let mut s = opened();
+    running(&mut s);
+    let notice =
+        reconnect(&mut s, Some(true)).expect("a restart during a turn is the user's business");
+
+    assert_eq!(notice.level, NotificationLevel::Warning, "{notice:?}");
+    assert_eq!(
+        notice.message,
+        "刚才的任务已中断，部分操作可能已完成，请检查结果。"
+    );
+}
+
+#[test]
+fn an_unverifiable_reconnect_is_not_read_as_a_restart() {
+    let mut s = opened();
+    assert!(
+        reconnect(&mut s, None).is_none(),
+        "an unreadable identity proves nothing, and nothing was running"
+    );
+
+    running(&mut s);
+    let notice =
+        reconnect(&mut s, None).expect("an unknown process is still a break the user must see");
+    assert_eq!(notice.message, "刚才的任务状态无法确认，请检查后再继续。");
+}
+
+#[test]
+fn a_repeated_reconnect_is_one_notice_not_two() {
+    let mut s = opened();
+    running(&mut s);
+    let first = reconnect(&mut s, Some(true)).expect("first notice");
+    let second = reconnect(&mut s, Some(true)).expect("the same fact after a duplicate event");
+
+    assert_eq!(
+        (first.level, first.message),
+        (second.level, second.message),
+        "two subscriptions watching one runtime must not mint two alarms"
+    );
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .all(|item| !matches!(item, TranscriptItem::Error(_))),
+        "a transient reconnect is not a durable transcript error"
+    );
+}
+
+#[test]
+fn a_reconnect_notice_survives_the_snapshot_that_follows_it() {
+    let mut s = opened();
+    running(&mut s);
+    reconnect(&mut s, Some(true)).expect("the restart is announced before the resync");
+
+    // The transport sends RuntimeReconnected, then the resynced snapshot.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+
+    assert!(s.runtime_connected);
+    let notice = s
+        .notification
+        .expect("the resync must not wipe the warning");
+    assert_eq!(
+        notice.message,
+        "刚才的任务已中断，部分操作可能已完成，请检查结果。"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Pending lifecycle: a person's decision settles the turn that proposed it.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Background-task recovery across a reconnect
+// ---------------------------------------------------------------------------
+
+fn background_record(
+    task_id: &str,
+    state: leveler_client_protocol::UiBackgroundTaskState,
+    exit_code: Option<i32>,
+) -> leveler_client_protocol::UiBackgroundTaskRecord {
+    leveler_client_protocol::UiBackgroundTaskRecord {
+        task_id: task_id.into(),
+        call_id: Some("call-1".into()),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        lifetime: Some("goal".into()),
+        state,
+        exit_code,
+        output: String::new(),
+        output_truncated: false,
+    }
+}
+
+fn reconnect_with_background(
+    mut state: AppState,
+    records: Vec<leveler_client_protocol::UiBackgroundTaskRecord>,
+    live: Vec<leveler_client_protocol::UiActiveBackgroundTask>,
+) -> AppState {
+    let mut snap = snapshot();
+    snap.background_tasks = records;
+    snap.active_background_tasks = live;
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    state
+}
+
+fn start_task(state: &mut AppState, task_id: &str) {
+    reduce(
+        state,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: task_id.into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            pid: None,
+        }),
+    );
+}
+
+/// The runtime died while the task ran. The record proves its boot is gone,
+/// so the row survives as Lost; it never disappears and never reads completed.
+#[test]
+fn a_running_task_whose_boot_died_is_lost_not_dropped() {
+    use leveler_tui::state::BackgroundOutcome;
+    let mut s = opened();
+    start_task(&mut s, "bg-1");
+    let s = reconnect_with_background(
+        s,
+        vec![background_record(
+            "bg-1",
+            leveler_client_protocol::UiBackgroundTaskState::Lost,
+            None,
+        )],
+        Vec::new(),
+    );
+
+    let chrome = s
+        .background_task_labels
+        .get("bg-1")
+        .expect("a lost record must not be dropped");
+    assert_eq!(chrome.outcome(), BackgroundOutcome::Lost);
+    assert!(!chrome.is_running(), "lost is not running");
+}
+
+/// A running row the runtime no longer lists, with no durable record either,
+/// is unknown — not a silent deletion.
+#[test]
+fn a_vanished_running_task_without_a_record_is_unknown() {
+    use leveler_tui::state::BackgroundOutcome;
+    let mut s = opened();
+    start_task(&mut s, "bg-1");
+    let s = reconnect_with_background(s, Vec::new(), Vec::new());
+
+    let chrome = s.background_task_labels.get("bg-1").expect("not dropped");
+    assert_eq!(chrome.outcome(), BackgroundOutcome::Unknown);
+    assert!(!chrome.is_running());
+}
+
+/// Completion recorded while the client was away settles the retained row
+/// with the durable exit code.
+#[test]
+fn a_completion_recorded_while_disconnected_settles_the_row() {
+    use leveler_tui::state::BackgroundOutcome;
+    let mut s = opened();
+    start_task(&mut s, "bg-1");
+    let s = reconnect_with_background(
+        s,
+        vec![background_record(
+            "bg-1",
+            leveler_client_protocol::UiBackgroundTaskState::Completed,
+            Some(0),
+        )],
+        Vec::new(),
+    );
+
+    let chrome = s.background_task_labels.get("bg-1").unwrap();
+    assert_eq!(chrome.outcome(), BackgroundOutcome::Completed);
+    assert_eq!(chrome.exit_code, Some(0));
+}
+
+/// A client started after the crash never saw the task; an unresolved record
+/// is restored rather than replayed as a fresh running task. Its run time is
+/// unknown, not zero.
+#[test]
+fn an_unresolved_record_is_restored_after_a_client_restart() {
+    use leveler_tui::state::BackgroundOutcome;
+    let s = opened();
+    let s = reconnect_with_background(
+        s,
+        vec![background_record(
+            "bg-old",
+            leveler_client_protocol::UiBackgroundTaskState::Lost,
+            None,
+        )],
+        Vec::new(),
+    );
+
+    let chrome = s.background_task_labels.get("bg-old").expect("restored");
+    assert_eq!(chrome.outcome(), BackgroundOutcome::Lost);
+    assert!(!chrome.started_known, "no start was observed here");
+    // The row's own clock is unknown; the renderer shows "—", never 0s.
+    assert!(chrome.label.contains("cargo"), "{chrome:?}");
+}
+
+/// The activity page says the word, not just the glyph.
+#[test]
+fn the_activity_page_names_a_lost_task() {
+    let s = opened();
+    let mut s = reconnect_with_background(
+        s,
+        vec![background_record(
+            "bg-old",
+            leveler_client_protocol::UiBackgroundTaskState::Lost,
+            None,
+        )],
+        Vec::new(),
+    );
+    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background(
+        "bg-old".into(),
+    ));
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background(
+        "bg-old".into(),
+    ));
+    s.active_screen = Screen::Activity;
+
+    let frame = rendered(&mut s, 90, 30);
+    assert!(frame.contains("随后台进程中断"), "{frame}");
+}
+
+/// A repeated Started is a reconnect/replay fact: no second toast, and it
+/// never revives a task that already settled.
+#[test]
+fn a_repeated_started_event_is_silent_and_never_revives_a_settled_task() {
+    use leveler_tui::state::BackgroundOutcome;
+    let mut s = opened();
+    start_task(&mut s, "bg-1");
+    s.notification = None;
+
+    start_task(&mut s, "bg-1");
+    assert!(
+        s.notification.is_none(),
+        "a repeated start must not re-toast"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-1".into(),
+            exit_code: Some(0),
+            duration_ms: 5_000,
+            ok: true,
+            stopped: false,
+            output: String::new(),
+        }),
+    );
+    start_task(&mut s, "bg-1");
+    assert_eq!(
+        s.background_task_labels.get("bg-1").unwrap().outcome(),
+        BackgroundOutcome::Completed,
+        "a replay must not turn a settled task back into running"
+    );
+}
+
+/// A live process reusing a legacy id does not erase the id's ambiguous
+/// durable history, and no outcome is attributed to it.
+#[test]
+fn a_live_entry_with_an_ambiguous_durable_id_is_a_conflict() {
+    use leveler_tui::state::BackgroundOutcome;
+    let s = opened();
+    let s = reconnect_with_background(
+        s,
+        vec![background_record(
+            "bg-1",
+            leveler_client_protocol::UiBackgroundTaskState::Conflict,
+            None,
+        )],
+        vec![leveler_client_protocol::UiActiveBackgroundTask {
+            task_id: "bg-1".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            elapsed_ms: 1_000,
+            pid: None,
+            ready_evidence: None,
+            lifetime: Some("goal".into()),
+        }],
+    );
+
+    let chrome = s.background_task_labels.get("bg-1").unwrap();
+    assert_eq!(chrome.outcome(), BackgroundOutcome::Conflict);
+    assert!(!chrome.is_running());
+}

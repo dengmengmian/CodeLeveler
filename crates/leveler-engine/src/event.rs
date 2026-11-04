@@ -388,6 +388,27 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         full_output: Option<String>,
     },
+    /// A background task was started by a tool call.
+    ///
+    /// The registry that hosts the task is process state: a crash takes it
+    /// with it, and a reconnecting client that only sees the live registry
+    /// cannot tell a task that never existed from one that was lost. This row
+    /// is the start fact — the call, the task id, the argv and the promised
+    /// lifetime — so the snapshot can reconcile it with the durable terminal
+    /// record ([`EngineEvent::BackgroundTaskFinished`]) and the boot that owns
+    /// the turn. A start is not an outcome: nothing here claims the task
+    /// completed, and a start with no finish whose boot is gone reads as lost.
+    BackgroundTaskStarted {
+        call_id: String,
+        task_id: String,
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// The lifetime the spawn promised (`goal`, `runtime`, `session`,
+        /// `persistent`). Kept as a stable key so an older payload decodes.
+        #[serde(default)]
+        lifetime: String,
+    },
     /// A background process task reached a natural exit AFTER the call that
     /// started it already returned.
     ///
@@ -896,7 +917,9 @@ impl EngineEvent {
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
             // The background task's command line and its terminal verdict —
-            // local-sensitive like the call that started it.
+            // local-sensitive like the call that started it. The start fact
+            // is the same shape and the same sensitivity.
+            | EngineEvent::BackgroundTaskStarted { .. }
             | EngineEvent::BackgroundTaskFinished { .. }
             // Raw command output — local-sensitive like the user shell's.
             | EngineEvent::ToolCallOutput { .. }
@@ -1061,6 +1084,7 @@ impl EngineEvent {
             | EngineEvent::UserShellBackgrounded { .. }
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
+            | EngineEvent::BackgroundTaskStarted { .. }
             | EngineEvent::BackgroundTaskFinished { .. }
             | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ModelRetrying { .. }

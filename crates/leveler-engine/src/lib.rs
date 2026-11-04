@@ -21,7 +21,7 @@ pub mod window;
 
 pub use engine::{
     EngineBoot, NewSession, NewSessionAxes, TaskEngine, TaskExecution, TaskTerminal,
-    acknowledge_crash_window,
+    USER_ACKNOWLEDGED_CRASH_PREVIEW, acknowledge_crash_window,
 };
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
@@ -30,7 +30,10 @@ pub use event::{
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
-pub use log::{DanglingCall, EventLog, FinishedChildFact, SnapshotView};
+pub use log::{
+    AcknowledgedCall, BackgroundTaskFact, BackgroundTaskTerminal, DanglingCall, EventLog,
+    FinishedChildFact, SnapshotView,
+};
 pub use ports::{
     ChildToolEvent, EventBarrier, ExecutionFence, GoalBinder, LostChild, LostChildNote,
     LostChildVoice, ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TranscriptSink,

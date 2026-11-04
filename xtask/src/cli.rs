@@ -5,8 +5,7 @@ use crate::error::{Fail, Report};
 use crate::exec::{self, CommandSpec, Host, SystemHost};
 use crate::fmt;
 use crate::pipeline;
-use crate::qualify;
-use crate::root::{self, Env};
+use crate::root::Env;
 use crate::scope::{self, Affected};
 use crate::version;
 
@@ -45,35 +44,13 @@ pub fn dispatch_with(repo: &Path, args: &[String], env: &Env, host: &dyn Host) -
         "test" => cmd_cargo(host, &repo, env, rest, true),
         "verify" => cmd_verify(host, &repo, env, rest),
         "clean" => clean::parse_args(rest).and_then(|mode| clean::apply(host, &repo, mode)),
-        "pre-release" => gate(host, &repo, env, rest, GateKind::PreRelease),
-        "dogfood" => gate(host, &repo, env, rest, GateKind::Dogfood),
+        "pre-release" => pipeline::pre_release_only(host, &repo, env, rest),
+        "dogfood" => pipeline::qualify_only(host, &repo, env, rest),
         "release" => pipeline::qualify_only(host, &repo, env, rest),
         "publish" => pipeline::run(host, &repo, env, rest),
         other => return unknown(other),
     };
     from_result(result)
-}
-
-enum GateKind {
-    PreRelease,
-    Dogfood,
-}
-
-fn gate(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    args: &[String],
-    kind: GateKind,
-) -> Result<Report, Fail> {
-    let (opts, rest) = root::extract_gate_opts(args)?;
-    if let Some(extra) = rest.first() {
-        return Err(Fail::new("UNKNOWN_COMMAND", format!("unknown argument: {extra}")).exit(2));
-    }
-    match kind {
-        GateKind::PreRelease => qualify::run_pre_release(host, repo, env, &opts),
-        GateKind::Dogfood => qualify::run_dogfood(host, repo, env, &opts),
-    }
 }
 
 fn cmd_fmt(host: &dyn Host, repo: &Path, env: &Env, args: &[String]) -> Result<Report, Fail> {
@@ -248,8 +225,8 @@ Maintenance
   clean build       same as clean --all
 
 Release
-  pre-release       L0-L2 of the dogfood release gate; check only
-  dogfood           release qualification, then RC qualification
+  pre-release       stages 1-2 of the release gate (L0-L2); check only, never RC
+  dogfood           alias for release: stages 1-3, qualification then RC
   release           stages 1-3 on the current commit: build & static, tests, real dogfood
   publish           one release transaction: bump, qualify, CI, publish (--patch is the default)
   publish --minor

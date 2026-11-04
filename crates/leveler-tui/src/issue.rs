@@ -7,7 +7,10 @@
 //!   turn ended in failure" state, and the transcript's failure block carries
 //!   its typed summary/subtitle/detail;
 //! - a **failed background task** — the task's failed terminal state in the
-//!   projection the runtime's events built, keyed by its stable task id.
+//!   projection the runtime's events built, keyed by its stable task id;
+//! - a **client/runtime version mismatch** — two known build identities
+//!   disagree. It stays active until a matching build is observed, so the
+//!   risk outlives any dismissible notice.
 //!
 //! What is deliberately NOT here:
 //!
@@ -43,6 +46,9 @@ pub(crate) enum IssueKind {
     /// A background task reached the runtime's failed terminal state. A
     /// stopped task is not a failure and never appears here.
     BackgroundFailure,
+    /// The client and the runtime it talks to are known to be different
+    /// builds. Only a matching observed build clears it.
+    RuntimeVersion,
 }
 
 impl IssueKind {
@@ -51,6 +57,7 @@ impl IssueKind {
         match self {
             Self::TurnFailure => "turn-failure",
             Self::BackgroundFailure => "background-failure",
+            Self::RuntimeVersion => "runtime-version",
         }
     }
 }
@@ -87,6 +94,10 @@ pub(crate) struct IssueSummary {
     pub severe: Option<String>,
     /// `true` while any active turn-failure issue exists.
     pub severe_active: bool,
+    /// The number of counted issues that are unviewed background failures.
+    /// `background_unread == total` therefore means every counted issue is a
+    /// background failure; anything else includes a version mismatch.
+    pub background_unread: usize,
 }
 
 impl IssueSummary {
@@ -95,10 +106,11 @@ impl IssueSummary {
     }
 }
 
-/// Every active issue, in display order: the failed turn first, then failed
-/// background tasks oldest-first (the projection's own start clock, so the
-/// order is deterministic and never a hash iteration order). Unviewed failures
-/// lead their viewed history, so what needs attention is what the eye lands on.
+/// Every active issue, in display order: the failed turn first, then a
+/// client/runtime version mismatch, then failed background tasks oldest-first
+/// (the projection's own start clock, so the order is deterministic and never
+/// a hash iteration order). Unviewed failures lead their viewed history, so
+/// what needs attention is what the eye lands on.
 pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
     let mut issues = Vec::new();
     if state.status == RuntimeStatus::Error {
@@ -120,6 +132,29 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
             label,
             meta,
             detail,
+            unread: false,
+        });
+    }
+    if state.runtime_version_mismatch {
+        let meta = state.runtime_build.as_ref().and_then(|build| {
+            let expected = leveler_client_protocol::BuildIdentity::current();
+            if !build.is_known() || !expected.is_known() {
+                return None;
+            }
+            Some(
+                state
+                    .t()
+                    .runtime_version_meta
+                    .replacen("{}", &expected.short(), 1)
+                    .replacen("{}", &build.short(), 1),
+            )
+        });
+        issues.push(Issue {
+            kind: IssueKind::RuntimeVersion,
+            key: IssueKind::RuntimeVersion.key().to_string(),
+            label: state.t().runtime_version_mismatch.to_string(),
+            meta,
+            detail: None,
             unread: false,
         });
     }
@@ -156,7 +191,8 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
 }
 
 /// Sum up what the strip must remind about: the severe label when a failed
-/// turn is active, and the count of issues that still need attention.
+/// turn is active, the persistent version mismatch, and the count of
+/// background failures that still need attention.
 pub(crate) fn issue_summary(state: &AppState) -> IssueSummary {
     let issues = active_issues(state);
     let severe = issues
@@ -168,9 +204,10 @@ pub(crate) fn issue_summary(state: &AppState) -> IssueSummary {
         .filter(|issue| issue.kind == IssueKind::BackgroundFailure && issue.unread)
         .count();
     IssueSummary {
-        total: usize::from(severe.is_some()) + unread,
+        total: usize::from(severe.is_some()) + usize::from(state.runtime_version_mismatch) + unread,
         severe_active: severe.is_some(),
         severe,
+        background_unread: unread,
     }
 }
 
@@ -512,5 +549,55 @@ mod tests {
             message: "some transient notice".into(),
         });
         assert!(active_issues(&state).is_empty());
+    }
+
+    /// A version mismatch is a durable issue of its own: it survives the
+    /// warning notice that announced it, and it leaves only when the state
+    /// says a matching build is serving the client.
+    #[test]
+    fn a_version_mismatch_persists_until_a_matching_build_is_observed() {
+        let mut state = state();
+        state.runtime_version_mismatch = true;
+        let mut foreign = leveler_client_protocol::BuildIdentity::current();
+        foreign.revision = "0000000000000000000000000000000000000000".into();
+        foreign.fingerprint = "foreign-fingerprint".into();
+        foreign.dirty = false;
+        state.runtime_build = Some(foreign);
+
+        state.notification = None;
+        let issues = active_issues(&state);
+        assert_eq!(issues.len(), 1, "dismissing the notice solved nothing");
+        assert_eq!(issues[0].kind, IssueKind::RuntimeVersion);
+        assert_eq!(issues[0].key, "runtime-version");
+        assert_eq!(issues[0].label, "CodeLeveler 版本不一致，请重启应用。");
+        assert!(
+            issues[0]
+                .meta
+                .as_deref()
+                .is_some_and(|m| m.contains("当前应用")),
+            "the row names both builds: {:?}",
+            issues[0].meta
+        );
+        assert_eq!(issue_summary(&state).total, 1);
+
+        state.runtime_version_mismatch = false;
+        assert!(
+            active_issues(&state).is_empty(),
+            "a matching build is the only recovery"
+        );
+    }
+
+    /// The two persistent faults stay distinct rows, and the version row does
+    /// not hide the failed turn's severe label.
+    #[test]
+    fn a_version_mismatch_and_a_failed_turn_are_separate_issues() {
+        let mut state = state();
+        state.status = RuntimeStatus::Error;
+        state.runtime_version_mismatch = true;
+        let issues = active_issues(&state);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].kind, IssueKind::TurnFailure);
+        assert_eq!(issues[1].kind, IssueKind::RuntimeVersion);
+        assert_eq!(issue_summary(&state).total, 2);
     }
 }

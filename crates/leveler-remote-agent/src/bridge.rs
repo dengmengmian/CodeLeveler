@@ -677,6 +677,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::DeleteAgent { .. } => "delete_agent",
         ClientCommand::ShutdownWhenIdle { .. } => "shutdown_when_idle",
         ClientCommand::ForceRetire { .. } => "force_retire",
+        ClientCommand::AcknowledgeCrashWindow { .. } => "acknowledge_crash_window",
         ClientCommand::Quit => "quit",
     }
 }

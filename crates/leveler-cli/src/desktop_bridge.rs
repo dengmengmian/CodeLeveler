@@ -529,6 +529,7 @@ fn error_kind(error: &anyhow::Error) -> &'static str {
     use leveler_client_protocol::ClientError;
     match error.downcast_ref::<ClientError>() {
         Some(ClientError::OutcomeUnknown(_)) => "outcome_unknown",
+        Some(ClientError::RecoveryRequired(_)) => "recovery_required",
         Some(ClientError::Unresolvable(_)) => "unresolvable",
         Some(ClientError::OwnershipConflict(_)) => "ownership_conflict",
         Some(ClientError::SessionNotFound(_)) => "session_not_found",

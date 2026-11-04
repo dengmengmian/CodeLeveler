@@ -6,7 +6,7 @@ use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
-    open_model_picker, open_theme_picker, open_unsupported_media,
+    open_model_picker, open_recovery_confirm, open_theme_picker, open_unsupported_media,
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
@@ -419,7 +419,7 @@ pub(super) fn delete_pending_input(state: &mut AppState, index: usize) {
 /// the runtime at all. The caller leaves the typed text in place.
 fn turn_input_held(state: &mut AppState) -> bool {
     let message = if !state.runtime_connected {
-        state.t().commands_disabled_disconnected
+        state.t().input_held_offline
     } else if state
         .pending_submissions
         .iter()
@@ -648,6 +648,10 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             open_checkpoint_picker(state);
             Vec::new()
         }
+        // Review the crash window and explicitly acknowledge that the
+        // interrupted calls' outcomes are unknown. It never replays them and
+        // never claims they succeeded.
+        "recover" => open_recovery_confirm(state),
         // The runtime copies record + transcript into a fresh session and
         // leaves this one open, so there is nothing to confirm here.
         "fork" => vec![Effect::Send(ClientCommand::ForkSession {

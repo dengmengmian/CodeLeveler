@@ -9,8 +9,8 @@ use leveler_engine::EngineEvent;
 
 use leveler_client_protocol::{
     AnswerEffect, ChildContribution, FailureCategory, FailureDelivery, FailureRetryability,
-    FailureSource, FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
-    UiFailure, UiPlan, UiPlanStep,
+    FailureSource, FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RecoveryStop,
+    RuntimeEvent, UiFailure, UiPlan, UiPlanStep,
 };
 
 use crate::AppError;
@@ -154,13 +154,28 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
             level: NotificationLevel::Error,
             message: format!("任务终态尚未发布：权威终态提交失败，需要恢复后重新结算（{error}）"),
         },
-        Err(error) => RuntimeEvent::TurnFailed {
-            error: error.to_string(),
-            failure: match &error {
+        Err(error) => {
+            // The message borrows nothing after this point, so the recovery
+            // facts can be cloned out of the same error without a second match
+            // arm.
+            let message = error.to_string();
+            let recovery = match &error {
+                AppError::RecoveryConfirmationRequired { call_id, tool } => Some(RecoveryStop {
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                }),
+                _ => None,
+            };
+            let failure = match &error {
                 AppError::Model(model) => Some(ui_failure_from_model(model)),
                 _ => None,
-            },
-        },
+            };
+            RuntimeEvent::TurnFailed {
+                error: message,
+                failure,
+                recovery,
+            }
+        }
     }
 }
 
@@ -405,6 +420,7 @@ fn task_finished_event(
         leveler_lifecycle::TaskOutcome::Failed => RuntimeEvent::TurnFailed {
             error: reason.unwrap_or_else(|| "任务执行失败".to_string()),
             failure: failure.as_ref().map(ui_failure_from_model),
+            recovery: None,
         },
         leveler_lifecycle::TaskOutcome::BudgetLimited => RuntimeEvent::TurnIncomplete {
             reason: reason.unwrap_or_else(|| "执行预算已用尽".to_string()),
@@ -677,6 +693,10 @@ impl EventBridge {
         }
         match event {
             EngineEvent::RetiredMemory {} => {}
+            // A durable start fact, not a live projection. The background-task
+            // registry bridge already tells this runtime's clients that a task
+            // started; this event exists for the ones that connect later.
+            EngineEvent::BackgroundTaskStarted { .. } => {}
             EngineEvent::FinalizationStarted { .. } => {
                 if !self.terminal_published {
                     let _ = self.events.send(RuntimeEvent::TurnFinalizing {
@@ -921,6 +941,16 @@ impl EventBridge {
                         Instant::now()
                     }
                 };
+                // A user-acknowledged crash marker is a recovery fact, not a
+                // tool outcome: it says the interrupted call's result is
+                // unknown and that nothing was replayed. Forwarding it as a
+                // completion would turn that unknown into a failure the
+                // runtime never observed (and the transcript would count it
+                // as one). Leave the call without a terminal fact; the view
+                // presents that as unknown.
+                if preview == leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW {
+                    return;
+                }
                 let _ = self.events.send(RuntimeEvent::ToolCallCompleted {
                     id: ToolCallId::new(id),
                     ok: !is_error,
@@ -2612,6 +2642,33 @@ mod bridge_tests {
         ));
     }
 
+    /// The recovery stop reaches presentation as structured facts. The raw
+    /// diagnostic travels in `error`, but the tool and call id are what let the
+    /// UI name the affected call without parsing English.
+    #[test]
+    fn a_recovery_stop_projects_its_tool_and_call_id() {
+        let projected = turn_runtime_event(Err(AppError::RecoveryConfirmationRequired {
+            call_id: "call-7".to_string(),
+            tool: "run_command".to_string(),
+        }));
+        let RuntimeEvent::TurnFailed {
+            error,
+            failure,
+            recovery,
+        } = projected
+        else {
+            panic!("a recovery stop is a failed turn, not a completion");
+        };
+        assert!(failure.is_none(), "a recovery gate is not a provider fault");
+        let stop = recovery.expect("the structured recovery stop");
+        assert_eq!(stop.call_id, "call-7");
+        assert_eq!(stop.tool, "run_command");
+        assert!(
+            !error.is_empty(),
+            "the runtime's diagnostic stays available for the log"
+        );
+    }
+
     #[test]
     fn a_failed_terminal_commit_is_a_recovery_fault_not_a_terminal() {
         let projected = turn_runtime_event(Err(AppError::TerminalCommitFailed(
@@ -3710,5 +3767,41 @@ mod projection_equivalence {
         }]);
         assert_eq!(shapes.len(), 1, "{shapes:?}");
         assert_eq!(shapes[0], "expanded:256000->512000:reread_pressure");
+    }
+
+    /// A user-acknowledged crash marker closes a dangling call so resume can
+    /// proceed. Its preview says the outcome is unknown and that nothing was
+    /// replayed; the engine records it as an errored `ToolCallFinished` only
+    /// so the model receives a tool result. Projecting it as a client-visible
+    /// completion would rewrite "unknown" into a failure the runtime never
+    /// observed, and the transcript would count it as one. The call must stay
+    /// without a terminal fact — which the view presents as unknown.
+    #[test]
+    fn an_acknowledged_crash_marker_is_not_a_failed_call() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(tool_started("c1", "run_command", None));
+        bridge.forward(EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
+            call_id: "c1".into(),
+            name: "run_command".into(),
+            is_error: true,
+            preview: leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW.into(),
+            agent_id: None,
+            applied_diff: None,
+        });
+        // A real failure still completes as one: the suppression belongs to
+        // the recovery marker, not to every errored call.
+        bridge.forward(tool_started("c2", "run_command", None));
+        bridge.forward(tool_finished("c2", "run_command", true, None));
+
+        let mut completed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let RuntimeEvent::ToolCallCompleted { id, ok, .. } = event {
+                completed.push((id.as_str().to_string(), ok));
+            }
+        }
+        assert_eq!(completed, vec![("c2".to_string(), false)]);
     }
 }

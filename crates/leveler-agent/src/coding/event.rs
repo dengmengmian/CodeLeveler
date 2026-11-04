@@ -65,6 +65,19 @@ impl From<AgentEvent> for EngineEvent {
                 exit_code,
                 stop,
             },
+            A::BackgroundTaskStarted {
+                call_id,
+                task_id,
+                program,
+                args,
+                lifetime,
+            } => EngineEvent::BackgroundTaskStarted {
+                call_id,
+                task_id,
+                program,
+                args,
+                lifetime,
+            },
             A::ToolOutput { id, stream, text } => EngineEvent::ToolCallOutput {
                 call_id: id,
                 stream: match stream {

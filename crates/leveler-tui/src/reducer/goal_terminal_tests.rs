@@ -64,6 +64,7 @@ fn a_failed_turn_keeps_the_goal_failed() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "boom".into(),
             failure: None,
+            recovery: None,
         }),
     );
     assert_eq!(
@@ -153,7 +154,7 @@ fn a_refused_closeout_is_shown_as_a_warning_without_an_invented_cause() {
     assert!(painted.contains("目标收尾"), "{screen}");
     assert!(screen.contains('⚠'), "{screen}");
     assert!(
-        painted.contains("目标未更新：收尾被运行时拒绝"),
+        painted.contains("目标未更新：收尾请求被拒绝"),
         "the row states the fact: {screen}"
     );
     assert!(

@@ -734,7 +734,7 @@ fn background_list_row(
     let indent = crate::layout::DETAIL_BODY_INDENT;
     let prefix = if selected { "→ " } else { "  " };
     let glyph = crate::activity::activity_glyph(summary.status);
-    let dur = crate::status_line::fmt_elapsed(summary.duration_secs);
+    let dur = crate::activity::duration_text(summary);
     // The shell's own "EXIT n" word, so a failure's code is visible without
     // opening the detail; the label truncation accounts for its width.
     let meta = match exit_code {
@@ -747,9 +747,10 @@ fn background_list_row(
         ActivityStatus::Completed => Style::default().fg(theme.status.success),
         ActivityStatus::Failed => Style::default().fg(theme.status.error),
         ActivityStatus::Stopped => Style::default().fg(theme.text.muted),
-        ActivityStatus::Interrupted | ActivityStatus::Unreported => {
-            Style::default().fg(theme.status.warning)
-        }
+        ActivityStatus::Interrupted
+        | ActivityStatus::Unreported
+        | ActivityStatus::Lost
+        | ActivityStatus::Conflict => Style::default().fg(theme.status.warning),
     };
     let label_style = Style::default().fg(if selected {
         theme.text.primary
@@ -855,7 +856,7 @@ fn activity_screen_lines(
     lines.push(Line::from(Span::styled(
         format!(
             "{glyph} {status_text} · {}",
-            crate::status_line::fmt_elapsed(summary.duration_secs)
+            crate::activity::duration_text(summary)
         ),
         status_style,
     )));
@@ -895,6 +896,11 @@ fn activity_status_text(
         // A stopped task did not fail: user/agent cancel or session cleanup.
         // Its own word, never the failure branch.
         ActivityStatus::Stopped => t.background_status_stopped.to_string(),
+        // The hosting boot ended without a terminal fact: the process may have
+        // died with it. Never folded into completed, failed, or stopped.
+        ActivityStatus::Lost => t.background_status_lost.to_string(),
+        // The id matches more than one durable start; no outcome is attributed.
+        ActivityStatus::Conflict => t.background_status_conflict.to_string(),
         ActivityStatus::Interrupted => t.sub_agent_interrupted.to_string(),
         ActivityStatus::Unreported => t.sub_agent_unreported.to_string(),
     };
@@ -907,9 +913,10 @@ fn activity_status_text(
         // Stopped is neutral, not alarming: it yields to failed and to a live
         // running accent.
         ActivityStatus::Stopped => Style::default().fg(theme.text.secondary),
-        ActivityStatus::Interrupted | ActivityStatus::Unreported => {
-            Style::default().fg(theme.status.warning)
-        }
+        ActivityStatus::Interrupted
+        | ActivityStatus::Unreported
+        | ActivityStatus::Lost
+        | ActivityStatus::Conflict => Style::default().fg(theme.status.warning),
     };
     match id {
         ActivityId::Background(task_id) => {
@@ -1019,7 +1026,7 @@ fn background_detail_header_lines(
     facts.push(format!(
         "{} {}",
         t.background_meta_elapsed,
-        crate::status_line::fmt_elapsed(summary.duration_secs)
+        crate::activity::duration_text(summary)
     ));
     match summary.status {
         ActivityStatus::Running | ActivityStatus::Waiting => {
@@ -1594,6 +1601,7 @@ fn issue_page_view(
         let (glyph, ink) = match issue.kind {
             crate::issue::IssueKind::TurnFailure => ("✕", error),
             crate::issue::IssueKind::BackgroundFailure => ("⚠", warning),
+            crate::issue::IssueKind::RuntimeVersion => ("⟳", warning),
         };
         let cursor = if selected == Some(issue.key.as_str()) {
             Span::styled("→ ", Style::default().fg(theme.text.secondary))
@@ -1672,6 +1680,14 @@ fn issue_page_view(
                             Style::default().fg(theme.text.muted),
                         )));
                     }
+                }
+            }
+            crate::issue::IssueKind::RuntimeVersion => {
+                if let Some(meta) = &issue.meta {
+                    view.lines.push(Line::from(Span::styled(
+                        format!("{indent}{meta}"),
+                        Style::default().fg(theme.text.muted),
+                    )));
                 }
             }
         }
@@ -2659,6 +2675,9 @@ mod tests {
                 last_output_at: None,
                 output: "Compiling leveler-core ...\ntest result: ok\n".into(),
                 unknown: false,
+                lost: false,
+                conflict: false,
+                started_known: true,
                 ready: None,
             },
         );
@@ -2696,6 +2715,9 @@ mod tests {
                 last_output_at: None,
                 output: "test result: ok. 428 passed\n".into(),
                 unknown: false,
+                lost: false,
+                conflict: false,
+                started_known: true,
                 ready: None,
             },
         );
@@ -2790,6 +2812,9 @@ mod tests {
                 last_output_at: None,
                 output: "Compiling leveler-tui\n".into(),
                 unknown: false,
+                lost: false,
+                conflict: false,
+                started_known: true,
                 ready: None,
             },
         );
@@ -2900,6 +2925,9 @@ mod tests {
                     last_output_at: None,
                     output: "a line of output that is much wider than the terminal\n".into(),
                     unknown: false,
+                    lost: false,
+                    conflict: false,
+                    started_known: true,
                     ready: None,
                 },
             );
@@ -3440,6 +3468,7 @@ mod tests {
             Action::Runtime(RuntimeEvent::TurnFailed {
                 error: "boom".into(),
                 failure: None,
+                recovery: None,
             }),
         );
         let text = render_text(&mut state, 100, 30);
@@ -4028,6 +4057,7 @@ mod tests {
             crate::action::Action::Runtime(leveler_client_protocol::RuntimeEvent::TurnFailed {
                 error: "boom".into(),
                 failure: None,
+                recovery: None,
             }),
         );
         let joined: String = crate::conversation::build::build_conversation_lines(&s, 80)
@@ -4066,6 +4096,7 @@ mod tests {
                         "tools.function.parameters is not a valid moonshot flavored json schema"
                             .into(),
                 }),
+                recovery: None,
             }),
         );
         // ONE terminal failure → ONE primary block.
@@ -4148,6 +4179,7 @@ mod tests {
                     summary: "模型服务拒绝了当前请求。".into(),
                     detail: "tools.function.parameters is not a valid json schema".into(),
                 }),
+                recovery: None,
             }),
         );
         let failure = s

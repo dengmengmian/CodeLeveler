@@ -931,9 +931,15 @@ fn issue_strip(state: &AppState, summary: &crate::issue::IssueSummary, labeled: 
     };
     let body = if !labeled {
         summary.total.to_string()
-    } else {
+    } else if summary.background_unread == summary.total {
+        // Every counted issue is a failed background task; naming that kind
+        // is exact.
         t.background_failed_only
             .replace("{}", &summary.total.to_string())
+    } else {
+        // A version mismatch (or a mix) is not a background failure: name no
+        // kind rather than the wrong one.
+        t.issue_count.replace("{}", &summary.total.to_string())
     };
     let text = format!("{glyph}{body}");
     let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
@@ -4628,6 +4634,23 @@ mod tests {
         );
     }
 
+    /// A version mismatch is a real active issue, but it is not a failed
+    /// background task. The count cell must state the count without naming
+    /// the wrong kind; the version-specific wording lives on the issue page
+    /// and in the one-time warning.
+    #[test]
+    fn a_version_mismatch_is_not_labelled_a_background_failure() {
+        let mut state = test_state();
+        state.runtime_version_mismatch = true;
+        let rows = strip_rows(&mut state, None, 140);
+        let line = rows[0].trim_end();
+        assert!(line.contains("⚠ 问题 1 ↗"), "{line}");
+        assert!(
+            !line.contains("后台失败"),
+            "the version mismatch is not a background failure: {line}"
+        );
+    }
+
     /// A failed turn is the blocking cell: red, named with the failure's own
     /// summary — never hidden behind a bare count.
     #[test]
@@ -5072,6 +5095,9 @@ mod tests {
             last_output_at: None,
             output: String::new(),
             unknown: false,
+            lost: false,
+            conflict: false,
+            started_known: true,
             ready: None,
         }
     }

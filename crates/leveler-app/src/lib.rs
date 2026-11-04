@@ -112,6 +112,15 @@ pub enum AppError {
     VerificationFailed(String),
     #[error("engine error: {0}")]
     Engine(String),
+    /// An earlier tool call was interrupted before its outcome was recorded.
+    /// Continuing would risk running it twice, so the task stops here until
+    /// the user acknowledges the crash window.
+    #[error(
+        "The previous {tool} call was interrupted before its result was confirmed (call {call_id}). \
+         To avoid running it twice, this task is paused; check the workspace, then resume with \
+         --confirm-recovery."
+    )]
+    RecoveryConfirmationRequired { call_id: String, tool: String },
     /// A truth-affecting child started but could not be durably settled. This
     /// is intentionally distinct from a terminal engine failure: clients must
     /// surface a recovery fault without inventing a terminal event.

@@ -63,7 +63,9 @@ fn snapshot() -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),
@@ -317,6 +319,7 @@ fn failed_turn_archives_its_exact_plan_without_leaving_active_work() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "boom".into(),
             failure: None,
+            recovery: None,
         }),
     );
 
@@ -584,7 +587,7 @@ fn a_cross_turn_background_task_keeps_running_into_the_next_turn() {
 }
 
 #[test]
-fn reconnect_rebuilds_only_registry_active_background_tasks() {
+fn a_reconnect_keeps_an_unlisted_running_task_as_unknown() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -611,9 +614,19 @@ fn reconnect_rebuilds_only_registry_active_background_tasks() {
         Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
     );
 
+    // The runtime's list is authoritative for what RUNS, not for what the
+    // process that hosted the missing task did. With no durable record, its
+    // terminal state cannot be attributed: keeping it Unknown is the only
+    // answer that neither invents a failure nor claims work that may still be
+    // alive has stopped.
     assert!(
-        !s.background_task_labels
-            .contains_key("terminal-before-reconnect")
+        s.background_task_labels
+            .get("terminal-before-reconnect")
+            .is_some_and(|task| {
+                !task.is_running()
+                    && task.outcome() == leveler_tui::state::BackgroundOutcome::Unknown
+            }),
+        "a vanished running task keeps an open state instead of disappearing"
     );
     assert!(
         s.background_task_labels
@@ -623,7 +636,7 @@ fn reconnect_rebuilds_only_registry_active_background_tasks() {
 }
 
 #[test]
-fn lifecycle_lag_reconciliation_replaces_stale_active_background_tasks() {
+fn lag_reconciliation_keeps_a_missed_terminal_task_as_unknown() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -655,14 +668,24 @@ fn lifecycle_lag_reconciliation_replaces_stale_active_background_tasks() {
         }),
     );
 
-    assert!(!s.background_task_labels.contains_key("missed-terminal"));
+    assert!(
+        s.background_task_labels
+            .get("missed-terminal")
+            .is_some_and(|task| {
+                !task.is_running()
+                    && task.outcome() == leveler_tui::state::BackgroundOutcome::Unknown
+            }),
+        "a missed terminal event leaves an open state, not a deleted row"
+    );
     assert!(
         s.background_task_labels
             .get("still-running")
             .is_some_and(|task| task.is_running())
     );
-    assert!(s.activity_selected.is_none());
-    assert!(s.activity_open.is_none());
+    // The row is still there, so a detail the user had open is still about a
+    // real row: the reconcile must not close it.
+    assert!(s.activity_selected.is_some());
+    assert!(s.activity_open.is_some());
 }
 
 /// Reopening a session must not rebuild a settled child as current activity,

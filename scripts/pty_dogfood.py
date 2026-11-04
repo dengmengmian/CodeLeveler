@@ -46,8 +46,13 @@ import time
 import unicodedata
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "target", "debug", "leveler")
+BIN = os.environ.get("LEVELER_BIN") or os.path.join(ROOT, "target", "debug", "leveler")
 EVIDENCE = os.path.join(ROOT, "target", "pty-dogfood")
+
+# The daemon path is the one users run: the TUI attaches to a socket runtime
+# that owns detached work. Scenarios that need connection faults are meaningless
+# in-process, so the transport is selected once per run.
+TRANSPORT = "in-process"
 
 # ---------------------------------------------------------------------------
 # Minimal VT-100 screen model
@@ -505,8 +510,14 @@ def text_turn(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def isolated_env(provider: str, mock: MockProvider | None):
-    root = tempfile.mkdtemp(prefix="leveler-pty-")
+def isolated_env(provider: str, mock: MockProvider | None, short: bool = False):
+    # The daemon's Unix socket lives under LEVELER_HOME/run/sockets and must
+    # stay below SUN_LEN (~104 bytes on macOS). The default macOS temp root is
+    # long enough to overflow it, so daemon scenarios opt into a short root.
+    if short:
+        root = tempfile.mkdtemp(prefix="lv-", dir="/tmp")
+    else:
+        root = tempfile.mkdtemp(prefix="leveler-pty-")
     home = os.path.join(root, "home")
     repo = os.path.join(root, "repo")
     os.makedirs(home)
@@ -542,17 +553,18 @@ def isolated_env(provider: str, mock: MockProvider | None):
     return root, home, repo, env
 
 
-def spawn(env: dict[str, str], repo: str, cols: int, rows: int, extra: list[str]) -> Pty:
-    argv = [
-        BIN,
-        "--repo",
-        repo,
-        "tui",
-        "--auto-approve",
-        "--in-process",
-        "--permission",
-        "full-access",
-    ] + extra
+def spawn(
+    env: dict[str, str],
+    repo: str,
+    cols: int,
+    rows: int,
+    extra: list[str],
+    bin_path: str | None = None,
+) -> Pty:
+    argv = [bin_path or BIN, "--repo", repo, "tui", "--auto-approve"]
+    if TRANSPORT == "in-process":
+        argv.append("--in-process")
+    argv += ["--permission", "full-access"] + extra
     return Pty(argv, env, cols, rows)
 
 
@@ -566,6 +578,7 @@ class Report:
         self.layer = layer
         self.results: list[dict] = []
         self.failures = 0
+        self.blocked = 0
 
     def check(self, scenario: str, name: str, ok: bool, detail: str = ""):
         self.results.append(
@@ -574,6 +587,22 @@ class Report:
         if not ok:
             self.failures += 1
         print(("  ok   " if ok else "  FAIL ") + f"[{scenario}] {name}" + (f" — {detail}" if detail and not ok else ""))
+
+    def block(self, scenario: str, name: str, detail: str):
+        """A required behavior the harness cannot reach. Not a pass and not a
+        product failure: the precondition itself is unavailable, and the
+        reason is recorded so the gap cannot be mistaken for coverage."""
+        self.results.append(
+            {
+                "scenario": scenario,
+                "check": name,
+                "ok": None,
+                "blocked": True,
+                "detail": detail,
+            }
+        )
+        self.blocked += 1
+        print(f"  BLOCKED [{scenario}] {name} — {detail}")
 
     def dump(self, name: str, pty: Pty):
         path = os.path.join(EVIDENCE, name + ".txt")
@@ -589,7 +618,12 @@ class Report:
         path = os.path.join(EVIDENCE, "report-%s.json" % self.layer)
         with open(path, "w") as fh:
             json.dump(
-                {"layer": self.layer, "failures": self.failures, "results": self.results},
+                {
+                    "layer": self.layer,
+                    "failures": self.failures,
+                    "blocked": self.blocked,
+                    "results": self.results,
+                },
                 fh,
                 indent=2,
             )
@@ -628,16 +662,23 @@ def create_file_args(path: str = "cookies_test.go", n: int = CONTENT_LINES) -> s
 class Env:
     """One isolated LEVELER_HOME + repo, plus the process environment."""
 
-    def __init__(self, provider: str, mock):
-        self.root, self.home, self.repo, self.env = isolated_env(provider, mock)
+    def __init__(self, provider: str, mock, short: bool = False):
+        self.root, self.home, self.repo, self.env = isolated_env(provider, mock, short)
 
 
 def make_env(provider: str, mock) -> "Env":
     return Env(provider, mock)
 
 
-def boot(report: Report, env: "Env", cols=120, rows=44, extra=None) -> Pty:
-    pty_ = spawn(env.env, env.repo, cols, rows, extra or [])
+def boot(
+    report: Report,
+    env: "Env",
+    cols=120,
+    rows=44,
+    extra=None,
+    bin_path: str | None = None,
+) -> Pty:
+    pty_ = spawn(env.env, env.repo, cols, rows, extra or [], bin_path)
     ok = pty_.wait_for("leveler", timeout=60) or pty_.wait_stable(1.0, 60)
     report.check(
         "boot",
@@ -1613,6 +1654,568 @@ def scenario_goal_multi_goal_live(report: Report, provider: str, mock):
         pty_.close()
 
 
+def repo_processes(repo: str, token: str, binary: str | None = None) -> list[int]:
+    """PIDs of `leveler <token>` processes owning this isolated repo.
+
+    `ps` is the only view that sees a process detached from the TUI's session;
+    the argv is matched by the real executable, the subcommand token and the
+    repo it serves, never by a substring any shell in this process tree could
+    also contain. A scenario that runs the client from its own copy passes
+    that path so the copy's processes are found too.
+    """
+    binary = os.path.realpath(binary or BIN)
+    wanted = {repo, os.path.realpath(repo)}
+    out = subprocess.run(
+        ["ps", "-axo", "pid=,command="], capture_output=True, text=True
+    ).stdout
+    pids = []
+    for line in out.splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if not pid_text.isdigit():
+            continue
+        words = command.split()
+        if not words or os.path.realpath(words[0]) != binary:
+            continue
+        if token not in words:
+            continue
+        if not any(path in command for path in wanted):
+            continue
+        pids.append(int(pid_text))
+    return pids
+
+
+def daemon_pids(repo: str, binary: str | None = None) -> list[int]:
+    return repo_processes(repo, "serve", binary)
+
+
+def cli_json(env: "Env", args: list[str]):
+    out = subprocess.run(
+        [BIN, "--repo", env.repo, *args],
+        capture_output=True,
+        text=True,
+        env=env.env,
+        timeout=120,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or out.stdout.strip())
+    return json.loads(out.stdout)
+
+
+def wait_file(path: str, needle: str, timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(path) as fh:
+                if needle in fh.read():
+                    return True
+        except FileNotFoundError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
+def composer_text(pty_: Pty) -> str:
+    """The composer box's rows, located from its own top border.
+
+    A transcript row that happens to sit near the bottom is not the input: a
+    refused submission is put back into THIS box, so only the box can tell
+    whether the text is still waiting to be sent.
+    """
+    lines = pty_.screen.lines()
+    for i in range(len(lines) - 1, -1, -1):
+        if "╭" in lines[i]:
+            return "\n".join(lines[i:])
+    return "\n".join(lines[-3:])
+
+
+def scenario_reconnect(report: Report, provider: str, mock):
+    """A genuinely killed runtime: an idle restart must invent no lost work,
+    a restart during a live turn must say that turn was interrupted, and the
+    replacement must re-read the session and its background work without
+    re-running or wrongly cancelling what the model started."""
+    env = Env(provider, mock, short=True)
+    pty_ = boot(report, env, 120, 44)
+    ran = os.path.join(env.repo, "ran.txt")
+    task_id = None
+    try:
+        first = daemon_pids(env.repo)
+        report.check(
+            "reconnect",
+            "the TUI attached to a detached runtime for this repo",
+            bool(first),
+            repr(first),
+        )
+        if not first:
+            return pty_
+        report.check(
+            "reconnect",
+            "a first connection reports no interruption",
+            "刚才的任务已中断" not in pty_.screen.text()
+            and "刚才的任务状态无法确认" not in pty_.screen.text(),
+            pty_.screen.text()[:500],
+        )
+
+        # 1. A real model turn starts a real background task owned by the
+        #    independent execution host: it must outlive the runtime it was
+        #    started from.
+        pty_.write(
+            "调用 run_command 工具，只调用一次：program=\"sh\"，"
+            "args=[\"-c\",\"sleep 600\"]，background=true，"
+            "background_lifetime=\"runtime\"。这是后台任务，不要等待它结束，"
+            "也不要调用其他工具。"
+        )
+        pty_.key("\r")
+        started = wait_until(pty_, lambda text: "后台 1" in text, timeout=300)
+        report.dump("RECONNECT-1-background-started", pty_)
+        report.check(
+            "reconnect",
+            "a real model turn started a real background task",
+            started,
+            pty_.screen.text()[-700:],
+        )
+        if not started:
+            return pty_
+        inventory = cli_json(env, ["background", "list", "--json"])
+        hosted = [
+            task
+            for task in inventory
+            if task.get("status") == "running" and task.get("owner") == "execution-host"
+        ]
+        report.check(
+            "reconnect",
+            "the running task is owned by the execution host",
+            bool(hosted),
+            json.dumps(inventory, ensure_ascii=False)[:800],
+        )
+        if not hosted:
+            return pty_
+        task_id = hosted[0]["task_id"]
+
+        # Let the model's turn finish before the fault: the restart must be
+        # judged on a settled session with nothing in flight but the host-owned
+        # service.
+        idle = wait_until(
+            pty_,
+            lambda text: "Esc 打断" not in text and "等待模型" not in text,
+            timeout=300,
+        )
+        report.check(
+            "reconnect",
+            "the model turn before the restart settled",
+            idle,
+            pty_.screen.text()[-700:],
+        )
+        if not idle:
+            return pty_
+
+        before = daemon_pids(env.repo)
+        for pid in before:
+            os.kill(pid, signal.SIGKILL)
+        after: list[int] = []
+        deadline = time.time() + 60
+        while time.time() < deadline and not after:
+            after = [pid for pid in daemon_pids(env.repo) if pid not in before]
+            time.sleep(0.2)
+        report.dump("RECONNECT-2-restarted", pty_)
+        report.check(
+            "reconnect",
+            "a replacement runtime is alive with a different pid",
+            bool(after),
+            "before %r after %r" % (before, after),
+        )
+        # The turn was settled before the kill: only a host-owned background
+        # service was running, so nothing this client executed was at risk.
+        # A reconnected view must not invent lost work; the snapshot that
+        # follows is what re-adopts the surviving task (checked below).
+        time.sleep(3.0)
+        report.check(
+            "reconnect",
+            "an idle restart invents no lost work",
+            "刚才的任务已中断" not in pty_.screen.text()
+            and "刚才的任务状态无法确认" not in pty_.screen.text(),
+            pty_.screen.text()[-700:],
+        )
+
+        # 2. The runtime is authoritative again: the host-owned task is still
+        #    running and the TUI re-adopts it from the snapshot.
+        inventory = cli_json(env, ["background", "list", "--json"])
+        still = [
+            task
+            for task in inventory
+            if task.get("task_id") == task_id and task.get("status") == "running"
+        ]
+        report.check(
+            "reconnect",
+            "the background task survived the runtime restart",
+            bool(still),
+            json.dumps(inventory, ensure_ascii=False)[:800],
+        )
+        report.check(
+            "reconnect",
+            "the TUI still shows the re-verified background task",
+            wait_until(pty_, lambda text: "后台 1" in text, timeout=30),
+            pty_.screen.text()[-700:],
+        )
+
+        # The crashed turn had no tool call in flight, so the runtime has no
+        # crash window to acknowledge. A new turn must reach the real model:
+        # reconnect restores command authority, not just the picture.
+        marker = "R3C0NN3CT-OK"
+        pty_.write("只回复这个标记，不要任何其他内容：%s" % marker)
+        pty_.key("\r")
+
+        def answered() -> bool:
+            # The echo of the prompt is not an answer: the composer must be
+            # empty (a refused submission is put back into it), and the marker
+            # must be in the transcript as both the user row and the reply.
+            return (
+                pty_.screen.text().count(marker) >= 2
+                and marker not in composer_text(pty_)
+            )
+
+        answered_ok = wait_until(pty_, lambda _: answered(), timeout=300)
+        report.dump("RECONNECT-3-answered", pty_)
+        report.check(
+            "reconnect",
+            "a new turn after the restart reaches the model and answers",
+            answered_ok,
+            pty_.screen.text()[-700:],
+        )
+
+        # 3. Kill the runtime in the middle of a foreground tool call. The
+        #    command is a child in its own process group and finishes on its
+        #    own; the new runtime must not run it a second time.
+        pty_.write(
+            "调用 shell_command 工具，只调用一次，命令为："
+            "echo start >> %s; sleep 8; echo end >> %s"
+            % (ran, ran)
+            + "。这是前台命令，不要设置 background，不要等待别的任务，"
+            "也不要调用其他工具。"
+        )
+        pty_.key("\r")
+        began = wait_file(ran, "start", 300)
+        report.dump("RECONNECT-4-command-running", pty_)
+        report.check(
+            "reconnect",
+            "the real model started the command whose work must not repeat",
+            began,
+            pty_.screen.text()[-700:],
+        )
+        if not began:
+            return pty_
+        before = daemon_pids(env.repo)
+        for pid in before:
+            os.kill(pid, signal.SIGKILL)
+        restarted = wait_until(
+            pty_, lambda text: "刚才的任务已中断" in text, timeout=90
+        )
+        report.dump("RECONNECT-5-interrupted", pty_)
+        report.check(
+            "reconnect",
+            "a restart during a tool call is reported",
+            restarted,
+            pty_.screen.text()[-700:],
+        )
+        # The orphaned command completes exactly once; then a quiet window
+        # proves the replacement runtime did not resume or re-run the turn.
+        finished = wait_file(ran, "end", 30)
+        time.sleep(5.0)
+        with open(ran) as fh:
+            lines = fh.read().splitlines()
+        report.check(
+            "reconnect",
+            "the interrupted command finished on its own",
+            finished,
+            repr(lines),
+        )
+        report.check(
+            "reconnect",
+            "the reconnect did not execute the command a second time",
+            lines == ["start", "end"],
+            repr(lines),
+        )
+        report.check(
+            "reconnect",
+            "the interrupted turn is not left busy in the TUI",
+            "Esc 打断" not in pty_.screen.text(),
+            pty_.screen.text()[-700:],
+        )
+        report.check(
+            "reconnect",
+            "the unresolved interrupted call is surfaced, not hidden",
+            "状态未知" in pty_.screen.text(),
+            pty_.screen.text()[-700:],
+        )
+
+        # The unresolved tool call is a real safety gate: the runtime must
+        # refuse to guess whether it ran, keep the user's next input, and say
+        # exactly how to acknowledge it. Nothing may be replayed silently.
+        pty_.write("只回复这个标记，不要任何其他内容：%s" % marker)
+        pty_.key("\r")
+        gated = wait_until(
+            pty_, lambda text: "任务恢复已暂停" in text, timeout=120
+        )
+        report.dump("RECONNECT-6-recovery-required", pty_)
+        with open(ran) as fh:
+            after_gate = fh.read().splitlines()
+        report.check(
+            "reconnect",
+            "an interrupted call stops the next turn instead of guessing",
+            gated,
+            pty_.screen.text()[-700:],
+        )
+        report.check(
+            "reconnect",
+            "the refused input is preserved for the user",
+            marker in composer_text(pty_),
+            pty_.screen.text()[-400:],
+        )
+        report.check(
+            "reconnect",
+            "the refused turn executed nothing",
+            after_gate == ["start", "end"],
+            repr(after_gate),
+        )
+
+        # 5. Warnings this incident produced are transient, not permanent chrome.
+        cleared = wait_until(
+            pty_,
+            lambda text: "刚才的任务已中断" not in text
+            and "刚才的任务状态无法确认" not in text,
+            timeout=30,
+        )
+        report.dump("RECONNECT-7-notice-cleared", pty_)
+        report.check(
+            "reconnect",
+            "the resolved reconnect notice does not stay on screen",
+            cleared,
+            pty_.screen.text()[-500:],
+        )
+        return pty_
+    finally:
+        # The isolated runtime and its host-owned service are test processes:
+        # stop the service through its own owner first (the host outlives the
+        # runtime), then retire the detached owners and the TUI.
+        if task_id is not None:
+            try:
+                subprocess.run(
+                    [BIN, "--repo", env.repo, "background", "stop", task_id],
+                    capture_output=True,
+                    text=True,
+                    env=env.env,
+                    timeout=60,
+                )
+            except Exception:
+                pass
+        for token in ("serve", "execution-host"):
+            try:
+                for pid in repo_processes(env.repo, token):
+                    os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        pty_.close()
+
+
+def scenario_version_mismatch(report: Report, provider: str, mock):
+    """A running client whose own binary was replaced must not mistake the
+    replacement runtime for its own generation: it says the versions do not
+    match, never claims an update finished, and keeps the fault visible after
+    the transient warning expires.
+
+    Two REAL builds are needed. `LEVELER_ALT_BIN` must point at a binary of
+    this source whose build fingerprint differs; the scenario proves the
+    fingerprint differs before the fault, so a same-file copy cannot pass.
+    """
+    if TRANSPORT != "daemon":
+        report.check(
+            "version-mismatch",
+            "the fault needs a detached runtime",
+            False,
+            "run with --transport daemon",
+        )
+        return None
+    alt = os.environ.get("LEVELER_ALT_BIN", "")
+    if not alt or not os.path.isfile(alt):
+        report.check(
+            "version-mismatch",
+            "a second build is available (LEVELER_ALT_BIN)",
+            False,
+            "set LEVELER_ALT_BIN to a binary built from a different fingerprint",
+        )
+        return None
+    mine, other = fingerprint_of(BIN), fingerprint_of(alt)
+    report.check(
+        "version-mismatch",
+        "the two binaries are different build identities",
+        bool(mine) and bool(other) and mine != other,
+        "app %s · alt %s" % (mine or "<none>", other or "<none>"),
+    )
+    if not mine or not other or mine == other:
+        return None
+    env = Env(provider, mock, short=True)
+    launcher = os.path.join(env.root, "leveler")
+    shutil.copy2(BIN, launcher)
+    os.chmod(launcher, 0o755)
+    pty_ = boot(report, env, 120, 44, bin_path=launcher)
+    try:
+        first = daemon_pids(env.repo, launcher)
+        report.check(
+            "version-mismatch",
+            "the TUI attached to a runtime started from its own path",
+            bool(first),
+            repr(first),
+        )
+        if not first:
+            return pty_
+
+        # Replace the file the running client re-execs, atomically: an
+        # in-place write would fault the running process's mapped image,
+        # while a rename swaps the directory entry under the same path.
+        staged = launcher + ".new"
+        shutil.copy2(alt, staged)
+        os.chmod(staged, 0o755)
+        os.replace(staged, launcher)
+        for pid in first:
+            os.kill(pid, signal.SIGKILL)
+
+        # Capture the replacement process while waiting for the notice. The
+        # client may retire and respawn it during the retry loop, so a pid
+        # sampled only after the text appears can be gone; what must be proven
+        # is that a replacement runtime WAS alive at the time of the fault,
+        # not that it survives the whole scenario.
+        after: list[int] = []
+        mismatch = False
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            observed = [
+                pid for pid in daemon_pids(env.repo, launcher) if pid not in first
+            ]
+            if observed:
+                after = observed
+            if "CodeLeveler 版本不一致" in pty_.screen.text():
+                mismatch = True
+                break
+            time.sleep(0.2)
+        report.dump("VERSION-MISMATCH-1-warning", pty_)
+        if not mismatch:
+            # The client never attaches to the replacement runtime, so the
+            # event that carries its build never reaches the TUI. Record the
+            # observed gate and stop: the remaining assertions depend on an
+            # attached stream and cannot be proven here.
+            log_path = os.path.join(env.home, "leveler.log")
+            try:
+                with open(log_path) as fh:
+                    log_tail = "".join(fh.readlines()[-60:])
+            except OSError:
+                log_tail = ""
+            with open(
+                os.path.join(EVIDENCE, "VERSION-MISMATCH-host-guard.log"), "w"
+            ) as fh:
+                fh.write(log_tail)
+            guard = [
+                line.strip()
+                for line in log_tail.splitlines()
+                if "runtime was not replaced correctly" in line
+            ]
+            report.block(
+                "version-mismatch",
+                "the version-mismatch notice is reachable in the real client path",
+                "no subscription was ever attached to the replacement runtime, so no "
+                "build observation exists to render; the runtime host refused it: "
+                + (guard[-1][-240:] if guard else "<no guard line in daemon log>"),
+            )
+            return pty_
+        report.check(
+            "version-mismatch",
+            "a runtime restarted from a different build is named as a version mismatch",
+            mismatch,
+            pty_.screen.text()[-700:],
+        )
+        report.check(
+            "version-mismatch",
+            "a version mismatch never claims an update was installed",
+            "更新已安装" not in pty_.screen.text(),
+            pty_.screen.text()[-500:],
+        )
+
+        report.check(
+            "version-mismatch",
+            "a replacement runtime with a different pid was alive during the fault",
+            bool(after),
+            "before %r observed during the fault %r" % (first, after),
+        )
+
+        # The warning is transient by design; the fault is not. After its TTL
+        # the state strip must still report an open issue.
+        time.sleep(2.0)
+        warning_gone = wait_until(
+            pty_,
+            lambda text: "CodeLeveler 版本不一致" not in text,
+            timeout=30,
+        )
+        report.dump("VERSION-MISMATCH-2-persistent", pty_)
+        report.check(
+            "version-mismatch",
+            "the transient warning expires",
+            mismatch and warning_gone,
+            pty_.screen.text()[-400:],
+        )
+        report.check(
+            "version-mismatch",
+            "the unresolved mismatch stays visible as an open issue",
+            "问题 1" in pty_.screen.text(),
+            pty_.screen.text()[-400:],
+        )
+
+        # The issue page names the fault and both identities; it is opened by
+        # the same click a user makes on the strip's issue cell.
+        spot = pty_.screen.find("问题")
+        if spot is not None:
+            row, char_col = spot
+            line = pty_.screen.lines()[row]
+            col = sum(cell_width(ch) for ch in line[:char_col])
+            pty_.click(row, col)
+            pty_.wait_stable(0.6, 20)
+            # The list stays compact; the diagnostic line (both build
+            # identities) is the selected row's expanded body.
+            pty_.key("\r")
+            pty_.wait_stable(0.6, 20)
+        report.dump("VERSION-MISMATCH-3-issue-page", pty_)
+        page = pty_.screen.text()
+        report.check(
+            "version-mismatch",
+            "the issue page names the mismatch and both build identities",
+            "CodeLeveler 版本不一致" in page
+            and "当前应用" in page
+            and "后台" in page,
+            page[-700:],
+        )
+        return pty_
+    finally:
+        for token in ("serve", "execution-host"):
+            try:
+                for pid in repo_processes(env.repo, token, launcher):
+                    os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        pty_.close()
+
+
+def fingerprint_of(path: str) -> str:
+    """The build fingerprint a binary carries, read from its own bytes.
+
+    The value is compiled in by `leveler-core/build.rs`; extracting it from
+    the artifact is what proves two files are really different identities
+    rather than one file copied twice.
+    """
+    out = subprocess.run(
+        ["grep", "-aoE", r"[0-9a-f]{40}-[0-9a-f]{16}", path],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    return out[0] if out else ""
+
+
 SCENARIOS = {
     "display": (
         scenario_default_display,
@@ -1657,6 +2260,8 @@ SCENARIOS = {
     "badge": (scenario_goal_pause_badge, lambda: []),
     "amend": (scenario_goal_chat_amend, lambda: []),
     "multigoal": (scenario_goal_multi_goal_live, lambda: []),
+    "reconnect": (scenario_reconnect, lambda: []),
+    "version-mismatch": (scenario_version_mismatch, lambda: []),
     "sizes": (
         scenario_sizes,
         lambda: [tool_turn("write_file", create_file_args()), text_turn("已创建 cookies_test.go，共 103 行。")],
@@ -1667,8 +2272,11 @@ SCENARIOS = {
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", choices=["mock", "real"], default="mock")
+    parser.add_argument("--transport", choices=["in-process", "daemon"], default="in-process")
     parser.add_argument("--only", default="", help="comma-separated scenario names")
     args = parser.parse_args()
+    global TRANSPORT
+    TRANSPORT = args.transport
     os.makedirs(EVIDENCE, exist_ok=True)
     if not os.path.exists(BIN):
         print("missing %s — build it first (cargo build -p leveler-cli)" % BIN)
@@ -1677,10 +2285,10 @@ def main() -> int:
     if args.provider == "mock":
         # The live-provider scenario asserts on a model's own edit; scripted
         # frames cannot stand in for it, so it is not run rather than faked.
-        skipped = [s for s in selected if s in ("live", "badge", "amend", "multigoal")]
+        skipped = [s for s in selected if s in ("live", "badge", "amend", "multigoal", "reconnect")]
         for name in skipped:
             print("=== scenario %s SKIPPED (needs --provider real) ===" % name)
-        selected = [s for s in selected if s not in ("live", "badge", "amend", "multigoal")]
+        selected = [s for s in selected if s not in ("live", "badge", "amend", "multigoal", "reconnect")]
     report = Report(args.provider)
     for name in selected:
         fn, script = SCENARIOS[name]
@@ -1700,9 +2308,14 @@ def main() -> int:
             if mock is not None:
                 mock.stop()
     path = report.save()
-    print("\nassertions: %d, failures: %d" % (len(report.results), report.failures))
+    print(
+        "\nassertions: %d, failures: %d, blocked: %d"
+        % (len(report.results), report.failures, report.blocked)
+    )
     print("evidence: %s" % path)
-    return 0 if report.failures == 0 else 1
+    if report.failures:
+        return 1
+    return 3 if report.blocked else 0
 
 
 if __name__ == "__main__":

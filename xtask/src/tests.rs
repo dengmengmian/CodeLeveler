@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cli::{Outcome, dispatch_with};
 use crate::exec::{CommandSpec, FakeHost, ProcessOut, SystemHost};
-use crate::git::Snapshot;
-use crate::qualify::{self, dogfood_exit};
+use crate::qualify;
 use crate::root::{self, Env, GateOpts};
 use crate::version::{self, Level};
 
@@ -132,15 +131,6 @@ pub(crate) fn point_config(repo: &Path, lab: &Path, model: &str) {
         format!("dogfood_root={}\nmodel={model}\n", lab.display()),
     )
     .unwrap();
-}
-
-pub(crate) fn pass_layers(lab: &Path) {
-    let dir = lab.join(RUN);
-    std::fs::create_dir_all(&dir).unwrap();
-    let l0 = r#"{"status":"PASS","checks":[{"id":"fmt","status":"PASS"}]}"#;
-    std::fs::write(dir.join("L0.json"), l0).unwrap();
-    std::fs::write(dir.join("L1.json"), r#"{"status":"PASS","checks":[]}"#).unwrap();
-    std::fs::write(dir.join("L2.json"), r#"{"status":"PASS","checks":[]}"#).unwrap();
 }
 
 pub(crate) fn process(status: i32, stdout: &str) -> ProcessOut {
@@ -481,202 +471,22 @@ fn publish_refuses_conflicting_levels_and_dirty_tree() {
 }
 
 #[test]
-fn dogfood_reads_baseline_file_and_stops_when_sha_changes() {
-    let repo_tmp = Tmp::new();
-    let lab_tmp = Tmp::new();
-    let repo = repo_tmp.path.canonicalize().unwrap();
-    let lab = lab_tmp.path.canonicalize().unwrap();
-    write_versions(&repo, "1.0.8");
-    write_lab(&lab, BASELINE);
-    point_config(&repo, &lab, "example/model");
-    let heads = Mutex::new(0u32);
-    let host = FakeHost::new(move |spec| {
-        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
-            let mut seen = heads.lock().expect("heads");
-            *seen += 1;
-            return Ok(text(if *seen == 1 { SHA_A } else { SHA_B }));
-        }
-        if is_cmd(spec, "git", &["status", "--porcelain"]) {
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("cat-file") {
-            return Ok(text(""));
-        }
-        if spec.program == "python3" {
-            return Ok(process(0, &format!("written: {RUN}/\n")));
-        }
-        Ok(text(""))
-    });
-    let locked = Snapshot {
-        head: SHA_A.to_string(),
-        porcelain: String::new(),
-    };
-    let err =
-        qualify::run_dogfood_locked(&host, &repo, &Env::default(), &GateOpts::default(), &locked)
-            .expect_err("sha change");
-    assert_eq!(err.code, "CANDIDATE_CHANGED");
-    let release: Vec<_> = host
-        .log()
-        .into_iter()
-        .filter(|spec| spec.args.iter().any(|arg| arg.contains("release_check.py")))
-        .collect();
-    assert_eq!(release.len(), 1);
-    assert_eq!(
-        arg_after(&release[0], "--baseline-sha").as_deref(),
-        Some(BASELINE)
+fn run_id_discovery_ignores_runs_the_gate_only_mentions() {
+    // `release_check` prints a `written:` block listing exactly the files this
+    // invocation produced. A reuse note names a *different* run by absolute
+    // path, which also contains `eval/release/`, so a mention must never be
+    // able to turn this run's id into an ambiguous one.
+    let text = format!(
+        "  L1 PASS (REUSED) source: /mnt/lab/dogfood/eval/release/20251231-235959-bbbbbbbbbbbb/L1.json\n\
+         written:\n  {RUN}/L0.json\n  {RUN}/release.json\n"
     );
-    assert_eq!(
-        arg_after(&release[0], "--model").as_deref(),
-        Some("example/model")
-    );
-    assert_eq!(
-        arg_after(&release[0], "--codeleveler-sha").as_deref(),
-        Some(SHA_A)
-    );
-    // The dogfood stage is started with `--force` on purpose: its own L0-L2 run
-    // is what pushes the host's load past the busy threshold, so the preflight
-    // cannot be allowed to block the stage it follows.
-    assert!(release[0].args.iter().any(|arg| arg == "--force"));
-    assert!(
-        host.log()
-            .iter()
-            .all(|spec| !spec.args.iter().any(|arg| arg.contains("rc_check.py")))
-    );
+    assert_eq!(qualify::find_release_runs(&text), vec![RUN.to_string()]);
 }
 
 #[test]
-fn dogfood_does_not_start_when_the_locked_sha_already_changed() {
-    let repo_tmp = Tmp::new();
-    let lab_tmp = Tmp::new();
-    let repo = repo_tmp.path.canonicalize().unwrap();
-    write_versions(&repo, "1.0.8");
-    write_lab(lab_tmp.path.as_path(), BASELINE);
-    point_config(
-        &repo,
-        &lab_tmp.path.canonicalize().unwrap(),
-        "example/model",
-    );
-    let host = FakeHost::new(|spec| {
-        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
-            return Ok(text(SHA_B));
-        }
-        if is_cmd(spec, "git", &["status", "--porcelain"]) {
-            return Ok(text(""));
-        }
-        if spec.program == "python3" {
-            panic!("gate must not start");
-        }
-        Ok(text(""))
-    });
-    let err = qualify::run_dogfood_locked(
-        &host,
-        &repo,
-        &Env::default(),
-        &GateOpts::default(),
-        &Snapshot {
-            head: SHA_A.to_string(),
-            porcelain: String::new(),
-        },
-    )
-    .expect_err("changed");
-    assert_eq!(err.code, "CANDIDATE_CHANGED");
-}
-
-#[test]
-fn dogfood_gate_exit_controls_whether_rc_starts() {
-    assert_eq!(dogfood_exit(0, Some(0)), 0);
-    assert_eq!(dogfood_exit(2, Some(0)), 2);
-    assert_eq!(dogfood_exit(0, Some(2)), 2);
-    assert_eq!(dogfood_exit(1, None), 1);
-    assert_eq!(dogfood_exit(3, None), 3);
-    assert_eq!(dogfood_exit(0, Some(4)), 4);
-
-    let (code, rc_started) = scripted_dogfood(1);
-    assert_eq!(code, 1);
-    assert!(!rc_started);
-    let (code, rc_started) = scripted_dogfood(3);
-    assert_eq!(code, 3);
-    assert!(!rc_started);
-    let (code, rc_started) = scripted_dogfood(2);
-    assert_eq!(code, 2);
-    assert!(rc_started);
-}
-
-fn scripted_dogfood(release_status: i32) -> (i32, bool) {
-    let repo_tmp = Tmp::new();
-    let lab_tmp = Tmp::new();
-    let repo = repo_tmp.path.canonicalize().unwrap();
-    let lab = lab_tmp.path.canonicalize().unwrap();
-    write_versions(&repo, "1.0.8");
-    write_lab(&lab, BASELINE);
-    point_config(&repo, &lab, "example/model");
-    let host = FakeHost::new(move |spec| {
-        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
-            return Ok(text(SHA_A));
-        }
-        if is_cmd(spec, "git", &["status", "--porcelain"])
-            || spec.program == "git" && spec.args.first().map(String::as_str) == Some("cat-file")
-        {
-            return Ok(text(""));
-        }
-        if spec.program == "python3" && spec.args.iter().any(|arg| arg.contains("release_check.py"))
-        {
-            return Ok(process(release_status, &format!("written: {RUN}/\n")));
-        }
-        if spec.program == "python3" && spec.args.iter().any(|arg| arg.contains("rc_check.py")) {
-            assert_eq!(arg_after(spec, "--release-run").as_deref(), Some(RUN));
-            assert_eq!(arg_after(spec, "--candidate-sha").as_deref(), Some(SHA_A));
-            return Ok(process(
-                0,
-                "written: eval/rc/20260101-000000-aaaaaaaaaaaa/\n",
-            ));
-        }
-        Ok(text(""))
-    });
-    let qual = qualify::run_dogfood_locked(
-        &host,
-        &repo,
-        &Env::default(),
-        &GateOpts::default(),
-        &Snapshot {
-            head: SHA_A.to_string(),
-            porcelain: String::new(),
-        },
-    )
-    .unwrap_or_else(|err| panic!("{} {}", err.code, err.detail));
-    let rc_started = host
-        .log()
-        .iter()
-        .any(|spec| spec.args.iter().any(|arg| arg.contains("rc_check.py")));
-    (qual.exit_code, rc_started)
-}
-
-#[test]
-fn pre_release_accepts_layer_pass_when_overall_exit_is_partial() {
-    let lab_tmp = Tmp::new();
-    pass_layers(lab_tmp.path.as_path());
-    let body = qualify::judge_pre_release(
-        &lab_tmp.path.canonicalize().unwrap(),
-        &format!("written: {RUN}/\n"),
-        1,
-    )
-    .unwrap();
-    assert!(body.contains("L0: PASS"), "{body}");
-    assert!(body.contains("L2: PASS"), "{body}");
-
-    let err = qualify::judge_pre_release(lab_tmp.path.as_path(), &format!("written: {RUN}/\n"), 3)
-        .expect_err("not started");
-    assert_eq!(err.code, "NOT_STARTED");
-    assert_eq!(err.exit, 3);
-
-    std::fs::write(
-        lab_tmp.path.join(RUN).join("L0.json"),
-        r#"{"status":"FAIL","checks":[{"id":"fmt","status":"FAIL"}]}"#,
-    )
-    .unwrap();
-    let err = qualify::judge_pre_release(lab_tmp.path.as_path(), &format!("written: {RUN}/\n"), 1)
-        .expect_err("fmt");
-    assert_eq!(err.code, "FMT_CHECK_FAIL");
+fn run_id_discovery_still_reads_a_mention_when_nothing_was_written() {
+    let text = format!("gate exited before writing\nnamed: {RUN}/\n");
+    assert_eq!(qualify::find_release_runs(&text), vec![RUN.to_string()]);
 }
 
 #[test]

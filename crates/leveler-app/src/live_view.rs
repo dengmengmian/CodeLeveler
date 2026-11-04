@@ -431,6 +431,7 @@ mod tests {
             RuntimeEvent::TurnFailed {
                 error: "failed".to_string(),
                 failure: None,
+                recovery: None,
             },
             RuntimeEvent::TurnCancelled,
         ];

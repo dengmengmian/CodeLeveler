@@ -269,6 +269,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::IdleOnly,
     ),
+    // The crash-recovery gate: review the interrupted calls the runtime could
+    // not finish, then explicitly acknowledge that their outcome is unknown.
+    // Never a model message, and never safe to do while a turn is running.
+    slash(
+        "/recover",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
+    ),
     slash(
         "/copy",
         &[],
@@ -399,6 +409,54 @@ pub fn is_known_slash_token(name: &str) -> bool {
         .any(|d| d.name == token.as_str() || d.aliases.contains(&token.as_str()))
 }
 
+/// Byte range of the leading slash-command token in `text` that the composer
+/// should paint in the command ink.
+///
+/// Only the first line is considered, and the token must start the line apart
+/// from leading whitespace. A token qualifies when it is a registered primary name
+/// or alias, or a prefix of exactly one registered command — `/he` is heading
+/// to `/help`, while `/mo` is ambiguous between `/model` and `/mode`. A bare
+/// `/` qualifies: it opens the command surface.
+///
+/// This is presentation only: execution still requires an exact token, so a
+/// highlighted prefix is a hint about where the typing is going, not a claim
+/// that the typed text already runs. The registry is read in place; no command
+/// list is rebuilt per keystroke.
+pub fn highlighted_slash_command(text: &str) -> Option<std::ops::Range<usize>> {
+    let first_line = text.split('\n').next()?;
+    let start = first_line.len() - first_line.trim_start().len();
+    let rest = &first_line[start..];
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let token = rest.split_whitespace().next()?;
+    let range = start..start + token.len();
+    if token == "/" {
+        // A bare `/` is the command surface itself, but only when nothing
+        // follows it: in ` / model` the slash is punctuation between words,
+        // not a command.
+        return (rest.trim_end() == "/").then_some(range);
+    }
+    if SLASH_DEFS
+        .iter()
+        .any(|d| d.name == token || d.aliases.contains(&token))
+    {
+        return Some(range);
+    }
+    let mut unique = None;
+    for def in SLASH_DEFS {
+        let matches =
+            def.name.starts_with(token) || def.aliases.iter().any(|alias| alias.starts_with(token));
+        if matches {
+            if unique.is_some() {
+                return None;
+            }
+            unique = Some(def);
+        }
+    }
+    unique.map(|_| range)
+}
+
 /// Canonical primary name (with `/`) for a typed token (with or without `/`).
 pub fn slash_primary(token: &str) -> Option<&'static str> {
     // Bare `/` is help.
@@ -430,16 +488,21 @@ pub fn slash_def(token: &str) -> Option<&'static SlashDef> {
 }
 
 fn slash_description(name: &str, t: &UiText) -> &'static str {
-    slash_copy(name, &t.slash)
+    slash_copy(name, t, false)
 }
 
 /// One-line palette label. Help keeps the longer [`slash_description`].
 pub fn slash_popup_label(name: &str, t: &UiText) -> &'static str {
-    slash_copy(name, &t.slash_brief)
+    slash_copy(name, t, true)
 }
 
-fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
+fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
+    let s = if brief { &t.slash_brief } else { &t.slash };
     match name {
+        // `/recover` is owned by the crash-recovery contract, whose copy sits
+        // under `recovery_*` rather than the general slash table: the two must
+        // not drift apart when the wording changes.
+        "/recover" => t.recovery_command_desc,
         "/model" => s.model,
         "/thinking" => s.thinking,
         "/permission" | "/mode" => s.permission,
@@ -772,6 +835,7 @@ mod surface_tests {
                 "/restore",
                 "/fork",
                 "/compact",
+                "/recover",
                 "/copy",
                 "/output",
                 "/export",
@@ -1321,6 +1385,56 @@ mod reachability_tests {
                 production_opener(screen).is_some(),
                 "{screen:?} is declared and rendered but no production path opens it"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::highlighted_slash_command;
+
+    fn range(text: &str) -> Option<(usize, usize)> {
+        highlighted_slash_command(text).map(|r| (r.start, r.end))
+    }
+
+    #[test]
+    fn a_registered_command_is_highlighted_up_to_the_argument() {
+        assert_eq!(range("/model"), Some((0, 6)));
+        assert_eq!(range("/model deepseek-v4.1"), Some((0, 6)));
+        assert_eq!(range("/mode"), Some((0, 5)), "alias is a command too");
+        assert_eq!(range("/model\nnext line"), Some((0, 6)));
+        assert_eq!(range("/model\targ"), Some((0, 6)));
+        assert_eq!(range("  /model arg"), Some((2, 8)), "leading spaces");
+    }
+
+    #[test]
+    fn a_unique_prefix_is_highlighted_but_an_ambiguous_one_is_not() {
+        assert_eq!(range("/he"), Some((0, 3)), "only /help starts with /he");
+        assert_eq!(range("/check"), Some((0, 6)), "only the /checkpoint alias");
+        assert_eq!(range("/mo"), None, "/model and /mode both continue /mo");
+        assert_eq!(range("/mod"), None);
+    }
+
+    #[test]
+    fn a_bare_slash_is_the_command_surface() {
+        assert_eq!(range("/"), Some((0, 1)));
+        assert_eq!(range("  /"), Some((2, 3)));
+    }
+
+    #[test]
+    fn unknown_tokens_and_ordinary_text_stay_plain() {
+        for text in [
+            "",
+            "这个项目怎么本地跑起来？",
+            "/unknown-command",
+            "/hlep",
+            "/modelt",
+            "/Users/mengmian/project",
+            "hello /model",
+            "\n/model",
+            " / model",
+        ] {
+            assert_eq!(range(text), None, "{text:?} must not look like a command");
         }
     }
 }

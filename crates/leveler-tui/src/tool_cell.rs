@@ -3148,7 +3148,7 @@ mod tests {
             "update_goal(complete) was not accepted: delegated sub-agent(s) x were still running",
         ] {
             let row = render("update_goal", refusal);
-            assert!(row.contains("目标未更新：收尾被运行时拒绝"), "{row}");
+            assert!(row.contains("目标未更新：收尾请求被拒绝"), "{row}");
             assert!(!row.contains("需先说明状态"), "{row}");
             assert!(!row.contains(refusal), "{row}");
         }
@@ -3260,10 +3260,7 @@ mod tests {
             "[goal_refused:future_gate]\nnew runtime reason".to_string(),
             false,
         );
-        assert!(
-            unknown.contains("目标未更新：收尾被运行时拒绝"),
-            "{unknown}"
-        );
+        assert!(unknown.contains("目标未更新：收尾请求被拒绝"), "{unknown}");
     }
 
     #[test]

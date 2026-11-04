@@ -194,6 +194,11 @@ impl CommandExecution {
                     "background": true,
                     "lifetime": lifetime.as_str(),
                     "stops_when": lifetime.stop_condition(),
+                    // The argv of the started process is a structured fact too:
+                    // after the hosting registry dies, it is the only thing that
+                    // can name what a recorded start actually ran.
+                    "program": program,
+                    "args": args,
                 })))
             }
             Err(e) => Ok(ToolOutput::error(format!("background spawn failed: {e}"))),

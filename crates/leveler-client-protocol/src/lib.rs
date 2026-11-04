@@ -87,8 +87,8 @@ pub use skills::{
 };
 
 pub use event::{
-    ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RuntimeEvent,
-    UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, parse_runtime_event,
+    ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RecoveryStop,
+    RuntimeEvent, UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, parse_runtime_event,
 };
 pub use global_tasks::{
     UiGlobalTaskIndex, UiGlobalTaskSourceError, UiGlobalTaskSourceErrorKind, UiGlobalTaskSummary,
@@ -111,8 +111,9 @@ pub use retirement::{RetireDecision, RetireRequest};
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
-    UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiCheckpoint,
-    UiExecutionTask, UiMessage, UiMessageKind, UiRole, UiSessionHistory, UiSessionSnapshot,
+    UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiBackgroundTaskRecord,
+    UiBackgroundTaskState, UiCheckpoint, UiExecutionTask, UiInterruptedCallState,
+    UiInterruptedToolCall, UiMessage, UiMessageKind, UiRole, UiSessionHistory, UiSessionSnapshot,
     UiSessionSummary, UiTaskDeclaration, UiThinkingAccess, UiThinkingState, UiToolTiming,
     UiTurnBlocker, UiUserShell,
 };

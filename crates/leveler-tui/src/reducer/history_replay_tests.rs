@@ -65,7 +65,9 @@ fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),
@@ -1538,5 +1540,60 @@ fn a_replayed_closeout_refusal_names_the_same_gate() {
             .iter()
             .any(|row| row.contains("not fully accounted for") || row.contains("[goal_refused:")),
         "model-facing prose and the tag stay out of the body: {live_rows:#?}"
+    );
+}
+
+/// A call whose turn ended without any terminal fact — the runtime died and
+/// the user acknowledged the crash window, so nothing was replayed — is
+/// history with an unknown outcome. It must stay unknown on replay: neither
+/// a success nor a failure was observed, and the summary must not count it
+/// as one.
+#[test]
+fn a_replayed_call_without_a_terminal_fact_stays_unknown() {
+    let mut s = state();
+    let effects = open(&mut s, vec![message(UiRole::User, "运行 probe")]);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries: vec![
+                entry(
+                    0,
+                    true,
+                    RuntimeEvent::UserMessageAdded {
+                        message: message(UiRole::User, "运行 probe"),
+                    },
+                ),
+                entry(
+                    10,
+                    false,
+                    RuntimeEvent::ToolCallStarted {
+                        id: ToolCallId::new("c1"),
+                        name: "run_command".into(),
+                        arguments: "{\"command\":\"touch ran.txt\"}".into(),
+                        parallel: false,
+                        model_step: None,
+                        answer_effect: None,
+                    },
+                ),
+            ],
+            omitted_turns: 0,
+        }),
+    );
+
+    let items = s.transcript.items();
+    let call = items
+        .iter()
+        .find_map(|i| match i {
+            TranscriptItem::ToolGroup(g) => g.calls.first(),
+            _ => None,
+        })
+        .expect("the interrupted call is history, not dropped");
+    assert_eq!(call.status, ToolStatus::Unknown);
+    let rows = conversation_rows(&s);
+    assert!(
+        !rows.iter().any(|row| row.contains("个失败")),
+        "an unobserved outcome is not a failure: {rows:#?}"
     );
 }

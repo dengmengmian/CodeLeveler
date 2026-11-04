@@ -212,11 +212,13 @@ pub async fn run(
                     };
                     match answer {
                         DeliveryAnswer::Delivered => EffectCompletion::CommandDelivered,
-                        DeliveryAnswer::Rejected(message) => EffectCompletion::CommandRejected {
-                            command,
-                            message,
-                            snapshot: snapshot_within(&delivery_client, &session_id).await,
-                        },
+                        DeliveryAnswer::Rejected { message, .. } => {
+                            EffectCompletion::CommandRejected {
+                                command,
+                                message,
+                                snapshot: snapshot_within(&delivery_client, &session_id).await,
+                            }
+                        }
                         // A fresh id per issue never meets an unsettled receipt;
                         // were it to, it is still no delivery this client saw.
                         DeliveryAnswer::Unresolvable | DeliveryAnswer::None => {
@@ -431,10 +433,14 @@ pub async fn run(
                             Err(error) => {
                                 // Resync failed: surface it instead of silently
                                 // dropping to a stale view. A later event or a
-                                // manual refresh retries.
+                                // manual refresh retries. The raw failure is
+                                // diagnostic; the notice states only what the
+                                // user can rely on.
+                                tracing::warn!(%error, "event stream lag resync failed");
+                                let message = state.t().stream_resync_failed.to_string();
                                 state.notification = Some(Notification {
                                     level: NotificationLevel::Error,
-                                    message: format!("事件流滞后后重同步失败：{error}"),
+                                    message,
                                 });
                             }
                         }
@@ -446,7 +452,7 @@ pub async fn run(
                         state.runtime_connected = false;
                         state.notification = Some(Notification {
                             level: NotificationLevel::Error,
-                            message: "与运行时的事件流已断开".to_string(),
+                            message: state.t().connection_lost.to_string(),
                         });
                         pending_runtime_paint = true;
                     }
@@ -760,8 +766,13 @@ fn spawn_delivery(
 /// What the runtime answered for one delivery attempt.
 enum DeliveryAnswer {
     Delivered,
-    /// Rejected, in the runtime's own words.
-    Rejected(String),
+    /// Rejected, in the runtime's own words. `recovery` marks a refusal that
+    /// must not be presented as a generic failure: an earlier tool call's
+    /// outcome is unconfirmed.
+    Rejected {
+        message: String,
+        recovery: bool,
+    },
     /// Admitted, with an outcome the runtime proves it cannot recover.
     Unresolvable,
     /// No answer — nothing may be concluded.
@@ -775,8 +786,18 @@ fn delivery_answer(
         Ok(Ok(())) => DeliveryAnswer::Delivered,
         Ok(Err(ClientError::OutcomeUnknown(_))) | Err(_) => DeliveryAnswer::None,
         Ok(Err(ClientError::Unresolvable(_))) => DeliveryAnswer::Unresolvable,
-        Ok(Err(ClientError::Runtime(message))) => DeliveryAnswer::Rejected(message),
-        Ok(Err(error)) => DeliveryAnswer::Rejected(error.to_string()),
+        Ok(Err(ClientError::Runtime(message))) => DeliveryAnswer::Rejected {
+            message,
+            recovery: false,
+        },
+        Ok(Err(ClientError::RecoveryRequired(message))) => DeliveryAnswer::Rejected {
+            message,
+            recovery: true,
+        },
+        Ok(Err(error)) => DeliveryAnswer::Rejected {
+            message: error.to_string(),
+            recovery: false,
+        },
     }
 }
 
@@ -808,11 +829,14 @@ async fn first_submission_attempt(
             command_id: envelope.command_id.clone(),
             snapshot: snapshot_within(client, &envelope.session_id).await,
         }),
-        DeliveryAnswer::Rejected(message) => Ok(EffectCompletion::SubmissionRejected {
-            command_id: envelope.command_id.clone(),
-            message,
-            snapshot: snapshot_within(client, &envelope.session_id).await,
-        }),
+        DeliveryAnswer::Rejected { message, recovery } => {
+            Ok(EffectCompletion::SubmissionRejected {
+                command_id: envelope.command_id.clone(),
+                message,
+                recovery,
+                snapshot: snapshot_within(client, &envelope.session_id).await,
+            })
+        }
         DeliveryAnswer::Unresolvable => Ok(EffectCompletion::SubmissionUnresolvable {
             command_id: envelope.command_id.clone(),
             snapshot: snapshot_within(client, &envelope.session_id).await,
@@ -854,11 +878,14 @@ async fn settle_submission(
                 command_id,
                 snapshot,
             },
-            DeliveryAnswer::Rejected(message) => EffectCompletion::SubmissionRejected {
-                command_id,
-                message,
-                snapshot,
-            },
+            DeliveryAnswer::Rejected { message, recovery } => {
+                EffectCompletion::SubmissionRejected {
+                    command_id,
+                    message,
+                    recovery,
+                    snapshot,
+                }
+            }
             // Final: the loop ends here and the old id is never sent again.
             DeliveryAnswer::Unresolvable | DeliveryAnswer::None => {
                 EffectCompletion::SubmissionUnresolvable {
@@ -893,7 +920,7 @@ fn dispatch_effects(
                 if !state.runtime_connected {
                     state.notification = Some(Notification {
                         level: NotificationLevel::Error,
-                        message: state.t().commands_disabled_disconnected.to_string(),
+                        message: state.t().connection_lost.to_string(),
                     });
                     continue;
                 }
@@ -945,7 +972,7 @@ fn dispatch_effects(
                     crate::reducer::overlay_keys::restore_interaction_overlay(state, restore);
                     state.notification = Some(Notification {
                         level: NotificationLevel::Error,
-                        message: "事件流已断开；审批/澄清未发送，请退出后重新连接".to_string(),
+                        message: state.t().interaction_held_offline.to_string(),
                     });
                     continue;
                 }
@@ -1988,6 +2015,33 @@ mod tests {
             &mut s,
             &mut shown,
             base + NOTIFICATION_TTL_INFO
+        ));
+        assert!(s.notification.is_none());
+    }
+
+    #[test]
+    fn a_repeated_warning_never_resets_its_clock() {
+        let mut s = state();
+        let warning = Notification {
+            level: NotificationLevel::Warning,
+            message: "同样的提醒".into(),
+        };
+        let base = Instant::now();
+        let mut shown = None;
+        s.notification = Some(warning.clone());
+        assert!(!expire_notification(&mut s, &mut shown, base));
+        // The same warning arriving again is the same fact, not a new one: it
+        // must not buy another eight seconds.
+        s.notification = Some(warning);
+        assert!(!expire_notification(
+            &mut s,
+            &mut shown,
+            base + std::time::Duration::from_secs(7)
+        ));
+        assert!(expire_notification(
+            &mut s,
+            &mut shown,
+            base + NOTIFICATION_TTL_WARNING
         ));
         assert!(s.notification.is_none());
     }

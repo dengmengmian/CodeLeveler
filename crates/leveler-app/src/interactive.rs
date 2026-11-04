@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use leveler_core::{CheckpointId, CommandId, SessionId};
+use leveler_core::{BootId, BootLiveness, BootLivenessProbe, CheckpointId, CommandId, SessionId};
 use leveler_execution::{
     AdoptedTaskSpec, Approver, AutoApprove, BackgroundTaskLifetime, OutputStream,
     PermissionProfile, StreamOutcome,
@@ -44,8 +44,9 @@ use leveler_storage::{MessageRepository, SessionRepository};
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
     AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
-    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiPlan, UiPlanState,
-    UiRole, UiSessionSnapshot, UiSessionSummary, UiThinkingAccess, UiThinkingState,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiInterruptedCallState,
+    UiInterruptedToolCall, UiMessage, UiPlan, UiPlanState, UiRole, UiSessionSnapshot,
+    UiSessionSummary, UiThinkingAccess, UiThinkingState,
 };
 
 /// Whether a turn auto-approves risky actions. True when the session opted in
@@ -145,8 +146,34 @@ fn turn_rejection<T>(result: &Result<T, crate::AppError>) -> ClientError {
             error @ (crate::AppError::SessionRunningElsewhere
             | crate::AppError::SessionOwnershipUnknown),
         ) => ownership_conflict(error),
+        Err(error @ crate::AppError::RecoveryConfirmationRequired { .. }) => {
+            ClientError::RecoveryRequired(error.to_string())
+        }
         Err(error) => ClientError::Runtime(error.to_string()),
         Ok(_) => ClientError::Runtime("turn ended before durable admission".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod turn_rejection_tests {
+    use super::turn_rejection;
+    use leveler_client_protocol::ClientError;
+
+    /// The crash-window gate has its own wire category: a client that received
+    /// it must not present it as an ordinary runtime failure.
+    #[test]
+    fn a_recovery_gate_is_typed_not_a_generic_runtime_error() {
+        let result: Result<(), crate::AppError> =
+            Err(crate::AppError::RecoveryConfirmationRequired {
+                call_id: "call-7".to_string(),
+                tool: "run_command".to_string(),
+            });
+        match turn_rejection(&result) {
+            ClientError::RecoveryRequired(message) => {
+                assert!(message.contains("call-7"), "{message}");
+            }
+            other => panic!("unexpected rejection: {other:?}"),
+        }
     }
 }
 
@@ -968,6 +995,35 @@ pub(crate) async fn reconcile_background_evidence(app: &Application, session_id:
     }
     for task in snapshots {
         persist_background_task_finished(app, session_id.clone(), &task).await;
+    }
+}
+
+/// Terminal process facts the Execution Host kept for this session.
+///
+/// The host outlives the runtime that admitted a task, so its archive can prove
+/// what an engine event has not recorded yet — a task that finished while no
+/// runtime was attached. Reading it claims no process and acknowledges no
+/// result; the projection only reports what the fact proves. An unreadable
+/// archive is reported and then treated as absent: a projection must not fail
+/// a reconnect over diagnostics it could not collect, and it must never invent
+/// the missing states either.
+fn hosted_terminal_facts(
+    app: &Application,
+    session_id: &SessionId,
+) -> Vec<leveler_execution::BackgroundTaskSnapshot> {
+    match app
+        .background_tasks()
+        .hosted_terminal_snapshots_for_scope(session_id.as_str())
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session = session_id.as_str(),
+                "cannot read Execution Host terminal facts"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -5020,6 +5076,7 @@ impl InProcessRuntimeClient {
                 let _ = events.send(RuntimeEvent::TurnFailed {
                     error: format!("压缩失败：{error}"),
                     failure: None,
+                    recovery: None,
                 });
                 self.notify_error(&session_id, format!("压缩失败：{error}"));
                 return Ok(());
@@ -5867,6 +5924,49 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     "该命令已结束或尚未开始执行,无需停止".to_string(),
                 )),
             },
+            ClientCommand::AcknowledgeCrashWindow { session_id } => {
+                // Acknowledging advances the ownership epoch, which would
+                // invalidate a live turn's token. Take the same admission gate
+                // every turn start uses, so an acknowledgement and a turn
+                // cannot interleave; the lease is released before the snapshot
+                // so the published state never claims this short critical
+                // section was a running turn.
+                let lease = self
+                    .active
+                    .admit(&session_id)
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let acknowledged = async {
+                    let closed = self
+                        .app
+                        .acknowledge_crash_window(&session_id)
+                        .await
+                        .map_err(|error| match &error {
+                            crate::AppError::SessionRunningElsewhere
+                            | crate::AppError::SessionOwnershipUnknown => {
+                                ownership_conflict(&error)
+                            }
+                            error => ClientError::Runtime(error.to_string()),
+                        })?;
+                    Ok::<usize, ClientError>(closed)
+                }
+                .await;
+                self.active.finish(&lease);
+                let closed = acknowledged?;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::CrashWindowAcknowledged {
+                        session_id: session_id.clone(),
+                        closed: u32::try_from(closed).unwrap_or(u32::MAX),
+                    });
+                // The answer to "did it take" is the runtime's own re-read,
+                // not the count alone.
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionOpened { session });
+                }
+                Ok(())
+            }
             ClientCommand::RunUserShell {
                 session_id,
                 command,
@@ -6625,6 +6725,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         )?;
         let status = session_status_wire(record.status, task_status);
 
+        // The crash window: starts with no finish. A call is only crash
+        // residue when no live turn owns it — while a turn runs here, its open
+        // calls are ordinary in-flight work. A turn whose owner boot cannot be
+        // probed keeps its `Unknown` state rather than being called
+        // interrupted.
+        let interrupted_tool_calls =
+            project_interrupted_tool_calls(&db, &facts, &probe, session_id, runtime_active).await?;
+
         // Unlike the best-effort fields above, a child row that cannot be
         // decoded fails the snapshot: it is canonical history, and every other
         // reader of it (restart reconciliation, observability) refuses corrupt
@@ -6632,7 +6740,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let children = crate::children::project_children(&db, session_id, runtime_active)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        let active_background_tasks = self
+        let active_background_tasks: Vec<leveler_client_protocol::UiActiveBackgroundTask> = self
             .app
             .background_tasks()
             .try_active_snapshots()
@@ -6650,6 +6758,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 lifetime: Some(task.lifetime.as_str().to_string()),
             })
             .collect();
+        // The full reconciled view: a reconnect must be able to tell a
+        // finished task from one that died with its runtime, not just list
+        // what is still alive. A snapshot is also a catch-up boundary: the
+        // client can reconnect to a session with no turn ever starting, so the
+        // durable record must be completed here, not only at a turn boundary.
+        reconcile_background_evidence(&self.app, session_id).await;
+        let hosted_terminal = hosted_terminal_facts(&self.app, session_id);
+        let background_tasks = project_background_tasks(
+            &db,
+            &probe,
+            session_id,
+            &active_background_tasks,
+            &hosted_terminal,
+        )
+        .await?;
 
         Ok(UiSessionSnapshot {
             history,
@@ -6673,7 +6796,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             vision,
             last_sequence,
             active_tools: live.active_tools,
+            interrupted_tool_calls,
             active_background_tasks,
+            background_tasks,
             plan,
             diff: live.diff,
             checkpoints,
@@ -6696,6 +6821,287 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             execution_task,
             children,
         })
+    }
+}
+
+/// Project the session's crash window for a client snapshot.
+///
+/// A `tool_call_started` with no `tool_call_finished` is either ordinary live
+/// work (a turn running here, or a running turn another live runtime owns) or
+/// crash residue. Only residue is reported. Liveness of a turn whose boot
+/// cannot be probed stays `Unknown`; it is never labelled interrupted.
+async fn project_interrupted_tool_calls(
+    db: &leveler_storage::Database,
+    facts: &leveler_storage::SessionFacts,
+    probe: &dyn BootLivenessProbe,
+    session_id: &SessionId,
+    runtime_active: bool,
+) -> Result<Vec<UiInterruptedToolCall>, ClientError> {
+    if runtime_active {
+        return Ok(Vec::new());
+    }
+    let running_liveness: HashMap<&str, BootLiveness> = facts
+        .turns
+        .iter()
+        .filter(|turn| turn.status == "running")
+        .map(|turn| {
+            let liveness = turn
+                .owner_boot_id
+                .as_deref()
+                .map(BootId::new)
+                .map(|boot| probe.liveness(&boot))
+                .unwrap_or(BootLiveness::Unknown);
+            (turn.id.as_str(), liveness)
+        })
+        .collect();
+    Ok(leveler_engine::EventLog::new(db, session_id.clone())
+        .dangling_tool_calls()
+        .await
+        .map_err(|error| ClientError::Runtime(error.to_string()))?
+        .into_iter()
+        .filter_map(|call| {
+            let state = match call.turn_id.as_deref() {
+                Some(turn) => match running_liveness.get(turn) {
+                    // Another live process still owns this call.
+                    Some(BootLiveness::Alive) => return None,
+                    Some(BootLiveness::Dead) => UiInterruptedCallState::Interrupted,
+                    Some(BootLiveness::Unknown) => UiInterruptedCallState::Unknown,
+                    // A turn that is no longer running cannot still be
+                    // executing its call.
+                    None => UiInterruptedCallState::Interrupted,
+                },
+                // Legacy rows carry no turn attribution; claiming a definite
+                // interruption would be a guess.
+                None => UiInterruptedCallState::Unknown,
+            };
+            Some(UiInterruptedToolCall {
+                call_id: call.call_id,
+                tool: call.name,
+                pending_approval: call.pending_approval,
+                state,
+            })
+        })
+        .collect())
+}
+
+/// Reconcile this session's background tasks from durable facts and the live
+/// registry.
+///
+/// A missing live entry is not a terminal state: the process may have exited,
+/// been cancelled, or died with the runtime that hosted it. Only a durable
+/// terminal row — or the Execution Host's archived process fact, when its
+/// stable identity agrees with the start — says how a task ended; without one,
+/// the owning boot's liveness separates `Lost` from `Unknown`. A live entry
+/// never gets a terminal it does not have: the snapshot reports what it can
+/// prove, not what would be convenient.
+async fn project_background_tasks(
+    db: &leveler_storage::Database,
+    probe: &dyn BootLivenessProbe,
+    session_id: &SessionId,
+    live: &[leveler_client_protocol::UiActiveBackgroundTask],
+    hosted_terminal: &[leveler_execution::BackgroundTaskSnapshot],
+) -> Result<Vec<leveler_client_protocol::UiBackgroundTaskRecord>, ClientError> {
+    use leveler_client_protocol::{UiBackgroundTaskRecord, UiBackgroundTaskState};
+
+    let facts = leveler_engine::EventLog::new(db, session_id.clone())
+        .background_task_facts()
+        .await
+        .map_err(|error| ClientError::Runtime(error.to_string()))?;
+
+    let turn_ids: Vec<String> = facts
+        .iter()
+        .filter_map(|fact| fact.turn_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let turns: HashMap<String, leveler_storage::TurnRecord> = if turn_ids.is_empty() {
+        HashMap::new()
+    } else {
+        leveler_storage::TurnRepository::new(db)
+            .list_by_ids(session_id, &turn_ids)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .into_iter()
+            .map(|turn| (turn.id.clone(), turn))
+            .collect()
+    };
+    let mut liveness: HashMap<String, BootLiveness> = HashMap::new();
+    let mut boot_of = |turn_id: &str| -> Option<BootLiveness> {
+        let boot = turns.get(turn_id)?.owner_boot_id.clone()?;
+        Some(
+            *liveness
+                .entry(boot.clone())
+                .or_insert_with(|| probe.liveness(&BootId::new(boot.as_str()))),
+        )
+    };
+
+    let live_by_id: HashMap<&str, &leveler_client_protocol::UiActiveBackgroundTask> = live
+        .iter()
+        .map(|task| (task.task_id.as_str(), task))
+        .collect();
+    let mut hosted_by_id: HashMap<&str, Vec<&leveler_execution::BackgroundTaskSnapshot>> =
+        HashMap::new();
+    for task in hosted_terminal {
+        hosted_by_id.entry(task.id.as_str()).or_default().push(task);
+    }
+
+    // One record per id. Repeated ids are an identity conflict, not two
+    // tasks: the client keys its chrome by task id, and neither the live
+    // process nor a terminal row can be attributed to one start safely.
+    let mut starts_by_id: HashMap<&str, Vec<&leveler_engine::BackgroundTaskFact>> = HashMap::new();
+    for fact in &facts {
+        starts_by_id
+            .entry(fact.task_id.as_str())
+            .or_default()
+            .push(fact);
+    }
+
+    let mut records: Vec<UiBackgroundTaskRecord> = Vec::new();
+    let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for fact in &facts {
+        if !emitted.insert(fact.task_id.as_str()) {
+            continue;
+        }
+        let starts = &starts_by_id[fact.task_id.as_str()];
+        let latest = starts.last().copied().unwrap_or(fact);
+        // The host's archive may close a start the engine never recorded a
+        // terminal for. It is evidence only when its stable identity agrees:
+        // exactly one archived record, for this task id, started by THIS call.
+        // A record that cannot be attributed is an identity conflict, never a
+        // completion.
+        let hosted =
+            hosted_by_id
+                .get(fact.task_id.as_str())
+                .and_then(|records| match records.as_slice() {
+                    [record] if record.origin_call_id.as_deref() == Some(fact.call_id.as_str()) => {
+                        Some(*record)
+                    }
+                    _ => None,
+                });
+        let hosted_conflict = fact.terminal.is_none()
+            && hosted_by_id.contains_key(fact.task_id.as_str())
+            && hosted.is_none();
+        let is_conflict = starts.len() > 1
+            || hosted_conflict
+            || (live_by_id.contains_key(fact.task_id.as_str())
+                && (starts.iter().any(|s| s.terminal.is_some()) || hosted.is_some()));
+        let state = if is_conflict {
+            UiBackgroundTaskState::Conflict
+        } else if live_by_id.contains_key(fact.task_id.as_str()) {
+            UiBackgroundTaskState::Running
+        } else if let Some(terminal) = &fact.terminal {
+            terminal_state(terminal)
+        } else if let Some(record) = hosted {
+            proven_terminal_state(
+                Some(record.status),
+                record.exit_code,
+                record.status != leveler_execution::BackgroundTaskStatus::Exited
+                    || record.exit_code != Some(0),
+            )
+        } else {
+            match latest.turn_id.as_deref().and_then(&mut boot_of) {
+                Some(BootLiveness::Dead) => UiBackgroundTaskState::Lost,
+                // A live boot that no longer holds the task, an unprobed boot,
+                // and a start without attribution all leave the state open.
+                Some(BootLiveness::Alive | BootLiveness::Unknown) | None => {
+                    UiBackgroundTaskState::Unknown
+                }
+            }
+        };
+        let (exit_code, output, output_truncated) = match (&state, &fact.terminal, hosted) {
+            (UiBackgroundTaskState::Conflict, _, _) | (_, None, None) => {
+                (None, String::new(), false)
+            }
+            (_, Some(terminal), _) => (
+                terminal.exit_code,
+                terminal.output.clone(),
+                terminal.output_truncated,
+            ),
+            (_, None, Some(record)) => {
+                // Same tail bound the durable fact uses, so a reconnect and a
+                // later turn boundary describe the result identically.
+                const OUTPUT_TAIL_BYTES: usize = 4096;
+                let start = leveler_core::ceil_char_boundary(
+                    &record.log,
+                    record.log.len().saturating_sub(OUTPUT_TAIL_BYTES),
+                );
+                (
+                    record.exit_code,
+                    record.log[start..].to_owned(),
+                    record.log_truncated || start != 0,
+                )
+            }
+        };
+        records.push(UiBackgroundTaskRecord {
+            task_id: fact.task_id.clone(),
+            call_id: (state != UiBackgroundTaskState::Conflict).then(|| fact.call_id.clone()),
+            program: latest.program.clone(),
+            args: latest.args.clone(),
+            lifetime: (!latest.lifetime.is_empty()).then(|| latest.lifetime.clone()),
+            state,
+            exit_code,
+            output,
+            output_truncated,
+        });
+    }
+
+    // A live task with no durable start (a log written before starts were
+    // recorded) is still running work; dropping it would be a silent loss.
+    for task in live {
+        if starts_by_id.contains_key(task.task_id.as_str()) {
+            continue;
+        }
+        records.push(UiBackgroundTaskRecord {
+            task_id: task.task_id.clone(),
+            call_id: None,
+            program: task.program.clone(),
+            args: task.args.clone(),
+            lifetime: task.lifetime.clone(),
+            state: UiBackgroundTaskState::Running,
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+        });
+    }
+    Ok(records)
+}
+
+/// Read a durable terminal as the state it proves. A zero exit is the only
+/// pass; a killed or unknown runtime status is never folded into one.
+fn terminal_state(
+    terminal: &leveler_engine::BackgroundTaskTerminal,
+) -> leveler_client_protocol::UiBackgroundTaskState {
+    proven_terminal_state(terminal.status, terminal.exit_code, terminal.is_error)
+}
+
+/// The same reading from a bare process fact, so the engine's durable row and
+/// the Execution Host's archive cannot describe one outcome two ways.
+fn proven_terminal_state(
+    status: Option<leveler_execution::BackgroundTaskStatus>,
+    exit_code: Option<i32>,
+    is_error: bool,
+) -> leveler_client_protocol::UiBackgroundTaskState {
+    use leveler_client_protocol::UiBackgroundTaskState;
+    match status {
+        Some(leveler_execution::BackgroundTaskStatus::Killed) => UiBackgroundTaskState::Cancelled,
+        Some(leveler_execution::BackgroundTaskStatus::Unknown) => UiBackgroundTaskState::Unknown,
+        Some(leveler_execution::BackgroundTaskStatus::Exited) => match exit_code {
+            Some(0) => UiBackgroundTaskState::Completed,
+            Some(_) => UiBackgroundTaskState::Failed,
+            // Exited without an established code is not a pass and not a
+            // proven failure.
+            None => UiBackgroundTaskState::Unknown,
+        },
+        // `is_error` is the runtime's own terminal reading for rows written
+        // before the status was recorded; it is never invented here.
+        Some(leveler_execution::BackgroundTaskStatus::Running)
+        | Some(leveler_execution::BackgroundTaskStatus::Killing) => UiBackgroundTaskState::Unknown,
+        None => match exit_code {
+            Some(0) => UiBackgroundTaskState::Completed,
+            Some(_) => UiBackgroundTaskState::Failed,
+            None if is_error => UiBackgroundTaskState::Failed,
+            None => UiBackgroundTaskState::Unknown,
+        },
     }
 }
 
@@ -7402,6 +7808,7 @@ async fn compact_conversation(
         let _ = events.send(RuntimeEvent::TurnFailed {
             error: message.clone(),
             failure: None,
+            recovery: None,
         });
         notify(NotificationLevel::Error, message);
     };
@@ -7669,32 +8076,45 @@ async fn compact_conversation(
                 live_plan
             }
         };
-        let active_background_tasks = background_snapshots
-            .into_iter()
-            .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
-            .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
-                task_id: task.id,
-                program: task.program,
-                args: task.args,
-                elapsed_ms: task.duration_ms,
-                pid: task.pid,
-                ready_evidence: task.ready.map(|ready| ready.evidence),
-                lifetime: Some(task.lifetime.as_str().to_string()),
-            })
-            .collect();
-        let task_projection = match db.session_facts_for(session_id).await {
-            Ok(facts) => facts.and_then(|facts| {
-                crate::session_projection::project_task(
-                    &facts,
-                    &crate::runtime_boot::StateDirBootLiveness::new(&app.layout.state_dir),
-                    false,
-                    false,
-                )
-                .ok()
-            }),
-            Err(_) => None,
+        let active_background_tasks: Vec<leveler_client_protocol::UiActiveBackgroundTask> =
+            background_snapshots
+                .into_iter()
+                .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
+                .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
+                    task_id: task.id,
+                    program: task.program,
+                    args: task.args,
+                    elapsed_ms: task.duration_ms,
+                    pid: task.pid,
+                    ready_evidence: task.ready.map(|ready| ready.evidence),
+                    lifetime: Some(task.lifetime.as_str().to_string()),
+                })
+                .collect();
+        let facts = match db.session_facts_for(session_id).await {
+            Ok(Some(facts)) => facts,
+            Ok(None) | Err(_) => return false,
         };
-        let Some((task_status, task_terminal)) = task_projection else {
+        let probe = crate::runtime_boot::StateDirBootLiveness::new(&app.layout.state_dir);
+        let Ok((task_status, task_terminal)) =
+            crate::session_projection::project_task(&facts, &probe, false, false)
+        else {
+            return false;
+        };
+        let Ok(interrupted_tool_calls) =
+            project_interrupted_tool_calls(&db, &facts, &probe, session_id, false).await
+        else {
+            return false;
+        };
+        let hosted_terminal = hosted_terminal_facts(app, session_id);
+        let Ok(background_tasks) = project_background_tasks(
+            &db,
+            &probe,
+            session_id,
+            &active_background_tasks,
+            &hosted_terminal,
+        )
+        .await
+        else {
             return false;
         };
         let _ = events.send(RuntimeEvent::SessionOpened {
@@ -7722,7 +8142,9 @@ async fn compact_conversation(
                 vision,
                 last_sequence,
                 active_tools: live.active_tools,
+                interrupted_tool_calls,
                 active_background_tasks,
+                background_tasks,
                 plan,
                 diff: live.diff,
                 checkpoints: Vec::new(),

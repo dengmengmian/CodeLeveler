@@ -12,8 +12,6 @@ use crate::multi_agent::ChildStatus;
 #[cfg(test)]
 use crate::render::truncate_display;
 use crate::state::{AppState, BackgroundTaskChrome};
-#[cfg(test)]
-use crate::status_line::fmt_elapsed;
 
 /// Cap on ACTIVITIES in the legacy status-strip projection (test-only since
 /// the state strip became one row): how many are listed before "还有 N 条".
@@ -56,6 +54,12 @@ pub enum ActivityStatus {
     /// A background task the runtime reported `Killed`: a user/agent cancel or
     /// session cleanup. Never counted as a failure.
     Stopped,
+    /// The background task's hosting boot ended with no terminal fact. The
+    /// process may have died with it; completion is never assumed.
+    Lost,
+    /// More than one durable start shares this background task id, so no
+    /// outcome can be attributed to it.
+    Conflict,
     /// A child whose activation died with its runtime window.
     Interrupted,
     /// A child whose turn ended without its terminal reaching this view.
@@ -80,6 +84,19 @@ pub struct ActivitySummary {
     pub status: ActivityStatus,
     pub started_elapsed_secs: u64,
     pub duration_secs: u64,
+    /// False when this view never observed the start (a record restored from
+    /// a durable snapshot). The duration is then unknown, not zero.
+    pub duration_known: bool,
+}
+
+/// The run time shown for any activity. One place so the list, the detail
+/// header, and the facts block cannot disagree about an unknown duration.
+pub(crate) fn duration_text(summary: &ActivitySummary) -> String {
+    if summary.duration_known {
+        crate::status_line::fmt_elapsed(summary.duration_secs)
+    } else {
+        "—".to_string()
+    }
 }
 
 pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
@@ -89,6 +106,9 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
     let mut done = Vec::new();
 
     for (task_id, chrome) in &state.background_task_labels {
+        // A duration needs an observed start or a runtime-reported end. A
+        // record restored from a durable snapshot has neither.
+        let duration_known = chrome.duration_ms.is_some() || chrome.started_known;
         let duration = match chrome.duration_ms {
             Some(ms) => ms / 1000,
             None => now.saturating_sub(chrome.started_elapsed_secs),
@@ -98,6 +118,8 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             crate::state::BackgroundOutcome::Completed => ActivityStatus::Completed,
             crate::state::BackgroundOutcome::Failed => ActivityStatus::Failed,
             crate::state::BackgroundOutcome::Stopped => ActivityStatus::Stopped,
+            crate::state::BackgroundOutcome::Lost => ActivityStatus::Lost,
+            crate::state::BackgroundOutcome::Conflict => ActivityStatus::Conflict,
             crate::state::BackgroundOutcome::Unknown => ActivityStatus::Interrupted,
         };
         let row = ActivitySummary {
@@ -109,13 +131,17 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             status,
             started_elapsed_secs: chrome.started_elapsed_secs,
             duration_secs: duration,
+            duration_known,
         };
         match status {
             ActivityStatus::Running => running.push(row),
-            // Interrupted is not finished: the next turn continues or settles it.
-            ActivityStatus::Waiting | ActivityStatus::Interrupted | ActivityStatus::Unreported => {
-                waiting.push(row)
-            }
+            // Not finished, and not a result: these need the user (or the next
+            // turn) to settle what happened.
+            ActivityStatus::Waiting
+            | ActivityStatus::Interrupted
+            | ActivityStatus::Unreported
+            | ActivityStatus::Lost
+            | ActivityStatus::Conflict => waiting.push(row),
             ActivityStatus::Completed | ActivityStatus::Failed | ActivityStatus::Stopped => {
                 done.push(row)
             }
@@ -161,13 +187,18 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
                 .settled_elapsed_secs
                 .unwrap_or(now)
                 .saturating_sub(child.started_elapsed_secs),
+            duration_known: true,
         };
         match status {
             ActivityStatus::Running => running.push(row),
             // Interrupted is not finished: the next turn continues or settles it.
-            ActivityStatus::Waiting | ActivityStatus::Interrupted | ActivityStatus::Unreported => {
-                waiting.push(row)
-            }
+            ActivityStatus::Waiting
+            | ActivityStatus::Interrupted
+            | ActivityStatus::Unreported
+            // A child never reports these; keep the projection total rather
+            // than silently mis-bucketing one that somehow arrives.
+            | ActivityStatus::Lost
+            | ActivityStatus::Conflict => waiting.push(row),
             ActivityStatus::Completed | ActivityStatus::Failed | ActivityStatus::Stopped => {
                 done.push(row)
             }
@@ -208,7 +239,7 @@ pub(crate) struct ActivityRow {
 #[cfg(test)]
 pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usize) -> String {
     let glyph = activity_glyph(summary.status);
-    let dur = fmt_elapsed(summary.duration_secs);
+    let dur = duration_text(summary);
     let prefix = if selected { "→ " } else { "  " };
     // `·` separates the identity from its run time, the same separator the
     // rest of the strip and the composer use.
@@ -265,6 +296,11 @@ pub(crate) fn activity_glyph(status: ActivityStatus) -> &'static str {
         ActivityStatus::Completed => "✓",
         ActivityStatus::Failed => "✕",
         ActivityStatus::Stopped => "■",
+        // The task's hosting boot ended; like an interrupted child, the work
+        // is not finished and needs a decision.
+        ActivityStatus::Lost => "⏸",
+        // Identity is ambiguous, so no outcome can be shown.
+        ActivityStatus::Conflict => "?",
         ActivityStatus::Interrupted => "⏸",
         ActivityStatus::Unreported => "?",
     }
@@ -1221,6 +1257,9 @@ second line ignored"
                 last_output_at: None,
                 output: String::new(),
                 unknown: false,
+                lost: false,
+                conflict: false,
+                started_known: true,
                 ready: None,
             },
         );
@@ -1592,6 +1631,9 @@ second line ignored"
                 last_output_at: None,
                 output: "test result: ok\n".into(),
                 unknown: false,
+                lost: false,
+                conflict: false,
+                started_known: true,
                 ready: None,
             },
         );
@@ -1627,6 +1669,9 @@ second line ignored"
                 last_output_at: None,
                 output: String::new(),
                 unknown: false,
+                lost: false,
+                conflict: false,
+                started_known: true,
                 ready: None,
             },
         );
@@ -1659,6 +1704,9 @@ second line ignored"
                     last_output_at: None,
                     output: String::new(),
                     unknown: false,
+                    lost: false,
+                    conflict: false,
+                    started_known: true,
                     ready: None,
                 },
             );
@@ -1694,6 +1742,9 @@ second line ignored"
             last_output_at: None,
             output: String::new(),
             unknown: false,
+            lost: false,
+            conflict: false,
+            started_known: true,
             ready: None,
         }
     }

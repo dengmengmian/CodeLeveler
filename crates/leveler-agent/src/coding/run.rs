@@ -13,10 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::{SessionId, TurnId};
 use leveler_engine::{
-    DanglingCall, EngineError, EngineEvent, EventLog, ExecutionKind, TaskEngine, TaskOutcome,
-    TurnKind, TurnRunner,
+    EngineError, EngineEvent, EventLog, ExecutionKind, TaskEngine, TaskOutcome, TurnKind,
+    TurnRunner,
 };
-use leveler_execution::{Approver, Clarifier, PermissionProfile, RiskLevel};
+use leveler_execution::{Approver, Clarifier, PermissionProfile};
 use leveler_lifecycle::{AgentState, PlanState, ProgressLedger, SessionStatus, StopReason};
 use leveler_model::{ContentPart, Message, Role, RuntimeNoticeKind, TranscriptOrigin};
 #[cfg(test)]
@@ -166,26 +166,6 @@ pub struct RuntimeTaskSpec {
     /// Evaluation may additionally supply an explicit case-wide round budget.
     pub limits: StepLimits,
 }
-/// Whether a dangling call may be re-run automatically after a crash.
-///
-/// This asks the TOOL, never the risk label. `RiskLevel::Safe` answers "does
-/// this need approval" and it admits side effects — `create_checkpoint` resets
-/// the rollback baseline, `wait_task` consumes a background task's one-time
-/// settlement report, and both are Safe. Deriving replay-safety from risk (as this once did) would
-/// silently undo the user's work during recovery.
-///
-/// A tool this build does not know, or one that never declared itself
-/// replay-safe, is NOT replayed: recovery stops for human reconciliation.
-/// `risk` is still consulted first as a coarse veto so a legacy event with no
-/// persisted risk can never be replayed either.
-fn is_auto_replayable(
-    registry: &leveler_tools::ToolRegistry,
-    name: &str,
-    risk: Option<RiskLevel>,
-) -> bool {
-    matches!(risk, Some(RiskLevel::Safe)) && registry.replay_is_side_effect_free(name)
-}
-
 /// The Coding-domain half of a task: where the work happens and how its
 /// completion is proven. Verification and baseline attribution live here —
 /// they are the Coding completion gate's inputs, not runtime lifecycle.
@@ -2073,9 +2053,10 @@ impl CodingRuntime {
         );
         // Reconcile the crash window before continuing — the interactive path
         // is how a crashed session normally gets reopened (TUI/Web), and a
-        // dangling mutating call means the workspace may already carry a side
-        // effect the user has not seen. Same classification as resume: safe
-        // reads replay, everything else stops for explicit acknowledgement.
+        // dangling call means the workspace may already carry a side effect
+        // the user has not seen. Nothing is replayed: every call the runtime
+        // cannot close as a pure observation stops for explicit
+        // acknowledgement.
         self.recover_crash_window(&log, observer, &cancellation)
             .await?;
         // Long-goal P3: over the fold threshold the continuation runs from a
@@ -2143,7 +2124,7 @@ impl CodingRuntime {
                     observer,
                     cancellation.clone(),
                     |ports| async {
-                        let prior = self
+                        let mut prior = self
                             .assembled_prior(
                                 &log,
                                 session_id,
@@ -2170,6 +2151,16 @@ impl CodingRuntime {
                             )
                             .await
                             .map_err(crate::coding::turn::seed_failure)?;
+                        // The interrupted call's result was never persisted;
+                        // tell the model what the user acknowledged before it
+                        // re-drives the request blind.
+                        if let Some(note) = self
+                            .crash_recovery_notice(&log)
+                            .await
+                            .map_err(crate::coding::turn::seed_failure)?
+                        {
+                            prior.push(note);
+                        }
                         drive_turn(
                             &self.factory,
                             chat_profile(spec),
@@ -2666,10 +2657,20 @@ impl CodingRuntime {
         };
 
         // Reconcile the crash window before continuing: a tool that started but
-        // never finished (the process died mid-execution) is replayed if
-        // idempotent, or surfaced for approval if it has a side effect (M5).
+        // never finished (the process died mid-execution) is closed as an
+        // interrupted observation or stops the turn for explicit
+        // acknowledgement. Nothing is replayed.
         self.recover_crash_window(&log, observer, &cancellation)
             .await?;
+
+        let mut prior = prior;
+        // An acknowledged call's result was never persisted. The model
+        // re-drives from the last clean turn boundary, so without this notice
+        // it would repeat the request blind — possibly repeating the side
+        // effect the crash already performed.
+        if let Some(note) = self.crash_recovery_notice(&log).await? {
+            prior.push(note);
+        }
 
         let terminal_cancellation = cancellation.clone();
         let result = self
@@ -2727,17 +2728,61 @@ impl CodingRuntime {
         closed
     }
 
-    /// Reconcile the crash window on resume: for every tool call that started
-    /// but never finished, replay it if idempotent, surface it for approval if
-    /// it has a side effect, or skip it if it never actually ran. The
-    /// reconciling `ToolCallFinished` goes to the event log only — the model
-    /// re-drives from the last clean turn boundary (tool-call results are not
-    /// injected into the transcript; see the M5 crash-window notes).
+    /// The recovery context the model gets on the first turn after the user
+    /// acknowledged a crash window: which calls were interrupted, that their
+    /// outcome is unknown, and that they were not replayed. `None` when no
+    /// acknowledged window is still awaiting its first post-recovery turn.
+    async fn crash_recovery_notice(
+        &self,
+        log: &EventLog<'_>,
+    ) -> Result<Option<Message>, EngineError> {
+        let calls = log.acknowledged_crash_calls().await?;
+        if calls.is_empty() {
+            return Ok(None);
+        }
+        let mut text = String::from(
+            "## Recovered after an interruption\n\
+             The runtime stopped while these tool calls were running. Their results are not in \
+             the conversation above:\n",
+        );
+        for call in &calls {
+            let arguments = leveler_core::truncate_head_bytes(&call.arguments, 200, "…");
+            let target = if arguments.is_empty() {
+                format!("(call {})", call.call_id)
+            } else {
+                format!("{arguments} (call {})", call.call_id)
+            };
+            text.push_str(&format!(
+                "- {} {target} — outcome unknown: the call may already have taken effect and \
+                 was not replayed.\n",
+                call.name
+            ));
+        }
+        text.push_str("Check the actual state before repeating a side-effecting action.\n");
+        Ok(Some(Message::user(
+            text,
+            TranscriptOrigin::RuntimeNotice {
+                notice: RuntimeNoticeKind::CrashRecovery,
+            },
+        )))
+    }
+
+    /// Reconcile the crash window before resume or chat.
+    ///
+    /// Nothing is replayed. The process died while these calls were running,
+    /// so their real outcome is unknown; running one again would record a
+    /// fresh result as if it were the interrupted call's answer, and could
+    /// repeat a side effect. A pure runtime observation whose answer the crash
+    /// destroyed (`recovery_is_skippable`) is closed as explicitly interrupted;
+    /// every other call stops the turn until the user acknowledges the crash
+    /// window. The reconciling `ToolCallFinished` goes to the event log only —
+    /// the model re-drives from the last clean turn boundary (tool-call results
+    /// are not injected into the transcript; see the M5 crash-window notes).
     async fn recover_crash_window(
         &self,
         log: &EventLog<'_>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: &CancellationToken,
+        _cancellation: &CancellationToken,
     ) -> Result<(), EngineError> {
         for call in log.dangling_tool_calls().await? {
             let turn_id = call.turn_id.as_ref().map(|t| TurnId::new(t.clone()));
@@ -2748,8 +2793,8 @@ impl CodingRuntime {
             // resolution for persistence, then the executor may start the tool
             // before the event-log pump flushes it. A crash in that window looks
             // pending even though the side effect may have happened. Stop before
-            // replay or model re-drive; a future explicit reconciliation flow can
-            // resolve the dangling call after the user inspects the workspace.
+            // any model re-drive; the explicit reconciliation flow resolves the
+            // dangling call after the user inspects the workspace.
             if call.pending_approval {
                 return Err(EngineError::RecoveryConfirmationRequired {
                     call_id: call.call_id,
@@ -2757,101 +2802,30 @@ impl CodingRuntime {
                 });
             }
 
-            if !is_auto_replayable(&self.factory.registry, &call.name, call.risk) {
-                // An observation the runtime can simply read again is not an
-                // unresolved side effect: the crash destroyed its answer, not
-                // the state it would have returned. Say exactly that and let
-                // the model re-drive. Halting here made a whole session
-                // unusable after an interrupted `wait_task`.
-                if self.factory.registry.recovery_is_skippable(&call.name) {
-                    self.engine
-                        .record_recovery_skip(
-                            log,
-                            &call,
-                            turn_ref,
-                            "interrupted observation; not replayed",
-                            observer,
-                        )
-                        .await?;
-                    continue;
-                }
-                // Risk classification must precede argument parsing. Corrupt
-                // arguments do not make a mutating/unknown call safe: its side
-                // effect may already have happened before the crash.
-                return Err(EngineError::RecoveryConfirmationRequired {
-                    call_id: call.call_id,
-                    tool: call.name,
-                });
+            // An observation the runtime can simply read again is not an
+            // unresolved side effect: the crash destroyed its answer, not the
+            // state it would have returned. Say exactly that and let the model
+            // re-drive. Halting here made a whole session unusable after an
+            // interrupted `wait_task`.
+            if self.factory.registry.recovery_is_skippable(&call.name) {
+                self.engine
+                    .record_recovery_skip(
+                        log,
+                        &call,
+                        turn_ref,
+                        "interrupted observation; not replayed",
+                        observer,
+                    )
+                    .await?;
+                continue;
             }
 
-            let args = match serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                Ok(value) => value,
-                Err(_) => {
-                    self.engine
-                        .record_recovery_skip(
-                            log,
-                            &call,
-                            turn_ref,
-                            "corrupt arguments for safe tool; not replayed",
-                            observer,
-                        )
-                        .await?;
-                    continue;
-                }
-            };
-
-            self.replay_dangling(log, &call, args, turn_ref, observer, cancellation)
-                .await?;
+            return Err(EngineError::RecoveryConfirmationRequired {
+                call_id: call.call_id,
+                tool: call.name,
+            });
         }
         Ok(())
-    }
-
-    /// Re-run a dangling tool and record its outcome as a `ToolCallFinished`. A
-    /// replay failure is recorded as an errored result — it never fails resume.
-    async fn replay_dangling(
-        &self,
-        log: &EventLog<'_>,
-        call: &DanglingCall,
-        args: serde_json::Value,
-        turn_ref: Option<&TurnId>,
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<(), EngineError> {
-        // Execution during recovery goes through the host's reconciliation
-        // entry, so the engine has exactly one auditable place that runs a
-        // tool (enforced by the ToolHost boundary tripwire).
-        // The replay gate above already established this tool declares itself
-        // replay-safe; if the host still refuses to reconstruct the call, that
-        // is a disagreement between two checks and must stop, not proceed.
-        let Some((is_error, preview)) = crate::coding::recovery::replay_tool(
-            &self.factory.registry,
-            self.factory.tool_context.clone(),
-            &call.name,
-            args,
-            cancellation,
-        )
-        .await
-        else {
-            return Err(EngineError::RecoveryConfirmationRequired {
-                call_id: call.call_id.clone(),
-                tool: call.name.clone(),
-            });
-        };
-        log.append(
-            turn_ref,
-            EngineEvent::ToolCallFinished {
-                exit_code: None,
-                stop: None,
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-                is_error,
-                preview,
-                agent_id: call.agent_id.clone(),
-                applied_diff: None,
-            },
-            observer,
-        )
-        .await
     }
 
     /// Continue the direct strategy from a prior transcript — the EXPLICIT

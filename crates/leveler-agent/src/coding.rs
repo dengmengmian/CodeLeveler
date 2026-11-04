@@ -1,8 +1,7 @@
 //! The Coding harness.
 //!
 //! Everything that makes this a *coding* agent is composed here: the executor
-//! and its policy, the crash-recovery
-//! replay that runs tools, the closure reviewer, and the mapping from loop
+//! and its policy, the closure reviewer, and the mapping from loop
 //! events onto the engine's durable vocabulary.
 //!
 //! `leveler-engine` sits underneath and owns lifecycle alone. The dependency
@@ -13,7 +12,6 @@ mod child_session;
 mod event;
 pub mod factory;
 pub mod policy;
-pub mod recovery;
 pub mod run;
 pub mod turn;
 pub mod workspace;

@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- `→` 可以像 `Tab` 一样接受输入框里的灰色下一步建议：建议变成可编辑内容，光标落在末尾，只有按 Enter 才会发送。没有建议显示时（补全菜单打开、Shell 模式、输入框已有内容），`→` 仍然是普通的光标右移。
+
 ## [1.0.22] - 2026-11-04
 
 - 支持 Streamable HTTP MCP。`[[mcp_servers]]` 在原有 stdio 的 `command` / `args` / `env` 之外，可以写 `url`（以及可选的 `transport = "streamable_http"`、`headers`、`bearer_token_env`）。请求头和 Bearer 的值是环境变量名。客户端优先协商 MCP `2026-07-28`，并按需要回退到仍在使用的旧版 Streamable HTTP。超时或会话中断后结果未知的工具调用不会自动再发一次。尚未实现 OAuth 2.1。已有 stdio 配置无需修改。

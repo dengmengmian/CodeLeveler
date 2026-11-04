@@ -20,6 +20,11 @@ pub enum ClientError {
     /// The runtime rejected or failed to accept the command.
     #[error("runtime error: {0}")]
     Runtime(String),
+    /// Refused because an earlier tool call was interrupted before its outcome
+    /// was recorded. Nothing was executed; the user must acknowledge the
+    /// crash window before this session continues.
+    #[error("{0}")]
+    RecoveryRequired(String),
     /// No authoritative answer: the transport failed mid-request, or the
     /// runtime holds this command id in a dispatch that never settled. Nothing
     /// may be concluded — not delivered, not rejected. Only a retry carrying

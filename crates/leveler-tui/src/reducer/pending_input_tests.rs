@@ -285,6 +285,7 @@ fn a_refused_send_stays_in_the_list_marked_failed_and_the_composer_is_untouched(
         Action::EffectCompleted(EffectCompletion::SubmissionRejected {
             command_id: id,
             message: "session busy".into(),
+            recovery: false,
             snapshot: None,
         }),
     );
@@ -312,6 +313,7 @@ fn a_refused_head_pauses_the_queue_until_the_user_decides() {
         Action::EffectCompleted(EffectCompletion::SubmissionRejected {
             command_id: id,
             message: "session busy".into(),
+            recovery: false,
             snapshot: None,
         }),
     );
@@ -553,7 +555,9 @@ fn idle_snapshot() -> leveler_client_protocol::UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),

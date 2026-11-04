@@ -1196,6 +1196,7 @@ mod tests {
             opts: crate::pipeline::PublishOpts::default(),
             baseline_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             holds_lock: false,
+            qualification: true,
         };
         let mut transaction = Transaction::new("v1.1.0", "1.1.0", head(repo), 0.0);
         transaction.previous_release = Some(previous.to_string());

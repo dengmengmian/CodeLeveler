@@ -20,6 +20,7 @@ use leveler_tui::state::{AppState, Boot, WorkbenchFocus};
 use leveler_tui::suggestion;
 use leveler_tui::theme::Theme;
 use leveler_tui::transcript::TranscriptItem;
+use unicode_segmentation::UnicodeSegmentation;
 
 const NEXT_STEP: &str = "查看 demo-order-01 的里程碑进度";
 
@@ -42,7 +43,9 @@ fn snapshot() -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
         plan: None,
         diff: None,
         checkpoints: Vec::new(),
@@ -916,6 +919,7 @@ fn a5_cancelled_and_failed_turns_offer_nothing() {
         Action::Runtime(RuntimeEvent::TurnFailed {
             error: "provider 502".into(),
             failure: None,
+            recovery: None,
         }),
     );
     assert_eq!(s.prompt_suggestion, None);
@@ -1227,6 +1231,307 @@ fn c9_a_staged_attachment_hides_the_ghost_even_if_one_is_held() {
     assert!(s.pending_attachments.is_empty());
     assert!(s.composer.is_empty());
     assert_eq!(s.prompt_suggestion, None);
+}
+
+// ---- R. `→` accepts the same ghost, or moves the caret ----------------------
+
+#[test]
+fn r1_right_arrow_on_an_empty_buffer_accepts_the_ghost_and_sends_nothing() {
+    let mut s = with_suggestion();
+    assert!(composer_row(&frame(&mut s, 100, 24)).contains(NEXT_STEP));
+
+    let effects = reduce(&mut s, key(KeyCode::Right));
+
+    assert_eq!(s.composer.text(), NEXT_STEP, "the ghost became real input");
+    assert_eq!(
+        s.composer.cursor(),
+        NEXT_STEP.chars().count(),
+        "caret lands at the end, ready to edit"
+    );
+    assert_eq!(s.prompt_suggestion, None);
+    assert!(effects.is_empty(), "`→` sends nothing: {effects:?}");
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Input, "focus stays put");
+    assert!(
+        s.composer.history().is_empty(),
+        "accepting is not submitting: no history entry"
+    );
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .all(|item| !matches!(item, TranscriptItem::User(_))),
+        "no user message may exist before Enter"
+    );
+
+    // The painted row now carries the same text as real input, once.
+    let row = composer_row(&frame(&mut s, 100, 24));
+    assert_eq!(row.matches(NEXT_STEP).count(), 1, "row: {row:?}");
+}
+
+#[test]
+fn r2_enter_after_the_right_arrow_submits_exactly_once() {
+    let mut s = with_suggestion();
+
+    let before = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        before.is_empty(),
+        "Enter on an empty buffer must not send the ghost: {before:?}"
+    );
+
+    reduce(&mut s, key(KeyCode::Right));
+    let sent = reduce(&mut s, key(KeyCode::Enter));
+    let submissions = sent
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. } if content == NEXT_STEP
+            )
+        })
+        .count();
+    assert_eq!(submissions, 1, "exactly one submission: {sent:?}");
+    assert_eq!(s.composer.history(), &[NEXT_STEP.to_string()]);
+}
+
+#[test]
+fn r3_right_arrow_without_a_ghost_edits_nothing() {
+    let mut s = opened();
+    for _ in 0..3 {
+        let effects = reduce(&mut s, key(KeyCode::Right));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(s.composer.is_empty());
+        assert_eq!(s.composer.cursor(), 0);
+        assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
+        assert_eq!(s.prompt_suggestion, None, "no ghost may be invented");
+    }
+}
+
+#[test]
+fn r4_right_arrow_in_the_middle_of_a_draft_moves_the_caret() {
+    let mut s = opened();
+    goal_turn(&mut s, "complete", Some(NEXT_STEP));
+    typed(&mut s, "这个项目怎么本地跑起来？");
+    assert_eq!(s.prompt_suggestion, None, "typing destroyed the ghost");
+
+    // Park the caret just after `这个项`, then move right one grapheme at a time.
+    for _ in 0..10 {
+        reduce(&mut s, key(KeyCode::Left));
+    }
+    let parked = s.composer.cursor();
+    assert!(parked > 0 && parked < s.composer.text().chars().count());
+
+    // A stale ghost that is not visible must never be accepted here.
+    s.prompt_suggestion = Some(NEXT_STEP.to_string());
+    assert!(!suggestion::is_visible(&s));
+    let text = s.composer.text().to_string();
+    let stepped_over: String = text.chars().take(parked + 1).collect();
+
+    reduce(&mut s, key(KeyCode::Right));
+
+    assert_eq!(s.composer.text(), text, "the draft is untouched");
+    assert_eq!(s.composer.cursor(), parked + 1, "one grapheme to the right");
+    assert_eq!(
+        s.composer.cursor_row_col_display(),
+        (
+            0,
+            unicode_width::UnicodeWidthStr::width(stepped_over.as_str())
+        ),
+        "the caret moved by the display width it stepped over"
+    );
+}
+
+#[test]
+fn r5_right_arrow_at_the_end_of_a_draft_never_appends_the_ghost() {
+    // This input system renders the ghost on an EMPTY buffer only; there is no
+    // prefix continuation to accept. A stale suggestion must therefore be a
+    // plain no-op at the buffer end, never a half-applied completion.
+    let mut s = opened();
+    goal_turn(&mut s, "complete", Some(NEXT_STEP));
+    typed(&mut s, "这个项");
+    s.prompt_suggestion = Some(NEXT_STEP.to_string());
+    assert!(!suggestion::is_visible(&s));
+
+    reduce(&mut s, key(KeyCode::Right));
+
+    assert_eq!(s.composer.text(), "这个项", "no duplicate prefix");
+    assert_eq!(s.composer.cursor(), 3, "caret cannot pass the buffer end");
+    assert_eq!(s.prompt_suggestion, Some(NEXT_STEP.to_string()));
+}
+
+#[test]
+fn r6_the_accepted_text_stays_editable() {
+    let mut s = with_suggestion();
+    reduce(&mut s, key(KeyCode::Right));
+
+    typed(&mut s, "，谢谢");
+    assert_eq!(s.composer.text(), format!("{NEXT_STEP}，谢谢"));
+    assert_eq!(s.composer.cursor(), s.composer.text().chars().count());
+
+    reduce(&mut s, key(KeyCode::Backspace));
+    assert_eq!(s.composer.text(), format!("{NEXT_STEP}，谢"));
+    assert_eq!(s.composer.cursor(), s.composer.text().chars().count());
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }
+                if *content == format!("{NEXT_STEP}，谢")
+        )),
+        "the edited text is what gets sent: {effects:?}"
+    );
+}
+
+#[test]
+fn r7_the_slash_popup_keeps_its_own_keys() {
+    let mut s = with_suggestion();
+    typed(&mut s, "/mod");
+    assert_eq!(s.prompt_suggestion, None);
+    assert!(!leveler_tui::screen::visible_slash_popup(&s).is_empty());
+
+    reduce(&mut s, key(KeyCode::Right));
+    assert_eq!(s.composer.text(), "/mod", "`→` is a caret move here");
+    assert!(
+        !leveler_tui::screen::visible_slash_popup(&s).is_empty(),
+        "the menu is still driven by its own keys"
+    );
+
+    reduce(&mut s, key(KeyCode::Tab));
+    assert!(
+        s.composer.text().starts_with("/model"),
+        "Tab still completes the highlighted command: {}",
+        s.composer.text()
+    );
+}
+
+#[test]
+fn r8_the_file_popup_keeps_its_own_keys() {
+    let mut s = with_suggestion();
+    s.file_candidates = vec!["crates/leveler-tui/src/composer.rs".to_string()];
+    typed(&mut s, "@composer");
+    assert!(!leveler_tui::screen::visible_file_popup(&s).is_empty());
+
+    let before = s.composer.text().to_string();
+    reduce(&mut s, key(KeyCode::Right));
+    assert_eq!(s.composer.text(), before, "`→` completed nothing");
+    assert!(
+        !leveler_tui::screen::visible_file_popup(&s).is_empty(),
+        "the candidate menu is untouched"
+    );
+
+    reduce(&mut s, key(KeyCode::Tab));
+    assert!(
+        s.composer
+            .text()
+            .contains("@crates/leveler-tui/src/composer.rs"),
+        "Tab still completes the file mention: {}",
+        s.composer.text()
+    );
+}
+
+#[test]
+fn r9_unicode_suggestions_land_on_grapheme_boundaries() {
+    let text = "看一下 👨‍👩‍👧 的进度 🚀";
+    let mut s = opened();
+    goal_turn(&mut s, "complete", Some(text));
+    assert!(suggestion::is_visible(&s));
+
+    reduce(&mut s, key(KeyCode::Right));
+
+    assert_eq!(s.composer.text(), text);
+    assert_eq!(
+        s.composer.cursor(),
+        text.graphemes(true).count(),
+        "caret counts grapheme clusters, not bytes or chars"
+    );
+    // Accepting must place the caret exactly where typing the same text does:
+    // no cluster is merged, split, or double-counted by the accept path.
+    let accepted_caret = draw(&mut s, 100, 24).1;
+    let mut typed_state = opened();
+    typed_state.composer.replace(text);
+    assert_eq!(
+        accepted_caret,
+        draw(&mut typed_state, 100, 24).1,
+        "the accepted text and the same text typed by hand place the caret alike"
+    );
+
+    // One Backspace removes exactly one cluster — the emoji stays whole.
+    reduce(&mut s, key(KeyCode::Backspace));
+    assert_eq!(s.composer.text(), "看一下 👨‍👩‍👧 的进度 ");
+    reduce(&mut s, key(KeyCode::Backspace));
+    assert_eq!(s.composer.text(), "看一下 👨‍👩‍👧 的进度");
+    reduce(&mut s, key(KeyCode::Backspace));
+    assert_eq!(s.composer.text(), "看一下 👨‍👩‍👧 的进");
+}
+
+#[test]
+fn r10_the_accepted_text_edits_like_any_multiline_draft() {
+    let mut s = with_suggestion();
+    reduce(&mut s, key(KeyCode::Right));
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+    );
+    typed(&mut s, "第二行");
+
+    assert_eq!(s.composer.text(), format!("{NEXT_STEP}\n第二行"));
+    let (row, col) = s.composer.cursor_row_col_display();
+    assert_eq!((row, col), (1, 6), "caret ends the second line");
+
+    reduce(&mut s, key(KeyCode::Left));
+    assert_eq!(s.composer.cursor_row_col_display(), (1, 4));
+    reduce(&mut s, key(KeyCode::Right));
+    assert_eq!(s.composer.cursor_row_col_display(), (1, 6));
+
+    // Walking left over the newline keeps the two lines intact, and `→` steps
+    // back over it one grapheme at a time.
+    let end = s.composer.text().chars().count();
+    for _ in 0..8 {
+        reduce(&mut s, key(KeyCode::Left));
+    }
+    assert_eq!(s.composer.text(), format!("{NEXT_STEP}\n第二行"));
+    assert_eq!(s.composer.cursor(), end - 8);
+    assert_eq!(s.composer.cursor_row_col_display().0, 0, "back on line one");
+    reduce(&mut s, key(KeyCode::Right));
+    assert_eq!(s.composer.cursor(), end - 7);
+    assert_eq!(s.composer.text(), format!("{NEXT_STEP}\n第二行"));
+}
+
+#[test]
+fn r11_an_unpainted_ghost_is_never_accepted() {
+    // Shell Mode suppresses the ghost in the renderer, so it must not be
+    // acceptable there either: the user cannot see what would be inserted.
+    let mut s = with_suggestion();
+    reduce(&mut s, key(KeyCode::Char('!')));
+    assert_eq!(s.input_mode, leveler_tui::shell_mode::InputMode::Shell);
+    assert!(
+        !suggestion::is_visible(&s),
+        "nothing is painted in Shell Mode"
+    );
+    assert!(!composer_row(&frame(&mut s, 100, 24)).contains(NEXT_STEP));
+
+    let effects = reduce(&mut s, key(KeyCode::Right));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(
+        s.composer.is_empty(),
+        "the hidden ghost never enters a command"
+    );
+
+    reduce(&mut s, key(KeyCode::Tab));
+    assert!(s.composer.is_empty(), "nor does Tab insert it");
+}
+
+#[test]
+fn r12_alt_right_is_still_a_word_move() {
+    // Alt/Opt+→ is readline word motion; it never accepts a ghost.
+    let mut s = with_suggestion();
+    let effects = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+    );
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.composer.is_empty(), "Alt+→ did not accept the ghost");
+    assert!(suggestion::is_visible(&s), "the ghost is still offered");
 }
 
 // ---- D. what the terminal actually paints ----------------------------------

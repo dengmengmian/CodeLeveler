@@ -1252,3 +1252,48 @@ async fn goal_completion_does_not_reap_background_work_it_did_not_start() {
     assert_eq!(surviving.status, BackgroundTaskStatus::Running);
     h.registry.kill(&unrelated).await.unwrap();
 }
+
+/// A task's START must be durable and structured, not prose in the tool
+/// output. After a crash the registry that held the task is gone; only a
+/// recorded start can tell a reconnecting client that the task existed, which
+/// call started it, what it ran, and which lifetime it was promised.
+#[tokio::test]
+async fn a_background_start_is_a_durable_structured_fact() {
+    let h = harness(vec![spawn_sleep_server(), text("server started; done")]).await;
+    let s = spec(&h, "start the dev server and report");
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "start the dev server".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the turn completes");
+
+    let events = leveler_storage::EventRepository::new(&h.db)
+        .load(&session)
+        .await
+        .unwrap();
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "background_task_started")
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "exactly one durable start fact per spawned task"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&starts[0].payload).unwrap();
+    let fact = &payload["payload"];
+    let (expected_program, expected_args) = leveler_test_support::sleep_command(300);
+    assert_eq!(fact["call_id"], "bg1");
+    assert_eq!(fact["task_id"], "bg-1");
+    assert_eq!(fact["program"], expected_program);
+    assert_eq!(fact["args"], serde_json::json!(expected_args));
+    assert_eq!(fact["lifetime"], "goal");
+}

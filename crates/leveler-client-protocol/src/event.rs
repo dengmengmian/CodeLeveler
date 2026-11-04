@@ -200,6 +200,14 @@ pub enum UiCommandStop {
     Unconfirmed,
 }
 
+/// The interrupted call a recovery stop refuses to guess about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecoveryStop {
+    pub call_id: String,
+    pub tool: String,
+}
+
 /// An event flowing from the runtime to clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -212,6 +220,53 @@ pub enum RuntimeEvent {
     },
     /// The runtime finished booting and is ready for commands.
     RuntimeReady,
+    /// The build this client's stream is connected to, observed when the
+    /// stream is first established. A long-lived runtime can outlive an
+    /// application update, so the client must learn at connect time whether
+    /// it is talking to the build it was installed with. Like
+    /// [`RuntimeEvent::RuntimeReconnected`], an unknown identity proves
+    /// nothing and is never a version change.
+    RuntimeBuildObserved {
+        #[serde(default)]
+        runtime_build: leveler_core::BuildIdentity,
+    },
+    /// The client's event stream dropped and was re-established.
+    ///
+    /// Emitted by the local transport, never by a runtime: it states only what
+    /// the client observed — that it is connected again, and to which build.
+    /// Whether the user must hear that work may have stopped, or that a
+    /// restart is needed to switch versions, is a presentation decision; the
+    /// transport cannot know either fact.
+    ///
+    /// A runtime built before [`leveler_core::BuildIdentity`] existed reports
+    /// the default identity, which is UNKNOWN. Unknown is not a version
+    /// change and must never be presented as one.
+    RuntimeReconnected {
+        #[serde(default)]
+        runtime_build: leveler_core::BuildIdentity,
+        /// Whether the runtime PROCESS changed across the break, when both
+        /// sides of it were observed: `Some(true)` a restart, `Some(false)`
+        /// the same process, `None` nothing proven. A stream reset on a live
+        /// runtime is `Some(false)` and cost no work.
+        #[serde(default)]
+        runtime_restarted: Option<bool>,
+    },
+    /// A reconnect re-established the stream but could not re-read the
+    /// session. The client's view may be pre-break state; it must say so
+    /// rather than present stale facts as current.
+    SessionResyncFailed {
+        /// The load/snapshot failure, unformatted. Presentation owns wording.
+        error: String,
+    },
+    /// The user acknowledged this session's crash window. `closed` interrupted
+    /// tool calls were marked "outcome unknown, not replayed"; zero means
+    /// there was nothing left to close (a retry or a concurrent
+    /// acknowledgement). This states what the runtime wrote, not that any
+    /// interrupted operation succeeded.
+    CrashWindowAcknowledged {
+        session_id: leveler_core::SessionId,
+        closed: u32,
+    },
     /// A session was opened / its snapshot refreshed.
     SessionOpened { session: UiSessionSnapshot },
     /// Session metadata changed (model/mode/branch) without touching the
@@ -509,6 +564,11 @@ pub enum RuntimeEvent {
         /// the runtime could not type; readers fall back to `error`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<crate::failure::UiFailure>,
+        /// Present when the turn stopped because an earlier tool call was
+        /// interrupted before its outcome was recorded. The runtime refuses
+        /// to replay it; the client owns the wording and the next step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryStop>,
     },
     /// The current turn was cancelled (resumable).
     TurnCancelled,
@@ -881,7 +941,9 @@ mod tests {
             vision: false,
             last_sequence: Some(7),
             active_tools: Vec::new(),
+            interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
+            background_tasks: Vec::new(),
             plan: None,
             diff: None,
             checkpoints: Vec::new(),
@@ -1012,6 +1074,33 @@ mod tests {
     #[test]
     fn runtime_ready_roundtrips() {
         roundtrip(RuntimeEvent::RuntimeReady, "runtime_ready");
+    }
+
+    /// An older runtime does not send this field at all; the default identity
+    /// must decode as unknown rather than as a version change.
+    #[test]
+    fn runtime_build_observation_roundtrips_and_tolerates_an_absent_build() {
+        let build = leveler_core::BuildIdentity {
+            version: "1.0.22".into(),
+            revision: "abc123".into(),
+            dirty: false,
+            fingerprint: "abc123-clean".into(),
+        };
+        roundtrip(
+            RuntimeEvent::RuntimeBuildObserved {
+                runtime_build: build,
+            },
+            "runtime_build_observed",
+        );
+
+        let legacy: RuntimeEvent =
+            serde_json::from_str(r#"{"type":"runtime_build_observed"}"#).unwrap();
+        match legacy {
+            RuntimeEvent::RuntimeBuildObserved { runtime_build } => {
+                assert!(!runtime_build.is_known(), "absent is unknown, not a match");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
@@ -1489,6 +1578,7 @@ mod tests {
             RuntimeEvent::TurnFailed {
                 error: "oops".to_string(),
                 failure: None,
+                recovery: None,
             },
             "turn_failed",
         );
@@ -1513,6 +1603,7 @@ mod tests {
                     summary: "模型服务拒绝了当前请求。".into(),
                     detail: "At path 'properties.plan.items' …".into(),
                 }),
+                recovery: None,
             },
             "turn_failed",
         );

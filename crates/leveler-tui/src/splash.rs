@@ -162,8 +162,19 @@ fn layout(
     } else {
         0
     };
-    let mascot_w = (hero_h * 20 / 7).min(22).min(inner.saturating_sub(34));
-    let mascot_h = (mascot_w * 7 / 20).min(hero_h);
+    // Terminal cells are about twice as tall as they are wide: a cell slot that
+    // preserves the illustration's aspect needs 2 * src_w / src_h columns per row.
+    let (src_w, src_h) = state
+        .welcome_image
+        .as_ref()
+        .map(NativeMascot::aspect)
+        .unwrap_or((2, 1));
+    let src_w = usize::try_from(src_w).unwrap_or(2).max(1);
+    let src_h = usize::try_from(src_h).unwrap_or(1).max(1);
+    let mascot_w = (hero_h * 2 * src_w / src_h)
+        .min(22)
+        .min(inner.saturating_sub(34));
+    let mascot_h = (mascot_w * src_h / (2 * src_w)).min(hero_h);
     let use_mascot = state.welcome_image.is_some()
         && !theme.monochrome
         && state.surface == crate::btw::SurfaceFocus::Main

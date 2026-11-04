@@ -260,6 +260,15 @@ impl RemotePolicy {
                 reason: "runtime observatory is local-only",
             },
 
+            // Acknowledging the crash window is the local operator asserting
+            // that interrupted calls' outcomes are unknown. The evidence lives
+            // on the host, and releasing the gate from a paired device would
+            // assert a judgement it cannot inspect.
+            ClientCommand::AcknowledgeCrashWindow { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "crash recovery acknowledgement is a local operator decision",
+            },
+
             // Same class as the context accounting: which models a session
             // used and what it spent is local machine metadata a remote client
             // has no business enumerating.

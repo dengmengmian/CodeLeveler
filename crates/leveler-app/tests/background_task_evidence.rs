@@ -13,14 +13,18 @@
 //! - a natural failure is persisted as a failure (never as a pass),
 //! - a stopped task is not persisted at all (a cancel is not a result),
 //! - the fact does not depend on the model calling `wait_task`,
-//! - a task started outside the runtime (no recorded call) writes nothing.
+//! - a task started outside the runtime (no recorded call) writes nothing,
+//! - a reconnecting snapshot separates running, completed, failed, cancelled,
+//!   lost, unknown and id-conflict states instead of inventing an outcome.
 #![cfg(unix)]
 
 use std::sync::Arc;
 
+use leveler_app::runtime_boot::RuntimeBootLease;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{
     InteractiveRuntimeClient, PermissionProfile as WirePermissionProfile, RuntimeEvent,
+    UiBackgroundTaskRecord, UiBackgroundTaskState, UiSessionSnapshot,
 };
 use leveler_execution::PermissionProfile;
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
@@ -439,5 +443,531 @@ async fn cancelling_an_idle_goal_reaps_its_background_process() {
     assert_eq!(
         registry.get(&id).await.unwrap().status,
         leveler_execution::BackgroundTaskStatus::Killed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect reconciliation: a snapshot must state what it can prove about a
+// task that is no longer in the live registry, and leave the rest open.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    async fn record_background_start(
+        &self,
+        turn_id: Option<&str>,
+        call_id: &str,
+        task_id: &str,
+        program: &str,
+        args: &[&str],
+    ) {
+        let db = self.app.open_database().await.expect("db");
+        let event = leveler_engine::EngineEvent::BackgroundTaskStarted {
+            call_id: call_id.into(),
+            task_id: task_id.into(),
+            program: program.into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            lifetime: "goal".into(),
+        };
+        let (event_type, payload) = event.to_row().unwrap();
+        let turn = turn_id.map(leveler_core::TurnId::new);
+        db.append(
+            &self.session,
+            turn.as_ref(),
+            &event_type,
+            &payload,
+            leveler_core::now(),
+        )
+        .await
+        .expect("append background start");
+    }
+
+    async fn record_background_finish(
+        &self,
+        call_id: &str,
+        task_id: &str,
+        status: leveler_execution::BackgroundTaskStatus,
+        exit_code: Option<i32>,
+    ) {
+        let db = self.app.open_database().await.expect("db");
+        let event = leveler_engine::EngineEvent::BackgroundTaskFinished {
+            call_id: call_id.into(),
+            task_id: task_id.into(),
+            goal_id: None,
+            program: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            is_error: exit_code != Some(0),
+            exit_code,
+            status: Some(status),
+            output: String::new(),
+            output_truncated: false,
+        };
+        let (event_type, payload) = event.to_row().unwrap();
+        db.append(
+            &self.session,
+            None,
+            &event_type,
+            &payload,
+            leveler_core::now(),
+        )
+        .await
+        .expect("append background finish");
+    }
+
+    async fn snapshot(&self) -> UiSessionSnapshot {
+        self.runtime
+            .snapshot(&self.session)
+            .await
+            .expect("snapshot")
+    }
+
+    /// Start a turn owned by a boot that is alive only as long as `lease`.
+    async fn turn_under(&self, lease: &RuntimeBootLease) -> leveler_storage::TurnRecord {
+        let db = self.app.open_database().await.expect("db");
+        let engine = leveler_engine::TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: self.app.runtime_id().unwrap(),
+            boot: leveler_engine::EngineBoot {
+                id: lease.id().clone(),
+                liveness: Arc::new(leveler_app::runtime_boot::StateDirBootLiveness::new(
+                    &self.app.layout.state_dir,
+                )),
+            },
+        };
+        let token = engine.acquire_ownership(&self.session).await.unwrap();
+        engine
+            .stores
+            .turns
+            .start_owned(&token, &self.session, "chat", None, leveler_core::now())
+            .await
+            .unwrap()
+    }
+
+    /// A turn that completed under a boot which has since ended, with its
+    /// ownership released: the state a runtime leaves when it finished the turn
+    /// and died while an independently hosted process kept running.
+    async fn finished_turn_under(&self, lease: &RuntimeBootLease) -> leveler_storage::TurnRecord {
+        let db = self.app.open_database().await.expect("db");
+        let engine = leveler_engine::TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&db),
+            runtime_id: self.app.runtime_id().unwrap(),
+            boot: leveler_engine::EngineBoot {
+                id: lease.id().clone(),
+                liveness: Arc::new(leveler_app::runtime_boot::StateDirBootLiveness::new(
+                    &self.app.layout.state_dir,
+                )),
+            },
+        };
+        let token = engine.acquire_ownership(&self.session).await.unwrap();
+        let turn = engine
+            .stores
+            .turns
+            .start_owned(&token, &self.session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let event = leveler_engine::EngineEvent::TurnFinished {
+            stop: None,
+            turn_id: leveler_core::TurnId::new(turn.id.clone()),
+            outcome: leveler_engine::TurnOutcome::Completed,
+            stop_reason: "completed".into(),
+            model_steps: 1,
+            modified_files: Vec::new(),
+        };
+        let (event_type, payload) = event.to_row().unwrap();
+        engine
+            .stores
+            .terminal
+            .finish_turn_owned(
+                &token,
+                &self.session,
+                &leveler_core::TurnId::new(turn.id.clone()),
+                &event_type,
+                &payload,
+                leveler_engine::TurnOutcome::Completed,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        engine.release_ownership(&token).await.unwrap();
+        turn
+    }
+
+    /// Archive a terminal process fact exactly as the Execution Host persists
+    /// it. No live host is needed: the scope query only reads `tasks.json`.
+    fn write_hosted_terminal(
+        &self,
+        task_id: &str,
+        call_id: &str,
+        status: leveler_execution::BackgroundTaskStatus,
+        exit_code: Option<i32>,
+    ) {
+        let state_dir = self.app.layout.state_dir.join("execution-host");
+        // The host's own boundary refuses a group/world-readable state dir;
+        // a test that fabricates its archive must meet the same contract.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&state_dir)
+            .unwrap();
+        let record = leveler_execution::execution_host::HostedTask {
+            snapshot: leveler_execution::BackgroundTaskSnapshot {
+                id: task_id.into(),
+                program: "sh".into(),
+                args: vec!["-c".into(), "printf 'hosted done\\n'".into()],
+                cwd: self.repo.clone(),
+                status,
+                exit_code,
+                log: "hosted done\n".into(),
+                duration_ms: 42,
+                pid: None,
+                owner_scope: Some(self.session.as_str().to_owned()),
+                goal_id: None,
+                origin_call_id: Some(call_id.into()),
+                log_truncated: false,
+                ready: None,
+                silent_ms: 0,
+                lifetime: leveler_execution::BackgroundTaskLifetime::Goal,
+                expired_exit_waits: 0,
+                output_bytes: 12,
+            },
+            lifetime: leveler_execution::BackgroundTaskLifetime::Goal,
+            writer_scope: self.session.as_str().to_owned(),
+            write_scope: leveler_execution::WriteScope::WorkspaceWithGit {
+                root: self.repo.clone(),
+            },
+            process_id: None,
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            log_end: 12,
+            log_prefix_len: 0,
+            loss: None,
+        };
+        std::fs::write(
+            state_dir.join("tasks.json"),
+            serde_json::to_vec(&[record]).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn record_of<'a>(snapshot: &'a UiSessionSnapshot, task_id: &str) -> &'a UiBackgroundTaskRecord {
+    snapshot
+        .background_tasks
+        .iter()
+        .find(|record| record.task_id == task_id)
+        .unwrap_or_else(|| panic!("no record for {task_id}: {:?}", snapshot.background_tasks))
+}
+
+/// A live task with no durable start (a log written before starts were
+/// recorded) is still running work; a reconnect must not drop it.
+#[tokio::test]
+async fn a_reconnect_reports_a_live_task_as_running() {
+    let f = fixture().await;
+    let mut events = f.runtime.subscribe_session(&f.session);
+    let id = f.spawn(Some("call-live"), "exec sleep 30").await;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .expect("start event")
+            .expect("stream open");
+        if matches!(event, RuntimeEvent::BackgroundTaskStarted { .. }) {
+            break;
+        }
+    }
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, &id);
+    assert_eq!(record.state, UiBackgroundTaskState::Running);
+    assert_eq!(record.program, "sh");
+    assert_eq!(record.call_id, None, "no start row was written");
+    assert!(
+        snapshot
+            .active_background_tasks
+            .iter()
+            .any(|task| task.task_id == id),
+        "the live list is unchanged"
+    );
+    f.app.background_tasks().kill(&id).await.expect("kill");
+}
+
+/// The durable terminal is the only evidence of completion; the TUI being
+/// reconnected to a quiet session is not.
+#[tokio::test]
+async fn a_completed_task_is_reported_from_its_paired_terminal_fact() {
+    let f = fixture().await;
+    let mut events = f.runtime.subscribe_session(&f.session);
+    f.record_background_start(None, "call-done", "bg-done", "sh", &["-c", "true"])
+        .await;
+    let id = f
+        .spawn(Some("call-done"), "printf 'finished\\n'; exit 0")
+        .await;
+    f.wait_for_events(&mut events).await;
+    while f.result_events().await.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, &id);
+    assert_eq!(record.state, UiBackgroundTaskState::Completed);
+    assert_eq!(record.call_id.as_deref(), Some("call-done"));
+    assert_eq!(record.exit_code, Some(0));
+    assert!(record.output.contains("finished"), "{record:?}");
+    assert_eq!(
+        snapshot
+            .background_tasks
+            .iter()
+            .filter(|record| record.task_id == id)
+            .count(),
+        1,
+        "start and terminal are one record"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_task_is_never_reported_as_completed() {
+    let f = fixture().await;
+    let mut events = f.runtime.subscribe_session(&f.session);
+    let id = f
+        .spawn(Some("call-fail"), "printf 'boom\\n' >&2; exit 3")
+        .await;
+    f.wait_for_events(&mut events).await;
+    while f.result_events().await.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, &id);
+    assert_eq!(record.state, UiBackgroundTaskState::Failed);
+    assert_eq!(record.exit_code, Some(3));
+}
+
+#[tokio::test]
+async fn a_stopped_task_stays_cancelled_across_a_snapshot() {
+    let f = fixture().await;
+    let mut events = f.runtime.subscribe_session(&f.session);
+    let id = f.spawn(Some("call-stop"), "exec sleep 30").await;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .expect("start event")
+            .expect("stream open");
+        if matches!(event, RuntimeEvent::BackgroundTaskStarted { .. }) {
+            break;
+        }
+    }
+    f.app.background_tasks().kill(&id).await.expect("kill");
+    f.wait_for_events(&mut events).await;
+    while f.result_events().await.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, &id);
+    assert_eq!(record.state, UiBackgroundTaskState::Cancelled);
+}
+
+/// The boot that hosted the task is gone and no terminal was written: the
+/// process may have died with it. Neither success nor failure is claimed.
+#[tokio::test]
+async fn a_task_whose_owning_boot_ended_is_lost() {
+    let f = fixture().await;
+    let crashed = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    let turn = f.turn_under(&crashed).await;
+    f.record_background_start(
+        Some(turn.id.as_str()),
+        "call-lost",
+        "bg-lost",
+        "sh",
+        &["-c", "sleep 30"],
+    )
+    .await;
+    drop(crashed);
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, "bg-lost");
+    assert_eq!(record.state, UiBackgroundTaskState::Lost);
+    assert_eq!(record.call_id.as_deref(), Some("call-lost"));
+    assert_eq!(record.exit_code, None);
+    assert!(record.output.is_empty());
+}
+
+/// A task the Execution Host outlived the runtime for: it finished while no
+/// runtime generation was attached. The archived process fact proves the
+/// completion, so a reconnect reports it — not `Lost` because the turn's boot
+/// is gone. Repeated snapshots keep the same reading.
+#[tokio::test]
+async fn a_hosted_terminal_fact_proves_completion_after_the_runtime_died() {
+    let f = fixture().await;
+    let crashed = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    let turn = f.finished_turn_under(&crashed).await;
+    f.record_background_start(
+        Some(turn.id.as_str()),
+        "call-host",
+        "host-finished",
+        "sh",
+        &["-c", "printf 'hosted done\\n'"],
+    )
+    .await;
+    drop(crashed);
+    f.write_hosted_terminal(
+        "host-finished",
+        "call-host",
+        leveler_execution::BackgroundTaskStatus::Exited,
+        Some(0),
+    );
+
+    for attempt in 0..2 {
+        let snapshot = f.snapshot().await;
+        let record = record_of(&snapshot, "host-finished");
+        assert_eq!(
+            record.state,
+            UiBackgroundTaskState::Completed,
+            "snapshot {attempt} must read the archived exit: {record:?}"
+        );
+        assert_eq!(record.call_id.as_deref(), Some("call-host"));
+        assert_eq!(record.exit_code, Some(0));
+        assert!(record.output.contains("hosted done"), "{record:?}");
+    }
+}
+
+/// The archive is evidence only for the start it belongs to. A record for the
+/// same task id but a different call is a new/old conflict, never a
+/// completion for this start.
+#[tokio::test]
+async fn a_hosted_fact_with_a_different_call_is_a_conflict() {
+    let f = fixture().await;
+    let crashed = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    let turn = f.finished_turn_under(&crashed).await;
+    f.record_background_start(
+        Some(turn.id.as_str()),
+        "call-current",
+        "host-reused",
+        "sh",
+        &["-c", "sleep 30"],
+    )
+    .await;
+    drop(crashed);
+    f.write_hosted_terminal(
+        "host-reused",
+        "call-previous",
+        leveler_execution::BackgroundTaskStatus::Exited,
+        Some(0),
+    );
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, "host-reused");
+    assert_eq!(
+        record.state,
+        UiBackgroundTaskState::Conflict,
+        "a different call cannot close this start: {record:?}"
+    );
+    assert_eq!(record.exit_code, None);
+}
+
+/// An archived task whose runtime lost the ability to observe its exit is
+/// terminal but unproven: it is never reported as completed.
+#[tokio::test]
+async fn a_hosted_unknown_exit_is_not_a_completion() {
+    let f = fixture().await;
+    let crashed = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    let turn = f.finished_turn_under(&crashed).await;
+    f.record_background_start(
+        Some(turn.id.as_str()),
+        "call-unknown",
+        "host-unknown",
+        "sh",
+        &["-c", "sleep 30"],
+    )
+    .await;
+    drop(crashed);
+    f.write_hosted_terminal(
+        "host-unknown",
+        "call-unknown",
+        leveler_execution::BackgroundTaskStatus::Unknown,
+        None,
+    );
+
+    assert_eq!(
+        record_of(&f.snapshot().await, "host-unknown").state,
+        UiBackgroundTaskState::Unknown
+    );
+}
+
+/// A start with no turn attribution cannot prove the hosting boot ended.
+#[tokio::test]
+async fn a_start_without_attribution_is_unknown_not_lost() {
+    let f = fixture().await;
+    f.record_background_start(None, "call-orphan", "bg-orphan", "sh", &["-c", "true"])
+        .await;
+
+    assert_eq!(
+        record_of(&f.snapshot().await, "bg-orphan").state,
+        UiBackgroundTaskState::Unknown
+    );
+}
+
+/// The owning boot is still alive, but this process does not hold the task.
+/// Neither "running" nor "lost" follows; the state stays open.
+#[tokio::test]
+async fn a_task_under_a_live_but_silent_boot_is_unknown() {
+    let f = fixture().await;
+    let live = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    let turn = f.turn_under(&live).await;
+    f.record_background_start(
+        Some(turn.id.as_str()),
+        "call-silent",
+        "bg-silent",
+        "sh",
+        &["-c", "true"],
+    )
+    .await;
+
+    assert_eq!(
+        record_of(&f.snapshot().await, "bg-silent").state,
+        UiBackgroundTaskState::Unknown
+    );
+    drop(live);
+}
+
+/// Legacy ids (`bg-1`) can repeat across generations. Two starts under one id
+/// are one conflict record, not two tasks and not a guessed outcome.
+#[tokio::test]
+async fn reused_task_ids_are_a_conflict() {
+    let f = fixture().await;
+    f.record_background_start(None, "call-old", "bg-1", "sh", &["-c", "true"])
+        .await;
+    f.record_background_start(None, "call-new", "bg-1", "sh", &["-c", "true"])
+        .await;
+
+    let snapshot = f.snapshot().await;
+    let records: Vec<_> = snapshot
+        .background_tasks
+        .iter()
+        .filter(|record| record.task_id == "bg-1")
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, UiBackgroundTaskState::Conflict);
+    assert_eq!(records[0].call_id, None);
+    assert_eq!(records[0].exit_code, None);
+}
+
+/// "Exited" without an established exit code is not a pass and not a proven
+/// failure; it must not be rewritten as either.
+#[tokio::test]
+async fn an_exit_without_a_code_is_unknown() {
+    let f = fixture().await;
+    f.record_background_start(None, "call-nocode", "bg-nocode", "sh", &["-c", "true"])
+        .await;
+    f.record_background_finish(
+        "call-nocode",
+        "bg-nocode",
+        leveler_execution::BackgroundTaskStatus::Exited,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        record_of(&f.snapshot().await, "bg-nocode").state,
+        UiBackgroundTaskState::Unknown
     );
 }

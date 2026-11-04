@@ -672,6 +672,15 @@ impl TaskEngine {
     }
 }
 
+/// The preview text a user-acknowledged crash-window marker carries.
+///
+/// The write ([`acknowledge_crash_window`]) and the reader that gives the
+/// model its recovery context ([`EventLog::acknowledged_crash_calls`]) must
+/// agree on one spelling; this constant is that spelling.
+pub const USER_ACKNOWLEDGED_CRASH_PREVIEW: &str = "user-acknowledged crash recovery: the \
+                                                     interrupted call's outcome is unknown and \
+                                                     the call was not replayed";
+
 /// Close every dangling tool call of a session with an explicit
 /// user-acknowledged marker (an errored `ToolCallFinished`, never a fake
 /// success), so a resume blocked by `RecoveryConfirmationRequired` can
@@ -696,9 +705,7 @@ pub async fn acknowledge_crash_window(
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
                 is_error: true,
-                preview: "user-acknowledged crash recovery: the interrupted call's outcome \
-                          is unknown and the call was not replayed"
-                    .to_string(),
+                preview: USER_ACKNOWLEDGED_CRASH_PREVIEW.to_string(),
                 agent_id: call.agent_id.clone(),
                 applied_diff: None,
             },

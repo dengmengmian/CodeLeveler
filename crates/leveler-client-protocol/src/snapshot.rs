@@ -167,7 +167,9 @@ mod tests {
             vision: false,
             last_sequence: None,
             active_tools: Vec::new(),
+            interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
+            background_tasks: Vec::new(),
             plan: None,
             diff: None,
             checkpoints: Vec::new(),
@@ -241,7 +243,9 @@ mod tests {
             vision: false,
             last_sequence: None,
             active_tools: Vec::new(),
+            interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
+            background_tasks: Vec::new(),
             plan: None,
             diff: None,
             checkpoints: Vec::new(),
@@ -516,6 +520,44 @@ pub struct UiActiveToolCall {
     pub answer_effect: Option<AnswerEffect>,
 }
 
+/// How much the runtime can prove about an interrupted tool call's owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiInterruptedCallState {
+    /// The runtime that owned the turn is provably gone, so the call is no
+    /// longer executing here. Its side effect may still have completed, or
+    /// left an orphaned process; the outcome is unknown either way.
+    Interrupted,
+    /// The owning turn still exists, but its runtime cannot be proven dead or
+    /// alive. The call may still be executing. Never shown as interrupted,
+    /// completed, or failed.
+    #[default]
+    Unknown,
+}
+
+/// A tool call that started but never recorded an outcome.
+///
+/// This is the crash window's evidence: a `tool_call_started` without a
+/// matching `tool_call_finished`. The next turn is refused until the user
+/// acknowledges it, because the call may already have produced its side
+/// effect and replaying it would duplicate that effect. The snapshot carries
+/// the list so a client that just reconnected can show the problem without
+/// first attempting a turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiInterruptedToolCall {
+    pub call_id: String,
+    pub tool: String,
+    /// The call was still waiting for an approval when the runtime died. Its
+    /// side effect had not started; the user still has to acknowledge that the
+    /// recovery decision is theirs.
+    #[serde(default)]
+    pub pending_approval: bool,
+    #[serde(default)]
+    pub state: UiInterruptedCallState,
+}
+
 /// One user shell execution (`!command`) as the reconnect snapshot carries
 /// it: the active one plus a bounded recent history. `output_tail` is the
 /// bounded end of the combined output (never the full log).
@@ -614,6 +656,68 @@ pub struct UiActiveBackgroundTask {
     pub lifetime: Option<String>,
 }
 
+/// The lifecycle state of a background task, as the runtime can establish it
+/// from durable facts.
+///
+/// This is deliberately not the process registry's status: a task that the
+/// registry no longer holds may have completed, been cancelled, or died with
+/// the runtime that hosted it. `Lost` and `Unknown` keep those apart instead
+/// of rewriting an absent record as success or failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiBackgroundTaskState {
+    /// The live registry still holds the process.
+    Running,
+    /// A durable terminal record says it exited zero.
+    Completed,
+    /// A durable terminal record says it exited non-zero, or exited without a
+    /// code.
+    Failed,
+    /// A durable terminal record says it was stopped by a user/agent cancel or
+    /// session cleanup.
+    Cancelled,
+    /// The task started, but the boot that hosted it is gone and no terminal
+    /// record exists. The process may have died with that runtime; nothing here
+    /// claims either completion or failure.
+    Lost,
+    /// No live entry and no terminal record, and the owning boot cannot be
+    /// proven gone (or the start carries no attribution). State unknown.
+    Unknown,
+    /// Two durable starts share one task id. Neither the live process nor a
+    /// terminal record can be attributed to one of them safely, so both stay
+    /// unclassified rather than guessing.
+    Conflict,
+}
+
+/// One background task as the snapshot reconciles it: durable start, durable
+/// terminal record, and the live registry, never a fabricated outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiBackgroundTaskRecord {
+    pub task_id: String,
+    /// The tool call that started the task, when the start was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The lifetime the spawn promised (`goal`, `runtime`, `session`,
+    /// `persistent`). Absent on a terminal-only record written before starts
+    /// were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
+    pub state: UiBackgroundTaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The bounded output tail retained with the terminal fact. Empty when no
+    /// terminal record exists; a live task's output is still a live event.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+    #[serde(default)]
+    pub output_truncated: bool,
+}
+
 /// One live background task that is keeping a runtime from becoming idle.
 ///
 /// Read-only status detail: a publishing runtime names the real blocker
@@ -682,10 +786,22 @@ pub struct UiSessionSnapshot {
     /// running. All fields are additive/defaulted for protocol compatibility.
     #[serde(default)]
     pub active_tools: Vec<UiActiveToolCall>,
+    /// Tool calls whose outcome a crash left unknown. Non-empty means the
+    /// next turn is blocked behind the crash-recovery gate until the user
+    /// acknowledges it; nothing is replayed by that acknowledgement. Additive:
+    /// an older runtime reports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interrupted_tool_calls: Vec<UiInterruptedToolCall>,
     /// Registry-backed background processes still active for this session.
     /// Additive/defaulted so older runtimes decode as no known live process.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_background_tasks: Vec<UiActiveBackgroundTask>,
+    /// Every background task the durable log knows for this session, including
+    /// the ones the live registry no longer holds. A task that vanished with a
+    /// crashed runtime appears as `lost`, never as completed and never as a
+    /// silently dropped record. Additive: an older runtime reports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<UiBackgroundTaskRecord>,
     #[serde(default)]
     pub plan: Option<UiPlan>,
     #[serde(default)]

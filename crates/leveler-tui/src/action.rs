@@ -45,6 +45,9 @@ pub enum EffectCompletion {
     SubmissionRejected {
         command_id: CommandId,
         message: String,
+        /// The reason is a recovery stop: an earlier tool call may have run and
+        /// the runtime will not guess. Presentation owns the user-facing copy.
+        recovery: bool,
         snapshot: Option<Box<UiSessionSnapshot>>,
     },
     /// The runtime proved this turn input's outcome unrecoverable: admitted,

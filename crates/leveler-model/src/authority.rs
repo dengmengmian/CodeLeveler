@@ -128,6 +128,9 @@ pub enum RuntimeNoticeKind {
     ChildLost,
     /// A resumed child is told what its own last activation already did.
     ChildRecovery,
+    /// The session's model is told which interrupted calls the user
+    /// acknowledged as outcome-unknown, and that they were not replayed.
+    CrashRecovery,
     /// The task string a parent agent handed a child.
     ChildTask,
     /// Host re-pin of the active objective after a fold.
@@ -364,6 +367,7 @@ fn classify_runtime_notice(notice: RuntimeNoticeKind) -> OriginClass {
         RuntimeNoticeKind::ChildResumed
         | RuntimeNoticeKind::ChildLost
         | RuntimeNoticeKind::ChildRecovery
+        | RuntimeNoticeKind::CrashRecovery
         | RuntimeNoticeKind::ObjectivePin
         | RuntimeNoticeKind::GoalCheckpoint => (PromptAuthority::RuntimeFact, false),
     };

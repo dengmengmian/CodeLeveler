@@ -175,6 +175,36 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 }
             }
         },
+        Overlay::ConfirmRecovery(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ConfirmRecovery(sel));
+                Vec::new()
+            }
+            // Esc and the cancel row mean the same thing: nothing was decided,
+            // and the runtime's recovery block stays exactly where it was.
+            SelectionOutcome::Cancel => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Info,
+                    message: state.t().recovery_cancelled.to_string(),
+                });
+                Vec::new()
+            }
+            SelectionOutcome::Confirm(key) if key == RECOVERY_CANCEL => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Info,
+                    message: state.t().recovery_cancelled.to_string(),
+                });
+                Vec::new()
+            }
+            // The only acknowledgement: mark the calls outcome-unknown and
+            // release the gate. It is not a claim that they succeeded, and it
+            // never replays them.
+            SelectionOutcome::Confirm(_) => {
+                vec![Effect::Send(ClientCommand::AcknowledgeCrashWindow {
+                    session_id: state.session_id.clone(),
+                })]
+            }
+        },
         Overlay::UnsupportedMedia(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::UnsupportedMedia(sel));
@@ -333,6 +363,59 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
 /// The key of the cancel row in the session-delete confirmation. Session ids
 /// are UUIDs, so this can never collide with the row it protects.
 const SESSION_DELETE_CANCEL: &str = "__cancel__";
+
+/// The two rows of the recovery confirmation. Neither is a call id, so they
+/// cannot collide with the evidence shown above them.
+const RECOVERY_CANCEL: &str = "__recovery_cancel__";
+const RECOVERY_CONFIRM: &str = "__recovery_confirm__";
+
+/// Show the crash window the runtime reported and ask for the one explicit
+/// decision that releases it: acknowledge that these calls' outcomes are
+/// unknown. Each call is evidence, not an action, so its row cannot be
+/// confirmed; only cancel and the acknowledgement are selectable.
+pub(super) fn open_recovery_confirm(state: &mut AppState) -> Vec<Effect> {
+    let t = state.t();
+    if state.interrupted_tool_calls.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: t.recovery_nothing_to_ack.to_string(),
+        });
+        return Vec::new();
+    }
+    let mut options = Vec::with_capacity(state.interrupted_tool_calls.len() + 2);
+    for call in &state.interrupted_tool_calls {
+        let evidence = if call.pending_approval {
+            t.recovery_state_pending_approval
+        } else {
+            match call.state {
+                leveler_client_protocol::UiInterruptedCallState::Interrupted => {
+                    t.recovery_state_interrupted
+                }
+                leveler_client_protocol::UiInterruptedCallState::Unknown => {
+                    t.recovery_state_unknown
+                }
+            }
+        };
+        options.push(
+            SelectionOption::new(
+                format!("call:{}", call.call_id),
+                format!("{} · {}", call.tool, call.call_id),
+            )
+            .disabled(evidence),
+        );
+    }
+    // Safe by default: the cursor starts on cancel, and a digest cannot pick
+    // the acknowledgement.
+    options.push(SelectionOption::new(RECOVERY_CANCEL, t.cancel));
+    options.push(
+        SelectionOption::new(RECOVERY_CONFIRM, t.recovery_confirm).description(t.recovery_warning),
+    );
+    let model = SelectionModel::new(t.recovery_overlay_title, options, false)
+        .with_description(t.recovery_overlay_intro)
+        .without_quick_select();
+    state.overlay = Some(Overlay::ConfirmRecovery(Box::new(model)));
+    Vec::new()
+}
 
 /// Ask before deleting a stored session. Deleting is irreversible and the
 /// runtime has no undo, so the safe choice (cancel) is the initial cursor and

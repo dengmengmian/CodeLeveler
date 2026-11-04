@@ -114,6 +114,19 @@ pub trait RuntimeReviver: Send + Sync {
     /// Ensure a runtime is serving the endpoint again. `Err` = revival
     /// failed (reported, then retried by the caller's loop).
     async fn revive(&self) -> Result<(), String>;
+
+    /// The build the endpoint answered with during the last FAILED revival,
+    /// when it could be observed.
+    ///
+    /// A revival can fail precisely because the runtime that came up is not
+    /// this client's build: the endpoint is reachable, but attaching would
+    /// serve a generation this client was not built against. That observed
+    /// identity is a fact the presentation layer needs — without it the only
+    /// honest user-facing answer would be silence. `None` means nothing was
+    /// proven and must not be read as a match.
+    fn observed_build(&self) -> Option<leveler_client_protocol::BuildIdentity> {
+        None
+    }
 }
 
 /// Omitted legacy selection inherits only the connected runtime's workspace.
@@ -518,6 +531,9 @@ struct WireError {
     /// [`ClientError::OwnershipConflict`]. Absent from older daemons.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     ownership_conflict: bool,
+    /// [`ClientError::RecoveryRequired`]. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    recovery_required: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -530,6 +546,7 @@ impl From<ClientError> for WireError {
                 outcome_unknown: false,
                 unresolvable: false,
                 ownership_conflict: false,
+                recovery_required: false,
             },
             ClientError::Runtime(message) => Self {
                 message,
@@ -537,6 +554,15 @@ impl From<ClientError> for WireError {
                 outcome_unknown: false,
                 unresolvable: false,
                 ownership_conflict: false,
+                recovery_required: false,
+            },
+            ClientError::RecoveryRequired(message) => Self {
+                message,
+                session_id: None,
+                outcome_unknown: false,
+                unresolvable: false,
+                ownership_conflict: false,
+                recovery_required: true,
             },
             ClientError::OutcomeUnknown(message) => Self {
                 message,
@@ -544,6 +570,7 @@ impl From<ClientError> for WireError {
                 outcome_unknown: true,
                 unresolvable: false,
                 ownership_conflict: false,
+                recovery_required: false,
             },
             ClientError::Unresolvable(message) => Self {
                 message,
@@ -551,6 +578,7 @@ impl From<ClientError> for WireError {
                 outcome_unknown: false,
                 unresolvable: true,
                 ownership_conflict: false,
+                recovery_required: false,
             },
             ClientError::OwnershipConflict(message) => Self {
                 message,
@@ -558,6 +586,7 @@ impl From<ClientError> for WireError {
                 outcome_unknown: false,
                 unresolvable: false,
                 ownership_conflict: true,
+                recovery_required: false,
             },
         }
     }
@@ -571,6 +600,7 @@ impl WireError {
             None if self.outcome_unknown => ClientError::OutcomeUnknown(self.message),
             None if self.unresolvable => ClientError::Unresolvable(self.message),
             None if self.ownership_conflict => ClientError::OwnershipConflict(self.message),
+            None if self.recovery_required => ClientError::RecoveryRequired(self.message),
             None => ClientError::Runtime(self.message),
         }
     }
@@ -1819,6 +1849,30 @@ mod transport {
         }
     }
 
+    /// The runtime identity behind an endpoint, or `None` when it cannot be
+    /// established.
+    ///
+    /// A reconnect compares the pid against the identity observed on the same
+    /// stream before the break: equality proves the runtime process never
+    /// died, a difference proves it did. The durable RuntimeId cannot answer
+    /// this — it survives restarts by design. The build is carried so the
+    /// presentation layer can tell whether the client is still served by the
+    /// generation it was built from.
+    async fn runtime_identity(
+        endpoint: &Endpoint,
+    ) -> Option<(u32, leveler_client_protocol::BuildIdentity)> {
+        let query = async {
+            match request_endpoint(endpoint, WireRequest::RuntimeInfo).await {
+                Ok(WireResponse::RuntimeInfo(info)) => Some((info.pid, info.build)),
+                _ => None,
+            }
+        };
+        match request_timeout() {
+            None => query.await,
+            Some(timeout) => tokio::time::timeout(timeout, query).await.ok().flatten(),
+        }
+    }
+
     async fn subscription_loop(
         endpoint: Endpoint,
         mut stream: ClientStream,
@@ -1828,6 +1882,18 @@ mod transport {
         client_kind: ClientKind,
         reviver: Arc<std::sync::OnceLock<Arc<dyn RuntimeReviver>>>,
     ) {
+        // Captured while this stream is known to be served, before any break:
+        // it is the only fact that separates a runtime restart from a benign
+        // stream reset.
+        let mut live = runtime_identity(&endpoint).await;
+        // The first observation is not a reconnect: it only tells the client
+        // which build serves it. A known-different build is the version
+        // mismatch presentation state; unknown is not a change.
+        if let Some((_, build)) = &live {
+            let _ = events.send(RuntimeEvent::RuntimeBuildObserved {
+                runtime_build: build.clone(),
+            });
+        }
         loop {
             loop {
                 tokio::select! {
@@ -1844,7 +1910,17 @@ mod transport {
                             Ok(_) => {}
                             Err(error) => tracing::warn!(%error, "local event protocol mismatch"),
                         },
-                        Err(_) => break,
+                        // The reason a stream ended is the only evidence that
+                        // separates a runtime restart from a stream reset; it
+                        // must not be discarded.
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                session = session_id.as_ref().map(SessionId::as_str),
+                                "local runtime event stream broke; reconnecting"
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -1853,24 +1929,66 @@ mod transport {
                 match open_subscription_deadline(&endpoint, session_id.clone(), client_kind).await {
                     Ok(new_stream) => {
                         stream = new_stream;
-                        // Say that the stream broke. This loop reconnects, and
-                        // may revive the daemon, without the client ever
-                        // learning: a TUI watching a turn when the runtime was
-                        // killed simply stopped updating — no notice, and the
-                        // turn the runtime settled as interrupted was never
-                        // marked. Sent BEFORE the snapshot, which replaces the
-                        // client's view of the session.
-                        let _ = events.send(RuntimeEvent::Notification {
-                            level: leveler_client_protocol::NotificationLevel::Warning,
-                            message: "与运行时的连接中断后已重连;中断时进行中的工作可能已经停止"
-                                .to_string(),
+                        let reconnected = runtime_identity(&endpoint).await;
+                        let runtime_build = reconnected
+                            .as_ref()
+                            .map(|(_, build)| build.clone())
+                            .unwrap_or_default();
+                        // `Some`: both sides of the break were observed and
+                        // agree. `None`: nothing was proven — the runtime may
+                        // or may not have been replaced.
+                        let runtime_restarted = match (&live, &reconnected) {
+                            (Some((before, _)), Some((after, _))) => Some(before != after),
+                            _ => None,
+                        };
+                        tracing::info!(
+                            session = session_id.as_ref().map(SessionId::as_str),
+                            before_pid = live.as_ref().map(|(pid, _)| *pid),
+                            after_pid = reconnected.as_ref().map(|(pid, _)| *pid),
+                            "local runtime event stream reconnected"
+                        );
+                        if let Some(identity) = reconnected {
+                            live = Some(identity);
+                        }
+                        // State what was observed: the stream is back, which
+                        // build answers it, and whether the process changed.
+                        // Whether that cost any in-progress work is not
+                        // knowable here — the client's turn state owns it, so
+                        // the presentation layer decides what the user hears.
+                        // Sent BEFORE the snapshot, which replaces the client's
+                        // view of the session.
+                        let _ = events.send(RuntimeEvent::RuntimeReconnected {
+                            runtime_build,
+                            runtime_restarted,
                         });
-                        if let Some(session_id) = session_id.clone()
-                            && let Ok(WireResponse::Snapshot(snapshot)) =
+                        if let Some(session_id) = session_id.clone() {
+                            let resync =
                                 request_endpoint(&endpoint, WireRequest::Snapshot { session_id })
-                                    .await
-                        {
-                            let _ = events.send(RuntimeEvent::SessionOpened { session: snapshot });
+                                    .await;
+                            match resync {
+                                Ok(WireResponse::Snapshot(snapshot)) => {
+                                    let _ = events
+                                        .send(RuntimeEvent::SessionOpened { session: snapshot });
+                                }
+                                // The client is now watching a session whose
+                                // state it could not re-read. Staying silent
+                                // would present pre-break state as current.
+                                Ok(WireResponse::Error(error)) => {
+                                    let _ = events.send(RuntimeEvent::SessionResyncFailed {
+                                        error: error.message,
+                                    });
+                                }
+                                Ok(response) => {
+                                    let _ = events.send(RuntimeEvent::SessionResyncFailed {
+                                        error: format!("unexpected response: {response:?}"),
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = events.send(RuntimeEvent::SessionResyncFailed {
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
                         }
                         break;
                     }
@@ -1881,10 +1999,20 @@ mod transport {
                     Err(error) => {
                         if matches!(error, TransportError::NoAnswer { .. }) {
                             tracing::warn!(%error, "local runtime did not answer; retrying without reviving");
-                        } else if let Some(reviver) = reviver.get()
-                            && let Err(error) = reviver.revive().await
-                        {
-                            tracing::warn!(%error, "local runtime revival failed; retrying");
+                        } else if let Some(reviver) = reviver.get() {
+                            if let Err(error) = reviver.revive().await {
+                                tracing::warn!(%error, "local runtime revival failed; retrying");
+                                // A refusal can be based on a real observation
+                                // of the runtime that answered (a different
+                                // build). Report that fact even though the
+                                // attach stays refused; otherwise the client
+                                // knows something is wrong and tells the user
+                                // nothing.
+                                if let Some(runtime_build) = reviver.observed_build() {
+                                    let _ = events
+                                        .send(RuntimeEvent::RuntimeBuildObserved { runtime_build });
+                                }
+                            }
                         }
                         tokio::select! {
                             _ = shutdown.cancelled() => return,
@@ -1944,6 +2072,7 @@ mod transport {
                     outcome_unknown: false,
                     unresolvable: false,
                     ownership_conflict: false,
+                    recovery_required: false,
                 }),
             )
             .await?;
@@ -2351,7 +2480,9 @@ mod tests {
                     vision: false,
                     last_sequence: None,
                     active_tools: Vec::new(),
+                    interrupted_tool_calls: Vec::new(),
                     active_background_tasks: Vec::new(),
+                    background_tasks: Vec::new(),
                     plan: None,
                     diff: None,
                     checkpoints: Vec::new(),
@@ -3029,13 +3160,19 @@ mod tests {
             })
             .unwrap();
         runtime.events.send(RuntimeEvent::TurnAnswered).unwrap();
-        assert!(matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        // The subscription first announces which build serves it; the turn
+        // answer under test follows.
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
                 .await
                 .unwrap()
-                .unwrap(),
-            RuntimeEvent::TurnAnswered
-        ));
+                .unwrap();
+            if matches!(event, RuntimeEvent::RuntimeBuildObserved { .. }) {
+                continue;
+            }
+            assert!(matches!(event, RuntimeEvent::TurnAnswered), "{event:?}");
+            break;
+        }
         shutdown.cancel();
     }
 
@@ -3307,22 +3444,756 @@ mod tests {
         shutdown.cancel();
         let _ = serve.await;
 
+        await_reconnect(&mut rx, "a broken connection").await;
+        reviver.shutdown.cancel();
+    }
+
+    /// A runtime whose event stream can be reset without the process dying,
+    /// and whose process identity can change across a restart. `TestRuntime`'s
+    /// single broadcast sender cannot express either: replacing the sender is
+    /// exactly the server's lag-forced close, and a different pid is the only
+    /// evidence that a reconnect outlived its runtime.
+    struct ReconnectRuntime {
+        events: Mutex<broadcast::Sender<RuntimeEvent>>,
+        pid: std::sync::atomic::AtomicU32,
+        info_fails: std::sync::atomic::AtomicBool,
+        /// What this runtime answers as its own build identity.
+        build: Mutex<leveler_client_protocol::BuildIdentity>,
+        snapshot: Mutex<Result<UiSessionSnapshot, String>>,
+        /// Session-specific answers for the multi-session case; every other id
+        /// falls back to the canonical fixture.
+        by_session: Mutex<std::collections::HashMap<SessionId, UiSessionSnapshot>>,
+        commands: Mutex<Vec<ClientCommand>>,
+        creates: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReconnectRuntime {
+        fn new(pid: u32) -> Self {
+            let (events, _) = broadcast::channel(64);
+            Self {
+                events: Mutex::new(events),
+                pid: std::sync::atomic::AtomicU32::new(pid),
+                info_fails: std::sync::atomic::AtomicBool::new(false),
+                build: Mutex::new(leveler_client_protocol::BuildIdentity::default()),
+                // Reuse the canonical session fixture the other tests serve.
+                snapshot: Mutex::new(Ok(TestRuntime::new().snapshot.lock().unwrap().clone())),
+                by_session: Mutex::new(std::collections::HashMap::new()),
+                commands: Mutex::new(Vec::new()),
+                creates: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// The runtime no longer answers its identity — the reconnect can
+        /// observe neither the old nor the new pid, and must say so.
+        fn fail_info(&self) {
+            self.info_fails
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Give one session its own snapshot, so two subscriptions can prove
+        /// they resync from their own session rather than a shared answer.
+        fn set_session_snapshot(&self, session: UiSessionSnapshot) {
+            self.by_session
+                .lock()
+                .unwrap()
+                .insert(session.id.clone(), session);
+        }
+
+        /// Drop the current sender: the server's subscription receiver sees
+        /// `Closed` and closes the connection, exactly as it does after a
+        /// broadcast lag. The process (pid) is unchanged.
+        fn reset_stream(&self) {
+            let (events, _) = broadcast::channel(64);
+            *self.events.lock().unwrap() = events;
+        }
+
+        fn fail_snapshots(&self, reason: &str) {
+            *self.snapshot.lock().unwrap() = Err(reason.to_string());
+        }
+
+        fn set_build(&self, build: leveler_client_protocol::BuildIdentity) {
+            *self.build.lock().unwrap() = build;
+        }
+
+        /// Replace the state the runtime will answer the next snapshot with —
+        /// how a live runtime records work that continued across the break.
+        fn set_snapshot(&self, snapshot: UiSessionSnapshot) {
+            *self.snapshot.lock().unwrap() = Ok(snapshot);
+        }
+    }
+
+    #[async_trait]
+    impl InteractiveRuntimeClient for ReconnectRuntime {
+        async fn deliver(
+            &self,
+            envelope: leveler_client_protocol::CommandEnvelope,
+        ) -> Result<(), ClientError> {
+            self.commands.lock().unwrap().push(envelope.command);
+            Ok(())
+        }
+
+        async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+            self.events.lock().unwrap().subscribe()
+        }
+
+        async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+            if let Some(snapshot) = self.by_session.lock().unwrap().get(session_id).cloned() {
+                return Ok(snapshot);
+            }
+            match self.snapshot.lock().unwrap().clone() {
+                Ok(snapshot) => Ok(snapshot),
+                Err(reason) => Err(ClientError::Runtime(reason)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LocalRuntimeService for ReconnectRuntime {
+        async fn create_session(
+            &self,
+            _request: CreateSessionRequest,
+        ) -> Result<SessionBootstrap, ClientError> {
+            self.creates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.snapshot.lock().unwrap().clone() {
+                Ok(session) => Ok(SessionBootstrap {
+                    session,
+                    context_window: 128_000,
+                    notice: None,
+                }),
+                Err(reason) => Err(ClientError::Runtime(reason)),
+            }
+        }
+
+        async fn runtime_info(&self) -> Result<leveler_client_protocol::RuntimeInfo, ClientError> {
+            if self.info_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ClientError::Runtime(
+                    "runtime identity unavailable".to_string(),
+                ));
+            }
+            Ok(leveler_client_protocol::RuntimeInfo {
+                runtime_id: leveler_client_protocol::RuntimeId::new("rt-reconnect"),
+                version: "test".to_string(),
+                build: self.build.lock().unwrap().clone(),
+                config_fingerprint: None,
+                pid: self.pid.load(std::sync::atomic::Ordering::SeqCst),
+                health: leveler_client_protocol::RuntimeHealth {
+                    accepting_work: true,
+                    active_turns: 0,
+                    active_background_tasks: 0,
+                    quiescent: true,
+                    turn_capacity: Some(4),
+                    shutting_down: false,
+                    retiring_reason: None,
+                    blockers: Vec::new(),
+                    turn_blockers: Vec::new(),
+                },
+            })
+        }
+    }
+
+    /// Wait until the client's subscription is actually served. The loop's
+    /// baseline identity query runs before its read loop, so receiving an
+    /// event also proves the baseline was captured.
+    async fn await_subscribed(
+        runtime: &ReconnectRuntime,
+        rx: &mut broadcast::Receiver<RuntimeEvent>,
+    ) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut said = Vec::new();
+        loop {
+            let _ = runtime
+                .events
+                .lock()
+                .unwrap()
+                .send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: "subscribed".to_string(),
+                });
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(RuntimeEvent::Notification { message, .. })) if message == "subscribed" => {
+                    return;
+                }
+                _ if tokio::time::Instant::now() < deadline => {}
+                _ => panic!("the subscription was never served"),
+            }
+        }
+    }
+
+    async fn await_resync_failure(
+        rx: &mut broadcast::Receiver<RuntimeEvent>,
+        what: &str,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(RuntimeEvent::SessionResyncFailed { error })) => return error,
+                Ok(Ok(_)) => {}
+                _ if tokio::time::Instant::now() < deadline => {}
+                _ => panic!("{what} was never reported"),
+            }
+        }
+    }
+
+    async fn await_reconnect(
+        rx: &mut broadcast::Receiver<RuntimeEvent>,
+        what: &str,
+    ) -> (leveler_client_protocol::BuildIdentity, Option<bool>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(RuntimeEvent::RuntimeReconnected {
+                    runtime_build,
+                    runtime_restarted,
+                })) => return (runtime_build, runtime_restarted),
+                Ok(Ok(RuntimeEvent::Notification { message, .. })) if message == "subscribed" => {}
                 Ok(Ok(RuntimeEvent::Notification { message, .. })) => {
-                    said.push(message.clone());
-                    if message.contains("连接") {
-                        break;
-                    }
+                    panic!("a reconnect must not narrate lost work: {message}")
                 }
                 Ok(Ok(_)) => {}
                 _ if tokio::time::Instant::now() < deadline => {}
-                _ => panic!("a broken connection was never reported: {said:?}"),
+                _ => panic!("{what} was never reported"),
             }
         }
-        reviver.shutdown.cancel();
+    }
+
+    async fn await_build(
+        rx: &mut broadcast::Receiver<RuntimeEvent>,
+        what: &str,
+    ) -> leveler_client_protocol::BuildIdentity {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(RuntimeEvent::RuntimeBuildObserved { runtime_build })) => {
+                    return runtime_build;
+                }
+                Ok(Ok(_)) => {}
+                _ if tokio::time::Instant::now() < deadline => {}
+                _ => panic!("{what} was never reported"),
+            }
+        }
+    }
+
+    /// A healthy start is not a reconnect, but the client still has to learn
+    /// WHICH build serves it: a daemon can outlive an application update.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_connection_reports_which_build_serves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let mut expected = leveler_client_protocol::BuildIdentity::current();
+        expected.revision = "1111111111111111111111111111111111111111".into();
+        expected.fingerprint = "the-serving-build".into();
+        runtime.set_build(expected.clone());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe();
+
+        let observed = await_build(&mut rx, "the connected build").await;
+        assert_eq!(
+            observed, expected,
+            "the client must know exactly which build answers"
+        );
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "learning the build must not send a command"
+        );
+        shutdown.cancel();
+    }
+
+    /// A stream reset on a LIVE runtime is the server's lag-forced close or a
+    /// brief IPC failure: the process never changed, and the client is told
+    /// exactly that — never that its work may have stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_reset_on_a_live_runtime_does_not_claim_work_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe();
+        await_subscribed(&runtime, &mut rx).await;
+
+        runtime.reset_stream();
+
+        let (build, restarted) = await_reconnect(&mut rx, "a reconnect").await;
+        assert_eq!(
+            restarted,
+            Some(false),
+            "the process was observed unchanged across the break"
+        );
+        assert!(
+            !build.is_known(),
+            "this runtime reports no build identity; unknown is not a version change"
+        );
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "a reconnect must not replay client commands"
+        );
+        assert_eq!(
+            runtime.creates.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a reconnect must not create a session"
+        );
+        shutdown.cancel();
+    }
+
+    /// A pid that changed across the reconnect is proof the process died. The
+    /// transport reports that process change; whether it cost work is the
+    /// presentation layer's verdict, not something the transport can know.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_after_the_runtime_restarted_reports_the_process_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let first = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, first.clone()).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe();
+        await_subscribed(&first, &mut rx).await;
+
+        let second = Arc::new(ReconnectRuntime::new(7002));
+        let reviver = Arc::new(RestartingReviver {
+            path: path.clone(),
+            runtime: second.clone(),
+            shutdown: Mutex::new(None),
+        });
+        client.set_reviver(reviver);
+
+        shutdown.cancel();
+        let _ = serve.await;
+
+        let (_, restarted) = await_reconnect(&mut rx, "a restart").await;
+        assert_eq!(
+            restarted,
+            Some(true),
+            "the pid changed, so the runtime process was replaced"
+        );
+        assert!(second.commands.lock().unwrap().is_empty());
+    }
+
+    /// A revival can fail because the runtime that answered is a DIFFERENT
+    /// build — the gate is right to refuse the attach. The observation is
+    /// still a fact, and without it the client cannot tell the user that the
+    /// version changed. Refusal must not become silence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_revival_reports_the_build_it_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe();
+        await_subscribed(&runtime, &mut rx).await;
+
+        let mut other = leveler_client_protocol::BuildIdentity::current();
+        other.revision = "2222222222222222222222222222222222222222".into();
+        other.fingerprint = "the-build-that-answered".into();
+        client.set_reviver(Arc::new(MismatchReviver {
+            build: other.clone(),
+        }));
+
+        shutdown.cancel();
+        let _ = serve.await;
+
+        let observed = await_build(&mut rx, "the build observed by a failed revival").await;
+        assert_eq!(
+            observed, other,
+            "a refused attach must still report which build answered"
+        );
+    }
+
+    /// The old code dropped a failed post-reconnect snapshot on the floor and
+    /// left the TUI showing pre-break state as if it were current.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_resync_after_a_reconnect_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        // Only a session subscription re-reads session state after a
+        // reconnect, so this notice can only come from that stream.
+        let mut rx = client.subscribe_session(&SessionId::new("s1"));
+        await_subscribed(&runtime, &mut rx).await;
+
+        runtime.fail_snapshots("snapshot store unavailable");
+        runtime.reset_stream();
+
+        let error = await_resync_failure(&mut rx, "a failed resync").await;
+        assert!(
+            error.contains("snapshot store unavailable"),
+            "the real failure stays diagnostic, never swallowed: {error}"
+        );
+        shutdown.cancel();
+    }
+
+    /// First launch and normal session creation are not interruptions: neither
+    /// connecting nor subscribing may fabricate a reconnect notice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_connection_and_session_creation_report_no_interruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let request: CreateSessionRequest = serde_json::from_value(
+            serde_json::json!({"goal": "g", "model": null, "mode": "assisted"}),
+        )
+        .unwrap();
+        let bootstrap = client.create_session(request).await.unwrap();
+        let mut rx = client.subscribe_session(&bootstrap.session.id);
+        await_subscribed(&runtime, &mut rx).await;
+
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while let Ok(event) = rx.recv().await {
+                if let RuntimeEvent::Notification { message, .. } = event {
+                    assert!(
+                        !message.contains("连接") && !message.contains("重启"),
+                        "a healthy start must not report an interruption: {message}"
+                    );
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "the subscription should stay open and quiet for the whole window"
+        );
+        shutdown.cancel();
+    }
+
+    /// A normal resume is a NEW connection to a runtime that never left. It
+    /// is not a reconnect: no interruption text may be replayed from history
+    /// or minted by the fresh subscription.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_an_existing_session_reports_no_interruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+
+        let first = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut first_rx = first.subscribe_session(&SessionId::new("s1"));
+        await_subscribed(&runtime, &mut first_rx).await;
+        drop(first);
+
+        // The TUI restarts and resumes the same session on the same runtime.
+        let resumed = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut resumed_rx = resumed.subscribe_session(&SessionId::new("s1"));
+        await_subscribed(&runtime, &mut resumed_rx).await;
+
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while let Ok(event) = resumed_rx.recv().await {
+                if let RuntimeEvent::Notification { message, .. } = event {
+                    assert!(
+                        !message.contains("连接") && !message.contains("重启"),
+                        "resuming a healthy session must not report an interruption: {message}"
+                    );
+                }
+            }
+        })
+        .await;
+        assert!(quiet.is_err(), "the resumed subscription must stay quiet");
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "opening a session must not send commands"
+        );
+        shutdown.cancel();
+    }
+
+    /// The reconnect also verifies the runtime's identity. When neither side
+    /// can be read, the notice must admit that instead of asserting a restart
+    /// or a live process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_without_a_readable_identity_admits_what_it_cannot_tell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let first = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, first.clone()).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe();
+        await_subscribed(&first, &mut rx).await;
+
+        // The replacement answers data requests but not its own identity.
+        let second = Arc::new(ReconnectRuntime::new(7002));
+        second.fail_info();
+        let reviver = Arc::new(RestartingReviver {
+            path: path.clone(),
+            runtime: second.clone(),
+            shutdown: Mutex::new(None),
+        });
+        client.set_reviver(reviver);
+
+        shutdown.cancel();
+        let _ = serve.await;
+
+        let (build, restarted) = await_reconnect(&mut rx, "an unverifiable reconnect").await;
+        assert!(
+            !build.is_known(),
+            "an unreadable identity is unknown, not a verdict"
+        );
+        assert_eq!(
+            restarted, None,
+            "no restart may be asserted without a pid on both sides"
+        );
+    }
+
+    /// Session subscriptions are independent: one runtime restart resyncs
+    /// every open session from its OWN snapshot, and never crosses them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_open_session_resyncs_its_own_state_after_a_stream_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+
+        let mut one = runtime.snapshot.lock().unwrap().clone().unwrap();
+        one.id = SessionId::new("s1");
+        one.status = "running".to_string();
+        one.active_tools = vec![leveler_client_protocol::UiActiveToolCall {
+            timing: None,
+            id: leveler_client_protocol::ToolCallId::new("tool-s1"),
+            name: "run_command".to_string(),
+            arguments: r#"{"program":"make"}"#.to_string(),
+            elapsed_ms: 1_000,
+            output_tail: String::new(),
+            output_truncated: false,
+            model_step: Some(1),
+            answer_effect: None,
+        }];
+        runtime.set_session_snapshot(one);
+        let mut two = runtime.snapshot.lock().unwrap().clone().unwrap();
+        two.id = SessionId::new("s2");
+        two.status = "idle".to_string();
+        runtime.set_session_snapshot(two);
+
+        let mut one_rx = client.subscribe_session(&SessionId::new("s1"));
+        await_subscribed(&runtime, &mut one_rx).await;
+        let mut two_rx = client.subscribe_session(&SessionId::new("s2"));
+        await_subscribed(&runtime, &mut two_rx).await;
+
+        runtime.reset_stream();
+
+        for (rx, expected_id, expected_status, expected_tools) in [
+            (&mut one_rx, "s1", "running", 1usize),
+            (&mut two_rx, "s2", "idle", 0usize),
+        ] {
+            let mut resynced = None;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while resynced.is_none() && tokio::time::Instant::now() < deadline {
+                if let Ok(Ok(RuntimeEvent::SessionOpened { session })) =
+                    tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+                {
+                    resynced = Some(session);
+                }
+            }
+            let session = resynced.expect("each open session must resync");
+            assert_eq!(session.id.as_str(), expected_id);
+            assert_eq!(session.status, expected_status);
+            assert_eq!(session.active_tools.len(), expected_tools);
+        }
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "resyncing two sessions must not replay commands"
+        );
+        shutdown.cancel();
+    }
+
+    /// A reconnect must re-verify execution state from the runtime, not keep
+    /// the pre-break view: work that continued through the break is in the
+    /// snapshot, and work the runtime no longer lists is absent from it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_resync_delivers_current_agent_and_background_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let session_id = SessionId::new("s1");
+        let mut rx = client.subscribe_session(&session_id);
+        await_subscribed(&runtime, &mut rx).await;
+
+        // The runtime kept working while this client was not reading.
+        let mut current = runtime.snapshot.lock().unwrap().clone().unwrap();
+        current.status = "running".to_string();
+        current.active_tools = vec![leveler_client_protocol::UiActiveToolCall {
+            timing: None,
+            id: leveler_client_protocol::ToolCallId::new("tool-1"),
+            name: "run_command".to_string(),
+            arguments: r#"{"cmd":"cargo test"}"#.to_string(),
+            elapsed_ms: 4_200,
+            output_tail: "running 12 tests".to_string(),
+            output_truncated: false,
+            model_step: Some(3),
+            answer_effect: None,
+        }];
+        current.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {
+            task_id: "bg-1".to_string(),
+            program: "npm".to_string(),
+            args: vec!["run".to_string(), "dev".to_string()],
+            elapsed_ms: 9_000,
+            pid: Some(4242),
+            ready_evidence: None,
+            lifetime: Some("session".to_string()),
+        }];
+        runtime.set_snapshot(current);
+
+        runtime.reset_stream();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(RuntimeEvent::SessionOpened { session })) => {
+                    assert_eq!(session.status, "running");
+                    assert_eq!(session.active_tools.len(), 1);
+                    assert_eq!(session.active_tools[0].id.as_str(), "tool-1");
+                    assert_eq!(session.active_tools[0].output_tail, "running 12 tests");
+                    assert_eq!(session.active_background_tasks.len(), 1);
+                    assert_eq!(session.active_background_tasks[0].task_id, "bg-1");
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ if tokio::time::Instant::now() < deadline => {}
+                _ => panic!("the runtime's current state was never re-read"),
+            }
+        }
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "resyncing must not replay or restart work"
+        );
+        shutdown.cancel();
+    }
+
+    /// Transient faults repeat. Each reconnect is reported once, with the same
+    /// evidence, and none of them re-send a command or create a session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_stream_resets_are_each_reported_once_without_replaying_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe();
+        await_subscribed(&runtime, &mut rx).await;
+
+        for _ in 0..2 {
+            runtime.reset_stream();
+            let (_, restarted) = await_reconnect(&mut rx, "each reconnect").await;
+            assert_eq!(
+                restarted,
+                Some(false),
+                "the same process served both breaks"
+            );
+        }
+        assert!(runtime.commands.lock().unwrap().is_empty());
+        assert_eq!(runtime.creates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        shutdown.cancel();
+    }
+
+    /// Binds a NEW runtime at the same path, reporting a different pid — the
+    /// restart a real daemon revival produces.
+    struct RestartingReviver {
+        path: PathBuf,
+        runtime: Arc<ReconnectRuntime>,
+        shutdown: Mutex<Option<CancellationToken>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl RuntimeReviver for RestartingReviver {
+        async fn revive(&self) -> Result<(), String> {
+            if let Some(shutdown) = self.shutdown.lock().unwrap().as_ref()
+                && !shutdown.is_cancelled()
+            {
+                return Ok(());
+            }
+            for _ in 0..40 {
+                match LocalSocketServer::bind(&self.path, self.runtime.clone()).await {
+                    Ok(server) => {
+                        let shutdown = CancellationToken::new();
+                        tokio::spawn(server.serve(shutdown.clone()));
+                        *self.shutdown.lock().unwrap() = Some(shutdown);
+                        return Ok(());
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+            Err("the socket never became available".to_string())
+        }
+    }
+
+    /// Fails like the real host when the runtime that came up is a different
+    /// build, while still reporting what it observed.
+    struct MismatchReviver {
+        build: leveler_client_protocol::BuildIdentity,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl RuntimeReviver for MismatchReviver {
+        async fn revive(&self) -> Result<(), String> {
+            Err("the local runtime is a different build".to_string())
+        }
+
+        fn observed_build(&self) -> Option<leveler_client_protocol::BuildIdentity> {
+            Some(self.build.clone())
+        }
     }
 
     /// A dead-end listener: accepts connections, fully reads one request
@@ -3572,6 +4443,13 @@ mod tests {
         assert!(matches!(
             back.into_client_error(),
             ClientError::OwnershipConflict(message) if message == "elsewhere"
+        ));
+
+        let wire = WireError::from(ClientError::RecoveryRequired("confirm first".to_string()));
+        let back: WireError = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        assert!(matches!(
+            back.into_client_error(),
+            ClientError::RecoveryRequired(message) if message == "confirm first"
         ));
 
         let legacy: WireError =
@@ -4423,6 +5301,66 @@ mod tests {
         })
         .await
         .expect("events after a reconnect must reach the existing subscriber");
+
+        second_shutdown.cancel();
+        second_task.await.unwrap().unwrap();
+    }
+
+    /// A reconnect states WHAT it reconnected to, not what it cost.
+    ///
+    /// The transport cannot know whether a turn was running when the stream
+    /// broke, so it must not tell the user that work may have stopped: that
+    /// verdict belongs to the presentation layer, which owns the turn state.
+    /// It must also report the build it landed on, so a client stuck on a
+    /// previous generation can be told to restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_reports_the_runtime_build_instead_of_asserting_lost_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let first_runtime = Arc::new(TestRuntime::new());
+        let first_server = LocalSocketServer::bind(&path, first_runtime).await.unwrap();
+        let first_shutdown = CancellationToken::new();
+        let first_task = tokio::spawn(first_server.serve(first_shutdown.clone()));
+
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        client.snapshot(&SessionId::new("s1")).await.unwrap();
+        let mut events = client.subscribe_session(&SessionId::new("s1"));
+        first_shutdown.cancel();
+        first_task.await.unwrap().unwrap();
+
+        let second_shutdown = CancellationToken::new();
+        let second_server = LocalSocketServer::bind(&path, Arc::new(TestRuntime::new()))
+            .await
+            .unwrap();
+        let second_task = tokio::spawn(second_server.serve(second_shutdown.clone()));
+
+        let runtime_build = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    RuntimeEvent::RuntimeReconnected {
+                        runtime_build,
+                        runtime_restarted,
+                    } => break (runtime_build, runtime_restarted),
+                    RuntimeEvent::Notification { message, .. } => {
+                        panic!("the transport must not assert lost work on reconnect: {message}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("a reconnect must report the runtime it reconnected to");
+        let (runtime_build, runtime_restarted) = runtime_build;
+        assert!(
+            !runtime_build.is_known(),
+            "the test runtime reports no build identity; unknown must not read as a version change"
+        );
+        assert_eq!(
+            runtime_restarted,
+            Some(false),
+            "the replacement runtime reports the test process's own pid"
+        );
 
         second_shutdown.cancel();
         second_task.await.unwrap().unwrap();

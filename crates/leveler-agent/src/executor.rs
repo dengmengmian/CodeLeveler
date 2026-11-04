@@ -136,6 +136,23 @@ pub enum AgentEvent {
         /// intentionally unaffected.
         execution_status: Option<leveler_execution::ToolExecutionStatus>,
     },
+    /// A tool call started a background task, as the spawn's structured
+    /// metadata reported it.
+    ///
+    /// The hosting registry lives in the runtime process, so a crash erases
+    /// it. This event is the durable fact that survives: the call that started
+    /// the task, its id, the argv it ran, and the lifetime it was promised.
+    /// Only a start is recorded this way; the terminal outcome already has its
+    /// own durable record (`BackgroundTaskFinished`).
+    BackgroundTaskStarted {
+        /// The tool call whose execution spawned the task.
+        call_id: String,
+        task_id: String,
+        program: String,
+        args: Vec<String>,
+        /// `goal`, `runtime`, `session` or `persistent`, as the spawn promised.
+        lifetime: String,
+    },
     /// Live output from a running command call, sanitized, one or more whole
     /// lines at a time. Transient: the finished `ToolResult` preview is the
     /// durable record.

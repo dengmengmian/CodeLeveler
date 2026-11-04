@@ -419,6 +419,174 @@ impl<'a> EventLog<'a> {
         }
         Ok(open)
     }
+
+    /// The session's unresolved crash window as the user acknowledged it: every
+    /// user-acknowledged marker with no completed turn after it, paired with
+    /// the arguments of the call it closed.
+    ///
+    /// These calls' results were never persisted. The model re-drives from the
+    /// last clean turn boundary, so without this context it would not know the
+    /// call exists — and could repeat a side effect the crash already
+    /// performed. A completed turn after the marker means the conversation has
+    /// moved past that window; it is history then, not this turn's context.
+    pub async fn acknowledged_crash_calls(&self) -> Result<Vec<AcknowledgedCall>, EngineError> {
+        let rows = self
+            .store
+            .load_by_types(
+                &self.session_id,
+                &["task_finished", "tool_call_started", "tool_call_finished"],
+            )
+            .await?;
+        // The newest completed turn is the point past which an acknowledged
+        // window is no longer undelivered context. Older windows stay closed.
+        let mut last_completed: Option<i64> = None;
+        for row in &rows {
+            if let EngineEvent::TaskFinished {
+                outcome: crate::TaskOutcome::Completed,
+                ..
+            } = decode_row(row)?
+            {
+                last_completed = Some(row.sequence);
+            }
+        }
+        let mut calls: Vec<AcknowledgedCall> = Vec::new();
+        for row in &rows {
+            if last_completed.is_some_and(|completed| row.sequence < completed) {
+                continue;
+            }
+            let EngineEvent::ToolCallFinished {
+                call_id,
+                name,
+                preview,
+                agent_id,
+                ..
+            } = decode_row(row)?
+            else {
+                continue;
+            };
+            // Only the top-level session's calls are the model's own rounds;
+            // a child's acknowledged call is covered by its own recovery note.
+            if agent_id.is_some() || preview != crate::USER_ACKNOWLEDGED_CRASH_PREVIEW {
+                continue;
+            }
+            let arguments = rows
+                .iter()
+                .find_map(|start| match decode_row(start) {
+                    Ok(EngineEvent::ToolCallStarted {
+                        call_id: started,
+                        name: started_name,
+                        arguments,
+                        agent_id: None,
+                        ..
+                    }) if started == call_id
+                        && started_name == name
+                        && start.turn_id == row.turn_id
+                        && start.sequence < row.sequence =>
+                    {
+                        Some(arguments)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            calls.push(AcknowledgedCall {
+                turn_id: row.turn_id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments,
+            });
+        }
+        Ok(calls)
+    }
+
+    /// Durable background-task lifecycle: every recorded start, paired with its
+    /// terminal record by `(task_id, call_id)`.
+    ///
+    /// The hosting registry is process state and dies with its process, so
+    /// these rows are the only facts a later reader can rely on. A terminal
+    /// record with no matching start (rows written before starts were
+    /// recorded) is still returned — as a record with `start: None` — so
+    /// history is never dropped. Records stay in start order; a terminal-only
+    /// record sorts at the position its finish row was read.
+    pub async fn background_task_facts(&self) -> Result<Vec<BackgroundTaskFact>, EngineError> {
+        let rows = self
+            .store
+            .load_by_types(
+                &self.session_id,
+                &["background_task_started", "background_task_finished"],
+            )
+            .await?;
+        let mut facts: Vec<BackgroundTaskFact> = Vec::new();
+        for row in &rows {
+            match decode_row(row)? {
+                EngineEvent::BackgroundTaskStarted {
+                    call_id,
+                    task_id,
+                    program,
+                    args,
+                    lifetime,
+                } => {
+                    // Pair strictly on the call that started it. Task ids are
+                    // stable per spawn today, but a legacy session may reuse a
+                    // local counter across generations; the call id is what
+                    // keeps old and new instances apart instead of letting a
+                    // finish settle the wrong process.
+                    if facts
+                        .iter()
+                        .any(|fact| fact.task_id == task_id && fact.call_id == call_id)
+                    {
+                        continue;
+                    }
+                    facts.push(BackgroundTaskFact {
+                        turn_id: row.turn_id.clone(),
+                        call_id,
+                        task_id,
+                        program,
+                        args,
+                        lifetime,
+                        terminal: None,
+                    });
+                }
+                EngineEvent::BackgroundTaskFinished {
+                    call_id,
+                    task_id,
+                    program,
+                    args,
+                    is_error,
+                    exit_code,
+                    status,
+                    output,
+                    output_truncated,
+                    ..
+                } => {
+                    let terminal = BackgroundTaskTerminal {
+                        is_error,
+                        exit_code,
+                        status,
+                        output,
+                        output_truncated,
+                    };
+                    match facts
+                        .iter_mut()
+                        .rev()
+                        .find(|fact| fact.task_id == task_id && fact.call_id == call_id)
+                    {
+                        Some(fact) => fact.terminal = Some(terminal),
+                        None => facts.push(BackgroundTaskFact {
+                            turn_id: None,
+                            call_id,
+                            task_id,
+                            program,
+                            args,
+                            lifetime: String::new(),
+                            terminal: Some(terminal),
+                        }),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(facts)
+    }
 }
 
 /// Mark (or unmark) the open call an approval was raised for.
@@ -487,6 +655,40 @@ pub struct FinishedChildFact {
     pub summary: String,
 }
 
+/// One background task as the durable log records it: a start, a terminal
+/// record, or both.
+///
+/// A start is not an outcome. `terminal: None` means the log has no terminal
+/// fact for this instance — the registry and the boot that owned the start
+/// decide what that means, never this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskFact {
+    /// The turn whose log the start was written to, when it was recorded
+    /// during a turn. It is how the owner boot (and therefore a crash) is
+    /// attributed. `None` for a terminal-only legacy record.
+    pub turn_id: Option<String>,
+    pub call_id: String,
+    pub task_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+    /// The lifetime the spawn promised; empty on a terminal-only legacy record.
+    pub lifetime: String,
+    pub terminal: Option<BackgroundTaskTerminal>,
+}
+
+/// A background task's durable terminal record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskTerminal {
+    pub is_error: bool,
+    pub exit_code: Option<i32>,
+    /// Absent only on records written before the field existed; such a row
+    /// only ever represented a natural exit.
+    pub status: Option<leveler_execution::BackgroundTaskStatus>,
+    /// Bounded output tail retained with the terminal fact.
+    pub output: String,
+    pub output_truncated: bool,
+}
+
 /// A tool call started but never finished — the crash window M5 reconciles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DanglingCall {
@@ -503,6 +705,16 @@ pub struct DanglingCall {
     /// Crashed while blocked in approval (`ApprovalRequested` with no resolution):
     /// dispatch never ran, so there is no side effect to recover.
     pub pending_approval: bool,
+}
+
+/// A tool call the user acknowledged as outcome-unknown after a crash. Its
+/// result was never persisted and it was not replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcknowledgedCall {
+    pub turn_id: Option<String>,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[cfg(test)]
@@ -858,6 +1070,72 @@ mod tests {
         assert_eq!(dangling[0].turn_id.as_deref(), Some(turn_id.as_str()));
         assert_eq!(dangling[0].arguments, "{\"path\":\"README.md\"}");
         assert!(!dangling[0].pending_approval);
+    }
+
+    /// Background lifecycle pairing: a finish settles only the start with the
+    /// same (task_id, call_id). A legacy session that reused a local task
+    /// counter must not let an old task's finish settle a new instance, and a
+    /// finish with no start is still history rather than a dropped row.
+    #[tokio::test]
+    async fn background_facts_pair_only_the_matching_start() {
+        let store = TypedOnlyStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("t1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        let start = |call_id: &str, task_id: &str| EngineEvent::BackgroundTaskStarted {
+            call_id: call_id.into(),
+            task_id: task_id.into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            lifetime: "goal".into(),
+        };
+        let finish =
+            |call_id: &str, task_id: &str, exit_code: i32| EngineEvent::BackgroundTaskFinished {
+                call_id: call_id.into(),
+                task_id: task_id.into(),
+                goal_id: None,
+                program: "cargo".into(),
+                args: vec!["test".into()],
+                is_error: exit_code != 0,
+                exit_code: Some(exit_code),
+                status: Some(leveler_execution::BackgroundTaskStatus::Exited),
+                output: String::new(),
+                output_truncated: false,
+            };
+
+        log.append(Some(&turn), start("call-old", "bg-1"), &mut sink)
+            .await
+            .unwrap();
+        // The same local id, started by a different call (a later generation).
+        log.append(Some(&turn), start("call-new", "bg-1"), &mut sink)
+            .await
+            .unwrap();
+        log.append(Some(&turn), finish("call-new", "bg-1", 0), &mut sink)
+            .await
+            .unwrap();
+        // A terminal record written before starts were recorded.
+        log.append(None, finish("call-legacy", "bg-9", 1), &mut sink)
+            .await
+            .unwrap();
+
+        let facts = log.background_task_facts().await.unwrap();
+        assert_eq!(facts.len(), 3, "{facts:?}");
+        assert_eq!(facts[0].call_id, "call-old");
+        assert!(
+            facts[0].terminal.is_none(),
+            "the old instance's outcome is unknown, not the new task's exit"
+        );
+        assert_eq!(facts[1].call_id, "call-new");
+        assert_eq!(facts[1].terminal.as_ref().unwrap().exit_code, Some(0));
+        assert_eq!(facts[2].call_id, "call-legacy");
+        assert!(facts[2].terminal.is_some());
+        assert_eq!(facts[2].turn_id, None);
+        assert_eq!(
+            store.whole_log_loads(),
+            0,
+            "background reconciliation must use the indexed by-type query"
+        );
     }
 
     /// Call ids are local to the agent that produced them, so two concurrent

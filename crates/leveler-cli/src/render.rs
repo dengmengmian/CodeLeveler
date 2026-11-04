@@ -229,6 +229,9 @@ fn render_event_text(event: AgentEvent) {
                 console::style("↺").dim()
             );
         }
+        // The tool result already reports the start in prose; this durable
+        // fact is not a transcript line of its own.
+        AgentEvent::BackgroundTaskStarted { .. } => {}
         AgentEvent::Finished(_) => {}
     }
 }
@@ -257,6 +260,20 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "attempt": attempt,
             "max_attempts": max_attempts,
             "delay_ms": delay_ms,
+        }),
+        AgentEvent::BackgroundTaskStarted {
+            call_id,
+            task_id,
+            program,
+            args,
+            lifetime,
+        } => serde_json::json!({
+            "type": "background_task_started",
+            "call_id": call_id,
+            "task_id": task_id,
+            "program": program,
+            "args": args,
+            "lifetime": lifetime,
         }),
         AgentEvent::ToolOutput { id, stream, text } => serde_json::json!({
             "type": "tool_output",
