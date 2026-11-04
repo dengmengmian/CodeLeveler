@@ -675,6 +675,10 @@ pub struct Application {
     /// thread starts until the first computer-use call. One handle serves
     /// every session; per-session observations are separated by session scope.
     computer: Arc<leveler_cua::ComputerUse>,
+    /// Deterministic actions over installed system applications. Stateless:
+    /// every call re-probes the machine, and each action runs through the
+    /// host execution authority.
+    native: Arc<leveler_native::NativeActions>,
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
@@ -869,6 +873,7 @@ impl Application {
             snapshot.loaded.browser_default,
         ));
         let computer = Arc::new(leveler_cua::ComputerUse::new());
+        let native = Arc::new(leveler_native::NativeActions::new());
         let has_workspace = layout.primary_workspace().is_some();
         Ok(Self {
             layout,
@@ -886,6 +891,7 @@ impl Application {
             background_tasks,
             browser,
             computer,
+            native,
             runtime_id: OnceLock::new(),
             boot: std::sync::Mutex::new(None),
             in_flight_commands: Default::default(),
@@ -1263,6 +1269,7 @@ impl Application {
             .with_artifact_store(artifact_store)
             .with_browser(self.browser.clone())
             .with_computer_use(self.computer.clone())
+            .with_native_actions(self.native.clone())
             .with_search_provider(resolve_search_provider(
                 snapshot.loaded.web_search.as_ref(),
                 self.environment.as_ref(),
@@ -1409,6 +1416,11 @@ impl Application {
             // `computer_observe availability`, so this does not start a
             // desktop worker on every turn.
             computer_use: leveler_cua::ComputerUse::platform_supported(),
+            // A compiled backend is the mechanical half; the mail application,
+            // its account and its automation permission are call-time facts
+            // reported by `native_capabilities`, so advertising the tools does
+            // not start an application or prompt.
+            native_actions: leveler_native::NativeActions::platform_supported(),
         }
     }
 
@@ -1487,6 +1499,7 @@ impl Application {
         for (present, id) in [
             (available_packs.browser, CapabilityId::Browser),
             (available_packs.computer_use, CapabilityId::ComputerUse),
+            (available_packs.native_actions, CapabilityId::NativeActions),
             (available_packs.skills, CapabilityId::Skills),
             (
                 available_packs.code_intelligence,

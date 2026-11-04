@@ -1978,6 +1978,7 @@ dependencies = [
  "leveler-local-transport",
  "leveler-media",
  "leveler-model",
+ "leveler-native",
  "leveler-project",
  "leveler-provider",
  "leveler-skills",
@@ -2039,6 +2040,7 @@ dependencies = [
  "leveler-local-transport",
  "leveler-lsp",
  "leveler-model",
+ "leveler-native",
  "leveler-project",
  "leveler-provider",
  "leveler-relay",
@@ -2247,6 +2249,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "leveler-native"
+version = "1.0.23"
+dependencies = [
+ "leveler-execution",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "winreg",
+]
+
+[[package]]
 name = "leveler-project"
 version = "1.0.23"
 dependencies = [
@@ -2432,6 +2449,7 @@ dependencies = [
  "leveler-lsp",
  "leveler-media",
  "leveler-model",
+ "leveler-native",
  "leveler-project",
  "leveler-skills",
  "leveler-test-support",
@@ -5572,6 +5590,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winreg"
+version = "0.55.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

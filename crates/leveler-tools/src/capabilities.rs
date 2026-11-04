@@ -49,6 +49,10 @@ pub struct Capabilities {
     /// by every session; per-session observations are separated by the scope
     /// each call carries, because the desktop itself is one OS resource.
     pub computer_use: Option<Arc<leveler_cua::ComputerUse>>,
+    /// Deterministic actions over installed system applications. `None` is the
+    /// same mechanical fact as `CapabilityPacks::native_actions == false`:
+    /// this build has no native-action backend, so the tools are not built.
+    pub native_actions: Option<Arc<leveler_native::NativeActions>>,
 }
 
 impl Capabilities {
@@ -67,6 +71,7 @@ impl Capabilities {
             browser: None,
             search_provider: None,
             computer_use: None,
+            native_actions: None,
         }
     }
 
@@ -103,6 +108,12 @@ impl Capabilities {
     /// Share the process-lived native desktop backend.
     pub fn with_computer_use(mut self, computer: Arc<leveler_cua::ComputerUse>) -> Self {
         self.computer_use = Some(computer);
+        self
+    }
+
+    /// Share the deterministic native-action backend.
+    pub fn with_native_actions(mut self, native: Arc<leveler_native::NativeActions>) -> Self {
+        self.native_actions = Some(native);
         self
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "leveler-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native capability discovery and deterministic local actions over existing system apps and tools."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+tempfile = "3"
+leveler-execution = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

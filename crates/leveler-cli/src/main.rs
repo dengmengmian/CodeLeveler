@@ -21,6 +21,7 @@ mod info_cmds;
 mod init_cmd;
 mod login_cmd;
 mod mcp_lsp_cmds;
+mod native_cmd;
 mod output;
 mod permissions_cmds;
 mod remote_cmds;
@@ -320,6 +321,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             .await
         }
         Command::Doctor => cmd_doctor(layout),
+        Command::Native(command) => Ok(native_cmd::cmd_native(command).await),
         Command::Permissions(pc) => cmd_permissions(layout, pc),
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,

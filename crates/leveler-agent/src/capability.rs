@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub enum CapabilityId {
     Browser,
     ComputerUse,
+    NativeActions,
     MultiAgent,
     Skills,
     CodeIntelligence,
@@ -31,9 +32,10 @@ pub enum CapabilityId {
     ExternalTools,
 }
 impl CapabilityId {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Browser,
         Self::ComputerUse,
+        Self::NativeActions,
         Self::MultiAgent,
         Self::Skills,
         Self::CodeIntelligence,
@@ -47,6 +49,7 @@ impl CapabilityId {
         match self {
             Self::Browser => "browser",
             Self::ComputerUse => "computer_use",
+            Self::NativeActions => "native_actions",
             Self::MultiAgent => "multi_agent",
             Self::Skills => "skills",
             Self::CodeIntelligence => "code_intelligence",
@@ -67,6 +70,7 @@ impl CapabilityId {
         match self {
             Self::Browser => "Browse/interact with pages",
             Self::ComputerUse => "Observe/control the desktop",
+            Self::NativeActions => "Use installed apps deterministically",
             Self::MultiAgent => "Delegate work",
             Self::Skills => "Load instructions",
             Self::CodeIntelligence => "Symbols/references/diagnostics",
@@ -83,6 +87,9 @@ pub fn tool_capability(name: &str) -> Option<CapabilityId> {
     match name {
         name if name.starts_with("browser_") => Some(CapabilityId::Browser),
         "computer_observe" | "computer_act" => Some(CapabilityId::ComputerUse),
+        "native_capabilities" | "native_action" | "native_verify" => {
+            Some(CapabilityId::NativeActions)
+        }
         "spawn_agent" => Some(CapabilityId::MultiAgent),
         "load_skill" => Some(CapabilityId::Skills),
         "find_symbol" | "read_symbol" | "find_references" | "diagnostics" | "blast_radius" => {
@@ -802,5 +809,23 @@ mod tests {
             "the goal rebind is not the session's to revoke"
         );
         assert_eq!(session.ids(), vec![CapabilityId::MultiAgent]);
+    }
+}
+
+#[cfg(test)]
+mod native_capability_tests {
+    use super::*;
+
+    #[test]
+    fn every_native_tool_belongs_to_native_actions() {
+        for tool in ["native_capabilities", "native_action", "native_verify"] {
+            assert_eq!(tool_capability(tool), Some(CapabilityId::NativeActions));
+        }
+        assert_eq!(CapabilityId::NativeActions.as_str(), "native_actions");
+        assert!(CapabilityId::ALL.contains(&CapabilityId::NativeActions));
+        assert_eq!(
+            CapabilityId::parse("native_actions"),
+            Ok(CapabilityId::NativeActions)
+        );
     }
 }

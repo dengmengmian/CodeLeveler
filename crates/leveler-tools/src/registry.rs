@@ -30,6 +30,8 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "grep",
     "list_files",
     "load_skill",
+    "native_capabilities",
+    "native_verify",
     "read_file",
     "read_project_rules",
     "read_symbol",
@@ -59,6 +61,9 @@ pub const MODEL_SURFACE_TOOLS: &[&str] = &[
     "kill_task",
     "list_files",
     "load_skill",
+    "native_action",
+    "native_capabilities",
+    "native_verify",
     "read_file",
     "read_project_rules",
     "read_symbol",
@@ -476,6 +481,9 @@ pub struct CapabilityPacks {
     /// Native desktop observation and control. Needs a platform backend built
     /// into this binary; TCC grants are reported at call time.
     pub computer_use: bool,
+    /// Deterministic actions over installed system applications. Needs a
+    /// platform backend and a live probe of the target application.
+    pub native_actions: bool,
 }
 
 impl CapabilityPacks {
@@ -490,6 +498,7 @@ impl CapabilityPacks {
         skills: false,
         browser: false,
         computer_use: false,
+        native_actions: false,
     };
 
     /// Every pack. The composition a host reaches when each capability is both
@@ -505,6 +514,7 @@ impl CapabilityPacks {
         skills: true,
         browser: true,
         computer_use: true,
+        native_actions: true,
     };
 
     /// Mechanical intersection of independently selected pack sets.
@@ -524,6 +534,7 @@ impl CapabilityPacks {
             skills: self.skills && other.skills,
             browser: self.browser && other.browser,
             computer_use: self.computer_use && other.computer_use,
+            native_actions: self.native_actions && other.native_actions,
         }
     }
 }
@@ -635,6 +646,16 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
     {
         registry.register(Arc::new(tools::ComputerObserveTool::new(computer.clone())));
         registry.register(Arc::new(tools::ComputerActTool::new(computer.clone())));
+    }
+    // Native actions need the compiled backend and the live application
+    // probe. The probe is a call-time fact reported by `native_capabilities`,
+    // so a missing account or a denied TCC grant does not hide the tools.
+    if packs.native_actions
+        && let Some(native) = &capabilities.native_actions
+    {
+        registry.register(Arc::new(tools::NativeCapabilitiesTool::new(native.clone())));
+        registry.register(Arc::new(tools::NativeActionTool::new(native.clone())));
+        registry.register(Arc::new(tools::NativeVerifyTool::new(native.clone())));
     }
     registry
 }
@@ -857,15 +878,18 @@ mod tests {
             "browser_inspect",
             "computer_observe",
             "computer_act",
+            "native_capabilities",
+            "native_action",
+            "native_verify",
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
         // core 12 + intel 5 + vcs 2 + web 2 + media 1 + skills 1
-        // + browser 3 + computer use 2 = 28. The harness controls
+        // + browser 3 + computer use 2 + native actions 3 = 31. The harness controls
         // (`update_plan` and the injected ones) are not in this count: they are
         // not a capability the host composes, so
         // `leveler_agent::register_harness_controls` adds them on top.
-        assert_eq!(names.len(), 28);
+        assert_eq!(names.len(), 31);
     }
 
     /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is
@@ -905,13 +929,14 @@ mod tests {
                 None,
             )))
             .with_computer_use(std::sync::Arc::new(leveler_cua::ComputerUse::new()))
+            .with_native_actions(std::sync::Arc::new(leveler_native::NativeActions::new()))
     }
 
     /// The mirror of the test above: a pack without the handle it is built
-    /// from composes nothing. Three packs work this way — search needs a key,
-    /// the browser needs a browser, computer use needs the platform backend —
-    /// and `default_registry` has none, so this is also what every test entry
-    /// point sees.
+    /// from composes nothing. Four packs work this way — search needs a key,
+    /// the browser needs a browser, computer use needs the platform backend,
+    /// native actions need the host implementation — and `default_registry`
+    /// has none, so this is also what every test entry point sees.
     #[test]
     fn a_pack_without_its_handle_composes_nothing() {
         let configured = model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
@@ -922,8 +947,9 @@ mod tests {
             .len();
         assert_eq!(
             bare,
-            configured - 6,
-            "web_search, the three browser tools and the two computer tools moved"
+            configured - 9,
+            "web_search, the three browser tools, the two computer tools and \
+             the three native tools moved"
         );
         let names: Vec<String> = default_registry()
             .definitions()
@@ -937,6 +963,9 @@ mod tests {
             "browser_inspect",
             "computer_observe",
             "computer_act",
+            "native_action",
+            "native_capabilities",
+            "native_verify",
         ] {
             assert!(
                 !names.iter().any(|n| n == absent),

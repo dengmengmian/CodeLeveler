@@ -107,6 +107,13 @@ pub enum Command {
     /// Diagnose the environment, tooling, and configuration.
     Doctor,
 
+    /// Probe and run deterministic actions over installed system applications.
+    ///
+    /// This path is direct: no model, daemon, session or agent loop is
+    /// involved. The action still runs through the host execution authority.
+    #[command(subcommand)]
+    Native(NativeCommand),
+
     /// Start the browser WebUI server for this repository.
     Web {
         /// Bind address (loopback only; defaults to an ephemeral port).
@@ -755,6 +762,41 @@ pub enum BackgroundJournalCommand {
     Abandon { task_id: String },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum NativeCommand {
+    /// Probe what this machine can actually do right now.
+    ///
+    /// Live probe: it does not launch applications, request permission or
+    /// send anything.
+    Capabilities {
+        /// Print the structured report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one deterministic action without a model, daemon or session.
+    Action {
+        /// Action id: mail.draft.create, mail.send.open_ui, mail.send.submit
+        /// or mail.sent.check.
+        #[arg(long)]
+        action: String,
+        /// One plain recipient address.
+        #[arg(long)]
+        to: String,
+        /// Exact subject; line breaks are rejected.
+        #[arg(long)]
+        subject: String,
+        /// Message body, empty when omitted. Not used by mail.sent.check.
+        #[arg(long)]
+        body: Option<String>,
+        /// Read the body from a UTF-8 file instead of --body.
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        /// Print the structured outcome as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1351,5 +1393,48 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod native_command_tests {
+    use clap::Parser;
+
+    #[test]
+    fn native_capabilities_and_action_parse() {
+        let capabilities =
+            super::Cli::try_parse_from(["leveler", "native", "capabilities", "--json"]);
+        assert!(capabilities.is_ok(), "{capabilities:?}");
+        let action = super::Cli::try_parse_from([
+            "leveler",
+            "native",
+            "action",
+            "--action",
+            "mail.send.submit",
+            "--to",
+            "controlled@example.test",
+            "--subject",
+            "hello",
+            "--body",
+            "world",
+            "--json",
+        ]);
+        assert!(action.is_ok(), "{action:?}");
+        let conflict = super::Cli::try_parse_from([
+            "leveler",
+            "native",
+            "action",
+            "--action",
+            "mail.send.submit",
+            "--to",
+            "controlled@example.test",
+            "--subject",
+            "hello",
+            "--body",
+            "world",
+            "--body-file",
+            "body.txt",
+        ]);
+        assert!(conflict.is_err(), "body and body-file must conflict");
     }
 }

@@ -24,6 +24,7 @@ leveler-skills = { workspace = true }
 leveler-tools = { workspace = true }
 leveler-browser = { workspace = true }
 leveler-cua = { workspace = true }
+leveler-native = { workspace = true }
 leveler-agent = { workspace = true }
 leveler-vcs = { workspace = true }
 leveler-engine = { workspace = true }
