@@ -114,6 +114,15 @@ pub enum Command {
     #[command(subcommand)]
     Native(NativeCommand),
 
+    /// Manage user-global scheduled automation.
+    ///
+    /// A schedule is one shell command on one trigger. A dispatcher connects
+    /// to the workspace's ordinary runtime as a local client, so the run
+    /// reuses the same Boot, ownership, permission and storage paths as an
+    /// interactive session — and never starts a second agent runtime.
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
+
     /// Start the browser WebUI server for this repository.
     Web {
         /// Bind address (loopback only; defaults to an ephemeral port).
@@ -797,6 +806,87 @@ pub enum NativeCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    /// Add a user-global scheduled action.
+    Add {
+        /// Display name.
+        #[arg(long)]
+        name: String,
+        /// Workspace whose runtime executes the action (defaults to the
+        /// current repository).
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// The exact shell command.
+        #[arg(long)]
+        command: String,
+        /// Run once at this RFC3339 instant.
+        #[arg(long, value_name = "RFC3339", conflicts_with = "every")]
+        at: Option<String>,
+        /// Run every N seconds.
+        #[arg(long, value_name = "SECONDS", conflicts_with = "at")]
+        every: Option<u64>,
+        /// First instant for --every (defaults to now).
+        #[arg(long, value_name = "RFC3339", requires = "every")]
+        anchor: Option<String>,
+        /// Permission profile the action's session runs under.
+        #[arg(long = "permission", value_enum, default_value = "assisted")]
+        mode: RunMode,
+        /// Model reference for the session (unused by a shell action).
+        #[arg(long)]
+        model: Option<String>,
+        /// Give up waiting for the action's terminal record after this many
+        /// seconds; the run becomes unknown rather than retried.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Print the created definition as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List schedule definitions.
+    List {
+        /// Print the definitions as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show run history, newest first.
+    Runs {
+        /// Only runs of this definition id.
+        #[arg(long)]
+        definition: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print the runs as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a definition and its occurrence/run history.
+    Remove {
+        /// Definition id.
+        id: String,
+    },
+    /// Run one dispatch pass: recover expired leases, then execute due
+    /// occurrences. This is the short-lived path an OS timer can invoke.
+    Dispatch {
+        /// Maximum occurrences to execute in this pass.
+        #[arg(long, default_value_t = 4)]
+        max: usize,
+        /// Print the summary as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stay resident and dispatch due occurrences as they become due. This is
+    /// the persistent lightweight scheduler: one process, no second runtime.
+    Serve {
+        /// Maximum occurrences to execute per pass.
+        #[arg(long, default_value_t = 4)]
+        max: usize,
+        /// Longest sleep between passes, in seconds.
+        #[arg(long, default_value_t = 30)]
+        poll_secs: u64,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -833,6 +923,97 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::*;
+
+    #[test]
+    fn schedule_subcommands_parse() {
+        let cli = parse(&[
+            "leveler",
+            "schedule",
+            "add",
+            "--name",
+            "nightly",
+            "--command",
+            "printf ok",
+            "--every",
+            "60",
+            "--permission",
+            "full-access",
+            "--timeout",
+            "30",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Command::Schedule(ScheduleCommand::Add {
+                name,
+                command,
+                every,
+                mode,
+                timeout,
+                json,
+                ..
+            })) => {
+                assert_eq!(name, "nightly");
+                assert_eq!(command, "printf ok");
+                assert_eq!(every, Some(60));
+                assert!(matches!(mode, RunMode::FullAccess));
+                assert_eq!(timeout, 30);
+                assert!(json);
+            }
+            other => panic!("expected Schedule::Add, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "leveler",
+                "schedule",
+                "add",
+                "--name",
+                "x",
+                "--command",
+                "true",
+                "--at",
+                "2026-01-01T00:00:00Z",
+                "--every",
+                "60",
+            ])
+            .is_err(),
+            "--at and --every are mutually exclusive"
+        );
+
+        let dispatch = parse(&["leveler", "schedule", "dispatch", "--max", "2", "--json"]);
+        assert!(matches!(
+            dispatch.command,
+            Some(Command::Schedule(ScheduleCommand::Dispatch { max: 2, json: true }))
+        ));
+
+        let serve = parse(&["leveler", "schedule", "serve", "--poll-secs", "5"]);
+        assert!(matches!(
+            serve.command,
+            Some(Command::Schedule(ScheduleCommand::Serve {
+                max: 4,
+                poll_secs: 5,
+            }))
+        ));
+
+        let runs = parse(&[
+            "leveler",
+            "schedule",
+            "runs",
+            "--definition",
+            "abc",
+            "--limit",
+            "3",
+            "--json",
+        ]);
+        assert!(matches!(
+            runs.command,
+            Some(Command::Schedule(ScheduleCommand::Runs {
+                limit: 3,
+                json: true,
+                ..
+            }))
+        ));
+    }
 
     #[test]
     fn retired_memory_subcommand_is_rejected() {

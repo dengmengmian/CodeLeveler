@@ -28,6 +28,7 @@ mod remote_cmds;
 mod remote_invite;
 mod render;
 mod run_cmds;
+mod schedule_cmd;
 mod sessions_cmd;
 mod skills_cmds;
 mod trace_cmd;
@@ -199,6 +200,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         return desktop_bridge::run(args.config_dir).await;
     }
     let config_overridden = args.config_dir.is_some();
+    let schedule_config_dir = args.config_dir.clone();
     let no_workspace = matches!(
         &args.command,
         Some(Command::Serve {
@@ -322,6 +324,9 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Doctor => cmd_doctor(layout),
         Command::Native(command) => Ok(native_cmd::cmd_native(command).await),
+        Command::Schedule(command) => schedule_cmd::cmd_schedule(layout, schedule_config_dir, command)
+            .await
+            .map(|()| std::process::ExitCode::SUCCESS),
         Command::Permissions(pc) => cmd_permissions(layout, pc),
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,

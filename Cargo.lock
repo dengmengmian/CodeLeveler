@@ -2047,6 +2047,7 @@ dependencies = [
  "leveler-remote-agent",
  "leveler-remote-protocol",
  "leveler-runtime-host",
+ "leveler-schedule",
  "leveler-storage",
  "leveler-test-support",
  "leveler-tools",
@@ -2386,6 +2387,29 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "leveler-schedule"
+version = "1.0.23"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "leveler-app",
+ "leveler-client-protocol",
+ "leveler-core",
+ "leveler-execution",
+ "leveler-local-transport",
+ "leveler-project",
+ "leveler-test-support",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 

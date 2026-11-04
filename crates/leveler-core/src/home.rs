@@ -81,6 +81,13 @@ impl LevelerHome {
         self.root.join("state")
     }
 
+    /// Global schedule definitions, occurrences and run history. User-global
+    /// because a schedule can exist before any project is open; the workspace
+    /// it names selects the runtime that executes it.
+    pub fn schedules_database(&self) -> PathBuf {
+        self.state_dir().join("schedules.db")
+    }
+
     /// Durable state for the source with no primary workspace.
     pub fn no_workspace_state_dir(&self) -> PathBuf {
         self.state_dir().join("no-workspace")

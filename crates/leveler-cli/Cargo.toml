@@ -22,6 +22,7 @@ leveler-model = { workspace = true }
 leveler-provider = { workspace = true }
 leveler-storage = { workspace = true }
 leveler-project = { workspace = true }
+leveler-schedule = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-agent = { workspace = true }
