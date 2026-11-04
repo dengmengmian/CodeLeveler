@@ -50,20 +50,21 @@ struct Input {
     /// Working directory relative to the workspace root. Defaults to ".".
     #[serde(default)]
     cwd: Option<String>,
-    /// Execution deadline in seconds. Leave it unset for an ordinary command:
-    /// the run then blocks for up to 120 seconds and, if it is still running, is
-    /// moved to the background without being killed at that point. Set it when
-    /// the command itself must not run longer than this — the deadline follows
-    /// the process, including after a move to the background, and is counted
-    /// from process start.
+    /// Execution deadline in seconds. A foreground call waits for the command
+    /// until it exits or this deadline ends it; the deadline is counted from
+    /// process start. A deadline up to the 120-second foreground ceiling ends
+    /// the command in this call. A longer deadline is waited for up to that
+    /// ceiling, then follows the process after it moves to the background.
+    /// Leave it unset for an ordinary command: the call waits 15 seconds, then
+    /// moves a still-running command to the background without killing it.
     #[serde(default)]
     timeout_seconds: Option<u64>,
     /// When true, start the process in the background immediately and return a
     /// task_id. Use get_task / wait_task / kill_task to manage it. This is the
     /// explicit way to start a long-lived process (an HTTP server, a watcher):
-    /// a background task has no execution deadline. A foreground run still going
-    /// after 15 seconds is moved to the background with lifetime `goal`; that
-    /// result is not a successful exit.
+    /// a background task has no execution deadline. A foreground run with no
+    /// `timeout_seconds` still going after 15 seconds is moved to the
+    /// background with lifetime `goal`; that result is not a successful exit.
     #[serde(default)]
     background: Option<bool>,
     /// Cleanup boundary for a background process. Defaults to `goal`, which
@@ -130,14 +131,16 @@ impl Tool for RunCommandTool {
          killed. Use `session` across runtime updates until its session is deleted; \
          use `persistent` only when the user explicitly wants a service to \
          survive runtime updates under the independent execution host. \
-         A foreground command still running after 15 seconds is moved to the \
-         background with the lifetime you set (`goal` by default) and this tool \
-         returns a task id while the process keeps running. That is not success, and the move does not \
-         kill it: `timeout_seconds` is an execution deadline only when you set \
-         it (counted from process start, following the process into the \
-         background). With it unset, the default 120s bounds only this call. \
-         `wait_task` reads the eventual result and does not kill the \
-         task when its own bound expires."
+         A foreground command with no `timeout_seconds` still running after 15 \
+         seconds is moved to the background with the lifetime you set (`goal` by \
+         default) and this tool returns a task id while the process keeps \
+         running. That is not success, and the move does not kill it. Set \
+         `timeout_seconds` to wait for a command: a deadline up to the \
+         120-second foreground ceiling ends it in this call; a longer deadline \
+         is waited for up to that ceiling, then the still-running process moves \
+         to the background and the deadline continues to follow it. `wait_task` \
+         reads the eventual result and does not kill the task when its own bound \
+         expires."
     }
 
     fn input_schema(&self) -> serde_json::Value {

@@ -256,18 +256,18 @@ impl CommandExecution {
     /// Run a program in the foreground: the shared path both command tools take
     /// once they have decoded their own arguments.
     ///
-    /// When the process is still the foreground driver's after
-    /// [`FOREGROUND_HANDOFF_AFTER`] and this call is not bounded below that
-    /// window, the same process moves to the background registry and this call
-    /// returns while it runs.
+    /// The wait before a still-running process moves to the background registry
+    /// is [`foreground_wait`]: 15 seconds when the caller set no execution
+    /// deadline, or the caller's own deadline up to [`DEFAULT_TIMEOUT_SECS`]
+    /// when it did. A deadline at or below that ceiling ends the command in
+    /// this call; a longer deadline continues to follow the process after the
+    /// handoff.
     ///
-    /// Two durations are kept apart there:
-    ///
-    /// - The caller's `timeout_seconds` is an EXECUTION deadline. It follows the
-    ///   process into the registry, still counted from process start.
-    /// - [`DEFAULT_TIMEOUT_SECS`] is only this call's WAIT budget when the caller
-    ///   set no deadline. It bounds how long one tool call blocks, not how long
-    ///   the process may live: a 20-minute service is not killed at 2 minutes.
+    /// The caller's `timeout_seconds` is an EXECUTION deadline, never merely a
+    /// wait budget: it is still counted from process start after a handoff.
+    /// [`DEFAULT_TIMEOUT_SECS`] is only this call's wait budget when the caller
+    /// set no deadline. It bounds how long one tool call blocks, not how long
+    /// the process may live: a 20-minute service is not killed at 2 minutes.
     ///
     /// A credential-bearing Git command stays here until it exits, so the staged
     /// secret is not left on disk.
@@ -426,7 +426,8 @@ impl CommandExecution {
         // The handoff is a transfer of this driver, not a second liveness check.
         // A timeout at or under the threshold kills on the original path, and a
         // staged Git credential never leaves this call.
-        let handoff = request.timeout > FOREGROUND_HANDOFF_AFTER
+        let wait = foreground_wait(caller_deadline);
+        let handoff = wait.handoff
             && !isolation
                 .as_ref()
                 .is_some_and(|iso| iso.carries_credential());
@@ -442,6 +443,7 @@ impl CommandExecution {
                 .hand_off_if_still_running(
                     request,
                     caller_deadline,
+                    wait.budget,
                     handoff_lifetime,
                     cancellation,
                     context.output.clone(),
@@ -459,6 +461,7 @@ impl CommandExecution {
                         &shown_program,
                         &shown_args,
                         &task_id,
+                        wait.budget,
                         caller_deadline,
                         handoff_lifetime.unwrap_or(BackgroundTaskLifetime::Goal),
                     ));
@@ -652,7 +655,8 @@ impl CommandExecution {
         Ok(out)
     }
 
-    /// Drive one foreground command that may be adopted at [`FOREGROUND_HANDOFF_AFTER`].
+    /// Drive one foreground command for `wait_budget`, then adopt it into the
+    /// background registry if it is still running.
     ///
     /// The driver's own select decides the race: process exit and cancellation
     /// beat the handoff. This function does not probe the process and then adopt.
@@ -660,6 +664,7 @@ impl CommandExecution {
         &self,
         request: ProcessRequest,
         caller_deadline: Option<Duration>,
+        wait_budget: Duration,
         handoff_lifetime: Option<BackgroundTaskLifetime>,
         cancellation: CancellationToken,
         live: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
@@ -671,7 +676,7 @@ impl CommandExecution {
         let timer = {
             let handoff = handoff.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(FOREGROUND_HANDOFF_AFTER).await;
+                tokio::time::sleep(wait_budget).await;
                 handoff.cancel();
             })
         };
@@ -775,6 +780,7 @@ fn foreground_handoff_output(
     program: &str,
     args: &[String],
     task_id: &str,
+    wait_budget: Duration,
     deadline: Option<Duration>,
     lifetime: BackgroundTaskLifetime,
 ) -> ToolOutput {
@@ -812,7 +818,7 @@ fn foreground_handoff_output(
          The process is still running. This is not a successful exit.\n\
          {lifetime_line}\
          Use wait_task to read the final result, get_task to observe it, or kill_task to stop it.\n",
-        FOREGROUND_HANDOFF_AFTER.as_secs(),
+        wait_budget.as_secs(),
         lifetime.as_str(),
         lifetime.stop_condition(),
     ))
@@ -907,6 +913,40 @@ pub(super) const MAX_TIMEOUT_SECS: u64 = 3600;
 /// process is adopted by the background registry. This is not a timeout and
 /// not a failure: the execution timeout still starts at process spawn.
 const FOREGROUND_HANDOFF_AFTER: Duration = Duration::from_secs(15);
+
+/// How long one foreground call waits before the process is moved to the
+/// background registry, and whether that move is possible at all.
+///
+/// A caller that set no execution deadline gets the short handoff window: the
+/// call stays responsive, and the process is hosted by the task registry when
+/// it outlives that window. A caller that set a deadline has already said how
+/// long the command may run; the call waits for that command up to the default
+/// 120-second ceiling, then moves a still-running process to the registry so
+/// the deadline can continue there. A deadline at or below the ceiling is
+/// fully covered by the foreground wait: the deadline itself ends the command,
+/// so no handoff is involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForegroundWait {
+    handoff: bool,
+    budget: Duration,
+}
+
+fn foreground_wait(caller_deadline: Option<Duration>) -> ForegroundWait {
+    match caller_deadline {
+        Some(deadline) if deadline <= Duration::from_secs(DEFAULT_TIMEOUT_SECS) => ForegroundWait {
+            handoff: false,
+            budget: deadline,
+        },
+        Some(_) => ForegroundWait {
+            handoff: true,
+            budget: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        },
+        None => ForegroundWait {
+            handoff: true,
+            budget: FOREGROUND_HANDOFF_AFTER,
+        },
+    }
+}
 
 /// Output already streamed before a handoff, kept so the background log does
 /// not start after the transfer. Only the tail is retained.
@@ -1462,7 +1502,7 @@ mod foreground_handoff_tests {
                 "sh",
                 vec!["-c".into(), "sleep 16".into()],
                 Some("."),
-                Some(60),
+                None,
                 Some(BackgroundTaskLifetime::Session),
                 ctx,
                 CancellationToken::new(),
@@ -1498,7 +1538,7 @@ mod foreground_handoff_tests {
                     "echo before; sleep 16; echo hi > created.txt".into(),
                 ],
                 Some("."),
-                Some(60),
+                None,
                 ctx.clone(),
                 CancellationToken::new(),
             )
@@ -1557,11 +1597,12 @@ mod foreground_handoff_tests {
             wait.content
         );
     }
-    /// LT-02 on the adopted path: a `timeout_seconds` the caller set is an
-    /// execution deadline, and the move to the background does not extend it.
+    /// LT-02: a `timeout_seconds` the caller set is the foreground execution
+    /// bound. A deadline at or below the default wait ceiling ends the command
+    /// in this call; it does not leave a background task behind.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_caller_deadline_still_ends_an_adopted_command() {
+    async fn a_caller_deadline_ends_the_foreground_command() {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, reg, commands) = harness(dir.path());
         let started = Instant::now();
@@ -1570,23 +1611,8 @@ mod foreground_handoff_tests {
                 "sh",
                 vec!["-c".into(), "sleep 60".into()],
                 Some("."),
-                // Longer than the 15s handoff, short enough to observe.
+                // Longer than the 15s handoff, within the foreground ceiling.
                 Some(17),
-                ctx.clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            out.content
-                .contains("execution deadline: timeout_seconds=17"),
-            "the handoff must state the consequence of the deadline: {out:?}"
-        );
-        let task_id = task_id_of(&out.content).expect("task id");
-        assert_eq!(out.metadata["deadline_seconds"], 17, "{out:?}");
-        let wait = WaitTaskTool::new(reg.clone())
-            .execute(
-                serde_json::json!({"task_id": task_id, "timeout_seconds": 20}),
                 ctx,
                 CancellationToken::new(),
             )
@@ -1597,13 +1623,15 @@ mod foreground_handoff_tests {
             "the deadline must fire on schedule: {:?}",
             started.elapsed()
         );
+        assert_eq!(out.metadata["timed_out"], true, "{out:?}");
         assert!(
-            wait.content.contains("timeout_seconds=17"),
-            "the terminal result must name the deadline that ended it: {wait:?}"
+            out.content.contains("[timed out after 17s]"),
+            "the caller's deadline ends the command: {out:?}"
         );
+        assert!(task_id_of(&out.content).is_none(), "{out:?}");
         assert!(
             reg.active_snapshots().await.is_empty(),
-            "an execution deadline ends the task: {wait:?}"
+            "a deadline within the foreground window must not create a task: {out:?}"
         );
     }
 
@@ -1678,5 +1706,40 @@ mod foreground_handoff_tests {
         assert_eq!(out.metadata["status"], "running");
         assert!(out.content.contains("execution deadline: none"), "{out:?}");
         reg.kill(&task_id).await.expect("stop it explicitly");
+    }
+
+    /// The foreground wait is bounded: a caller deadline up to the default
+    /// ceiling is served in the call, a longer one moves to the registry at
+    /// the ceiling, and no deadline keeps the short handoff window.
+    #[test]
+    fn the_foreground_wait_is_bounded_and_keeps_long_deadlines() {
+        assert_eq!(
+            foreground_wait(None),
+            ForegroundWait {
+                handoff: true,
+                budget: FOREGROUND_HANDOFF_AFTER,
+            }
+        );
+        assert_eq!(
+            foreground_wait(Some(Duration::from_secs(17))),
+            ForegroundWait {
+                handoff: false,
+                budget: Duration::from_secs(17),
+            }
+        );
+        assert_eq!(
+            foreground_wait(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS))),
+            ForegroundWait {
+                handoff: false,
+                budget: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            }
+        );
+        assert_eq!(
+            foreground_wait(Some(Duration::from_secs(300))),
+            ForegroundWait {
+                handoff: true,
+                budget: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            }
+        );
     }
 }

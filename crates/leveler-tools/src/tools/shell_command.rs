@@ -29,11 +29,13 @@ struct Input {
     /// Accepts `workdir` as an alias for `cwd`.
     #[serde(default, alias = "workdir")]
     cwd: Option<String>,
-    /// Execution deadline in seconds. Leave it unset for an ordinary command:
-    /// the run then blocks for up to 120 seconds and, if it is still running, is
-    /// moved to the background without being killed at that point. Set it when
-    /// the command itself must not run longer than this — the deadline follows
-    /// the process, including after a move to the background.
+    /// Execution deadline in seconds. A foreground call waits for the command
+    /// until it exits or this deadline ends it; the deadline is counted from
+    /// process start. A deadline up to the 120-second foreground ceiling ends
+    /// the command in this call. A longer deadline is waited for up to that
+    /// ceiling, then follows the process after it moves to the background.
+    /// Leave it unset for an ordinary command: the call waits 15 seconds, then
+    /// moves a still-running command to the background without killing it.
     #[serde(default)]
     timeout_seconds: Option<u64>,
     /// When true, start the command in the background immediately and return a
@@ -76,10 +78,14 @@ impl Tool for ShellCommandTool {
          system `/tmp`; other host paths are not writable. Reads of system and toolchain paths \
          are allowed. Writes outside the workspace, other user directories, \
          and readonly roots require approval outside full-access mode. \
-         A command still running after 15 seconds is moved to the background \
-         and this tool returns a task id while the process keeps running. That is \
-         not success, and it is not killed by the 15s/120s wait budget: \
-         `timeout_seconds` is a deadline only when you set it. Set `background` \
+         A foreground command with no `timeout_seconds` still running after 15 \
+         seconds is moved to the background and this tool returns a task id \
+         while the process keeps running. That is not success, and the move \
+         does not kill it. Set `timeout_seconds` to wait for a command: a \
+         deadline up to the 120-second foreground ceiling ends it in this call; \
+         a longer deadline is waited for up to that ceiling, then the \
+         still-running process moves to the background and the deadline \
+         continues to follow it. Set `background` \
          true to start a long-lived service in the background immediately. \
          `background_lifetime` decides what stops it — `goal` (the default) stops \
          it when the goal finishes, so a service the user asked to keep running \

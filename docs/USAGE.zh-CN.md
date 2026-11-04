@@ -22,7 +22,7 @@
 
 点击底部后台任务入口可以查看任务、输出或单独停止任务。Esc 只返回列表；连接后台服务时，关闭终端也不会停止后台任务。
 
-前台命令超过 15 秒仍没结束时，会自动转入后台并返回 `task_id`：这不是成功退出，之后用 `get_task` / `wait_task` 观察、用 `kill_task` 停止。`timeout_seconds` 只有在调用方明确设置时才是进程的执行期限（从进程启动计时，转入后台后仍然有效）；没有设置时，默认的 120 秒只限制这一次调用等待多久，不会杀掉运行中的服务。需要长期运行的服务用 `background=true` 显式启动，它的生命周期由 `background_lifetime`（默认 `goal`，可选 `runtime` / `session` / `persistent`）决定，而不是由等待预算决定。
+未设置 `timeout_seconds` 时，前台命令超过 15 秒仍没结束会转入后台并返回 `task_id`。设置了 `timeout_seconds` 时，调用会等待命令：不超过 120 秒的期限会在本次调用内结束命令；更长的期限会先等待到 120 秒，再把仍在运行的进程转入后台，期限继续跟随该进程。转入后台不是成功退出，之后用 `get_task` / `wait_task` 观察、用 `kill_task` 停止；`timeout_seconds` 是从进程启动计时的执行期限。需要长期运行的服务用 `background=true` 显式启动，它的生命周期由 `background_lifetime`（默认 `goal`，可选 `runtime` / `session` / `persistent`）决定，而不是由等待预算决定。
 
 ## 会话与后台运行
 

@@ -22,7 +22,7 @@ Use `/thinking high` to change reasoning intensity for the session, or `/thinkin
 
 Open background tasks from the footer to inspect output or stop an individual task. Esc only returns to the list. Closing the terminal does not stop background tasks when connected to the background service.
 
-A foreground command still running after 15 seconds moves to the background and returns a `task_id`. That is not a successful exit: observe it with `get_task` / `wait_task` and stop it with `kill_task`. `timeout_seconds` is a process execution deadline only when the caller sets it (counted from process start and still applied after the move to the background). When it is not set, the 120 second default bounds how long this one call waits — it does not kill a running service. Start a long-lived service with `background=true`; its lifetime follows `background_lifetime` (`goal` by default, or `runtime` / `session` / `persistent`), not the wait budget.
+Without `timeout_seconds`, a foreground command still running after 15 seconds moves to the background and returns a `task_id`. With `timeout_seconds`, the call waits for the command: a deadline up to 120 seconds ends it in that call, and a longer deadline is waited for up to 120 seconds before the still-running process moves to the background (the deadline continues to follow it). A move is not a successful exit: observe it with `get_task` / `wait_task` and stop it with `kill_task`. `timeout_seconds` is a process execution deadline counted from process start. Start a long-lived service with `background=true`; its lifetime follows `background_lifetime` (`goal` by default, or `runtime` / `session` / `persistent`), not the wait budget.
 
 ## Sessions and background work
 
