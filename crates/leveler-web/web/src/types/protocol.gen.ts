@@ -36,6 +36,18 @@ export interface AttachmentRef {
   width?: number | null;
 }
 
+/** The build a binary was produced from. */
+export interface BuildIdentity {
+  /** Built from a modified working tree. Metadata about provenance, not an identity: use `fingerprint` to tell two builds apart. */
+  dirty?: boolean;
+  /** Deterministic digest of the exact source this artifact was built from (`revision` + the working-tree delta). Two runs of the SAME executable share it, so a dirty development build recognises itself instead of being retired on every launch; a rebuild from different source does not share it, so a true new build still replaces the old runtime. Empty for a runtime built before this field existed: those fall back to the conservative `dirty` rule. */
+  fingerprint?: string;
+  /** The source revision. `unknown` when the build had no git available — which is itself a mismatch against anything, by design. */
+  revision: string;
+  /** The package version, e.g. `0.2.0-beta.1`. */
+  version: string;
+}
+
 /** Identifies a conversation checkpoint (restore point). */
 export type CheckpointId = string;
 
@@ -331,6 +343,12 @@ export type ReasoningRetention =
   /** No historical reasoning is carried. */
   | 'none';
 
+/** The interrupted call a recovery stop refuses to guess about. */
+export interface RecoveryStop {
+  call_id: string;
+  tool: string;
+}
+
 /** Why a runtime is being asked to retire. Typed rather than a string because the updater will reuse this exact lifecycle: install an artifact, ask the running runtime to retire, verify the replacement's identity. Only the reason differs. */
 export type RestartReason =
   /** The connecting client is a different build than this runtime. */
@@ -347,6 +365,14 @@ export type RuntimeEvent =
   | { type: 'global_tasks_loaded'; index: UiGlobalTaskIndex; query_id: string; requester_session_id: SessionId }
   /** The runtime finished booting and is ready for commands. */
   | { type: 'runtime_ready' }
+  /** The build this client's stream is connected to, observed when the stream is first established. A long-lived runtime can outlive an application update, so the client must learn at connect time whether it is talking to the build it was installed with. Like [`RuntimeEvent::RuntimeReconnected`], an unknown identity proves nothing and is never a version change. */
+  | { type: 'runtime_build_observed'; runtime_build?: BuildIdentity }
+  /** The client's event stream dropped and was re-established. Emitted by the local transport, never by a runtime: it states only what the client observed — that it is connected again, and to which build. Whether the user must hear that work may have stopped, or that a restart is needed to switch versions, is a presentation decision; the transport cannot know either fact. A runtime built before [`leveler_core::BuildIdentity`] existed reports the default identity, which is UNKNOWN. Unknown is not a version change and must never be presented as one. */
+  | { type: 'runtime_reconnected'; runtime_build?: BuildIdentity; runtime_restarted?: boolean | null }
+  /** A reconnect re-established the stream but could not re-read the session. The client's view may be pre-break state; it must say so rather than present stale facts as current. */
+  | { type: 'session_resync_failed'; error: string }
+  /** The user acknowledged this session's crash window. `closed` interrupted tool calls were marked "outcome unknown, not replayed"; zero means there was nothing left to close (a retry or a concurrent acknowledgement). This states what the runtime wrote, not that any interrupted operation succeeded. */
+  | { type: 'crash_window_acknowledged'; closed: number; session_id: SessionId }
   /** A session was opened / its snapshot refreshed. */
   | { type: 'session_opened'; session: UiSessionSnapshot }
   /** Session metadata changed (model/mode/branch) without touching the transcript — refresh the header only. */
@@ -448,7 +474,7 @@ export type RuntimeEvent =
   /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
   | { type: 'turn_incomplete'; reason: string }
   /** The current turn failed. `error` is the legacy display string, kept for compatibility with older clients (CLI, Web). New presentations must prefer `failure` and must never parse `error` to decide a category, a retry, or a delivery truth. */
-  | { type: 'turn_failed'; error: string; failure?: UiFailure | null }
+  | { type: 'turn_failed'; error: string; failure?: UiFailure | null; recovery?: RecoveryStop | null }
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
   /** The logical task was explicitly cancelled by the user. Terminal: unlike [`Self::TurnCancelled`] a continuation must not reopen it. */
@@ -679,6 +705,39 @@ export interface UiApprovalRequest {
   /** The tool requesting permission (e.g. `run_command`). */
   tool: string;
 }
+
+/** One background task as the snapshot reconciles it: durable start, durable terminal record, and the live registry, never a fabricated outcome. */
+export interface UiBackgroundTaskRecord {
+  args?: string[];
+  /** The tool call that started the task, when the start was recorded. */
+  call_id?: string | null;
+  exit_code?: number | null;
+  /** The lifetime the spawn promised (`goal`, `runtime`, `session`, `persistent`). Absent on a terminal-only record written before starts were recorded. */
+  lifetime?: string | null;
+  /** The bounded output tail retained with the terminal fact. Empty when no terminal record exists; a live task's output is still a live event. */
+  output?: string;
+  output_truncated?: boolean;
+  program: string;
+  state: UiBackgroundTaskState;
+  task_id: string;
+}
+
+/** The lifecycle state of a background task, as the runtime can establish it from durable facts. This is deliberately not the process registry's status: a task that the registry no longer holds may have completed, been cancelled, or died with the runtime that hosted it. `Lost` and `Unknown` keep those apart instead of rewriting an absent record as success or failure. */
+export type UiBackgroundTaskState =
+  /** The live registry still holds the process. */
+  | 'running'
+  /** A durable terminal record says it exited zero. */
+  | 'completed'
+  /** A durable terminal record says it exited non-zero, or exited without a code. */
+  | 'failed'
+  /** A durable terminal record says it was stopped by a user/agent cancel or session cleanup. */
+  | 'cancelled'
+  /** The task started, but the boot that hosted it is gone and no terminal record exists. The process may have died with that runtime; nothing here claims either completion or failure. */
+  | 'lost'
+  /** No live entry and no terminal record, and the owning boot cannot be proven gone (or the start carries no attribution). State unknown. */
+  | 'unknown'
+  /** Two durable starts share one task id. Neither the live process nor a terminal record can be attributed to one of them safely, so both stay unclassified rather than guessing. */
+  | 'conflict';
 
 /** A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git. */
 export interface UiCheckpoint {
@@ -928,6 +987,22 @@ export interface UiHistoryEntry {
   turn_start?: boolean;
 }
 
+/** How much the runtime can prove about an interrupted tool call's owner. */
+export type UiInterruptedCallState =
+  /** The runtime that owned the turn is provably gone, so the call is no longer executing here. Its side effect may still have completed, or left an orphaned process; the outcome is unknown either way. */
+  | 'interrupted'
+  /** The owning turn still exists, but its runtime cannot be proven dead or alive. The call may still be executing. Never shown as interrupted, completed, or failed. */
+  | 'unknown';
+
+/** A tool call that started but never recorded an outcome. This is the crash window's evidence: a `tool_call_started` without a matching `tool_call_finished`. The next turn is refused until the user acknowledges it, because the call may already have produced its side effect and replaying it would duplicate that effect. The snapshot carries the list so a client that just reconnected can show the problem without first attempting a turn. */
+export interface UiInterruptedToolCall {
+  call_id: string;
+  /** The call was still waiting for an approval when the runtime died. Its side effect had not started; the user still has to acknowledge that the recovery decision is theirs. */
+  pending_approval?: boolean;
+  state?: UiInterruptedCallState;
+  tool: string;
+}
+
 /** What one lane of a session spent. `lane` is `main`, `children` or `total`. */
 export interface UiLaneAccounting {
   cached_input_tokens?: number | null;
@@ -1131,6 +1206,8 @@ export interface UiSessionSnapshot {
   active_tools?: UiActiveToolCall[];
   /** Models the user can switch to (for the model picker, ). */
   available_models?: ModelRef[];
+  /** Every background task the durable log knows for this session, including the ones the live registry no longer holds. A task that vanished with a crashed runtime appears as `lost`, never as completed and never as a silently dropped record. Additive: an older runtime reports none. */
+  background_tasks?: UiBackgroundTaskRecord[];
   /** VCS branch, if the repository is a git repo. */
   branch?: string | null;
   checkpoints?: UiCheckpoint[];
@@ -1147,6 +1224,8 @@ export interface UiSessionSnapshot {
   goal: string;
   history?: UiSessionHistory | null;
   id: SessionId;
+  /** Tool calls whose outcome a crash left unknown. Non-empty means the next turn is blocked behind the crash-recovery gate until the user acknowledges it; nothing is replayed by that acknowledgement. Additive: an older runtime reports none. */
+  interrupted_tool_calls?: UiInterruptedToolCall[];
   /** The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet). */
   last_sequence?: number | null;
   messages: UiMessage[];
@@ -1373,6 +1452,8 @@ export type ClientCommand =
   | { type: 'cancel_child'; child_id: string; session_id: SessionId }
   /** Stop ONE running tool call of the session's turn (for a command, its whole process tree). The call settles with its own stop outcome; the turn keeps running. Rejected when no such call is executing. */
   | { type: 'cancel_tool_call'; call_id: ToolCallId; session_id: SessionId }
+  /** Acknowledge the session's crash window: close every tool call that started but never recorded an outcome with an explicit "outcome unknown, not replayed" marker, so the next turn may run. This is the interactive counterpart of `run --resume --confirm-recovery`. It asserts only that the user inspected the workspace; it never turns an unknown result into success, never replays a call, and is refused while a turn is executing. The runtime answers with [`crate::RuntimeEvent::CrashWindowAcknowledged`] and a fresh snapshot. */
+  | { type: 'acknowledge_crash_window'; session_id: SessionId }
   /** Resolve a pending permission request . */
   | { type: 'approval_decision'; decision: ApprovalDecision; request_id: ApprovalId }
   /** Answer a pending clarification (spec §35). An empty answer means "skip". */
