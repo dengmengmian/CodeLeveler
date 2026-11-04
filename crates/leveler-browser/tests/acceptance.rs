@@ -60,6 +60,12 @@ fn session() -> BrowserSessionId {
 
 /// The first navigate of a test, which is also where a browser is started.
 ///
+/// A browser process on a loaded runner can stop answering its first
+/// navigation: the protocol connection is up, but `Page.navigate` never
+/// returns. That is an environment failure rather than a product result, so
+/// one fresh browser process is tried before the test fails. The attempt is
+/// printed, so a test that needed it never reads as a first-try pass.
+///
 /// A prerequisite only the user can satisfy — Safari's Remote Automation
 /// toggle — surfaces here rather than from `availability`, so this is where a
 /// run turns into a SKIP. `false` means the test printed SKIP and must return;
@@ -76,6 +82,18 @@ async fn started(
         Err(leveler_browser::BrowserError::Unavailable(why)) => {
             println!("SKIP {test}: {why}");
             false
+        }
+        Err(e @ leveler_browser::BrowserError::Timeout { .. }) => {
+            println!("RETRY {test}: first navigate did not answer: {e}");
+            b.shutdown().await;
+            match b.navigate(s, Some(p), url).await {
+                Ok(_) => true,
+                Err(leveler_browser::BrowserError::Unavailable(why)) => {
+                    println!("SKIP {test}: {why}");
+                    false
+                }
+                Err(e) => panic!("{test}: navigate failed after one retry: {e}"),
+            }
         }
         Err(e) => panic!("{test}: navigate failed: {e}"),
     }
