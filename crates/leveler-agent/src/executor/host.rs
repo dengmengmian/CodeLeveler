@@ -3596,12 +3596,15 @@ mod authorize_tests {
             .unwrap();
         assert!(init.status.success(), "git fixture setup failed: {init:?}");
 
-        // A global credential helper that answers for any host, so the
-        // explicit URL's host has a stored credential.
+        // Model a helper inherited from system Git config ahead of the
+        // fixture helper, without accessing the host credential store.
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join(".gitconfig"),
-            "[credential]\n\thelper = \"!f() { echo username=leveler-test; echo password=s3cret; }; f\"\n",
+            "[credential]\n\
+             \thelper = \"!f() { echo quit=true; }; f\"\n\
+             \thelper =\n\
+             \thelper = \"!f() { echo username=leveler-test; echo password=s3cret; }; f\"\n",
         )
         .unwrap();
         // HOME only: the install-less test process's `leveler_core::environment()`

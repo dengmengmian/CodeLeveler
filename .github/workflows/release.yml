@@ -64,6 +64,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.guard.outputs.version }}
+      commit: ${{ steps.guard.outputs.commit }}
       tag: ${{ steps.guard.outputs.tag }}
       prerelease: ${{ steps.guard.outputs.prerelease }}
     steps:
@@ -103,6 +104,7 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$head" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
           case "$version" in
             *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
@@ -259,6 +261,84 @@ jobs:
           if ($entries -notmatch "leveler-confine\.exe") { throw "archive is missing leveler-confine.exe" }
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+
+      # Execute the archived bytes on the existing runners before upload.
+      # Intel macOS uses Rosetta when available on the arm64 build runner.
+      - name: Install and smoke test archive (unix)
+        if: runner.os != 'Windows'
+        timeout-minutes: 3
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          COMMIT: ${{ needs.version.outputs.commit }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="leveler-v${VERSION}-${TARGET}"
+          (
+            cd dist
+            if command -v sha256sum >/dev/null; then
+              sha256sum -c "${archive}.tar.gz.sha256"
+            else
+              shasum -a 256 -c "${archive}.tar.gz.sha256"
+            fi
+          )
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          tar -xzf "dist/${archive}.tar.gz" -C "$scratch"
+          test -x "$scratch/${archive}/leveler"
+          mkdir "$scratch/bin"
+          install -m 755 "$scratch/${archive}/leveler" "$scratch/bin/leveler"
+          smoke=("$scratch/bin/leveler")
+          if [[ "$TARGET" == x86_64-apple-darwin && "$(uname -m)" == arm64 ]]; then
+            if ! arch -x86_64 /usr/bin/true; then
+              echo "::warning::NOT_VERIFIED: Intel macOS archive requires Rosetta on this runner"
+              echo "Intel macOS archive execution: NOT_VERIFIED (Rosetta unavailable)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            smoke=(arch -x86_64 "${smoke[@]}")
+          fi
+          actual="$("${smoke[@]}" --version)"
+          printf 'Installed archive version: %s\n' "$actual"
+          test "$actual" = "$VERSION (${COMMIT:0:12})"
+          "${smoke[@]}" completions bash > "$scratch/completions"
+          test -s "$scratch/completions"
+
+      - name: Install and smoke test archive (windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          COMMIT: ${{ needs.version.outputs.commit }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $name = "leveler-v$env:VERSION-$env:TARGET"
+          $archive = "dist/$name.zip"
+          $expected = ((Get-Content "$archive.sha256" -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw "archive checksum mismatch"
+          }
+          $scratch = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid())
+          try {
+            Expand-Archive -LiteralPath $archive -DestinationPath $scratch
+            $bin = Join-Path $scratch $name
+            $actual = & "$bin/leveler.exe" --version
+            $provenance = "$env:VERSION ($($env:COMMIT.Substring(0, 12)))"
+            if ($LASTEXITCODE -ne 0 -or $actual -cne $provenance) {
+              throw "installed archive provenance check failed: expected $provenance, got $actual"
+            }
+            Write-Host "Installed archive version: $actual"
+            $completion = & "$bin/leveler.exe" completions bash
+            if ($LASTEXITCODE -ne 0 -or -not $completion) { throw "completion generation failed" }
+            $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            $PSNativeCommandUseErrorActionPreference = $false
+            & "$bin/leveler-confine.exe" -- $cmd /d /c exit 23
+            if ($LASTEXITCODE -ne 23) { throw "confinement launcher did not propagate exit 23" }
+            # GitHub's PowerShell wrapper otherwise re-raises the canary's exit code.
+            $global:LASTEXITCODE = 0
+          } finally {
+            if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force }
+          }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

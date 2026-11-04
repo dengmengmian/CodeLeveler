@@ -233,7 +233,7 @@ mod tests {
         std::fs::write(
             home.path().join(".gitconfig"),
             format!(
-                "[credential]\n\thelper = \"!f() {{ echo username=leveler-test; echo password={password}; }}; f\"\n"
+                "[credential]\n\thelper =\n\thelper = \"!f() {{ echo username=leveler-test; echo password={password}; }}; f\"\n"
             ),
         )
         .unwrap();
@@ -293,7 +293,7 @@ mod tests {
         // A helper configured only in the scratch repo must be invisible: the
         // broker runs `git credential fill` outside any repository.
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".gitconfig"), "").unwrap();
+        std::fs::write(home.path().join(".gitconfig"), "[credential]\n\thelper =\n").unwrap();
         let material = fill_http_credential("example.com", "https", &snapshot(home.path()))
             .await
             .unwrap();

@@ -144,7 +144,10 @@ fn credential_home(password: &str) -> tempfile::TempDir {
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(
         home.path().join(".gitconfig"),
-        format!("[credential]\n\thelper = {}\n", helper.display()),
+        format!(
+            "[credential]\n\thelper =\n\thelper = {}\n",
+            helper.display()
+        ),
     )
     .unwrap();
     home
