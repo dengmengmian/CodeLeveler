@@ -44,6 +44,11 @@ pub struct Capabilities {
     /// answers "is a provider configured" once and both follow from that
     /// answer. The provider owns its credential, endpoint and request shape.
     pub search_provider: Option<Arc<dyn crate::search::SearchProvider>>,
+    /// The process-lived native desktop backend. `None` is the same mechanical
+    /// fact as `CapabilityPacks::computer_use == false`. One handle is shared
+    /// by every session; per-session observations are separated by the scope
+    /// each call carries, because the desktop itself is one OS resource.
+    pub computer_use: Option<Arc<leveler_cua::ComputerUse>>,
 }
 
 impl Capabilities {
@@ -61,6 +66,7 @@ impl Capabilities {
 
             browser: None,
             search_provider: None,
+            computer_use: None,
         }
     }
 
@@ -91,6 +97,12 @@ impl Capabilities {
     /// Share the daemon-owned browser.
     pub fn with_browser(mut self, browser: Arc<leveler_browser::Browser>) -> Self {
         self.browser = Some(browser);
+        self
+    }
+
+    /// Share the process-lived native desktop backend.
+    pub fn with_computer_use(mut self, computer: Arc<leveler_cua::ComputerUse>) -> Self {
+        self.computer_use = Some(computer);
         self
     }
 }

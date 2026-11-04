@@ -18,6 +18,7 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 /// (git_status missing) and the plan gate refusing a read-only tool.
 pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "blast_radius",
+    "computer_observe",
     "diagnostics",
     "expand_tools",
     "find_files",
@@ -45,6 +46,8 @@ pub const MODEL_SURFACE_TOOLS: &[&str] = &[
     "browser_act",
     "browser_inspect",
     "browser_tab",
+    "computer_act",
+    "computer_observe",
     "diagnostics",
     "find_files",
     "find_references",
@@ -470,6 +473,9 @@ pub struct CapabilityPacks {
     /// The browser. Needs a browser this machine can actually drive: the
     /// selected product installed, and for Safari, Remote Automation on.
     pub browser: bool,
+    /// Native desktop observation and control. Needs a platform backend built
+    /// into this binary; TCC grants are reported at call time.
+    pub computer_use: bool,
 }
 
 impl CapabilityPacks {
@@ -483,6 +489,7 @@ impl CapabilityPacks {
 
         skills: false,
         browser: false,
+        computer_use: false,
     };
 
     /// Every pack. The composition a host reaches when each capability is both
@@ -497,6 +504,7 @@ impl CapabilityPacks {
 
         skills: true,
         browser: true,
+        computer_use: true,
     };
 
     /// Mechanical intersection of independently selected pack sets.
@@ -515,6 +523,7 @@ impl CapabilityPacks {
 
             skills: self.skills && other.skills,
             browser: self.browser && other.browser,
+            computer_use: self.computer_use && other.computer_use,
         }
     }
 }
@@ -618,6 +627,14 @@ pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> Too
         registry.register(Arc::new(tools::BrowserTabTool::new(browser.clone())));
         registry.register(Arc::new(tools::BrowserActTool::new(browser.clone())));
         registry.register(Arc::new(tools::BrowserInspectTool::new(browser.clone())));
+    }
+    // Same two halves as the browser: the flag says the product asked for
+    // native desktop control, the handle is the backend that can provide it.
+    if packs.computer_use
+        && let Some(computer) = &capabilities.computer_use
+    {
+        registry.register(Arc::new(tools::ComputerObserveTool::new(computer.clone())));
+        registry.register(Arc::new(tools::ComputerActTool::new(computer.clone())));
     }
     registry
 }
@@ -771,6 +788,13 @@ mod tests {
             ),
             (
                 CapabilityPacks {
+                    computer_use: true,
+                    ..CapabilityPacks::NONE
+                },
+                2,
+            ),
+            (
+                CapabilityPacks {
                     skills: true,
                     ..CapabilityPacks::NONE
                 },
@@ -831,15 +855,17 @@ mod tests {
             "browser_tab",
             "browser_act",
             "browser_inspect",
+            "computer_observe",
+            "computer_act",
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
         // core 12 + intel 5 + vcs 2 + web 2 + media 1 + skills 1
-        // + browser 3 = 26. The harness controls (`update_plan` and the
-        // injected ones) are not in this count: they are not a capability the
-        // host composes, so `leveler_agent::register_harness_controls` adds
-        // them on top.
-        assert_eq!(names.len(), 26);
+        // + browser 3 + computer use 2 = 28. The harness controls
+        // (`update_plan` and the injected ones) are not in this count: they are
+        // not a capability the host composes, so
+        // `leveler_agent::register_harness_controls` adds them on top.
+        assert_eq!(names.len(), 28);
     }
 
     /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is
@@ -878,12 +904,14 @@ mod tests {
                 std::env::temp_dir().join("leveler-registry-test-profile"),
                 None,
             )))
+            .with_computer_use(std::sync::Arc::new(leveler_cua::ComputerUse::new()))
     }
 
     /// The mirror of the test above: a pack without the handle it is built
-    /// from composes nothing. Two packs work this way — search needs a key,
-    /// the browser needs a browser — and `default_registry` has neither, so
-    /// this is also what every test entry point sees.
+    /// from composes nothing. Three packs work this way — search needs a key,
+    /// the browser needs a browser, computer use needs the platform backend —
+    /// and `default_registry` has none, so this is also what every test entry
+    /// point sees.
     #[test]
     fn a_pack_without_its_handle_composes_nothing() {
         let configured = model_surface(CapabilityPacks::ALL, &configured_test_capabilities())
@@ -894,8 +922,8 @@ mod tests {
             .len();
         assert_eq!(
             bare,
-            configured - 4,
-            "web_search plus the three browser tools moved"
+            configured - 6,
+            "web_search, the three browser tools and the two computer tools moved"
         );
         let names: Vec<String> = default_registry()
             .definitions()
@@ -907,6 +935,8 @@ mod tests {
             "browser_tab",
             "browser_act",
             "browser_inspect",
+            "computer_observe",
+            "computer_act",
         ] {
             assert!(
                 !names.iter().any(|n| n == absent),

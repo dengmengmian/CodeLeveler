@@ -671,6 +671,10 @@ pub struct Application {
     /// across turns and client disconnect. Nothing starts until a browser tool
     /// is first used.
     browser: Arc<leveler_browser::Browser>,
+    /// Process-lived native desktop backend. The handle is lazy: no worker
+    /// thread starts until the first computer-use call. One handle serves
+    /// every session; per-session observations are separated by session scope.
+    computer: Arc<leveler_cua::ComputerUse>,
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
@@ -864,6 +868,7 @@ impl Application {
             layout.browser_profile_dir(),
             snapshot.loaded.browser_default,
         ));
+        let computer = Arc::new(leveler_cua::ComputerUse::new());
         let has_workspace = layout.primary_workspace().is_some();
         Ok(Self {
             layout,
@@ -880,6 +885,7 @@ impl Application {
             environment,
             background_tasks,
             browser,
+            computer,
             runtime_id: OnceLock::new(),
             boot: std::sync::Mutex::new(None),
             in_flight_commands: Default::default(),
@@ -1256,6 +1262,7 @@ impl Application {
             .with_background_tasks(self.background_tasks.clone())
             .with_artifact_store(artifact_store)
             .with_browser(self.browser.clone())
+            .with_computer_use(self.computer.clone())
             .with_search_provider(resolve_search_provider(
                 snapshot.loaded.web_search.as_ref(),
                 self.environment.as_ref(),
@@ -1397,6 +1404,11 @@ impl Application {
             // whose default is a browser CodeLeveler cannot drive sees no
             // browser tools rather than a surprise one.
             browser: self.browser.resolve(None).is_ok(),
+            // A compiled platform backend is the mechanical half. TCC grants
+            // and the interactive session are call-time facts reported by
+            // `computer_observe availability`, so this does not start a
+            // desktop worker on every turn.
+            computer_use: leveler_cua::ComputerUse::platform_supported(),
         }
     }
 
@@ -1474,6 +1486,7 @@ impl Application {
         ];
         for (present, id) in [
             (available_packs.browser, CapabilityId::Browser),
+            (available_packs.computer_use, CapabilityId::ComputerUse),
             (available_packs.skills, CapabilityId::Skills),
             (
                 available_packs.code_intelligence,

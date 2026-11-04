@@ -28,6 +28,7 @@ members = [
     "crates/leveler-runtime-host",
     "crates/leveler-media",
     "crates/leveler-browser",
+    "crates/leveler-cua",
     "crates/leveler-update",
     "crates/leveler-tui",
     "crates/leveler-web",
@@ -75,6 +76,7 @@ leveler-local-transport = { version = "1.0.23", path = "crates/leveler-local-tra
 leveler-runtime-host = { version = "1.0.23", path = "crates/leveler-runtime-host" }
 leveler-media = { version = "1.0.23", path = "crates/leveler-media" }
 leveler-browser = { version = "1.0.23", path = "crates/leveler-browser" }
+leveler-cua = { version = "1.0.23", path = "crates/leveler-cua" }
 leveler-update = { version = "1.0.23", path = "crates/leveler-update" }
 leveler-tui = { version = "1.0.23", path = "crates/leveler-tui" }
 leveler-web = { version = "1.0.23", path = "crates/leveler-web" }

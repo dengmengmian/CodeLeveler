@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityId {
     Browser,
+    ComputerUse,
     MultiAgent,
     Skills,
     CodeIntelligence,
@@ -30,8 +31,9 @@ pub enum CapabilityId {
     ExternalTools,
 }
 impl CapabilityId {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Browser,
+        Self::ComputerUse,
         Self::MultiAgent,
         Self::Skills,
         Self::CodeIntelligence,
@@ -44,6 +46,7 @@ impl CapabilityId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Browser => "browser",
+            Self::ComputerUse => "computer_use",
             Self::MultiAgent => "multi_agent",
             Self::Skills => "skills",
             Self::CodeIntelligence => "code_intelligence",
@@ -63,6 +66,7 @@ impl CapabilityId {
     fn description(self) -> &'static str {
         match self {
             Self::Browser => "Browse/interact with pages",
+            Self::ComputerUse => "Observe/control the desktop",
             Self::MultiAgent => "Delegate work",
             Self::Skills => "Load instructions",
             Self::CodeIntelligence => "Symbols/references/diagnostics",
@@ -78,6 +82,7 @@ impl CapabilityId {
 pub fn tool_capability(name: &str) -> Option<CapabilityId> {
     match name {
         name if name.starts_with("browser_") => Some(CapabilityId::Browser),
+        "computer_observe" | "computer_act" => Some(CapabilityId::ComputerUse),
         "spawn_agent" => Some(CapabilityId::MultiAgent),
         "load_skill" => Some(CapabilityId::Skills),
         "find_symbol" | "read_symbol" | "find_references" | "diagnostics" | "blast_radius" => {

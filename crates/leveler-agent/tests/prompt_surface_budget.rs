@@ -189,6 +189,7 @@ fn packs(minimal_baseline: bool) -> CapabilityPacks {
 
             skills: true,
             browser: false,
+            computer_use: false,
         }
     }
 }
