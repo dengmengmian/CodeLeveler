@@ -4,7 +4,14 @@
 
 ## [Unreleased]
 
+## [1.0.23] - 2026-11-04
+
 - `→` accepts the inline next-step suggestion, exactly like Tab: the ghost becomes editable input with the caret at its end and nothing is sent until Enter. With no suggestion showing — an empty popup, Shell Mode, a completion menu, a non-empty draft — it stays an ordinary caret move.
+- Reconnect state is evidence-based. The runtime reports the build serving the session and whether its process changed across a reconnect; a version mismatch stays visible as an issue, a turn that was running is described as possibly interrupted or unknown rather than stopped without proof, and input or approval choices are held when the connection is down.
+- A turn whose tool calls were interrupted with no recorded result now pauses instead of retrying. `/recover` lists each call with its state and, after confirmation, records it as "result unknown, not replayed" — nothing is replayed and no call is reported as successful.
+- A submitted message reports whether it was delivered, rejected with its content restored, or unconfirmed; a message whose owning process died is never retried automatically.
+- Background task status distinguishes a task lost with its background process, an unconfirmable state and an identifier conflict from a task that is running or finished.
+- Goal accounting recognizes explicit single-letter field labels while still rejecting incidental prose and evidence-only mentions.
 
 ## [1.0.22] - 2026-11-04
 
