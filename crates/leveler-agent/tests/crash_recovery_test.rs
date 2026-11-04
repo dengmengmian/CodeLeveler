@@ -1006,13 +1006,15 @@ async fn chat_stops_a_dangling_read_tool_until_acknowledged() {
         )
         .await
         .expect("chat proceeds after acknowledgement");
-    let requests = requests.lock().unwrap();
-    let seen = requests[0]
-        .messages
-        .iter()
-        .map(|message| message.text_content())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let seen = {
+        let requests = requests.lock().unwrap();
+        requests[0]
+            .messages
+            .iter()
+            .map(|message| message.text_content())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert!(
         seen.contains("Recovered after an interruption") && seen.contains("(call c1)"),
         "interactive chat must carry the recovery context to the model:\n{seen}"

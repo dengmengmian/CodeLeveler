@@ -1106,7 +1106,7 @@ mod p1_tests {
 
     /// Spans that paint the editable text — the same background as the input
     /// surface. Chrome (border, prompt) and the ghost hint are not body text.
-    fn body_spans<'a>(s: &AppState, spans: &'a [(String, Style)]) -> Vec<(String, Style)> {
+    fn body_spans(s: &AppState, spans: &[(String, Style)]) -> Vec<(String, Style)> {
         spans
             .iter()
             .filter(|(_, style)| style.bg == Some(s.theme.surface.input))
