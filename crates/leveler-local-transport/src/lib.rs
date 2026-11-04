@@ -5097,13 +5097,21 @@ mod tests {
 
         let mut events = client.subscribe();
         runtime.events.send(RuntimeEvent::RuntimeReady).unwrap();
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            RuntimeEvent::RuntimeReady
-        );
+        // A subscription first reports how the connection was served. That
+        // per-connection fact may arrive before the session event the test
+        // waits for, so skip it rather than assuming the event order.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    RuntimeEvent::RuntimeBuildObserved { .. }
+                    | RuntimeEvent::RuntimeReconnected { .. } => {}
+                    event => return event,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(event, RuntimeEvent::RuntimeReady);
 
         shutdown.cancel();
         task.await.unwrap().unwrap();
