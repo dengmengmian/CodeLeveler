@@ -484,6 +484,45 @@ async fn a_suite_named_in_the_repositorys_own_words_resolves_the_goal() {
     assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
 }
 
+/// A verification command judges the workspace. Writing scratch evidence to
+/// an absolute path outside it changes no file the command looked at, so it
+/// must not make a fresh pass look stale.
+#[tokio::test]
+async fn a_write_outside_the_workspace_does_not_stale_the_verification_run() {
+    let outside = tempfile::tempdir().unwrap();
+    let evidence = outside.path().join("captured-evidence.txt");
+    let fx = fixture(
+        vec![
+            Scripted::commit(),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({
+                    "path": evidence.to_string_lossy(),
+                    "content": "observed evidence\n",
+                }),
+            ),
+            Scripted::complete(),
+            Scripted::Text("完成，外部证据已保存。"),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat(&fx).await;
+
+    assert!(
+        evidence.is_file(),
+        "the scratch write must really have happened outside the workspace"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "a write outside the workspace must not invalidate the verification: {report:?}"
+    );
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+}
+
 #[tokio::test]
 async fn a_declared_objective_cannot_narrow_the_users_request() {
     let fx = fixture(

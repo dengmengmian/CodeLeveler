@@ -5107,14 +5107,20 @@ impl AgentHarness for Drive<'_> {
                         touched.push(path.clone());
                     }
                 }
-                note_tool_side_effects(
-                    &mut self.ledger,
-                    call.id.as_str(),
-                    call.name.as_str(),
+                let touched = workspace_mutations(
+                    self.executor.tool_context.execution.workspace.as_deref(),
                     touched,
-                    &self.plan_state,
-                    &mut *self.observer,
                 );
+                if !touched.is_empty() {
+                    note_tool_side_effects(
+                        &mut self.ledger,
+                        call.id.as_str(),
+                        call.name.as_str(),
+                        touched,
+                        &self.plan_state,
+                        &mut *self.observer,
+                    );
+                }
             }
             for path in &self.modified_files {
                 push_unique_path(&mut self.scoped_paths, path);
@@ -5262,14 +5268,20 @@ impl AgentHarness for Drive<'_> {
                     }
                 }
                 if !is_error && !job_files.is_empty() {
-                    note_tool_side_effects(
-                        &mut self.ledger,
-                        job.admitted.call.id.as_str(),
-                        job.admitted.call.name.as_str(),
-                        job_files.clone(),
-                        &self.plan_state,
-                        &mut *self.observer,
+                    let touched = workspace_mutations(
+                        executor.tool_context.execution.workspace.as_deref(),
+                        job_files,
                     );
+                    if !touched.is_empty() {
+                        note_tool_side_effects(
+                            &mut self.ledger,
+                            job.admitted.call.id.as_str(),
+                            job.admitted.call.name.as_str(),
+                            touched,
+                            &self.plan_state,
+                            &mut *self.observer,
+                        );
+                    }
                 }
                 if let Some(part) = extract_image(&metadata) {
                     pending_images.push(part);
@@ -7040,6 +7052,63 @@ fn scoped_rule_body(rule: &ProjectInstruction) -> String {
     )
 }
 
+/// Keep mutation evidence about the task tree.
+///
+/// A model may keep scratch evidence under an absolute path outside the
+/// workspace. That write is real, but it changes no file a task's tests or
+/// build read, so counting it would make a fresh verification pass look
+/// stale. Without a workspace there is nothing to compare against, so every
+/// reported path is kept.
+fn workspace_mutations(
+    workspace: Option<&leveler_execution::Workspace>,
+    paths: Vec<String>,
+) -> Vec<String> {
+    let Some(workspace) = workspace else {
+        return paths;
+    };
+    let root = workspace.root();
+    paths
+        .into_iter()
+        .filter(|path| path_is_within(root, path))
+        .collect()
+}
+
+fn path_is_within(root: &std::path::Path, path: &str) -> bool {
+    let raw = std::path::Path::new(path);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        root.join(raw)
+    };
+    let candidate = lexical_clean(&candidate);
+    if candidate.starts_with(root) {
+        return true;
+    }
+    // The same directory can have more than one spelling (`/tmp` and
+    // `/private/tmp` on macOS). Compare real paths when the file still
+    // exists.
+    match (candidate.canonicalize(), root.canonicalize()) {
+        (Ok(candidate), Ok(root)) => candidate.starts_with(root),
+        _ => false,
+    }
+}
+
+fn lexical_clean(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut cleaned = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cleaned.pop();
+            }
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    cleaned
+}
+
 fn artifact_state(
     workspace: Option<&leveler_execution::Workspace>,
     path: &str,
@@ -7577,5 +7646,27 @@ mod gate_refusal_bound_tests {
             note_gate_refusal(&mut slot, "third requirement is missing");
             assert_eq!(stuck_gate_detail(&slot), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_mutation_tests {
+    use super::path_is_within;
+
+    /// Verification freshness is about the tree the command judged. A scratch
+    /// file outside it, however absolute, is not a change to that tree.
+    #[test]
+    fn only_paths_inside_the_workspace_count_as_task_mutations() {
+        let root = std::env::temp_dir().join("leveler-workspace-root");
+        let root_text = root.to_string_lossy();
+
+        assert!(path_is_within(&root, "src/lib.rs"));
+        assert!(path_is_within(&root, &format!("{root_text}/src/lib.rs")));
+        assert!(path_is_within(&root, "src/../src/lib.rs"));
+        assert!(!path_is_within(
+            &root,
+            &format!("{root_text}/../outside.txt")
+        ));
+        assert!(!path_is_within(&root, "/tmp/captured-evidence.txt"));
     }
 }
