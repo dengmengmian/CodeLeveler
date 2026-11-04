@@ -3453,6 +3453,7 @@ mod tests {
     /// single broadcast sender cannot express either: replacing the sender is
     /// exactly the server's lag-forced close, and a different pid is the only
     /// evidence that a reconnect outlived its runtime.
+    #[cfg(unix)]
     struct ReconnectRuntime {
         events: Mutex<broadcast::Sender<RuntimeEvent>>,
         pid: std::sync::atomic::AtomicU32,
@@ -3467,6 +3468,7 @@ mod tests {
         creates: std::sync::atomic::AtomicUsize,
     }
 
+    #[cfg(unix)]
     impl ReconnectRuntime {
         fn new(pid: u32) -> Self {
             let (events, _) = broadcast::channel(64);
@@ -3522,6 +3524,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl InteractiveRuntimeClient for ReconnectRuntime {
         async fn deliver(
@@ -3552,6 +3555,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl LocalRuntimeService for ReconnectRuntime {
         async fn create_session(
@@ -3600,6 +3604,7 @@ mod tests {
     /// Wait until the client's subscription is actually served. The loop's
     /// baseline identity query runs before its read loop, so receiving an
     /// event also proves the baseline was captured.
+    #[cfg(unix)]
     async fn await_subscribed(
         runtime: &ReconnectRuntime,
         rx: &mut broadcast::Receiver<RuntimeEvent>,
@@ -3624,6 +3629,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn await_resync_failure(
         rx: &mut broadcast::Receiver<RuntimeEvent>,
         what: &str,
@@ -3639,6 +3645,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn await_reconnect(
         rx: &mut broadcast::Receiver<RuntimeEvent>,
         what: &str,
@@ -3661,6 +3668,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn await_build(
         rx: &mut broadcast::Receiver<RuntimeEvent>,
         what: &str,
@@ -4148,6 +4156,7 @@ mod tests {
 
     /// Binds a NEW runtime at the same path, reporting a different pid — the
     /// restart a real daemon revival produces.
+    #[cfg(unix)]
     struct RestartingReviver {
         path: PathBuf,
         runtime: Arc<ReconnectRuntime>,
@@ -4180,6 +4189,7 @@ mod tests {
 
     /// Fails like the real host when the runtime that came up is a different
     /// build, while still reporting what it observed.
+    #[cfg(unix)]
     struct MismatchReviver {
         build: leveler_client_protocol::BuildIdentity,
     }
