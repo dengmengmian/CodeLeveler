@@ -186,6 +186,30 @@ jobs:
           RUST_TEST_THREADS: "2"
         run: cargo test --workspace --all-features --locked --no-fail-fast
 
+      # Task Scheduler is the Windows wakeup authority, and the workspace run
+      # cannot prove it works: the acceptance test is opt-in because it
+      # registers a real per-user task. It uses a unique label and an isolated
+      # home, verifies the task's own side effect instead of trusting an exit
+      # code, and removes the task on every exit path. Evidence is uploaded
+      # even when the test fails so a runner without an interactive session
+      # can be reported as NOT_VERIFIED rather than a silent pass.
+      - name: Task Scheduler acceptance
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        env:
+          LEVELER_TASK_SCHEDULER_ACCEPTANCE: "1"
+          LEVELER_TASK_SCHEDULER_EVIDENCE_DIR: ${{ runner.temp }}\task-scheduler-evidence
+        run: cargo test -p leveler-schedule --test task_scheduler_acceptance --all-features --locked -- --nocapture
+
+      - name: Upload Task Scheduler evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-scheduler-evidence
+          path: ${{ runner.temp }}\task-scheduler-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
   # `leveler-app` is the largest test crate: 39 integration targets plus the
   # lib. On Ubuntu it twice took its runner down with no log and no step
   # timeout, while every other shard stayed healthy. Four runners, each with a

@@ -30,3 +30,46 @@ pub(super) async fn disable(home: &Path) -> Result<WakeupStatus, WakeupError> {
 pub(super) async fn status(home: &Path) -> Result<WakeupStatus, WakeupError> {
     disable(home).await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn the_unsupported_backend_reports_absence_instead_of_pretending() {
+        let home = Path::new("/tmp/leveler-unsupported-wakeup-test");
+        let spec = WakeupSpec {
+            home: home.to_path_buf(),
+            executable: PathBuf::from("/bin/true"),
+            arguments: Vec::new(),
+            environment: BTreeMap::new(),
+            interval: WAKE_INTERVAL,
+            log_dir: home.join("logs"),
+        };
+
+        assert!(!crate::wakeup::is_supported());
+        assert_eq!(crate::wakeup::backend_name(), "unsupported");
+
+        match crate::wakeup::enable(&spec).await {
+            Err(WakeupError::Unsupported(reason)) => assert_eq!(reason, REASON),
+            other => panic!("unsupported enable must report Unsupported, got {other:?}"),
+        }
+
+        let status = crate::wakeup::status(home).await.expect("status");
+        assert_eq!(status.backend, "unsupported");
+        assert!(!status.supported);
+        assert_eq!(status.label, label_for(home));
+        assert!(!status.registered);
+        assert!(!status.loaded);
+        assert!(status.registration.is_none());
+        assert!(status.registration_path.is_none());
+        assert_eq!(status.detail.as_deref(), Some(REASON));
+
+        let disabled = crate::wakeup::disable(home).await.expect("disable");
+        assert!(!disabled.registered);
+        assert_eq!(disabled.detail.as_deref(), Some(REASON));
+    }
+}
