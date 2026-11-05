@@ -216,6 +216,10 @@ pub enum ActRequest {
 /// A validated desktop action. The facade resolves references into paths and
 /// expectations before this reaches a backend; the backend re-reads the live
 /// window and element and refuses a mismatch.
+// The platform backends are the only consumers. On other targets the facade
+// still validates and rejects the action as unsupported, so the value is
+// constructed but intentionally never read.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedAction {
     pub action: ActionKind,
@@ -223,6 +227,7 @@ pub(crate) struct ResolvedAction {
     pub activate: bool,
 }
 
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum ActionKind {
     ActivateApp {

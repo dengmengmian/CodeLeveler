@@ -165,10 +165,10 @@ fn classic_profile_exists(errors: &mut Vec<String>) -> bool {
     };
     for version in versions {
         let profiles = format!(r"{version}\Outlook\Profiles");
-        if let Ok(key) = office.open_subkey(&profiles) {
-            if key.enum_keys().next().is_some() {
-                return true;
-            }
+        if let Ok(key) = office.open_subkey(&profiles)
+            && key.enum_keys().next().is_some()
+        {
+            return true;
         }
     }
     false
