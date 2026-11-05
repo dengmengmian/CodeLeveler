@@ -819,19 +819,21 @@ There are two independent layers:
    `full-access`) is passed into the runtime session; it governs what the
    runtime/tools permit. Interactive approvals are never promoted into
    scheduled authority.
-2. **The persisted unattended grant** is required by the dispatcher for
-   `native` and `agent` actions unless the profile is `full-access`. The grant
-   is scoped by definition id, canonical workspace, permission mode, action
-   kind, the exact action fingerprint (shell command, or native action + its
-   full structured input, or agent goal), the authorized model, and an
-   explicit `external_side_effects` flag; `revoke-grant` removes it. A
-   definition row whose action, input, goal or model was edited after issuance
-   no longer matches its grant and is refused before the authority starts.
-   Version-1 grants, which bound only the action kind, fail closed and must be
-   re-created. A grant is created explicitly (`--grant-unattended`), never by
-   adding a rule or by answering one prompt. A TCC/macOS permission is still
-   enforced by the host authority; `full-access` bypasses the CodeLeveler gate,
-   not the operating system.
+2. **The persisted unattended grant** is required by the dispatcher for every
+   action kind (`shell`, `native` and `agent`), in every permission profile: a
+   profile governs interactive admission, not durable background
+   authorization. The grant is scoped by definition id, canonical workspace,
+   permission mode, action kind, the exact action fingerprint (shell command,
+   or native action + its full structured input, or agent goal), the
+   authorized model, the trigger scope (cadence and timezone) and an explicit
+   `external_side_effects` flag; `revoke-grant` removes it. A definition row
+   whose action, input, goal, model or cadence was edited after issuance no
+   longer matches its grant and is refused before the authority starts.
+   Grants whose version is not `3` (including the older kind-only grants)
+   fail closed and must be re-issued. A grant is created explicitly
+   (`--grant-unattended`), never by adding a rule or by answering one prompt.
+   A TCC/macOS permission is still enforced by the host authority;
+   `full-access` bypasses the CodeLeveler gate, not the operating system.
 
 The dispatcher decides from the persisted definition re-read immediately
 before delivery, not from the snapshot carried by the claim, so a grant

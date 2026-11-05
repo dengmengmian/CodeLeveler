@@ -12,9 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::CommandRunner;
 use leveler_native::{
-    ActionId, ActionStatus, CapabilityReport, CapabilityState, DiscoveryReport, NativeActionRequest,
-    NativeActions,
-    NativeOutcome,
+    ActionId, ActionStatus, CapabilityReport, CapabilityState, DiscoveryReport,
+    NativeActionRequest, NativeActions, NativeOutcome,
 };
 
 use crate::cli::NativeCommand;
@@ -121,9 +120,7 @@ async fn run_action(
     };
     let outcome = run.outcome;
 
-    if !json
-        && let Some(capability) = &run.capability
-    {
+    if !json && let Some(capability) = &run.capability {
         eprintln!(
             "{} via {} — discovery says {} (permission: {}, configured: {:?})",
             action.as_str(),
@@ -134,11 +131,7 @@ async fn run_action(
         );
     }
     if outcome.execution_id.is_empty() {
-        eprintln!(
-            "{} was not started: {}",
-            action.as_str(),
-            outcome.detail
-        );
+        eprintln!("{} was not started: {}", action.as_str(), outcome.detail);
     }
     if json {
         print_json(&outcome);

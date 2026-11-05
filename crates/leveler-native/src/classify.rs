@@ -218,17 +218,16 @@ pub(crate) fn windows_mail(probe: &WindowsMailProbe) -> Vec<CapabilityReport> {
             )
         };
         let mut actions = actions(true, supported, reason.as_deref());
-        if supported {
-            if let Some(send) = actions
+        if supported
+            && let Some(send) = actions
                 .iter_mut()
                 .find(|action| action.id == ActionId::MailSendSubmit.as_str())
-            {
-                send.reason = Some(
-                    "Outlook may show its own programmatic-send guard; the result reports what \
-                     actually happened"
-                        .into(),
-                );
-            }
+        {
+            send.reason = Some(
+                "Outlook may show its own programmatic-send guard; the result reports what \
+                 actually happened"
+                    .into(),
+            );
         }
         reports.push(CapabilityReport {
             id: "mail",

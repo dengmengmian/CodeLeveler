@@ -933,6 +933,16 @@ impl ScheduleDefinition {
         })?;
         grant.covers(self, kind, external_side_effects)
     }
+
+    /// Whether the persisted grant still authorizes this definition's current
+    /// action. This is the static identity check a user surface shows before a
+    /// run; the observed side-effect need is only known at dispatch time and
+    /// stays a dispatch-time check.
+    pub fn unattended_grant_valid(&self) -> bool {
+        self.unattended
+            .as_ref()
+            .is_some_and(|grant| grant.covers(self, self.action.kind(), false).is_ok())
+    }
 }
 
 /// Model usage attributed to one agent session at one instant.

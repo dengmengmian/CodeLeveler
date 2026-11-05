@@ -17,9 +17,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
-use leveler_native::{
-    ActionId, ActionStatus, NativeActionRequest, NativeActions,
-};
+use leveler_native::{ActionId, ActionStatus, NativeActionRequest, NativeActions};
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -337,16 +335,17 @@ async fn run_action(
         let reason = outcome.detail;
         return Ok(ToolOutput::error(match outcome.status {
             ActionStatus::Unsupported if run.capability.is_some() => {
-                format!("native action {} is not supported here: {reason}", action.as_str())
+                format!(
+                    "native action {} is not supported here: {reason}",
+                    action.as_str()
+                )
             }
             _ => format!("native action {} was not run: {reason}", action.as_str()),
         }));
     }
-    if run
-        .capability
-        .as_ref()
-        .is_some_and(|capability| capability.permission == leveler_native::PermissionState::NotDetermined)
-    {
+    if run.capability.as_ref().is_some_and(|capability| {
+        capability.permission == leveler_native::PermissionState::NotDetermined
+    }) {
         tracing::info!(
             provider = outcome.provider.as_str(),
             action = action.as_str(),

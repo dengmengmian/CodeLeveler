@@ -139,8 +139,8 @@ impl Backend for MacBackend {
         let target = cg_window(window)?;
         let app = app_element(target.pid)?;
         let ax_windows = ax_windows(&app)?;
-        let ax_window = choose_ax_window(&ax_windows, &target)
-            .ok_or_else(|| CuaError::WindowNotFound(window))?;
+        let ax_window =
+            choose_ax_window(&ax_windows, &target).ok_or(CuaError::WindowNotFound(window))?;
         let mut walk = Walk {
             remaining: max_nodes as usize,
             truncated: false,
@@ -363,11 +363,7 @@ fn cg_windows(all: bool) -> CuaResult<Vec<CgWindow>> {
 }
 
 fn bounds_from_dictionary(dictionary: &CfOwned) -> Option<Bounds> {
-    let read = |key: &str| {
-        dictionary_value(dictionary, key)
-            .and_then(|value| value.as_double())
-            .map(|value| value)
-    };
+    let read = |key: &str| dictionary_value(dictionary, key).and_then(|value| value.as_double());
     Some(Bounds {
         x: read("X")?,
         y: read("Y")?,
@@ -870,8 +866,7 @@ fn focus_window(window: u64) -> CuaResult<ActOutcome> {
     let target = cg_window(window)?;
     let app = app_element(target.pid)?;
     let windows = ax_windows(&app)?;
-    let ax_window =
-        choose_ax_window(&windows, &target).ok_or_else(|| CuaError::WindowNotFound(window))?;
+    let ax_window = choose_ax_window(&windows, &target).ok_or(CuaError::WindowNotFound(window))?;
     raise_window(&app, ax_window)?;
     let applied = wait_for_focus(&target, FOCUS_WAIT);
     Ok(ActOutcome {
@@ -961,7 +956,7 @@ fn ensure_focus(target: &CgWindow, activate: bool) -> CuaResult<()> {
     let app = app_element(target.pid)?;
     let windows = ax_windows(&app)?;
     let ax_window =
-        choose_ax_window(&windows, target).ok_or_else(|| CuaError::WindowNotFound(target.id))?;
+        choose_ax_window(&windows, target).ok_or(CuaError::WindowNotFound(target.id))?;
     raise_window(&app, ax_window)?;
     if wait_for_focus(target, FOCUS_WAIT) {
         Ok(())
@@ -988,8 +983,7 @@ fn click(
     let before_title = target.title.clone();
     let app = app_element(target.pid)?;
     let windows = ax_windows(&app)?;
-    let ax_window =
-        choose_ax_window(&windows, &target).ok_or_else(|| CuaError::WindowNotFound(window))?;
+    let ax_window = choose_ax_window(&windows, &target).ok_or(CuaError::WindowNotFound(window))?;
 
     let mut detail;
     if let Some(path) = path {
@@ -1053,8 +1047,7 @@ fn type_text(
     let target = cg_window(window)?;
     let app = app_element(target.pid)?;
     let windows = ax_windows(&app)?;
-    let ax_window =
-        choose_ax_window(&windows, &target).ok_or_else(|| CuaError::WindowNotFound(window))?;
+    let ax_window = choose_ax_window(&windows, &target).ok_or(CuaError::WindowNotFound(window))?;
 
     let mut detail;
     let mut applied = false;
@@ -1156,8 +1149,7 @@ fn set_value(
     let target = cg_window(window)?;
     let app = app_element(target.pid)?;
     let windows = ax_windows(&app)?;
-    let ax_window =
-        choose_ax_window(&windows, &target).ok_or_else(|| CuaError::WindowNotFound(window))?;
+    let ax_window = choose_ax_window(&windows, &target).ok_or(CuaError::WindowNotFound(window))?;
     let element = resolve_element(ax_window, path, expectation)?;
     set_ax_value(&element, value)?;
     let live = ax_value_string(element.as_ptr());
@@ -1189,8 +1181,7 @@ fn perform_action(
     let before_title = target.title.clone();
     let app = app_element(target.pid)?;
     let windows = ax_windows(&app)?;
-    let ax_window =
-        choose_ax_window(&windows, &target).ok_or_else(|| CuaError::WindowNotFound(window))?;
+    let ax_window = choose_ax_window(&windows, &target).ok_or(CuaError::WindowNotFound(window))?;
     let element = resolve_element(ax_window, path, expectation)?;
     let actions = ax_actions(element.as_ptr());
     if !actions.iter().any(|name| name == action_name) {

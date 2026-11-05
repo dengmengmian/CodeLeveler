@@ -148,9 +148,9 @@ async fn a_deterministic_action_run_succeeds_without_a_model() {
             .expect("the action run reported an outcome before the deadline")
             .expect("the event stream stayed open");
         match event {
-            RuntimeEvent::UserShellOutput {
-                stream, chunk, ..
-            } if stream == "stdout" => stdout.push_str(&chunk),
+            RuntimeEvent::UserShellOutput { stream, chunk, .. } if stream == "stdout" => {
+                stdout.push_str(&chunk)
+            }
             RuntimeEvent::UserShellExited {
                 exit_code, status, ..
             } => exit = Some((exit_code, status)),
@@ -163,7 +163,11 @@ async fn a_deterministic_action_run_succeeds_without_a_model() {
         stdout.contains("leveler-action-ok"),
         "the action's own output was not observed: {stdout:?}"
     );
-    assert_eq!(workspace_entries(&workspace), before, "the action changed its workspace");
+    assert_eq!(
+        workspace_entries(&workspace),
+        before,
+        "the action changed its workspace"
+    );
     assert_eq!(
         provider.request_count(),
         0,

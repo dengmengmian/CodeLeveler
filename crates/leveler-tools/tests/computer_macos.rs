@@ -73,7 +73,11 @@ impl Harness {
             .execute(input, self.context.clone(), CancellationToken::new())
             .await
             .expect("the act tool runs");
-        assert!(!output.is_error, "computer_act reported: {}", output.content);
+        assert!(
+            !output.is_error,
+            "computer_act reported: {}",
+            output.content
+        );
         output.content
     }
 
@@ -316,10 +320,7 @@ async fn the_tools_drive_a_real_window_and_verify_every_effect() {
 
     let display = wait_for_display(&harness, id, "78").await;
     println!("display after 8: {display:?}");
-    assert_eq!(
-        display, "78",
-        "raw key input did not reach the display"
-    );
+    assert_eq!(display, "78", "raw key input did not reach the display");
 
     let cleared = harness
         .act(serde_json::json!({
@@ -332,10 +333,7 @@ async fn the_tools_drive_a_real_window_and_verify_every_effect() {
     println!("escape:\n{cleared}");
     let display = wait_for_display(&harness, id, "0").await;
     println!("display after escape: {display:?}");
-    assert_eq!(
-        display, "0",
-        "Escape did not clear the display"
-    );
+    assert_eq!(display, "0", "Escape did not clear the display");
 
     // 3. A screenshot of this window: the reported scale must match the image.
     let output = harness
@@ -375,7 +373,14 @@ async fn the_tools_drive_a_real_window_and_verify_every_effect() {
         .and_then(|line| line.split_whitespace().next())
         .and_then(|value| value.parse().ok())
         .expect("the text reports the screenshot scale");
-    let logical_width = window
+    // The screenshot reports the bounds it captured. The window line from the
+    // first discovery can predate a restore animation (226x402 before the
+    // 230x408 frame), so projecting a stale width would compare two frames.
+    let captured_window = text
+        .lines()
+        .find_map(|line| line.strip_prefix("window: "))
+        .expect("the screenshot reports the captured window");
+    let logical_width = captured_window
         .split("bounds=")
         .nth(1)
         .and_then(|rest| rest.split(' ').nth(1))

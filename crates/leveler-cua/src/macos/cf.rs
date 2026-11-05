@@ -304,11 +304,7 @@ pub(crate) fn dictionary_value(dictionary: &CfOwned, key: &str) -> Option<CfOwne
         return None;
     }
     let key = CfString::new(key)?;
-    let value = unsafe {
-        CFDictionaryGetValue(
-            dictionary.as_ptr() as CFDictionaryRef,
-            key.as_ptr() as *const c_void,
-        )
-    };
+    let value =
+        unsafe { CFDictionaryGetValue(dictionary.as_ptr() as CFDictionaryRef, key.as_ptr()) };
     CfOwned::retain(value)
 }

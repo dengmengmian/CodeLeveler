@@ -25,10 +25,10 @@ mod windows;
 mod platform {
     #[cfg(target_os = "macos")]
     pub(crate) use crate::macos as imp;
-    #[cfg(windows)]
-    pub(crate) use crate::windows as imp;
     #[cfg(not(any(target_os = "macos", windows)))]
     pub(crate) use crate::unsupported as imp;
+    #[cfg(windows)]
+    pub(crate) use crate::windows as imp;
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -57,11 +57,11 @@ use std::time::Duration;
 
 pub use error::{CuaError, CuaResult, PermissionKind};
 use state::ObservationState;
-use types::{ActionKind, Expectation, Node, ResolvedAction};
 pub use types::{
     ActOutcome, ActRequest, ActStatus, AppInfo, Availability, Bounds, ElementInfo, Modifier,
     MouseButton, Observation, PermissionState, Point, Screenshot, WindowInfo,
 };
+use types::{ActionKind, Expectation, Node, ResolvedAction};
 
 const APPS_TIMEOUT: Duration = Duration::from_secs(10);
 const TREE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -216,12 +216,7 @@ impl ComputerUse {
         }
     }
 
-    pub fn act(
-        &self,
-        scope: &str,
-        request: ActRequest,
-        activate: bool,
-    ) -> CuaResult<ActOutcome> {
+    pub fn act(&self, scope: &str, request: ActRequest, activate: bool) -> CuaResult<ActOutcome> {
         let mut inner = self.lock();
         let action = resolve_action(inner.state(scope), request, activate)?;
         match inner.call(RequestKind::Act(action), ACT_TIMEOUT, None)? {
@@ -357,9 +352,7 @@ fn dispatch(backend: &mut dyn backend::Backend, request: &Request) -> CuaResult<
     match &request.kind {
         RequestKind::Availability => backend.availability().map(Response::Availability),
         RequestKind::Apps => backend.apps().map(Response::Apps),
-        RequestKind::Windows { app } => backend
-            .windows(app.as_deref())
-            .map(Response::Windows),
+        RequestKind::Windows { app } => backend.windows(app.as_deref()).map(Response::Windows),
         RequestKind::Tree {
             window,
             depth,
@@ -371,9 +364,7 @@ fn dispatch(backend: &mut dyn backend::Backend, request: &Request) -> CuaResult<
                 root,
                 truncated,
             }),
-        RequestKind::Screenshot { window } => backend
-            .screenshot(*window)
-            .map(Response::Screenshot),
+        RequestKind::Screenshot { window } => backend.screenshot(*window).map(Response::Screenshot),
         RequestKind::Act(action) => backend.act(action).map(Response::Act),
     }
 }

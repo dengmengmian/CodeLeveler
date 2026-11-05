@@ -217,7 +217,8 @@ pub enum ActRequest {
 /// expectations before this reaches a backend; the backend re-reads the live
 /// window and element and refuses a mismatch.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedAction {    pub action: ActionKind,
+pub(crate) struct ResolvedAction {
+    pub action: ActionKind,
     pub expectation: Option<Expectation>,
     pub activate: bool,
 }

@@ -422,10 +422,7 @@ async fn an_unattended_goal_is_refused_while_another_clients_turn_runs() {
         })
         .await
         .expect_err("an unattended goal must not join a running turn");
-    assert!(
-        error.to_string().contains("requires a new turn"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("requires a new turn"), "{error}");
     assert_eq!(
         collaboration_of(&app, &session).await,
         "chat",

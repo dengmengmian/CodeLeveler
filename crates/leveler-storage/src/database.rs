@@ -878,12 +878,11 @@ mod tests {
         }
 
         let db = Database::connect(&path).await.unwrap();
-        let (model, collaboration, kind): (Option<String>, String, String) = sqlx::query_as(
-            "SELECT model, collaboration, kind FROM sessions WHERE id = 'legacy'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let (model, collaboration, kind): (Option<String>, String, String) =
+            sqlx::query_as("SELECT model, collaboration, kind FROM sessions WHERE id = 'legacy'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(model.as_deref(), Some("provider/model"));
         assert_eq!(collaboration, "goal");
         assert_eq!(kind, "direct");
@@ -945,12 +944,11 @@ mod tests {
         let backed = SessionRecord::new("/r", "chat", "provider/model", leveler_core::now());
         let backed_id = leveler_core::SessionId::new(backed.id.clone());
         SessionRepository::new(&db).create(&backed).await.unwrap();
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT model FROM sessions WHERE id = ?1")
-                .bind(backed_id.as_str())
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let stored: Option<String> = sqlx::query_scalar("SELECT model FROM sessions WHERE id = ?1")
+            .bind(backed_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(stored.as_deref(), Some("provider/model"));
     }
 

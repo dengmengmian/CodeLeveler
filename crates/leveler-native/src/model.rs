@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
     Deserialize,
     schemars::JsonSchema,
 )]
+// The enum is the shared native-action vocabulary, not a mail-only enum: the
+// `Mail` prefix is the action's domain and is part of its wire identity. Future
+// domains add their own prefix instead of making `Create` mean one thing today
+// and another tomorrow.
+#[allow(clippy::enum_variant_names)]
 pub enum ActionId {
     #[serde(rename = "mail.draft.create")]
     MailDraftCreate,

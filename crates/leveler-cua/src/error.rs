@@ -57,7 +57,9 @@ pub enum CuaError {
         observed: Bounds,
         current: Bounds,
     },
-    #[error("focus conflict: {target} is not focused (frontmost: {frontmost}); pass activate=true to bring it forward")]
+    #[error(
+        "focus conflict: {target} is not focused (frontmost: {frontmost}); pass activate=true to bring it forward"
+    )]
     FocusConflict { target: String, frontmost: String },
     #[error("could not bring {0} to the front")]
     FocusUnavailable(String),

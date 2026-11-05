@@ -1084,6 +1084,7 @@ fn grant_json(definition: &leveler_schedule::ScheduleDefinition) -> serde_json::
             "actions": grant.actions.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
             "external_side_effects": grant.external_side_effects,
             "granted_at": grant.granted_at,
+            "requires_regrant": !definition.unattended_grant_valid(),
         }),
         // The permission profile is never a durable authorization. A missing
         // grant must stay missing here, whatever interactive profile the
@@ -1094,22 +1095,31 @@ fn grant_json(definition: &leveler_schedule::ScheduleDefinition) -> serde_json::
 
 fn grant_text(definition: &leveler_schedule::ScheduleDefinition) -> String {
     match &definition.unattended {
-        Some(grant) => format!(
-            "unattended {} ({}; external side effects: {})",
-            grant
-                .actions
-                .iter()
-                .map(|kind| kind.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            grant.permission_mode,
-            if grant.external_side_effects {
-                "yes"
+        Some(grant) => {
+            let grant = format!(
+                "unattended {} ({}; external side effects: {})",
+                grant
+                    .actions
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                grant.permission_mode,
+                if grant.external_side_effects {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            if definition.unattended_grant_valid() {
+                grant
             } else {
-                "no"
+                // The dispatcher refuses this grant before starting a run, so
+                // saying only "unattended ..." would hide the real state.
+                format!("{grant} — no longer matches; unattended runs are refused until re-authorized")
             }
-        ),
-        None => "none — native/agent runs are refused before starting".into(),
+        }
+        None => "none — every unattended run (shell, native, agent) is refused before starting; authorize it explicitly".into(),
     }
 }
 
@@ -1721,4 +1731,94 @@ fn doctor_report(
 fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leveler_schedule::{ActionKind, UnattendedGrant};
+
+    fn definition_with_grant() -> ScheduleDefinition {
+        let action = ScheduleAction::Shell {
+            command: "printf x".into(),
+        };
+        let trigger = ScheduleTrigger::Every {
+            anchor: Utc::now(),
+            every: Duration::from_secs(3600),
+        };
+        let id = leveler_schedule::ScheduleId::from("00000000-0000-4000-8000-000000000001");
+        let workspace = PathBuf::from("/tmp/schedule-display");
+        let grant = UnattendedGrant::new(
+            id.clone(),
+            workspace.clone(),
+            PermissionProfile::Assisted,
+            &action,
+            &trigger,
+            None,
+            UnattendedRequest {
+                allow_external_side_effects: true,
+            },
+            Utc::now(),
+        )
+        .expect("a grant for this definition");
+        ScheduleDefinition {
+            id,
+            name: "probe".into(),
+            workspace,
+            action,
+            trigger,
+            session_policy: SessionPolicy::Continue,
+            overlap: OverlapPolicy::SkipIfRunning,
+            mode: PermissionProfile::Assisted,
+            model: None,
+            timeout: Duration::from_secs(600),
+            misfire: MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
+            session_id: None,
+            unattended: Some(grant),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_missing_grant_tells_the_user_every_action_kind_is_refused() {
+        let mut definition = definition_with_grant();
+        definition.unattended = None;
+        let text = grant_text(&definition);
+        assert!(text.contains("shell"), "{text}");
+        assert!(text.contains("native"), "{text}");
+        assert!(text.contains("agent"), "{text}");
+        assert!(text.contains("authoriz"), "{text}");
+        assert!(grant_json(&definition).is_null());
+    }
+
+    #[test]
+    fn a_current_grant_is_not_marked_for_reauthorization() {
+        let definition = definition_with_grant();
+        assert_eq!(
+            grant_json(&definition)["requires_regrant"],
+            serde_json::json!(false)
+        );
+        assert!(!grant_text(&definition).contains("re-authorize"));
+    }
+
+    #[test]
+    fn an_old_grant_version_is_reported_as_requiring_reauthorization() {
+        let mut definition = definition_with_grant();
+        definition.unattended.as_mut().expect("grant").version = 2;
+        assert_eq!(
+            grant_json(&definition)["requires_regrant"],
+            serde_json::json!(true)
+        );
+        let text = grant_text(&definition);
+        assert!(text.contains("re-authorize"), "{text}");
+        assert!(
+            definition
+                .unattended_authorization(ActionKind::Shell, true)
+                .is_err(),
+            "the old grant must stay fail-closed"
+        );
+    }
 }

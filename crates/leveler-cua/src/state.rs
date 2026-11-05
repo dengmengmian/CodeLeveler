@@ -223,12 +223,6 @@ mod tests {
         state.record_windows(&[window()]);
         let observed = state.observed_window(7).expect("recorded");
         assert_eq!(observed.app, "Fixture");
-        assert_eq!(
-            observed.bounds.center(),
-            Point {
-                x: 160.0,
-                y: 120.0
-            }
-        );
+        assert_eq!(observed.bounds.center(), Point { x: 160.0, y: 120.0 });
     }
 }

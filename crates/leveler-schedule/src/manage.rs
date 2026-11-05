@@ -628,9 +628,7 @@ fn grant_view(definition: &ScheduleDefinition) -> ScheduleGrantView {
     // The static identity check ignores the observed side-effect
     // classification: whether a particular run may touch the network is only
     // known when it runs, and the grant names the scope the user accepted.
-    let valid = grant
-        .covers(definition, definition.action.kind(), false)
-        .is_ok();
+    let valid = definition.unattended_grant_valid();
     ScheduleGrantView {
         granted: true,
         external_side_effects: grant.external_side_effects,
