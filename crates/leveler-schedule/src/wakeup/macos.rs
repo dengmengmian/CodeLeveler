@@ -257,13 +257,13 @@ fn parse_run_count(print_output: &str) -> Option<u64> {
 }
 
 async fn read_plist(path: &Path) -> Result<serde_json::Value, WakeupError> {
-    let output = command(PLUTIL, &["-convert", "json", "-o", "-", &path.to_string_lossy()]).await?;
+    let output = command(
+        PLUTIL,
+        &["-convert", "json", "-o", "-", &path.to_string_lossy()],
+    )
+    .await?;
     if !output.success {
-        return Err(WakeupError::command(
-            PLUTIL,
-            output.status,
-            output.stderr,
-        ));
+        return Err(WakeupError::command(PLUTIL, output.status, output.stderr));
     }
     serde_json::from_str(&output.stdout)
         .map_err(|error| WakeupError::Invalid(format!("invalid launchd plist JSON: {error}")))
@@ -379,7 +379,10 @@ mod tests {
         assert_eq!(registration.executable, PathBuf::from("/opt/bin/leveler"));
         assert_eq!(registration.arguments, vec!["schedule", "dispatch"]);
         assert_eq!(registration.interval, Some(Duration::from_secs(60)));
-        assert_eq!(registration.environment.get("PATH").unwrap(), "/usr/bin:/bin");
+        assert_eq!(
+            registration.environment.get("PATH").unwrap(),
+            "/usr/bin:/bin"
+        );
         assert_eq!(
             registration.working_directory,
             Some(PathBuf::from("/home/u/.leveler"))

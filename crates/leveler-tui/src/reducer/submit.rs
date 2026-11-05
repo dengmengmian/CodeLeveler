@@ -1313,6 +1313,7 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
             let command = ClientCommand::RunGoal {
                 session_id: state.session_id.clone(),
                 content: rest,
+                require_new_turn: false,
             };
             submit_turn_input(state, command)
         }

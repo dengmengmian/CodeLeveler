@@ -368,6 +368,7 @@ async fn explicit_cancel_of_a_running_task_records_cancelled() {
         .send(ClientCommand::RunGoal {
             session_id: f.session.clone(),
             content: "finish the inventory work".to_string(),
+            require_new_turn: false,
         })
         .await
         .unwrap();

@@ -125,15 +125,20 @@ async fn a_due_schedule_runs_its_action_once_without_a_model() {
         .create_definition(NewScheduleDefinition {
             name: "deterministic action".into(),
             workspace: workspace.clone(),
-            command: "printf 'scheduled-action-ok\\n'".into(),
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: "printf 'scheduled-action-ok\\n'".into(),
+            },
             trigger: ScheduleTrigger::Once {
                 at: leveler_core::now() - chrono::Duration::seconds(1),
             },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             model: Some(ModelRef::new("mock", "m")),
             timeout: Duration::from_secs(20),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         })
         .await
         .unwrap();
@@ -239,16 +244,21 @@ async fn a_recurring_definition_keeps_one_future_slot_after_a_run() {
         .create_definition(NewScheduleDefinition {
             name: "hourly action".into(),
             workspace: workspace.clone(),
-            command: "printf 'hourly-ok\\n'".into(),
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: "printf 'hourly-ok\\n'".into(),
+            },
             trigger: ScheduleTrigger::Every {
                 anchor: leveler_core::now() - chrono::Duration::seconds(10),
                 every: Duration::from_secs(3600),
             },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             model: None,
             timeout: Duration::from_secs(20),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         })
         .await
         .unwrap();

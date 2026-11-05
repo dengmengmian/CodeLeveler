@@ -1228,6 +1228,8 @@ export interface UiSessionSnapshot {
   interrupted_tool_calls?: UiInterruptedToolCall[];
   /** The event-log sequence this snapshot reflects — the resync anchor. A client that fell behind (broadcast lag, reconnect) takes a fresh snapshot and resumes the event stream *after* this sequence, so it neither double-applies nor misses a canonical event. `None` when unknown (e.g. a brand-new session with no events yet). */
   last_sequence?: number | null;
+  /** Ordinal of the newest durable turn in this session. A client that submitted work and later correlates its terminal compares this value: the projected terminal always belongs to the newest turn, so an ordinal that moved on means a different turn now owns the terminal. Additive: an older runtime reports `None`. */
+  latest_turn_ordinal?: number | null;
   messages: UiMessage[];
   mode: PermissionProfile;
   model?: ModelRef | null;
@@ -1404,6 +1406,8 @@ export interface UiUserShell {
   /** The directory holding this execution's complete raw capture (`stdout.log`, `stderr.log`, `combined.log`) once the copy finished. A client reads the copy for "Copy Output"; it never parses display text to find it. `None` while the execution runs (the capture is still being written) or when the host could not complete one. */
   full_output?: string | null;
   id: UserShellId;
+  /** The delivery identity of the command that produced this execution, when it arrived through a `CommandEnvelope`. It is the runtime's record of *which request* this execution answers, so a caller that owns the command id can find its own execution without matching command text. Absent for a raw `send` and for executions recorded before the field existed; never inferred from the command. */
+  origin_command_id?: CommandId | null;
   output_tail?: string;
   /** True when `output_tail` dropped earlier output. */
   output_truncated?: boolean;
@@ -1429,7 +1433,7 @@ export type ClientCommand =
   /** Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. Distinct from queuing a follow-up (which `SubmitMessage` does while busy): a correction like "actually use the other module" is worthless once the work is finished. Ignored when no turn is running — the caller should submit normally in that case. */
   | { type: 'steer_current_turn'; content: string; session_id: SessionId }
   /** Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop. */
-  | { type: 'run_goal'; content: string; session_id: SessionId }
+  | { type: 'run_goal'; content: string; require_new_turn?: boolean; session_id: SessionId }
   /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. The client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it. */
   | { type: 'resume_task'; content: string; session_id: SessionId }
   /** Import a file as an attachment; the runtime processes and stores it. `name` overrides the display name that would otherwise come from the file name. A terminal that answers Cmd+V on an image by writing a scratch file and pasting its path knows the file name is its own bookkeeping (`clipboard-2026-09-16-215212-CE7C9522.png`) and not something the user chose — only the client that made the gesture knows that, so only it can say so. */

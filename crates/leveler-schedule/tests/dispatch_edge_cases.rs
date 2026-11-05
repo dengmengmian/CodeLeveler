@@ -23,7 +23,7 @@ use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, Session
 use leveler_schedule::{
     Dispatcher, NewScheduleDefinition, RunState, RuntimeConnector, ScheduleStore, ScheduleTrigger,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Barrier, broadcast};
 
 const COMMAND: &str = "printf 'edge\\n'";
 
@@ -37,6 +37,8 @@ struct ScriptedRuntime {
     snapshots: Mutex<SnapshotFn>,
     /// The first delivery is accepted but its acknowledgement is lost.
     lose_ack_once: AtomicBool,
+    /// When set, a run delivery waits until every claim in the pass delivered.
+    deliver_barrier: Option<Arc<Barrier>>,
     events: broadcast::Sender<RuntimeEvent>,
 }
 
@@ -54,8 +56,14 @@ impl ScriptedRuntime {
             delivered: Mutex::new(Vec::new()),
             snapshots: Mutex::new(Box::new(snapshots)),
             lose_ack_once: AtomicBool::new(false),
+            deliver_barrier: None,
             events,
         }
+    }
+
+    fn with_deliver_barrier(mut self, barrier: Arc<Barrier>) -> Self {
+        self.deliver_barrier = Some(barrier);
+        self
     }
 
     fn with_lost_ack(self) -> Self {
@@ -97,6 +105,7 @@ impl ScriptedRuntime {
             available_models: Vec::new(),
             vision: false,
             last_sequence: None,
+            latest_turn_ordinal: None,
             active_tools: Vec::new(),
             interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
@@ -145,6 +154,9 @@ impl InteractiveRuntimeClient for ScriptedRuntime {
     async fn deliver(&self, envelope: CommandEnvelope) -> Result<(), ClientError> {
         let is_run = matches!(envelope.command, ClientCommand::RunUserShell { .. });
         self.delivered.lock().unwrap().push(envelope);
+        if is_run && let Some(barrier) = &self.deliver_barrier {
+            barrier.wait().await;
+        }
         if is_run && self.lose_ack_once.swap(false, Ordering::SeqCst) {
             // The runtime accepted and started the action; only the
             // acknowledgement back to the dispatcher was lost.
@@ -213,15 +225,20 @@ async fn fixture(runtime: &ScriptedRuntime, timeout: Duration) -> Fixture {
             // The runtime connector ignores the workspace; the definition's
             // bound session is the one the dispatcher verifies.
             workspace,
-            command: COMMAND.into(),
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: COMMAND.into(),
+            },
             trigger: ScheduleTrigger::Once {
                 at: leveler_core::now() - chrono::Duration::seconds(1),
             },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             model: None,
             timeout,
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         })
         .await
         .unwrap();
@@ -280,7 +297,7 @@ async fn a_failed_shell_settles_failed_with_its_exit_code() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancelled_shell_settles_failed() {
+async fn a_cancelled_shell_settles_cancelled() {
     let runtime = Arc::new(ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
         let Some(envelope) = delivered
             .iter()
@@ -300,13 +317,15 @@ async fn a_cancelled_shell_settles_failed() {
         .dispatch_due(1)
         .await
         .unwrap();
-    assert_eq!(summary.failed, 1, "{summary:?}");
+    assert_eq!(summary.cancelled, 1, "{summary:?}");
     let run = &fixture
         .store
         .runs(Some(&fixture.definition_id), 10)
         .await
         .unwrap()[0];
-    assert_eq!(run.state, RunState::Failed);
+    // Cancellation is the runtime's observed terminal fact, not a failure
+    // this schedule invents or a success it cannot claim.
+    assert_eq!(run.state, RunState::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -517,4 +536,76 @@ async fn a_foreign_look_alike_seen_first_never_wins_over_our_own_execution() {
         Some("ush-scripted"),
         "the run adopted the foreign execution"
     );
+}
+
+/// Two due occurrences in one pass must be in flight at the same time. The
+/// scripted runtime holds the first delivery until the second arrives, so a
+/// pass that executes claims one after another can never pass this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_due_actions_are_delivered_concurrently() {
+    let barrier = Arc::new(Barrier::new(2));
+    let runtime = Arc::new(
+        ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
+            Ok(delivered
+                .iter()
+                .filter(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+                .map(|envelope| UiUserShell {
+                    id: leveler_core::UserShellId::new(format!(
+                        "ush-{}",
+                        envelope.command_id.as_str()
+                    )),
+                    origin_command_id: Some(envelope.command_id.clone()),
+                    command: COMMAND.into(),
+                    cwd: "/tmp".into(),
+                    status: "success".into(),
+                    elapsed_secs: 1,
+                    exit_code: Some(0),
+                    output_tail: String::new(),
+                    output_truncated: false,
+                    full_output: None,
+                    task_id: None,
+                })
+                .collect())
+        })
+        .with_deliver_barrier(barrier),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = ScheduleStore::open(&tmp.path().join("schedules.db"))
+        .await
+        .unwrap();
+    for name in ["concurrent-a", "concurrent-b"] {
+        store
+            .create_definition(NewScheduleDefinition {
+                name: name.into(),
+                workspace: workspace.clone(),
+                action: leveler_schedule::ScheduleAction::Shell {
+                    command: COMMAND.into(),
+                },
+                trigger: ScheduleTrigger::Once {
+                    at: leveler_core::now() - chrono::Duration::seconds(1),
+                },
+                session_policy: leveler_schedule::SessionPolicy::Continue,
+                overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
+                mode: PermissionProfile::Assisted,
+                model: None,
+                timeout: Duration::from_secs(10),
+                misfire: leveler_schedule::MisfirePolicy::Skip,
+                misfire_grace: Duration::from_secs(300),
+                unattended: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let summary = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatcher(&runtime, store).dispatch_due(10),
+    )
+    .await
+    .expect("both deliveries must be in flight at the same time")
+    .unwrap();
+    assert_eq!(summary.claimed, 2, "{summary:?}");
+    assert_eq!(summary.succeeded, 2, "{summary:?}");
 }

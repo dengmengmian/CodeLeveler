@@ -81,6 +81,12 @@ pub enum ClientCommand {
     RunGoal {
         session_id: SessionId,
         content: String,
+        /// Refuse to join a turn another client is already running instead of
+        /// steering into it. An unattended delivery must own the turn it
+        /// starts, so its terminal can be attributed to that delivery alone.
+        /// Defaulted for wire compatibility with clients that predate it.
+        #[serde(default)]
+        require_new_turn: bool,
     },
     /// Continue the session's interrupted logical task through the runtime's
     /// existing resume path, instead of starting a fresh turn.
@@ -679,6 +685,7 @@ mod tests {
             ClientCommand::RunGoal {
                 session_id: SessionId::new("s1"),
                 content: "修复测试".to_string(),
+                require_new_turn: false,
             },
             "run_goal",
         );

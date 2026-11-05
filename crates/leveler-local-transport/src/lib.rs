@@ -2479,6 +2479,7 @@ mod tests {
                     available_models: vec![ModelRef::new("mock", "m")],
                     vision: false,
                     last_sequence: None,
+                    latest_turn_ordinal: None,
                     active_tools: Vec::new(),
                     interrupted_tool_calls: Vec::new(),
                     active_background_tasks: Vec::new(),

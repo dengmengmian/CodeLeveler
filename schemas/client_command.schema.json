@@ -133,6 +133,11 @@
         "content": {
           "type": "string"
         },
+        "require_new_turn": {
+          "description": "Refuse to join a turn another client is already running instead of steering into it. An unattended delivery must own the turn it starts, so its terminal can be attributed to that delivery alone. Defaulted for wire compatibility with clients that predate it.",
+          "default": false,
+          "type": "boolean"
+        },
         "session_id": {
           "$ref": "#/definitions/SessionId"
         },

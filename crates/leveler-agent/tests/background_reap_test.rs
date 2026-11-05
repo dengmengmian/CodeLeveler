@@ -380,7 +380,7 @@ async fn a_goal_less_chat_session_reaps_goal_lifetime_tasks() {
         .create_task(&leveler_engine::NewSession {
             workspace: Some(h.dir.path().display().to_string()),
             goal: String::new(),
-            model: "mock/m".into(),
+            model: Some("mock/m".into()),
             mode: "assisted".into(),
             sandbox: false,
             kind: leveler_engine::ExecutionKind::Direct,

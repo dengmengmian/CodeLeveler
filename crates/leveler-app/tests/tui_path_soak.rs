@@ -618,6 +618,7 @@ async fn scenario_goal(n: usize) -> Vec<ScenarioResult> {
             ClientCommand::RunGoal {
                 session_id: session_id.clone(),
                 content: format!("检查仓库根目录并完成目标 {i}"),
+                require_new_turn: false,
             },
             Duration::from_secs(60),
         )

@@ -940,6 +940,7 @@ mod tests {
             available_models: vec![ModelRef::new("openai", "gpt-4o-mini")],
             vision: false,
             last_sequence: Some(7),
+            latest_turn_ordinal: None,
             active_tools: Vec::new(),
             interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),

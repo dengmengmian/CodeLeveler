@@ -113,7 +113,7 @@ async fn open_session(db: &Database) -> SessionId {
             // must not need one.
             workspace: Some("/nowhere".into()),
             goal: "process alpha".into(),
-            model: "mock/minimal".into(),
+            model: Some("mock/minimal".into()),
             mode: "read-only".into(),
             sandbox: false,
             kind: ExecutionKind::Direct,

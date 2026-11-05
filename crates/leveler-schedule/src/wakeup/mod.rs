@@ -59,14 +59,12 @@ impl WakeupSpec {
                 "the wakeup executable must be an absolute path".into(),
             ));
         }
-        self.executable
-            .metadata()
-            .map_err(|error| {
-                WakeupError::Invalid(format!(
-                    "the wakeup executable `{}` is not accessible: {error}",
-                    self.executable.display()
-                ))
-            })?;
+        self.executable.metadata().map_err(|error| {
+            WakeupError::Invalid(format!(
+                "the wakeup executable `{}` is not accessible: {error}",
+                self.executable.display()
+            ))
+        })?;
         if !self.executable.is_file() {
             return Err(WakeupError::Invalid(format!(
                 "the wakeup executable `{}` is not a file",
@@ -150,7 +148,11 @@ pub enum WakeupError {
 }
 
 impl WakeupError {
-    fn command(program: impl Into<String>, status: impl std::fmt::Display, stderr: impl Into<String>) -> Self {
+    fn command(
+        program: impl Into<String>,
+        status: impl std::fmt::Display,
+        stderr: impl Into<String>,
+    ) -> Self {
         Self::Command {
             program: program.into(),
             status: status.to_string(),
@@ -415,7 +417,10 @@ mod tests {
         assert_eq!(a, label_for(Path::new("/Users/u/.leveler")));
         assert_ne!(a, label_for(Path::new("/Users/u/other-home")));
         assert!(a.starts_with("com.leveler.schedule."));
-        assert!(a.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-'));
+        assert!(
+            a.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-')
+        );
     }
 
     #[test]

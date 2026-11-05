@@ -166,6 +166,7 @@ mod tests {
             available_models: Vec::new(),
             vision: false,
             last_sequence: None,
+            latest_turn_ordinal: None,
             active_tools: Vec::new(),
             interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
@@ -242,6 +243,7 @@ mod tests {
             available_models: Vec::new(),
             vision: false,
             last_sequence: None,
+            latest_turn_ordinal: None,
             active_tools: Vec::new(),
             interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
@@ -790,6 +792,13 @@ pub struct UiSessionSnapshot {
     /// brand-new session with no events yet).
     #[serde(default)]
     pub last_sequence: Option<i64>,
+    /// Ordinal of the newest durable turn in this session. A client that
+    /// submitted work and later correlates its terminal compares this value:
+    /// the projected terminal always belongs to the newest turn, so an
+    /// ordinal that moved on means a different turn now owns the terminal.
+    /// Additive: an older runtime reports `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_turn_ordinal: Option<i64>,
     /// Live render state needed to reconnect while a long turn is still
     /// running. All fields are additive/defaulted for protocol compatibility.
     #[serde(default)]

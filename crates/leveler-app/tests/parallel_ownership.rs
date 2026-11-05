@@ -26,7 +26,7 @@ async fn create_parallel_parent(engine: &TaskEngine) -> leveler_core::SessionId 
         .create_task(&NewSession {
             workspace: Some("/repo".into()),
             goal: "parallel goal".into(),
-            model: "mock/m".into(),
+            model: Some("mock/m".into()),
             mode: "assisted".into(),
             sandbox: false,
             kind: ExecutionKind::Parallel,

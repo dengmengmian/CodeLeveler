@@ -10,10 +10,11 @@ use std::process::ExitCode;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{CommandRunner, ProcessRequest};
+use leveler_execution::CommandRunner;
 use leveler_native::{
-    ActionId, ActionStatus, CapabilityReport, CapabilityState, DiscoveryReport, ExecutionEvidence,
-    NativeActionRequest, NativeActions, NativeOutcome, PermissionState,
+    ActionId, ActionStatus, CapabilityReport, CapabilityState, DiscoveryReport, NativeActionRequest,
+    NativeActions,
+    NativeOutcome,
 };
 
 use crate::cli::NativeCommand;
@@ -101,42 +102,28 @@ async fn run_action(
         }),
     };
     let request = NativeActionRequest { action, input };
-    let plan = match native.plan(&request) {
-        Ok(plan) => plan,
+    let run = match native
+        .run(
+            runner,
+            &request,
+            leveler_native::PermissionMode::MayPrompt,
+            None,
+            256 * 1024,
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(run) => run,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::from(EXIT_REQUIRES_ACTION);
         }
     };
+    let outcome = run.outcome;
 
-    let report = native.discover(runner).await;
-    let provider = plan.provider().as_str();
-    let Some(capability) = report
-        .capabilities
-        .iter()
-        .find(|capability| capability.provider == provider)
-    else {
-        eprintln!(
-            "{} is not available: this host reported no provider {provider}",
-            action.as_str()
-        );
-        print_report(&report);
-        return ExitCode::from(EXIT_REQUIRES_ACTION);
-    };
-    if capability.state == CapabilityState::Unavailable
-        || capability.state == CapabilityState::Unsupported
+    if !json
+        && let Some(capability) = &run.capability
     {
-        eprintln!(
-            "{} is not available: {}",
-            action.as_str(),
-            capability
-                .reason
-                .as_deref()
-                .unwrap_or("the provider is unavailable")
-        );
-        return ExitCode::from(EXIT_REQUIRES_ACTION);
-    }
-    if !json {
         eprintln!(
             "{} via {} — discovery says {} (permission: {}, configured: {:?})",
             action.as_str(),
@@ -146,45 +133,13 @@ async fn run_action(
             capability.configured
         );
     }
-    if capability.permission == PermissionState::Unknown {
+    if outcome.execution_id.is_empty() {
         eprintln!(
             "{} was not started: {}",
             action.as_str(),
-            capability
-                .reason
-                .as_deref()
-                .unwrap_or("automation permission could not be determined")
+            outcome.detail
         );
-        return ExitCode::from(EXIT_REQUIRES_ACTION);
     }
-
-    let mut process = ProcessRequest::new(
-        plan.program(),
-        plan.args().to_vec(),
-        plan.cwd().to_path_buf(),
-    );
-    process.timeout = plan.timeout();
-    process.max_output_bytes = 256 * 1024;
-    let started = std::time::Instant::now();
-    let output = runner.run(process, CancellationToken::new()).await;
-    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let evidence = match output {
-        Ok(output) => ExecutionEvidence {
-            exit_code: output.exit_code,
-            timed_out: output.timed_out,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            duration_ms,
-        },
-        Err(error) => ExecutionEvidence {
-            exit_code: None,
-            timed_out: false,
-            stdout: String::new(),
-            stderr: error.to_string(),
-            duration_ms,
-        },
-    };
-    let outcome = native.interpret(action, plan.provider(), &evidence);
     if json {
         print_json(&outcome);
     } else {

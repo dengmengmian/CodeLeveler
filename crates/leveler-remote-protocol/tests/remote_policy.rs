@@ -75,6 +75,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             ClientCommand::RunGoal {
                 session_id: session(),
                 content: "goal".to_string(),
+                require_new_turn: false,
             },
             true,
         ),

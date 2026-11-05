@@ -3016,6 +3016,7 @@ impl InProcessRuntimeClient {
             let result = Box::pin(self.send(ClientCommand::RunGoal {
                 session_id: session_id.clone(),
                 content: task.clone(),
+                require_new_turn: false,
             }))
             .await;
             if result.is_err() {
@@ -3660,12 +3661,23 @@ impl InProcessRuntimeClient {
         &self,
         session_id: SessionId,
         content: String,
+        require_new_turn: bool,
     ) -> Result<(), ClientError> {
         // A client that sends the explicit command while a turn already runs
         // must get the same upgrade as a text steer. Refusing with "session is
         // busy" would make Goal entry depend on which command shape a client
-        // happened to send.
+        // happened to send. An unattended delivery is different: it must own
+        // the turn it starts, because its terminal is attributed to that one
+        // delivery. Joining another client's work would make the schedule
+        // settle (and charge) work it did not start.
         if self.active.is_running(&session_id) {
+            if require_new_turn {
+                return Err(ClientError::Runtime(
+                    "the session already has an active turn; this delivery requires a new \
+                     turn and does not join another client's work"
+                        .into(),
+                ));
+            }
             return self.steer_into_goal(session_id, content).await;
         }
         let config = self.runtime_config(&session_id).await?;
@@ -3797,7 +3809,7 @@ impl InProcessRuntimeClient {
                 GoalCommand::Run(task) if self.active.is_running(&session_id) => {
                     self.steer_into_goal(session_id, task).await
                 }
-                GoalCommand::Run(task) => self.run_goal_turn(session_id, task).await,
+                GoalCommand::Run(task) => self.run_goal_turn(session_id, task, false).await,
                 GoalCommand::Clear => self.clear_goal_axis(session_id).await,
                 GoalCommand::Status => self.goal_status(session_id).await,
                 GoalCommand::Usage => Err(ClientError::Runtime(
@@ -5484,7 +5496,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::RunGoal {
                 session_id,
                 content,
-            } => self.run_goal_turn(session_id, content).await,
+                require_new_turn,
+            } => {
+                self.run_goal_turn(session_id, content, require_new_turn)
+                    .await
+            }
             ClientCommand::AddAttachment {
                 session_id,
                 path,
@@ -6915,6 +6931,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             available_models,
             vision,
             last_sequence,
+            latest_turn_ordinal: facts.turns.last().map(|turn| turn.ordinal),
             active_tools: live.active_tools,
             interrupted_tool_calls,
             active_background_tasks,
@@ -8276,6 +8293,7 @@ async fn compact_conversation(
                 available_models,
                 vision,
                 last_sequence,
+                latest_turn_ordinal: facts.turns.last().map(|turn| turn.ordinal),
                 active_tools: live.active_tools,
                 interrupted_tool_calls,
                 active_background_tasks,

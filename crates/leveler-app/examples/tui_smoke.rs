@@ -207,6 +207,7 @@ fn parse_scenarios(session_id: &leveler_core::SessionId, args: &[String]) -> Vec
             ClientCommand::RunGoal {
                 session_id: session_id.clone(),
                 content,
+                require_new_turn: false,
             }
         } else {
             ClientCommand::SubmitMessage {

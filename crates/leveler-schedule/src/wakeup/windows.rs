@@ -126,7 +126,11 @@ pub(super) async fn status(home: &Path) -> Result<WakeupStatus, WakeupError> {
             )),
         ),
         Ok(_) => (None, None, None),
-        Err(error) => (None, None, Some(format!("could not query Task Scheduler: {error}"))),
+        Err(error) => (
+            None,
+            None,
+            Some(format!("could not query Task Scheduler: {error}")),
+        ),
     };
     Ok(WakeupStatus {
         backend: "task-scheduler",
@@ -143,7 +147,9 @@ pub(super) async fn status(home: &Path) -> Result<WakeupStatus, WakeupError> {
 }
 
 fn registration_from_xml(xml: &str) -> WakeupRegistration {
-    let command = element_text(xml, "Command").map(PathBuf::from).unwrap_or_default();
+    let command = element_text(xml, "Command")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let arguments = element_text(xml, "Arguments")
         .map(|raw| split_windows_arguments(&raw))
         .unwrap_or_default();
@@ -296,9 +302,18 @@ mod tests {
 
     #[test]
     fn iso8601_durations_parse() {
-        assert_eq!(parse_iso8601_duration("PT60S"), Some(Duration::from_secs(60)));
-        assert_eq!(parse_iso8601_duration("PT1M"), Some(Duration::from_secs(60)));
-        assert_eq!(parse_iso8601_duration("PT2H"), Some(Duration::from_secs(7200)));
+        assert_eq!(
+            parse_iso8601_duration("PT60S"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_iso8601_duration("PT1M"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_iso8601_duration("PT2H"),
+            Some(Duration::from_secs(7200))
+        );
         assert_eq!(parse_iso8601_duration("P1D"), None);
     }
 }

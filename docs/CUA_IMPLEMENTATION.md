@@ -698,3 +698,258 @@ Linux compile environment with the C toolchain; native-action and real-mail
 schedules only after their separate authorization and consent gates. Phase 1
 stays **PARTIAL** and Phase 2 stays **PARTIAL / NA-02 BLOCKED**; this phase does
 not promote any of their items.
+
+## Phase 4 — Scheduled Automation product closure (2026-11-04)
+
+### Verdict
+
+**macOS: the three action kinds (`shell`, `native`, `agent`) share one schedule
+store and one runtime; the agent path was observed end to end with a real
+DeepSeek model, and native actions run through `leveler-native` and the host
+execution authority.** A schedule can now be `once`, `every`, `daily`, `weekly`,
+`cron` or an explicit run-now, in an IANA timezone, with explicit overlap,
+misfire, session and unattended-authorization policies. An agent run is an
+ordinary runtime session, task, turn and goal; the dispatcher hands the goal
+over and returns, and a later dispatch pass settles the run from the runtime's
+own terminal record. No second scheduler, agent loop or execution authority was
+added.
+
+Windows remains **compile-checked only**; a real Windows host did not run the
+task, native actions or the schedule. Linux remains an explicit typed
+`unsupported` OS-wakeup backend, and even a compile check is blocked on this
+host by the missing Linux C toolchain for `libsqlite3-sys`. Real mail sending
+remains **BLOCKED**: no run executed `mail.send.submit`, and that action is only
+schedulable when the persisted grant explicitly covers external side effects.
+
+Baseline: `82ea7dd` (OS wakeup and misfire) plus this worktree; debug
+`aarch64-apple-darwin`, macOS 26.5.
+
+### Trigger and time contract
+
+| Rule | Stored facts | Next occurrence |
+|---|---|---|
+| `once` | `once_at` | exactly once, never a successor |
+| `every` | anchor + interval seconds | first grid point strictly after now; no accumulated drift |
+| `daily` | `HH:MM` + IANA timezone | next local wall clock |
+| `weekly` | weekday set + `HH:MM` + IANA timezone | next listed local weekday |
+| `cron` | five fields + IANA timezone | next matching local minute, floored to `:00.000` |
+| run-now | one `run_now=1` occurrence | dispatched on demand; not part of the rule grid |
+
+Local times use `chrono-tz`. A nonexistent wall time (spring forward) runs at
+the first valid instant after the gap; an ambiguous wall time (fall back) runs
+once at the earlier instant and is not repeated. Month-end, leap day, invalid
+cron and sub-minute cron are rejected or resolved by the rule itself. Every
+next occurrence is computed from the rule and the current instant, never from
+the previous run's finish, so a late run cannot shift the grid. Cron slots are
+minute-aligned after the fix below; daily/weekly slots already were. An expired
+`once` slot is not resurrected; a recurring definition keeps exactly one future
+slot and missed slots are not backfilled.
+
+The attempt carries four distinct instants: `scheduled_for` (the rule), the
+wake/claim instant, `delivered_at` / `handed_off_at` / `running_at` (what the
+dispatcher observed), and `finished_at` (the terminal fact). None is derived
+from another.
+
+**Cron alignment defect found and fixed during dogfood.** The first cron
+occurrences carried the creation instant's sub-second part (`16:15:00.904Z`,
+`16:20:00.723Z`) because the cron engine preserved the query's sub-second
+precision. A fixed 60 s OS wake that fires near `:00.x` can be earlier than
+such a slot, delaying it by a whole interval. `ScheduleTrigger::next_after`
+now floors the local query instant to the minute, and the live launchd job
+produced `16:28:00.000Z` and `16:29:00.000Z` afterwards. Locked by
+`rule::tests::cron_next_occurrence_is_minute_aligned` (red at
+`16:26:00.752Z`, green at `16:26:00Z`).
+
+### Action kinds
+
+| Kind | Execution chain | Completion fact |
+|---|---|---|
+| `shell` | `ClientCommand::RunUserShell` with `CommandId("schedule-run-{run_id}")` | runtime `UserShellFinished`, exit code and `execution_id` |
+| `native` | typed id + structured JSON → `leveler-native` classify/execute → `NativeActionExecutor` → host authority (AppleScript / UIA / Mail) | native report `status`, `capability_state`, `permission_state`; `Submitted` is not success |
+| `agent` | ordinary `CreateSessionRequest` + `SubmitGoal` through the existing runtime, model and tools | a terminal task record owned by this run's turn (`sequence > baseline_sequence` and `latest_turn_ordinal == run.turn_ordinal`), `task_outcome` and usage delta |
+
+No action is converted to a shell string. The native executor receives the
+typed `ActionId` and validated input; an unknown field or an unsupported action
+is `invalid_input` / `unsupported` and settles `blocked` without starting
+anything. `mail.send.open_ui` is refused because it needs a person;
+`mail.send.submit` is classified as external side effects.
+
+### Agent run lifecycle
+
+`SessionPolicy::Continue` binds one session per definition on the first run and
+reuses it; `Fresh` creates one session per run and binds nothing. The session
+is created with the definition's workspace, permission profile and model; a
+`Continue` run re-asserts `AutoApprove` from the persisted grant before
+submitting, because approval policy is not a persisted session fact, and
+restores `Interactive` immediately after the admission on both success and
+failure so the policy cannot leak into a later person's turn. A goal is
+delivered once with `CommandId("schedule-goal-{run_id}")` and
+`require_new_turn: true`: if another client's turn is already running, the
+dispatcher records `skipped` instead of steering into that client's work. The
+dispatcher records the submitted `TaskId`, the pre-submission task `sequence`,
+the pre-submission newest turn ordinal, and — only after a successful
+delivery — the ordinal of the turn the delivery started. A later pass observes
+the snapshot: a terminal record at or below the baseline belongs to an earlier
+turn and cannot settle this run; a terminal is attributable only while the
+run's recorded ordinal is still the session's newest (`latest_turn_ordinal`).
+If a person starts and finishes a newer turn, this run's terminal is no longer
+projected, so the run settles `unknown` at its deadline and never settles,
+cancels or charges that person's turn. Only a later terminal in the run's own
+turn sets `succeeded`/`failed` plus `task_outcome` and the usage delta
+(`final.since(baseline)`, missing components stay missing). A pending
+interaction is not a failure and not a success: it settles
+`waiting_approval` with a reason and sends a cancellation, and the runtime's
+terminal record is the cancellation result. If no terminal arrives within the
+timeout the run becomes `unknown` and is not retried.
+
+The run's identity is `(task, task sequence baseline, turn ordinal)`, not just
+`task_id + sequence`: a terminal satisfies `sequence > baseline` even when it
+belongs to a later turn in the same session. `TurnOrdinal` is captured from
+the runtime snapshot after delivery and stored on the run; `None` means the
+identity could not be established, and reconciliation then never settles or
+cancels from a terminal. `RunGoal.require_new_turn` and
+`UiSessionSnapshot.latest_turn_ordinal` are additive, defaulted wire fields:
+an older client omits the flag, and an older runtime reports `None`.
+
+### Authorization
+
+There are two independent layers:
+
+1. **The definition's permission profile** (`assisted`, `request-approval`,
+   `full-access`) is passed into the runtime session; it governs what the
+   runtime/tools permit. Interactive approvals are never promoted into
+   scheduled authority.
+2. **The persisted unattended grant** is required by the dispatcher for
+   `native` and `agent` actions unless the profile is `full-access`. The grant
+   is scoped by definition id, canonical workspace, permission mode, action
+   kind, the exact action fingerprint (shell command, or native action + its
+   full structured input, or agent goal), the authorized model, and an
+   explicit `external_side_effects` flag; `revoke-grant` removes it. A
+   definition row whose action, input, goal or model was edited after issuance
+   no longer matches its grant and is refused before the authority starts.
+   Version-1 grants, which bound only the action kind, fail closed and must be
+   re-created. A grant is created explicitly (`--grant-unattended`), never by
+   adding a rule or by answering one prompt. A TCC/macOS permission is still
+   enforced by the host authority; `full-access` bypasses the CodeLeveler gate,
+   not the operating system.
+
+The dispatcher decides from the persisted definition re-read immediately
+before delivery, not from the snapshot carried by the claim, so a grant
+revoked or narrowed after the claim cannot start the action. Revocation is not
+a retroactive kill: an attempt that already passed the decision is authorized
+work, and like `pause` it is not interrupted (use `cancel` for that). The
+remaining window between the decision and the start of the external effect is
+inherent in an in-flight action; there is no second approval engine and no
+per-action re-approval.
+
+A run that needs a person (`mail.send.open_ui`), lacks a capability, or lacks
+TCC permission settles `waiting_approval` or `blocked` with the observed
+reason. The dispatcher never waits for a dialog and never prompts repeatedly.
+
+### Overlap, misfire, retry and cancel
+
+- `skip-if-running` (default): a due slot suppressed by an active run of the
+  same definition is recorded `skipped`. `queue-one`: the slot stays pending
+  and becomes claimable after the active run settles. `allow-concurrent`:
+  only when the type and resources permit; two GUI tasks contending for one
+  desktop input are not allowed by the product contract, and a concurrent
+  agent definition must use a fresh session per run.
+- Claiming is one SQLite CAS transaction; the `(definition_id,
+  scheduled_for)` unique key deduplicates OS wakes. The claim carries a 120 s
+  lease; an expired lease becomes `interrupted`/`unknown` with an explicit
+  reason and is never retried. Claims taken by one pass run concurrently,
+  bounded by `max`, so a long shell or native action cannot delay a claimed
+  agent handoff or another due schedule.
+- Misfire: `skip` (default) records an older-than-grace slot `missed` and runs
+  nothing; `run-once-on-recovery` leaves the single overdue slot claimable for
+  one pass. Neither backfills multiple slots.
+- Retry is absent by design. The persisted facts still keep the required
+  distinctions: `failed` is a terminal error after an attempt (no automatic
+  retry); `blocked` was refused before any authority started; `submitted` /
+  `completed` may already have produced an external side effect; `unknown` was
+  delivered or may have been delivered without a terminal; a claim with no
+  `delivered_at` / `running_at` was not delivered; a claim with `delivered_at`
+  but no terminal is delivered-unconfirmed; the bound session/task record is
+  the agent's resumable identity, owned by the runtime, not by a re-run of the
+  schedule. `unknown` is never retried; a person must read the run history.
+  `run-now` is the explicit manual new attempt, never an automatic retry.
+- `pause` stops future slots and never kills an active run; `remove` is refused
+  while a run is active (`cancel` first); `cancel` records the request, the
+  owning dispatcher sends the runtime cancellation while the process is
+  observable, and the runtime's terminal record settles `cancelled`. At most
+  one cancellation is issued per run.
+
+### CLI
+
+`schedule add` accepts exactly one of `--command`, `--native-action
+--native-input` or `--agent-goal`, plus `--at`, `--every`, `--daily`,
+`--weekly --local-time`, `--cron` and `--timezone`, `--model`,
+`--session-policy`, `--overlap`, `--misfire`, `--timeout`,
+`--grant-unattended [--allow-external-side-effects]` and `--permission`.
+`show` prints action, trigger and timezone, next occurrence, permission, model,
+bound/fresh session, overlap, misfire, grant, and recent runs; `runs` prints
+state, slot, delivery/start/finish, exit code, provider, native facts, usage,
+session and error; `run-now`, `cancel`, `pause`, `resume`, `revoke-grant`,
+`remove`, `dispatch`, `serve`, `enable`, `disable`, `status`, `doctor` and
+`uninstall` complete the surface. Schedule subcommands accept the hidden global
+`--home` so an isolated home can be addressed on every platform.
+
+### Real evidence (macOS)
+
+| Dogfood | Observed |
+|---|---|
+| DF-41 daily/weekly/cron | `dogfood-daily` (`00:15 Asia/Shanghai`) first slot `16:15:00.000Z`, next `2026-11-05T16:15:00Z`; `dogfood-weekly` (`mon,thu`, same time) first slot executed, next `2026-11-08T16:15:00Z`; `dogfood-cron` (`*/5`) slots `16:15:00.904Z` and `16:20:00.723Z`, the latter `missed` under `skip` after its 300 s grace, next `16:30:00.039Z`. Real launchd wake #16 (`16:28:14.447Z`) claimed and executed the minute-aligned cron slot `16:28:00.000Z`; next slot `16:29:00.000Z`. The LaunchAgent then ran unattended until it was uninstalled: the cron marker reached 473 lines, wakes reached id 486, and every due slot was claimed and settled exactly once. All runs carry session id, slot, start and finish. |
+| DF-42 native | `mail.sent.check` ran through the real `macos.mail` backend when dispatched from the terminal: run `e569ba27…` `succeeded`, `native_outcome=completed`, `capability_state=available`, `permission_state=granted`. The same action scheduled in the isolated OS-wake home settled `waiting_approval` (`native_outcome=requires_permission`, `capability_state=requires_permission`, `permission_state=not_determined`, reason "Apple Events automation consent has not been determined; the first action asks the user, and discovery does not prompt") because the LaunchAgent process has no Automation consent of its own: it did not wait, prompt or elevate. `mail.send.submit` (`native-send-refused`) settled `blocked` with "the action can create external side effects and the unattended grant did not authorize them"; the authority was never started and no mail was sent. Invalid native input now settles `blocked` / `invalid_input` with "unknown field `limit`, expected `to` or `subject`". |
+| DF-43 agent | run `47264ef3…`, session `747ba0cf…`, goal "Read README.md … create SUMMARY.md …"; real provider `deepseek`, 4 model requests, 38,112 input (25,600 cached), 613 output, 167 reasoning tokens, 5,463 µs cost; 42 session events, 3 tool calls (`read_file`, `write_file`, `update_goal`); `SUMMARY.md` contains `blue-green`; `task_outcome=completed`, `task_sequence=42`. This real run predates the turn-identity hardening; the ownership rule itself is locked by the controlled-runtime tests in `scheduled_agent` (later turn cannot settle, unowned cancel refused, restarted dispatcher settles). |
+| DF-44 no Desktop/TUI | launchd started `schedule dispatch --source os` from the LaunchAgent with no TUI or Desktop process; the whole launchd sequence (wakes reached id 486) claimed 0 when nothing was due and 1 when the store held a due slot, with no other driver involved. |
+| DF-45 long run outlives the dispatcher | run Now handoff at `16:17:21.158Z`; its wake finished at `16:17:21.159Z` (`handed_off=1`, `succeeded=0`); the task finished at `16:18:14.984Z` and was settled by a later pass. |
+| DF-46 duplicates/crash/pause/delete | duplicate OS wakes claimed 0; crash: claim `16:22:51.627Z`, lease `16:24:51.627Z`, `SIGKILL` at `16:22:58.42Z`; the shell kept running and wrote its marker, and the recovery pass at `16:25:20.039Z` settled the run `unknown` ("the runtime had already started this action; … not retried"), occurrence `interrupted`, exactly one execution marker; pause mid-run left the shell running to exit 0; remove was refused while active and succeeded after settlement; `cancel` requested at `16:22:29.082Z`, issued at `.147`, runtime terminal settled `cancelled` at `.430Z` with `execution_id`; model `deepseek/does-not-exist` failed with "not configured". |
+| DF-47 security | unauthorized external side effect blocked before execution; no TCC permission was created or upgraded; a temporary approval is not a grant (grant tests: matching scope only, revocation effective); crash/unknown is not retried; model-free shell and native schedules ran with zero provider requests in a home with no `config.toml`. |
+| Concurrency | Two `once` shell schedules due at the same instant (`00:46:19Z`) were claimed by one pass (`--max 4`): both runs started at `00:46:21.060Z` and finished at `00:46:25.319Z` / `.337Z`, so the two 4 s actions ran in parallel; each marker was written exactly once and the concurrent second dispatcher claimed 0. The claim is still bounded by `max` and at-most-once by the store CAS. `two_due_actions_are_delivered_concurrently` locks this behavior (red under the old sequential loop). |
+| Interactive regression | The ordinary TUI agent was driven over a real PTY with the machine's real DeepSeek config while the schedule feature was present: session `e794c4b6…`, turn `c4a35c93…` `completed`, 2 provider rounds (7,971 / 8,702 input, 6,144 cached, 710 / 38 output, 2,523 µs total cost), the model wrote `probe_real.go` with exactly 103 lines, and all 8 PTY assertions (full diff paint, fold/unfold, `/copy diff`) passed. The interactive path never enters the scheduler. |
+
+Commands: `cargo test -p leveler-schedule` (84 tests: 40 unit, 8 edge,
+24 agent, 6 policy, plus the existing identity/model-free/action suites; all
+green), `cargo test -p leveler-native --lib` (33 passed),
+`cargo test -p leveler-cli --bin leveler schedule` (passed). Windows GNU
+compile: `cargo check --target x86_64-pc-windows-gnu -p leveler-schedule -p
+leveler-cli` (passed after the cron fix). Interactive regression:
+`python3 scripts/pty_dogfood.py --provider real --only live` (8 assertions,
+0 failures; re-run against this worktree). The dogfood home is
+`/tmp/leveler-df4` (isolated `LEVELER_HOME`, no provider key in
+`config.toml`; the key was supplied only through the environment for the agent
+run). The real launchd label was uninstalled after the evidence was recorded.
+
+### Limits and risks
+
+- Windows is compile-only; no Windows host ran the task, native action or
+  schedule. Linux is unsupported by design and not compile-checked here.
+- Real TCC revocation during a scheduled native run was not exercised
+  (`RequiresPermission → waiting_approval` is covered by a unit test); real
+  sleep/wake and logout/login transitions remain **NOT_VERIFIED**.
+- `mail.sent.check` is read-only; no real mail was sent and `mail.send.submit`
+  remains blocked without an explicit external-side-effect grant. The control
+  recipient is still not configured.
+- A cron slot is minute-granular; launchd decides the actual start within the
+  minute, and the misfire policy decides whether an overdue slot still runs.
+- Concurrent dispatcher passes are at-most-once, but the candidate snapshot is
+  bounded by `--max`. Two passes racing with an explicit `--max 1` can leave a
+  claimable slot pending for the next pass (observed in the concurrency probe);
+  the OS registration uses the default 4, and the slot is not lost. This is a
+  latency edge, not a duplicate or a lost run.
+- A live system timezone change or clock jump was not exercised; next
+  occurrences are always recomputed from the current instant and the stored
+  rule, and DST transitions are covered by unit tests, not by moving this
+  host's clock.
+- The dispatcher lacks a TUI/Desktop surface (Phase 5); only the CLI exists.
+- An agent run is only as good as the runtime's own terminal record. A
+  `waiting_approval` outcome means a person is needed; it is not silently
+  converted into a retry.
+- Usage is the session's cumulative delta across the run's own turn. A person
+  who steers extra input into that same turn is included; the runtime does not
+  persist a per-request turn link (`model_requests.turn_id` is currently
+  unused), so per-request attribution is not claimed.
+- A terminal that is no longer projected because a newer turn exists leaves
+  the run `unknown`; the person's turn is never settled or cancelled by the
+  schedule, and the run is not retried.
+

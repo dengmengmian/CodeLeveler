@@ -26,6 +26,7 @@
 //! is not.
 
 mod dispatch;
+mod rule;
 mod store;
 
 use std::path::PathBuf;
@@ -35,16 +36,387 @@ use chrono::{DateTime, Utc};
 use leveler_client_protocol::{ModelRef, PermissionProfile, SessionId};
 use serde::{Deserialize, Serialize};
 
-pub use dispatch::{DispatchSummary, Dispatcher, RuntimeConnector};
-pub use store::{Claim, Recovered, RunOutcome, ScheduleStore};
+pub use dispatch::{
+    DispatchSummary, Dispatcher, NativeActionClass, NativeActionExecutor, NativeExecutionReport,
+    NativeExecutionRequest, NativeRunStatus, RuntimeConnector, UsageReader,
+};
+pub use rule::{LocalTime, ScheduleTrigger, WeekdaySet, parse_cron, parse_timezone};
+pub use store::{Claim, HandedOffRun, Recovered, RunFacts, RunOutcome, ScheduleStore};
 pub use wakeup::{WakeupError, WakeupRegistration, WakeupSpec, WakeupStatus};
 
 pub mod wakeup;
 
 /// Longest shell command a definition may carry.
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
+/// Longest agent goal a definition may carry.
+pub const MAX_GOAL_BYTES: usize = 64 * 1024;
+/// Longest serialized native-action input.
+pub const MAX_NATIVE_INPUT_BYTES: usize = 256 * 1024;
 /// Longest display name.
 pub const MAX_NAME_BYTES: usize = 200;
+
+/// What a schedule executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// A deterministic shell command.
+    Shell,
+    /// One structured native action, executed through the host execution
+    /// authority.
+    Native,
+    /// A real agent turn submitted to the existing runtime.
+    Agent,
+}
+
+impl ActionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Native => "native",
+            Self::Agent => "agent",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "shell" => Some(Self::Shell),
+            "native" => Some(Self::Native),
+            "agent" => Some(Self::Agent),
+            _ => None,
+        }
+    }
+
+    /// Whether the kind can create effects outside CodeLeveler's workspace.
+    /// An agent run can, because its tools can.
+    pub const fn may_have_external_side_effects(self) -> bool {
+        matches!(self, Self::Native | Self::Agent)
+    }
+}
+
+/// The declared work of a schedule. The variants are typed; no action is
+/// converted into a shell string to reuse the old path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScheduleAction {
+    Shell {
+        command: String,
+    },
+    Native {
+        action: String,
+        input: serde_json::Value,
+    },
+    Agent {
+        goal: String,
+    },
+}
+
+impl ScheduleAction {
+    pub const fn kind(&self) -> ActionKind {
+        match self {
+            Self::Shell { .. } => ActionKind::Shell,
+            Self::Native { .. } => ActionKind::Native,
+            Self::Agent { .. } => ActionKind::Agent,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ScheduleError> {
+        match self {
+            Self::Shell { command } => {
+                validate_text(command, "the schedule command", MAX_COMMAND_BYTES, true)
+            }
+            Self::Native { action, input } => {
+                if action.trim().is_empty() {
+                    return Err(ScheduleError::Invalid(
+                        "the native action id is empty".into(),
+                    ));
+                }
+                if action.len() > 128 {
+                    return Err(ScheduleError::Invalid(
+                        "the native action id exceeds 128 bytes".into(),
+                    ));
+                }
+                if !action
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+                {
+                    return Err(ScheduleError::Invalid(
+                        "the native action id may only contain ASCII letters, digits, `.`, `_` and `-`"
+                            .into(),
+                    ));
+                }
+                if !input.is_object() {
+                    return Err(ScheduleError::Invalid(
+                        "the native action input must be a JSON object".into(),
+                    ));
+                }
+                let serialized = serde_json::to_vec(input).map_err(|error| {
+                    ScheduleError::Invalid(format!(
+                        "the native action input is not serializable: {error}"
+                    ))
+                })?;
+                if serialized.len() > MAX_NATIVE_INPUT_BYTES {
+                    return Err(ScheduleError::Invalid(format!(
+                        "the native action input exceeds {MAX_NATIVE_INPUT_BYTES} bytes"
+                    )));
+                }
+                Ok(())
+            }
+            Self::Agent { goal } => validate_text(goal, "the agent goal", MAX_GOAL_BYTES, false),
+        }
+    }
+
+    /// The command field is only meaningful for shell actions. Empty strings
+    /// are stored for the other kinds so an old reader cannot mistake a goal
+    /// for a command.
+    pub fn command(&self) -> &str {
+        match self {
+            Self::Shell { command } => command,
+            Self::Native { .. } | Self::Agent { .. } => "",
+        }
+    }
+
+    pub fn goal(&self) -> Option<&str> {
+        match self {
+            Self::Agent { goal } => Some(goal),
+            _ => None,
+        }
+    }
+
+    /// Stable text that binds an unattended grant to this exact declared
+    /// action — its kind, target and parameters.
+    ///
+    /// A grant is authorization for one concrete action, not for whatever the
+    /// schedule row happens to contain later. The fingerprint is deliberately
+    /// the typed action data; no action is flattened into a shell string.
+    pub fn fingerprint(&self) -> Result<String, String> {
+        match self {
+            Self::Shell { command } => Ok(format!("shell\u{0}{command}")),
+            Self::Native { action, input } => {
+                let input = serde_json::to_string(input).map_err(|error| {
+                    format!("the native action input is not serializable: {error}")
+                })?;
+                Ok(format!("native\u{0}{action}\u{0}{input}"))
+            }
+            Self::Agent { goal } => Ok(format!("agent\u{0}{goal}")),
+        }
+    }
+}
+
+fn validate_text(
+    value: &str,
+    what: &str,
+    max_bytes: usize,
+    reject_control: bool,
+) -> Result<(), ScheduleError> {
+    if value.trim().is_empty() {
+        return Err(ScheduleError::Invalid(format!("{what} is empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(ScheduleError::Invalid(format!(
+            "{what} exceeds {max_bytes} bytes"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(ScheduleError::Invalid(format!(
+            "{what} contains a NUL byte"
+        )));
+    }
+    if reject_control && value.chars().any(|ch| ch.is_control()) {
+        return Err(ScheduleError::Invalid(format!(
+            "{what} contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+/// How a definition's session is chosen for each run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPolicy {
+    /// Reuse one durable session for every run. The session is bound on the
+    /// first run and never silently replaced.
+    Continue,
+    /// Create a new session for every run. The run stores its own session id;
+    /// the definition does not bind one.
+    Fresh,
+}
+
+impl SessionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Fresh => "fresh",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "continue" => Some(Self::Continue),
+            "fresh" => Some(Self::Fresh),
+            _ => None,
+        }
+    }
+}
+
+/// What happens when a slot becomes due while the same definition still has an
+/// active run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapPolicy {
+    /// Record the slot as skipped. Chosen by default: a missed slot stays
+    /// visible, while a duplicate side effect does not.
+    SkipIfRunning,
+    /// Leave the slot pending and execute it after the active run settles.
+    QueueOne,
+    /// Allow the new slot to run while the previous one is still running.
+    AllowConcurrent,
+}
+
+impl OverlapPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SkipIfRunning => "skip-if-running",
+            Self::QueueOne => "queue-one",
+            Self::AllowConcurrent => "allow-concurrent",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "skip-if-running" => Some(Self::SkipIfRunning),
+            "queue-one" => Some(Self::QueueOne),
+            "allow-concurrent" => Some(Self::AllowConcurrent),
+            _ => None,
+        }
+    }
+}
+
+/// The explicit user request that creates an unattended grant. Passing this
+/// to `create_definition` is the only way a grant comes into existence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnattendedRequest {
+    /// The user acknowledged that this definition's declared action can create
+    /// effects outside the workspace.
+    pub allow_external_side_effects: bool,
+}
+
+/// A persisted, inspectable authorization for unattended execution.
+///
+/// It is bound to one definition, one workspace, one permission profile, the
+/// exact declared action and its model, and the action kind. Changing any of
+/// those makes it stop matching; it is never widened by a later schedule.
+/// Revocation deletes it from the definition, which takes effect before the
+/// next run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnattendedGrant {
+    pub version: u8,
+    pub definition_id: ScheduleId,
+    pub workspace: PathBuf,
+    pub permission_mode: PermissionProfile,
+    /// The exact action text the grant was issued for. A schedule row whose
+    /// action (recipient, parameters or goal) changed no longer matches.
+    #[serde(default)]
+    pub action: String,
+    /// The model the user authorized for this unattended run. Changing it is
+    /// a different execution and needs a fresh grant.
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+    pub actions: Vec<ActionKind>,
+    pub external_side_effects: bool,
+    pub granted_at: DateTime<Utc>,
+}
+
+impl UnattendedGrant {
+    /// Version 2 binds the exact action and model. A version-1 grant fails
+    /// closed rather than being interpreted as covering an action it never
+    /// named.
+    pub const VERSION: u8 = 2;
+
+    pub fn new(
+        definition_id: ScheduleId,
+        workspace: PathBuf,
+        permission_mode: PermissionProfile,
+        action: &ScheduleAction,
+        model: Option<ModelRef>,
+        request: UnattendedRequest,
+        granted_at: DateTime<Utc>,
+    ) -> Result<Self, ScheduleError> {
+        Ok(Self {
+            version: Self::VERSION,
+            definition_id,
+            workspace,
+            permission_mode,
+            action: action
+                .fingerprint()
+                .map_err(|error| ScheduleError::Invalid(format!("cannot bind the action: {error}")))?,
+            model,
+            actions: vec![action.kind()],
+            external_side_effects: request.allow_external_side_effects,
+            granted_at,
+        })
+    }
+
+    /// The grant covers this definition, its current workspace, permission
+    /// profile, exact action, model and the kind of action about to run.
+    /// `external_side_effects` is the action's own observed classification,
+    /// not a schedule guess.
+    pub fn covers(
+        &self,
+        definition: &ScheduleDefinition,
+        kind: ActionKind,
+        external_side_effects: bool,
+    ) -> Result<(), String> {
+        if self.version != Self::VERSION {
+            return Err(format!(
+                "the unattended grant version {} is not understood; re-create the schedule \
+                 to issue a current grant",
+                self.version
+            ));
+        }
+        if self.definition_id != definition.id {
+            return Err("the unattended grant belongs to a different schedule".into());
+        }
+        if self.workspace != definition.workspace {
+            return Err("the unattended grant was issued for a different workspace".into());
+        }
+        if self.permission_mode != definition.mode {
+            return Err(format!(
+                "the unattended grant was issued for permission mode `{}`, not `{}`",
+                self.permission_mode.as_str(),
+                definition.mode.as_str()
+            ));
+        }
+        if !self.actions.contains(&kind) {
+            return Err(format!(
+                "the unattended grant does not cover `{}` actions",
+                kind.as_str()
+            ));
+        }
+        let action = definition.action.fingerprint()?;
+        if self.action != action {
+            return Err(
+                "the schedule's action changed after this grant was issued; the grant \
+                 authorizes only the exact action it named"
+                    .into(),
+            );
+        }
+        if self.model != definition.model {
+            return Err(
+                "the schedule's model changed after this grant was issued; the grant \
+                 authorizes only the model it named"
+                    .into(),
+            );
+        }
+        if external_side_effects && !self.external_side_effects {
+            return Err(
+                "the action can create external side effects and the unattended grant did \
+                 not authorize them"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
 
 macro_rules! schedule_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -101,40 +473,6 @@ schedule_id!(
     /// Identifies one execution attempt of an occurrence.
     RunId
 );
-
-/// When a definition generates its next occurrence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScheduleTrigger {
-    /// Exactly one occurrence at this instant. A past instant is due now.
-    Once { at: DateTime<Utc> },
-    /// One occurrence at `anchor`, then one every `every` from that anchor.
-    /// Missed slots are not backfilled: after downtime the next slot is the
-    /// first one strictly after now.
-    Every {
-        anchor: DateTime<Utc>,
-        every: Duration,
-    },
-}
-
-impl ScheduleTrigger {
-    /// Validate the trigger's own bounds before it reaches storage.
-    pub fn validate(&self) -> Result<(), ScheduleError> {
-        if let Self::Every { every, .. } = self {
-            let seconds = every.as_secs();
-            if seconds == 0 {
-                return Err(ScheduleError::Invalid(
-                    "an interval schedule must be at least one second".into(),
-                ));
-            }
-            if seconds > 366 * 24 * 60 * 60 {
-                return Err(ScheduleError::Invalid(
-                    "an interval schedule may not exceed one year".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-}
 
 /// What to do with a pending slot whose time passed while no dispatcher was
 /// available.
@@ -205,11 +543,21 @@ pub struct WakeRecord {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub recovered: usize,
+    pub skipped: usize,
     pub missed: usize,
     pub claimed: usize,
     pub succeeded: usize,
+    /// Native actions a provider accepted without confirming the final
+    /// effect. Never counted as a success.
+    pub submitted: usize,
     pub failed: usize,
     pub unknown: usize,
+    /// Agent runs handed to the runtime during this pass. Their outcome is
+    /// observed by a later pass, not this one.
+    pub handed_off: usize,
+    pub cancelled: usize,
+    pub waiting_approval: usize,
+    pub blocked: usize,
     pub error: Option<String>,
 }
 
@@ -218,13 +566,20 @@ pub struct WakeRecord {
 pub struct NewScheduleDefinition {
     pub name: String,
     pub workspace: PathBuf,
-    pub command: String,
+    pub action: ScheduleAction,
     pub trigger: ScheduleTrigger,
+    /// Reuse one session or create a fresh one per run.
+    pub session_policy: SessionPolicy,
+    /// What to do when the previous run is still active.
+    pub overlap: OverlapPolicy,
     pub mode: PermissionProfile,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
     pub misfire: MisfirePolicy,
     pub misfire_grace: Duration,
+    /// `Some` is the user's explicit request for a persisted unattended
+    /// grant. It is never implied by creating a schedule.
+    pub unattended: Option<UnattendedRequest>,
 }
 
 impl NewScheduleDefinition {
@@ -250,17 +605,20 @@ impl NewScheduleDefinition {
                 "the schedule workspace must be an absolute path".into(),
             ));
         }
-        if self.command.trim().is_empty() {
-            return Err(ScheduleError::Invalid("the schedule command is empty".into()));
-        }
-        if self.command.len() > MAX_COMMAND_BYTES {
-            return Err(ScheduleError::Invalid(format!(
-                "the schedule command exceeds {MAX_COMMAND_BYTES} bytes"
-            )));
-        }
-        if self.command.contains('\0') {
+        self.action.validate()?;
+        if self.action.kind() == ActionKind::Agent && self.model.is_none() {
             return Err(ScheduleError::Invalid(
-                "the schedule command contains a NUL byte".into(),
+                "an agent schedule needs an explicit --model; the runtime never guesses one".into(),
+            ));
+        }
+        if self.action.kind() == ActionKind::Agent
+            && self.overlap == OverlapPolicy::AllowConcurrent
+            && self.session_policy == SessionPolicy::Continue
+        {
+            return Err(ScheduleError::Invalid(
+                "concurrent agent runs need a fresh session per run; two concurrent turns \
+                 cannot share one session"
+                    .into(),
             ));
         }
         if self.timeout < Duration::from_secs(1) {
@@ -283,20 +641,23 @@ impl NewScheduleDefinition {
 }
 
 /// A persisted definition. `session_id` is set on the first successful
-/// session resolution and reused by every later run.
+/// session resolution and reused by every later `Continue` run.
 #[derive(Debug, Clone)]
 pub struct ScheduleDefinition {
     pub id: ScheduleId,
     pub name: String,
     pub workspace: PathBuf,
-    pub command: String,
+    pub action: ScheduleAction,
     pub trigger: ScheduleTrigger,
+    pub session_policy: SessionPolicy,
+    pub overlap: OverlapPolicy,
     pub mode: PermissionProfile,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
     pub misfire: MisfirePolicy,
     pub misfire_grace: Duration,
     pub session_id: Option<SessionId>,
+    pub unattended: Option<UnattendedGrant>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -305,7 +666,77 @@ impl ScheduleDefinition {
     /// The runtime session request must be byte-identical on every retry so
     /// the daemon's identified-creation receipt can deduplicate it.
     pub fn session_goal(&self) -> String {
-        format!("Scheduled action: {}", self.name)
+        match &self.action {
+            ScheduleAction::Agent { goal } => goal.clone(),
+            _ => format!("Scheduled action: {}", self.name),
+        }
+    }
+
+    /// Whether this definition may run unattended with the given observed
+    /// side-effect classification. Full Access is itself the user's explicit
+    /// no-prompt choice; every other profile needs a matching persisted grant.
+    pub fn unattended_authorization(
+        &self,
+        kind: ActionKind,
+        external_side_effects: bool,
+    ) -> Result<(), String> {
+        if self.mode == PermissionProfile::FullAccess {
+            return Ok(());
+        }
+        let grant = self.unattended.as_ref().ok_or_else(|| {
+            format!(
+                "no unattended authorization exists for this schedule; create it with \
+                     --grant-unattended or switch the schedule to full access"
+            )
+        })?;
+        grant.covers(self, kind, external_side_effects)
+    }
+}
+
+/// Model usage attributed to one agent session at one instant.
+///
+/// Totals are cumulative; a scheduled run stores the session's baseline at
+/// handoff and the difference at settlement, so a continued session never
+/// charges earlier turns to this run. A missing component stays missing (it is
+/// counted in `rows_without_cost`), never zero-filled as if observed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cost_usd_micros: u64,
+    /// Rows without pricing. Cost is then a lower bound, not the total.
+    pub rows_without_cost: u64,
+}
+
+impl UsageSnapshot {
+    /// Saturating difference, used to attribute one run inside a shared
+    /// session. A total that moved backwards (reconciled storage, a deleted
+    /// row) saturates at zero rather than reporting negative usage.
+    pub fn since(&self, baseline: &Self) -> Self {
+        Self {
+            requests: self.requests.saturating_sub(baseline.requests),
+            input_tokens: self.input_tokens.saturating_sub(baseline.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(baseline.cached_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(baseline.output_tokens),
+            reasoning_tokens: self
+                .reasoning_tokens
+                .saturating_sub(baseline.reasoning_tokens),
+            cost_usd_micros: self
+                .cost_usd_micros
+                .saturating_sub(baseline.cost_usd_micros),
+            rows_without_cost: self
+                .rows_without_cost
+                .saturating_sub(baseline.rows_without_cost),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -321,6 +752,15 @@ pub enum OccurrenceState {
     /// The slot's time passed without a dispatcher and the definition's
     /// misfire policy says not to run it. Never executed, never retried.
     Missed,
+    /// The slot was due while this definition still had an active run and its
+    /// overlap policy said to skip it. Never executed.
+    Skipped,
+    /// The run stopped because an unattended approval could not be obtained.
+    /// The reason is on the run; a later explicit `run` may try again.
+    WaitingApproval,
+    /// A precondition or authorization permanently (for this run) refused
+    /// execution. Never retried automatically.
+    Blocked,
     Cancelled,
 }
 
@@ -332,6 +772,9 @@ impl OccurrenceState {
             Self::Completed => "completed",
             Self::Interrupted => "interrupted",
             Self::Missed => "missed",
+            Self::Skipped => "skipped",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
         }
     }
@@ -343,6 +786,9 @@ impl OccurrenceState {
             "completed" => Some(Self::Completed),
             "interrupted" => Some(Self::Interrupted),
             "missed" => Some(Self::Missed),
+            "skipped" => Some(Self::Skipped),
+            "waiting_approval" => Some(Self::WaitingApproval),
+            "blocked" => Some(Self::Blocked),
             "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
@@ -356,6 +802,9 @@ pub struct Occurrence {
     pub definition_id: ScheduleId,
     pub scheduled_for: DateTime<Utc>,
     pub state: OccurrenceState,
+    /// True for a slot created by an explicit `run` request rather than by the
+    /// rule. It may become claimable while the definition is paused.
+    pub run_now: bool,
 }
 
 /// The lifecycle of one execution attempt.
@@ -369,10 +818,26 @@ pub enum RunState {
     /// identity.
     Running,
     Succeeded,
+    /// A native provider accepted the request but the final effect (for
+    /// example delivery) is not confirmable. Not a success claim.
+    Submitted,
     Failed,
     /// The effect cannot be proven (delivery or terminal state was lost).
     /// Never retried automatically.
     Unknown,
+    /// The slot was due while another run of the same definition was active
+    /// and the overlap policy skipped it. No process was started.
+    Skipped,
+    /// Execution stopped because the unattended admission needed a decision
+    /// nobody could make. No process was started.
+    WaitingApproval,
+    /// A precondition, authorization or OS permission refused the run. No
+    /// process was started.
+    Blocked,
+    /// The user or the runtime stopped the run and the terminal record was
+    /// observed. Distinct from Unknown, which means the record was not
+    /// observed.
+    Cancelled,
 }
 
 impl RunState {
@@ -381,9 +846,28 @@ impl RunState {
             Self::Dispatching => "dispatching",
             Self::Running => "running",
             Self::Succeeded => "succeeded",
+            Self::Submitted => "submitted",
             Self::Failed => "failed",
             Self::Unknown => "unknown",
+            Self::Skipped => "skipped",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
         }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Submitted
+                | Self::Failed
+                | Self::Unknown
+                | Self::Skipped
+                | Self::WaitingApproval
+                | Self::Blocked
+                | Self::Cancelled
+        )
     }
 
     fn parse(raw: &str) -> Option<Self> {
@@ -391,8 +875,13 @@ impl RunState {
             "dispatching" => Some(Self::Dispatching),
             "running" => Some(Self::Running),
             "succeeded" => Some(Self::Succeeded),
+            "submitted" => Some(Self::Submitted),
             "failed" => Some(Self::Failed),
             "unknown" => Some(Self::Unknown),
+            "skipped" => Some(Self::Skipped),
+            "waiting_approval" => Some(Self::WaitingApproval),
+            "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -420,6 +909,44 @@ pub struct ScheduleRun {
     /// When the runtime reported the execution carrying this run's identity.
     pub running_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Session event-log sequence observed immediately before the agent goal
+    /// was submitted. The runtime's terminal record is recognized only when
+    /// its sequence is greater, which keeps a previous turn from settling this
+    /// run.
+    pub baseline_sequence: Option<i64>,
+    /// The turn this run started, captured from the snapshot returned after
+    /// delivery. A terminal settles the run only while this ordinal is still
+    /// the session's newest turn; `None` means the identity was never
+    /// established and a terminal can never settle it.
+    pub turn_ordinal: Option<i64>,
+    /// The terminal sequence the runtime reported for this run's task.
+    pub task_sequence: Option<i64>,
+    pub task_outcome: Option<String>,
+    /// Agent runs only: the provider and terminal detail recorded by the
+    /// runtime. Never inferred from assistant text.
+    pub provider: Option<String>,
+    /// Native runs only: the action status observed by the interpreter.
+    pub native_outcome: Option<String>,
+    pub capability_state: Option<String>,
+    pub permission_state: Option<String>,
+    pub usage_requests: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cost_usd_micros: Option<u64>,
+    pub usage_rows_without_cost: Option<u64>,
+    /// The session's cumulative usage immediately before this run was handed
+    /// off. `None` means no baseline was observed, so per-run attribution is
+    /// impossible and no usage figures are invented.
+    pub usage_baseline: Option<UsageSnapshot>,
+    /// When this dispatcher handed an agent run to the runtime and stopped
+    /// owning its lifetime.
+    pub handed_off_at: Option<DateTime<Utc>>,
+    /// Last instant the schedule waits before requesting cancellation.
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    pub cancel_issued_at: Option<DateTime<Utc>>,
 }
 
 /// Schedule-domain failures. Runtime/action failures are recorded on the run,

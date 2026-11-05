@@ -97,6 +97,7 @@ fn a_session_snapshot_carries_the_rounds_of_its_running_calls() {
         available_models: Vec::new(),
         vision: false,
         last_sequence: None,
+        latest_turn_ordinal: None,
         active_tools: vec![
             active_tool("a", Some(3)),
             active_tool("b", Some(3)),

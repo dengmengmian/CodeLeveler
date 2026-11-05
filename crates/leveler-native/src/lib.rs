@@ -25,13 +25,25 @@ mod macos;
 mod windows;
 
 pub use discover::{
-    ActionReport, CapabilityReport, CapabilityState, DiscoveryReport, Evidence, PermissionState,
-    SystemToolReport, UnattendedSupport,
+    ActionReport, CapabilityReport, CapabilityState, DiscoveryReport, Evidence, PermissionMode,
+    PermissionState, SystemToolReport, UnattendedSupport,
 };
 pub use model::{
     ActionId, ActionPlan, ActionStatus, DeliveryState, ExecutionEvidence, NativeActionRequest,
     NativeError, NativeOutcome, ProviderId, SentState,
 };
+
+/// One live admission-and-execution attempt.
+///
+/// `outcome.status == RequiresPermission` and the other non-executed statuses
+/// carry an empty `execution_id`: no process was started. Callers must not
+/// record an execution fact for those outcomes.
+#[derive(Debug, Clone)]
+pub struct NativeRun {
+    pub provider: ProviderId,
+    pub capability: Option<CapabilityReport>,
+    pub outcome: NativeOutcome,
+}
 
 /// The capability handle injected into the tool surface and used directly by
 /// the zero-model CLI path.
@@ -106,6 +118,116 @@ impl NativeActions {
         evidence: &ExecutionEvidence,
     ) -> NativeOutcome {
         protocol::interpret(action, provider, evidence)
+    }
+
+    /// Plan, re-probe, admit and execute one action through the host execution
+    /// authority. This is the single execution path for the native tool, the
+    /// zero-model CLI and scheduled native actions.
+    ///
+    /// `timeout` may shorten the provider plan's own bound; it never extends
+    /// it. Cancellation and process-tree termination stay in `CommandRunner`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run(
+        &self,
+        runner: &leveler_execution::CommandRunner,
+        request: &NativeActionRequest,
+        mode: PermissionMode,
+        timeout: Option<std::time::Duration>,
+        max_output_bytes: usize,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<NativeRun, NativeError> {
+        use crate::{ActionStatus, ExecutionEvidence};
+
+        let plan = self.plan(request)?;
+        let provider = plan.provider();
+        // Re-probe on every attempt: permissions, installed clients and
+        // signed-in accounts can change between creation and execution.
+        let report = self.discover(runner).await;
+        let capability = report
+            .capabilities
+            .iter()
+            .find(|capability| capability.provider == provider.as_str())
+            .cloned();
+
+        let Some(capability) = capability else {
+            let detail = format!(
+                "the discovery probe did not report provider {}",
+                provider.as_str()
+            );
+            return Ok(NativeRun {
+                provider,
+                capability: None,
+                outcome: blocked_outcome(
+                    request.action,
+                    provider,
+                    ActionStatus::Unsupported,
+                    detail,
+                ),
+            });
+        };
+
+        if let Some((status, detail)) = capability.admission_block(request.action, mode) {
+            return Ok(NativeRun {
+                provider,
+                capability: Some(capability),
+                outcome: blocked_outcome(request.action, provider, status, detail),
+            });
+        }
+
+        let mut process = leveler_execution::ProcessRequest::new(
+            plan.program(),
+            plan.args().to_vec(),
+            plan.cwd().to_path_buf(),
+        );
+        process.timeout = timeout
+            .map(|requested| requested.min(plan.timeout()))
+            .unwrap_or_else(|| plan.timeout());
+        process.max_output_bytes = max_output_bytes;
+        let started = std::time::Instant::now();
+        let output = runner.run(process, cancellation).await;
+        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let evidence = match output {
+            Ok(output) => ExecutionEvidence {
+                exit_code: output.exit_code,
+                timed_out: output.timed_out,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                duration_ms,
+            },
+            Err(error) => ExecutionEvidence {
+                exit_code: None,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: error.to_string(),
+                duration_ms,
+            },
+        };
+        let outcome = self.interpret(request.action, provider, &evidence);
+        Ok(NativeRun {
+            provider,
+            capability: Some(capability),
+            outcome,
+        })
+    }
+}
+
+fn blocked_outcome(
+    action: ActionId,
+    provider: ProviderId,
+    status: ActionStatus,
+    detail: String,
+) -> NativeOutcome {
+    NativeOutcome {
+        action,
+        provider,
+        status,
+        detail,
+        execution_id: String::new(),
+        exit_code: None,
+        timed_out: false,
+        sent_state: SentState::NotApplicable,
+        delivery: DeliveryState::NotApplicable,
+        evidence: vec!["executed=false".into()],
     }
 }
 

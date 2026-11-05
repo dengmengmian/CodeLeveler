@@ -6,8 +6,7 @@ use std::path::Path;
 
 use super::{WakeupError, WakeupSpec, WakeupStatus, label_for};
 
-const REASON: &str =
-    "no OS wakeup backend is implemented for this platform; use `leveler schedule serve` while a terminal is available";
+const REASON: &str = "no OS wakeup backend is implemented for this platform; use `leveler schedule serve` while a terminal is available";
 
 pub(super) async fn enable(_spec: &WakeupSpec) -> Result<WakeupStatus, WakeupError> {
     Err(WakeupError::Unsupported(REASON.into()))

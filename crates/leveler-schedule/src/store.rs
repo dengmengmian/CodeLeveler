@@ -10,11 +10,37 @@ use sqlx::{Pool, Row, Sqlite};
 
 use crate::{
     DispatchSummary, MisfirePolicy, NewScheduleDefinition, Occurrence, OccurrenceId,
-    OccurrenceState, RunId, RunState, ScheduleDefinition, ScheduleError, ScheduleId, ScheduleRun,
-    ScheduleTrigger, WakeRecord, WakeSource, parse_timestamp, timestamp,
+    OccurrenceState, OverlapPolicy, RunId, RunState, ScheduleAction, ScheduleDefinition,
+    ScheduleError, ScheduleId, ScheduleRun, ScheduleTrigger, SessionPolicy, UnattendedGrant,
+    UsageSnapshot, WakeRecord, WakeSource, parse_timestamp, timestamp,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// One projection for every read of a definition. Keeping the column list in
+/// one place prevents a newly persisted field from being silently dropped by
+/// one of the readers.
+const DEFINITION_COLUMNS: &str = "id, name, workspace, action, command, agent_goal, \
+     native_action, native_input, trigger_kind, once_at, anchor_at, every_secs, timezone, \
+     local_time, weekdays, cron_expr, session_policy, overlap_policy, permission_mode, model, \
+     timeout_secs, misfire_policy, misfire_grace_secs, unattended_grant, session_id, enabled, \
+     created_at";
+
+/// The same for runs: the occurrence's `scheduled_for` is joined because the
+/// slot, not the run, owns it.
+const RUN_COLUMNS: &str = "r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
+     r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, r.delivered_at, \
+     r.running_at, r.finished_at, r.baseline_sequence, r.turn_ordinal, r.task_sequence, \
+     r.task_outcome, \
+     r.provider, r.native_outcome, r.capability_state, r.permission_state, r.usage_requests, \
+     r.input_tokens, r.cached_input_tokens, r.output_tokens, r.reasoning_tokens, \
+     r.cost_usd_micros, r.usage_rows_without_cost, r.handed_off_at, r.deadline_at, \
+     r.cancel_requested_at, r.cancel_issued_at, r.usage_baseline_requests, \
+     r.usage_baseline_input_tokens, r.usage_baseline_cached_input_tokens, \
+     r.usage_baseline_output_tokens, r.usage_baseline_reasoning_tokens, \
+     r.usage_baseline_cost_usd_micros, r.usage_baseline_rows_without_cost";
+
+const RUN_FROM: &str = "schedule_runs r JOIN schedule_occurrences o ON o.id = r.occurrence_id";
 
 /// Dispatch-pass observations older than this are pruned when a new pass
 /// starts. A minute-cadence wake writes ~1,440 rows per day; the recent window
@@ -36,11 +62,41 @@ pub struct Recovered {
     pub definition_id: ScheduleId,
 }
 
+/// An agent run the dispatcher handed to the runtime and no longer owns. The
+/// dispatcher reconnects on a later pass, observes the runtime's terminal
+/// record, and only then settles it.
+#[derive(Debug, Clone)]
+pub struct HandedOffRun {
+    pub run: ScheduleRun,
+    pub definition: ScheduleDefinition,
+}
+
+/// Facts observed about a run when it settles. Every field is optional and
+/// written only when it was actually observed; absence stays absence.
+#[derive(Debug, Clone, Default)]
+pub struct RunFacts {
+    pub task_sequence: Option<i64>,
+    pub task_outcome: Option<String>,
+    pub provider: Option<String>,
+    pub native_outcome: Option<String>,
+    pub capability_state: Option<String>,
+    pub permission_state: Option<String>,
+    /// Final totals in the agent session, not the run's delta.
+    pub usage: Option<UsageSnapshot>,
+    /// The run's own usage, already subtracted from the session baseline.
+    pub usage_delta: Option<UsageSnapshot>,
+}
+
 /// The observed outcome of one run.
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
     Succeeded {
         exit_code: Option<i32>,
+    },
+    /// A provider accepted the request; the final effect is unconfirmed.
+    /// Never reported as success and never retried automatically.
+    Submitted {
+        error: Option<String>,
     },
     Failed {
         exit_code: Option<i32>,
@@ -50,28 +106,70 @@ pub enum RunOutcome {
     Unknown {
         error: String,
     },
+    /// The overlap policy suppressed this slot before any delivery.
+    Skipped {
+        error: String,
+    },
+    /// Execution stopped because an unattended decision could not be made.
+    /// Nothing was started; a later explicit attempt may succeed.
+    WaitingApproval {
+        error: String,
+    },
+    /// A precondition or authorization refused this run. Nothing was started.
+    Blocked {
+        error: String,
+    },
+    /// The runtime observed cancellation. Distinct from `Unknown`.
+    Cancelled {
+        error: Option<String>,
+    },
 }
 
 impl RunOutcome {
     fn state(&self) -> RunState {
         match self {
             Self::Succeeded { .. } => RunState::Succeeded,
+            Self::Submitted { .. } => RunState::Submitted,
             Self::Failed { .. } => RunState::Failed,
             Self::Unknown { .. } => RunState::Unknown,
+            Self::Skipped { .. } => RunState::Skipped,
+            Self::WaitingApproval { .. } => RunState::WaitingApproval,
+            Self::Blocked { .. } => RunState::Blocked,
+            Self::Cancelled { .. } => RunState::Cancelled,
         }
     }
 
     fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Succeeded { exit_code } | Self::Failed { exit_code, .. } => *exit_code,
-            Self::Unknown { .. } => None,
+            _ => None,
         }
     }
 
     fn error(&self) -> Option<&str> {
         match self {
             Self::Succeeded { .. } => None,
-            Self::Failed { error, .. } | Self::Unknown { error } => Some(error),
+            Self::Failed { error, .. }
+            | Self::Unknown { error }
+            | Self::Skipped { error }
+            | Self::WaitingApproval { error }
+            | Self::Blocked { error } => Some(error),
+            Self::Submitted { error } | Self::Cancelled { error } => error.as_deref(),
+        }
+    }
+
+    /// The occurrence state this run leaves behind. A run always settles its
+    /// own occurrence; policy is reflected in both records, never in only one.
+    fn occurrence_state(&self) -> OccurrenceState {
+        match self {
+            Self::Succeeded { .. }
+            | Self::Submitted { .. }
+            | Self::Failed { .. }
+            | Self::Unknown { .. } => OccurrenceState::Completed,
+            Self::Skipped { .. } => OccurrenceState::Skipped,
+            Self::WaitingApproval { .. } => OccurrenceState::WaitingApproval,
+            Self::Blocked { .. } => OccurrenceState::Blocked,
+            Self::Cancelled { .. } => OccurrenceState::Cancelled,
         }
     }
 }
@@ -125,12 +223,14 @@ impl ScheduleStore {
         // runtime compares it by its canonical identity, so the durable value
         // must be canonical too; otherwise a macOS `/var` spelling would bind
         // the schedule to a source that refuses it.
-        let workspace = tokio::fs::canonicalize(&new.workspace).await.map_err(|error| {
-            ScheduleError::Invalid(format!(
-                "the schedule workspace `{}` is not accessible: {error}",
-                new.workspace.display()
-            ))
-        })?;
+        let workspace = tokio::fs::canonicalize(&new.workspace)
+            .await
+            .map_err(|error| {
+                ScheduleError::Invalid(format!(
+                    "the schedule workspace `{}` is not accessible: {error}",
+                    new.workspace.display()
+                ))
+            })?;
         if !tokio::fs::metadata(&workspace).await?.is_dir() {
             return Err(ScheduleError::Invalid(format!(
                 "the schedule workspace `{}` is not a directory",
@@ -139,37 +239,145 @@ impl ScheduleStore {
         }
         let now = leveler_core::now();
         let id = ScheduleId::generate();
-        let (trigger_kind, once_at, anchor_at, every_secs, first) = match new.trigger {
-            ScheduleTrigger::Once { at } => ("once", Some(timestamp(at)), None, None, at),
+        let first = new.trigger.first_occurrence(now)?;
+        let grant = new
+            .unattended
+            .map(|request| {
+                UnattendedGrant::new(
+                    id.clone(),
+                    workspace.clone(),
+                    new.mode,
+                    &new.action,
+                    new.model.clone(),
+                    request,
+                    now,
+                )
+            })
+            .transpose()?;
+        let grant_json = grant
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                ScheduleError::Invalid(format!("the unattended grant is not serializable: {error}"))
+            })?;
+        let (native_action, native_input, agent_goal) = match &new.action {
+            ScheduleAction::Native { action, input } => (
+                Some(action.clone()),
+                Some(serde_json::to_string(input).map_err(|error| {
+                    ScheduleError::Invalid(format!(
+                        "the native action input is not serializable: {error}"
+                    ))
+                })?),
+                None,
+            ),
+            ScheduleAction::Agent { goal } => (None, None, Some(goal.clone())),
+            ScheduleAction::Shell { .. } => (None, None, None),
+        };
+        let (
+            trigger_kind,
+            once_at,
+            anchor_at,
+            every_secs,
+            timezone,
+            local_time,
+            weekdays,
+            cron_expr,
+        ) = match &new.trigger {
+            ScheduleTrigger::Once { at } => (
+                "once",
+                Some(timestamp(*at)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             ScheduleTrigger::Every { anchor, every } => (
                 "every",
                 None,
-                Some(timestamp(anchor)),
+                Some(timestamp(*anchor)),
                 Some(every.as_secs() as i64),
-                anchor,
+                None,
+                None,
+                None,
+                None,
+            ),
+            ScheduleTrigger::Daily { time, timezone } => (
+                "daily",
+                None,
+                None,
+                None,
+                Some(timezone.to_string()),
+                Some(time.to_string()),
+                None,
+                None,
+            ),
+            ScheduleTrigger::Weekly {
+                weekdays,
+                time,
+                timezone,
+            } => (
+                "weekly",
+                None,
+                None,
+                None,
+                Some(timezone.to_string()),
+                Some(time.to_string()),
+                Some(i64::from(weekdays.bits())),
+                None,
+            ),
+            ScheduleTrigger::Cron {
+                expression,
+                timezone,
+            } => (
+                "cron",
+                None,
+                None,
+                None,
+                Some(timezone.to_string()),
+                None,
+                None,
+                Some(expression.clone()),
             ),
         };
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO schedule_definitions \
-             (id, name, workspace, action, command, trigger_kind, once_at, anchor_at, every_secs, \
-              permission_mode, model, timeout_secs, misfire_policy, misfire_grace_secs, \
+             (id, name, workspace, action, command, agent_goal, native_action, native_input, \
+              trigger_kind, once_at, anchor_at, every_secs, \
+              timezone, local_time, weekdays, cron_expr, \
+              session_policy, overlap_policy, permission_mode, model, timeout_secs, \
+              misfire_policy, misfire_grace_secs, unattended_grant, \
               session_id, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, 'shell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                     NULL, 1, ?, ?)",
         )
         .bind(id.as_str())
         .bind(new.name.trim())
         .bind(workspace.display().to_string())
-        .bind(&new.command)
+        .bind(new.action.kind().as_str())
+        .bind(new.action.command())
+        .bind(agent_goal)
+        .bind(native_action)
+        .bind(native_input)
         .bind(trigger_kind)
         .bind(once_at)
         .bind(anchor_at)
         .bind(every_secs)
+        .bind(timezone)
+        .bind(local_time)
+        .bind(weekdays)
+        .bind(cron_expr)
+        .bind(new.session_policy.as_str())
+        .bind(new.overlap.as_str())
         .bind(new.mode.as_str())
         .bind(new.model.as_ref().map(|model| model.to_string()))
         .bind(new.timeout.as_secs() as i64)
         .bind(new.misfire.as_str())
         .bind(new.misfire_grace.as_secs() as i64)
+        .bind(grant_json)
         .bind(timestamp(now))
         .bind(timestamp(now))
         .execute(&mut *tx)
@@ -192,12 +400,9 @@ impl ScheduleStore {
 
     /// Every definition, oldest first.
     pub async fn definitions(&self) -> Result<Vec<ScheduleDefinition>, ScheduleError> {
-        let rows = sqlx::query(
-            "SELECT id, name, workspace, action, command, trigger_kind, once_at, anchor_at, \
-             every_secs, permission_mode, model, timeout_secs, misfire_policy, \
-             misfire_grace_secs, session_id, enabled, created_at \
-             FROM schedule_definitions ORDER BY created_at, id",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {DEFINITION_COLUMNS} FROM schedule_definitions ORDER BY created_at, id"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(definition_from_row).collect()
@@ -208,12 +413,9 @@ impl ScheduleStore {
         &self,
         id: &ScheduleId,
     ) -> Result<Option<ScheduleDefinition>, ScheduleError> {
-        let row = sqlx::query(
-            "SELECT id, name, workspace, action, command, trigger_kind, once_at, anchor_at, \
-             every_secs, permission_mode, model, timeout_secs, misfire_policy, \
-             misfire_grace_secs, session_id, enabled, created_at \
-             FROM schedule_definitions WHERE id = ?",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {DEFINITION_COLUMNS} FROM schedule_definitions WHERE id = ?"
+        ))
         .bind(id.as_str())
         .fetch_optional(&self.pool)
         .await?;
@@ -221,12 +423,83 @@ impl ScheduleStore {
     }
 
     /// Delete a definition, its occurrences and their runs.
+    ///
+    /// Deletion never kills a task the runtime already started: while a run is
+    /// active, removal is refused so the caller must make the cancellation an
+    /// explicit, observable action first. The runtime task outlives neither a
+    /// silent delete nor a rewritten history.
     pub async fn remove_definition(&self, id: &ScheduleId) -> Result<bool, ScheduleError> {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedule_runs WHERE definition_id = ? \
+             AND state IN ('dispatching', 'running')",
+        )
+        .bind(id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        if active > 0 {
+            return Err(ScheduleError::Invalid(format!(
+                "schedule {id} still has {active} active run(s); cancel it explicitly before \
+                 deleting, so the runtime's task is settled rather than orphaned"
+            )));
+        }
         let result = sqlx::query("DELETE FROM schedule_definitions WHERE id = ?")
             .bind(id.as_str())
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Enable or pause future triggers. An active run is intentionally not
+    /// affected: pausing says "stop creating slots", not "kill the task".
+    pub async fn set_enabled(&self, id: &ScheduleId, enabled: bool) -> Result<bool, ScheduleError> {
+        let result =
+            sqlx::query("UPDATE schedule_definitions SET enabled = ?, updated_at = ? WHERE id = ?")
+                .bind(if enabled { 1_i64 } else { 0_i64 })
+                .bind(timestamp(leveler_core::now()))
+                .bind(id.as_str())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Remove the persisted unattended grant. The next run re-evaluates
+    /// authorization and refuses, because the grant is read from storage at
+    /// dispatch time, not captured when the schedule was created.
+    pub async fn revoke_unattended(&self, id: &ScheduleId) -> Result<bool, ScheduleError> {
+        let result = sqlx::query(
+            "UPDATE schedule_definitions SET unattended_grant = NULL, updated_at = ? \
+             WHERE id = ? AND unattended_grant IS NOT NULL",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Create an explicit one-off slot that is claimable even while paused.
+    /// It is an ordinary occurrence in every other respect: deduplicated,
+    /// policy-bound and visible in history.
+    pub async fn create_run_now(
+        &self,
+        definition: &ScheduleDefinition,
+    ) -> Result<Occurrence, ScheduleError> {
+        let now = leveler_core::now();
+        let id = OccurrenceId::generate();
+        sqlx::query(
+            "INSERT INTO schedule_occurrences \
+             (id, definition_id, scheduled_for, state, run_now, created_at) \
+             VALUES (?, ?, ?, 'pending', 1, ?)",
+        )
+        .bind(id.as_str())
+        .bind(definition.id.as_str())
+        .bind(timestamp(now))
+        .bind(timestamp(now))
+        .execute(&self.pool)
+        .await?;
+        self.occurrence(&id)
+            .await?
+            .ok_or_else(|| ScheduleError::NotFound(definition.id.clone()))
     }
 
     /// Bind the definition's durable session. A concurrent winner's value is
@@ -263,8 +536,77 @@ impl ScheduleStore {
         }
     }
 
+    /// Mark due slots suppressed by `skip-if-running` before they are claimed.
+    ///
+    /// The row is a terminal fact with its own skipped run: an operator can
+    /// see that the trigger fired and why nothing was executed. `run_now`
+    /// slots are explicit requests and are still subject to the definition's
+    /// overlap policy; they are not silently dropped.
+    pub async fn reconcile_overlaps(&self, now: DateTime<Utc>) -> Result<usize, ScheduleError> {
+        let candidates: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT o.id, o.definition_id, o.scheduled_for FROM schedule_occurrences o \
+             JOIN schedule_definitions d ON d.id = o.definition_id \
+             WHERE o.state = 'pending' AND o.scheduled_for <= ? \
+               AND (d.enabled = 1 OR o.run_now = 1) \
+               AND d.overlap_policy = 'skip-if-running' \
+               AND EXISTS (SELECT 1 FROM schedule_runs active \
+                           WHERE active.definition_id = d.id \
+                             AND active.state IN ('dispatching', 'running')) \
+             ORDER BY o.scheduled_for, o.id",
+        )
+        .bind(timestamp(now))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut skipped = 0;
+        for (occurrence_id, definition_id, scheduled_for) in candidates {
+            let mut tx = self.pool.begin().await?;
+            let updated = sqlx::query(
+                "UPDATE schedule_occurrences SET state = 'skipped' \
+                 WHERE id = ? AND state = 'pending'",
+            )
+            .bind(&occurrence_id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+            let reason = format!(
+                "the slot scheduled for {scheduled_for} became due while an earlier run of \
+                 this schedule was still active; the overlap policy is skip-if-running and \
+                 nothing was executed"
+            );
+            sqlx::query(
+                "INSERT INTO schedule_runs \
+                 (id, occurrence_id, definition_id, state, error, started_at, finished_at) \
+                 VALUES (?, ?, ?, 'skipped', ?, ?, ?)",
+            )
+            .bind(RunId::generate().as_str())
+            .bind(&occurrence_id)
+            .bind(&definition_id)
+            .bind(&reason)
+            .bind(timestamp(now))
+            .bind(timestamp(now))
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            skipped += 1;
+            if let Some(definition) = self.definition(&ScheduleId::from(definition_id)).await? {
+                self.ensure_next_occurrence(&definition, now).await?;
+            }
+        }
+        Ok(skipped)
+    }
+
     /// Pending occurrences that are due, claimed atomically under `lease`.
     /// Candidates that lose the compare-and-set are skipped, not retried here.
+    ///
+    /// `queue-one` leaves its slot pending while any run of the same
+    /// definition is active; it becomes claimable on the first pass after the
+    /// active run settles. `skip-if-running` slots are normally settled by
+    /// [`Self::reconcile_overlaps`]; the same predicate here closes the race
+    /// between reconciliation and the claim.
     pub async fn claim_due(
         &self,
         now: DateTime<Utc>,
@@ -274,7 +616,12 @@ impl ScheduleStore {
         let candidates: Vec<(String, String)> = sqlx::query_as(
             "SELECT o.id, o.definition_id FROM schedule_occurrences o \
              JOIN schedule_definitions d ON d.id = o.definition_id \
-             WHERE o.state = 'pending' AND o.scheduled_for <= ? AND d.enabled = 1 \
+             WHERE o.state = 'pending' AND o.scheduled_for <= ? \
+               AND (d.enabled = 1 OR o.run_now = 1) \
+               AND (d.overlap_policy = 'allow-concurrent' OR NOT EXISTS ( \
+                     SELECT 1 FROM schedule_runs active \
+                     WHERE active.definition_id = d.id \
+                       AND active.state IN ('dispatching', 'running'))) \
              ORDER BY o.scheduled_for, o.id LIMIT ?",
         )
         .bind(timestamp(now))
@@ -312,7 +659,8 @@ impl ScheduleStore {
             .await?;
             tx.commit().await?;
 
-            let Some(occurrence) = self.occurrence(&OccurrenceId::from(occurrence_id)).await? else {
+            let Some(occurrence) = self.occurrence(&OccurrenceId::from(occurrence_id)).await?
+            else {
                 continue;
             };
             let Some(definition) = self.definition(&ScheduleId::from(definition_id)).await? else {
@@ -325,6 +673,76 @@ impl ScheduleStore {
             });
         }
         Ok(claims)
+    }
+
+    /// Claim one explicit run-now slot, ignoring its scheduled time.
+    ///
+    /// This exists so `run-now` cannot be starved by unrelated overdue slots:
+    /// the user asked for this occurrence, not for a generic pass. Overlap is
+    /// still enforced by the same predicate as [`Self::claim_due`]; a caller
+    /// that wants the skip-if-running verdict recorded runs
+    /// [`Self::reconcile_overlaps`] first.
+    pub async fn claim_run_now(
+        &self,
+        occurrence_id: &OccurrenceId,
+        now: DateTime<Utc>,
+        lease: Duration,
+    ) -> Result<Option<Claim>, ScheduleError> {
+        let candidate: Option<(String, String)> = sqlx::query_as(
+            "SELECT o.id, o.definition_id FROM schedule_occurrences o \
+             JOIN schedule_definitions d ON d.id = o.definition_id \
+             WHERE o.id = ? AND o.state = 'pending' AND o.run_now = 1 \
+               AND (d.overlap_policy = 'allow-concurrent' OR NOT EXISTS ( \
+                     SELECT 1 FROM schedule_runs active \
+                     WHERE active.definition_id = d.id \
+                       AND active.state IN ('dispatching', 'running')))",
+        )
+        .bind(occurrence_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((occurrence_id, definition_id)) = candidate else {
+            return Ok(None);
+        };
+
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE schedule_occurrences SET state = 'claimed', claimed_at = ?, \
+             lease_expires_at = ? WHERE id = ? AND state = 'pending'",
+        )
+        .bind(timestamp(now))
+        .bind(timestamp(lease_until(now, lease)))
+        .bind(&occurrence_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let run_id = RunId::generate();
+        sqlx::query(
+            "INSERT INTO schedule_runs \
+             (id, occurrence_id, definition_id, state, started_at) \
+             VALUES (?, ?, ?, 'dispatching', ?)",
+        )
+        .bind(run_id.as_str())
+        .bind(&occurrence_id)
+        .bind(&definition_id)
+        .bind(timestamp(now))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let Some(occurrence) = self.occurrence(&OccurrenceId::from(occurrence_id)).await? else {
+            return Ok(None);
+        };
+        let Some(definition) = self.definition(&ScheduleId::from(definition_id)).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Claim {
+            definition,
+            occurrence,
+            run_id,
+        }))
     }
 
     /// Recover claims whose dispatcher did not renew its lease. The occurrence
@@ -429,24 +847,59 @@ impl ScheduleStore {
             "SELECT o.id, o.definition_id, o.scheduled_for, d.misfire_policy, \
              d.misfire_grace_secs FROM schedule_occurrences o \
              JOIN schedule_definitions d ON d.id = o.definition_id \
-             WHERE o.state = 'pending' AND o.scheduled_for <= ? AND d.enabled = 1",
+             WHERE o.state = 'pending' AND o.scheduled_for <= ? AND d.enabled = 1 \
+               AND o.run_now = 0 \
+             ORDER BY o.definition_id, o.scheduled_for",
         )
         .bind(timestamp(now))
         .fetch_all(&self.pool)
         .await?;
+
+        // `RunOnceOnRecovery` executes at most the newest overdue slot. Older
+        // ones are recorded as missed in the same pass, so a long outage can
+        // never turn into a burst of catch-up side effects.
+        let mut newest_overdue: std::collections::HashMap<String, (String, DateTime<Utc>)> =
+            std::collections::HashMap::new();
+        for (occurrence_id, definition_id, scheduled_for, policy, grace_secs) in &candidates {
+            if MisfirePolicy::parse(policy) != Some(MisfirePolicy::RunOnceOnRecovery) {
+                continue;
+            }
+            let scheduled_for = parse_timestamp(scheduled_for)?;
+            let grace = chrono::Duration::seconds((*grace_secs).max(0));
+            if now - scheduled_for <= grace {
+                continue;
+            }
+            match newest_overdue.get(definition_id) {
+                Some((_, stored)) if *stored >= scheduled_for => {}
+                _ => {
+                    newest_overdue.insert(
+                        definition_id.clone(),
+                        (occurrence_id.clone(), scheduled_for),
+                    );
+                }
+            }
+        }
 
         let mut missed = 0;
         for (occurrence_id, definition_id, scheduled_for, policy, grace_secs) in candidates {
             let policy = MisfirePolicy::parse(&policy).ok_or_else(|| {
                 ScheduleError::Invalid(format!("unsupported misfire policy `{policy}`"))
             })?;
-            if policy != MisfirePolicy::Skip {
-                continue;
-            }
             let scheduled_for = parse_timestamp(&scheduled_for)?;
             let grace = chrono::Duration::seconds(grace_secs.max(0));
             if now - scheduled_for <= grace {
                 continue;
+            }
+            match policy {
+                MisfirePolicy::RunOnceOnRecovery => {
+                    if newest_overdue
+                        .get(&definition_id)
+                        .is_some_and(|(id, _)| *id == occurrence_id)
+                    {
+                        continue;
+                    }
+                }
+                MisfirePolicy::Skip => {}
             }
             let mut tx = self.pool.begin().await?;
             let updated = sqlx::query(
@@ -462,10 +915,7 @@ impl ScheduleStore {
             }
             tx.commit().await?;
             missed += 1;
-            if let Some(definition) = self
-                .definition(&ScheduleId::from(definition_id))
-                .await?
-            {
+            if let Some(definition) = self.definition(&ScheduleId::from(definition_id)).await? {
                 self.ensure_next_occurrence(&definition, now).await?;
             }
         }
@@ -477,13 +927,11 @@ impl ScheduleStore {
     /// honest record of a driver that started and never reached a verdict.
     pub async fn begin_wake(&self, source: WakeSource) -> Result<i64, ScheduleError> {
         let now = leveler_core::now();
-        let result = sqlx::query(
-            "INSERT INTO schedule_wakeups (source, started_at) VALUES (?, ?)",
-        )
-        .bind(source.as_str())
-        .bind(timestamp(now))
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("INSERT INTO schedule_wakeups (source, started_at) VALUES (?, ?)")
+            .bind(source.as_str())
+            .bind(timestamp(now))
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM schedule_wakeups WHERE started_at < ?")
             .bind(timestamp(now - chrono::Duration::days(WAKE_RETENTION_DAYS)))
             .execute(&self.pool)
@@ -498,16 +946,24 @@ impl ScheduleStore {
         summary: &DispatchSummary,
     ) -> Result<(), ScheduleError> {
         sqlx::query(
-            "UPDATE schedule_wakeups SET finished_at = ?, recovered = ?, missed = ?, \
-             claimed = ?, succeeded = ?, failed = ?, unknown = ?, error = NULL WHERE id = ?",
+            "UPDATE schedule_wakeups SET finished_at = ?, recovered = ?, skipped = ?, \
+             missed = ?, claimed = ?, succeeded = ?, submitted = ?, failed = ?, unknown = ?, \
+             handed_off = ?, cancelled = ?, waiting_approval = ?, blocked = ?, \
+             error = NULL WHERE id = ?",
         )
         .bind(timestamp(leveler_core::now()))
         .bind(summary.recovered as i64)
+        .bind(summary.skipped as i64)
         .bind(summary.missed as i64)
         .bind(summary.claimed as i64)
         .bind(summary.succeeded as i64)
+        .bind(summary.submitted as i64)
         .bind(summary.failed as i64)
         .bind(summary.unknown as i64)
+        .bind(summary.handed_off as i64)
+        .bind(summary.cancelled as i64)
+        .bind(summary.waiting_approval as i64)
+        .bind(summary.blocked as i64)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -517,22 +973,21 @@ impl ScheduleStore {
     /// Finish a wake record with a failure. The counts stay at their defaults
     /// and the error names what prevented a verdict.
     pub async fn fail_wake(&self, id: i64, error: &str) -> Result<(), ScheduleError> {
-        sqlx::query(
-            "UPDATE schedule_wakeups SET finished_at = ?, error = ? WHERE id = ?",
-        )
-        .bind(timestamp(leveler_core::now()))
-        .bind(error)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE schedule_wakeups SET finished_at = ?, error = ? WHERE id = ?")
+            .bind(timestamp(leveler_core::now()))
+            .bind(error)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Dispatch-pass history, newest first.
     pub async fn wakes(&self, limit: usize) -> Result<Vec<WakeRecord>, ScheduleError> {
         let rows = sqlx::query(
-            "SELECT id, source, started_at, finished_at, recovered, missed, claimed, \
-             succeeded, failed, unknown, error FROM schedule_wakeups \
+            "SELECT id, source, started_at, finished_at, recovered, skipped, missed, claimed, \
+             succeeded, submitted, failed, unknown, handed_off, cancelled, waiting_approval, \
+             blocked, error FROM schedule_wakeups \
              ORDER BY started_at DESC, id DESC LIMIT ?",
         )
         .bind(limit as i64)
@@ -544,8 +999,9 @@ impl ScheduleStore {
     /// The most recent OS-started dispatch pass, if any.
     pub async fn last_os_wake(&self) -> Result<Option<WakeRecord>, ScheduleError> {
         let row = sqlx::query(
-            "SELECT id, source, started_at, finished_at, recovered, missed, claimed, \
-             succeeded, failed, unknown, error FROM schedule_wakeups \
+            "SELECT id, source, started_at, finished_at, recovered, skipped, missed, claimed, \
+             succeeded, submitted, failed, unknown, handed_off, cancelled, waiting_approval, \
+             blocked, error FROM schedule_wakeups \
              WHERE source = 'os' ORDER BY started_at DESC, id DESC LIMIT 1",
         )
         .fetch_optional(&self.pool)
@@ -559,7 +1015,8 @@ impl ScheduleStore {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM schedule_occurrences o \
              JOIN schedule_definitions d ON d.id = o.definition_id \
-             WHERE o.state = 'pending' AND o.scheduled_for <= ? AND d.enabled = 1",
+             WHERE o.state = 'pending' AND o.scheduled_for <= ? \
+               AND (d.enabled = 1 OR o.run_now = 1)",
         )
         .bind(timestamp(now))
         .fetch_one(&self.pool)
@@ -620,6 +1077,146 @@ impl ScheduleStore {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Record that this dispatcher handed an agent run to the runtime.
+    ///
+    /// From this point the runtime owns the turn; the schedule owns only the
+    /// observation of its terminal record. The claim lease is cleared so
+    /// lease recovery cannot misclassify a long, healthy run as a lost
+    /// dispatcher. The session baseline and usage baseline make the eventual
+    /// settlement attributable to this run and no earlier turn.
+    pub async fn mark_handed_off(
+        &self,
+        run_id: &RunId,
+        baseline_sequence: i64,
+        turn_ordinal: Option<i64>,
+        usage_baseline: Option<&UsageSnapshot>,
+        deadline: DateTime<Utc>,
+    ) -> Result<bool, ScheduleError> {
+        let now = leveler_core::now();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE schedule_runs SET state = 'running', \
+             delivered_at = COALESCE(delivered_at, ?), \
+             running_at = COALESCE(running_at, ?), handed_off_at = ?, deadline_at = ?, \
+             baseline_sequence = ?, turn_ordinal = ?, task_sequence = NULL, task_outcome = NULL, \
+             usage_baseline_requests = ?, usage_baseline_input_tokens = ?, \
+             usage_baseline_cached_input_tokens = ?, usage_baseline_output_tokens = ?, \
+             usage_baseline_reasoning_tokens = ?, usage_baseline_cost_usd_micros = ?, \
+             usage_baseline_rows_without_cost = ? \
+             WHERE id = ? AND state = 'dispatching'",
+        )
+        .bind(timestamp(now))
+        .bind(timestamp(now))
+        .bind(timestamp(now))
+        .bind(timestamp(deadline))
+        .bind(baseline_sequence)
+        .bind(turn_ordinal)
+        .bind(usage_baseline.map(|usage| usage.requests as i64))
+        .bind(usage_baseline.map(|usage| usage.input_tokens as i64))
+        .bind(usage_baseline.map(|usage| usage.cached_input_tokens as i64))
+        .bind(usage_baseline.map(|usage| usage.output_tokens as i64))
+        .bind(usage_baseline.map(|usage| usage.reasoning_tokens as i64))
+        .bind(usage_baseline.map(|usage| usage.cost_usd_micros as i64))
+        .bind(usage_baseline.map(|usage| usage.rows_without_cost as i64))
+        .bind(run_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE schedule_occurrences SET lease_expires_at = NULL \
+                 WHERE state = 'claimed' AND id = \
+                 (SELECT occurrence_id FROM schedule_runs WHERE id = ?)",
+            )
+            .bind(run_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Agent runs whose turn is owned by the runtime right now.
+    pub async fn handed_off_runs(&self) -> Result<Vec<HandedOffRun>, ScheduleError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {RUN_COLUMNS} FROM {RUN_FROM} \
+             WHERE r.state = 'running' AND r.handed_off_at IS NOT NULL \
+             ORDER BY r.handed_off_at, r.id"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        let runs: Vec<ScheduleRun> = rows.iter().map(run_from_row).collect::<Result<_, _>>()?;
+        let mut handed_off = Vec::with_capacity(runs.len());
+        for run in runs {
+            if let Some(definition) = self.definition(&run.definition_id).await? {
+                handed_off.push(HandedOffRun { run, definition });
+            }
+        }
+        Ok(handed_off)
+    }
+
+    /// Ask the dispatcher to stop one active run. This records intent only;
+    /// the process that owns the observation issues the runtime cancellation
+    /// and settles the terminal fact.
+    pub async fn request_cancel(&self, run_id: &RunId) -> Result<bool, ScheduleError> {
+        let result = sqlx::query(
+            "UPDATE schedule_runs SET cancel_requested_at = COALESCE(cancel_requested_at, ?) \
+             WHERE id = ? AND state IN ('dispatching', 'running')",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(run_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Request cancellation of every active run of one definition and return
+    /// their ids. Pausing or deleting a schedule is intentionally a different
+    /// operation and never calls this.
+    pub async fn request_cancel_definition(
+        &self,
+        definition_id: &ScheduleId,
+    ) -> Result<Vec<RunId>, ScheduleError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM schedule_runs WHERE definition_id = ? \
+             AND state IN ('dispatching', 'running')",
+        )
+        .bind(definition_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for raw in rows {
+            let id = RunId::from(raw);
+            if self.request_cancel(&id).await? {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    pub async fn cancel_requested(&self, run_id: &RunId) -> Result<bool, ScheduleError> {
+        let requested: Option<Option<String>> =
+            sqlx::query_scalar("SELECT cancel_requested_at FROM schedule_runs WHERE id = ?")
+                .bind(run_id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(requested.flatten().is_some())
+    }
+
+    /// Record that the cancellation was actually sent to the runtime. The
+    /// difference between `cancel_requested_at` and this timestamp is what
+    /// distinguishes "user asked" from "runtime was told".
+    pub async fn mark_cancel_issued(&self, run_id: &RunId) -> Result<bool, ScheduleError> {
+        let result = sqlx::query(
+            "UPDATE schedule_runs SET cancel_issued_at = COALESCE(cancel_issued_at, ?) \
+             WHERE id = ? AND state IN ('dispatching', 'running')",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(run_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Settle the run and its occurrence. Idempotent: a run already settled
     /// (for example by lease recovery) is returned unchanged. `None` means the
     /// definition was removed while the run was in flight.
@@ -628,25 +1225,99 @@ impl ScheduleStore {
         run_id: &RunId,
         outcome: RunOutcome,
     ) -> Result<Option<ScheduleRun>, ScheduleError> {
+        self.finish_run_with_facts(run_id, outcome, RunFacts::default())
+            .await
+    }
+
+    /// Settle a run together with the facts observed about it. An absent fact
+    /// never overwrites an earlier observed value.
+    pub async fn finish_run_with_facts(
+        &self,
+        run_id: &RunId,
+        outcome: RunOutcome,
+        facts: RunFacts,
+    ) -> Result<Option<ScheduleRun>, ScheduleError> {
         let now = leveler_core::now();
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
-            "UPDATE schedule_runs SET state = ?, exit_code = ?, error = ?, finished_at = ? \
+            "UPDATE schedule_runs SET state = ?, exit_code = ?, error = ?, finished_at = ?, \
+             task_sequence = COALESCE(?, task_sequence), \
+             task_outcome = COALESCE(?, task_outcome), \
+             provider = COALESCE(?, provider), \
+             native_outcome = COALESCE(?, native_outcome), \
+             capability_state = COALESCE(?, capability_state), \
+             permission_state = COALESCE(?, permission_state), \
+             usage_requests = COALESCE(?, usage_requests), \
+             input_tokens = COALESCE(?, input_tokens), \
+             cached_input_tokens = COALESCE(?, cached_input_tokens), \
+             output_tokens = COALESCE(?, output_tokens), \
+             reasoning_tokens = COALESCE(?, reasoning_tokens), \
+             cost_usd_micros = COALESCE(?, cost_usd_micros), \
+             usage_rows_without_cost = COALESCE(?, usage_rows_without_cost) \
              WHERE id = ? AND state IN ('dispatching', 'running')",
         )
         .bind(outcome.state().as_str())
         .bind(outcome.exit_code())
         .bind(outcome.error())
         .bind(timestamp(now))
+        .bind(facts.task_sequence)
+        .bind(facts.task_outcome.as_deref())
+        .bind(facts.provider.as_deref())
+        .bind(facts.native_outcome.as_deref())
+        .bind(facts.capability_state.as_deref())
+        .bind(facts.permission_state.as_deref())
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.requests as i64),
+        )
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.input_tokens as i64),
+        )
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.cached_input_tokens as i64),
+        )
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.output_tokens as i64),
+        )
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.reasoning_tokens as i64),
+        )
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.cost_usd_micros as i64),
+        )
+        .bind(
+            facts
+                .usage_delta
+                .as_ref()
+                .map(|usage| usage.rows_without_cost as i64),
+        )
         .bind(run_id.as_str())
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() == 1 {
             sqlx::query(
-                "UPDATE schedule_occurrences SET state = 'completed' \
+                "UPDATE schedule_occurrences SET state = ?, lease_expires_at = NULL \
                  WHERE state = 'claimed' AND id = \
                  (SELECT occurrence_id FROM schedule_runs WHERE id = ?)",
             )
+            .bind(outcome.occurrence_state().as_str())
             .bind(run_id.as_str())
             .execute(&mut *tx)
             .await?;
@@ -670,26 +1341,20 @@ impl ScheduleStore {
     ) -> Result<Vec<ScheduleRun>, ScheduleError> {
         let rows = match definition_id {
             Some(id) => {
-                sqlx::query(
-                    "SELECT r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
-                     r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, \
-                     r.delivered_at, r.running_at, r.finished_at FROM schedule_runs r \
-                     JOIN schedule_occurrences o ON o.id = r.occurrence_id \
-                     WHERE r.definition_id = ? ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
-                )
+                sqlx::query(&format!(
+                    "SELECT {RUN_COLUMNS} FROM {RUN_FROM} \
+                     WHERE r.definition_id = ? ORDER BY r.started_at DESC, r.id DESC LIMIT ?"
+                ))
                 .bind(id.as_str())
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?
             }
             None => {
-                sqlx::query(
-                    "SELECT r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
-                     r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, \
-                     r.delivered_at, r.running_at, r.finished_at FROM schedule_runs r \
-                     JOIN schedule_occurrences o ON o.id = r.occurrence_id \
-                     ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
-                )
+                sqlx::query(&format!(
+                    "SELECT {RUN_COLUMNS} FROM {RUN_FROM} \
+                     ORDER BY r.started_at DESC, r.id DESC LIMIT ?"
+                ))
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?
@@ -698,12 +1363,13 @@ impl ScheduleStore {
         rows.iter().map(run_from_row).collect()
     }
 
-    /// The earliest pending occurrence across enabled definitions.
+    /// The earliest pending occurrence across enabled definitions, plus
+    /// explicit run-now slots of paused definitions.
     pub async fn next_due(&self) -> Result<Option<DateTime<Utc>>, ScheduleError> {
         let raw: Option<String> = sqlx::query_scalar(
             "SELECT MIN(o.scheduled_for) FROM schedule_occurrences o \
              JOIN schedule_definitions d ON d.id = o.definition_id \
-             WHERE o.state = 'pending' AND d.enabled = 1",
+             WHERE o.state = 'pending' AND (d.enabled = 1 OR o.run_now = 1)",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -717,7 +1383,7 @@ impl ScheduleStore {
         limit: usize,
     ) -> Result<Vec<Occurrence>, ScheduleError> {
         let rows = sqlx::query(
-            "SELECT id, definition_id, scheduled_for, state FROM schedule_occurrences \
+            "SELECT id, definition_id, scheduled_for, state, run_now FROM schedule_occurrences \
              WHERE definition_id = ? ORDER BY scheduled_for DESC LIMIT ?",
         )
         .bind(definition_id.as_str())
@@ -727,12 +1393,10 @@ impl ScheduleStore {
         rows.iter().map(occurrence_from_row).collect()
     }
 
-    async fn occurrence(
-        &self,
-        id: &OccurrenceId,
-    ) -> Result<Option<Occurrence>, ScheduleError> {
+    async fn occurrence(&self, id: &OccurrenceId) -> Result<Option<Occurrence>, ScheduleError> {
         let row = sqlx::query(
-            "SELECT id, definition_id, scheduled_for, state FROM schedule_occurrences WHERE id = ?",
+            "SELECT id, definition_id, scheduled_for, state, run_now \
+             FROM schedule_occurrences WHERE id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -742,20 +1406,17 @@ impl ScheduleStore {
 
     /// One run by id.
     pub async fn run(&self, id: &RunId) -> Result<Option<ScheduleRun>, ScheduleError> {
-        let row = sqlx::query(
-            "SELECT r.id, r.occurrence_id, r.definition_id, o.scheduled_for, r.state, \
-             r.session_id, r.execution_id, r.exit_code, r.error, r.started_at, \
-             r.delivered_at, r.running_at, r.finished_at FROM schedule_runs r \
-             JOIN schedule_occurrences o ON o.id = r.occurrence_id WHERE r.id = ?",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {RUN_COLUMNS} FROM {RUN_FROM} WHERE r.id = ?"
+        ))
         .bind(id.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(run_from_row).transpose()
     }
 
-    /// Create the next future occurrence for an interval definition. Missed
-    /// slots are skipped, never generated in a burst, and the unique
+    /// Create the next future occurrence from the rule itself. Missed slots
+    /// are skipped, never generated in a burst, and the unique
     /// `(definition, scheduled_for)` key makes this safe to call twice.
     pub async fn ensure_next_occurrence(
         &self,
@@ -765,34 +1426,22 @@ impl ScheduleStore {
         if !definition.enabled {
             return Ok(None);
         }
-        let ScheduleTrigger::Every { anchor, every } = definition.trigger else {
+        let Some(next) = definition.trigger.next_after(now)? else {
             return Ok(None);
         };
-        let every_secs = every.as_secs();
-        if every_secs == 0 {
-            return Err(ScheduleError::Invalid(
-                "an interval schedule must be at least one second".into(),
-            ));
-        }
-        let every = chrono::Duration::seconds(every_secs as i64);
         let last: Option<String> = sqlx::query_scalar(
             "SELECT MAX(scheduled_for) FROM schedule_occurrences WHERE definition_id = ?",
         )
         .bind(definition.id.as_str())
         .fetch_one(&self.pool)
         .await?;
-        let last = last.as_deref().map(parse_timestamp).transpose()?;
-        let next = match last {
-            Some(last) if last + every > now => last + every,
-            _ if now < anchor => anchor,
-            _ => {
-                // The first slot strictly after now, on the anchor's grid.
-                // Computed from now instead of a slot index so a very old
-                // anchor cannot overflow the interval multiplication.
-                let remainder = (now - anchor).num_seconds().rem_euclid(every_secs as i64);
-                now + chrono::Duration::seconds(every_secs as i64 - remainder)
+        if let Some(last) = last.as_deref().map(parse_timestamp).transpose()? {
+            if next <= last {
+                // A future slot already exists. The store keeps at most one;
+                // this also makes the call idempotent after a crash.
+                return Ok(None);
             }
-        };
+        }
         let id = OccurrenceId::generate();
         sqlx::query(
             "INSERT OR IGNORE INTO schedule_occurrences \
@@ -805,7 +1454,8 @@ impl ScheduleStore {
         .execute(&self.pool)
         .await?;
         let row = sqlx::query(
-            "SELECT id, definition_id, scheduled_for, state FROM schedule_occurrences \
+            "SELECT id, definition_id, scheduled_for, state, run_now \
+             FROM schedule_occurrences \
              WHERE definition_id = ? AND scheduled_for = ?",
         )
         .bind(definition.id.as_str())
@@ -816,13 +1466,63 @@ impl ScheduleStore {
     }
 }
 
+fn storage_time(row: &sqlx::sqlite::SqliteRow) -> Result<crate::LocalTime, ScheduleError> {
+    let raw: String = row.try_get("local_time")?;
+    crate::LocalTime::parse(&raw)
+}
+
+fn storage_timezone(row: &sqlx::sqlite::SqliteRow) -> Result<chrono_tz::Tz, ScheduleError> {
+    let raw: String = row.try_get("timezone")?;
+    crate::parse_timezone(&raw)
+}
+
 fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefinition, ScheduleError> {
-    let action: String = row.try_get("action")?;
-    if action != "shell" {
-        return Err(ScheduleError::Invalid(format!(
-            "unsupported schedule action `{action}`"
-        )));
-    }
+    let action_kind: String = row.try_get("action")?;
+    let action = match action_kind.as_str() {
+        "shell" => ScheduleAction::Shell {
+            command: row.try_get("command")?,
+        },
+        "native" => {
+            let id: String = row.try_get("native_action")?;
+            let input: String = row.try_get("native_input")?;
+            ScheduleAction::Native {
+                action: id,
+                input: serde_json::from_str(&input).map_err(|error| {
+                    ScheduleError::Invalid(format!(
+                        "stored native action input is not valid JSON: {error}"
+                    ))
+                })?,
+            }
+        }
+        "agent" => ScheduleAction::Agent {
+            goal: row.try_get("agent_goal")?,
+        },
+        other => {
+            return Err(ScheduleError::Invalid(format!(
+                "unsupported schedule action `{other}`"
+            )));
+        }
+    };
+    action.validate()?;
+    let session_policy_raw: String = row.try_get("session_policy")?;
+    let session_policy = SessionPolicy::parse(&session_policy_raw).ok_or_else(|| {
+        ScheduleError::Invalid(format!("unsupported session policy `{session_policy_raw}`"))
+    })?;
+    let overlap_raw: String = row.try_get("overlap_policy")?;
+    let overlap = OverlapPolicy::parse(&overlap_raw).ok_or_else(|| {
+        ScheduleError::Invalid(format!("unsupported overlap policy `{overlap_raw}`"))
+    })?;
+    let grant_raw: Option<String> = row.try_get("unattended_grant")?;
+    let unattended: Option<UnattendedGrant> = grant_raw
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str(raw).map_err(|error| {
+                ScheduleError::Invalid(format!(
+                    "stored unattended grant is not valid JSON: {error}"
+                ))
+            })
+        })
+        .transpose()?;
     let trigger_kind: String = row.try_get("trigger_kind")?;
     let trigger = match trigger_kind.as_str() {
         "once" => {
@@ -839,29 +1539,45 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
                 every: Duration::from_secs(every_secs.max(1) as u64),
             }
         }
+        "daily" => ScheduleTrigger::Daily {
+            time: storage_time(row)?,
+            timezone: storage_timezone(row)?,
+        },
+        "weekly" => ScheduleTrigger::Weekly {
+            weekdays: crate::WeekdaySet::from_bits(
+                u8::try_from(row.try_get::<i64, _>("weekdays")?)
+                    .map_err(|_| ScheduleError::Invalid("invalid weekday mask".into()))?,
+            )?,
+            time: storage_time(row)?,
+            timezone: storage_timezone(row)?,
+        },
+        "cron" => ScheduleTrigger::Cron {
+            expression: row.try_get::<String, _>("cron_expr")?,
+            timezone: storage_timezone(row)?,
+        },
         other => {
             return Err(ScheduleError::Invalid(format!(
                 "unsupported schedule trigger `{other}`"
             )));
         }
     };
+    trigger.validate()?;
     let permission_mode: String = row.try_get("permission_mode")?;
     let mode = PermissionProfile::parse(&permission_mode).ok_or_else(|| {
         ScheduleError::Invalid(format!("unsupported permission mode `{permission_mode}`"))
     })?;
     let model: Option<String> = row.try_get("model")?;
-    let model = match model {
-        Some(raw) => Some(ModelRef::parse(&raw).ok_or_else(|| {
-            ScheduleError::Invalid(format!("invalid model reference `{raw}`"))
-        })?),
-        None => None,
-    };
+    let model =
+        match model {
+            Some(raw) => Some(ModelRef::parse(&raw).ok_or_else(|| {
+                ScheduleError::Invalid(format!("invalid model reference `{raw}`"))
+            })?),
+            None => None,
+        };
     let timeout_secs: i64 = row.try_get("timeout_secs")?;
     let misfire_policy: String = row.try_get("misfire_policy")?;
     let misfire = MisfirePolicy::parse(&misfire_policy).ok_or_else(|| {
-        ScheduleError::Invalid(format!(
-            "unsupported misfire policy `{misfire_policy}`"
-        ))
+        ScheduleError::Invalid(format!("unsupported misfire policy `{misfire_policy}`"))
     })?;
     let misfire_grace_secs: i64 = row.try_get("misfire_grace_secs")?;
     let session: Option<String> = row.try_get("session_id")?;
@@ -870,14 +1586,17 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
         id: ScheduleId::from(row.try_get::<String, _>("id")?),
         name: row.try_get("name")?,
         workspace: std::path::PathBuf::from(row.try_get::<String, _>("workspace")?),
-        command: row.try_get("command")?,
+        action,
         trigger,
+        session_policy,
+        overlap,
         mode,
         model,
         timeout: Duration::from_secs(timeout_secs.max(1) as u64),
         misfire,
         misfire_grace: Duration::from_secs(misfire_grace_secs.max(0) as u64),
         session_id: session.map(SessionId::from),
+        unattended,
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         created_at: parse_timestamp(&created_at)?,
     })
@@ -892,6 +1611,7 @@ fn occurrence_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Occurrence, Sche
         state: OccurrenceState::parse(&state).ok_or_else(|| {
             ScheduleError::Invalid(format!("unsupported occurrence state `{state}`"))
         })?,
+        run_now: row.try_get::<i64, _>("run_now")? != 0,
     })
 }
 
@@ -903,9 +1623,8 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleRun, ScheduleEr
         occurrence_id: OccurrenceId::from(row.try_get::<String, _>("occurrence_id")?),
         definition_id: ScheduleId::from(row.try_get::<String, _>("definition_id")?),
         scheduled_for: parse_timestamp(&row.try_get::<String, _>("scheduled_for")?)?,
-        state: RunState::parse(&state).ok_or_else(|| {
-            ScheduleError::Invalid(format!("unsupported run state `{state}`"))
-        })?,
+        state: RunState::parse(&state)
+            .ok_or_else(|| ScheduleError::Invalid(format!("unsupported run state `{state}`")))?,
         session_id: session.map(SessionId::from),
         execution_id: row.try_get("execution_id")?,
         exit_code: row.try_get("exit_code")?,
@@ -914,24 +1633,74 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleRun, ScheduleEr
         delivered_at: optional_timestamp(row, "delivered_at")?,
         running_at: optional_timestamp(row, "running_at")?,
         finished_at: optional_timestamp(row, "finished_at")?,
+        baseline_sequence: row.try_get("baseline_sequence")?,
+        turn_ordinal: row.try_get("turn_ordinal")?,
+        task_sequence: row.try_get("task_sequence")?,
+        task_outcome: row.try_get("task_outcome")?,
+        provider: row.try_get("provider")?,
+        native_outcome: row.try_get("native_outcome")?,
+        capability_state: row.try_get("capability_state")?,
+        permission_state: row.try_get("permission_state")?,
+        usage_requests: optional_u64(row, "usage_requests")?,
+        input_tokens: optional_u64(row, "input_tokens")?,
+        cached_input_tokens: optional_u64(row, "cached_input_tokens")?,
+        output_tokens: optional_u64(row, "output_tokens")?,
+        reasoning_tokens: optional_u64(row, "reasoning_tokens")?,
+        cost_usd_micros: optional_u64(row, "cost_usd_micros")?,
+        usage_rows_without_cost: optional_u64(row, "usage_rows_without_cost")?,
+        usage_baseline: usage_baseline_from_row(row)?,
+        handed_off_at: optional_timestamp(row, "handed_off_at")?,
+        deadline_at: optional_timestamp(row, "deadline_at")?,
+        cancel_requested_at: optional_timestamp(row, "cancel_requested_at")?,
+        cancel_issued_at: optional_timestamp(row, "cancel_issued_at")?,
     })
+}
+
+fn optional_u64(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<Option<u64>, ScheduleError> {
+    let raw: Option<i64> = row.try_get(column)?;
+    Ok(raw.map(|value| value.max(0) as u64))
+}
+
+/// A baseline is all-or-nothing: the writer stores every component together.
+fn usage_baseline_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<Option<UsageSnapshot>, ScheduleError> {
+    if optional_u64(row, "usage_baseline_requests")?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(UsageSnapshot {
+        requests: optional_u64(row, "usage_baseline_requests")?.unwrap_or_default(),
+        input_tokens: optional_u64(row, "usage_baseline_input_tokens")?.unwrap_or_default(),
+        cached_input_tokens: optional_u64(row, "usage_baseline_cached_input_tokens")?
+            .unwrap_or_default(),
+        output_tokens: optional_u64(row, "usage_baseline_output_tokens")?.unwrap_or_default(),
+        reasoning_tokens: optional_u64(row, "usage_baseline_reasoning_tokens")?.unwrap_or_default(),
+        cost_usd_micros: optional_u64(row, "usage_baseline_cost_usd_micros")?.unwrap_or_default(),
+        rows_without_cost: optional_u64(row, "usage_baseline_rows_without_cost")?
+            .unwrap_or_default(),
+    }))
 }
 
 fn wake_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<WakeRecord, ScheduleError> {
     let source: String = row.try_get("source")?;
     Ok(WakeRecord {
         id: row.try_get("id")?,
-        source: WakeSource::parse(&source).ok_or_else(|| {
-            ScheduleError::Invalid(format!("unsupported wake source `{source}`"))
-        })?,
+        source: WakeSource::parse(&source)
+            .ok_or_else(|| ScheduleError::Invalid(format!("unsupported wake source `{source}`")))?,
         started_at: parse_timestamp(&row.try_get::<String, _>("started_at")?)?,
         finished_at: optional_timestamp(row, "finished_at")?,
         recovered: usize_of(row, "recovered")?,
+        skipped: usize_of(row, "skipped")?,
         missed: usize_of(row, "missed")?,
         claimed: usize_of(row, "claimed")?,
         succeeded: usize_of(row, "succeeded")?,
+        submitted: usize_of(row, "submitted")?,
         failed: usize_of(row, "failed")?,
         unknown: usize_of(row, "unknown")?,
+        handed_off: usize_of(row, "handed_off")?,
+        cancelled: usize_of(row, "cancelled")?,
+        waiting_approval: usize_of(row, "waiting_approval")?,
+        blocked: usize_of(row, "blocked")?,
         error: row.try_get("error")?,
     })
 }
@@ -964,19 +1733,82 @@ mod tests {
         ScheduleStore::open_in_memory().await.unwrap()
     }
 
+    #[tokio::test]
+    async fn calendar_triggers_round_trip_and_schedule_from_the_rule() {
+        let store = store().await;
+        let daily = ScheduleTrigger::Daily {
+            time: crate::LocalTime::parse("09:00").unwrap(),
+            timezone: crate::parse_timezone("Asia/Shanghai").unwrap(),
+        };
+        let created = store.create_definition(definition(daily)).await.unwrap();
+        let reread = store.definition(&created.id).await.unwrap().unwrap();
+        assert_eq!(reread.trigger, created.trigger);
+
+        let first = store.occurrences(&created.id, 10).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].scheduled_for > leveler_core::now());
+
+        // Three hours after the first slot, the next one is still the next
+        // local 09:00 - not "three hours after the run finished".
+        let next = store
+            .ensure_next_occurrence(&reread, first[0].scheduled_for + chrono::Duration::hours(3))
+            .await
+            .unwrap()
+            .expect("next daily occurrence");
+        assert_eq!(
+            next.scheduled_for,
+            first[0].scheduled_for + chrono::Duration::days(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn weekly_and_cron_definitions_round_trip() {
+        let store = store().await;
+        let weekly = ScheduleTrigger::Weekly {
+            weekdays: crate::WeekdaySet::parse("mon,wed,fri").unwrap(),
+            time: crate::LocalTime::parse("07:45").unwrap(),
+            timezone: crate::parse_timezone("Europe/Berlin").unwrap(),
+        };
+        let cron = ScheduleTrigger::Cron {
+            expression: "0 9 1 * *".into(),
+            timezone: crate::parse_timezone("America/New_York").unwrap(),
+        };
+        for trigger in [weekly, cron] {
+            let created = store.create_definition(definition(trigger)).await.unwrap();
+            let reread = store.definition(&created.id).await.unwrap().unwrap();
+            assert_eq!(reread.trigger, created.trigger);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_calendar_rules_never_reach_storage() {
+        let store = store().await;
+        let trigger = ScheduleTrigger::Cron {
+            expression: "not a cron".into(),
+            timezone: crate::parse_timezone("UTC").unwrap(),
+        };
+        assert!(store.create_definition(definition(trigger)).await.is_err());
+        assert!(store.definitions().await.unwrap().is_empty());
+    }
+
     fn definition(trigger: ScheduleTrigger) -> NewScheduleDefinition {
         let workspace = std::env::temp_dir().join("leveler-schedule-test");
         std::fs::create_dir_all(&workspace).unwrap();
         NewScheduleDefinition {
             name: "nightly".into(),
             workspace,
-            command: "printf ok".into(),
+            action: ScheduleAction::Shell {
+                command: "printf ok".into(),
+            },
             trigger,
+            session_policy: SessionPolicy::Continue,
+            overlap: OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             model: None,
             timeout: Duration::from_secs(60),
             misfire: MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         }
     }
 
@@ -1038,9 +1870,7 @@ mod tests {
         let run = store
             .finish_run(
                 &claims[0].run_id,
-                RunOutcome::Succeeded {
-                    exit_code: Some(0),
-                },
+                RunOutcome::Succeeded { exit_code: Some(0) },
             )
             .await
             .unwrap()
@@ -1080,9 +1910,7 @@ mod tests {
         store
             .finish_run(
                 &claims[0].run_id,
-                RunOutcome::Succeeded {
-                    exit_code: Some(0),
-                },
+                RunOutcome::Succeeded { exit_code: Some(0) },
             )
             .await
             .unwrap();
@@ -1205,6 +2033,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claims.len(), 1);
+        // A definition with a live run is not removed: the runtime's task
+        // would be orphaned with no schedule record owning its settlement.
+        let refused = store.remove_definition(&created.id).await;
+        assert!(refused.is_err(), "an active run must block deletion");
+        store
+            .finish_run(
+                &claims[0].run_id,
+                RunOutcome::Succeeded { exit_code: Some(0) },
+            )
+            .await
+            .unwrap();
         assert!(store.remove_definition(&created.id).await.unwrap());
         assert!(store.definition(&created.id).await.unwrap().is_none());
         assert!(store.runs(Some(&created.id), 10).await.unwrap().is_empty());
@@ -1368,8 +2207,10 @@ mod tests {
             missed: 2,
             claimed: 3,
             succeeded: 4,
+            submitted: 7,
             failed: 5,
             unknown: 6,
+            ..DispatchSummary::default()
         };
         store.finish_wake(os, &summary).await.unwrap();
         let finished = &store.wakes(10).await.unwrap()[0];
@@ -1385,9 +2226,13 @@ mod tests {
             ),
             (1, 2, 3, 4, 5, 6)
         );
+        assert_eq!(finished.submitted, 7, "submitted is not success");
 
         let manual = store.begin_wake(WakeSource::Manual).await.unwrap();
-        store.fail_wake(manual, "database unavailable").await.unwrap();
+        store
+            .fail_wake(manual, "database unavailable")
+            .await
+            .unwrap();
         let failed = &store.wakes(10).await.unwrap()[0];
         assert_eq!(failed.error.as_deref(), Some("database unavailable"));
         assert!(failed.finished_at.is_some());

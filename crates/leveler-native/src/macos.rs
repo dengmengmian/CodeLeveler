@@ -164,12 +164,8 @@ end readField
 
 pub(super) async fn discover(runner: &CommandRunner, probes: &PermissionProbes) -> DiscoveryReport {
     let installed = Path::new(MAIL_APP).exists();
-    let (permission, permission_detail) = bounded_permission_probe(
-        probes,
-        automation_permission,
-        PERMISSION_PROBE_TIMEOUT,
-    )
-    .await;
+    let (permission, permission_detail) =
+        bounded_permission_probe(probes, automation_permission, PERMISSION_PROBE_TIMEOUT).await;
     let (running, running_error) = if installed {
         match run_probe(runner, PGREP, &["-x", "Mail"], Duration::from_secs(5)).await {
             Ok(output) => match output.exit_code {
@@ -777,8 +773,7 @@ mod tests {
         let probes = PermissionProbes::default();
         RELEASE_STUCK_PROBE.store(false, Ordering::Release);
 
-        let (state, _) =
-            bounded_permission_probe(&probes, stuck, Duration::from_millis(50)).await;
+        let (state, _) = bounded_permission_probe(&probes, stuck, Duration::from_millis(50)).await;
         assert_eq!(state, PermissionState::Unknown);
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -789,8 +784,7 @@ mod tests {
         // The original stuck thread still owns the replacement allowance.
         // Another stuck probe may start, but the next admission is refused
         // instead of leaking one more thread per discovery.
-        let (state, _) =
-            bounded_permission_probe(&probes, stuck, Duration::from_millis(50)).await;
+        let (state, _) = bounded_permission_probe(&probes, stuck, Duration::from_millis(50)).await;
         assert_eq!(state, PermissionState::Unknown);
         tokio::time::sleep(Duration::from_millis(60)).await;
         let (state, reason) =

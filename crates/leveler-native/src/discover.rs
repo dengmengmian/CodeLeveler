@@ -27,6 +27,20 @@ pub enum CapabilityState {
     Unknown,
 }
 
+impl CapabilityState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Available => "available",
+            Self::RequiresPermission => "requires_permission",
+            Self::RequiresConfiguration => "requires_configuration",
+            Self::Unavailable => "unavailable",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionState {
@@ -97,6 +111,16 @@ pub struct ActionReport {
     pub reason: Option<String>,
 }
 
+/// How much interaction the caller allows before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// A person may answer an OS consent prompt (interactive tool/CLI path).
+    MayPrompt,
+    /// Nobody is present. A permission that is not already granted blocks the
+    /// action instead of prompting or hanging.
+    Unattended,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityReport {
     pub id: &'static str,
@@ -113,6 +137,76 @@ pub struct CapabilityReport {
     pub reason: Option<String>,
     pub evidence: Vec<Evidence>,
     pub actions: Vec<ActionReport>,
+}
+
+impl CapabilityReport {
+    /// Why this capability cannot start the action now, and the status the
+    /// caller must report if it does not start. `None` means admission may
+    /// proceed; runtime failure is still interpreted by the action itself.
+    pub fn admission_block(
+        &self,
+        action: crate::ActionId,
+        mode: PermissionMode,
+    ) -> Option<(crate::ActionStatus, String)> {
+        use crate::{ActionStatus, PermissionState};
+
+        let action_report = self
+            .actions
+            .iter()
+            .find(|candidate| candidate.id == action.as_str());
+        if !action_report.is_some_and(|report| report.supported) {
+            let reason = action_report
+                .and_then(|report| report.reason.as_deref())
+                .or(self.reason.as_deref())
+                .unwrap_or("no supported capability was reported");
+            return Some((ActionStatus::Unsupported, reason.to_string()));
+        }
+
+        let block = |status, fallback: &str| {
+            Some((
+                status,
+                self.reason.clone().unwrap_or_else(|| fallback.to_string()),
+            ))
+        };
+        match self.state {
+            CapabilityState::Unavailable | CapabilityState::Unsupported => block(
+                ActionStatus::Unsupported,
+                "the capability is not available on this host",
+            ),
+            CapabilityState::RequiresPermission => {
+                if self.permission == PermissionState::NotDetermined
+                    && mode == PermissionMode::MayPrompt
+                {
+                    None
+                } else if self.permission == PermissionState::NotDetermined {
+                    Some((
+                        ActionStatus::RequiresPermission,
+                        self.reason.clone().unwrap_or_else(|| {
+                            "the OS permission has not been granted and an unattended run \
+                             never prompts"
+                                .to_string()
+                        }),
+                    ))
+                } else {
+                    block(
+                        ActionStatus::RequiresPermission,
+                        "automation permission is required",
+                    )
+                }
+            }
+            CapabilityState::RequiresConfiguration => block(
+                ActionStatus::RequiresConfiguration,
+                "an account or application setting must be configured first",
+            ),
+            CapabilityState::Unknown if self.permission == PermissionState::Unknown => block(
+                ActionStatus::RequiresPermission,
+                "automation permission could not be determined",
+            ),
+            CapabilityState::Installed | CapabilityState::Available | CapabilityState::Unknown => {
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -123,6 +123,7 @@ fn snapshot() -> UiSessionSnapshot {
         ],
         vision: false,
         last_sequence: None,
+        latest_turn_ordinal: None,
         active_tools: Vec::new(),
         interrupted_tool_calls: Vec::new(),
         active_background_tasks: Vec::new(),
@@ -9410,6 +9411,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
     snap.user_shells = vec![
         leveler_client_protocol::UiUserShell {
             id: leveler_core::UserShellId::new("ush-done"),
+            origin_command_id: None,
             command: "echo done".into(),
             cwd: "/repo".into(),
             status: "success".into(),
@@ -9422,6 +9424,7 @@ fn snapshot_restores_shell_blocks_and_running_focus() {
         },
         leveler_client_protocol::UiUserShell {
             id: leveler_core::UserShellId::new("ush-live"),
+            origin_command_id: None,
             command: "sleep 60".into(),
             cwd: "/repo".into(),
             status: "running".into(),

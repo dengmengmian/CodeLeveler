@@ -16,9 +16,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::{ProcessRequest, RiskLevel};
+use leveler_execution::RiskLevel;
 use leveler_native::{
-    ActionId, ActionStatus, ExecutionEvidence, NativeActionRequest, NativeActions,
+    ActionId, ActionStatus, NativeActionRequest, NativeActions,
 };
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -313,82 +313,47 @@ async fn run_action(
         None => serde_json::json!({ "to": to, "subject": subject }),
     };
     let request = NativeActionRequest { action, input };
-    let plan = match native.plan(&request) {
-        Ok(plan) => plan,
-        Err(error) => return Ok(ToolOutput::error(error.to_string())),
-    };
 
     // Re-probe on every call: a user may have granted automation, installed a
     // client or signed out of an account since the last check.
-    let report = native.discover(&context.execution.runner).await;
-    let provider = plan.provider().as_str();
-    let Some(capability) = report
-        .capabilities
-        .iter()
-        .find(|capability| capability.provider == provider)
-    else {
-        return Ok(ToolOutput::error(format!(
-            "native action {} was not run: the discovery probe did not report provider {provider}",
-            action.as_str()
-        )));
+    let run = match native
+        .run(
+            &context.execution.runner,
+            &request,
+            leveler_native::PermissionMode::MayPrompt,
+            None,
+            256 * 1024,
+            cancellation,
+        )
+        .await
+    {
+        Ok(run) => run,
+        Err(error) => return Ok(ToolOutput::error(error.to_string())),
     };
-    let action_report = capability
-        .actions
-        .iter()
-        .find(|candidate| candidate.id == action.as_str());
-    if !action_report.is_some_and(|report| report.supported) {
-        let reason = action_report
-            .and_then(|report| report.reason.as_deref())
-            .or(capability.reason.as_deref())
-            .unwrap_or("no supported capability was reported");
-        return Ok(ToolOutput::error(format!(
-            "native action {} is not supported here: {reason}",
-            action.as_str()
-        )));
+    let outcome = run.outcome;
+    // Admission failures are plain text for the model; an executed action is
+    // reported as the structured outcome it observed.
+    if outcome.execution_id.is_empty() {
+        let reason = outcome.detail;
+        return Ok(ToolOutput::error(match outcome.status {
+            ActionStatus::Unsupported if run.capability.is_some() => {
+                format!("native action {} is not supported here: {reason}", action.as_str())
+            }
+            _ => format!("native action {} was not run: {reason}", action.as_str()),
+        }));
     }
-    if let Some(reason) = blocking_reason(capability) {
-        return Ok(ToolOutput::error(format!(
-            "native action {} was not run: {reason}",
-            action.as_str()
-        )));
-    }
-    if capability.permission == leveler_native::PermissionState::NotDetermined {
-        // The action itself asks the OS now; if nobody answers, the timeout
-        // produces `unknown` and the action is never retried.
+    if run
+        .capability
+        .as_ref()
+        .is_some_and(|capability| capability.permission == leveler_native::PermissionState::NotDetermined)
+    {
         tracing::info!(
-            provider,
+            provider = outcome.provider.as_str(),
             action = action.as_str(),
-            "native action will request automation consent"
+            "native action requested automation consent"
         );
     }
 
-    let mut process = ProcessRequest::new(
-        plan.program(),
-        plan.args().to_vec(),
-        plan.cwd().to_path_buf(),
-    );
-    process.timeout = plan.timeout();
-    process.max_output_bytes = 256 * 1024;
-    let started = std::time::Instant::now();
-    let output = context.execution.runner.run(process, cancellation).await;
-    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let evidence = match output {
-        Ok(output) => ExecutionEvidence {
-            exit_code: output.exit_code,
-            timed_out: output.timed_out,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            duration_ms,
-        },
-        Err(error) => ExecutionEvidence {
-            exit_code: None,
-            timed_out: false,
-            stdout: String::new(),
-            stderr: error.to_string(),
-            duration_ms,
-        },
-    };
-    let outcome = native.interpret(action, plan.provider(), &evidence);
     let metadata = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
     let content = serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| {
         format!(
@@ -412,53 +377,6 @@ async fn run_action(
         is_error,
         metadata,
     })
-}
-
-/// Facts that make execution pointless before a process is started. An
-/// unobserved account configuration is not one of them: Mail may be closed,
-/// and the action itself can launch it. An unknown *permission* is one.
-fn blocking_reason(capability: &leveler_native::CapabilityReport) -> Option<String> {
-    use leveler_native::CapabilityState;
-    match capability.state {
-        CapabilityState::Unavailable | CapabilityState::Unsupported => Some(
-            capability
-                .reason
-                .clone()
-                .unwrap_or_else(|| "the capability is not available".to_string()),
-        ),
-        CapabilityState::RequiresPermission
-            if capability.permission == leveler_native::PermissionState::NotDetermined =>
-        {
-            None
-        }
-        CapabilityState::RequiresPermission => Some(
-            capability
-                .reason
-                .clone()
-                .unwrap_or_else(|| "automation permission is required".to_string()),
-        ),
-        CapabilityState::RequiresConfiguration => Some(
-            capability
-                .reason
-                .clone()
-                .unwrap_or_else(|| "an account must be configured first".to_string()),
-        ),
-        // `Unknown` from unobserved account configuration is safe to attempt:
-        // the action reports the missing account itself. An unknown
-        // *permission* is not: the probe could not establish whether the OS
-        // will allow the action, so starting it would guess or hang again.
-        CapabilityState::Unknown
-            if capability.permission == leveler_native::PermissionState::Unknown =>
-        {
-            Some(
-                capability
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "automation permission could not be determined".to_string()),
-            )
-        }
-        CapabilityState::Installed | CapabilityState::Available | CapabilityState::Unknown => None,
-    }
 }
 
 #[cfg(test)]
@@ -528,16 +446,39 @@ mod tests {
             configured: None,
             reason: Some("the permission probe timed out".into()),
             evidence: Vec::new(),
-            actions: Vec::new(),
+            actions: vec![leveler_native::ActionReport {
+                id: "mail.draft.create",
+                supported: true,
+                deterministic: true,
+                external_side_effects: false,
+                gui_only: false,
+                unattended: leveler_native::UnattendedSupport::Conditional,
+                sent_state_confirmable: true,
+                delivery_confirmable: false,
+                reason: None,
+            }],
         };
         assert_eq!(
-            blocking_reason(&capability).as_deref(),
+            capability
+                .admission_block(
+                    ActionId::MailDraftCreate,
+                    leveler_native::PermissionMode::MayPrompt
+                )
+                .map(|(_, reason)| reason)
+                .as_deref(),
             Some("the permission probe timed out")
         );
 
         capability.permission = leveler_native::PermissionState::Granted;
         capability.reason = Some("Mail is not running".into());
-        assert!(blocking_reason(&capability).is_none());
+        assert!(
+            capability
+                .admission_block(
+                    ActionId::MailDraftCreate,
+                    leveler_native::PermissionMode::MayPrompt
+                )
+                .is_none()
+        );
     }
 
     #[test]

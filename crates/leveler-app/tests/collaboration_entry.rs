@@ -355,6 +355,7 @@ async fn run_goal_is_durable_and_explicit_chat_restores_chat() {
         .send(ClientCommand::RunGoal {
             session_id: session.clone(),
             content: "now drive it".to_string(),
+            require_new_turn: false,
         })
         .await
         .unwrap();
@@ -383,6 +384,60 @@ async fn run_goal_is_durable_and_explicit_chat_restores_chat() {
         .await
         .unwrap();
     assert_eq!(collaboration_of(&app, &session).await, "chat");
+}
+
+/// A scheduled delivery must own the turn it settles. When another client's
+/// turn already runs, a `require_new_turn` goal is refused instead of being
+/// steered into that turn: joining would attribute the other client's work
+/// and model usage to the schedule.
+#[tokio::test]
+async fn an_unattended_goal_is_refused_while_another_clients_turn_runs() {
+    use leveler_local_transport::LocalRuntimeService;
+
+    let (_tmp, _server, app, client) = harness(vec![long_tool_call(3)]).await;
+    let session = client
+        .create_session(request(
+            "human work",
+            leveler_local_transport::CollaborationMode::Chat,
+        ))
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "hold the turn".to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let error = client
+        .send(ClientCommand::RunGoal {
+            session_id: session.clone(),
+            content: "scheduled goal must not join".to_string(),
+            require_new_turn: true,
+        })
+        .await
+        .expect_err("an unattended goal must not join a running turn");
+    assert!(
+        error.to_string().contains("requires a new turn"),
+        "{error}"
+    );
+    assert_eq!(
+        collaboration_of(&app, &session).await,
+        "chat",
+        "the refusal happens before the goal declaration is persisted"
+    );
+
+    client
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
 }
 
 /// G — an ordinary composer submit in a Goal session enters the goal executor:

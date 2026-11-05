@@ -123,10 +123,11 @@ pub enum Command {
 
     /// Manage user-global scheduled automation.
     ///
-    /// A schedule is one shell command on one trigger. A dispatcher connects
-    /// to the workspace's ordinary runtime as a local client, so the run
-    /// reuses the same Boot, ownership, permission and storage paths as an
-    /// interactive session — and never starts a second agent runtime.
+    /// A schedule is one typed action (shell, native or agent) on one trigger.
+    /// A dispatcher connects to the workspace's ordinary runtime as a local
+    /// client, so the run reuses the same Boot, ownership, permission and
+    /// storage paths as an interactive session — and never starts a second
+    /// agent runtime.
     #[command(subcommand)]
     Schedule(ScheduleCommand),
 
@@ -835,9 +836,35 @@ pub enum ScheduleSource {
     Serve,
 }
 
+/// How a recurring agent schedule treats the session across runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScheduleSessionPolicy {
+    /// Reuse one durable session; context accumulates deliberately.
+    Continue,
+    /// Create a new session for every run; no context is carried over.
+    Fresh,
+}
+
+/// What to do when a slot becomes due while the previous run is still active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScheduleOverlap {
+    /// Record the slot as skipped. Safe for actions with side effects.
+    #[value(name = "skip-if-running")]
+    SkipIfRunning,
+    /// Keep at most one pending slot; a later wake runs it once.
+    #[value(name = "queue-one")]
+    QueueOne,
+    /// Let runs overlap. Requires a side-effect-free or concurrency-safe action.
+    #[value(name = "allow-concurrent")]
+    AllowConcurrent,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ScheduleCommand {
     /// Add a user-global scheduled action.
+    #[command(group(
+        clap::ArgGroup::new("action_kind").required(true).multiple(false)
+    ))]
     Add {
         /// Display name.
         #[arg(long)]
@@ -846,24 +873,83 @@ pub enum ScheduleCommand {
         /// current repository).
         #[arg(long, value_name = "PATH")]
         workspace: Option<PathBuf>,
-        /// The exact shell command.
-        #[arg(long)]
-        command: String,
+        /// The exact shell command (a shell action).
+        #[arg(long, group = "action_kind")]
+        command: Option<String>,
+        /// A typed native action id, for example `mail.draft.create`.
+        #[arg(long, value_name = "ACTION_ID", group = "action_kind")]
+        native_action: Option<String>,
+        /// Structured JSON input for --native-action (defaults to `{}`).
+        #[arg(long, value_name = "JSON", requires = "native_action")]
+        native_input: Option<String>,
+        /// The goal submitted to the ordinary agent runtime.
+        #[arg(long, value_name = "TEXT", group = "action_kind")]
+        agent_goal: Option<String>,
         /// Run once at this RFC3339 instant.
-        #[arg(long, value_name = "RFC3339", conflicts_with = "every")]
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            conflicts_with_all = ["every", "daily", "weekly", "cron"]
+        )]
         at: Option<String>,
         /// Run every N seconds.
-        #[arg(long, value_name = "SECONDS", conflicts_with = "at")]
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            conflicts_with_all = ["at", "daily", "weekly", "cron"]
+        )]
         every: Option<u64>,
+        /// Run once per local calendar day at this HH:MM.
+        #[arg(
+            long,
+            value_name = "HH:MM",
+            conflicts_with_all = ["at", "every", "weekly", "cron"]
+        )]
+        daily: Option<String>,
+        /// Run on these local weekdays at --local-time: `mon,wed` or `mon-fri`.
+        #[arg(
+            long,
+            value_name = "DAYS",
+            requires = "local_time",
+            conflicts_with_all = ["at", "every", "daily", "cron"]
+        )]
+        weekly: Option<String>,
+        /// Wall-clock time for --weekly.
+        #[arg(long, value_name = "HH:MM", requires = "weekly")]
+        local_time: Option<String>,
+        /// Five-field cron expression, evaluated in --timezone.
+        #[arg(
+            long,
+            value_name = "CRON",
+            conflicts_with_all = ["at", "every", "daily", "weekly"]
+        )]
+        cron: Option<String>,
+        /// IANA timezone for --daily, --weekly or --cron (defaults to the
+        /// system zone).
+        #[arg(long, value_name = "IANA")]
+        timezone: Option<String>,
         /// First instant for --every (defaults to now).
         #[arg(long, value_name = "RFC3339", requires = "every")]
         anchor: Option<String>,
         /// Permission profile the action's session runs under.
         #[arg(long = "permission", value_enum, default_value = "assisted")]
         mode: RunMode,
-        /// Model reference for the session (unused by a shell action).
+        /// Model reference for an agent action.
         #[arg(long)]
         model: Option<String>,
+        /// Session reuse for an agent action.
+        #[arg(long, value_enum, default_value = "continue")]
+        session_policy: ScheduleSessionPolicy,
+        /// How an overlapping run is handled.
+        #[arg(long, value_enum, default_value = "skip-if-running")]
+        overlap: ScheduleOverlap,
+        /// Persist an explicit unattended grant for this schedule identity.
+        /// Without it a native or agent action is refused before it starts.
+        #[arg(long)]
+        grant_unattended: bool,
+        /// Let the unattended grant cover actions with external side effects.
+        #[arg(long, requires = "grant_unattended")]
+        allow_external_side_effects: bool,
         /// Give up waiting for the action's terminal record after this many
         /// seconds; the run becomes unknown rather than retried.
         #[arg(long, default_value_t = 600)]
@@ -885,6 +971,14 @@ pub enum ScheduleCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show one definition: action, policy, grant, next occurrence and last run.
+    Show {
+        /// Definition id.
+        id: String,
+        /// Print the definition as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show run history, newest first.
     Runs {
         /// Only runs of this definition id.
@@ -896,8 +990,41 @@ pub enum ScheduleCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a definition and its occurrence/run history.
+    /// Remove a definition and its occurrence/run history. Refused while a
+    /// run is active, so a runtime task is never orphaned.
     Remove {
+        /// Definition id.
+        id: String,
+    },
+    /// Stop creating future occurrences. An active run is not killed.
+    Pause {
+        /// Definition id.
+        id: String,
+    },
+    /// Resume future occurrences.
+    Resume {
+        /// Definition id.
+        id: String,
+    },
+    /// Create one explicit slot and dispatch it now, even while paused.
+    RunNow {
+        /// Definition id.
+        id: String,
+        /// Print the resulting run as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the owning dispatcher to cancel this definition's active runs.
+    Cancel {
+        /// Definition id.
+        id: String,
+        /// Print the observed result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke the persisted unattended grant. Later runs are refused until a
+    /// new grant is created.
+    RevokeGrant {
         /// Definition id.
         id: String,
     },
@@ -947,6 +1074,15 @@ pub enum ScheduleCommand {
     /// Show the OS registration and schedule counts side by side.
     Status {
         /// Print the state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show dispatch-pass (wake) history, newest first. This is the record of
+    /// what each OS wake, manual pass or resident driver observed.
+    Wakeups {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print the wake history as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -1025,7 +1161,7 @@ mod tests {
                 ..
             })) => {
                 assert_eq!(name, "nightly");
-                assert_eq!(command, "printf ok");
+                assert_eq!(command.as_deref(), Some("printf ok"));
                 assert_eq!(every, Some(60));
                 assert!(matches!(mode, RunMode::FullAccess));
                 assert_eq!(timeout, 30);
@@ -1052,6 +1188,97 @@ mod tests {
             "--at and --every are mutually exclusive"
         );
 
+        // Exactly one action kind is required, and the kinds are exclusive.
+        assert!(
+            Cli::try_parse_from([
+                "leveler",
+                "schedule",
+                "add",
+                "--name",
+                "x",
+                "--at",
+                "2026-01-01T00:00:00Z",
+            ])
+            .is_err(),
+            "an action kind is required"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "leveler",
+                "schedule",
+                "add",
+                "--name",
+                "x",
+                "--command",
+                "true",
+                "--agent-goal",
+                "do work",
+                "--at",
+                "2026-01-01T00:00:00Z",
+            ])
+            .is_err(),
+            "two action kinds are refused"
+        );
+        let native = parse(&[
+            "leveler",
+            "schedule",
+            "add",
+            "--name",
+            "draft",
+            "--native-action",
+            "mail.draft.create",
+            "--native-input",
+            "{\"to\":\"a@example.test\",\"subject\":\"s\",\"body\":\"b\"}",
+            "--session-policy",
+            "fresh",
+            "--overlap",
+            "queue-one",
+            "--grant-unattended",
+            "--allow-external-side-effects",
+            "--at",
+            "2026-01-01T00:00:00Z",
+        ]);
+        assert!(
+            Cli::try_parse_from([
+                "leveler",
+                "schedule",
+                "add",
+                "--name",
+                "draft",
+                "--native-action",
+                "mail.draft.create",
+                "--daily",
+                "09:00",
+                "--session-policy",
+                "fresh",
+                "--overlap",
+                "queue-one",
+                "--grant-unattended",
+                "--allow-external-side-effects",
+                "--at",
+                "2026-01-01T00:00:00Z",
+            ])
+            .is_err(),
+            "--daily and --at are mutually exclusive"
+        );
+        match native.command {
+            Some(Command::Schedule(ScheduleCommand::Add {
+                native_action,
+                session_policy,
+                overlap,
+                grant_unattended,
+                allow_external_side_effects,
+                ..
+            })) => {
+                assert_eq!(native_action.as_deref(), Some("mail.draft.create"));
+                assert!(matches!(session_policy, ScheduleSessionPolicy::Fresh));
+                assert!(matches!(overlap, ScheduleOverlap::QueueOne));
+                assert!(grant_unattended);
+                assert!(allow_external_side_effects);
+            }
+            other => panic!("expected a native Schedule::Add, got {other:?}"),
+        }
+
         let dispatch = parse(&["leveler", "schedule", "dispatch", "--max", "2", "--json"]);
         assert!(matches!(
             dispatch.command,
@@ -1062,13 +1289,7 @@ mod tests {
             }))
         ));
 
-        let os_dispatch = parse(&[
-            "leveler",
-            "schedule",
-            "dispatch",
-            "--source",
-            "os",
-        ]);
+        let os_dispatch = parse(&["leveler", "schedule", "dispatch", "--source", "os"]);
         assert!(matches!(
             os_dispatch.command,
             Some(Command::Schedule(ScheduleCommand::Dispatch {

@@ -8512,6 +8512,14 @@
           ],
           "format": "int64"
         },
+        "latest_turn_ordinal": {
+          "description": "Ordinal of the newest durable turn in this session. A client that submitted work and later correlates its terminal compares this value: the projected terminal always belongs to the newest turn, so an ordinal that moved on means a different turn now owns the terminal. Additive: an older runtime reports `None`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "messages": {
           "type": "array",
           "items": {
@@ -9170,6 +9178,17 @@
         },
         "id": {
           "$ref": "#/definitions/UserShellId"
+        },
+        "origin_command_id": {
+          "description": "The delivery identity of the command that produced this execution, when it arrived through a `CommandEnvelope`. It is the runtime's record of *which request* this execution answers, so a caller that owns the command id can find its own execution without matching command text. Absent for a raw `send` and for executions recorded before the field existed; never inferred from the command.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "output_tail": {
           "default": "",

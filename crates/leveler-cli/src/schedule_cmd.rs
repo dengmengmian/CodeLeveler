@@ -11,22 +11,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cli::{
+    RunMode, ScheduleCommand, ScheduleMisfire, ScheduleOverlap, ScheduleSessionPolicy,
+    ScheduleSource,
+};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use leveler_client_protocol::{ModelRef, PermissionProfile};
+use leveler_client_protocol::{ModelRef, PermissionProfile, SessionId};
+use leveler_execution::CommandRunner;
 use leveler_local_transport::LocalRuntimeService;
+use leveler_native::{ActionId, ActionStatus, NativeActionRequest, NativeActions, PermissionMode};
 use leveler_project::Layout;
 use leveler_runtime_host::{
     DetachedRuntimeLaunch, NonInteractiveHandoffUi, ensure_default_runtime,
 };
 use leveler_schedule::{
-    DispatchSummary, Dispatcher, MisfirePolicy, NewScheduleDefinition, RuntimeConnector,
-    ScheduleStore, ScheduleTrigger, WakeSource,
+    DispatchSummary, Dispatcher, LocalTime, MisfirePolicy, NativeActionClass, NativeActionExecutor,
+    NativeExecutionReport, NativeExecutionRequest, NativeRunStatus, NewScheduleDefinition,
+    OverlapPolicy, RuntimeConnector, ScheduleAction, ScheduleStore, ScheduleTrigger, SessionPolicy,
+    UnattendedRequest, UsageReader, UsageSnapshot, WakeSource, WeekdaySet, parse_cron,
     wakeup::{self, WAKE_INTERVAL, WakeupSpec, WakeupStatus},
 };
-
-use crate::cli::{RunMode, ScheduleCommand, ScheduleMisfire, ScheduleSource};
 
 const DISPATCH_LEASE: Duration = Duration::from_secs(120);
 
@@ -43,11 +49,23 @@ pub async fn cmd_schedule(
             name,
             workspace,
             command,
+            native_action,
+            native_input,
+            agent_goal,
             at,
             every,
             anchor,
+            daily,
+            weekly,
+            local_time,
+            cron,
+            timezone,
             mode,
             model,
+            session_policy,
+            overlap,
+            grant_unattended,
+            allow_external_side_effects,
             timeout,
             misfire,
             misfire_grace,
@@ -60,22 +78,62 @@ pub async fn cmd_schedule(
                     .map(Path::to_path_buf)
                     .context("this command has no workspace; pass --workspace")?,
             };
-            let trigger = match (at, every) {
-                (Some(at), None) => ScheduleTrigger::Once {
-                    at: parse_time(&at)?,
-                },
-                (None, Some(every)) => ScheduleTrigger::Every {
-                    anchor: anchor
-                        .as_deref()
-                        .map(parse_time)
-                        .transpose()?
-                        .unwrap_or_else(Utc::now),
-                    every: Duration::from_secs(every),
-                },
-                (None, None) => {
-                    anyhow::bail!("a schedule needs --at <RFC3339> or --every <SECONDS>")
+            let action = build_action(command, native_action, native_input, agent_goal)?;
+            let trigger = match (at, every, daily, weekly, cron) {
+                (Some(at), None, None, None, None) => {
+                    if timezone.is_some() {
+                        anyhow::bail!("--timezone only applies to --daily, --weekly or --cron");
+                    }
+                    ScheduleTrigger::Once {
+                        at: parse_time(&at)?,
+                    }
                 }
-                (Some(_), Some(_)) => unreachable!("clap conflicts --at with --every"),
+                (None, Some(every), None, None, None) => {
+                    if timezone.is_some() {
+                        anyhow::bail!("--timezone only applies to --daily, --weekly or --cron");
+                    }
+                    ScheduleTrigger::Every {
+                        anchor: anchor
+                            .as_deref()
+                            .map(parse_time)
+                            .transpose()?
+                            .unwrap_or_else(Utc::now),
+                        every: Duration::from_secs(every),
+                    }
+                }
+                (None, None, Some(time), None, None) => {
+                    let timezone = rule_timezone(timezone.as_deref())?;
+                    ScheduleTrigger::Daily {
+                        time: LocalTime::parse(&time).map_err(anyhow::Error::msg)?,
+                        timezone,
+                    }
+                }
+                (None, None, None, Some(days), None) => {
+                    let timezone = rule_timezone(timezone.as_deref())?;
+                    let time = local_time.as_deref().context(
+                        "--weekly needs --local-time <HH:MM> for the wall-clock run time",
+                    )?;
+                    ScheduleTrigger::Weekly {
+                        weekdays: WeekdaySet::parse(&days).map_err(anyhow::Error::msg)?,
+                        time: LocalTime::parse(time).map_err(anyhow::Error::msg)?,
+                        timezone,
+                    }
+                }
+                (None, None, None, None, Some(expression)) => {
+                    let timezone = rule_timezone(timezone.as_deref())?;
+                    parse_cron(&expression).map_err(anyhow::Error::msg)?;
+                    ScheduleTrigger::Cron {
+                        expression,
+                        timezone,
+                    }
+                }
+                (None, None, None, None, None) => {
+                    anyhow::bail!(
+                        "a schedule needs --at <RFC3339>, --every <SECONDS>, --daily <HH:MM>, \
+                         --weekly <DAYS> or --cron <EXPRESSION>"
+                    )
+                }
+                _ => unreachable!("clap makes the trigger flags mutually exclusive"),
             };
             let model = match model {
                 Some(reference) => Some(
@@ -88,13 +146,18 @@ pub async fn cmd_schedule(
                 .create_definition(NewScheduleDefinition {
                     name,
                     workspace,
-                    command,
+                    action,
                     trigger,
+                    session_policy: map_session_policy(session_policy),
+                    overlap: map_overlap_policy(overlap),
                     mode: schedule_mode(mode),
                     model,
                     timeout: Duration::from_secs(timeout),
                     misfire: misfire_policy(misfire),
                     misfire_grace: Duration::from_secs(misfire_grace),
+                    unattended: grant_unattended.then_some(UnattendedRequest {
+                        allow_external_side_effects,
+                    }),
                 })
                 .await?;
             let next = store
@@ -108,21 +171,28 @@ pub async fn cmd_schedule(
                     "id": definition.id,
                     "name": definition.name,
                     "workspace": definition.workspace,
-                    "command": definition.command,
+                    "action": action_json(&definition.action),
                     "trigger": trigger_json(&definition.trigger),
+                    "session_policy": definition.session_policy.as_str(),
+                    "overlap": definition.overlap.as_str(),
                     "mode": definition.mode.as_str(),
                     "model": definition.model.as_ref().map(|model| model.to_string()),
                     "timeout_secs": definition.timeout.as_secs(),
                     "misfire": definition.misfire.as_str(),
                     "misfire_grace_secs": definition.misfire_grace.as_secs(),
+                    "unattended_grant": grant_json(&definition),
                     "next_occurrence": next,
                 }))?;
             } else {
                 println!("added schedule {}", definition.id);
-                println!("  name:      {}", definition.name);
-                println!("  workspace: {}", definition.workspace.display());
-                println!("  trigger:   {}", trigger_text(&definition.trigger));
-                println!("  next:      {}", next.unwrap_or_else(|| "none".into()));
+                println!("  name:       {}", definition.name);
+                println!("  workspace:  {}", definition.workspace.display());
+                println!("  action:     {}", action_text(&definition.action));
+                println!("  trigger:    {}", trigger_text(&definition.trigger));
+                println!("  session:    {}", definition.session_policy.as_str());
+                println!("  overlap:    {}", definition.overlap.as_str());
+                println!("  grant:      {}", grant_text(&definition));
+                println!("  next:       {}", next.unwrap_or_else(|| "none".into()));
             }
         }
         ScheduleCommand::List { json } => {
@@ -135,12 +205,15 @@ pub async fn cmd_schedule(
                             "id": definition.id,
                             "name": definition.name,
                             "workspace": definition.workspace,
-                            "command": definition.command,
+                            "action": action_json(&definition.action),
                             "trigger": trigger_json(&definition.trigger),
+                            "session_policy": definition.session_policy.as_str(),
+                            "overlap": definition.overlap.as_str(),
                             "enabled": definition.enabled,
                             "misfire": definition.misfire.as_str(),
                             "misfire_grace_secs": definition.misfire_grace.as_secs(),
                             "session_id": definition.session_id,
+                            "unattended_grant": grant_json(definition),
                             "created_at": definition.created_at,
                         })
                     })
@@ -151,14 +224,15 @@ pub async fn cmd_schedule(
             } else {
                 for definition in definitions {
                     println!(
-                        "{}  {}  {}  {}  session={}",
+                        "{}  {}  {}  {}  {}  session={}",
                         definition.id,
                         definition.name,
+                        action_kind_text(&definition.action),
                         trigger_text(&definition.trigger),
                         if definition.enabled {
                             "enabled"
                         } else {
-                            "disabled"
+                            "paused"
                         },
                         definition
                             .session_id
@@ -166,7 +240,92 @@ pub async fn cmd_schedule(
                             .map(|session| session.as_str())
                             .unwrap_or("-"),
                     );
-                    println!("  workspace: {}", definition.workspace.display());
+                    println!(
+                        "  workspace: {}  overlap: {}  grant: {}",
+                        definition.workspace.display(),
+                        definition.overlap.as_str(),
+                        grant_text(&definition),
+                    );
+                }
+            }
+        }
+        ScheduleCommand::Show { id, json } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            let Some(definition) = store.definition(&id).await? else {
+                anyhow::bail!("schedule {id} not found");
+            };
+            let next = store
+                .occurrences(&id, 1)
+                .await?
+                .into_iter()
+                .next()
+                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            let last = store.runs(Some(&id), 5).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "id": definition.id,
+                    "name": definition.name,
+                    "workspace": definition.workspace,
+                    "action": action_json(&definition.action),
+                    "trigger": trigger_json(&definition.trigger),
+                    "timezone": trigger_json(&definition.trigger).get("timezone").cloned(),
+                    "session_policy": definition.session_policy.as_str(),
+                    "overlap": definition.overlap.as_str(),
+                    "mode": definition.mode.as_str(),
+                    "model": definition.model.as_ref().map(|model| model.to_string()),
+                    "timeout_secs": definition.timeout.as_secs(),
+                    "misfire": definition.misfire.as_str(),
+                    "misfire_grace_secs": definition.misfire_grace.as_secs(),
+                    "enabled": definition.enabled,
+                    "session_id": definition.session_id,
+                    "unattended_grant": grant_json(&definition),
+                    "next_occurrence": next,
+                    "recent_runs": last,
+                }))?;
+            } else {
+                println!("{}  {}", definition.id, definition.name);
+                println!("  workspace:  {}", definition.workspace.display());
+                println!("  action:     {}", action_text(&definition.action));
+                println!("  trigger:    {}", trigger_text(&definition.trigger));
+                println!("  next:       {}", next.unwrap_or_else(|| "none".into()));
+                println!(
+                    "  state:      {}",
+                    if definition.enabled {
+                        "enabled"
+                    } else {
+                        "paused"
+                    }
+                );
+                println!("  permission: {}", definition.mode.as_str());
+                println!(
+                    "  model:      {}",
+                    definition
+                        .model
+                        .as_ref()
+                        .map(|model| model.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
+                println!("  session:    {}", definition.session_policy.as_str());
+                println!(
+                    "  bound to:   {}",
+                    definition
+                        .session_id
+                        .as_ref()
+                        .map(|session| session.as_str())
+                        .unwrap_or("-")
+                );
+                println!("  overlap:    {}", definition.overlap.as_str());
+                println!(
+                    "  misfire:    {} (grace {}s)",
+                    definition.misfire.as_str(),
+                    definition.misfire_grace.as_secs()
+                );
+                println!("  grant:      {}", grant_text(&definition));
+                if !last.is_empty() {
+                    println!("  recent runs:");
+                    for run in &last {
+                        println!("    {}", run_line(run));
+                    }
                 }
             }
         }
@@ -183,18 +342,22 @@ pub async fn cmd_schedule(
                 println!("no runs");
             } else {
                 for run in runs {
-                    println!(
-                        "{}  {}  {}  exit={}  started={}",
-                        run.id,
-                        run.definition_id,
-                        run.state.as_str(),
-                        run.exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "-".into()),
-                        run.started_at.to_rfc3339(),
-                    );
+                    println!("{}", run_line(&run));
                     if let Some(error) = run.error {
-                        println!("  error: {error}");
+                        println!("  reason: {error}");
+                    }
+                    if run.usage_requests.is_some() {
+                        println!(
+                            "  usage: requests={} input={} cached={} output={} reasoning={} cost_usd={}",
+                            run.usage_requests.unwrap_or(0),
+                            run.input_tokens.unwrap_or(0),
+                            run.cached_input_tokens.unwrap_or(0),
+                            run.output_tokens.unwrap_or(0),
+                            run.reasoning_tokens.unwrap_or(0),
+                            run.cost_usd_micros
+                                .map(|micros| format!("{:.4}", micros as f64 / 1_000_000.0))
+                                .unwrap_or_else(|| "-".into()),
+                        );
                     }
                 }
             }
@@ -205,6 +368,114 @@ pub async fn cmd_schedule(
                 println!("removed schedule {id}");
             } else {
                 anyhow::bail!("schedule {id} not found");
+            }
+        }
+        ScheduleCommand::Pause { id } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            if store.set_enabled(&id, false).await? {
+                println!(
+                    "paused schedule {id}; future occurrences will not be created. An already \
+                     started run keeps running"
+                );
+            } else {
+                anyhow::bail!("schedule {id} not found");
+            }
+        }
+        ScheduleCommand::Resume { id } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            if store.set_enabled(&id, true).await? {
+                println!("resumed schedule {id}");
+            } else {
+                anyhow::bail!("schedule {id} not found");
+            }
+        }
+        ScheduleCommand::RunNow { id, json } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            let Some(definition) = store.definition(&id).await? else {
+                anyhow::bail!("schedule {id} not found");
+            };
+            let occurrence = store.create_run_now(&definition).await?;
+            // Execute this occurrence explicitly. A generic pass could be
+            // consumed by an unrelated overdue slot, leaving the requested run
+            // pending while the command appears to have succeeded.
+            let state = dispatcher(config_dir, store.clone())
+                .dispatch_run_now(&occurrence.id)
+                .await?;
+            let run = store
+                .runs(Some(&id), 20)
+                .await?
+                .into_iter()
+                .find(|run| run.occurrence_id == occurrence.id);
+            if json {
+                print_json(&serde_json::json!({
+                    "occurrence": occurrence.id,
+                    "scheduled_for": occurrence.scheduled_for,
+                    "state": state,
+                    "run": run,
+                }))?;
+            } else {
+                match &run {
+                    Some(run) => println!("{}", run_line(run)),
+                    None => println!(
+                        "created a run-now slot {} but it was not claimable (an earlier run \
+                         still owns this schedule); a dispatcher will pick it up on its next \
+                         wake",
+                        occurrence.id
+                    ),
+                }
+                if let Some(error) = run.as_ref().and_then(|run| run.error.as_deref()) {
+                    println!("  reason: {error}");
+                }
+            }
+        }
+        ScheduleCommand::Cancel { id, json } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            let runs = store.request_cancel_definition(&id).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "definition": id,
+                    "cancel_requested_runs": runs.iter().map(|run| run.as_str()).collect::<Vec<_>>(),
+                }))?;
+            } else if runs.is_empty() {
+                println!("schedule {id} has no active run to cancel");
+            } else {
+                println!(
+                    "requested cancellation of {} active run(s) of schedule {id}: {}",
+                    runs.len(),
+                    runs.iter()
+                        .map(|run| run.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                println!(
+                    "the dispatcher that owns each run issues the runtime cancellation and \
+                     records the terminal fact; nothing is reported as cancelled until observed"
+                );
+            }
+        }
+        ScheduleCommand::RevokeGrant { id } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            if store.revoke_unattended(&id).await? {
+                println!(
+                    "revoked the unattended grant for schedule {id}; later native and agent \
+                     runs are refused before they start"
+                );
+            } else {
+                println!("schedule {id} has no unattended grant to revoke");
+            }
+        }
+        ScheduleCommand::Wakeups { limit, json } => {
+            let wakes = store.wakes(limit).await?;
+            if json {
+                print_json(&serde_json::json!(
+                    wakes.iter().map(wake_json).collect::<Vec<_>>()
+                ))?;
+            } else if wakes.is_empty() {
+                println!("no dispatch passes recorded");
+            } else {
+                for wake in &wakes {
+                    println!("{}", wake_line(wake));
+                }
             }
         }
         ScheduleCommand::Dispatch { max, source, json } => {
@@ -355,13 +626,157 @@ async fn serve(
 
 fn dispatcher(config_dir: Option<PathBuf>, store: ScheduleStore) -> Dispatcher {
     let connector = DaemonConnector {
-        config_dir,
+        config_dir: config_dir.clone(),
         launch: DetachedRuntimeLaunch {
             executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("leveler")),
             ready_prefix: "leveler-schedule-ready".into(),
         },
     };
-    Dispatcher::new(store, Arc::new(connector)).with_lease(DISPATCH_LEASE)
+    Dispatcher::new(store, Arc::new(connector))
+        .with_native_executor(Arc::new(NativeExecutor::new()))
+        .with_usage_reader(Arc::new(SessionUsage { config_dir }))
+        .with_lease(DISPATCH_LEASE)
+}
+
+/// The scheduled native path is the same `NativeActions::run` the interactive
+/// tool and `leveler native` use. Only the admission mode differs: an
+/// unattended run may never prompt, so a missing permission blocks it instead
+/// of waiting for a person who is not there.
+struct NativeExecutor {
+    runner: CommandRunner,
+    native: NativeActions,
+}
+
+impl NativeExecutor {
+    fn new() -> Self {
+        Self {
+            runner: CommandRunner::new(),
+            native: NativeActions::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl NativeActionExecutor for NativeExecutor {
+    fn classify(&self, action: &str) -> Result<NativeActionClass, String> {
+        let action = ActionId::parse(action)?;
+        if !action.unattended_after_preconditions() {
+            return Err(format!(
+                "{} needs a person to complete it in the application; a scheduled run \
+                 cannot supply that person",
+                action.as_str()
+            ));
+        }
+        Ok(NativeActionClass {
+            external_side_effects: action.external_side_effects(),
+        })
+    }
+
+    async fn execute(
+        &self,
+        request: NativeExecutionRequest,
+    ) -> Result<NativeExecutionReport, String> {
+        let action = ActionId::parse(&request.action)?;
+        let run = match self
+            .native
+            .run(
+                &self.runner,
+                &NativeActionRequest {
+                    action,
+                    input: request.input,
+                },
+                PermissionMode::Unattended,
+                Some(request.timeout),
+                256 * 1024,
+                request.cancellation,
+            )
+            .await
+        {
+            Ok(run) => run,
+            // `run` returns an error only while validating or preparing,
+            // before any process starts. Reporting `Unknown` here would claim
+            // an effect that provably does not exist.
+            Err(error) => {
+                let status = match &error {
+                    leveler_native::NativeError::InvalidInput(_) => NativeRunStatus::InvalidInput,
+                    leveler_native::NativeError::Unsupported(..) => NativeRunStatus::Unsupported,
+                    leveler_native::NativeError::Prepare { .. } => NativeRunStatus::NotStarted,
+                };
+                return Ok(NativeExecutionReport {
+                    status,
+                    provider: None,
+                    execution_id: None,
+                    exit_code: None,
+                    detail: error.to_string(),
+                    capability_state: None,
+                    permission_state: None,
+                    executed: false,
+                });
+            }
+        };
+        let executed = !run.outcome.execution_id.is_empty();
+        Ok(NativeExecutionReport {
+            status: match run.outcome.status {
+                ActionStatus::Completed => NativeRunStatus::Completed,
+                ActionStatus::Submitted => NativeRunStatus::Submitted,
+                ActionStatus::Unknown => NativeRunStatus::Unknown,
+                ActionStatus::RequiresPermission => NativeRunStatus::RequiresPermission,
+                ActionStatus::RequiresConfiguration => NativeRunStatus::RequiresConfiguration,
+                ActionStatus::Failed => NativeRunStatus::Failed,
+                ActionStatus::Unsupported => NativeRunStatus::Unsupported,
+            },
+            provider: Some(run.provider.as_str().to_string()),
+            execution_id: executed.then(|| run.outcome.execution_id.clone()),
+            exit_code: run.outcome.exit_code,
+            detail: run.outcome.detail,
+            capability_state: run
+                .capability
+                .as_ref()
+                .map(|capability| capability.state.as_str().to_string()),
+            permission_state: run
+                .capability
+                .as_ref()
+                .map(|capability| capability.permission.as_str().to_string()),
+            executed,
+        })
+    }
+}
+
+/// Model usage from the authoritative request ledger, never from the model's
+/// own text. The dispatcher subtracts this baseline from the final totals so a
+/// continue-session run is not credited with earlier turns.
+struct SessionUsage {
+    config_dir: Option<PathBuf>,
+}
+
+#[async_trait]
+impl UsageReader for SessionUsage {
+    async fn usage(&self, workspace: &Path, session: &SessionId) -> Result<UsageSnapshot, String> {
+        let layout = Layout::resolve(workspace.to_path_buf(), self.config_dir.clone());
+        let path = layout.database_path();
+        // A workspace with no database has no recorded model requests. That is
+        // zero usage, not an unobserved baseline.
+        if !path.is_file() {
+            return Ok(UsageSnapshot::default());
+        }
+        let db = leveler_storage::Database::connect(&path)
+            .await
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        let totals = leveler_storage::ModelRequestRepository::new(&db)
+            .reconcile_session(session)
+            .await
+            .map_err(|error| format!("could not read model usage: {error}"))?
+            .total;
+        Ok(UsageSnapshot {
+            requests: totals.requests,
+            input_tokens: totals.input_tokens,
+            cached_input_tokens: totals.cached_input_tokens,
+            output_tokens: totals.output_tokens,
+            reasoning_tokens: totals.reasoning_tokens,
+            cost_usd_micros: totals.cost_usd_micros,
+            rows_without_cost: totals.rows_without_cost,
+        })
+    }
 }
 
 struct DaemonConnector {
@@ -397,13 +812,150 @@ fn schedule_mode(mode: RunMode) -> PermissionProfile {
     }
 }
 
-fn trigger_text(trigger: &ScheduleTrigger) -> String {
-    match trigger {
-        ScheduleTrigger::Once { at } => format!("once at {}", at.to_rfc3339()),
-        ScheduleTrigger::Every { anchor, every } => {
-            format!("every {}s from {}", every.as_secs(), anchor.to_rfc3339())
-        }
+fn map_session_policy(policy: ScheduleSessionPolicy) -> SessionPolicy {
+    match policy {
+        ScheduleSessionPolicy::Continue => SessionPolicy::Continue,
+        ScheduleSessionPolicy::Fresh => SessionPolicy::Fresh,
     }
+}
+
+fn map_overlap_policy(policy: ScheduleOverlap) -> OverlapPolicy {
+    match policy {
+        ScheduleOverlap::SkipIfRunning => OverlapPolicy::SkipIfRunning,
+        ScheduleOverlap::QueueOne => OverlapPolicy::QueueOne,
+        ScheduleOverlap::AllowConcurrent => OverlapPolicy::AllowConcurrent,
+    }
+}
+
+/// One and only one action kind; clap enforces it, this also gives the store
+/// typed input instead of a command string reinterpreted as another kind.
+fn build_action(
+    command: Option<String>,
+    native_action: Option<String>,
+    native_input: Option<String>,
+    agent_goal: Option<String>,
+) -> anyhow::Result<ScheduleAction> {
+    match (command, native_action, agent_goal) {
+        (Some(command), None, None) => Ok(ScheduleAction::Shell { command }),
+        (None, Some(action), None) => {
+            ActionId::parse(&action).map_err(anyhow::Error::msg)?;
+            let input = match native_input {
+                Some(raw) => serde_json::from_str(&raw)
+                    .with_context(|| format!("--native-input is not valid JSON: {raw}"))?,
+                None => serde_json::json!({}),
+            };
+            if !input.is_object() {
+                anyhow::bail!("--native-input must be a JSON object");
+            }
+            Ok(ScheduleAction::Native { action, input })
+        }
+        (None, None, Some(goal)) => Ok(ScheduleAction::Agent { goal }),
+        _ => anyhow::bail!("pass exactly one of --command, --native-action or --agent-goal"),
+    }
+}
+
+fn action_kind_text(action: &ScheduleAction) -> &'static str {
+    action.kind().as_str()
+}
+
+fn action_text(action: &ScheduleAction) -> String {
+    match action {
+        ScheduleAction::Shell { command } => format!("shell: {command}"),
+        ScheduleAction::Native { action, input } => {
+            format!("native: {action} (input {input})")
+        }
+        ScheduleAction::Agent { goal } => format!("agent: {goal}"),
+    }
+}
+
+fn action_json(action: &ScheduleAction) -> serde_json::Value {
+    match action {
+        ScheduleAction::Shell { command } => serde_json::json!({
+            "kind": "shell",
+            "command": command,
+        }),
+        ScheduleAction::Native { action, input } => serde_json::json!({
+            "kind": "native",
+            "action": action,
+            "input": input,
+        }),
+        ScheduleAction::Agent { goal } => serde_json::json!({
+            "kind": "agent",
+            "goal": goal,
+        }),
+    }
+}
+
+fn grant_json(definition: &leveler_schedule::ScheduleDefinition) -> serde_json::Value {
+    match &definition.unattended {
+        Some(grant) => serde_json::json!({
+            "version": grant.version,
+            "definition_id": grant.definition_id,
+            "workspace": grant.workspace,
+            "permission_mode": grant.permission_mode,
+            "actions": grant.actions.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
+            "external_side_effects": grant.external_side_effects,
+            "granted_at": grant.granted_at,
+        }),
+        None if definition.mode == PermissionProfile::FullAccess => serde_json::json!({
+            "full_access": true,
+            "detail": "Full Access is the explicit no-prompt profile; no separate grant exists",
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn grant_text(definition: &leveler_schedule::ScheduleDefinition) -> String {
+    match &definition.unattended {
+        Some(grant) => format!(
+            "unattended {} ({}; external side effects: {})",
+            grant
+                .actions
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            grant.permission_mode,
+            if grant.external_side_effects {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        None if definition.mode == PermissionProfile::FullAccess => {
+            "Full Access (no separate grant)".into()
+        }
+        None => "none — native/agent runs are refused before starting".into(),
+    }
+}
+
+fn run_line(run: &leveler_schedule::ScheduleRun) -> String {
+    let identity = match (&run.session_id, run.task_sequence) {
+        (Some(session), Some(sequence)) => format!(" session={session} task_seq={sequence}"),
+        (Some(session), None) => format!(" session={session}"),
+        (None, Some(sequence)) => format!(" task_seq={sequence}"),
+        (None, None) => String::new(),
+    };
+    format!(
+        "{}  {}  {}  slot={}  exit={}{}{}",
+        run.id,
+        run.definition_id,
+        run.state.as_str(),
+        run.scheduled_for.to_rfc3339(),
+        run.exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "-".into()),
+        identity,
+        match (&run.task_outcome, &run.native_outcome) {
+            (Some(outcome), _) => format!("  task={outcome}"),
+            (None, Some(outcome)) => format!("  native={outcome}"),
+            (None, None) => String::new(),
+        },
+    )
+}
+
+fn trigger_text(trigger: &ScheduleTrigger) -> String {
+    trigger.describe()
 }
 
 fn trigger_json(trigger: &ScheduleTrigger) -> serde_json::Value {
@@ -417,28 +969,84 @@ fn trigger_json(trigger: &ScheduleTrigger) -> serde_json::Value {
             "anchor": anchor,
             "every_secs": every.as_secs(),
         }),
+        ScheduleTrigger::Daily { time, timezone } => serde_json::json!({
+            "kind": "daily",
+            "time": time.to_string(),
+            "timezone": timezone.to_string(),
+        }),
+        ScheduleTrigger::Weekly {
+            weekdays,
+            time,
+            timezone,
+        } => serde_json::json!({
+            "kind": "weekly",
+            "weekdays": weekdays.to_string(),
+            "time": time.to_string(),
+            "timezone": timezone.to_string(),
+        }),
+        ScheduleTrigger::Cron {
+            expression,
+            timezone,
+        } => serde_json::json!({
+            "kind": "cron",
+            "expression": expression,
+            "timezone": timezone.to_string(),
+        }),
     }
+}
+
+/// Resolve the wall-clock timezone for calendar rules. An explicit `--timezone`
+/// wins; otherwise use the host's current IANA zone, never a UTC assumption.
+fn rule_timezone(explicit: Option<&str>) -> anyhow::Result<chrono_tz::Tz> {
+    match explicit {
+        Some(raw) => leveler_schedule::parse_timezone(raw).map_err(anyhow::Error::msg),
+        None => {
+            let zone = iana_time_zone::get_timezone().map_err(|error| {
+                anyhow::anyhow!(
+                    "could not determine the system timezone ({error}); pass --timezone"
+                )
+            })?;
+            leveler_schedule::parse_timezone(&zone).map_err(anyhow::Error::msg)
+        }
+    }
+}
+
+fn summary_json(summary: &DispatchSummary) -> serde_json::Value {
+    serde_json::json!({
+        "recovered": summary.recovered,
+        "skipped": summary.skipped,
+        "missed": summary.missed,
+        "claimed": summary.claimed,
+        "succeeded": summary.succeeded,
+        "submitted": summary.submitted,
+        "failed": summary.failed,
+        "unknown": summary.unknown,
+        "handed_off": summary.handed_off,
+        "cancelled": summary.cancelled,
+        "waiting_approval": summary.waiting_approval,
+        "blocked": summary.blocked,
+    })
 }
 
 fn print_summary(summary: &DispatchSummary, json: bool) -> anyhow::Result<()> {
     if json {
-        return print_json(&serde_json::json!({
-            "recovered": summary.recovered,
-            "missed": summary.missed,
-            "claimed": summary.claimed,
-            "succeeded": summary.succeeded,
-            "failed": summary.failed,
-            "unknown": summary.unknown,
-        }));
+        return print_json(&summary_json(summary));
     }
     println!(
-        "recovered={} missed={} claimed={} succeeded={} failed={} unknown={}",
+        "recovered={} skipped={} missed={} claimed={} succeeded={} submitted={} failed={} \
+         unknown={} handed_off={} cancelled={} waiting_approval={} blocked={}",
         summary.recovered,
+        summary.skipped,
         summary.missed,
         summary.claimed,
         summary.succeeded,
+        summary.submitted,
         summary.failed,
-        summary.unknown
+        summary.unknown,
+        summary.handed_off,
+        summary.cancelled,
+        summary.waiting_approval,
+        summary.blocked,
     );
     Ok(())
 }
@@ -539,13 +1147,10 @@ fn wakeup_executable() -> anyhow::Result<PathBuf> {
 fn wakeup_environment(home: &Path) -> BTreeMap<String, String> {
     let snapshot = leveler_core::environment();
     let mut environment = BTreeMap::new();
-    for key in [
-        "PATH",
-        "HOME",
-        "TMPDIR",
-        "LEVELER_DAEMON_IDLE_TIMEOUT_SECS",
-    ] {
-        if let Some(value) = snapshot.var_os(key).and_then(|value| value.to_str().map(str::to_owned))
+    for key in ["PATH", "HOME", "TMPDIR", "LEVELER_DAEMON_IDLE_TIMEOUT_SECS"] {
+        if let Some(value) = snapshot
+            .var_os(key)
+            .and_then(|value| value.to_str().map(str::to_owned))
         {
             environment.insert(key.to_owned(), value);
         }
@@ -630,18 +1235,26 @@ fn wake_json(wake: &leveler_schedule::WakeRecord) -> serde_json::Value {
         "started_at": wake.started_at,
         "finished_at": wake.finished_at,
         "recovered": wake.recovered,
+        "skipped": wake.skipped,
         "missed": wake.missed,
         "claimed": wake.claimed,
         "succeeded": wake.succeeded,
+        "submitted": wake.submitted,
         "failed": wake.failed,
         "unknown": wake.unknown,
+        "handed_off": wake.handed_off,
+        "cancelled": wake.cancelled,
+        "waiting_approval": wake.waiting_approval,
+        "blocked": wake.blocked,
         "error": wake.error,
     })
 }
 
 fn wake_line(wake: &leveler_schedule::WakeRecord) -> String {
     format!(
-        "#{} {} started={} finished={} recovered={} missed={} claimed={} succeeded={} failed={} unknown={}{}",
+        "#{} {} started={} finished={} recovered={} skipped={} missed={} claimed={} \
+         succeeded={} submitted={} failed={} unknown={} handed_off={} cancelled={} \
+         waiting_approval={} blocked={}{}",
         wake.id,
         wake.source.as_str(),
         wake.started_at.to_rfc3339(),
@@ -649,11 +1262,17 @@ fn wake_line(wake: &leveler_schedule::WakeRecord) -> String {
             .map(|finished| finished.to_rfc3339())
             .unwrap_or_else(|| "unfinished".into()),
         wake.recovered,
+        wake.skipped,
         wake.missed,
         wake.claimed,
         wake.succeeded,
+        wake.submitted,
         wake.failed,
         wake.unknown,
+        wake.handed_off,
+        wake.cancelled,
+        wake.waiting_approval,
+        wake.blocked,
         wake.error
             .as_deref()
             .map(|error| format!(" error={error}"))
@@ -763,8 +1382,7 @@ fn doctor_report(
             push(
                 "registration",
                 CheckSeverity::Fail,
-                "the OS record exists but is not loaded; run `leveler schedule enable`"
-                    .into(),
+                "the OS record exists but is not loaded; run `leveler schedule enable`".into(),
             );
         } else {
             push(
@@ -805,11 +1423,7 @@ fn doctor_report(
                     );
                 }
                 if registration.arguments == spec.arguments {
-                    push(
-                        "arguments",
-                        CheckSeverity::Ok,
-                        spec.arguments.join(" "),
-                    );
+                    push("arguments", CheckSeverity::Ok, spec.arguments.join(" "));
                 } else {
                     push(
                         "arguments",

@@ -66,6 +66,7 @@ impl ForeignExecutionRuntime {
             available_models: Vec::new(),
             vision: false,
             last_sequence: None,
+            latest_turn_ordinal: None,
             active_tools: Vec::new(),
             interrupted_tool_calls: Vec::new(),
             active_background_tasks: Vec::new(),
@@ -165,15 +166,20 @@ async fn a_run_never_adopts_another_clients_identical_command() {
         .create_definition(NewScheduleDefinition {
             name: "identity".into(),
             workspace: PathBuf::from("/tmp"),
-            command: IDENTICAL.into(),
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: IDENTICAL.into(),
+            },
             trigger: ScheduleTrigger::Once {
                 at: leveler_core::now() - chrono::Duration::seconds(1),
             },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             model: None,
             timeout: Duration::from_secs(1),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         })
         .await
         .unwrap();
@@ -435,15 +441,20 @@ async fn identical_text_from_two_clients_and_a_schedule_keeps_three_identities()
         .create_definition(NewScheduleDefinition {
             name: "same text".into(),
             workspace: workspace.clone(),
-            command: IDENTICAL.into(),
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: IDENTICAL.into(),
+            },
             trigger: ScheduleTrigger::Once {
                 at: leveler_core::now() - chrono::Duration::seconds(1),
             },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             model: Some(ModelRef::new("mock", "m")),
             timeout: Duration::from_secs(10),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         })
         .await
         .unwrap();

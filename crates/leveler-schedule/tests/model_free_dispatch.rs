@@ -106,16 +106,21 @@ async fn a_scheduled_shell_runs_and_calls_no_model() {
         .create_definition(NewScheduleDefinition {
             name: "model-free".into(),
             workspace: workspace.clone(),
-            command: COMMAND.into(),
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: COMMAND.into(),
+            },
             trigger: ScheduleTrigger::Once {
                 at: leveler_core::now() - chrono::Duration::seconds(1),
             },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
             // The definition itself carries no model: the run is deterministic.
             model: None,
             timeout: Duration::from_secs(15),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
+            unattended: None,
         })
         .await
         .unwrap();
