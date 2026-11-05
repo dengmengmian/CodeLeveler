@@ -865,6 +865,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         // No TUI action issues this query. A response on the shared stream is
         // therefore necessarily owned by another client.
         RuntimeEvent::UnfinishedGoalsLoaded { .. } => {}
+        // The schedule page's answer. The query id is the ownership check: a
+        // response for a request this client did not send matches none of the
+        // page's slots and is ignored, exactly like the agents queries above.
+        RuntimeEvent::ScheduleManaged {
+            query_id, response, ..
+        } => {
+            crate::schedules::apply_response(state, &query_id, *response);
+        }
         RuntimeEvent::AgentsLoaded {
             query_id,
             agents,

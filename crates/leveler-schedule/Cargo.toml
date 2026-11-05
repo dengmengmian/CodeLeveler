@@ -24,6 +24,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 chrono-tz = "0.10"
 croner = "3"
+iana-time-zone = "0.1"
 
 [dev-dependencies]
 leveler-app = { workspace = true }

@@ -49,6 +49,10 @@ pub enum Screen {
     /// `/clean`: reclaim CodeLeveler-owned local storage. A page over the host's
     /// cleanup plan; scan and cleanup run off-thread.
     Clean,
+    /// `/schedules`: scheduled automation. A view over the runtime's schedule
+    /// management API — list, detail, create/edit, pause, run now, history,
+    /// grant and OS wakeup. The runtime owns every definition and run.
+    Schedules,
     /// Complete output of a finished local command. File-backed and windowed:
     /// the page paints only the visible rows, so a 50 MiB result costs the
     /// same per frame as a 1 KiB one.
@@ -367,6 +371,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // Scheduled automation. Management is the runtime's; the page never
+    // schedules anything itself.
+    slash(
+        "/schedules",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Self-update. `IdleOnly`: replacing the running binary under an active
     // task would strand it, so the busy gate refuses first.
     slash(
@@ -532,6 +545,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/help" => s.help,
         "/doctor" => s.doctor,
         "/clean" => s.clean,
+        "/schedules" => s.schedules,
         "/update" | "/upgrade" => s.update,
         "/reload" => s.reload,
         _ => "",
@@ -848,6 +862,7 @@ mod surface_tests {
                 "/help",
                 "/doctor",
                 "/clean",
+                "/schedules",
                 "/update",
                 "/reload",
             ]
@@ -1356,6 +1371,7 @@ mod reachability_tests {
             Screen::Doctor => Some("`/doctor` — toggle_screen"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
+            Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
             Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
             Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
         }
@@ -1378,6 +1394,7 @@ mod reachability_tests {
             Screen::Doctor,
             Screen::Trace,
             Screen::Context,
+            Screen::Schedules,
             Screen::Output,
         ];
         for screen in all {

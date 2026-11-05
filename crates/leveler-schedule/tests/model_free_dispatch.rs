@@ -25,6 +25,7 @@ use leveler_local_transport::{
 use leveler_project::Layout;
 use leveler_schedule::{
     Dispatcher, NewScheduleDefinition, RunState, RuntimeConnector, ScheduleStore, ScheduleTrigger,
+    UnattendedRequest,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -120,7 +121,9 @@ async fn a_scheduled_shell_runs_and_calls_no_model() {
             timeout: Duration::from_secs(15),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
-            unattended: None,
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
         })
         .await
         .unwrap();

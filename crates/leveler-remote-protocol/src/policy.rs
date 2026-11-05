@@ -315,6 +315,15 @@ impl RemotePolicy {
                 reason: "agent definitions are local-only",
             },
 
+            // Scheduled automation declares unattended execution on the host:
+            // definitions carry workspace paths, shell commands and standing
+            // grants that outlive the session. Like agent definitions, it is
+            // managed by the local TUI, Web or Desktop surfaces.
+            ClientCommand::ManageSchedule { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "scheduled automation is managed locally",
+            },
+
             // A replayed history carries every tool call's arguments and
             // output — repository content, same class as the observatory. A
             // remote client reads the conversation from the snapshot.

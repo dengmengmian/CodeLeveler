@@ -4,6 +4,7 @@
 import { PanelLeftClose, PanelLeftOpen, PanelRight } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { MoreMenu } from './components/Appearance';
+import { AutomationView } from './components/Automation';
 import { Composer } from './components/Composer';
 import { DiffView } from './components/DiffView';
 import { ExecutionView } from './components/ExecutionView';
@@ -189,8 +190,19 @@ function Shell() {
               >
                 Execution
               </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'automation'}
+                className={`ws-tab${view === 'automation' ? ' on' : ''}`}
+                onClick={() => setView('automation')}
+              >
+                Automation
+              </button>
             </div>
-            {view === 'execution' ? (
+            {view === 'automation' ? (
+              <AutomationView />
+            ) : view === 'execution' ? (
               <ExecutionView />
             ) : view === 'diff' && !state.draft ? (
               <DiffView />

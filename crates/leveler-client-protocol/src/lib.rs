@@ -53,6 +53,8 @@ mod observability;
 mod origin;
 mod progress;
 mod retirement;
+/// Structured scheduled-automation management shared by every client.
+pub mod schedule;
 /// WebSocket framing for a session: the shapes every session client speaks.
 pub mod session_wire;
 mod skills;

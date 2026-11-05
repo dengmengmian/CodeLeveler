@@ -1,5 +1,6 @@
 //! SQLite persistence for the global schedule domain.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,10 +10,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Row, Sqlite};
 
 use crate::{
-    DispatchSummary, MisfirePolicy, NewScheduleDefinition, Occurrence, OccurrenceId,
-    OccurrenceState, OverlapPolicy, RunId, RunState, ScheduleAction, ScheduleDefinition,
-    ScheduleError, ScheduleId, ScheduleRun, ScheduleTrigger, SessionPolicy, UnattendedGrant,
-    UsageSnapshot, WakeRecord, WakeSource, parse_timestamp, timestamp,
+    DefinitionUpdate, DispatchSummary, MisfirePolicy, NewScheduleDefinition, Occurrence,
+    OccurrenceId, OccurrenceState, OverlapPolicy, RunId, RunState, ScheduleAction,
+    ScheduleDefinition, ScheduleError, ScheduleId, ScheduleRun, ScheduleTrigger, SessionPolicy,
+    UnattendedGrant, UnattendedRequest, UsageSnapshot, WakeRecord, WakeSource, parse_timestamp,
+    timestamp,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -24,7 +26,7 @@ const DEFINITION_COLUMNS: &str = "id, name, workspace, action, command, agent_go
      native_action, native_input, trigger_kind, once_at, anchor_at, every_secs, timezone, \
      local_time, weekdays, cron_expr, session_policy, overlap_policy, permission_mode, model, \
      timeout_secs, misfire_policy, misfire_grace_secs, unattended_grant, session_id, enabled, \
-     created_at";
+     created_at, updated_at";
 
 /// The same for runs: the occurrence's `scheduled_for` is joined because the
 /// slot, not the run, owns it.
@@ -192,11 +194,39 @@ impl ScheduleStore {
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5))
             .foreign_keys(true);
+        // Several clients (the TUI, a CLI command, a dispatcher pass) may open
+        // a brand-new store at the same time. The WAL switch and sqlx's
+        // migration ledger both take short write locks, and the loser of that
+        // race observes the winner's state (`database is locked`, `table ...
+        // already exists`, `duplicate column name`). Retrying the whole open is
+        // idempotent: a converged store skips its applied ledger rows, while a
+        // genuinely invalid migration fails identically and is returned.
+        let mut last_error = None;
+        for attempt in 0..20 {
+            match Self::open_once(&options).await {
+                Ok(store) => return Ok(store),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < 20 {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("the open loop runs at least once"))
+    }
+
+    async fn open_once(options: &SqliteConnectOptions) -> Result<Self, ScheduleError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
-        MIGRATOR.run(&pool).await?;
+        if let Err(error) = MIGRATOR.run(&pool).await {
+            // Release the handle before the caller retries so this attempt
+            // cannot keep the database lock it just failed to acquire.
+            pool.close().await;
+            return Err(error.into());
+        }
         Ok(Self { pool })
     }
 
@@ -219,6 +249,9 @@ impl ScheduleStore {
         new: NewScheduleDefinition,
     ) -> Result<ScheduleDefinition, ScheduleError> {
         new.validate()?;
+        if let Some(request) = new.unattended {
+            validate_unattended_request(&new.action, request)?;
+        }
         // The workspace names the runtime source that owns this schedule. The
         // runtime compares it by its canonical identity, so the durable value
         // must be canonical too; otherwise a macOS `/var` spelling would bind
@@ -248,6 +281,7 @@ impl ScheduleStore {
                     workspace.clone(),
                     new.mode,
                     &new.action,
+                    &new.trigger,
                     new.model.clone(),
                     request,
                     now,
@@ -261,87 +295,21 @@ impl ScheduleStore {
             .map_err(|error| {
                 ScheduleError::Invalid(format!("the unattended grant is not serializable: {error}"))
             })?;
-        let (native_action, native_input, agent_goal) = match &new.action {
-            ScheduleAction::Native { action, input } => (
-                Some(action.clone()),
-                Some(serde_json::to_string(input).map_err(|error| {
-                    ScheduleError::Invalid(format!(
-                        "the native action input is not serializable: {error}"
-                    ))
-                })?),
-                None,
-            ),
-            ScheduleAction::Agent { goal } => (None, None, Some(goal.clone())),
-            ScheduleAction::Shell { .. } => (None, None, None),
-        };
-        let (
-            trigger_kind,
-            once_at,
-            anchor_at,
-            every_secs,
-            timezone,
-            local_time,
-            weekdays,
-            cron_expr,
-        ) = match &new.trigger {
-            ScheduleTrigger::Once { at } => (
-                "once",
-                Some(timestamp(*at)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            ScheduleTrigger::Every { anchor, every } => (
-                "every",
-                None,
-                Some(timestamp(*anchor)),
-                Some(every.as_secs() as i64),
-                None,
-                None,
-                None,
-                None,
-            ),
-            ScheduleTrigger::Daily { time, timezone } => (
-                "daily",
-                None,
-                None,
-                None,
-                Some(timezone.to_string()),
-                Some(time.to_string()),
-                None,
-                None,
-            ),
-            ScheduleTrigger::Weekly {
-                weekdays,
-                time,
-                timezone,
-            } => (
-                "weekly",
-                None,
-                None,
-                None,
-                Some(timezone.to_string()),
-                Some(time.to_string()),
-                Some(i64::from(weekdays.bits())),
-                None,
-            ),
-            ScheduleTrigger::Cron {
-                expression,
-                timezone,
-            } => (
-                "cron",
-                None,
-                None,
-                None,
-                Some(timezone.to_string()),
-                None,
-                None,
-                Some(expression.clone()),
-            ),
-        };
+        let action_columns = action_columns(&new.action)?;
+        let trigger_columns = trigger_columns(&new.trigger);
+        let (native_action, native_input, agent_goal) = (
+            action_columns.native_action,
+            action_columns.native_input,
+            action_columns.agent_goal,
+        );
+        let trigger_kind = trigger_columns.kind;
+        let once_at = trigger_columns.once_at;
+        let anchor_at = trigger_columns.anchor_at;
+        let every_secs = trigger_columns.every_secs;
+        let timezone = trigger_columns.timezone;
+        let local_time = trigger_columns.local_time;
+        let weekdays = trigger_columns.weekdays;
+        let cron_expr = trigger_columns.cron_expr;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO schedule_definitions \
@@ -357,7 +325,7 @@ impl ScheduleStore {
         .bind(id.as_str())
         .bind(new.name.trim())
         .bind(workspace.display().to_string())
-        .bind(new.action.kind().as_str())
+        .bind(action_columns.kind)
         .bind(new.action.command())
         .bind(agent_goal)
         .bind(native_action)
@@ -475,6 +443,199 @@ impl ScheduleStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Replace a definition in place, keeping its id and run history.
+    ///
+    /// The update is a full declaration; the management layer resolves a
+    /// partial patch against the definition the client observed. When
+    /// `expected_updated_at` is supplied and no longer matches the stored row,
+    /// the update is refused with [`ScheduleError::Conflict`] instead of
+    /// overwriting a newer definition.
+    ///
+    /// A grant survives only while it still covers the new identity (action,
+    /// workspace, permission mode and model). Anything the user changed that
+    /// the grant named drops the grant, so the next unattended run refuses
+    /// until the user re-authorizes; it is never silently widened.
+    pub async fn update_definition(
+        &self,
+        id: &ScheduleId,
+        update: DefinitionUpdate,
+        expected_updated_at: Option<DateTime<Utc>>,
+    ) -> Result<ScheduleDefinition, ScheduleError> {
+        update.validate()?;
+        if let Some(request) = update.grant {
+            validate_unattended_request(&update.action, request)?;
+        }
+        let existing = self
+            .definition(id)
+            .await?
+            .ok_or_else(|| ScheduleError::NotFound(id.clone()))?;
+        if let Some(expected) = expected_updated_at
+            && timestamp(expected) != timestamp(existing.updated_at)
+        {
+            return Err(ScheduleError::Conflict(id.clone()));
+        }
+        let workspace = tokio::fs::canonicalize(&update.workspace)
+            .await
+            .map_err(|error| {
+                ScheduleError::Invalid(format!(
+                    "the schedule workspace `{}` is not accessible: {error}",
+                    update.workspace.display()
+                ))
+            })?;
+        if !tokio::fs::metadata(&workspace).await?.is_dir() {
+            return Err(ScheduleError::Invalid(format!(
+                "the schedule workspace `{}` is not a directory",
+                workspace.display()
+            )));
+        }
+        // `updated_at` is the client's revision. Stored with millisecond
+        // precision, so two updates inside one millisecond must still produce
+        // distinct revisions or a later stale write would compare equal.
+        let now = std::cmp::max(
+            leveler_core::now(),
+            existing.updated_at + chrono::Duration::milliseconds(1),
+        );
+        let trigger_changed = existing.trigger != update.trigger;
+        let candidate = ScheduleDefinition {
+            id: id.clone(),
+            name: update.name.trim().to_string(),
+            workspace: workspace.clone(),
+            action: update.action.clone(),
+            trigger: update.trigger.clone(),
+            session_policy: update.session_policy,
+            overlap: update.overlap,
+            mode: update.mode,
+            model: update.model.clone(),
+            timeout: update.timeout,
+            misfire: update.misfire,
+            misfire_grace: update.misfire_grace,
+            session_id: if workspace == existing.workspace {
+                existing.session_id.clone()
+            } else {
+                // A session belongs to the workspace database that owns it.
+                // Carrying the id across a workspace change would name a
+                // session the new runtime cannot resolve.
+                None
+            },
+            unattended: None,
+            enabled: existing.enabled,
+            created_at: existing.created_at,
+            updated_at: now,
+        };
+        let grant = match (update.grant, existing.unattended.as_ref()) {
+            (Some(request), _) => Some(UnattendedGrant::new(
+                id.clone(),
+                workspace.clone(),
+                update.mode,
+                &update.action,
+                &update.trigger,
+                update.model.clone(),
+                request,
+                now,
+            )?),
+            (None, Some(current)) => current
+                .covers(&candidate, update.action.kind(), false)
+                .ok()
+                .map(|()| current.clone()),
+            (None, None) => None,
+        };
+        let grant_json = grant
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                ScheduleError::Invalid(format!("the unattended grant is not serializable: {error}"))
+            })?;
+        let action_columns = action_columns(&update.action)?;
+        let trigger_columns = trigger_columns(&update.trigger);
+        let (occurrence_id, first) = if trigger_changed {
+            match update.trigger.next_after(now)? {
+                Some(first) => (OccurrenceId::generate(), Some(first)),
+                None => (OccurrenceId::generate(), None),
+            }
+        } else {
+            (OccurrenceId::generate(), None)
+        };
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE schedule_definitions SET \
+             name = ?, workspace = ?, action = ?, command = ?, agent_goal = ?, \
+             native_action = ?, native_input = ?, \
+             trigger_kind = ?, once_at = ?, anchor_at = ?, every_secs = ?, \
+             timezone = ?, local_time = ?, weekdays = ?, cron_expr = ?, \
+             session_policy = ?, overlap_policy = ?, permission_mode = ?, model = ?, \
+             timeout_secs = ?, misfire_policy = ?, misfire_grace_secs = ?, \
+             unattended_grant = ?, session_id = ?, updated_at = ? \
+             WHERE id = ? AND updated_at = ?",
+        )
+        .bind(candidate.name.as_str())
+        .bind(workspace.display().to_string())
+        .bind(action_columns.kind)
+        .bind(update.action.command())
+        .bind(action_columns.agent_goal)
+        .bind(action_columns.native_action)
+        .bind(action_columns.native_input)
+        .bind(trigger_columns.kind)
+        .bind(trigger_columns.once_at)
+        .bind(trigger_columns.anchor_at)
+        .bind(trigger_columns.every_secs)
+        .bind(trigger_columns.timezone)
+        .bind(trigger_columns.local_time)
+        .bind(trigger_columns.weekdays)
+        .bind(trigger_columns.cron_expr)
+        .bind(update.session_policy.as_str())
+        .bind(update.overlap.as_str())
+        .bind(update.mode.as_str())
+        .bind(update.model.as_ref().map(ModelRef::to_string))
+        .bind(update.timeout.as_secs() as i64)
+        .bind(update.misfire.as_str())
+        .bind(update.misfire_grace.as_secs() as i64)
+        .bind(grant_json)
+        .bind(candidate.session_id.as_ref().map(SessionId::as_str))
+        .bind(timestamp(now))
+        .bind(id.as_str())
+        // The expected revision is checked again inside the transaction: the
+        // row could have changed between the read above and this write.
+        .bind(timestamp(existing.updated_at))
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(ScheduleError::Conflict(id.clone()));
+        }
+        // Slots generated by the old rule no longer describe the schedule the
+        // user now owns. Explicit run-now slots are user requests and stay. An
+        // unchanged rule keeps its pending slot untouched: re-deriving it would
+        // shift or drop a slot (an interval's anchor, a pending one-off) for a
+        // change that had nothing to do with timing.
+        if trigger_changed {
+            sqlx::query(
+                "DELETE FROM schedule_occurrences \
+                 WHERE definition_id = ? AND state = 'pending' AND run_now = 0",
+            )
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if let Some(first) = first {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO schedule_occurrences \
+                     (id, definition_id, scheduled_for, state, created_at) \
+                     VALUES (?, ?, ?, 'pending', ?)",
+                )
+                .bind(occurrence_id.as_str())
+                .bind(id.as_str())
+                .bind(timestamp(first))
+                .bind(timestamp(now))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        self.definition(id)
+            .await?
+            .ok_or_else(|| ScheduleError::NotFound(id.clone()))
     }
 
     /// Create an explicit one-off slot that is claimable even while paused.
@@ -632,13 +793,24 @@ impl ScheduleStore {
         let mut claims = Vec::new();
         for (occurrence_id, definition_id) in candidates {
             let mut tx = self.pool.begin().await?;
+            // The overlap predicate is part of the write, not only the read
+            // above: a pass that sees two due slots of one definition must not
+            // claim both. SQLite serializes writers, so the second claim sees
+            // the first claim's active run and leaves its slot pending.
             let updated = sqlx::query(
                 "UPDATE schedule_occurrences SET state = 'claimed', claimed_at = ?, \
-                 lease_expires_at = ? WHERE id = ? AND state = 'pending'",
+                 lease_expires_at = ? \
+                 WHERE id = ? AND state = 'pending' \
+                   AND EXISTS (SELECT 1 FROM schedule_definitions d WHERE d.id = ? \
+                               AND (d.overlap_policy = 'allow-concurrent' OR NOT EXISTS ( \
+                                     SELECT 1 FROM schedule_runs active \
+                                     WHERE active.definition_id = d.id \
+                                       AND active.state IN ('dispatching', 'running'))))",
             )
             .bind(timestamp(now))
             .bind(timestamp(lease_until(now, lease)))
             .bind(&occurrence_id)
+            .bind(&definition_id)
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() != 1 {
@@ -705,13 +877,23 @@ impl ScheduleStore {
         };
 
         let mut tx = self.pool.begin().await?;
+        // Re-check the overlap predicate inside the write. The read above can
+        // race another dispatcher claiming a different slot of the same
+        // definition; the write serialization is what makes it exclusive.
         let updated = sqlx::query(
             "UPDATE schedule_occurrences SET state = 'claimed', claimed_at = ?, \
-             lease_expires_at = ? WHERE id = ? AND state = 'pending'",
+             lease_expires_at = ? \
+             WHERE id = ? AND state = 'pending' \
+               AND EXISTS (SELECT 1 FROM schedule_definitions d WHERE d.id = ? \
+                           AND (d.overlap_policy = 'allow-concurrent' OR NOT EXISTS ( \
+                                 SELECT 1 FROM schedule_runs active \
+                                 WHERE active.definition_id = d.id \
+                                   AND active.state IN ('dispatching', 'running'))))",
         )
         .bind(timestamp(now))
         .bind(timestamp(lease_until(now, lease)))
         .bind(&occurrence_id)
+        .bind(&definition_id)
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() != 1 {
@@ -1325,10 +1507,10 @@ impl ScheduleStore {
         tx.commit().await?;
 
         let run = self.run(run_id).await?;
-        if let Some(run) = &run {
-            if let Some(definition) = self.definition(&run.definition_id).await? {
-                self.ensure_next_occurrence(&definition, now).await?;
-            }
+        if let Some(run) = &run
+            && let Some(definition) = self.definition(&run.definition_id).await?
+        {
+            self.ensure_next_occurrence(&definition, now).await?;
         }
         Ok(run)
     }
@@ -1374,6 +1556,93 @@ impl ScheduleStore {
         .fetch_one(&self.pool)
         .await?;
         raw.as_deref().map(parse_timestamp).transpose()
+    }
+
+    /// Active (dispatching or running) attempts of one definition.
+    pub async fn active_run_count(
+        &self,
+        definition_id: &ScheduleId,
+    ) -> Result<usize, ScheduleError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedule_runs WHERE definition_id = ? \
+             AND state IN ('dispatching', 'running')",
+        )
+        .bind(definition_id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
+    /// Active attempt counts for every definition in one read, so a list view
+    /// does not issue one query per row.
+    pub async fn active_run_counts(&self) -> Result<HashMap<ScheduleId, usize>, ScheduleError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT definition_id, COUNT(*) FROM schedule_runs \
+             WHERE state IN ('dispatching', 'running') GROUP BY definition_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, count)| (ScheduleId::from(id), count as usize))
+            .collect())
+    }
+
+    /// The newest attempt of every definition in one read.
+    pub async fn latest_run_per_definition(&self) -> Result<Vec<ScheduleRun>, ScheduleError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {RUN_COLUMNS} FROM {RUN_FROM} \
+             JOIN ( \
+               SELECT id, ROW_NUMBER() OVER ( \
+                 PARTITION BY definition_id ORDER BY started_at DESC, id DESC \
+               ) AS rank FROM schedule_runs \
+             ) latest ON latest.id = r.id AND latest.rank = 1"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(run_from_row).collect()
+    }
+
+    /// The earliest claimable pending slot of every definition in one read.
+    pub async fn next_pending_occurrences(&self) -> Result<Vec<Occurrence>, ScheduleError> {
+        let rows = sqlx::query(
+            "SELECT o.id, o.definition_id, o.scheduled_for, o.state, o.run_now \
+             FROM schedule_occurrences o \
+             JOIN schedule_definitions d ON d.id = o.definition_id \
+             WHERE o.state = 'pending' AND (d.enabled = 1 OR o.run_now = 1) \
+             ORDER BY o.scheduled_for ASC, o.id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut next = Vec::new();
+        for row in rows.iter() {
+            let occurrence = occurrence_from_row(row)?;
+            if seen.insert(occurrence.definition_id.clone()) {
+                next.push(occurrence);
+            }
+        }
+        Ok(next)
+    }
+
+    /// The earliest slot a dispatcher could actually claim: generated slots of
+    /// a paused definition are not included, explicit run-now slots are.
+    pub async fn next_pending_occurrence(
+        &self,
+        definition_id: &ScheduleId,
+    ) -> Result<Option<Occurrence>, ScheduleError> {
+        let row = sqlx::query(
+            "SELECT o.id, o.definition_id, o.scheduled_for, o.state, o.run_now \
+             FROM schedule_occurrences o \
+             JOIN schedule_definitions d ON d.id = o.definition_id \
+             WHERE o.definition_id = ? AND o.state = 'pending' \
+               AND (d.enabled = 1 OR o.run_now = 1) \
+             ORDER BY o.scheduled_for ASC, o.id ASC LIMIT 1",
+        )
+        .bind(definition_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(occurrence_from_row).transpose()
     }
 
     /// Occurrences, newest first, for display and verification.
@@ -1435,12 +1704,12 @@ impl ScheduleStore {
         .bind(definition.id.as_str())
         .fetch_one(&self.pool)
         .await?;
-        if let Some(last) = last.as_deref().map(parse_timestamp).transpose()? {
-            if next <= last {
-                // A future slot already exists. The store keeps at most one;
-                // this also makes the call idempotent after a crash.
-                return Ok(None);
-            }
+        if let Some(last) = last.as_deref().map(parse_timestamp).transpose()?
+            && next <= last
+        {
+            // A future slot already exists. The store keeps at most one;
+            // this also makes the call idempotent after a crash.
+            return Ok(None);
         }
         let id = OccurrenceId::generate();
         sqlx::query(
@@ -1474,6 +1743,134 @@ fn storage_time(row: &sqlx::sqlite::SqliteRow) -> Result<crate::LocalTime, Sched
 fn storage_timezone(row: &sqlx::sqlite::SqliteRow) -> Result<chrono_tz::Tz, ScheduleError> {
     let raw: String = row.try_get("timezone")?;
     crate::parse_timezone(&raw)
+}
+
+struct ActionColumns {
+    kind: &'static str,
+    agent_goal: Option<String>,
+    native_action: Option<String>,
+    native_input: Option<String>,
+}
+
+/// A grant must name every scope its action can reach. A shell command can
+/// write anywhere the user can and an agent's tools can act outside the
+/// workspace, so both need an explicit external-side-effect grant. A native
+/// action is classified by the executor at dispatch time, which checks the
+/// grant against the observed classification.
+fn validate_unattended_request(
+    action: &ScheduleAction,
+    request: UnattendedRequest,
+) -> Result<(), ScheduleError> {
+    let always_external = matches!(
+        action,
+        ScheduleAction::Shell { .. } | ScheduleAction::Agent { .. }
+    );
+    if always_external && !request.allow_external_side_effects {
+        return Err(ScheduleError::Invalid(format!(
+            "a scheduled {} action can create effects outside the workspace; the grant \
+             must explicitly allow external side effects",
+            action.kind().as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// The one encoding of a typed action into its columns, shared by create and
+/// update so the two writers cannot drift.
+fn action_columns(action: &ScheduleAction) -> Result<ActionColumns, ScheduleError> {
+    let (agent_goal, native_action, native_input) = match action {
+        ScheduleAction::Native { action, input } => (
+            None,
+            Some(action.clone()),
+            Some(serde_json::to_string(input).map_err(|error| {
+                ScheduleError::Invalid(format!(
+                    "the native action input is not serializable: {error}"
+                ))
+            })?),
+        ),
+        ScheduleAction::Agent { goal } => (Some(goal.clone()), None, None),
+        ScheduleAction::Shell { .. } => (None, None, None),
+    };
+    Ok(ActionColumns {
+        kind: action.kind().as_str(),
+        agent_goal,
+        native_action,
+        native_input,
+    })
+}
+
+struct TriggerColumns {
+    kind: &'static str,
+    once_at: Option<String>,
+    anchor_at: Option<String>,
+    every_secs: Option<i64>,
+    timezone: Option<String>,
+    local_time: Option<String>,
+    weekdays: Option<i64>,
+    cron_expr: Option<String>,
+}
+
+/// The one encoding of a trigger into its columns, shared by create and update.
+fn trigger_columns(trigger: &ScheduleTrigger) -> TriggerColumns {
+    match trigger {
+        ScheduleTrigger::Once { at } => TriggerColumns {
+            kind: "once",
+            once_at: Some(timestamp(*at)),
+            anchor_at: None,
+            every_secs: None,
+            timezone: None,
+            local_time: None,
+            weekdays: None,
+            cron_expr: None,
+        },
+        ScheduleTrigger::Every { anchor, every } => TriggerColumns {
+            kind: "every",
+            once_at: None,
+            anchor_at: Some(timestamp(*anchor)),
+            every_secs: Some(every.as_secs() as i64),
+            timezone: None,
+            local_time: None,
+            weekdays: None,
+            cron_expr: None,
+        },
+        ScheduleTrigger::Daily { time, timezone } => TriggerColumns {
+            kind: "daily",
+            once_at: None,
+            anchor_at: None,
+            every_secs: None,
+            timezone: Some(timezone.to_string()),
+            local_time: Some(time.to_string()),
+            weekdays: None,
+            cron_expr: None,
+        },
+        ScheduleTrigger::Weekly {
+            weekdays,
+            time,
+            timezone,
+        } => TriggerColumns {
+            kind: "weekly",
+            once_at: None,
+            anchor_at: None,
+            every_secs: None,
+            timezone: Some(timezone.to_string()),
+            local_time: Some(time.to_string()),
+            weekdays: Some(i64::from(weekdays.bits())),
+            cron_expr: None,
+        },
+        ScheduleTrigger::Cron {
+            expression,
+            timezone,
+        } => TriggerColumns {
+            kind: "cron",
+            once_at: None,
+            anchor_at: None,
+            every_secs: None,
+            timezone: Some(timezone.to_string()),
+            local_time: None,
+            weekdays: None,
+            cron_expr: Some(expression.clone()),
+        },
+    }
 }
 
 fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefinition, ScheduleError> {
@@ -1582,6 +1979,7 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
     let misfire_grace_secs: i64 = row.try_get("misfire_grace_secs")?;
     let session: Option<String> = row.try_get("session_id")?;
     let created_at: String = row.try_get("created_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
     Ok(ScheduleDefinition {
         id: ScheduleId::from(row.try_get::<String, _>("id")?),
         name: row.try_get("name")?,
@@ -1599,6 +1997,7 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
         unattended,
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
     })
 }
 
@@ -1848,6 +2247,47 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].state, RunState::Dispatching);
         assert_eq!(runs[0].occurrence_id, claims[0].occurrence.id);
+    }
+
+    #[tokio::test]
+    async fn one_pass_claims_at_most_one_due_slot_of_a_skip_if_running_schedule() {
+        let store = store().await;
+        let now = leveler_core::now();
+        let created = store
+            .create_definition(definition(ScheduleTrigger::Once {
+                at: now - chrono::Duration::seconds(1),
+            }))
+            .await
+            .unwrap();
+        // A run-now slot is due immediately, so one pass sees two due slots of
+        // the same definition. Claiming both would start two runs at once and
+        // bypass the skip-if-running overlap policy.
+        store.create_run_now(&created).await.unwrap();
+
+        // The run-now slot is stamped at creation; evaluate the pass just
+        // after it so both slots are due.
+        let due = leveler_core::now() + chrono::Duration::seconds(1);
+        let claims = store
+            .claim_due(due, Duration::from_secs(60), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            claims.len(),
+            1,
+            "skip-if-running must start at most one run of a definition per pass"
+        );
+        let pending = store
+            .occurrences(&created.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|occurrence| occurrence.state == OccurrenceState::Pending)
+            .count();
+        assert_eq!(
+            pending, 1,
+            "the second due slot stays pending for the overlap policy to settle"
+        );
     }
 
     #[tokio::test]

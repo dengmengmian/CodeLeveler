@@ -363,6 +363,64 @@ impl Dispatcher {
                     .await;
             }
         };
+        // The claim carries the definition as it was when the slot was
+        // generated. Re-read it so neither an edit made after the claim nor a
+        // missing grant can turn into unattended execution. Authorization is
+        // decided before any runtime connection exists.
+        let current = match self.store.definition(&definition.id).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                return self
+                    .settle(
+                        &claim.run_id,
+                        RunOutcome::Blocked {
+                            error: "the schedule was removed after this occurrence was claimed"
+                                .into(),
+                        },
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .settle(
+                        &claim.run_id,
+                        RunOutcome::Failed {
+                            exit_code: None,
+                            error: format!(
+                                "could not re-read the schedule before executing it: {error}"
+                            ),
+                        },
+                    )
+                    .await;
+            }
+        };
+        if current.action != definition.action {
+            return self
+                .settle(
+                    &claim.run_id,
+                    RunOutcome::Blocked {
+                        error: "the schedule's action changed after this occurrence was claimed"
+                            .into(),
+                    },
+                )
+                .await;
+        }
+        if current.workspace != definition.workspace {
+            return self
+                .settle(
+                    &claim.run_id,
+                    RunOutcome::Blocked {
+                        error: "the schedule's workspace changed after this occurrence was claimed"
+                            .into(),
+                    },
+                )
+                .await;
+        }
+        if let Err(reason) = current.unattended_authorization(ActionKind::Shell, true) {
+            return self
+                .settle(&claim.run_id, RunOutcome::Blocked { error: reason })
+                .await;
+        }
         let client = match self.connector.connect(&definition.workspace).await {
             Ok(client) => client,
             Err(error) => {
@@ -528,29 +586,30 @@ impl Dispatcher {
 
             // An explicit cancel request is acted on while the process is
             // still observable, rather than waiting for the timeout.
-            if !cancel_issued && self.store.cancel_requested(&claim.run_id).await? {
-                if let Some(execution) = &execution {
-                    match client
-                        .issue(
-                            session.clone(),
-                            ClientCommand::CancelUserShell {
-                                session_id: session.clone(),
-                                execution_id: execution.clone(),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            self.store.mark_cancel_issued(&claim.run_id).await?;
-                            cancel_issued = true;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                run = claim.run_id.as_str(),
-                                "could not cancel the scheduled action"
-                            );
-                        }
+            if !cancel_issued
+                && self.store.cancel_requested(&claim.run_id).await?
+                && let Some(execution) = &execution
+            {
+                match client
+                    .issue(
+                        session.clone(),
+                        ClientCommand::CancelUserShell {
+                            session_id: session.clone(),
+                            execution_id: execution.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.store.mark_cancel_issued(&claim.run_id).await?;
+                        cancel_issued = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            run = claim.run_id.as_str(),
+                            "could not cancel the scheduled action"
+                        );
                     }
                 }
             }
@@ -995,20 +1054,19 @@ impl Dispatcher {
                 )
                 .await;
         }
-        match snapshot.task_status {
-            Some(UiTaskStatus::Running | UiTaskStatus::WaitingUser | UiTaskStatus::Answered) => {
-                return self
-                    .settle(
-                        &claim.run_id,
-                        RunOutcome::Skipped {
-                            error: "the session already has an active turn; an unattended \
-                                    schedule does not interrupt or share it"
-                                .into(),
-                        },
-                    )
-                    .await;
-            }
-            _ => {}
+        if let Some(UiTaskStatus::Running | UiTaskStatus::WaitingUser | UiTaskStatus::Answered) =
+            snapshot.task_status
+        {
+            return self
+                .settle(
+                    &claim.run_id,
+                    RunOutcome::Skipped {
+                        error: "the session already has an active turn; an unattended \
+                                schedule does not interrupt or share it"
+                            .into(),
+                    },
+                )
+                .await;
         }
         let baseline_sequence = snapshot.last_sequence.unwrap_or(0);
         let baseline_turn_ordinal = snapshot.latest_turn_ordinal;

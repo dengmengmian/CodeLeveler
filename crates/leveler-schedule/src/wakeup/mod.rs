@@ -46,6 +46,76 @@ pub struct WakeupSpec {
 }
 
 impl WakeupSpec {
+    /// The one registration shape every entry point (CLI, TUI, Desktop) must
+    /// produce. A different argument list is a different OS job, so building it
+    /// in one place keeps `enable` and `doctor` comparing the same facts.
+    pub fn standard(
+        home: PathBuf,
+        executable: PathBuf,
+        config_dir: Option<&Path>,
+        environment: &leveler_core::EnvSnapshot,
+    ) -> Self {
+        let mut arguments = vec![
+            "schedule".to_string(),
+            "dispatch".to_string(),
+            "--source".to_string(),
+            "os".to_string(),
+        ];
+        // The home travels in the arguments, not only in the environment: Task
+        // Scheduler has no environment map, and an explicit argument is what
+        // makes doctor compare the exact home the job was enabled for.
+        arguments.push("--home".to_string());
+        arguments.push(home.to_string_lossy().into_owned());
+        if let Some(config_dir) = config_dir {
+            arguments.push("--config-dir".to_string());
+            arguments.push(config_dir.to_string_lossy().into_owned());
+        }
+        // The OS job's stdout is its log. One JSON line per pass is the most
+        // parseable record and does not depend on a terminal.
+        arguments.push("--json".to_string());
+
+        let mut job_environment = BTreeMap::new();
+        for key in ["PATH", "HOME", "TMPDIR", "LEVELER_DAEMON_IDLE_TIMEOUT_SECS"] {
+            if let Some(value) = environment
+                .var_os(key)
+                .and_then(|value| value.to_str().map(str::to_owned))
+            {
+                job_environment.insert(key.to_owned(), value);
+            }
+        }
+        job_environment.insert("LEVELER_HOME".into(), home.to_string_lossy().into_owned());
+
+        Self {
+            log_dir: home.join("logs").join("schedule"),
+            home,
+            executable,
+            arguments,
+            environment: job_environment,
+            interval: WAKE_INTERVAL,
+        }
+    }
+}
+
+/// Prefer the Homebrew entry point when it is the same file as the running
+/// executable, so a `brew upgrade` that replaces the Cellar target does not
+/// leave the OS job pointing at a removed path.
+pub fn preferred_executable() -> Result<PathBuf, WakeupError> {
+    let current = std::env::current_exe().map_err(|error| {
+        WakeupError::Invalid(format!("could not resolve the leveler executable: {error}"))
+    })?;
+    #[cfg(target_os = "macos")]
+    if let Ok(resolved) = std::fs::canonicalize(&current) {
+        for candidate in ["/opt/homebrew/bin/leveler", "/usr/local/bin/leveler"] {
+            let candidate = PathBuf::from(candidate);
+            if std::fs::canonicalize(&candidate).ok().as_ref() == Some(&resolved) {
+                return Ok(candidate);
+            }
+        }
+    }
+    Ok(current)
+}
+
+impl WakeupSpec {
     /// Reject a registration that could not run or that would put an
     /// unexpected value into an OS-owned file.
     pub fn validate(&self) -> Result<(), WakeupError> {
@@ -290,7 +360,7 @@ pub(crate) fn windows_decode_output(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return decode_utf16le(rest);
     }
-    if bytes.len() >= 4 && bytes.len() % 2 == 0 {
+    if bytes.len() >= 4 && bytes.len().is_multiple_of(2) {
         let high_nuls = bytes
             .iter()
             .skip(1)

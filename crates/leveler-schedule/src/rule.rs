@@ -208,6 +208,16 @@ pub fn parse_timezone(raw: &str) -> Result<Tz, ScheduleError> {
         .map_err(|_| ScheduleError::Invalid(format!("unknown IANA timezone `{trimmed}`")))
 }
 
+/// The host's current IANA timezone. A calendar rule that does not name a zone
+/// uses this instead of assuming UTC, so "每天 09:00" means the user's wall
+/// clock. Failing to resolve it is an explicit error, never a silent fallback.
+pub fn host_timezone() -> Result<Tz, ScheduleError> {
+    let raw = iana_time_zone::get_timezone().map_err(|error| {
+        ScheduleError::Invalid(format!("could not resolve the local timezone: {error}"))
+    })?;
+    parse_timezone(&raw)
+}
+
 /// Parse a five-field cron expression. Seconds are rejected so an occurrence
 /// can never be finer than the 60-second wake interval.
 pub fn parse_cron(expression: &str) -> Result<croner::Cron, ScheduleError> {

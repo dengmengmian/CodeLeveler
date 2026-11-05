@@ -458,6 +458,15 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             false,
         ),
         (
+            "manage_schedule",
+            ClientCommand::ManageSchedule {
+                requester_session_id: session(),
+                query_id: leveler_client_protocol::CommandId::new("q1"),
+                request: Box::new(leveler_client_protocol::schedule::ScheduleRequest::Status),
+            },
+            false,
+        ),
+        (
             "list_unfinished_goals",
             ClientCommand::ListUnfinishedGoals {
                 session_id: session(),

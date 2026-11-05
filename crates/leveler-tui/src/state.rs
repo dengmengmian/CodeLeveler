@@ -396,6 +396,10 @@ pub struct AppState {
     /// `/clean` page state: scan/cleanup stage, the plan, and the result.
     /// Presentation-only; the CLI host owns the scan and the deletion.
     pub clean: crate::clean::CleanState,
+    /// `/schedules`: a view over the runtime's scheduled-automation API. The
+    /// page owns no definitions, runs or grants; it only holds their last
+    /// authoritative projection and the query ids it is waiting on.
+    pub schedule: crate::schedules::ScheduleState,
 
     /// Active plan from the current run, if any. Terminal plans move into the
     /// transcript and never remain in this slot.
@@ -791,6 +795,7 @@ impl AppState {
             trace: crate::observability::TraceView::default(),
             context: crate::context::ContextView::default(),
             clean: crate::clean::CleanState::default(),
+            schedule: crate::schedules::ScheduleState::default(),
             plan: None,
             project_rule_sources: Vec::new(),
             turn_diff_files: None,

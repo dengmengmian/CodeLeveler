@@ -3173,6 +3173,13 @@ fn page_tail_queries(state: &mut AppState) -> Vec<Effect> {
     if state.active_screen == Screen::Context && state.usage.track.wants_refresh() {
         effects.push(Effect::Send(crate::usage::query(state)));
     }
+    // The schedule page's rows change asynchronously (a dispatcher claims a
+    // slot), so the page re-reads the runtime on a bounded cadence rather than
+    // holding a projection the client cannot refresh.
+    effects.extend(crate::schedules::tail_queries(
+        state,
+        std::time::Instant::now(),
+    ));
     effects
 }
 

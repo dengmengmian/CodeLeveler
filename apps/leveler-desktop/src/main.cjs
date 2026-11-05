@@ -129,7 +129,7 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs']);
+  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs']);
   protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(['node_modules/@xterm/xterm/lib/xterm.mjs','node_modules/@xterm/xterm/css/xterm.css','node_modules/@xterm/addon-fit/lib/addon-fit.mjs'].includes(name))return net.fetch(pathToFileURL(path.join(__dirname,'..',name)).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);

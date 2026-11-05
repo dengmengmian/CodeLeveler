@@ -53,6 +53,7 @@ pub mod query_track;
 pub mod record;
 pub mod reducer;
 pub mod render;
+pub mod schedules;
 pub mod screen;
 mod secondary;
 mod selection;

@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','fork_session','compact_context','cancel_background_task']);
+const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -33,6 +33,9 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.query_id))throw new Error('Invalid settings query');
     if(command.type==='get_agent'&&(typeof command.name!=='string'||command.name.length>64||!/^[a-z](?:[a-z0-9-]*[a-z0-9])?$/.test(command.name)||/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(command.name)))throw new Error('Invalid agent name');
     if(command.type==='query_observability'&&(!(command.center_seq===null||(Number.isSafeInteger(command.center_seq)&&command.center_seq>=0))||![command.before,command.after].every(value=>Number.isInteger(value)&&value>=0&&value<=100)))throw new Error('Invalid observability window');
+  }
+  if(command.type==='manage_schedule'){
+    if(!exactKeys(command,['type','requester_session_id','query_id','request'])||!nonblank(command.requester_session_id)||command.requester_session_id!==envelope.session_id||!string(command.query_id,256)||!command.request||typeof command.request!=='object'||Array.isArray(command.request)||!string(command.request.action,32)||JSON.stringify(command.request).length>200000)throw new Error('Invalid schedule command');
   }
   if(command.type==='request_diff'&&(!exactKeys(command,Object.hasOwn(command,'query_id')?['type','session_id','query_id']:['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||(Object.hasOwn(command,'query_id')&&!nonblank(command.query_id))))throw new Error('Invalid diff query');
   if(command.type==='set_permission_profile'&&(!exactKeys(command,['type','session_id','mode'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!['full_access','assisted','request_approval'].includes(command.mode)))throw new Error('Invalid permission selection');

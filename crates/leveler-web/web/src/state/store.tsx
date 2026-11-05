@@ -7,6 +7,7 @@
 import { createContext, useContext, type Dispatch, type ReactNode } from 'react';
 import { committedFinalAnswer } from '../lib/executionRounds';
 import { isCompactionSummaryText, isTurnUser } from '../lib/presentationKind';
+import type { ScheduleIntent } from '../lib/schedules';
 import { finalizationStageLabel, type TurnOutcome } from '../lib/turn';
 import { useImmerReducer } from '../lib/useImmerReducer';
 import type {
@@ -19,6 +20,12 @@ import type {
   PermissionProfile,
   ProjectInfo,
   ProjectStatus,
+  ScheduleCheck,
+  ScheduleFilter,
+  ScheduleResponse,
+  ScheduleRunView,
+  ScheduleStatusView,
+  ScheduleView,
   SessionId,
   ToolCallId,
   UiAgentDetail,
@@ -195,6 +202,61 @@ function emptyAgents(): AgentsView {
   return { entries: [], problems: [], loading: false, loaded: false, detail: {}, lastMutation: null };
 }
 
+/** 自动化页：列表 / 详情 / 运行历史的完整投影。 */
+export interface SchedulesView {
+  items: ScheduleView[];
+  filter: ScheduleFilter;
+  status: ScheduleStatusView | null;
+  selected: string | null;
+  detail: ScheduleView | null;
+  runs: ScheduleRunView[];
+  runsLoaded: boolean;
+  doctor: { healthy: boolean; checks: ScheduleCheck[] } | null;
+  /** 一次读取在飞。 */
+  loading: boolean;
+  loaded: boolean;
+  /** 一次写操作在飞：surface 据此禁用会冲突的动作。 */
+  busy: boolean;
+  /** 最近一次运行时拒绝/失败；如实展示，不折叠成成功。 */
+  error: string | null;
+  /** 最近一次确认的变更（intent + 运行时消息）。 */
+  lastChange: { intent: ScheduleIntent; message: string } | null;
+}
+
+/** 每次新建，理由同 emptyAgents。 */
+export function emptySchedules(): SchedulesView {
+  return {
+    items: [],
+    filter: 'all',
+    status: null,
+    selected: null,
+    detail: null,
+    runs: [],
+    runsLoaded: false,
+    doctor: null,
+    loading: false,
+    loaded: false,
+    busy: false,
+    error: null,
+    lastChange: null,
+  };
+}
+
+/** 用运行时返回的定义替换/插入列表行。 */
+function upsertSchedule(items: ScheduleView[], schedule: ScheduleView): void {
+  const index = items.findIndex((item) => item.id === schedule.id);
+  if (index >= 0) items[index] = schedule;
+  else items.push(schedule);
+}
+
+/** 详情换目标时，旧运行历史必须一起清掉。 */
+function selectSchedule(state: AppState, id: string | null): void {
+  state.schedules.selected = id;
+  state.schedules.detail = null;
+  state.schedules.runs = [];
+  state.schedules.runsLoaded = false;
+}
+
 export interface SessionView {
   id: SessionId;
   title: string;
@@ -269,7 +331,7 @@ export interface HistoryView {
 }
 
 /** Central workspace surface. `execution` is a Phase 1 slot only (no observatory). */
-export type StageView = 'chat' | 'diff' | 'execution';
+export type StageView = 'chat' | 'diff' | 'execution' | 'automation';
 
 /** Sidebar destination. Workspace tabs (Conversation / Changes / Execution) are independent. */
 export type RailNav = 'sessions' | 'files' | 'search' | 'settings';
@@ -316,6 +378,8 @@ export interface AppState {
   /** QueryObservability.query_id this view currently owns. */
   pendingObservationQuery: string | null;
   agents: AgentsView;
+  /** 用户级自动化的权威投影：定义、状态、运行历史。 */
+  schedules: SchedulesView;
 }
 
 export const initialState: AppState = {
@@ -342,6 +406,7 @@ export const initialState: AppState = {
   observationStatus: 'idle',
   pendingObservationQuery: null,
   agents: emptyAgents(),
+  schedules: emptySchedules(),
 };
 
 // ── Actions ─────────────────────────────────────────────────────────
@@ -444,6 +509,14 @@ export type Action =
   | { type: 'agents_loaded'; entries: UiAgentEntry[]; problems: UiAgentProblem[] }
   | { type: 'agent_loaded'; name: string; agent: UiAgentDetail | null; error: string | null }
   | { type: 'agent_mutated'; name: string; ok: boolean; error: string | null; queryId: string | null }
+  /** 自动化页开始读取（列表 + 后台状态）。 */
+  | { type: 'schedules_opening' }
+  /** 一条 ScheduleManaged 应答；intent 为 null 表示读取，非 null 表示用户发起的写。 */
+  | { type: 'schedule_applied'; intent: ScheduleIntent | null; response: ScheduleResponse }
+  | { type: 'schedules_filter'; filter: ScheduleFilter }
+  | { type: 'schedule_select'; id: string | null }
+  | { type: 'schedules_busy'; busy: boolean }
+  | { type: 'schedules_closed' }
   | { type: 'approval_requested'; request: UiApprovalRequest }
   | { type: 'approval_resolved'; requestId: string }
   | { type: 'clarification_requested'; request: UiClarificationRequest }
@@ -639,6 +712,10 @@ function leaveSessionView(state: AppState): void {
   state.pendingAttachments = [];
   state.composerSeed = null;
   state.agents = emptyAgents();
+  // Schedule answers route to the requester session's stream: a different
+  // session is a different requester, so nothing from the previous one is
+  // still this view's truth.
+  state.schedules = emptySchedules();
 }
 
 /** TUI mark_turn_busy 的对应物：事件到来说明回合在跑。 */
@@ -1155,6 +1232,108 @@ export function reducer(state: AppState, action: Action): void {
       };
       // 成功写入后旧的详情已过期；失败时 runtime 什么也没写，详情仍然有效。
       if (action.ok) delete state.agents.detail[action.name];
+      return;
+    case 'schedules_opening':
+      state.schedules.loading = true;
+      state.schedules.error = null;
+      state.schedules.lastChange = null;
+      return;
+    case 'schedule_applied': {
+      const schedules = state.schedules;
+      const response = action.response;
+      if (action.intent !== null) schedules.busy = false;
+      else schedules.loading = false;
+      switch (response.kind) {
+        case 'list': {
+          schedules.items = response.schedules;
+          schedules.loaded = true;
+          schedules.error = null;
+          if (
+            schedules.selected !== null &&
+            !response.schedules.some((schedule) => schedule.id === schedules.selected)
+          ) {
+            // The new query no longer returns the selected row: keeping its
+            // detail on screen would describe a definition this view is not
+            // showing.
+            selectSchedule(state, null);
+          } else if (schedules.detail) {
+            const fresh = response.schedules.find(
+              (schedule) => schedule.id === schedules.detail?.id,
+            );
+            if (fresh) schedules.detail = fresh;
+          }
+          break;
+        }
+        case 'show':
+          upsertSchedule(schedules.items, response.schedule);
+          if (schedules.selected === null || schedules.selected === response.schedule.id) {
+            schedules.selected = response.schedule.id;
+            schedules.detail = response.schedule;
+          }
+          schedules.error = null;
+          break;
+        case 'runs':
+          schedules.runs = response.runs;
+          schedules.runsLoaded = true;
+          break;
+        case 'status':
+          schedules.status = response.status;
+          break;
+        case 'doctor':
+          schedules.doctor = { healthy: response.healthy, checks: response.checks };
+          break;
+        case 'changed': {
+          const intent: ScheduleIntent = action.intent ?? 'update';
+          schedules.lastChange = { intent, message: response.message };
+          schedules.error = null;
+          if (response.schedule) {
+            const schedule = response.schedule;
+            upsertSchedule(schedules.items, schedule);
+            if (intent === 'create') {
+              // The runtime returned the definition it persisted: open its
+              // detail (including the computed next run) instead of leaving
+              // the person on a list that has not re-read yet.
+              schedules.selected = schedule.id;
+              schedules.detail = schedule;
+              schedules.runs = [];
+              schedules.runsLoaded = false;
+            } else if (schedules.detail?.id === schedule.id) {
+              schedules.detail = schedule;
+            }
+          }
+          break;
+        }
+        case 'removed':
+          schedules.items = schedules.items.filter((schedule) => schedule.id !== response.id);
+          if (schedules.selected === response.id) selectSchedule(state, null);
+          if (schedules.detail?.id === response.id) {
+            schedules.detail = null;
+            schedules.runs = [];
+            schedules.runsLoaded = false;
+          }
+          if (action.intent !== null) {
+            schedules.lastChange = { intent: action.intent, message: '' };
+          }
+          break;
+        case 'error':
+          schedules.error = response.message;
+          break;
+      }
+      return;
+    }
+    case 'schedules_filter':
+      state.schedules.filter = action.filter;
+      state.schedules.loading = true;
+      selectSchedule(state, null);
+      return;
+    case 'schedule_select':
+      selectSchedule(state, action.id);
+      return;
+    case 'schedules_busy':
+      state.schedules.busy = action.busy;
+      return;
+    case 'schedules_closed':
+      state.schedules = emptySchedules();
       return;
     case 'approval_requested':
       if (state.current && !state.current.pendingApprovals.some((a) => a.id === action.request.id)) {

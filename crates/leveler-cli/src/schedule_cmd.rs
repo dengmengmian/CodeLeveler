@@ -27,10 +27,11 @@ use leveler_runtime_host::{
     DetachedRuntimeLaunch, NonInteractiveHandoffUi, ensure_default_runtime,
 };
 use leveler_schedule::{
-    DispatchSummary, Dispatcher, LocalTime, MisfirePolicy, NativeActionClass, NativeActionExecutor,
-    NativeExecutionReport, NativeExecutionRequest, NativeRunStatus, NewScheduleDefinition,
-    OverlapPolicy, RuntimeConnector, ScheduleAction, ScheduleStore, ScheduleTrigger, SessionPolicy,
-    UnattendedRequest, UsageReader, UsageSnapshot, WakeSource, WeekdaySet, parse_cron,
+    DefinitionUpdate, DispatchSummary, Dispatcher, LocalTime, MisfirePolicy, NativeActionClass,
+    NativeActionExecutor, NativeExecutionReport, NativeExecutionRequest, NativeRunStatus,
+    NewScheduleDefinition, OverlapPolicy, RuntimeConnector, ScheduleAction, ScheduleDefinition,
+    ScheduleStore, ScheduleTrigger, SessionPolicy, UnattendedRequest, UsageReader, UsageSnapshot,
+    WakeSource, WeekdaySet, parse_cron,
     wakeup::{self, WAKE_INTERVAL, WakeupSpec, WakeupStatus},
 };
 
@@ -79,62 +80,8 @@ pub async fn cmd_schedule(
                     .context("this command has no workspace; pass --workspace")?,
             };
             let action = build_action(command, native_action, native_input, agent_goal)?;
-            let trigger = match (at, every, daily, weekly, cron) {
-                (Some(at), None, None, None, None) => {
-                    if timezone.is_some() {
-                        anyhow::bail!("--timezone only applies to --daily, --weekly or --cron");
-                    }
-                    ScheduleTrigger::Once {
-                        at: parse_time(&at)?,
-                    }
-                }
-                (None, Some(every), None, None, None) => {
-                    if timezone.is_some() {
-                        anyhow::bail!("--timezone only applies to --daily, --weekly or --cron");
-                    }
-                    ScheduleTrigger::Every {
-                        anchor: anchor
-                            .as_deref()
-                            .map(parse_time)
-                            .transpose()?
-                            .unwrap_or_else(Utc::now),
-                        every: Duration::from_secs(every),
-                    }
-                }
-                (None, None, Some(time), None, None) => {
-                    let timezone = rule_timezone(timezone.as_deref())?;
-                    ScheduleTrigger::Daily {
-                        time: LocalTime::parse(&time).map_err(anyhow::Error::msg)?,
-                        timezone,
-                    }
-                }
-                (None, None, None, Some(days), None) => {
-                    let timezone = rule_timezone(timezone.as_deref())?;
-                    let time = local_time.as_deref().context(
-                        "--weekly needs --local-time <HH:MM> for the wall-clock run time",
-                    )?;
-                    ScheduleTrigger::Weekly {
-                        weekdays: WeekdaySet::parse(&days).map_err(anyhow::Error::msg)?,
-                        time: LocalTime::parse(time).map_err(anyhow::Error::msg)?,
-                        timezone,
-                    }
-                }
-                (None, None, None, None, Some(expression)) => {
-                    let timezone = rule_timezone(timezone.as_deref())?;
-                    parse_cron(&expression).map_err(anyhow::Error::msg)?;
-                    ScheduleTrigger::Cron {
-                        expression,
-                        timezone,
-                    }
-                }
-                (None, None, None, None, None) => {
-                    anyhow::bail!(
-                        "a schedule needs --at <RFC3339>, --every <SECONDS>, --daily <HH:MM>, \
-                         --weekly <DAYS> or --cron <EXPRESSION>"
-                    )
-                }
-                _ => unreachable!("clap makes the trigger flags mutually exclusive"),
-            };
+            let trigger =
+                build_trigger(at, every, anchor, daily, weekly, local_time, cron, timezone)?;
             let model = match model {
                 Some(reference) => Some(
                     ModelRef::parse(&reference)
@@ -167,22 +114,7 @@ pub async fn cmd_schedule(
                 .next()
                 .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
             if json {
-                print_json(&serde_json::json!({
-                    "id": definition.id,
-                    "name": definition.name,
-                    "workspace": definition.workspace,
-                    "action": action_json(&definition.action),
-                    "trigger": trigger_json(&definition.trigger),
-                    "session_policy": definition.session_policy.as_str(),
-                    "overlap": definition.overlap.as_str(),
-                    "mode": definition.mode.as_str(),
-                    "model": definition.model.as_ref().map(|model| model.to_string()),
-                    "timeout_secs": definition.timeout.as_secs(),
-                    "misfire": definition.misfire.as_str(),
-                    "misfire_grace_secs": definition.misfire_grace.as_secs(),
-                    "unattended_grant": grant_json(&definition),
-                    "next_occurrence": next,
-                }))?;
+                print_json(&definition_json(&definition, next.as_deref()))?;
             } else {
                 println!("added schedule {}", definition.id);
                 println!("  name:       {}", definition.name);
@@ -279,6 +211,7 @@ pub async fn cmd_schedule(
                     "enabled": definition.enabled,
                     "session_id": definition.session_id,
                     "unattended_grant": grant_json(&definition),
+                    "revision": definition.updated_at.to_rfc3339(),
                     "next_occurrence": next,
                     "recent_runs": last,
                 }))?;
@@ -327,6 +260,167 @@ pub async fn cmd_schedule(
                         println!("    {}", run_line(run));
                     }
                 }
+            }
+        }
+        ScheduleCommand::Update {
+            id,
+            name,
+            workspace,
+            command,
+            native_action,
+            native_input,
+            agent_goal,
+            at,
+            every,
+            anchor,
+            daily,
+            weekly,
+            local_time,
+            cron,
+            timezone,
+            mode,
+            model,
+            session_policy,
+            overlap,
+            timeout,
+            misfire,
+            misfire_grace,
+            expected_revision,
+            json,
+        } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            let Some(existing) = store.definition(&id).await? else {
+                anyhow::bail!("schedule {id} not found");
+            };
+            let replaces_action =
+                command.is_some() || native_action.is_some() || agent_goal.is_some();
+            let action = if replaces_action {
+                build_action(command, native_action, native_input, agent_goal)?
+            } else {
+                existing.action.clone()
+            };
+            let replaces_trigger = at.is_some()
+                || every.is_some()
+                || daily.is_some()
+                || weekly.is_some()
+                || cron.is_some();
+            let trigger = if replaces_trigger {
+                build_trigger(at, every, anchor, daily, weekly, local_time, cron, timezone)?
+            } else {
+                if timezone.is_some() {
+                    anyhow::bail!(
+                        "--timezone only applies together with a new calendar rule \
+                         (--daily, --weekly or --cron)"
+                    );
+                }
+                existing.trigger.clone()
+            };
+            let model = match model.as_deref() {
+                Some("") => None,
+                Some(reference) => Some(
+                    ModelRef::parse(reference)
+                        .with_context(|| format!("`{reference}` is not a valid model reference"))?,
+                ),
+                None => existing.model.clone(),
+            };
+            let expected = expected_revision.as_deref().map(parse_time).transpose()?;
+            let definition = store
+                .update_definition(
+                    &id,
+                    DefinitionUpdate {
+                        name: name.unwrap_or_else(|| existing.name.clone()),
+                        workspace: workspace.unwrap_or_else(|| existing.workspace.clone()),
+                        action,
+                        trigger,
+                        session_policy: session_policy
+                            .map(map_session_policy)
+                            .unwrap_or(existing.session_policy),
+                        overlap: overlap.map(map_overlap_policy).unwrap_or(existing.overlap),
+                        mode: mode.map(schedule_mode).unwrap_or(existing.mode),
+                        model,
+                        timeout: timeout.map(Duration::from_secs).unwrap_or(existing.timeout),
+                        misfire: misfire.map(misfire_policy).unwrap_or(existing.misfire),
+                        misfire_grace: misfire_grace
+                            .map(Duration::from_secs)
+                            .unwrap_or(existing.misfire_grace),
+                        // A grant survives only while it still covers the new
+                        // declaration; the store drops it otherwise.
+                        grant: None,
+                    },
+                    expected,
+                )
+                .await
+                .with_context(|| {
+                    format!("updating schedule {id}; re-read it if another editor changed it")
+                })?;
+            let next = store
+                .occurrences(&id, 1)
+                .await?
+                .into_iter()
+                .next()
+                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            if json {
+                print_json(&definition_json(&definition, next.as_deref()))?;
+            } else {
+                println!("updated schedule {}", definition.id);
+                println!("  name:       {}", definition.name);
+                println!("  action:     {}", action_text(&definition.action));
+                println!("  trigger:    {}", trigger_text(&definition.trigger));
+                println!("  grant:      {}", grant_text(&definition));
+                println!("  next:       {}", next.unwrap_or_else(|| "none".into()));
+            }
+        }
+        ScheduleCommand::Grant {
+            id,
+            allow_external_side_effects,
+            json,
+        } => {
+            let id = leveler_schedule::ScheduleId::from(id);
+            let Some(existing) = store.definition(&id).await? else {
+                anyhow::bail!("schedule {id} not found");
+            };
+            let definition = store
+                .update_definition(
+                    &id,
+                    DefinitionUpdate {
+                        name: existing.name.clone(),
+                        workspace: existing.workspace.clone(),
+                        action: existing.action.clone(),
+                        trigger: existing.trigger.clone(),
+                        session_policy: existing.session_policy,
+                        overlap: existing.overlap,
+                        mode: existing.mode,
+                        model: existing.model.clone(),
+                        timeout: existing.timeout,
+                        misfire: existing.misfire,
+                        misfire_grace: existing.misfire_grace,
+                        grant: Some(UnattendedRequest {
+                            allow_external_side_effects,
+                        }),
+                    },
+                    Some(existing.updated_at),
+                )
+                .await
+                .context("issuing the unattended grant")?;
+            let next = store
+                .occurrences(&id, 1)
+                .await?
+                .into_iter()
+                .next()
+                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            if json {
+                print_json(&definition_json(&definition, next.as_deref()))?;
+            } else {
+                println!("granted unattended execution for schedule {id}");
+                println!(
+                    "  covers:     {}",
+                    if allow_external_side_effects {
+                        "actions with external side effects"
+                    } else {
+                        "actions without external side effects"
+                    }
+                );
+                println!("  grant:      {}", grant_text(&definition));
             }
         }
         ScheduleCommand::Runs {
@@ -854,6 +948,78 @@ fn build_action(
     }
 }
 
+/// One and only one trigger rule. `add` and `update` share this builder so a
+/// rule means the same thing on both commands; the argument order matches the
+/// flag names rather than the struct fields.
+#[allow(clippy::too_many_arguments)]
+fn build_trigger(
+    at: Option<String>,
+    every: Option<u64>,
+    anchor: Option<String>,
+    daily: Option<String>,
+    weekly: Option<String>,
+    local_time: Option<String>,
+    cron: Option<String>,
+    timezone: Option<String>,
+) -> anyhow::Result<ScheduleTrigger> {
+    match (at, every, daily, weekly, cron) {
+        (Some(at), None, None, None, None) => {
+            if timezone.is_some() {
+                anyhow::bail!("--timezone only applies to --daily, --weekly or --cron");
+            }
+            Ok(ScheduleTrigger::Once {
+                at: parse_time(&at)?,
+            })
+        }
+        (None, Some(every), None, None, None) => {
+            if timezone.is_some() {
+                anyhow::bail!("--timezone only applies to --daily, --weekly or --cron");
+            }
+            Ok(ScheduleTrigger::Every {
+                anchor: anchor
+                    .as_deref()
+                    .map(parse_time)
+                    .transpose()?
+                    .unwrap_or_else(Utc::now),
+                every: Duration::from_secs(every),
+            })
+        }
+        (None, None, Some(time), None, None) => {
+            let timezone = rule_timezone(timezone.as_deref())?;
+            Ok(ScheduleTrigger::Daily {
+                time: LocalTime::parse(&time).map_err(anyhow::Error::msg)?,
+                timezone,
+            })
+        }
+        (None, None, None, Some(days), None) => {
+            let timezone = rule_timezone(timezone.as_deref())?;
+            let time = local_time
+                .as_deref()
+                .context("--weekly needs --local-time <HH:MM> for the wall-clock run time")?;
+            Ok(ScheduleTrigger::Weekly {
+                weekdays: WeekdaySet::parse(&days).map_err(anyhow::Error::msg)?,
+                time: LocalTime::parse(time).map_err(anyhow::Error::msg)?,
+                timezone,
+            })
+        }
+        (None, None, None, None, Some(expression)) => {
+            let timezone = rule_timezone(timezone.as_deref())?;
+            parse_cron(&expression).map_err(anyhow::Error::msg)?;
+            Ok(ScheduleTrigger::Cron {
+                expression,
+                timezone,
+            })
+        }
+        (None, None, None, None, None) => {
+            anyhow::bail!(
+                "a schedule needs --at <RFC3339>, --every <SECONDS>, --daily <HH:MM>, \
+                 --weekly <DAYS> or --cron <EXPRESSION>"
+            )
+        }
+        _ => unreachable!("clap makes the trigger flags mutually exclusive"),
+    }
+}
+
 fn action_kind_text(action: &ScheduleAction) -> &'static str {
     action.kind().as_str()
 }
@@ -886,6 +1052,28 @@ fn action_json(action: &ScheduleAction) -> serde_json::Value {
     }
 }
 
+/// The shape `add`, `update` and `grant` print. The revision is included so a
+/// caller can use it as `--expected-revision` on the next edit.
+fn definition_json(definition: &ScheduleDefinition, next: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "id": definition.id,
+        "name": definition.name,
+        "workspace": definition.workspace,
+        "action": action_json(&definition.action),
+        "trigger": trigger_json(&definition.trigger),
+        "session_policy": definition.session_policy.as_str(),
+        "overlap": definition.overlap.as_str(),
+        "mode": definition.mode.as_str(),
+        "model": definition.model.as_ref().map(|model| model.to_string()),
+        "timeout_secs": definition.timeout.as_secs(),
+        "misfire": definition.misfire.as_str(),
+        "misfire_grace_secs": definition.misfire_grace.as_secs(),
+        "unattended_grant": grant_json(definition),
+        "revision": definition.updated_at.to_rfc3339(),
+        "next_occurrence": next,
+    })
+}
+
 fn grant_json(definition: &leveler_schedule::ScheduleDefinition) -> serde_json::Value {
     match &definition.unattended {
         Some(grant) => serde_json::json!({
@@ -897,10 +1085,9 @@ fn grant_json(definition: &leveler_schedule::ScheduleDefinition) -> serde_json::
             "external_side_effects": grant.external_side_effects,
             "granted_at": grant.granted_at,
         }),
-        None if definition.mode == PermissionProfile::FullAccess => serde_json::json!({
-            "full_access": true,
-            "detail": "Full Access is the explicit no-prompt profile; no separate grant exists",
-        }),
+        // The permission profile is never a durable authorization. A missing
+        // grant must stay missing here, whatever interactive profile the
+        // definition runs under.
         None => serde_json::Value::Null,
     }
 }
@@ -922,9 +1109,6 @@ fn grant_text(definition: &leveler_schedule::ScheduleDefinition) -> String {
                 "no"
             }
         ),
-        None if definition.mode == PermissionProfile::FullAccess => {
-            "Full Access (no separate grant)".into()
-        }
         None => "none — native/agent runs are refused before starting".into(),
     }
 }

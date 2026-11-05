@@ -6,6 +6,7 @@ import type { Dispatch } from 'react';
 import * as api from './api';
 import { formatClock, modelRefString } from './format';
 import { loadLastSession, saveLastSession } from './lastSession';
+import type { ScheduleIntent } from './schedules';
 import { getToken } from './token';
 import { shouldRefreshObservability } from './observabilityView';
 import { committedFinalAnswer } from './executionRounds';
@@ -32,12 +33,18 @@ import type {
   ModelRef,
   PermissionProfile,
   RuntimeEvent,
+  ScheduleFilter,
+  ScheduleRequest,
   SessionId,
   UiHistoryEntry,
   UiAgentDraft,
   UiAgentScope,
   UiSessionSnapshot,
 } from '../types/protocol';
+
+/** What this client's in-flight schedule query asked for, so only its own
+ *  answer (and only for the definition still selected) can land. */
+type ScheduleReadKind = 'list' | 'status' | 'show' | 'runs' | 'doctor';
 
 /** 产品轴合法值（wire 契约：SetProductAxes 的注释）。 */
 export const COLLABORATIONS = ['chat', 'plan', 'goal'] as const;
@@ -65,6 +72,20 @@ export class RuntimeBridge {
   /** The client's own in-flight session-history query, so a foreign or stale
    *  answer never replaces this client's transcript. */
   private pendingHistoryQueryId: string | null = null;
+  /** Schedule reads this client owns, keyed by query id. */
+  private readonly pendingScheduleReads = new Map<
+    string,
+    { kind: ScheduleReadKind; id?: string; filter?: ScheduleFilter; generation: number }
+  >();
+  /** One management mutation at a time; the surface disables conflicting actions. */
+  private pendingScheduleMutation: { queryId: string; intent: ScheduleIntent } | null = null;
+  /** A list/status pair this client is waiting for; a refresh waits for it so
+   *  polls never stack reads on top of each other. */
+  private scheduleBulkOutstanding = 0;
+  private scheduleRefreshQueued = false;
+  /** Bumped when the automation view closes or its requester session changes:
+   *  an answer from the previous view must not repaint the new one. */
+  private scheduleGeneration = 0;
   /** Sessions whose durable history this connection already loaded. */
   private readonly historyLoaded = new Set<SessionId>();
   /** True while durable history is being replayed into a scratch view. The
@@ -563,6 +584,45 @@ export class RuntimeBridge {
         if (ev.accounting) this.sink({ type: 'context_usage', accounting: ev.accounting });
         else this.sink({ type: 'context_unavailable' });
         break;
+      case 'schedule_managed': {
+        // Schedule answers are live runtime facts; a durable-history replay
+        // must never paint them into a transcript.
+        if (this.replaying) break;
+        if (ev.requester_session_id !== current.id) break;
+        if (this.pendingScheduleMutation?.queryId === ev.query_id) {
+          const { intent } = this.pendingScheduleMutation;
+          this.pendingScheduleMutation = null;
+          this.sink({ type: 'schedule_applied', intent, response: ev.response });
+          if (ev.response.kind === 'changed' || ev.response.kind === 'removed') {
+            // The answer confirms one operation; the list/status/detail the
+            // person sees is still re-read from the store's authority.
+            this.refreshSchedules();
+            const selected = this.getState().schedules.selected;
+            if (selected) this.loadScheduleDetail(selected);
+          }
+          break;
+        }
+        const read = this.pendingScheduleReads.get(ev.query_id);
+        if (!read) break; // another client's answer, or one this view never asked for
+        this.pendingScheduleReads.delete(ev.query_id);
+        const bulk = read.kind === 'list' || read.kind === 'status';
+        if (bulk) {
+          this.scheduleBulkOutstanding = Math.max(0, this.scheduleBulkOutstanding - 1);
+        }
+        const staleList =
+          read.kind === 'list' && read.filter !== this.getState().schedules.filter;
+        const staleSelection =
+          (read.kind === 'show' || read.kind === 'runs') &&
+          this.getState().schedules.selected !== read.id;
+        if (read.generation === this.scheduleGeneration && !staleList && !staleSelection) {
+          this.sink({ type: 'schedule_applied', intent: null, response: ev.response });
+        }
+        if (bulk && this.scheduleBulkOutstanding === 0 && this.scheduleRefreshQueued) {
+          this.scheduleRefreshQueued = false;
+          this.readSchedules(current.id, this.getState().schedules.filter);
+        }
+        break;
+      }
       case 'context_compacted':
         // The compaction is a durable conversation fact, not only a fading
         // toast: everything above this point is a summary to the model now, and
@@ -631,21 +691,24 @@ export class RuntimeBridge {
 
   // ── 命令发送 ──────────────────────────────────────────────────────
 
-  private deliver(command: ClientCommand, commandId?: string): void {
+  private deliver(command: ClientCommand, commandId?: string): boolean {
     const sessionId =
       command.type === 'request_session_list' || command.type === 'quit'
         ? (this.getState().current?.id ?? '')
-        : ((command as { session_id?: SessionId }).session_id ??
-          this.getState().current?.id ??
-          '');
+        : command.type === 'manage_schedule'
+          ? command.requester_session_id
+          : ((command as { session_id?: SessionId }).session_id ??
+            this.getState().current?.id ??
+            '');
     const versioned = SNAPSHOT_VERSIONED_COMMANDS.includes(command.type);
     const expectedVersion = versioned ? this.snapshotVersions.get(sessionId) : undefined;
     if (versioned && expectedVersion === undefined) {
       this.ws.send({ type: 'snapshot', session_id: sessionId });
       this.sink({ type: 'notice', message: '请先刷新会话，再重新修改设置。' });
-      return;
+      return false;
     }
-    this.ws.send(deliverFrame(sessionId, command, commandId, expectedVersion));
+    const sent = this.ws.send(deliverFrame(sessionId, command, commandId, expectedVersion));
+    return sent;
   }
 
   requestSessionList(): void {
@@ -698,6 +761,13 @@ export class RuntimeBridge {
   private leaveSessionSubscription(): void {
     this.pendingSessionId = null;
     this.awaitingNewSession = false;
+    // Schedule answers are addressed to the requester session; a different
+    // session must not inherit a read or mutation started by the old one.
+    this.scheduleGeneration += 1;
+    this.pendingScheduleReads.clear();
+    this.pendingScheduleMutation = null;
+    this.scheduleBulkOutstanding = 0;
+    this.scheduleRefreshQueued = false;
     this.ws.setSession(null);
   }
 
@@ -1028,6 +1098,153 @@ export class RuntimeBridge {
     this.pendingAgentMutationQueryIds.add(queryId);
     this.deliver({ type: 'delete_agent', session_id: current.id, scope, name, query_id: queryId });
     return queryId;
+  }
+
+  // ── 用户级定时任务（结构化管理 API；schedule store 是唯一权威）──────
+  // 每个方法都通过当前会话的运行时；未打开会话时明确拒绝，绝不切换身份。
+
+  openSchedules(): void {
+    const current = this.getState().current;
+    if (!current) {
+      this.notice('先打开一个会话：定时任务通过该会话所属的运行时管理。');
+      return;
+    }
+    this.scheduleGeneration += 1;
+    this.pendingScheduleReads.clear();
+    this.pendingScheduleMutation = null;
+    this.scheduleBulkOutstanding = 0;
+    this.scheduleRefreshQueued = false;
+    this.sink({ type: 'schedules_opening' });
+    this.readSchedules(current.id, this.getState().schedules.filter);
+  }
+
+  /** Re-read the list and the background status without flashing a spinner. */
+  refreshSchedules(): void {
+    const current = this.getState().current;
+    if (!current) return;
+    if (this.scheduleBulkOutstanding > 0) {
+      this.scheduleRefreshQueued = true;
+      return;
+    }
+    this.readSchedules(current.id, this.getState().schedules.filter);
+  }
+
+  selectSchedule(id: string | null): void {
+    this.sink({ type: 'schedule_select', id });
+    if (id) this.loadScheduleDetail(id);
+  }
+
+  loadScheduleDetail(id: string): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.sendScheduleRead('show', { action: 'show', id }, current.id, { id });
+    this.sendScheduleRead(
+      'runs',
+      { action: 'runs', definition: id, limit: 50 },
+      current.id,
+      { id },
+    );
+  }
+
+  setScheduleFilter(filter: ScheduleFilter): void {
+    this.sink({ type: 'schedules_filter', filter });
+    this.refreshSchedules();
+  }
+
+  /**
+   * Send one structured management request. `intent` is what the person asked
+   * for, so a refusal is displayed against that action and a success is never
+   * attributed to a different one.
+   */
+  manageSchedule(request: ScheduleRequest, intent: ScheduleIntent): boolean {
+    const current = this.getState().current;
+    if (!current) {
+      this.notice('先打开一个会话：定时任务通过该会话所属的运行时管理。');
+      return false;
+    }
+    if (this.pendingScheduleMutation !== null) {
+      this.notice('上一个定时任务操作还在处理中。');
+      return false;
+    }
+    const queryId = crypto.randomUUID();
+    this.pendingScheduleMutation = { queryId, intent };
+    this.sink({ type: 'schedules_busy', busy: true });
+    const sent = this.deliver({
+      type: 'manage_schedule',
+      requester_session_id: current.id,
+      query_id: queryId,
+      request,
+    });
+    if (!sent) {
+      this.pendingScheduleMutation = null;
+      this.sink({
+        type: 'schedule_applied',
+        intent,
+        response: { kind: 'error', message: '与运行时的连接已断开，操作未发出。' },
+      });
+      return false;
+    }
+    return true;
+  }
+
+  setScheduleWakeup(enable: boolean): void {
+    this.manageSchedule(
+      { action: enable ? 'wakeup_enable' : 'wakeup_disable' },
+      enable ? 'wakeup_enable' : 'wakeup_disable',
+    );
+  }
+
+  checkScheduleWakeup(): void {
+    const current = this.getState().current;
+    if (!current) return;
+    this.sendScheduleRead('doctor', { action: 'wakeup_doctor' }, current.id);
+  }
+
+  closeSchedules(): void {
+    this.scheduleGeneration += 1;
+    this.pendingScheduleReads.clear();
+    this.pendingScheduleMutation = null;
+    this.scheduleBulkOutstanding = 0;
+    this.scheduleRefreshQueued = false;
+    this.sink({ type: 'schedules_closed' });
+  }
+
+  private readSchedules(sessionId: SessionId, filter: ScheduleFilter): void {
+    this.scheduleBulkOutstanding = 2;
+    this.sendScheduleRead('list', { action: 'list', filter }, sessionId, { filter });
+    this.sendScheduleRead('status', { action: 'status' }, sessionId);
+  }
+
+  private sendScheduleRead(
+    kind: ScheduleReadKind,
+    request: ScheduleRequest,
+    sessionId: SessionId,
+    extra: { id?: string; filter?: ScheduleFilter } = {},
+  ): void {
+    const queryId = crypto.randomUUID();
+    this.pendingScheduleReads.set(queryId, {
+      kind,
+      id: extra.id,
+      filter: extra.filter,
+      generation: this.scheduleGeneration,
+    });
+    const sent = this.deliver({
+      type: 'manage_schedule',
+      requester_session_id: sessionId,
+      query_id: queryId,
+      request,
+    });
+    if (!sent) {
+      this.pendingScheduleReads.delete(queryId);
+      if (kind === 'list' || kind === 'status') {
+        this.scheduleBulkOutstanding = Math.max(0, this.scheduleBulkOutstanding - 1);
+      }
+      this.sink({
+        type: 'schedule_applied',
+        intent: null,
+        response: { kind: 'error', message: '与运行时的连接已断开，未能读取定时任务。' },
+      });
+    }
   }
 
   restoreCheckpoint(checkpointId: CheckpointId): void {

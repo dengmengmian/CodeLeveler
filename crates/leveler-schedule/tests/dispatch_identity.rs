@@ -21,6 +21,7 @@ use leveler_client_protocol::{
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
 use leveler_schedule::{
     Dispatcher, NewScheduleDefinition, RunState, RuntimeConnector, ScheduleStore, ScheduleTrigger,
+    UnattendedRequest,
 };
 use tokio::sync::broadcast;
 
@@ -179,7 +180,9 @@ async fn a_run_never_adopts_another_clients_identical_command() {
             timeout: Duration::from_secs(1),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
-            unattended: None,
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
         })
         .await
         .unwrap();
@@ -454,7 +457,9 @@ async fn identical_text_from_two_clients_and_a_schedule_keeps_three_identities()
             timeout: Duration::from_secs(10),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
-            unattended: None,
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
         })
         .await
         .unwrap();

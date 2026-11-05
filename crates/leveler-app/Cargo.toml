@@ -31,9 +31,11 @@ leveler-engine = { workspace = true }
 leveler-context = { workspace = true }
 leveler-client-protocol = { workspace = true }
 leveler-local-transport = { workspace = true }
+leveler-schedule = { workspace = true }
 leveler-media = { workspace = true }
 arboard = "3"
 serde = { workspace = true }
+schemars = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 serde_json = { workspace = true }

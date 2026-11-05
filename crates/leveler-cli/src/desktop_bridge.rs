@@ -1,4 +1,7 @@
 //! JSONL desktop adapter; runtime host owns daemon lifetime and session truth.
+use leveler_client_protocol::schedule::{
+    ScheduleActionWire, ScheduleDraft, SchedulePatch, ScheduleRequest, ScheduleTriggerWire,
+};
 use leveler_client_protocol::{
     ClientCommand, CommandEnvelope, InteractiveRuntimeClient, SessionId,
 };
@@ -80,6 +83,14 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
             if query_id
                 .as_ref()
                 .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
+        // Scheduled automation is a structured adapter over the schedule store:
+        // the runtime answers `ScheduleManaged` on the requester session's
+        // stream, and the bridge only bounds the payload. Definition semantics
+        // (empty name, unknown rule, stale revision) stay owned by the
+        // schedule manager so every client sees the same refusal.
+        ClientCommand::ManageSchedule {
+            query_id, request, ..
+        } if valid_desktop_command_id(query_id) && valid_desktop_schedule_request(request) => {}
         ClientCommand::ResumeTask { content, .. }
             if !content.is_empty() && content.chars().count() <= 100_000 => {}
         ClientCommand::CancelBackgroundTask { task_id, .. }
@@ -105,8 +116,151 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
 }
 
 fn valid_desktop_query_id(id: &Option<leveler_core::CommandId>) -> bool {
-    id.as_ref()
-        .is_some_and(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256)
+    id.as_ref().is_some_and(valid_desktop_command_id)
+}
+
+fn valid_desktop_command_id(id: &leveler_core::CommandId) -> bool {
+    !id.as_str().trim().is_empty() && id.as_str().len() <= 256
+}
+
+const MAX_DESKTOP_SCHEDULE_ID: usize = 256;
+const MAX_DESKTOP_SCHEDULE_NAME: usize = 1_024;
+const MAX_DESKTOP_SCHEDULE_PATH: usize = 4_096;
+const MAX_DESKTOP_SCHEDULE_FIELD: usize = 256;
+const MAX_DESKTOP_SCHEDULE_TEXT: usize = 100_000;
+const MAX_DESKTOP_SCHEDULE_RUNS: u32 = 500;
+
+fn valid_desktop_schedule_id(id: &str) -> bool {
+    !id.trim().is_empty() && id.len() <= MAX_DESKTOP_SCHEDULE_ID
+}
+
+fn valid_desktop_schedule_field(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.len() <= MAX_DESKTOP_SCHEDULE_FIELD)
+}
+
+fn valid_desktop_schedule_action(action: &ScheduleActionWire) -> bool {
+    match action {
+        ScheduleActionWire::Agent { goal } => {
+            !goal.trim().is_empty() && goal.len() <= MAX_DESKTOP_SCHEDULE_TEXT
+        }
+        ScheduleActionWire::Shell { command } => {
+            !command.trim().is_empty() && command.len() <= MAX_DESKTOP_SCHEDULE_TEXT
+        }
+        ScheduleActionWire::Native { action, input } => {
+            !action.trim().is_empty()
+                && action.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+                && input.len() <= MAX_DESKTOP_SCHEDULE_TEXT
+        }
+    }
+}
+
+fn valid_desktop_schedule_trigger(trigger: &ScheduleTriggerWire) -> bool {
+    match trigger {
+        ScheduleTriggerWire::Once { at } => {
+            !at.trim().is_empty() && at.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+        }
+        ScheduleTriggerWire::Every { every_secs, anchor } => {
+            *every_secs > 0 && valid_desktop_schedule_field(anchor.as_deref())
+        }
+        ScheduleTriggerWire::Daily { time, timezone } => {
+            !time.trim().is_empty()
+                && time.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+                && valid_desktop_schedule_field(timezone.as_deref())
+        }
+        ScheduleTriggerWire::Weekly {
+            weekdays,
+            time,
+            timezone,
+        } => {
+            !weekdays.trim().is_empty()
+                && weekdays.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+                && !time.trim().is_empty()
+                && time.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+                && valid_desktop_schedule_field(timezone.as_deref())
+        }
+        ScheduleTriggerWire::Cron {
+            expression,
+            timezone,
+        } => {
+            !expression.trim().is_empty()
+                && expression.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+                && valid_desktop_schedule_field(timezone.as_deref())
+        }
+    }
+}
+
+fn valid_desktop_schedule_draft(draft: &ScheduleDraft) -> bool {
+    !draft.name.trim().is_empty()
+        && draft.name.len() <= MAX_DESKTOP_SCHEDULE_NAME
+        && !draft.workspace.trim().is_empty()
+        && draft.workspace.len() <= MAX_DESKTOP_SCHEDULE_PATH
+        && valid_desktop_schedule_action(&draft.action)
+        && valid_desktop_schedule_trigger(&draft.trigger)
+        && valid_desktop_schedule_field(draft.session_policy.as_deref())
+        && valid_desktop_schedule_field(draft.overlap.as_deref())
+        && valid_desktop_schedule_field(draft.mode.as_deref())
+        && valid_desktop_schedule_field(draft.model.as_deref())
+        && valid_desktop_schedule_field(draft.misfire.as_deref())
+}
+
+fn valid_desktop_schedule_patch(patch: &SchedulePatch) -> bool {
+    patch
+        .name
+        .as_ref()
+        .is_none_or(|name| name.len() <= MAX_DESKTOP_SCHEDULE_NAME)
+        && patch
+            .workspace
+            .as_ref()
+            .is_none_or(|workspace| workspace.len() <= MAX_DESKTOP_SCHEDULE_PATH)
+        && patch
+            .action
+            .as_ref()
+            .is_none_or(valid_desktop_schedule_action)
+        && patch
+            .trigger
+            .as_ref()
+            .is_none_or(valid_desktop_schedule_trigger)
+        && valid_desktop_schedule_field(patch.session_policy.as_deref())
+        && valid_desktop_schedule_field(patch.overlap.as_deref())
+        && valid_desktop_schedule_field(patch.mode.as_deref())
+        && valid_desktop_schedule_field(patch.model.as_deref())
+        && valid_desktop_schedule_field(patch.misfire.as_deref())
+}
+
+fn valid_desktop_schedule_request(request: &ScheduleRequest) -> bool {
+    match request {
+        ScheduleRequest::List { .. }
+        | ScheduleRequest::Status
+        | ScheduleRequest::WakeupEnable
+        | ScheduleRequest::WakeupDisable
+        | ScheduleRequest::WakeupDoctor => true,
+        ScheduleRequest::Show { id }
+        | ScheduleRequest::Pause { id }
+        | ScheduleRequest::Resume { id }
+        | ScheduleRequest::RunNow { id }
+        | ScheduleRequest::Cancel { id }
+        | ScheduleRequest::Remove { id }
+        | ScheduleRequest::RevokeGrant { id }
+        | ScheduleRequest::Grant { id, .. } => valid_desktop_schedule_id(id),
+        ScheduleRequest::Create { draft } => valid_desktop_schedule_draft(draft),
+        ScheduleRequest::Update {
+            id,
+            expected_revision,
+            patch,
+        } => {
+            valid_desktop_schedule_id(id)
+                && expected_revision.as_ref().is_none_or(|revision| {
+                    !revision.trim().is_empty() && revision.len() <= MAX_DESKTOP_SCHEDULE_FIELD
+                })
+                && valid_desktop_schedule_patch(patch)
+        }
+        ScheduleRequest::Runs { definition, limit } => {
+            definition
+                .as_ref()
+                .is_none_or(|id| valid_desktop_schedule_id(id))
+                && limit.is_none_or(|limit| (1..=MAX_DESKTOP_SCHEDULE_RUNS).contains(&limit))
+        }
+    }
 }
 
 fn valid_desktop_image(attachment: &leveler_client_protocol::AttachmentRef) -> bool {
@@ -853,6 +1007,130 @@ mod tests {
             CollaborationMode::interactive_session(),
             CollaborationMode::default()
         );
+    }
+
+    #[test]
+    fn desktop_schedule_management_is_session_scoped_and_bounded() {
+        use leveler_client_protocol::schedule::{
+            ScheduleActionWire, ScheduleDraft, SchedulePatch, ScheduleRequest, ScheduleTriggerWire,
+        };
+        let session = SessionId::new("desktop-schedule");
+        let command = |requester: &SessionId, query_id: &str, request: ScheduleRequest| {
+            ClientCommand::ManageSchedule {
+                requester_session_id: requester.clone(),
+                query_id: query_id.into(),
+                request: Box::new(request),
+            }
+        };
+        let draft = ScheduleDraft {
+            name: "morning report".into(),
+            workspace: "/repo".into(),
+            action: ScheduleActionWire::Agent {
+                goal: "summarize the night".into(),
+            },
+            trigger: ScheduleTriggerWire::Daily {
+                time: "09:00".into(),
+                timezone: Some("Asia/Shanghai".into()),
+            },
+            session_policy: None,
+            overlap: None,
+            mode: Some("assisted".into()),
+            model: None,
+            timeout_secs: None,
+            misfire: None,
+            misfire_grace_secs: None,
+            grant_unattended: false,
+            allow_external_side_effects: false,
+        };
+        for request in [
+            ScheduleRequest::List { filter: None },
+            ScheduleRequest::Status,
+            ScheduleRequest::WakeupDoctor,
+            ScheduleRequest::Show {
+                id: "schedule-1".into(),
+            },
+            ScheduleRequest::Create {
+                draft: draft.clone(),
+            },
+            ScheduleRequest::Update {
+                id: "schedule-1".into(),
+                expected_revision: Some("rev-1".into()),
+                patch: SchedulePatch {
+                    name: Some("renamed".into()),
+                    ..SchedulePatch::default()
+                },
+            },
+            ScheduleRequest::Runs {
+                definition: Some("schedule-1".into()),
+                limit: Some(50),
+            },
+        ] {
+            assert!(
+                validate_command(&session, &command(&session, "query-1", request.clone())).is_ok()
+            );
+            assert!(
+                validate_command(
+                    &SessionId::new("other-session"),
+                    &command(&session, "query-1", request.clone())
+                )
+                .is_err()
+            );
+        }
+        for query_id in ["", " ", &"a".repeat(257)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &command(&session, query_id, ScheduleRequest::Status)
+                )
+                .is_err()
+            );
+        }
+        for id in [String::new(), " ".into(), "a".repeat(257)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &command(&session, "query-1", ScheduleRequest::Show { id })
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_command(
+                &session,
+                &command(
+                    &session,
+                    "query-1",
+                    ScheduleRequest::Runs {
+                        definition: None,
+                        limit: Some(501),
+                    }
+                )
+            )
+            .is_err()
+        );
+        let too_long = "a".repeat(100_001);
+        for action in [
+            ScheduleActionWire::Agent {
+                goal: too_long.clone(),
+            },
+            ScheduleActionWire::Shell {
+                command: too_long.clone(),
+            },
+            ScheduleActionWire::Native {
+                action: "open".into(),
+                input: too_long.clone(),
+            },
+        ] {
+            let mut bad = draft.clone();
+            bad.action = action;
+            assert!(
+                validate_command(
+                    &session,
+                    &command(&session, "query-1", ScheduleRequest::Create { draft: bad })
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

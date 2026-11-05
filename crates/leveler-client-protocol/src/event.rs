@@ -218,6 +218,14 @@ pub enum RuntimeEvent {
         query_id: String,
         index: crate::UiGlobalTaskIndex,
     },
+    /// The answer to [`crate::ClientCommand::ManageSchedule`]. `response`
+    /// carries domain failures too; a transport failure is the only case where
+    /// no answer arrives.
+    ScheduleManaged {
+        requester_session_id: crate::SessionId,
+        query_id: crate::CommandId,
+        response: Box<crate::schedule::ScheduleResponse>,
+    },
     /// The runtime finished booting and is ready for commands.
     RuntimeReady,
     /// The build this client's stream is connected to, observed when the

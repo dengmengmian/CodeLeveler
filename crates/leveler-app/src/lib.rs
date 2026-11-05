@@ -31,6 +31,7 @@ mod prompt_assist;
 mod prompt_bridge;
 pub mod runtime_boot;
 mod runtime_identity;
+mod schedule_tools;
 mod session;
 pub mod session_history;
 pub mod session_projection;
@@ -112,6 +113,8 @@ pub enum AppError {
     VerificationFailed(String),
     #[error("engine error: {0}")]
     Engine(String),
+    #[error("schedule error: {0}")]
+    Schedule(#[from] leveler_schedule::ScheduleError),
     /// An earlier tool call was interrupted before its outcome was recorded.
     /// Continuing would risk running it twice, so the task stops here until
     /// the user acknowledges the crash window.
@@ -682,6 +685,10 @@ pub struct Application {
     /// Durable runtime identity, loaded (and minted on first use) lazily from
     /// the state directory. Cached: the id cannot change within one process.
     runtime_id: OnceLock<leveler_core::RuntimeId>,
+    /// The user-global scheduled-automation manager, opened lazily on the
+    /// first schedule request. It owns no scheduler: definitions, runs and
+    /// grants live in the same store the CLI and the OS wakeup driver use.
+    schedule: tokio::sync::Mutex<Option<Arc<leveler_schedule::ScheduleManager>>>,
     /// This process's boot: started before the first ownership-sensitive
     /// write, held until the application is dropped. Command receipts, task
     /// ownership and running turns all carry its one id.
@@ -893,6 +900,7 @@ impl Application {
             computer,
             native,
             runtime_id: OnceLock::new(),
+            schedule: tokio::sync::Mutex::new(None),
             boot: std::sync::Mutex::new(None),
             in_flight_commands: Default::default(),
             default_model_notice: std::sync::Mutex::new(None),
@@ -954,6 +962,31 @@ impl Application {
         }
         let id = runtime_identity::load_or_create_runtime_id(&self.layout.state_dir)?;
         Ok(self.runtime_id.get_or_init(|| id).clone())
+    }
+
+    /// The scheduled-automation manager for this process, opened on first use.
+    ///
+    /// The manager is a client of the user-global schedule database, not a
+    /// scheduler: every run is still claimed and executed by the existing
+    /// dispatcher (`leveler schedule dispatch` / the OS wakeup). The resolved
+    /// config directory travels with an OS registration because the job does
+    /// not inherit this process's environment.
+    pub async fn schedule_manager(
+        &self,
+    ) -> Result<Arc<leveler_schedule::ScheduleManager>, AppError> {
+        let mut slot = self.schedule.lock().await;
+        if let Some(manager) = slot.as_ref() {
+            return Ok(manager.clone());
+        }
+        let manager = Arc::new(
+            leveler_schedule::ScheduleManager::open(
+                self.layout.home(),
+                Some(self.layout.config_dir.clone()),
+            )
+            .await?,
+        );
+        *slot = Some(manager.clone());
+        Ok(manager)
     }
 
     /// The configuration generation loaded by this application (and any later
@@ -1300,7 +1333,26 @@ impl Application {
         // Build all mechanically available tools. The executor discloses them
         // progressively, independently of this registry's construction.
         let available_packs = self.capability_availability(snapshot, model).await;
-        let registry = model_surface(available_packs, &capabilities);
+        let mut registry = model_surface(available_packs, &capabilities);
+        // Scheduled automation is host-global state in the same store the CLI
+        // and the OS wakeup driver use. The adapters are ordinary tools over
+        // the management API; a store this process cannot open removes them
+        // from this turn instead of breaking the rest of the surface.
+        match self.schedule_manager().await {
+            Ok(manager) => {
+                registry.register(Arc::new(schedule_tools::ScheduleInspectTool::new(
+                    manager.clone(),
+                )));
+                registry.register(Arc::new(schedule_tools::ScheduleManageTool::new(
+                    manager,
+                    schedule_tools::dispatch_trigger(&self.layout),
+                )));
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "scheduled-automation tools are unavailable in this process"
+            ),
+        }
         let registry = if self.layout.primary_workspace().is_none() {
             registry.workspace_independent_subset()
         } else {

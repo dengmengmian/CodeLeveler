@@ -48,6 +48,10 @@ pub enum Overlay {
     /// Confirm deleting a stored session. Deleting is irreversible, so it takes
     /// an explicit choice rather than firing on the first `d`.
     ConfirmSessionDelete(Box<SelectionModel>),
+    /// A schedule-page decision: deleting a definition, granting unattended
+    /// execution, or enabling/disabling OS wakeup. The target travels with the
+    /// overlay so a moved list cannot redirect the answer.
+    ConfirmSchedule(Box<crate::schedules::ScheduleConfirm>),
     /// Review the tool calls a crashed runtime left without an outcome, then
     /// acknowledge that their result is unknown. Acknowledging never replays
     /// them; it only releases the recovery gate the runtime holds.
@@ -76,6 +80,7 @@ impl Overlay {
             | Overlay::CollabPicker(_)
             | Overlay::CheckpointPicker(_)
             | Overlay::ConfirmSessionDelete(_)
+            | Overlay::ConfirmSchedule(_)
             | Overlay::ConfirmRecovery(_)
             | Overlay::ThinkingPicker(_) => None,
         }
@@ -109,7 +114,9 @@ impl Overlay {
                 m.insert_query_text(text);
                 true
             }
-            Overlay::Approval(_) | Overlay::ThinkingPicker(_) => false,
+            Overlay::Approval(_) | Overlay::ThinkingPicker(_) | Overlay::ConfirmSchedule(_) => {
+                false
+            }
         }
     }
 }
@@ -319,6 +326,7 @@ fn build_content(
         | Overlay::ThinkingPicker(model) => selection_content(model, theme, width, locale),
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
+        Overlay::ConfirmSchedule(ov) => selection_content(&ov.model, theme, width, locale),
     }
 }
 

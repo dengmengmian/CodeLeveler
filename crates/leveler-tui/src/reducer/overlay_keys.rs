@@ -175,6 +175,22 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 }
             }
         },
+        Overlay::ConfirmSchedule(mut confirm) => match confirm.model.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ConfirmSchedule(confirm));
+                Vec::new()
+            }
+            // Esc and the cancel row decide nothing: the definition, its grant
+            // and the OS registration stay exactly where they were.
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => {
+                if key == crate::schedules::CONFIRM_CANCEL {
+                    Vec::new()
+                } else {
+                    crate::schedules::confirmed(state, confirm.purpose.clone())
+                }
+            }
+        },
         Overlay::ConfirmRecovery(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::ConfirmRecovery(sel));

@@ -363,6 +363,8 @@ export type RestartReason =
 /** An event flowing from the runtime to clients. */
 export type RuntimeEvent =
   | { type: 'global_tasks_loaded'; index: UiGlobalTaskIndex; query_id: string; requester_session_id: SessionId }
+  /** The answer to [`crate::ClientCommand::ManageSchedule`]. `response` carries domain failures too; a transport failure is the only case where no answer arrives. */
+  | { type: 'schedule_managed'; query_id: CommandId; requester_session_id: SessionId; response: ScheduleResponse }
   /** The runtime finished booting and is ready for commands. */
   | { type: 'runtime_ready' }
   /** The build this client's stream is connected to, observed when the stream is first established. A long-lived runtime can outlive an application update, so the client must learn at connect time whether it is talking to the build it was installed with. Like [`RuntimeEvent::RuntimeReconnected`], an unknown identity proves nothing and is never a version change. */
@@ -539,6 +541,227 @@ export type RuntimeEvent =
   | { type: 'config_reloaded'; changed?: string[]; deferred_to_next_turn?: boolean; error?: string | null; model?: string | null; outcome: string; provider?: string | null; query_id?: CommandId | null; restart_required?: string[]; thinking?: string | null; version: number }
   /** Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest turns in order. `omitted_turns` older turns were left out to bound the response; they are still in the session. */
   | { type: 'session_history_loaded'; entries: UiHistoryEntry[]; omitted_turns?: number; query_id?: CommandId | null; session_id: SessionId };
+
+/** The declared work of a schedule, in wire form. */
+export type ScheduleActionWire =
+  | { command: string; kind: 'shell' }
+  | { action: string; input?: string; kind: 'native' }
+  | { goal: string; kind: 'agent' };
+
+/** One doctor check, in user language. */
+export interface ScheduleCheck {
+  detail: string;
+  name: string;
+  severity: string;
+}
+
+/** The complete declaration a create request carries. */
+export interface ScheduleDraft {
+  action: ScheduleActionWire;
+  /** The grant also covers actions with external side effects. */
+  allow_external_side_effects?: boolean;
+  /** The user explicitly asked for unattended execution. */
+  grant_unattended?: boolean;
+  /** `skip` (default) or `run-once`. */
+  misfire?: string | null;
+  misfire_grace_secs?: number | null;
+  /** `request_approval`, `assisted` (default) or `full_access`. */
+  mode?: string | null;
+  model?: string | null;
+  name: string;
+  /** `skip-if-running` (default), `queue-one` or `allow-concurrent`. */
+  overlap?: string | null;
+  /** `continue` (default) or `fresh`. */
+  session_policy?: string | null;
+  timeout_secs?: number | null;
+  trigger: ScheduleTriggerWire;
+  workspace: string;
+}
+
+/** Which definitions a client wants to see. */
+export type ScheduleFilter =
+  | 'all' | 'enabled' | 'paused' | 'running'
+  /** Anything a person must act on: waiting approval, blocked, unknown or failed in the latest attempt. */
+  | 'needs_attention'
+  /** The latest run is `failed`, `unknown` or `blocked`. */
+  | 'recent_failure';
+
+/** The persisted unattended authorization, as a user surface sees it. */
+export interface ScheduleGrantView {
+  external_side_effects: boolean;
+  granted: boolean;
+  granted_at?: string | null;
+  /** Unattended execution is not authorized right now: either no grant was ever issued, or a stored grant no longer matches the current definition. The user must authorize before the next scheduled run. */
+  requires_regrant: boolean;
+}
+
+/** A partial replacement of an existing definition. Every absent field keeps its stored value; an empty `model` clears the model. `expected_revision` on the request is the optimistic-concurrency guard. */
+export interface SchedulePatch {
+  action?: ScheduleActionWire | null;
+  misfire?: string | null;
+  misfire_grace_secs?: number | null;
+  mode?: string | null;
+  /** `Some("")` clears the model; `None` keeps it. */
+  model?: string | null;
+  name?: string | null;
+  overlap?: string | null;
+  session_policy?: string | null;
+  timeout_secs?: number | null;
+  trigger?: ScheduleTriggerWire | null;
+  workspace?: string | null;
+}
+
+/** One structured management request from a client. */
+export type ScheduleRequest =
+  | { action: 'list'; filter?: ScheduleFilter | null }
+  | { action: 'show'; id: string }
+  | { action: 'create'; draft: ScheduleDraft }
+  | { action: 'update'; expected_revision?: string | null; id: string; patch: SchedulePatch }
+  | { action: 'pause'; id: string }
+  | { action: 'resume'; id: string }
+  | { action: 'run_now'; id: string }
+  | { action: 'cancel'; id: string }
+  | { action: 'remove'; id: string }
+  | { action: 'runs'; definition?: string | null; limit?: number | null }
+  | { action: 'grant'; allow_external_side_effects?: boolean; id: string }
+  | { action: 'revoke_grant'; id: string }
+  /** The background-scheduler picture: OS registration, counts, next slot. */
+  | { action: 'status' }
+  | { action: 'wakeup_enable' }
+  | { action: 'wakeup_disable' }
+  | { action: 'wakeup_doctor' };
+
+/** The structured answer to one [`ScheduleRequest`]. */
+export type ScheduleResponse =
+  | { kind: 'list'; schedules: ScheduleView[] }
+  | { kind: 'show'; schedule: ScheduleView }
+  | { kind: 'runs'; runs: ScheduleRunView[] }
+  | { kind: 'changed'; message: string; schedule?: ScheduleView | null }
+  | { id: string; kind: 'removed' }
+  | { kind: 'status'; status: ScheduleStatusView }
+  | { checks: ScheduleCheck[]; healthy: boolean; kind: 'doctor' }
+  | { kind: 'error'; message: string };
+
+/** One run, projected for a user surface. */
+export interface ScheduleRunView {
+  cancel_requested_at?: string | null;
+  capability_state?: string | null;
+  error?: string | null;
+  execution_id?: string | null;
+  exit_code?: number | null;
+  finished_at?: string | null;
+  id: string;
+  native_outcome?: string | null;
+  permission_state?: string | null;
+  provider?: string | null;
+  scheduled_for: string;
+  session_id?: string | null;
+  started_at: string;
+  state: string;
+  task_outcome?: string | null;
+  usage?: ScheduleUsageView | null;
+}
+
+/** The background-scheduler status. */
+export interface ScheduleStatusView {
+  definitions: number;
+  enabled: number;
+  last_os_wake?: ScheduleWakeView | null;
+  next_occurrence?: string | null;
+  overdue_pending: number;
+  paused: number;
+  running: number;
+  wakeup: ScheduleWakeupView;
+}
+
+/** A trigger rule in the vocabulary a user can actually choose. */
+export type ScheduleTriggerWire =
+  /** One RFC3339 instant. */
+  | { at: string; kind: 'once' }
+  /** A fixed interval in seconds, anchored at `anchor` (default now). */
+  | { anchor?: string | null; every_secs: number; kind: 'every' }
+  /** One local wall-clock time per day. */
+  | { kind: 'daily'; time: string; timezone?: string | null }
+  /** Local wall-clock time on selected weekdays (`mon`, `mon-fri`, ...). */
+  | { kind: 'weekly'; time: string; timezone?: string | null; weekdays: string }
+  /** Five-field cron expression. */
+  | { expression: string; kind: 'cron'; timezone?: string | null };
+
+/** Model usage attributed to one run. Missing totals stay missing. */
+export interface ScheduleUsageView {
+  cached_input_tokens: number;
+  cost_usd_micros: number;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  requests: number;
+  rows_without_cost: number;
+}
+
+/** One definition with the facts a list/detail surface needs. */
+export interface ScheduleView {
+  action: ScheduleActionWire;
+  action_kind: string;
+  attention_reason?: string | null;
+  created_at: string;
+  /** A one-line, user-readable statement of what runs. */
+  description: string;
+  enabled: boolean;
+  grant: ScheduleGrantView;
+  id: string;
+  last_run?: ScheduleRunView | null;
+  misfire: string;
+  misfire_grace_secs: number;
+  mode: string;
+  model?: string | null;
+  name: string;
+  needs_attention: boolean;
+  next_run_at?: string | null;
+  overlap: string;
+  /** Changes whenever the definition changes; a client sends it back on update so a stale editor cannot overwrite a newer definition. */
+  revision: string;
+  run_state?: string | null;
+  running: boolean;
+  session_id?: string | null;
+  session_policy: string;
+  timeout_secs: number;
+  timezone?: string | null;
+  trigger: ScheduleTriggerWire;
+  /** The rule in words: `每天 18:00 (Asia/Shanghai)`. */
+  trigger_text: string;
+  workspace: string;
+}
+
+/** The OS wakeup registration as observed, plus what the product can do. */
+export interface ScheduleWakeupView {
+  /** `launchd`, `task-scheduler` or `unsupported`. */
+  backend: string;
+  detail?: string | null;
+  /** The registration's wake interval, when observed. */
+  interval_secs?: number | null;
+  label: string;
+  last_exit_code?: number | null;
+  loaded: boolean;
+  registered: boolean;
+  registration_path?: string | null;
+  run_count?: number | null;
+  supported: boolean;
+}
+
+/** One recorded dispatch pass. */
+export interface ScheduleWakeView {
+  claimed: number;
+  error?: string | null;
+  failed: number;
+  finished_at?: string | null;
+  id: number;
+  missed: number;
+  skipped: number;
+  source: string;
+  started_at: string;
+  succeeded: number;
+  unknown: number;
+}
 
 /** Identifies a single agent session (one user goal end to end). */
 export type SessionId = string;
@@ -1424,6 +1647,8 @@ export type UserShellId = string;
 export type ClientCommand =
   /** Read local durable sources; never starts their runtimes. */
   | { type: 'query_global_tasks'; include_archived?: boolean; query_id: string; requester_session_id: SessionId }
+  /** Manage user-global scheduled automation. The schedule store remains the single authority; this command is the structured adapter every client uses, so no client parses human-readable CLI output back into state. The answer is [`crate::RuntimeEvent::ScheduleManaged`] carrying the same `query_id`. */
+  | { type: 'manage_schedule'; query_id: CommandId; request: ScheduleRequest; requester_session_id: SessionId }
   /** Ask the runtime for one best-effort prediction of the user's next prompt. The request is advisory UI chrome: it starts no task, persists no message, and may produce no event when there is insufficient context. */
   | { type: 'request_prompt_suggestion'; session_id: SessionId }
   /** Generate a one-shot recap after the UI has observed a post-turn idle window. The runtime may decline when the conversation is too short. */

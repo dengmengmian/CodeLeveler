@@ -22,6 +22,7 @@ use leveler_client_protocol::{
 use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
 use leveler_schedule::{
     Dispatcher, NewScheduleDefinition, RunState, RuntimeConnector, ScheduleStore, ScheduleTrigger,
+    UnattendedRequest,
 };
 use tokio::sync::{Barrier, broadcast};
 
@@ -238,7 +239,9 @@ async fn fixture(runtime: &ScriptedRuntime, timeout: Duration) -> Fixture {
             timeout,
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
-            unattended: None,
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
         })
         .await
         .unwrap();
@@ -593,7 +596,9 @@ async fn two_due_actions_are_delivered_concurrently() {
                 timeout: Duration::from_secs(10),
                 misfire: leveler_schedule::MisfirePolicy::Skip,
                 misfire_grace: Duration::from_secs(300),
-                unattended: None,
+                unattended: Some(UnattendedRequest {
+                    allow_external_side_effects: true,
+                }),
             })
             .await
             .unwrap();

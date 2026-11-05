@@ -26,6 +26,7 @@
 //! is not.
 
 mod dispatch;
+mod manage;
 mod rule;
 mod store;
 
@@ -40,7 +41,8 @@ pub use dispatch::{
     DispatchSummary, Dispatcher, NativeActionClass, NativeActionExecutor, NativeExecutionReport,
     NativeExecutionRequest, NativeRunStatus, RuntimeConnector, UsageReader,
 };
-pub use rule::{LocalTime, ScheduleTrigger, WeekdaySet, parse_cron, parse_timezone};
+pub use manage::{ScheduleManager, doctor_checks};
+pub use rule::{LocalTime, ScheduleTrigger, WeekdaySet, host_timezone, parse_cron, parse_timezone};
 pub use store::{Claim, HandedOffRun, Recovered, RunFacts, RunOutcome, ScheduleStore};
 pub use wakeup::{WakeupError, WakeupRegistration, WakeupSpec, WakeupStatus};
 
@@ -87,9 +89,10 @@ impl ActionKind {
     }
 
     /// Whether the kind can create effects outside CodeLeveler's workspace.
-    /// An agent run can, because its tools can.
+    /// All three can: a shell command can write anywhere the user can, a
+    /// native action drives the host, and an agent's tools can do both.
     pub const fn may_have_external_side_effects(self) -> bool {
-        matches!(self, Self::Native | Self::Agent)
+        matches!(self, Self::Shell | Self::Native | Self::Agent)
     }
 }
 
@@ -299,13 +302,174 @@ pub struct UnattendedRequest {
     pub allow_external_side_effects: bool,
 }
 
+/// The trigger scope an unattended grant was issued for.
+///
+/// A grant authorizes an action at a cadence and in a timezone. A same-zone
+/// time adjustment or a lower cadence stays inside what the user accepted;
+/// running more often, moving to another zone, replacing a one-off with a
+/// recurrence, or introducing a cron rule is a different authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GrantedTrigger {
+    Once {
+        at: DateTime<Utc>,
+    },
+    Every {
+        every_secs: u64,
+    },
+    Daily {
+        time: String,
+        timezone: String,
+    },
+    Weekly {
+        weekdays: u8,
+        time: String,
+        timezone: String,
+    },
+    Cron {
+        expression: String,
+        timezone: String,
+    },
+}
+
+impl GrantedTrigger {
+    pub fn from_trigger(trigger: &ScheduleTrigger) -> Self {
+        match trigger {
+            ScheduleTrigger::Once { at } => Self::Once { at: *at },
+            ScheduleTrigger::Every { every, .. } => Self::Every {
+                every_secs: every.as_secs(),
+            },
+            ScheduleTrigger::Daily { time, timezone } => Self::Daily {
+                time: time.to_string(),
+                timezone: timezone.to_string(),
+            },
+            ScheduleTrigger::Weekly {
+                weekdays,
+                time,
+                timezone,
+            } => Self::Weekly {
+                weekdays: weekdays.bits(),
+                time: time.to_string(),
+                timezone: timezone.to_string(),
+            },
+            ScheduleTrigger::Cron {
+                expression,
+                timezone,
+            } => Self::Cron {
+                expression: expression.clone(),
+                timezone: timezone.to_string(),
+            },
+        }
+    }
+
+    /// Authorized runs per week, used only to compare recurring cadences that
+    /// do not involve cron. `None` means the shape is not rate-comparable.
+    fn weekly_rate(&self) -> Option<u64> {
+        match self {
+            Self::Every { every_secs } => {
+                (*every_secs > 0).then(|| 604_800u64.div_ceil(*every_secs))
+            }
+            Self::Daily { .. } => Some(7),
+            Self::Weekly { weekdays, .. } => Some(u64::from(weekdays.count_ones())),
+            Self::Once { .. } | Self::Cron { .. } => None,
+        }
+    }
+
+    fn timezone(&self) -> Option<&str> {
+        match self {
+            Self::Daily { timezone, .. }
+            | Self::Weekly { timezone, .. }
+            | Self::Cron { timezone, .. } => Some(timezone),
+            Self::Once { .. } | Self::Every { .. } => None,
+        }
+    }
+
+    /// Whether a grant issued for this trigger still covers `new`.
+    pub fn covers(&self, new: &ScheduleTrigger) -> Result<(), String> {
+        match (self, new) {
+            (Self::Once { at: granted }, ScheduleTrigger::Once { at }) => {
+                // Storage keeps milliseconds, so compare at that precision:
+                // a grant issued for the same instant must not look "earlier"
+                // after its sub-millisecond digits are truncated.
+                if at.timestamp_millis() < granted.timestamp_millis() {
+                    Err(
+                        "the one-off schedule moved earlier than the instant the grant \
+                         was issued for"
+                            .into(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            (Self::Once { .. }, _) => Err(
+                "the grant authorized one run; the schedule is now recurring and needs \
+                 a fresh grant"
+                    .into(),
+            ),
+            // Narrowing a recurring rule to one run stays inside the cadence
+            // the user already accepted.
+            (_, ScheduleTrigger::Once { .. }) => Ok(()),
+            (
+                Self::Cron {
+                    expression,
+                    timezone,
+                },
+                ScheduleTrigger::Cron {
+                    expression: new_expression,
+                    timezone: new_timezone,
+                },
+            ) => {
+                if expression == new_expression && timezone == &new_timezone.to_string() {
+                    Ok(())
+                } else {
+                    Err(
+                        "the cron rule changed after the grant was issued; cron edits need \
+                         a fresh grant"
+                            .into(),
+                    )
+                }
+            }
+            (Self::Cron { .. }, _) | (_, ScheduleTrigger::Cron { .. }) => Err(
+                "converting a schedule to or from a cron rule needs a fresh grant: the \
+                 grant named a comparable cadence, not a cron expression"
+                    .into(),
+            ),
+            (granted, new) => {
+                let new_timezone = new.timezone().map(|timezone| timezone.to_string());
+                if granted.timezone() != new_timezone.as_deref() {
+                    return Err(
+                        "the schedule moved to a different timezone after the grant was \
+                         issued; a new execution window needs a fresh grant"
+                            .into(),
+                    );
+                }
+                let granted_rate = granted
+                    .weekly_rate()
+                    .ok_or_else(|| "cannot compare the granted cadence".to_string())?;
+                let new_rate = Self::from_trigger(new)
+                    .weekly_rate()
+                    .ok_or_else(|| "cannot compare the new cadence".to_string())?;
+                if new_rate > granted_rate {
+                    Err(format!(
+                        "the schedule now runs {new_rate} times per week; the grant was \
+                         issued for at most {granted_rate}, so a higher frequency needs a \
+                         fresh grant"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 /// A persisted, inspectable authorization for unattended execution.
 ///
 /// It is bound to one definition, one workspace, one permission profile, the
-/// exact declared action and its model, and the action kind. Changing any of
-/// those makes it stop matching; it is never widened by a later schedule.
-/// Revocation deletes it from the definition, which takes effect before the
-/// next run.
+/// exact declared action and its model, the action kind, and the trigger
+/// scope. Changing any of those makes it stop matching; it is never widened
+/// by a later schedule. Revocation deletes it from the definition, which takes
+/// effect before the next run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnattendedGrant {
@@ -322,21 +486,26 @@ pub struct UnattendedGrant {
     #[serde(default)]
     pub model: Option<ModelRef>,
     pub actions: Vec<ActionKind>,
+    /// The cadence and timezone the user accepted. Grants written before this
+    /// binding existed fail closed and must be re-issued.
+    #[serde(default)]
+    pub trigger: Option<GrantedTrigger>,
     pub external_side_effects: bool,
     pub granted_at: DateTime<Utc>,
 }
 
 impl UnattendedGrant {
-    /// Version 2 binds the exact action and model. A version-1 grant fails
-    /// closed rather than being interpreted as covering an action it never
-    /// named.
-    pub const VERSION: u8 = 2;
+    /// Version 3 binds the trigger scope in addition to the exact action and
+    /// model. Older grants fail closed rather than being interpreted as
+    /// covering an action or cadence they never named.
+    pub const VERSION: u8 = 3;
 
     pub fn new(
         definition_id: ScheduleId,
         workspace: PathBuf,
         permission_mode: PermissionProfile,
         action: &ScheduleAction,
+        trigger: &ScheduleTrigger,
         model: Option<ModelRef>,
         request: UnattendedRequest,
         granted_at: DateTime<Utc>,
@@ -346,20 +515,21 @@ impl UnattendedGrant {
             definition_id,
             workspace,
             permission_mode,
-            action: action
-                .fingerprint()
-                .map_err(|error| ScheduleError::Invalid(format!("cannot bind the action: {error}")))?,
+            action: action.fingerprint().map_err(|error| {
+                ScheduleError::Invalid(format!("cannot bind the action: {error}"))
+            })?,
             model,
             actions: vec![action.kind()],
+            trigger: Some(GrantedTrigger::from_trigger(trigger)),
             external_side_effects: request.allow_external_side_effects,
             granted_at,
         })
     }
 
     /// The grant covers this definition, its current workspace, permission
-    /// profile, exact action, model and the kind of action about to run.
-    /// `external_side_effects` is the action's own observed classification,
-    /// not a schedule guess.
+    /// profile, exact action, model, trigger scope and the kind of action
+    /// about to run. `external_side_effects` is the action's own observed
+    /// classification, not a schedule guess.
     pub fn covers(
         &self,
         definition: &ScheduleDefinition,
@@ -373,6 +543,13 @@ impl UnattendedGrant {
                 self.version
             ));
         }
+        self.trigger
+            .as_ref()
+            .ok_or_else(|| {
+                "the unattended grant does not name a trigger scope; issue a fresh grant"
+                    .to_string()
+            })?
+            .covers(&definition.trigger)?;
         if self.definition_id != definition.id {
             return Err("the unattended grant belongs to a different schedule".into());
         }
@@ -586,58 +763,122 @@ impl NewScheduleDefinition {
     /// Validate every externally supplied field. The CLI validates for a good
     /// error message; the store validates again because it is a trust boundary.
     pub fn validate(&self) -> Result<(), ScheduleError> {
-        let name = self.name.trim();
-        if name.is_empty() {
-            return Err(ScheduleError::Invalid("the schedule name is empty".into()));
-        }
-        if name.len() > MAX_NAME_BYTES {
-            return Err(ScheduleError::Invalid(format!(
-                "the schedule name exceeds {MAX_NAME_BYTES} bytes"
-            )));
-        }
-        if name.chars().any(|ch| ch.is_control()) {
-            return Err(ScheduleError::Invalid(
-                "the schedule name contains a control character".into(),
-            ));
-        }
-        if !self.workspace.is_absolute() {
-            return Err(ScheduleError::Invalid(
-                "the schedule workspace must be an absolute path".into(),
-            ));
-        }
-        self.action.validate()?;
-        if self.action.kind() == ActionKind::Agent && self.model.is_none() {
-            return Err(ScheduleError::Invalid(
-                "an agent schedule needs an explicit --model; the runtime never guesses one".into(),
-            ));
-        }
-        if self.action.kind() == ActionKind::Agent
-            && self.overlap == OverlapPolicy::AllowConcurrent
-            && self.session_policy == SessionPolicy::Continue
-        {
-            return Err(ScheduleError::Invalid(
-                "concurrent agent runs need a fresh session per run; two concurrent turns \
-                 cannot share one session"
-                    .into(),
-            ));
-        }
-        if self.timeout < Duration::from_secs(1) {
-            return Err(ScheduleError::Invalid(
-                "the run timeout must be at least one second".into(),
-            ));
-        }
-        if self.timeout > Duration::from_secs(7 * 24 * 60 * 60) {
-            return Err(ScheduleError::Invalid(
-                "the run timeout may not exceed seven days".into(),
-            ));
-        }
-        if self.misfire_grace > Duration::from_secs(7 * 24 * 60 * 60) {
-            return Err(ScheduleError::Invalid(
-                "the misfire grace may not exceed seven days".into(),
-            ));
-        }
-        self.trigger.validate()
+        validate_declaration(
+            &self.name,
+            &self.workspace,
+            &self.action,
+            &self.trigger,
+            self.session_policy,
+            self.overlap,
+            self.model.as_ref(),
+            self.timeout,
+            self.misfire_grace,
+        )
     }
+}
+
+/// The replacement declaration an update carries. Every field is the full new
+/// value: a partial patch is resolved by the management layer against the
+/// definition it observed, so the store never guesses what an absent field
+/// meant.
+#[derive(Debug, Clone)]
+pub struct DefinitionUpdate {
+    pub name: String,
+    pub workspace: PathBuf,
+    pub action: ScheduleAction,
+    pub trigger: ScheduleTrigger,
+    pub session_policy: SessionPolicy,
+    pub overlap: OverlapPolicy,
+    pub mode: PermissionProfile,
+    pub model: Option<ModelRef>,
+    pub timeout: Duration,
+    pub misfire: MisfirePolicy,
+    pub misfire_grace: Duration,
+    /// Issue a fresh unattended grant for the new identity. `None` keeps an
+    /// existing grant only while it still covers the new declaration.
+    pub grant: Option<UnattendedRequest>,
+}
+
+impl DefinitionUpdate {
+    /// The same trust-boundary validation as a create.
+    pub fn validate(&self) -> Result<(), ScheduleError> {
+        validate_declaration(
+            &self.name,
+            &self.workspace,
+            &self.action,
+            &self.trigger,
+            self.session_policy,
+            self.overlap,
+            self.model.as_ref(),
+            self.timeout,
+            self.misfire_grace,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_declaration(
+    name: &str,
+    workspace: &std::path::Path,
+    action: &ScheduleAction,
+    trigger: &ScheduleTrigger,
+    session_policy: SessionPolicy,
+    overlap: OverlapPolicy,
+    model: Option<&ModelRef>,
+    timeout: Duration,
+    misfire_grace: Duration,
+) -> Result<(), ScheduleError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ScheduleError::Invalid("the schedule name is empty".into()));
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return Err(ScheduleError::Invalid(format!(
+            "the schedule name exceeds {MAX_NAME_BYTES} bytes"
+        )));
+    }
+    if name.chars().any(|ch| ch.is_control()) {
+        return Err(ScheduleError::Invalid(
+            "the schedule name contains a control character".into(),
+        ));
+    }
+    if !workspace.is_absolute() {
+        return Err(ScheduleError::Invalid(
+            "the schedule workspace must be an absolute path".into(),
+        ));
+    }
+    action.validate()?;
+    if action.kind() == ActionKind::Agent && model.is_none() {
+        return Err(ScheduleError::Invalid(
+            "an agent schedule needs an explicit --model; the runtime never guesses one".into(),
+        ));
+    }
+    if action.kind() == ActionKind::Agent
+        && overlap == OverlapPolicy::AllowConcurrent
+        && session_policy == SessionPolicy::Continue
+    {
+        return Err(ScheduleError::Invalid(
+            "concurrent agent runs need a fresh session per run; two concurrent turns \
+             cannot share one session"
+                .into(),
+        ));
+    }
+    if timeout < Duration::from_secs(1) {
+        return Err(ScheduleError::Invalid(
+            "the run timeout must be at least one second".into(),
+        ));
+    }
+    if timeout > Duration::from_secs(7 * 24 * 60 * 60) {
+        return Err(ScheduleError::Invalid(
+            "the run timeout may not exceed seven days".into(),
+        ));
+    }
+    if misfire_grace > Duration::from_secs(7 * 24 * 60 * 60) {
+        return Err(ScheduleError::Invalid(
+            "the misfire grace may not exceed seven days".into(),
+        ));
+    }
+    trigger.validate()
 }
 
 /// A persisted definition. `session_id` is set on the first successful
@@ -660,6 +901,9 @@ pub struct ScheduleDefinition {
     pub unattended: Option<UnattendedGrant>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// Last definition change. Clients echo this as the optimistic-concurrency
+    /// revision, so a stale editor cannot overwrite a newer definition.
+    pub updated_at: DateTime<Utc>,
 }
 
 impl ScheduleDefinition {
@@ -673,21 +917,19 @@ impl ScheduleDefinition {
     }
 
     /// Whether this definition may run unattended with the given observed
-    /// side-effect classification. Full Access is itself the user's explicit
-    /// no-prompt choice; every other profile needs a matching persisted grant.
+    /// side-effect classification. Unattended execution always needs a
+    /// persisted grant: a permission profile describes how an interactive
+    /// session admits an action, not a durable authorization for future
+    /// background runs.
     pub fn unattended_authorization(
         &self,
         kind: ActionKind,
         external_side_effects: bool,
     ) -> Result<(), String> {
-        if self.mode == PermissionProfile::FullAccess {
-            return Ok(());
-        }
         let grant = self.unattended.as_ref().ok_or_else(|| {
-            format!(
-                "no unattended authorization exists for this schedule; create it with \
-                     --grant-unattended or switch the schedule to full access"
-            )
+            "no unattended authorization exists for this schedule; grant unattended \
+             execution explicitly before enabling it"
+                .to_string()
         })?;
         grant.covers(self, kind, external_side_effects)
     }
@@ -963,6 +1205,11 @@ pub enum ScheduleError {
     Invalid(String),
     #[error("schedule not found: {0}")]
     NotFound(ScheduleId),
+    /// The definition changed after the client read it. Refusing is the only
+    /// safe answer: applying the stale view would silently overwrite a newer
+    /// definition the user has not seen.
+    #[error("schedule {0} changed since it was read; refresh and retry")]
+    Conflict(ScheduleId),
     #[error("scheduled session mismatch: {0}")]
     SessionMismatch(String),
     #[error("runtime connection failed: {0}")]

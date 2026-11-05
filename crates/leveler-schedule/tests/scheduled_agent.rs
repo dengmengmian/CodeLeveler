@@ -38,25 +38,13 @@ use tokio::sync::broadcast;
 const GOAL: &str = "Read the repository and summarize the last change";
 const PROVIDER: &str = "deepseek";
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct RuntimeState {
     task_status: Option<UiTaskStatus>,
     task_terminal: Option<UiTaskTerminal>,
     last_sequence: Option<i64>,
     turn_ordinal: i64,
     pending_interactions: Vec<UiPendingInteraction>,
-}
-
-impl Default for RuntimeState {
-    fn default() -> Self {
-        Self {
-            task_status: None,
-            task_terminal: None,
-            last_sequence: None,
-            turn_ordinal: 0,
-            pending_interactions: Vec::new(),
-        }
-    }
 }
 
 struct AgentRuntime {
@@ -588,6 +576,39 @@ async fn an_agent_run_without_an_unattended_grant_is_blocked_before_any_session_
     )
     .await;
 
+    let summary = dispatcher(&runtime, fixture.store.clone())
+        .dispatch_due(1)
+        .await
+        .unwrap();
+    assert_eq!(summary.blocked, 1, "{summary:?}");
+
+    let run = only_run(&fixture).await;
+    assert_eq!(run.state, RunState::Blocked);
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|error| error.contains("unattended authorization")),
+        "{run:?}"
+    );
+    assert!(runtime.goals().is_empty());
+    assert!(runtime.created().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_access_without_a_persisted_grant_is_blocked_before_any_session_work() {
+    let runtime = Arc::new(AgentRuntime::new(SessionId::new("sess-agent")));
+    let fixture = fixture(
+        &runtime,
+        agent_action(),
+        SessionPolicy::Continue,
+        OverlapPolicy::SkipIfRunning,
+        PermissionProfile::FullAccess,
+        None,
+    )
+    .await;
+
+    // The session's permission profile governs interactive admission. It is
+    // not a durable authorization for future unattended runs.
     let summary = dispatcher(&runtime, fixture.store.clone())
         .dispatch_due(1)
         .await
@@ -1186,7 +1207,7 @@ async fn a_changed_model_is_not_covered_by_an_issued_grant() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_access_admits_the_action_but_cannot_override_an_os_permission_denial() {
+async fn a_full_access_schedule_with_a_grant_still_cannot_override_an_os_permission_denial() {
     let runtime = Arc::new(AgentRuntime::new(SessionId::new("sess-agent")));
     let executor = Arc::new(ScriptedNative::new(
         true,
@@ -1201,16 +1222,17 @@ async fn full_access_admits_the_action_but_cannot_override_an_os_permission_deni
         SessionPolicy::Continue,
         OverlapPolicy::SkipIfRunning,
         PermissionProfile::FullAccess,
-        None,
+        grant(),
     )
     .await;
-    let dispatcher = dispatcher(&runtime, fixture.store.clone()).with_native_executor(executor.clone());
+    let dispatcher =
+        dispatcher(&runtime, fixture.store.clone()).with_native_executor(executor.clone());
 
     let summary = dispatcher.dispatch_due(1).await.unwrap();
     assert_eq!(
         executor.executions.load(Ordering::SeqCst),
         1,
-        "Full access is the product's own admission decision; it does not refuse the action"
+        "with a grant, full access admits the action; it does not refuse it"
     );
     assert_eq!(
         summary.waiting_approval, 1,
@@ -1276,11 +1298,7 @@ impl SessionUsage {
 
 #[async_trait]
 impl UsageReader for SessionUsage {
-    async fn usage(
-        &self,
-        _workspace: &Path,
-        session: &SessionId,
-    ) -> Result<UsageSnapshot, String> {
+    async fn usage(&self, _workspace: &Path, session: &SessionId) -> Result<UsageSnapshot, String> {
         self.readings
             .lock()
             .unwrap()
@@ -1315,10 +1333,7 @@ async fn create_agent_definition(
         })
         .await
         .unwrap();
-    store
-        .set_session(&definition.id, session)
-        .await
-        .unwrap();
+    store.set_session(&definition.id, session).await.unwrap();
     definition.id
 }
 
@@ -1541,10 +1556,7 @@ async fn two_schedules_in_one_workspace_settle_their_own_terminals_and_usage() {
         ..UsageSnapshot::default()
     };
     let usage = Arc::new(SessionUsage::new(vec![
-        (
-            session_a.clone(),
-            vec![baseline(1, 100), baseline(3, 250)],
-        ),
+        (session_a.clone(), vec![baseline(1, 100), baseline(3, 250)]),
         (
             session_b.clone(),
             vec![baseline(10, 1_000), baseline(14, 1_400)],
@@ -1557,7 +1569,11 @@ async fn two_schedules_in_one_workspace_settle_their_own_terminals_and_usage() {
     let run_a = store.runs(Some(&a), 10).await.unwrap().remove(0);
     let run_b = store.runs(Some(&b), 10).await.unwrap().remove(0);
     assert_eq!(run_a.turn_ordinal, Some(1));
-    assert_eq!(run_b.turn_ordinal, Some(1), "each session has its own ordinal");
+    assert_eq!(
+        run_b.turn_ordinal,
+        Some(1),
+        "each session has its own ordinal"
+    );
     assert_ne!(run_a.session_id, run_b.session_id);
 
     runtime.set_terminal_for(&session_a, 5, "completed");

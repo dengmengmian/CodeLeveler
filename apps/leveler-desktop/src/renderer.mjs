@@ -16,6 +16,11 @@ import {
   beginDiffQuery, expireDiffQuery, retainInterruptedThoughts, mergeRestoredConversation,
 } from './state.mjs';
 import { brandMark, fileIcon } from './icons.mjs';
+import {
+  scheduleState, runState, triggerLabel, filterLabel, wakeupLabel, formatDateTime,
+  runUsage, actionSummary, attentionLabel, modeLabel, policyLabel, overlapLabel, misfireLabel,
+  intentLabel, localInputValue, doctorCheckLabel, severityLabel,
+} from './schedules.mjs';
 import { projectTrajectory, searchTrajectory, buildTimeline, formatDuration, trajectoryWindow } from './trajectory.mjs';
 import {
   el, iconNode, iconButton, installTooltips, toast, openMenu, closeMenu, openPopover, closePopover, confirmDialog,
@@ -91,6 +96,12 @@ let entryPage = null;
 let settingsSection = 'general';
 let fontSettingsOpen = false;
 let agentsRead = null;
+let scheduleBoard = emptyScheduleView();
+const schedulePending = new Map();
+let scheduleMutation = null;
+let scheduleBulkOutstanding = 0;
+let scheduleRefreshQueued = false;
+let schedulePollTimer = null;
 let headerMenuButton = null;
 let headerSubagentButton = null;
 let headerJobsButton = null;
@@ -1250,12 +1261,12 @@ function openSchedulePopover(anchor) {
   openPopover({
     anchor, width: 336, align: 'end', className: 'schedule-popover',
     render: node => {
-      node.append(el('div', 'header-popover-title', '提醒'));
-      node.append(el('div', 'header-popover-empty', '提醒目录尚未接入当前桌面桥接。'));
-      node.append(el('div', 'header-popover-note', 'Runtime 暴露了 schedule 工具与事件，但桌面没有列表、创建或取消接口。'));
-      const open = el('button', 'header-popover-action', '打开任务详情');
+      node.append(el('div', 'header-popover-title', '定时任务'));
+      node.append(el('div', 'header-popover-empty', '定时任务由运行时统一管理，定义和运行记录不保存在桌面。'));
+      node.append(el('div', 'header-popover-note', '在自动化任务页查看状态、创建、编辑、运行记录与无人值守授权。'));
+      const open = el('button', 'header-popover-action', '打开自动化任务');
       open.type = 'button';
-      open.addEventListener('click', () => { closePopover(); openRightbarTab('schedule'); });
+      open.addEventListener('click', () => { closePopover(); openPage('automation'); });
       node.append(open);
     },
   });
@@ -4178,11 +4189,13 @@ function dismissPage() {
   if (!entryPage) return;
   entryPage = null;
   $('entry-page').hidden = true;
+  stopSchedulePolling();
   for (const button of document.querySelectorAll('.panel-row')) button.setAttribute('aria-current', 'false');
 }
 
 function newSession() {
   dismissPage();
+  resetScheduleProjection();
   stashDraft();
   selection = null;
   current = null;
@@ -4213,6 +4226,7 @@ async function createTask() {
   uncertain = null;
   currentSource = result.source_id ?? null;
   current = attachExtras(projectSnapshot(result.session), result.session);
+  resetScheduleProjection();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
   liveTrajectory = [];
@@ -4272,6 +4286,7 @@ async function openTask(task) {
   if (task.primary_workspace) foldedGroups.delete(task.primary_workspace);
   currentSource = result.source_id ?? task.source_id;
   current = attachExtras(projectSnapshot(result.session), result.session);
+  resetScheduleProjection();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
   liveTrajectory = [];
@@ -6327,13 +6342,17 @@ function subagentView() {
 
 function scheduleView() {
   const view = el('div', 'schedule-task-view');
-  const empty = el('div', 'right-empty schedule-task-empty');
-  empty.append(
+  const card = el('div', 'right-empty schedule-task-empty');
+  card.append(
     iconNode('clock', { size: 24 }),
-    el('h3', undefined, '定时任务未接入'),
-    el('p', undefined, 'Runtime 未向桌面提供定时任务目录与任务详情，无法显示规则或运行记录。'),
+    el('h3', undefined, '定时任务由运行时管理'),
+    el('p', undefined, '自动化任务页提供筛选、创建、编辑、运行记录、无人值守授权和后台唤醒管理。关闭页面不会删除或停止任何任务。'),
   );
-  view.append(empty);
+  const open = el('button', 'button secondary', '打开自动化任务');
+  open.type = 'button';
+  open.addEventListener('click', () => openPage('automation'));
+  card.append(open);
+  view.append(card);
   return view;
 }
 
@@ -6827,6 +6846,7 @@ function openPage(kind) {
   if (entryPage === kind) { closePage(); return; }
   entryPage = kind;
   $('entry-page').hidden = false;
+  if (kind === 'automation') openSchedulesPage();
   renderEntryPage();
   renderHeader();
   layout();
@@ -6834,6 +6854,7 @@ function openPage(kind) {
 function closePage() {
   entryPage = null;
   $('entry-page').hidden = true;
+  stopSchedulePolling();
   renderHeader();
   render();
 }
@@ -6877,41 +6898,949 @@ function renderEntryPage() {
     card.append(el('h2', undefined, '当前 Runtime 未提供插件目录'), el('p', undefined, '桌面桥接层没有可读取的插件清单、启停或安装接口。这里不会伪造插件列表或开关。'));
     page.append(card);
   } else {
-    copy.append(el('h1', undefined, '自动化任务'), el('p', undefined, '按计划运行 Agent 任务。'));
-    const action = el('button', 'button secondary', '新建任务');
-    action.type = 'button'; action.disabled = true; action.title = '当前版本未接入调度接口';
-    const wrap = el('div', 'settings-actions'); wrap.append(action);
-    head.append(copy, wrap);
-    page.append(head);
-    const search = el('div', 'entry-search');
-    search.append(iconNode('search', { size: 15 }));
-    const input = el('input');
-    input.placeholder = '搜索自动化任务';
-    input.disabled = true;
-    input.title = '当前版本未接入调度接口';
-    input.setAttribute('aria-label', '搜索自动化任务');
-    search.append(input);
-    page.append(search);
-    const tabs = el('div', 'entry-tabs');
-    for (const [label, selected] of [['全部', true], ['已启用', false], ['已结束', false]]) {
-      const tab = el('button', 'entry-tab', label);
-      tab.type = 'button';
-      tab.disabled = true;
-      tab.title = '当前版本未接入调度接口';
-      tab.setAttribute('aria-selected', String(selected));
-      tabs.append(tab);
-    }
-    page.append(tabs);
-    const card = el('div', 'entry-card');
-    card.append(el('h2', undefined, '调度接口尚未接入'), el('p', undefined, 'CodeLeveler Runtime 暴露了 schedule 工具与事件，但桌面桥接层没有列表/创建/取消接口。这里不会展示伪造的计划记录。'));
-    page.append(card);
-    const empty = el('div', 'entry-empty');
-    const mark = el('span', 'empty-mark');
-    mark.append(iconNode('automation', { size: 44, stroke: 1.1 }));
-    empty.append(mark, document.createTextNode('还没有自动化任务，在会话中创建的任务会显示在这里'));
-    page.append(empty);
+    renderAutomationPage(page);
   }
   host.replaceChildren(page);
+}
+
+/* ------------------------------------------------------- scheduled tasks */
+
+// The runtime's schedule store is the only authority. This page holds a
+// projection: every read carries a query id on the selected session's stream,
+// and only this client's own answers may update it.
+
+const SCHEDULE_FILTERS = ['all', 'enabled', 'paused', 'running', 'needs_attention', 'recent_failure'];
+const SCHEDULE_WEEKDAYS = [['mon', '一'], ['tue', '二'], ['wed', '三'], ['thu', '四'], ['fri', '五'], ['sat', '六'], ['sun', '日']];
+
+function emptyScheduleView() {
+  return {
+    items: [], filter: 'all', status: null, doctor: null, doctorPending: false,
+    selected: null, detail: null, runs: [], runsLoaded: false,
+    loading: false, loaded: false, busy: false, error: null, notice: null,
+  };
+}
+
+function scheduleSession() {
+  return current?.session.id ?? null;
+}
+
+function resetScheduleProjection() {
+  scheduleBoard = emptyScheduleView();
+  schedulePending.clear();
+  scheduleMutation = null;
+  scheduleBulkOutstanding = 0;
+  scheduleRefreshQueued = false;
+}
+
+function paintSchedules() {
+  if (entryPage === 'automation') renderEntryPage();
+}
+
+function scheduleSendFailure(queryId, message) {
+  schedulePending.delete(queryId);
+  const mutation = scheduleMutation?.queryId === queryId ? scheduleMutation : null;
+  if (mutation) {
+    scheduleMutation = null;
+    scheduleBoard.busy = false;
+    mutation.reject(new Error(message));
+  }
+  if (scheduleBulkOutstanding > 0) scheduleBulkOutstanding -= 1;
+  scheduleBoard.loading = false;
+  scheduleBoard.error = message;
+  paintSchedules();
+}
+
+async function sendScheduleRequest(request, { kind, id = null, queryId = crypto.randomUUID() } = {}) {
+  const sessionId = scheduleSession();
+  if (!sessionId) {
+    scheduleBoard.error = '先打开一个会话：定时任务通过该会话所属的运行时管理。';
+    paintSchedules();
+    return;
+  }
+  schedulePending.set(queryId, { kind, id, queryId });
+  if (kind === 'list' || kind === 'status') scheduleBulkOutstanding += 1;
+  const command = {
+    type: 'manage_schedule',
+    requester_session_id: sessionId,
+    query_id: queryId,
+    request,
+  };
+  try {
+    const result = await api.deliver(commandEnvelope(sessionId, command, current.session.last_sequence ?? 0));
+    if (!result?.ok) scheduleSendFailure(queryId, result?.error?.message ?? '运行时拒绝了这次请求');
+  } catch (error) {
+    scheduleSendFailure(queryId, error.message);
+  }
+}
+
+function readSchedules({ silent = false } = {}) {
+  if (!scheduleSession()) return;
+  if (!silent) {
+    scheduleBoard.loading = true;
+    scheduleBoard.error = null;
+    paintSchedules();
+  }
+  sendScheduleRequest({ action: 'list', filter: scheduleBoard.filter }, { kind: 'list' });
+  sendScheduleRequest({ action: 'status' }, { kind: 'status' });
+}
+
+function refreshSchedules() {
+  if (!scheduleSession()) return;
+  if (scheduleBoard.busy || scheduleBulkOutstanding > 0) {
+    scheduleRefreshQueued = true;
+    return;
+  }
+  readSchedules({ silent: scheduleBoard.loaded });
+}
+
+function openSchedulesPage() {
+  if (!scheduleSession()) return;
+  if (!schedulePollTimer) {
+    schedulePollTimer = setInterval(() => {
+      if (entryPage !== 'automation' || document.hidden || scheduleBoard.busy) return;
+      if (scheduleBulkOutstanding > 0) return;
+      readSchedules({ silent: true });
+      // Run state changes asynchronously. The list poll alone would leave an
+      // open detail showing "正在派发" forever after the run has finished.
+      if (scheduleBoard.selected) loadScheduleDetail(scheduleBoard.selected);
+    }, 5000);
+  }
+  if (!scheduleBoard.loaded && scheduleBulkOutstanding === 0) readSchedules({ silent: true });
+  else refreshSchedules();
+}
+
+function stopSchedulePolling() {
+  if (!schedulePollTimer) return;
+  clearInterval(schedulePollTimer);
+  schedulePollTimer = null;
+}
+
+function setScheduleFilter(filter) {
+  if (scheduleBoard.filter === filter) return;
+  scheduleBoard.filter = filter;
+  scheduleBoard.selected = null;
+  scheduleBoard.detail = null;
+  scheduleBoard.runs = [];
+  scheduleBoard.runsLoaded = false;
+  schedulePending.clear();
+  scheduleBulkOutstanding = 0;
+  scheduleRefreshQueued = false;
+  readSchedules();
+}
+
+function selectSchedule(id) {
+  if (scheduleBoard.selected === id) {
+    scheduleBoard.selected = null;
+    scheduleBoard.detail = null;
+    scheduleBoard.runs = [];
+    scheduleBoard.runsLoaded = false;
+    paintSchedules();
+    return;
+  }
+  scheduleBoard.selected = id;
+  scheduleBoard.detail = scheduleBoard.items.find(item => item.id === id) ?? null;
+  scheduleBoard.runs = [];
+  scheduleBoard.runsLoaded = false;
+  paintSchedules();
+  loadScheduleDetail(id);
+}
+
+function loadScheduleDetail(id) {
+  if (!id) return;
+  sendScheduleRequest({ action: 'show', id }, { kind: 'show', id });
+  sendScheduleRequest({ action: 'runs', definition: id, limit: 50 }, { kind: 'runs', id });
+}
+
+function manageSchedule(request, intent) {
+  if (scheduleBoard.busy) return Promise.reject(new Error('上一个定时任务操作还在处理中。'));
+  if (!scheduleSession()) return Promise.reject(new Error('先打开一个会话：定时任务通过该会话所属的运行时管理。'));
+  scheduleBoard.busy = true;
+  scheduleBoard.error = null;
+  scheduleBoard.notice = null;
+  paintSchedules();
+  const queryId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    scheduleMutation = { queryId, intent, resolve, reject };
+    sendScheduleRequest(request, { kind: 'mutation', intent, queryId });
+  });
+}
+
+function runScheduleAction(callback) {
+  callback().catch(error => {
+    scheduleBoard.busy = false;
+    scheduleBoard.error = error.message;
+    paintSchedules();
+  });
+}
+
+function checkScheduleWakeup() {
+  if (scheduleBoard.doctorPending) return;
+  scheduleBoard.doctorPending = true;
+  scheduleBoard.error = null;
+  paintSchedules();
+  sendScheduleRequest({ action: 'wakeup_doctor' }, { kind: 'doctor' });
+}
+
+function consumeScheduleEvent(frame) {
+  if (frame.event !== 'runtime' || frame.data?.type !== 'schedule_managed') return false;
+  const data = frame.data;
+  if (data.requester_session_id !== scheduleSession()) return false;
+  const pending = schedulePending.get(data.query_id);
+  if (!pending) return false;
+  schedulePending.delete(data.query_id);
+  if (pending.kind === 'list' || pending.kind === 'status') {
+    scheduleBulkOutstanding = Math.max(0, scheduleBulkOutstanding - 1);
+  }
+  const response = data.response;
+  const mutation = scheduleMutation?.queryId === data.query_id ? scheduleMutation : null;
+  if (mutation) {
+    scheduleMutation = null;
+    scheduleBoard.busy = false;
+    if (response?.kind === 'error') {
+      const message = response.message || '运行时拒绝了这次操作';
+      scheduleBoard.error = message;
+      mutation.reject(new Error(message));
+    } else {
+      scheduleBoard.error = null;
+      scheduleBoard.notice = intentLabel(mutation.intent);
+      if (response?.kind === 'changed' && response.schedule) {
+        if (mutation.intent === 'create') {
+          scheduleBoard.selected = response.schedule.id;
+          scheduleBoard.detail = response.schedule;
+          scheduleBoard.runs = [];
+          scheduleBoard.runsLoaded = false;
+        } else if (scheduleBoard.selected === response.schedule.id) {
+          scheduleBoard.detail = response.schedule;
+        }
+      }
+      if (response?.kind === 'removed' && scheduleBoard.selected === response.id) {
+        scheduleBoard.selected = null;
+        scheduleBoard.detail = null;
+        scheduleBoard.runs = [];
+        scheduleBoard.runsLoaded = false;
+      }
+      mutation.resolve(response);
+    }
+    refreshSchedules();
+    if (scheduleBoard.selected) loadScheduleDetail(scheduleBoard.selected);
+    paintSchedules();
+    return true;
+  }
+  applyScheduleRead(pending, response);
+  return true;
+}
+
+function applyScheduleRead(pending, response) {
+  if (!response) return;
+  if (pending.kind === 'doctor') scheduleBoard.doctorPending = false;
+  if (response.kind === 'error') {
+    scheduleBoard.error = response.message;
+  } else if (pending.kind === 'list' && response.kind === 'list') {
+    scheduleBoard.items = response.schedules ?? [];
+    scheduleBoard.loaded = true;
+    if (scheduleBoard.selected) {
+      const row = scheduleBoard.items.find(item => item.id === scheduleBoard.selected);
+      if (row) scheduleBoard.detail = row;
+      else {
+        scheduleBoard.selected = null;
+        scheduleBoard.detail = null;
+        scheduleBoard.runs = [];
+        scheduleBoard.runsLoaded = false;
+      }
+    }
+  } else if (pending.kind === 'status' && response.kind === 'status') {
+    scheduleBoard.status = response.status;
+  } else if (pending.kind === 'show' && response.kind === 'show') {
+    if (scheduleBoard.selected === pending.id) scheduleBoard.detail = response.schedule;
+  } else if (pending.kind === 'runs' && response.kind === 'runs') {
+    if (scheduleBoard.selected === pending.id) {
+      scheduleBoard.runs = response.runs ?? [];
+      scheduleBoard.runsLoaded = true;
+    }
+  } else if (pending.kind === 'doctor') {
+    if (response.kind === 'doctor') {
+      scheduleBoard.doctor = { healthy: response.healthy, checks: response.checks ?? [] };
+    } else {
+      scheduleBoard.error = response.message ?? '后台调度检查失败';
+    }
+  }
+  if (pending.kind === 'list' || pending.kind === 'status') {
+    if (scheduleBulkOutstanding === 0) {
+      scheduleBoard.loading = false;
+      if (scheduleRefreshQueued) {
+        scheduleRefreshQueued = false;
+        refreshSchedules();
+      }
+    }
+  }
+  paintSchedules();
+}
+
+/* ------------------------------------------------------- automation view */
+
+function scheduleChip(label, tone) {
+  return el('span', `schedule-chip tone-${tone}`, label);
+}
+
+function renderAutomationPage(page) {
+  const head = el('div', 'entry-head');
+  const copy = el('div');
+  copy.append(
+    el('h1', undefined, '自动化任务'),
+    el('p', undefined, '按计划运行 Agent 任务。后台检查由本机运行时负责；关闭此页面不会删除或停止任何任务。'),
+  );
+  const actions = el('div', 'settings-actions');
+  const refresh = el('button', 'button secondary', '刷新');
+  refresh.type = 'button';
+  refresh.disabled = !scheduleSession() || scheduleBoard.loading;
+  refresh.addEventListener('click', () => readSchedules());
+  const create = el('button', 'button primary', '新建任务');
+  create.type = 'button';
+  create.disabled = !scheduleSession() || scheduleBoard.busy;
+  create.addEventListener('click', () => openScheduleEditor());
+  actions.append(refresh, create);
+  head.append(copy, actions);
+  page.append(head);
+
+  if (!scheduleSession()) {
+    const card = el('div', 'entry-card');
+    card.append(
+      el('h2', undefined, '先打开一个会话'),
+      el('p', undefined, '定时任务通过该会话所属的运行时管理，不会另起一套后台进程或数据库。'),
+    );
+    page.append(card);
+    return;
+  }
+
+  page.append(renderScheduleStatus());
+
+  const tabs = el('div', 'entry-tabs');
+  for (const filter of SCHEDULE_FILTERS) {
+    const tab = el('button', 'entry-tab', filterLabel(filter));
+    tab.type = 'button';
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', String(scheduleBoard.filter === filter));
+    tab.addEventListener('click', () => setScheduleFilter(filter));
+    tabs.append(tab);
+  }
+  page.append(tabs);
+
+  if (scheduleBoard.error) {
+    const banner = el('div', 'schedule-banner error', scheduleBoard.error);
+    banner.setAttribute('role', 'alert');
+    page.append(banner);
+  }
+  if (scheduleBoard.notice) {
+    const banner = el('div', 'schedule-banner notice', scheduleBoard.notice);
+    banner.setAttribute('role', 'status');
+    page.append(banner);
+  }
+
+  if (!scheduleBoard.loaded && scheduleBulkOutstanding > 0) {
+    page.append(el('div', 'schedule-empty', '正在读取定时任务…'));
+  } else if (!scheduleBoard.items.length) {
+    page.append(el('div', 'schedule-empty', '这个筛选下没有定时任务。可以在对话里用自然语言创建，也可以点“新建任务”。'));
+  } else {
+    const list = el('div', 'entry-list schedule-list');
+    for (const item of scheduleBoard.items) list.append(renderScheduleRow(item));
+    page.append(list);
+  }
+
+  if (scheduleBoard.detail) page.append(renderScheduleDetail(scheduleBoard.detail));
+}
+
+function renderScheduleStatus() {
+  const card = el('div', 'entry-card schedule-status');
+  const status = scheduleBoard.status;
+  if (!status) {
+    card.append(el('div', 'schedule-muted', '正在读取后台调度状态…'));
+    return card;
+  }
+  const counts = el('div', 'schedule-counts');
+  for (const [label, value] of [
+    ['定义', status.definitions], ['启用', status.enabled], ['暂停', status.paused],
+    ['运行中', status.running], ['待处理', status.overdue_pending],
+  ]) {
+    const item = el('span', 'schedule-count');
+    item.append(el('strong', undefined, String(value)), el('span', undefined, label));
+    counts.append(item);
+  }
+  card.append(counts);
+
+  const wakeup = wakeupLabel(status);
+  const row = el('div', 'schedule-wakeup');
+  row.append(scheduleChip(wakeup.label, wakeup.tone));
+  if (status.wakeup?.detail) row.append(el('span', 'schedule-muted', String(status.wakeup.detail)));
+  const check = el('button', 'button ghost small', '检查');
+  check.type = 'button';
+  check.disabled = scheduleBoard.doctorPending;
+  check.addEventListener('click', checkScheduleWakeup);
+  row.append(check);
+  if (wakeup.actionable) {
+    const toggle = el('button', 'button secondary small', wakeup.enabled ? '关闭后台唤醒' : '启用后台唤醒');
+    toggle.type = 'button';
+    toggle.disabled = scheduleBoard.busy;
+    toggle.addEventListener('click', async () => {
+      if (wakeup.enabled) {
+        const ok = await confirmDialog({
+          title: '关闭后台唤醒',
+          body: '关闭后，全部定时任务仍会保留；但系统不会单独唤醒运行时，只有应用打开时才会检查待执行任务。',
+          confirm: '关闭唤醒',
+        });
+        if (ok) runScheduleAction(() => manageSchedule({ action: 'wakeup_disable' }, 'wakeup_disable'));
+      } else {
+        const ok = await confirmDialog({
+          title: '启用后台唤醒',
+          body: '会在本机注册系统级计划任务，由系统每分钟唤醒一次检查待执行任务。这不会授权任何无人值守执行；每条任务仍需单独授权。',
+          confirm: '启用',
+        });
+        if (ok) runScheduleAction(() => manageSchedule({ action: 'wakeup_enable' }, 'wakeup_enable'));
+      }
+    });
+    row.append(toggle);
+  }
+  card.append(row);
+
+  if (status.next_occurrence) {
+    card.append(el('div', 'schedule-line', `下次运行：${formatDateTime(status.next_occurrence)}`));
+  }
+  if (status.last_os_wake) {
+    const wake = status.last_os_wake;
+    card.append(el('div', 'schedule-line', `最近系统唤醒：${formatDateTime(wake.started_at)} · 触发 ${wake.claimed} / 成功 ${wake.succeeded} / 失败 ${wake.failed} / 未知 ${wake.unknown} / 跳过 ${wake.skipped} / 错过 ${wake.missed}`));
+    if (wake.error) card.append(el('div', 'schedule-error-text', `上次唤醒错误：${wake.error}`));
+  }
+  if (scheduleBoard.doctor) {
+    const doctor = el('div', 'schedule-doctor');
+    doctor.append(el('div', 'schedule-doctor-head', scheduleBoard.doctor.healthy ? '后台调度检查：正常' : '后台调度检查：发现问题'));
+    for (const check of scheduleBoard.doctor.checks) {
+      const line = el('div', 'schedule-doctor-row');
+      line.append(
+        el('span', `schedule-chip tone-${check.severity === 'fail' ? 'danger' : check.severity === 'warn' ? 'warn' : 'ok'}`, severityLabel(check.severity)),
+        el('span', 'schedule-doctor-name', doctorCheckLabel(check.name)),
+        el('span', 'schedule-muted', check.detail),
+      );
+      doctor.append(line);
+    }
+    card.append(doctor);
+  }
+  return card;
+}
+
+function renderScheduleRow(item) {
+  const row = el('button', 'entry-row schedule-row');
+  row.type = 'button';
+  row.setAttribute('aria-selected', String(scheduleBoard.selected === item.id));
+  const mark = el('span', 'entry-row-icon');
+  mark.append(iconNode('clock', { size: 16 }));
+  const copy = el('span', 'entry-row-copy');
+  copy.append(el('span', 'entry-row-title', item.name));
+  copy.append(el('span', 'entry-row-desc', `${triggerLabel(item.trigger)} · 下次 ${formatDateTime(item.next_run_at)} · ${actionSummary(item.action)}`));
+  const state = scheduleState(item);
+  row.append(mark, copy, scheduleChip(state.label, state.tone));
+  row.addEventListener('click', () => selectSchedule(item.id));
+  return row;
+}
+
+function scheduleField(label, value) {
+  const row = el('div', 'schedule-field');
+  row.append(el('span', 'schedule-field-label', label), el('span', 'schedule-field-value', value ?? '—'));
+  return row;
+}
+
+function renderScheduleDetail(item) {
+  const card = el('div', 'entry-card schedule-detail');
+  const head = el('div', 'schedule-detail-head');
+  const copy = el('div');
+  copy.append(
+    el('h2', undefined, item.name),
+    el('div', 'schedule-muted', `${actionSummary(item.action)} · ${item.workspace}`),
+  );
+  const state = scheduleState(item);
+  head.append(copy, scheduleChip(state.label, state.tone));
+  card.append(head);
+
+  const attention = attentionLabel(item);
+  if (attention) card.append(el('div', 'schedule-attention', attention));
+  if (item.last_run?.error) card.append(el('div', 'schedule-error-text', `上次错误：${item.last_run.error}`));
+
+  const actions = el('div', 'schedule-actions');
+  const actionButton = (label, onClick, { disabled = false, danger = false } = {}) => {
+    const button = el('button', `button ${danger ? 'danger' : 'secondary'} small`, label);
+    button.type = 'button';
+    button.disabled = disabled || scheduleBoard.busy;
+    button.addEventListener('click', onClick);
+    actions.append(button);
+  };
+  actionButton(item.enabled ? '暂停' : '恢复', () => runScheduleAction(() => manageSchedule({ action: item.enabled ? 'pause' : 'resume', id: item.id }, item.enabled ? 'pause' : 'resume')));
+  actionButton('立即运行', () => runScheduleAction(() => manageSchedule({ action: 'run_now', id: item.id }, 'run_now')));
+  actionButton('取消执行', () => runScheduleAction(() => manageSchedule({ action: 'cancel', id: item.id }, 'cancel')), { disabled: !item.running });
+  actionButton('编辑', () => openScheduleEditor(item));
+  actionButton('删除', async () => {
+    const ok = await confirmDialog({
+      title: '删除定时任务',
+      body: `删除「${item.name}」？已产生的运行记录会保留。`,
+      confirm: '删除',
+      danger: true,
+    });
+    if (ok) runScheduleAction(() => manageSchedule({ action: 'remove', id: item.id }, 'remove'));
+  }, { danger: true });
+  card.append(actions);
+
+  const fields = el('div', 'schedule-fields');
+  fields.append(
+    scheduleField('动作', actionSummary(item.action)),
+    scheduleField('工作目录', item.workspace),
+    scheduleField('规则', triggerLabel(item.trigger)),
+    scheduleField('时区', item.timezone ?? '本机时区'),
+    scheduleField('下次运行', formatDateTime(item.next_run_at)),
+    scheduleField('权限模式', modeLabel(item.mode)),
+    scheduleField('会话策略', policyLabel(item.session_policy)),
+    scheduleField('重叠策略', overlapLabel(item.overlap)),
+    scheduleField('错过策略', misfireLabel(item.misfire)),
+    scheduleField('模型', item.model ?? '会话默认'),
+    scheduleField('超时', `${item.timeout_secs} 秒`),
+    scheduleField('无人值守', grantSummary(item.grant)),
+  );
+  card.append(fields);
+
+  card.append(renderScheduleGrant(item));
+  if (item.session_id) {
+    const jump = el('button', 'button ghost small', '打开关联会话');
+    jump.type = 'button';
+    jump.addEventListener('click', () => openScheduleSession(item.session_id));
+    card.append(jump);
+  }
+  card.append(renderScheduleRuns());
+  return card;
+}
+
+function grantSummary(grant) {
+  if (!grant) return '—';
+  if (grant.requires_regrant) return grant.granted ? '授权已失效，需要重新授权' : '未授权';
+  if (grant.granted) return grant.external_side_effects ? '已授权（含外部副作用）' : '已授权';
+  return '未授权';
+}
+
+function renderScheduleGrant(item) {
+  const box = el('div', 'schedule-grant');
+  if (item.grant.granted && !item.grant.requires_regrant) {
+    const line = `已授权无人值守（${item.grant.external_side_effects ? '含外部副作用' : '不含外部副作用'}）${item.grant.granted_at ? ` · ${formatDateTime(item.grant.granted_at)}` : ''}`;
+    box.append(el('div', 'schedule-muted', line));
+    const revoke = el('button', 'button ghost small', '撤销授权');
+    revoke.type = 'button';
+    revoke.disabled = scheduleBoard.busy;
+    revoke.addEventListener('click', () => runScheduleAction(() => manageSchedule({ action: 'revoke_grant', id: item.id }, 'revoke_grant')));
+    box.append(revoke);
+    return box;
+  }
+  box.append(el('div', 'schedule-muted', item.grant.requires_regrant
+    ? '无人值守授权已失效；修改目标、动作、模型、工作目录、时区或执行频率后需要重新授权。'
+    : '尚未授权无人值守执行。'));
+  const requiresExternal = item.action_kind === 'shell' || item.action_kind === 'agent';
+  const label = el('label', 'schedule-check');
+  const external = el('input');
+  external.type = 'checkbox';
+  label.append(
+    external,
+    document.createTextNode(`允许外部副作用（例如发送消息、访问网络）${requiresExternal ? '（此类任务必须勾选）' : ''}`),
+  );
+  const grant = el('button', 'button secondary small', '授权无人值守');
+  grant.type = 'button';
+  grant.disabled = scheduleBoard.busy || (requiresExternal && !external.checked);
+  external.addEventListener('change', () => {
+    grant.disabled = scheduleBoard.busy || (requiresExternal && !external.checked);
+  });
+  grant.addEventListener('click', async () => {
+    const ok = await confirmDialog({
+      title: '授权无人值守执行',
+      body: `授权后，该任务会在后台按计划运行，不再逐次询问。${external.checked ? '这次授权同时包含外部副作用。' : '外部副作用仍会在运行时被拒绝。'}修改任务目标、动作、模型、工作目录、时区或执行频率会要求重新授权。`,
+      confirm: '授权',
+    });
+    if (ok) runScheduleAction(() => manageSchedule({ action: 'grant', id: item.id, allow_external_side_effects: external.checked }, 'grant'));
+  });
+  box.append(label, grant);
+  return box;
+}
+
+function scheduleDuration(run) {
+  if (!run.started_at || !run.finished_at) return null;
+  const ms = new Date(run.finished_at).getTime() - new Date(run.started_at).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  if (ms < 1000) return `${ms} 毫秒`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} 秒`;
+  return `${Math.round(ms / 60_000)} 分钟`;
+}
+
+function renderScheduleRuns() {
+  const box = el('div', 'schedule-runs');
+  box.append(el('h3', undefined, '运行记录'));
+  if (!scheduleBoard.runsLoaded) {
+    box.append(el('div', 'schedule-muted', '正在读取运行记录…'));
+    return box;
+  }
+  if (!scheduleBoard.runs.length) {
+    box.append(el('div', 'schedule-muted', '暂无运行记录。'));
+    return box;
+  }
+  for (const run of scheduleBoard.runs) {
+    const row = el('div', 'schedule-run');
+    const state = runState(run.state);
+    const head = el('div', 'schedule-run-head');
+    head.append(scheduleChip(state.label, state.tone), el('span', 'schedule-run-time', formatDateTime(run.scheduled_for)));
+    const duration = scheduleDuration(run);
+    if (duration) head.append(el('span', 'schedule-muted', duration));
+    row.append(head, el('div', 'schedule-run-usage', runUsage(run)));
+    if (run.exit_code !== undefined && run.exit_code !== null) row.append(el('div', 'schedule-muted', `退出码 ${run.exit_code}`));
+    if (run.error) row.append(el('div', 'schedule-error-text', run.error));
+    if (run.session_id) {
+      const jump = el('button', 'button ghost small', '打开会话');
+      jump.type = 'button';
+      jump.addEventListener('click', () => openScheduleSession(run.session_id));
+      row.append(jump);
+    }
+    box.append(row);
+  }
+  return box;
+}
+
+async function openScheduleSession(sessionId) {
+  let task = tasks.find(candidate => candidate.id === sessionId);
+  if (!task) {
+    await refreshTasks();
+    task = tasks.find(candidate => candidate.id === sessionId);
+  }
+  if (!task) {
+    toast('这个会话不在当前任务列表中', { tone: 'warning' });
+    return;
+  }
+  await action(() => openTask(task));
+}
+
+/* ------------------------------------------------------- schedule editor */
+
+function scheduleInput(type, value) {
+  const input = el('input', 'schedule-input');
+  input.type = type;
+  if (value !== undefined && value !== null) input.value = String(value);
+  return input;
+}
+
+function scheduleTextarea(value, placeholder) {
+  const area = el('textarea', 'schedule-input schedule-textarea');
+  area.rows = 3;
+  area.value = value ?? '';
+  if (placeholder) area.placeholder = placeholder;
+  return area;
+}
+
+function scheduleSelect(options, value) {
+  const select = el('select', 'schedule-input');
+  for (const [key, label] of options) {
+    const option = el('option', undefined, label);
+    option.value = key;
+    select.append(option);
+  }
+  select.value = value;
+  return select;
+}
+
+function scheduleEditorRow(label, control, hint) {
+  const row = el('label', 'schedule-editor-row');
+  row.append(el('span', 'schedule-editor-label', label));
+  const body = el('span', 'schedule-editor-control');
+  body.append(control);
+  if (hint) body.append(el('small', 'schedule-muted', hint));
+  row.append(body);
+  return row;
+}
+
+function parseWeekdays(raw) {
+  const selected = new Set();
+  for (const part of String(raw ?? '').split(',')) {
+    const [start, end] = part.trim().toLowerCase().split('-');
+    const from = SCHEDULE_WEEKDAYS.findIndex(([code]) => code === start);
+    const to = end ? SCHEDULE_WEEKDAYS.findIndex(([code]) => code === end) : from;
+    if (from < 0 || to < 0) continue;
+    for (let at = from; at <= to; at += 1) selected.add(SCHEDULE_WEEKDAYS[at][0]);
+  }
+  return selected;
+}
+
+function openScheduleEditor(source = null) {
+  const editing = Boolean(source);
+  const trigger = source?.trigger ?? null;
+  const declared = source?.action ?? { kind: 'agent', goal: '' };
+  const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+
+  const dialog = el('dialog', 'modal schedule-editor');
+  const form = el('form', 'modal-card schedule-editor-card');
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, editing ? '编辑定时任务' : '新建定时任务'));
+  const body = el('div', 'schedule-editor-body');
+
+  const name = scheduleInput('text', source?.name ?? '');
+  name.maxLength = 200;
+  name.placeholder = '例如：每日提交摘要';
+  body.append(scheduleEditorRow('名称', name));
+
+  const workspace = scheduleInput('text', source?.workspace ?? current?.session.repository ?? '');
+  workspace.placeholder = '/path/to/project';
+  body.append(scheduleEditorRow('工作目录', workspace, '由该目录所属的运行时执行任务。'));
+
+  const actionKind = scheduleSelect(
+    [['agent', 'Agent 任务'], ['shell', 'Shell 命令'], ['native', '原生操作']],
+    declared.kind ?? 'agent',
+  );
+  body.append(scheduleEditorRow('动作类型', actionKind));
+
+  const agentGoal = scheduleTextarea(declared.kind === 'agent' ? declared.goal : '', '描述这次运行要完成的目标');
+  const shellCommand = scheduleTextarea(declared.kind === 'shell' ? declared.command : '', '例如：npm test');
+  const nativeAction = scheduleInput('text', declared.kind === 'native' ? declared.action : '');
+  nativeAction.placeholder = '例如：open-url';
+  const nativeInput = scheduleTextarea(declared.kind === 'native' ? declared.input : '{}', 'JSON 对象，留空表示 {}');
+  const actionGroups = {
+    agent: scheduleEditorRow('任务目标', agentGoal),
+    shell: scheduleEditorRow('命令', shellCommand),
+    native: (() => {
+      const group = el('div', 'schedule-editor-group');
+      group.append(scheduleEditorRow('操作名', nativeAction), scheduleEditorRow('参数 JSON', nativeInput));
+      return group;
+    })(),
+  };
+  const actionDetail = el('div', 'schedule-editor-groups');
+  actionDetail.append(actionGroups.agent, actionGroups.shell, actionGroups.native);
+  body.append(actionDetail);
+  const showAction = kind => {
+    for (const [key, node] of Object.entries(actionGroups)) node.hidden = key !== kind;
+  };
+  actionKind.addEventListener('change', () => showAction(actionKind.value));
+  showAction(declared.kind ?? 'agent');
+
+  const triggerKind = scheduleSelect(
+    [['once', '一次'], ['daily', '每天'], ['weekly', '每周'], ['every', '固定间隔'], ['cron', 'Cron 表达式']],
+    trigger?.kind ?? 'daily',
+  );
+  body.append(scheduleEditorRow('规则类型', triggerKind));
+
+  const onceAt = scheduleInput('datetime-local', localInputValue(trigger?.kind === 'once' ? trigger.at : null));
+  onceAt.step = '1';
+  const dailyTime = scheduleInput('time', trigger?.kind === 'daily' ? trigger.time : '09:00');
+  const weeklyTime = scheduleInput('time', trigger?.kind === 'weekly' ? trigger.time : '09:00');
+  const weekdayState = parseWeekdays(trigger?.kind === 'weekly' ? trigger.weekdays : 'mon');
+  const weekdayBox = el('div', 'schedule-weekdays');
+  const weekdayInputs = SCHEDULE_WEEKDAYS.map(([code, label]) => {
+    const wrap = el('label', 'schedule-weekday');
+    const input = el('input');
+    input.type = 'checkbox';
+    input.value = code;
+    input.checked = weekdayState.has(code);
+    wrap.append(input, document.createTextNode(label));
+    weekdayBox.append(wrap);
+    return input;
+  });
+  const everyValue = scheduleInput('number', trigger?.kind === 'every'
+    ? String(trigger.every_secs % 3600 === 0 ? trigger.every_secs / 3600 : trigger.every_secs % 60 === 0 ? trigger.every_secs / 60 : trigger.every_secs)
+    : '1');
+  everyValue.min = '1';
+  everyValue.step = '1';
+  const everyUnit = scheduleSelect(
+    [['1', '秒'], ['60', '分钟'], ['3600', '小时']],
+    trigger?.kind === 'every' ? (trigger.every_secs % 3600 === 0 ? '3600' : trigger.every_secs % 60 === 0 ? '60' : '1') : '3600',
+  );
+  const everyRow = el('div', 'schedule-every');
+  everyRow.append(everyValue, everyUnit);
+  const cronExpression = scheduleInput('text', trigger?.kind === 'cron' ? trigger.expression : '');
+  cronExpression.placeholder = '0 9 * * mon-fri';
+  const timezone = scheduleInput('text', source?.timezone ?? trigger?.timezone ?? localZone);
+  timezone.placeholder = 'Asia/Shanghai';
+
+  const triggerGroups = {
+    once: scheduleEditorRow('运行时间', onceAt),
+    daily: scheduleEditorRow('每天时间', dailyTime),
+    weekly: (() => {
+      const group = el('div', 'schedule-editor-group');
+      const weekdaysRow = el('div', 'schedule-editor-row');
+      weekdaysRow.append(el('span', 'schedule-editor-label', '星期'), weekdayBox);
+      group.append(weekdaysRow, scheduleEditorRow('时间', weeklyTime));
+      return group;
+    })(),
+    every: scheduleEditorRow('间隔', everyRow),
+    cron: scheduleEditorRow('表达式', cronExpression, '五段 cron：分 时 日 月 周。'),
+  };
+  const timezoneRow = scheduleEditorRow('IANA 时区', timezone, '例如 Asia/Shanghai；留空使用本机时区。');
+  const triggerDetail = el('div', 'schedule-editor-groups');
+  triggerDetail.append(triggerGroups.once, triggerGroups.daily, triggerGroups.weekly, triggerGroups.every, triggerGroups.cron, timezoneRow);
+  body.append(triggerDetail);
+  const showTrigger = kind => {
+    for (const [key, node] of Object.entries(triggerGroups)) node.hidden = key !== kind;
+    timezoneRow.hidden = !['daily', 'weekly', 'cron'].includes(kind);
+  };
+  triggerKind.addEventListener('change', () => showTrigger(triggerKind.value));
+  showTrigger(trigger?.kind ?? 'daily');
+
+  const advanced = el('details', 'schedule-advanced');
+  advanced.append(el('summary', undefined, '高级设置'));
+  const advancedBody = el('div', 'schedule-editor-grid');
+  const mode = scheduleSelect(
+    [['assisted', '工作区内修改'], ['request_approval', '需批准'], ['full_access', '完全权限']],
+    source?.mode ?? 'assisted',
+  );
+  const model = scheduleInput('text', source?.model ?? '');
+  model.placeholder = 'provider/model';
+  const sessionPolicy = scheduleSelect([['continue', '继续同一会话'], ['fresh', '每次新会话']], source?.session_policy ?? 'continue');
+  const overlap = scheduleSelect(
+    [['skip-if-running', '跳过重叠运行'], ['queue-one', '排队一次'], ['allow-concurrent', '允许并发']],
+    source?.overlap ?? 'skip-if-running',
+  );
+  const misfire = scheduleSelect([['skip', '跳过'], ['run-once', '补跑一次']], source?.misfire ?? 'skip');
+  const timeout = scheduleInput('number', String(source?.timeout_secs ?? 600));
+  timeout.min = '1';
+  timeout.step = '1';
+  advancedBody.append(
+    scheduleEditorRow('权限模式', mode),
+    scheduleEditorRow('模型', model, '留空使用会话默认模型。'),
+    scheduleEditorRow('会话策略', sessionPolicy),
+    scheduleEditorRow('重叠策略', overlap),
+    scheduleEditorRow('错过策略', misfire),
+    scheduleEditorRow('超时（秒）', timeout),
+  );
+  advanced.append(advancedBody);
+  body.append(advanced);
+
+  let grantCheckbox = null;
+  let externalCheckbox = null;
+  if (!editing) {
+    const grantBox = el('div', 'schedule-editor-grant');
+    const grantLabel = el('label', 'schedule-check');
+    grantCheckbox = el('input');
+    grantCheckbox.type = 'checkbox';
+    grantLabel.append(grantCheckbox, document.createTextNode('允许无人值守执行（后续计划运行不再逐次询问）'));
+    const externalLabel = el('label', 'schedule-check');
+    externalCheckbox = el('input');
+    externalCheckbox.type = 'checkbox';
+    externalCheckbox.disabled = true;
+    externalLabel.append(externalCheckbox, document.createTextNode('同时允许外部副作用（发送消息、访问网络等）'));
+    grantCheckbox.addEventListener('change', () => {
+      externalCheckbox.disabled = !grantCheckbox.checked;
+      if (!grantCheckbox.checked) externalCheckbox.checked = false;
+    });
+    grantBox.append(
+      grantLabel,
+      externalLabel,
+      el('small', 'schedule-muted', '授权只覆盖这一条定义的动作、工作目录、时区和执行频率；扩大范围后，运行时会要求重新授权。'),
+    );
+    body.append(grantBox);
+  }
+
+  const errorNode = el('div', 'schedule-error-text');
+  errorNode.setAttribute('role', 'alert');
+  const footer = el('div', 'modal-actions');
+  const cancel = el('button', 'button secondary', '取消');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => dialog.close());
+  const submit = el('button', 'button primary', editing ? '保存' : '创建');
+  submit.type = 'submit';
+  footer.append(cancel, submit);
+
+  const buildAction = () => {
+    if (actionKind.value === 'agent') {
+      if (!agentGoal.value.trim()) throw new Error('请填写任务目标');
+      return { kind: 'agent', goal: agentGoal.value.trim() };
+    }
+    if (actionKind.value === 'shell') {
+      if (!shellCommand.value.trim()) throw new Error('请填写命令');
+      return { kind: 'shell', command: shellCommand.value };
+    }
+    if (!nativeAction.value.trim()) throw new Error('请填写原生操作名');
+    return { kind: 'native', action: nativeAction.value.trim(), input: nativeInput.value.trim() || '{}' };
+  };
+
+  const buildTrigger = () => {
+    const zone = timezone.value.trim() ? { timezone: timezone.value.trim() } : {};
+    if (triggerKind.value === 'once') {
+      const date = new Date(onceAt.value);
+      if (Number.isNaN(date.getTime())) throw new Error('请选择一次运行的时间');
+      return { kind: 'once', at: date.toISOString() };
+    }
+    if (triggerKind.value === 'daily') {
+      if (!dailyTime.value) throw new Error('请选择每天运行的时间');
+      return { kind: 'daily', time: dailyTime.value, ...zone };
+    }
+    if (triggerKind.value === 'weekly') {
+      const weekdays = weekdayInputs.filter(input => input.checked).map(input => input.value);
+      if (!weekdays.length) throw new Error('请至少选择一个星期');
+      if (!weeklyTime.value) throw new Error('请选择每周运行的时间');
+      return { kind: 'weekly', weekdays: weekdays.join(','), time: weeklyTime.value, ...zone };
+    }
+    if (triggerKind.value === 'every') {
+      const value = Number(everyValue.value);
+      const secs = value * Number(everyUnit.value);
+      if (!Number.isSafeInteger(value) || value <= 0 || !Number.isSafeInteger(secs) || secs <= 0) {
+        throw new Error('间隔必须是正整数');
+      }
+      const anchor = trigger?.kind === 'every' ? trigger.anchor : null;
+      return anchor ? { kind: 'every', every_secs: secs, anchor } : { kind: 'every', every_secs: secs };
+    }
+    if (!cronExpression.value.trim()) throw new Error('请填写 cron 表达式');
+    return { kind: 'cron', expression: cronExpression.value.trim(), ...zone };
+  };
+
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    errorNode.textContent = '';
+    submit.disabled = true;
+    try {
+      const action = buildAction();
+      const rule = buildTrigger();
+      if (!name.value.trim()) throw new Error('请填写名称');
+      if (!workspace.value.trim()) throw new Error('请填写工作目录');
+      let timeoutSecs = null;
+      if (timeout.value.trim()) {
+        timeoutSecs = Number(timeout.value);
+        if (!Number.isSafeInteger(timeoutSecs) || timeoutSecs <= 0) throw new Error('超时必须是正整数秒');
+      }
+      const common = {
+        name: name.value.trim(),
+        workspace: workspace.value.trim(),
+        action,
+        trigger: rule,
+        session_policy: sessionPolicy.value,
+        overlap: overlap.value,
+        mode: mode.value,
+        misfire: misfire.value,
+      };
+      if (timeoutSecs !== null) common.timeout_secs = timeoutSecs;
+      if (editing) {
+        const patch = { ...common, model: model.value.trim() };
+        await manageSchedule({ action: 'update', id: source.id, expected_revision: source.revision, patch }, 'update');
+      } else {
+        const grantUnattended = Boolean(grantCheckbox?.checked);
+        const allowExternal = Boolean(externalCheckbox?.checked);
+        if (grantUnattended && (action.kind === 'shell' || action.kind === 'agent') && !allowExternal) {
+          throw new Error('Shell 和 Agent 任务可能访问工作目录之外，授权时必须勾选外部副作用');
+        }
+        const draft = {
+          ...common,
+          grant_unattended: grantUnattended,
+          allow_external_side_effects: allowExternal,
+        };
+        if (model.value.trim()) draft.model = model.value.trim();
+        await manageSchedule({ action: 'create', draft }, 'create');
+      }
+      dialog.close();
+    } catch (error) {
+      errorNode.textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+
+  form.append(head, body, errorNode, footer);
+  dialog.append(form);
+  dialog.addEventListener('keydown', event => trapTab(dialog, event));
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  name.focus();
 }
 
 /* ------------------------------------------------------------ event stream */
@@ -6925,6 +7854,7 @@ function consumeSettingsEvent(frame) {
 }
 
 api.onEvent(frame => {
+  if (consumeScheduleEvent(frame)) return;
   consumeSettingsEvent(frame);
   if (frame.event === 'connection') { applyConnection(frame); return; }
   if (frame.event === 'restored') {
@@ -6936,6 +7866,7 @@ api.onEvent(frame => {
     currentSource = result.source_id ?? currentSource;
     history = [];
     current = attachExtras(projectSnapshot(session, history), session);
+    resetScheduleProjection();
     lastEventSeq = session.last_sequence ?? 0;
     activeView = 'chat';
     liveTrajectory = [];

@@ -96,6 +96,7 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
             }
         },
         Screen::Clean => state.clean.move_selection(notches),
+        Screen::Schedules => crate::schedules::wheel(state, notches),
         Screen::Help => {
             let t = state.t();
             state.help.move_selection(notches, t);
@@ -154,6 +155,7 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
                 state.clean.selected = index;
             }
         }
+        Screen::Schedules => crate::schedules::select_row(state, key),
         Screen::Help => {
             if let Ok(index) = key.parse::<usize>() {
                 state.help.select(index, state.t());
@@ -501,6 +503,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 }
             }
         }
+        Screen::Schedules => return crate::schedules::handle_key(state, &key),
         Screen::Clean => match key.code {
             // Esc leaves the page. It never cancels foreground Agent work, and
             // a cleanup already running keeps running: the page owns no work
@@ -563,6 +566,9 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         }
         // The Context & Usage page drops the queries it owned on the way out.
         Screen::Context => close_stats(state),
+        // The schedule page's back is one level, not always the whole page:
+        // form → detail → list → conversation, the same rule Esc follows.
+        Screen::Schedules => crate::schedules::back(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
         _ => match state.detail_return.take() {

@@ -96,3 +96,9 @@ test('compaction is a selected-session command with no versioned authority',()=>
  assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
  for(const fields of [{session_id:'s2'},{session_id:' '},{content:'x'},{expected_version:1}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
 });
+
+test('scheduled automation is session-scoped, bounded and forwarded as a structured request',()=>{
+ const valid={type:'manage_schedule',requester_session_id:'s1',query_id:'q1',request:{action:'list',filter:'all'}};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(valid)));
+ for(const fields of [{requester_session_id:'s2'},{requester_session_id:''},{requester_session_id:' '},{query_id:''},{query_id:'a'.repeat(257)},{request:null},{request:[]},{request:'list'},{request:{}},{request:{action:'a'.repeat(33)}},{request:{action:'list',extra:'x'.repeat(200000)}},{path:'/private'},{expected_version:7}])assert.throws(()=>security.validateEnvelope(envelope({...valid,...fields})));
+});

@@ -39,6 +39,11 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+/// A CLI command line is parsed once per process and dispatched immediately;
+/// boxing the schedule subcommand would only add deref noise at every match
+/// site (clap still accepts a boxed subcommand, but nothing here stores the
+/// enum or moves it in bulk).
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Internal JSONL adapter for the desktop shell.
     #[command(hide = true)]
@@ -979,6 +984,119 @@ pub enum ScheduleCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Replace fields of an existing definition in place, keeping its id and
+    /// run history. Omitted fields keep their stored value.
+    #[command(group(
+        clap::ArgGroup::new("update_action_kind").multiple(false)
+    ))]
+    Update {
+        /// Definition id.
+        id: String,
+        /// New display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New workspace whose runtime executes the action.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Replace the action with this exact shell command.
+        #[arg(long, group = "update_action_kind")]
+        command: Option<String>,
+        /// Replace the action with this typed native action id.
+        #[arg(long, value_name = "ACTION_ID", group = "update_action_kind")]
+        native_action: Option<String>,
+        /// Structured JSON input for --native-action (defaults to `{}`).
+        #[arg(long, value_name = "JSON", requires = "native_action")]
+        native_input: Option<String>,
+        /// Replace the action with this goal for the ordinary agent runtime.
+        #[arg(long, value_name = "TEXT", group = "update_action_kind")]
+        agent_goal: Option<String>,
+        /// Replace the rule with a one-off at this RFC3339 instant.
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            conflicts_with_all = ["every", "daily", "weekly", "cron"]
+        )]
+        at: Option<String>,
+        /// Replace the rule with a run every N seconds.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            conflicts_with_all = ["at", "daily", "weekly", "cron"]
+        )]
+        every: Option<u64>,
+        /// Replace the rule with one run per local calendar day at this HH:MM.
+        #[arg(
+            long,
+            value_name = "HH:MM",
+            conflicts_with_all = ["at", "every", "weekly", "cron"]
+        )]
+        daily: Option<String>,
+        /// Replace the rule with runs on these local weekdays at --local-time.
+        #[arg(
+            long,
+            value_name = "DAYS",
+            requires = "local_time",
+            conflicts_with_all = ["at", "every", "daily", "cron"]
+        )]
+        weekly: Option<String>,
+        /// Wall-clock time for --weekly.
+        #[arg(long, value_name = "HH:MM", requires = "weekly")]
+        local_time: Option<String>,
+        /// Replace the rule with a five-field cron expression.
+        #[arg(
+            long,
+            value_name = "CRON",
+            conflicts_with_all = ["at", "every", "daily", "weekly"]
+        )]
+        cron: Option<String>,
+        /// IANA timezone for a new calendar rule.
+        #[arg(long, value_name = "IANA")]
+        timezone: Option<String>,
+        /// First instant for --every (defaults to now).
+        #[arg(long, value_name = "RFC3339", requires = "every")]
+        anchor: Option<String>,
+        /// New permission profile for the action's session.
+        #[arg(long = "permission", value_enum)]
+        mode: Option<RunMode>,
+        /// New model reference for an agent action; an empty value clears it.
+        #[arg(long)]
+        model: Option<String>,
+        /// New session reuse policy.
+        #[arg(long, value_enum)]
+        session_policy: Option<ScheduleSessionPolicy>,
+        /// New overlapping-run policy.
+        #[arg(long, value_enum)]
+        overlap: Option<ScheduleOverlap>,
+        /// New cap on waiting for the action's terminal record, in seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// New misfire policy.
+        #[arg(long, value_enum)]
+        misfire: Option<ScheduleMisfire>,
+        /// New misfire grace, in seconds.
+        #[arg(long)]
+        misfire_grace: Option<u64>,
+        /// The revision the editor last observed. A mismatch is refused
+        /// instead of overwriting a newer definition.
+        #[arg(long, value_name = "RFC3339")]
+        expected_revision: Option<String>,
+        /// Print the updated definition as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Issue an unattended grant for this definition. The grant is bound to
+    /// its current action, workspace, permission mode and model; a later edit
+    /// to any of those drops it again.
+    Grant {
+        /// Definition id.
+        id: String,
+        /// Let the grant cover actions with external side effects.
+        #[arg(long)]
+        allow_external_side_effects: bool,
+        /// Print the updated definition as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show run history, newest first.
     Runs {
         /// Only runs of this definition id.
@@ -1337,17 +1455,18 @@ mod tests {
             ("doctor", "doctor"),
         ] {
             let parsed = parse(&["leveler", "schedule", name, "--json"]);
-            let matched = match parsed.command {
-                Some(Command::Schedule(command)) => match (name, command) {
-                    ("enable", ScheduleCommand::Enable { json: true })
-                    | ("disable", ScheduleCommand::Disable { json: true })
-                    | ("uninstall", ScheduleCommand::Uninstall { json: true })
-                    | ("status", ScheduleCommand::Status { json: true })
-                    | ("doctor", ScheduleCommand::Doctor { json: true }) => true,
-                    _ => false,
-                },
-                _ => false,
-            };
+            let matched = matches!(
+                parsed.command,
+                Some(Command::Schedule(command))
+                    if matches!(
+                        (name, &command),
+                        ("enable", ScheduleCommand::Enable { json: true })
+                            | ("disable", ScheduleCommand::Disable { json: true })
+                            | ("uninstall", ScheduleCommand::Uninstall { json: true })
+                            | ("status", ScheduleCommand::Status { json: true })
+                            | ("doctor", ScheduleCommand::Doctor { json: true })
+                    )
+            );
             assert!(matched, "{expected} must parse");
         }
 

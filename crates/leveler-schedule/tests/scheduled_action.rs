@@ -21,7 +21,7 @@ use leveler_local_transport::{
 use leveler_project::Layout;
 use leveler_schedule::{
     Dispatcher, NewScheduleDefinition, OccurrenceState, RunState, RuntimeConnector, ScheduleStore,
-    ScheduleTrigger,
+    ScheduleTrigger, UnattendedRequest,
 };
 use leveler_test_support::MockServer;
 use tokio_util::sync::CancellationToken;
@@ -138,7 +138,9 @@ async fn a_due_schedule_runs_its_action_once_without_a_model() {
             timeout: Duration::from_secs(20),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
-            unattended: None,
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
         })
         .await
         .unwrap();
@@ -258,7 +260,9 @@ async fn a_recurring_definition_keeps_one_future_slot_after_a_run() {
             timeout: Duration::from_secs(20),
             misfire: leveler_schedule::MisfirePolicy::Skip,
             misfire_grace: Duration::from_secs(300),
-            unattended: None,
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
         })
         .await
         .unwrap();
@@ -282,10 +286,7 @@ async fn a_recurring_definition_keeps_one_future_slot_after_a_run() {
             .any(|occurrence| occurrence.state == OccurrenceState::Pending),
         "a recurring definition must keep its next slot"
     );
-    assert_eq!(
-        store.runs(Some(&definition.id), 10).await.unwrap().len(),
-        1
-    );
+    assert_eq!(store.runs(Some(&definition.id), 10).await.unwrap().len(), 1);
     assert_eq!(
         provider.request_count(),
         0,

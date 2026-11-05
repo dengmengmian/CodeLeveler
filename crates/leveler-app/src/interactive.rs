@@ -5359,6 +5359,48 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             return Err(ClientError::Runtime("snapshot version required: deliver this setting with its observed expected_version".into()));
         }
         match command {
+            ClientCommand::ManageSchedule {
+                requester_session_id,
+                query_id,
+                request,
+            } => {
+                let run_now = matches!(
+                    *request,
+                    leveler_client_protocol::schedule::ScheduleRequest::RunNow { .. }
+                );
+                let mut response = match self.app.schedule_manager().await {
+                    Ok(manager) => manager.handle(*request).await,
+                    Err(error) => leveler_client_protocol::schedule::ScheduleResponse::Error {
+                        message: error.to_string(),
+                    },
+                };
+                // Run-now is an explicit user request; leaving the slot for a
+                // later OS wake would make the button appear broken when
+                // background scheduling is off. Start the existing dispatcher
+                // command, which connects to this runtime as an ordinary local
+                // client; nothing here executes the action itself.
+                if run_now
+                    && let leveler_client_protocol::schedule::ScheduleResponse::Changed {
+                        message,
+                        ..
+                    } = &mut response
+                {
+                    match spawn_schedule_dispatch(self.app.as_ref()) {
+                        Ok(()) => message.push_str("; the dispatcher was started"),
+                        Err(error) => message.push_str(&format!(
+                            "; but this process could not start the dispatcher: {error}"
+                        )),
+                    }
+                }
+                let _ =
+                    self.events_for(&requester_session_id)
+                        .send(RuntimeEvent::ScheduleManaged {
+                            requester_session_id,
+                            query_id,
+                            response: Box::new(response),
+                        });
+                Ok(())
+            }
             ClientCommand::QueryGlobalTasks {
                 requester_session_id,
                 query_id,
@@ -9388,6 +9430,16 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
             "one command must cause one provider request"
         );
     }
+}
+
+/// Start the existing short-lived dispatch command for an explicit run-now.
+///
+/// The action itself is still claimed and executed by the dispatcher through
+/// this runtime; the child only performs one due pass, exactly as an OS wake
+/// would. Its output is discarded because a run's observed outcome belongs to
+/// the schedule store, never to an unobserved pipe.
+fn spawn_schedule_dispatch(app: &Application) -> Result<(), String> {
+    crate::schedule_tools::dispatch_trigger(&app.layout)()
 }
 
 #[cfg(test)]

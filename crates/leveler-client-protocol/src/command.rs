@@ -51,6 +51,17 @@ pub enum ClientCommand {
         #[serde(default)]
         include_archived: bool,
     },
+    /// Manage user-global scheduled automation.
+    ///
+    /// The schedule store remains the single authority; this command is the
+    /// structured adapter every client uses, so no client parses human-readable
+    /// CLI output back into state. The answer is
+    /// [`crate::RuntimeEvent::ScheduleManaged`] carrying the same `query_id`.
+    ManageSchedule {
+        requester_session_id: SessionId,
+        query_id: CommandId,
+        request: Box<crate::schedule::ScheduleRequest>,
+    },
     /// Ask the runtime for one best-effort prediction of the user's next
     /// prompt. The request is advisory UI chrome: it starts no task, persists
     /// no message, and may produce no event when there is insufficient context.
@@ -575,6 +586,10 @@ impl ClientCommand {
             | ClientCommand::QueryUsage { session_id, .. }
             | ClientCommand::QueryContext { session_id, .. } => Some(session_id),
             ClientCommand::QueryGlobalTasks { requester_session_id, .. }
+            | ClientCommand::ManageSchedule {
+                requester_session_id,
+                ..
+            }
             | ClientCommand::RequestSessionListFor {
                 requester_session_id,
             }
