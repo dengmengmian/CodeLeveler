@@ -1964,6 +1964,19 @@ def scenario_reconnect(report: Report, provider: str, mock):
             gated,
             pty_.screen.text()[-700:],
         )
+        # A refused turn opens the recovery acknowledgement over the draft.
+        # Backing out of it acknowledges nothing and must leave the refused
+        # input where the user can submit it once the gate is resolved.
+        overlay_open = "恢复确认" in pty_.screen.text()
+        report.check(
+            "reconnect",
+            "the refusal presents the acknowledgement without acting",
+            overlay_open,
+            pty_.screen.text()[-500:],
+        )
+        if overlay_open:
+            pty_.key("\x1b")  # cancel: nothing is acknowledged
+            time.sleep(0.3)
         report.check(
             "reconnect",
             "the refused input is preserved for the user",

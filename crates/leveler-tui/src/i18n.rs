@@ -822,6 +822,10 @@ pub struct UiText {
     /// The refusal is a recovery stop: an earlier tool call may have run and
     /// the runtime will not guess. The next step is the user's to take.
     pub recovery_submission_rejected: &'static str,
+    /// The same stop, when the acknowledgement is already on screen: the
+    /// preserved draft fills the composer, so naming `/recover` would ask for
+    /// an input the user cannot type without discarding it.
+    pub recovery_submission_paused: &'static str,
     /// The same stop as a turn-failure block.
     pub recovery_paused: &'static str,
     /// Title of the crash-recovery block.
@@ -2335,6 +2339,7 @@ static ZH: UiText = UiText {
     submission_rejected: "消息未被接受，内容已恢复到输入框。",
     submission_rejected_queued: "消息未被接受，内容仍保留在待发送列表。",
     recovery_submission_rejected: "任务恢复已暂停。上次的操作可能已执行，请确认结果后再继续。输入 /recover 查看并确认。",
+    recovery_submission_paused: "任务恢复已暂停。上次的操作可能已执行，请先确认恢复后再继续。",
     recovery_paused: "上次的操作可能已执行。为避免重复操作，请确认结果后再继续。",
     recovery_title: "任务恢复已暂停",
     recovery_command_desc: "查看并确认上次中断的工具调用",
@@ -3384,6 +3389,7 @@ static EN: UiText = UiText {
     submission_rejected: "The message wasn't accepted; it is back in the composer.",
     submission_rejected_queued: "The message wasn't accepted; it is still in the unsent list.",
     recovery_submission_rejected: "Task recovery is paused. The previous action may have run; check the result before continuing. Type /recover to review and acknowledge.",
+    recovery_submission_paused: "Task recovery is paused. The previous action may have run; acknowledge the recovery before continuing.",
     recovery_paused: "A previous action may have run. To avoid running it twice, check the result before continuing.",
     recovery_title: "Task recovery paused",
     recovery_command_desc: "Review and acknowledge interrupted tool calls",

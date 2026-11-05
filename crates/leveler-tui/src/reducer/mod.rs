@@ -720,8 +720,21 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             // names its own next step; the runtime's raw diagnostic would bury
             // it and is not user copy, but it stays in the log.
             tracing::warn!(reason = %message, recovery, "submission rejected");
+            // The gateway is the acknowledgement, and `/recover` only parses at
+            // the START of the composer. The restored draft now occupies it, so
+            // pointing the user at `/recover` would require destroying what was
+            // just preserved. Present the same explicit, safe-by-default
+            // confirmation here; the runtime still owns the decision.
+            let acknowledgement_shown = recovery && !state.interrupted_tool_calls.is_empty();
+            if acknowledgement_shown {
+                let _ = overlay_keys::open_recovery_confirm(state);
+            }
             let text = if recovery {
-                state.t().recovery_submission_rejected.to_string()
+                if acknowledgement_shown {
+                    state.t().recovery_submission_paused.to_string()
+                } else {
+                    state.t().recovery_submission_rejected.to_string()
+                }
             } else if restored_to_composer {
                 state.t().submission_rejected.to_string()
             } else {

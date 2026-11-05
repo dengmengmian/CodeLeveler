@@ -260,6 +260,23 @@ def scenario_a(report: pd.Report):
             gated,
             screen(pty_)[-700:],
         )
+        # A refused turn presents the acknowledgement over the draft. Returning
+        # from it acknowledges nothing and leaves the refused input where the
+        # user can submit it once the window is resolved.
+        overlay_first = pd.wait_until(
+            pty_,
+            lambda text: "恢复确认" in text and "已中断（结果未知）" in text,
+            timeout=60,
+        )
+        report.check(
+            "A",
+            "the refusal presents the acknowledgement without acting",
+            overlay_first,
+            screen(pty_)[-900:],
+        )
+        if overlay_first:
+            pty_.key("\x1b")  # cancel: nothing is acknowledged
+            time.sleep(0.3)
         report.check(
             "A",
             "the refused input is preserved in the composer",
