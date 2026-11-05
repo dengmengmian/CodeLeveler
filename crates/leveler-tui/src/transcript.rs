@@ -902,12 +902,33 @@ impl TranscriptState {
     /// keeps its kind, so a duplicate or replayed event cannot reclassify
     /// history.
     fn decide_pending_assistants(&mut self, kind: AssistantKind) {
+        // The answer is the last prose the turn wrote. An earlier message in
+        // the same turn that a work call did not already demote (a transition
+        // published beside a bookkeeping call, the runtime's delivery request
+        // in between) is narration: the turn did not end on it. Marking every
+        // pending block Final would present a transition as a second answer.
+        let answer_index = if kind == AssistantKind::Final {
+            self.items.iter().rposition(|item| {
+                matches!(
+                    item,
+                    TranscriptItem::Assistant(block)
+                        if block.kind == AssistantKind::Pending
+                            && !block.text.trim().is_empty()
+                )
+            })
+        } else {
+            None
+        };
         let mut changed = false;
-        for item in &mut self.items {
+        for (index, item) in self.items.iter_mut().enumerate() {
             if let TranscriptItem::Assistant(block) = item
                 && block.kind == AssistantKind::Pending
             {
-                block.kind = kind;
+                block.kind = if answer_index.is_some_and(|answer| answer != index) {
+                    AssistantKind::Progress
+                } else {
+                    kind
+                };
                 changed = true;
             }
         }
@@ -1992,12 +2013,16 @@ impl TranscriptState {
             match &self.items[index] {
                 TranscriptItem::User(_) => answer_seen = false,
                 TranscriptItem::Assistant(block) if block.kind == AssistantKind::Pending => {
-                    let kind = if answer_seen {
+                    // An empty message is not prose: it cannot be the answer,
+                    // and treating it as one hides the real answer before it.
+                    let kind = if answer_seen || block.text.trim().is_empty() {
                         AssistantKind::Progress
                     } else {
                         AssistantKind::Final
                     };
-                    answer_seen = true;
+                    if kind == AssistantKind::Final {
+                        answer_seen = true;
+                    }
                     if let TranscriptItem::Assistant(block) = &mut self.items[index] {
                         block.kind = kind;
                     }
@@ -3340,6 +3365,58 @@ mod tests {
         say(&mut t, "m2", "后续");
         t.classify_replayed_history();
         assert_eq!(kinds(&t), vec![AssistantKind::Final, AssistantKind::Final]);
+    }
+
+    /// The compensated-delivery shape: a transition message and the settlement
+    /// call, then the runtime's delivery request, then the answer. The turn
+    /// ends on the answer, so only that message is the answer — the earlier
+    /// prose in the same turn was narration. Event order decides, not wording.
+    #[test]
+    fn the_turn_ends_on_one_final_answer_after_a_delivery_round() {
+        let mut t = TranscriptState::new();
+        say(
+            &mut t,
+            "m1",
+            "The goal checker expects the requirements phrased exactly as stated.",
+        );
+        settled(
+            &mut t,
+            "g1",
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#,
+        );
+        say(
+            &mut t,
+            "m2",
+            "Implemented --doc-count; go test ./... exited 0.",
+        );
+        assert!(t.settle_final_answer());
+        t.push_turn_end(TurnEndStatus::Completed, 1, 9, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Progress, AssistantKind::Final],
+            "only the answer the turn ended on is final"
+        );
+    }
+
+    /// A replayed turn has no event order, so its last message is the answer.
+    /// An empty trailing message is not prose and cannot take that place.
+    #[test]
+    fn replayed_history_skips_an_empty_trailing_message() {
+        let mut t = TranscriptState::new();
+        t.push_user("do it".into());
+        say(
+            &mut t,
+            "m1",
+            "Implemented --doc-count; go test ./... exited 0.",
+        );
+        say(&mut t, "m2", "");
+        t.classify_replayed_history();
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Final, AssistantKind::Progress],
+            "the non-empty answer survives replay"
+        );
     }
 
     fn group(expanded: bool) -> ToolGroupBlock {

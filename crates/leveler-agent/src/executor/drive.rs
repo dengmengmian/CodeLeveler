@@ -1747,6 +1747,17 @@ impl<'a> Drive<'a> {
                 ledger: self.progress.clone(),
             });
         }
+        // The delivery decision is durable before the transient `Finished`
+        // marker and before the turn/task terminals. A crash in the terminal
+        // commit window must recover THIS text, not ask the model again.
+        if delivered {
+            (self.observer)(AgentEvent::DeliveryCommitted {
+                text: final_text.clone(),
+                stop: reason,
+                model_steps,
+                modified_files: self.modified_files.clone(),
+            });
+        }
         (self.observer)(AgentEvent::Finished(final_text.clone()));
         self.enter_finalization();
         self.flush_epoch(rt);
@@ -3233,6 +3244,11 @@ impl AgentHarness for Drive<'_> {
         // Goal mode: set when the model calls update_goal this round; the run
         // ends (Completed/Blocked) once this round's tool results are recorded.
         let mut goal_resolution: Option<(StopReason, String)> = None;
+        // Whether the accepted resolution declared its visible text as the
+        // answer (`update_goal(deliver_answer = true)`). This is the only
+        // mechanical proof that prose in this turn is a delivery rather than
+        // narration: both shapes are text next to a tool call.
+        let mut goal_delivery_declared = false;
         // Images loaded via view_image this round, injected as a user message
         // after the tool results so a vision model sees them next request.
         let mut pending_images: Vec<ContentPart> = Vec::new();
@@ -4153,6 +4169,11 @@ impl AgentHarness for Drive<'_> {
                     .trim()
                     .to_string();
                 goal_resolution = Some((reason, summary));
+                goal_delivery_declared = call
+                    .arguments
+                    .get("deliver_answer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 results[index] = Some(ContentPart::ToolResult {
                     result: ToolResultContent {
                         call_id: call.id,
@@ -6009,13 +6030,29 @@ impl AgentHarness for Drive<'_> {
             let already_settled = self.settled_goal.is_some();
             self.settled_goal = Some((reason, summary));
             // A blocked goal still owes the work itself, and its resolution is
-            // a report, so its round ends exactly as before.
+            // a report, so its round ends exactly as before — but the report
+            // is THIS round's prose. Reaching back for text from before the
+            // block would present a refused or abandoned claim as the report.
             if reason != StopReason::Completed {
+                self.terminal_answer = if round_spoke && !work_executed {
+                    Some(round_prose.trim().to_string())
+                } else {
+                    None
+                };
                 return self.finish_settled_goal(rt, messages, model_steps).await;
             }
-            // The answer and the resolution landed together, and nothing acted
-            // on that prose. That is the delivery.
-            if self.terminal_answer.is_some() && !already_settled {
+            // Settling without saying which text is the answer settles the
+            // goal, not the delivery. Prose the model happened to publish in a
+            // bookkeeping round (a transition, the state of the last check)
+            // has the same protocol shape as a finished answer, so it is not
+            // promoted on the runtime's guess: the post-settlement request
+            // below is the compatibility path, and it asks for the answer.
+            if !goal_delivery_declared {
+                self.terminal_answer = None;
+            } else if self.terminal_answer.is_some() {
+                // The declared text is the answer, already written: deliver it
+                // as written. It may be this round's prose, or the latest
+                // prose before a bookkeeping-only round.
                 return self.finish_settled_goal(rt, messages, model_steps).await;
             }
             // Resolving a goal this turn already resolved, without doing any

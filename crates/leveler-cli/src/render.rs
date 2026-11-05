@@ -232,6 +232,9 @@ fn render_event_text(event: AgentEvent) {
         // The tool result already reports the start in prose; this durable
         // fact is not a transcript line of its own.
         AgentEvent::BackgroundTaskStarted { .. } => {}
+        // The text was already printed by its `AssistantText`; this durable
+        // decision is evidence, not a transcript line of its own.
+        AgentEvent::DeliveryCommitted { .. } => {}
         AgentEvent::Finished(_) => {}
     }
 }
@@ -317,6 +320,21 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
                 "reasoning": reasoning,
             })
         }
+        // The runtime's delivery decision: the exact text it accepted as this
+        // turn's answer. Recorded in the JSONL evidence so a resumed or
+        // recovered delivery can be told apart from a regenerated one.
+        AgentEvent::DeliveryCommitted {
+            text,
+            stop,
+            model_steps,
+            modified_files,
+        } => serde_json::json!({
+            "type": "delivery_committed",
+            "text": text,
+            "stop": stop,
+            "model_steps": model_steps,
+            "modified_files": modified_files,
+        }),
         AgentEvent::ToolCall {
             id,
             name,

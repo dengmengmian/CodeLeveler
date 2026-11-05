@@ -168,6 +168,10 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                     "type": "string",
                     "description": "Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. Do not restate the user question or list files you read."
                 },
+                "deliver_answer": {
+                    "type": "boolean",
+                    "description": "Set true when the visible text you wrote in this SAME response is your complete final answer to the user, ready to be delivered verbatim. It may be the text of this response, or the last text you wrote before a bookkeeping-only round (`update_plan`) with no work tool in between. When true, the runtime delivers that text as written and asks for nothing more. Omit it when the text only announces a next step or reports progress; the runtime will then ask for the answer. Only the model can know which of the two its text is."
+                },
                 "next_step": {
                     "type": "string",
                     "description": "Optional concrete follow-up for the user. Omit this field when no genuine next step remains; never copy or paraphrase the conversation merely to fill it."
