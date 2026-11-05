@@ -16,6 +16,10 @@ use crate::model::{
 pub(crate) const MAX_SUBJECT_CHARS: usize = 512;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
 
+// The platform backends are the only consumers of the parsed fields. On other
+// targets `plan` still validates the input before reporting the action is
+// unsupported, so the payload is constructed but intentionally never read.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) enum Payload {
     Message {
@@ -163,6 +167,9 @@ pub(crate) fn validate_body(body: &str) -> Result<(), String> {
 
 /// Write a payload file only the current user can read. The directory itself
 /// is created by `tempfile` with owner-only permissions.
+// Only the platform backends write payload files; other targets stop before
+// preparing an execution and never call this.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();

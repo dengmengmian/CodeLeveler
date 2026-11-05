@@ -76,15 +76,17 @@ impl Canvas {
     }
 
     fn png(&self) -> CuaResult<Vec<u8>> {
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: self.width,
-            // A negative height requests top-down rows.
-            biHeight: -self.height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: self.width,
+                // A negative height requests top-down rows.
+                biHeight: -self.height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut pixels = vec![0u8; self.width as usize * self.height as usize * 4];
