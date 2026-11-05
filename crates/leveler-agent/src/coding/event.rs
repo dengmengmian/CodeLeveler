@@ -23,6 +23,17 @@ impl From<AgentEvent> for EngineEvent {
             A::AssistantText { text, reasoning } => {
                 EngineEvent::AssistantMessage { text, reasoning }
             }
+            A::DeliveryCommitted {
+                text,
+                stop,
+                model_steps,
+                modified_files,
+            } => EngineEvent::DeliveryCommitted {
+                text,
+                stop,
+                model_steps,
+                modified_files,
+            },
             A::ToolCall {
                 id,
                 name,

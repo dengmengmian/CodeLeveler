@@ -1390,6 +1390,11 @@ impl EventBridge {
             | EngineEvent::TaskCancelRequested { .. }
             | EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnFinished { .. }
+            // The delivery decision is the runtime's record of which visible
+            // text is the answer. Its text already reached the client as the
+            // assistant message; projecting it again would duplicate the
+            // answer on screen.
+            | EngineEvent::DeliveryCommitted { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }

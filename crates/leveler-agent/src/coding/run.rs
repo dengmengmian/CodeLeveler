@@ -114,6 +114,20 @@ struct ResumeLineage {
     latest_completed: bool,
 }
 
+/// A delivery the crashed terminal commit never published, read back from the
+/// turn that produced it.
+struct UncommittedDelivery {
+    turn_id: TurnId,
+    text: String,
+    stop: StopReason,
+    model_steps: u32,
+    modified_files: Vec<String>,
+    /// The delivery's turn has no `TurnFinished`: the crash hit inside the
+    /// turn's own terminal commit, so recovery must close that turn first.
+    /// Otherwise only the task terminal is missing.
+    turn_open: bool,
+}
+
 fn continuation_root_is_valid(
     turns: &[leveler_storage::TurnRecord],
     continuation: &leveler_storage::TurnRecord,
@@ -2317,6 +2331,199 @@ impl CodingRuntime {
         Ok(stop != Some(crate::StopReason::Answered))
     }
 
+    /// The delivery a crash left between the transcript and the task terminal.
+    ///
+    /// [`Self::finish_from_result`] commits the task terminal last, so the
+    /// drive's answer can be durable (a persisted [`EngineEvent::DeliveryCommitted`]
+    /// and, depending on where the process died, its `TurnFinished`) while the
+    /// task terminal is not. Replaying that turn would ask the model for a
+    /// second answer; the recorded delivery is already the answer the user is
+    /// owed.
+    ///
+    /// The cut is identified by durable facts only: the latest delivery has no
+    /// task terminal after it, its stop is a terminal delivery, and that turn
+    /// is still the newest user/chat turn of this very goal. The delivery
+    /// event carries the turn facts, so recovery works whether the crash hit
+    /// the turn terminal or only the task terminal: a finished turn must have
+    /// reached the terminal-publish phase (the crash was the commit, not a
+    /// review or a tool round), and a turn with no terminal must still be
+    /// `running`. Anything else falls through to the ordinary resume.
+    async fn uncommitted_delivery(
+        &self,
+        session_id: &SessionId,
+        goal_id: &leveler_core::GoalId,
+    ) -> Result<Option<UncommittedDelivery>, EngineError> {
+        let rows = self.engine.stores.events.load(session_id).await?;
+        let Some(at) = rows
+            .iter()
+            .rposition(|row| row.event_type == "delivery_committed")
+        else {
+            return Ok(None);
+        };
+        let delivery = &rows[at];
+        // A task terminal after the delivery means the delivery was already
+        // committed; there is nothing left to recover.
+        if rows[at + 1..]
+            .iter()
+            .any(|row| row.event_type == "task_finished")
+        {
+            return Ok(None);
+        }
+        let EngineEvent::DeliveryCommitted {
+            text,
+            stop,
+            model_steps,
+            modified_files,
+        } = EngineEvent::from_payload(&delivery.payload)?
+        else {
+            return Ok(None);
+        };
+        if text.trim().is_empty() || !matches!(stop, StopReason::Completed | StopReason::Blocked) {
+            return Ok(None);
+        }
+        let Some(turn_id) = delivery.turn_id.as_deref() else {
+            return Ok(None);
+        };
+        // The delivery is this goal's, and its turn is the newest user/chat
+        // turn. A later turn means the session moved on; this is history.
+        let turns = self
+            .engine
+            .stores
+            .turns
+            .list_for_session(session_id)
+            .await?;
+        let Some(newest) = turns
+            .iter()
+            .rev()
+            .find(|turn| turn.kind == "user" || turn.kind == "chat")
+        else {
+            return Ok(None);
+        };
+        if newest.id != turn_id {
+            return Ok(None);
+        }
+        let Some(payload) = newest.payload.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(lineage) = leveler_engine::decode_turn_continuation(payload) else {
+            return Ok(None);
+        };
+        if lineage.goal_id.as_ref() != Some(goal_id) {
+            return Ok(None);
+        }
+        // Two crash cuts share this record: after the turn terminal (only the
+        // task commit died) and inside it (the turn's own commit died). The
+        // delivery event is written by the turn's event pump, so it is durable
+        // in both; the turn row tells them apart.
+        let turn_terminal = rows
+            .iter()
+            .filter(|row| {
+                row.turn_id.as_deref() == Some(turn_id) && row.event_type == "turn_finished"
+            })
+            .map(|row| EngineEvent::from_payload(&row.payload))
+            .next()
+            .transpose()?;
+        let turn_open = match (turn_terminal, newest.status.as_str()) {
+            (None, "running") => true,
+            (
+                Some(EngineEvent::TurnFinished {
+                    outcome: leveler_lifecycle::TurnOutcome::Completed,
+                    ..
+                }),
+                "completed",
+            ) => {
+                // Entering `publishing_terminal` proves finalization decided
+                // the terminal; the crash was the commit, not earlier work.
+                let reached_terminal_publish = rows[at + 1..].iter().any(|row| {
+                    matches!(
+                        EngineEvent::from_payload(&row.payload),
+                        Ok(EngineEvent::FinalizationPhaseStarted { phase, .. })
+                            if phase == FINALIZATION_PUBLISHING_TERMINAL
+                    )
+                });
+                if !reached_terminal_publish {
+                    return Ok(None);
+                }
+                false
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(UncommittedDelivery {
+            turn_id: TurnId::new(turn_id),
+            text,
+            stop,
+            model_steps,
+            modified_files,
+            turn_open,
+        }))
+    }
+
+    /// Close the delivery turn a crash left open, before its task terminal.
+    ///
+    /// Mirrors the turn-end sequence in [`TurnRunner::run_turn`] exactly:
+    /// children this turn started and never finished are settled first, then
+    /// the `TurnFinished` row commits, and only then is the observer told.
+    /// The delivery event recorded every fact that row carries, so no model
+    /// call and no replayed tool work are involved.
+    async fn close_recovered_turn(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        delivery: &UncommittedDelivery,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(), EngineError> {
+        let log = EventLog::new_owned(
+            self.engine.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
+        let runner = TurnRunner {
+            stores: &self.engine.stores,
+            token: token.clone(),
+            session_id: session_id.clone(),
+            log: &log,
+            approver: self.approver.clone(),
+            clarifier: self.clarifier.clone(),
+            lost_child_voice: Some(self.lost_child_voice(session_id)),
+        };
+        runner
+            .reconcile_terminal_children(leveler_lifecycle::ChildStop::Lost, observer)
+            .await?;
+        let event = EngineEvent::TurnFinished {
+            turn_id: delivery.turn_id.clone(),
+            outcome: leveler_lifecycle::TurnOutcome::Completed,
+            stop_reason: format!("{:?}", delivery.stop),
+            stop: Some(delivery.stop),
+            model_steps: delivery.model_steps,
+            modified_files: delivery.modified_files.clone(),
+        };
+        let (event_type, payload) = event.to_row().map_err(|error| {
+            EngineError::UnclosedTerminalBoundary(format!(
+                "could not serialize the recovered turn terminal: {error}"
+            ))
+        })?;
+        self.engine
+            .stores
+            .terminal
+            .finish_turn_owned(
+                token,
+                session_id,
+                &delivery.turn_id,
+                &event_type,
+                &payload,
+                leveler_lifecycle::TurnOutcome::Completed,
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|error| {
+                EngineError::UnclosedTerminalBoundary(format!(
+                    "could not commit the recovered turn terminal: {error}"
+                ))
+            })?;
+        observer(event);
+        Ok(())
+    }
+
     async fn resume_inner(
         &self,
         session_id: &SessionId,
@@ -2453,6 +2660,57 @@ impl CodingRuntime {
         // happened to be written after the bind. Idempotent.
         if let Some(goal_id) = lineage.goal_id.as_ref() {
             self.adopt_chat_window_budget(session_id, goal_id).await?;
+        }
+        // A crash between the drive's published delivery and the task terminal
+        // leaves the answer durable and the task unfinished. Re-driving the
+        // model here would make it answer a second time; the recorded delivery
+        // is already the answer the user is owed. A resume that carries a new
+        // instruction asks for new work, so only a bare continuation (or no
+        // instruction at all) recovers the recorded answer.
+        let asks_for_new_work = instruction.as_ref().is_some_and(|message| {
+            !is_bare_legacy_continuation(message)
+                || message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, leveler_model::ContentPart::Image { .. }))
+        });
+        if pending.is_none()
+            && !asks_for_new_work
+            && let Some(goal_id) = lineage.goal_id.clone()
+            && let Some(delivery) = self.uncommitted_delivery(session_id, &goal_id).await?
+        {
+            tracing::info!(
+                %session_id,
+                goal = %goal_id.as_str(),
+                "recovering the delivery the crashed terminal commit never published"
+            );
+            if delivery.turn_open {
+                self.close_recovered_turn(&token, session_id, &delivery, observer)
+                    .await?;
+            }
+            let blocked = matches!(delivery.stop, StopReason::Blocked);
+            let result = Ok(TaskReport::new(
+                if blocked {
+                    TaskOutcome::Blocked
+                } else {
+                    TaskOutcome::Completed
+                },
+                delivery.text,
+                delivery.modified_files,
+                delivery.stop,
+                delivery.model_steps,
+            ));
+            self.finish_from_result(
+                &token,
+                session_id,
+                &result,
+                Some(&goal_id),
+                spec.coding.repository.as_deref(),
+                observer,
+                &cancellation,
+            )
+            .await?;
+            return result;
         }
         // The declaration this resume continues, if one is still pending. It
         // is consumed atomically with the resumed turn's WAL row below.

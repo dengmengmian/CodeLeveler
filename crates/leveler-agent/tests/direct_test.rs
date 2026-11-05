@@ -3601,8 +3601,8 @@ async fn a_process_sentence_is_not_the_final_answer_when_tools_follow() {
     );
 }
 
-/// An answer in the same round as `update_goal`, with no later work tool, is
-/// the delivery. The turn ends on it.
+/// An answer the model declares in the same round as `update_goal`, with no
+/// later work tool, is the delivery. The turn ends on it.
 #[tokio::test]
 async fn an_answer_beside_update_goal_is_the_delivery() {
     let h = harness(vec![
@@ -3612,7 +3612,11 @@ async fn an_answer_beside_update_goal_is_the_delivery() {
             vec![(
                 "g1",
                 "update_goal",
-                serde_json::json!({"status": "complete", "summary": "read the library"}),
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "read the library",
+                    "deliver_answer": true,
+                }),
             )],
         ),
     ])

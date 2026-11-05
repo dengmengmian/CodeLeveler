@@ -662,6 +662,28 @@ pub enum EngineEvent {
     RunFinished {
         text: String,
     },
+    /// DURABLE: the text the runtime accepted as this turn's delivery.
+    ///
+    /// The model's declaration (`update_goal(deliver_answer = true)`) says
+    /// which visible text is the answer; this event records the runtime's
+    /// resulting delivery decision, with the exact text it published. It is
+    /// NOT the task terminal: [`EngineEvent::TaskFinished`] remains the one
+    /// authoritative terminal, committed atomically with the goal settlement.
+    /// A process that dies in between leaves this fact durable and the task
+    /// terminal absent, so recovery can commit that same delivery instead of
+    /// driving the model into producing a second answer.
+    DeliveryCommitted {
+        text: String,
+        /// The executor stop that produced the delivery. Recovery uses it to
+        /// rebuild the missing turn/task terminals without a model call.
+        stop: leveler_lifecycle::StopReason,
+        /// Turn facts recorded on the same decision: the number of model
+        /// steps the turn started and the files its tools changed.
+        #[serde(default)]
+        model_steps: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modified_files: Vec<String>,
+    },
 
     // ── kernel: approvals / clarifications ──────────────────────────────
     ApprovalRequested {
@@ -897,6 +919,7 @@ impl EngineEvent {
             | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }
             | EngineEvent::RunFinished { .. }
+            | EngineEvent::DeliveryCommitted { .. }
             | EngineEvent::PlanUpdated { .. }
             | EngineEvent::GoalIntercepted { .. }
             | EngineEvent::DelegationStage { .. }
@@ -1070,6 +1093,7 @@ impl EngineEvent {
             | EngineEvent::SubAgentActivity { .. }
             | EngineEvent::SubAgentFinished { .. }
             | EngineEvent::RunFinished { .. }
+            | EngineEvent::DeliveryCommitted { .. }
             | EngineEvent::PlanUpdated { .. }
             | EngineEvent::GoalIntercepted { .. }
             | EngineEvent::DelegationStage { .. }

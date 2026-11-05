@@ -323,6 +323,19 @@ pub enum AgentEvent {
         /// repairs return `Flow::NextRound`).
         forces_continuation: bool,
     },
+    /// The loop selected `text` as this turn's delivery to the person.
+    ///
+    /// Durable, unlike [`AgentEvent::Finished`]: the terminal commit can fail
+    /// after the answer is already in the transcript, and recovery must be
+    /// able to deliver this exact text instead of asking the model again.
+    /// `stop`, `model_steps` and `modified_files` are the turn facts the
+    /// terminal rows would have carried; recovery commits them unchanged.
+    DeliveryCommitted {
+        text: String,
+        stop: StopReason,
+        model_steps: u32,
+        modified_files: Vec<String>,
+    },
     /// The loop finished with a final answer.
     Finished(String),
 }
