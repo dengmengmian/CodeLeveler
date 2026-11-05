@@ -218,6 +218,9 @@ pub enum WakeupError {
 }
 
 impl WakeupError {
+    // Only the macOS and Windows backends build command errors; other targets
+    // report Unsupported before any command runs.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     fn command(
         program: impl Into<String>,
         status: impl std::fmt::Display,
@@ -301,6 +304,9 @@ pub fn launch_agents_dir() -> Result<PathBuf, WakeupError> {
 
 /// XML-escape a property-list string. launchd reads a real plist; paths with
 /// spaces, Unicode or `&<>` must survive unchanged.
+// The platform backends are the only consumers; the pure tests still cover it
+// on every host.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
