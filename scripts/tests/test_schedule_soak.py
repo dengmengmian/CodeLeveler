@@ -1,0 +1,428 @@
+import datetime as dt
+import importlib.util
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parent.parent / "schedule_soak.py"
+spec = importlib.util.spec_from_file_location("schedule_soak", SCRIPT)
+soak = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = soak
+spec.loader.exec_module(soak)
+
+
+class TimeTests(unittest.TestCase):
+    def test_iso_round_trip(self):
+        value = dt.datetime(2026, 11, 6, 1, 2, 3, tzinfo=dt.timezone.utc)
+        self.assertEqual(soak.parse_iso(soak.iso(value)), value)
+
+    def test_version_revision_reads_clean_and_dirty_suffixes(self):
+        self.assertEqual(soak.version_revision("1.0.23 (a421315cc4ad)"), "a421315cc4ad")
+        self.assertEqual(soak.version_revision("1.0.23 (a421315cc4ad-dirty)"), "a421315cc4ad")
+        self.assertIsNone(soak.version_revision("1.0.23"))
+
+
+class IsolationTests(unittest.TestCase):
+    def test_real_home_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(soak.SoakError):
+                soak.assert_isolated_home(Path.home() / ".leveler", Path(root))
+
+    def test_home_outside_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as other:
+            with self.assertRaises(soak.SoakError):
+                soak.assert_isolated_home(Path(other) / "home", Path(root))
+
+    def test_tmp_home_is_accepted(self):
+        root = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvs-test-"))
+        try:
+            home = root / "homes" / "os"
+            home.mkdir(parents=True)
+            soak.assert_isolated_home(home, root)
+        finally:
+            import shutil
+
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class StatisticsTests(unittest.TestCase):
+    def test_percentile_uses_nearest_rank(self):
+        values = [1, 2, 3, 4, 5]
+        self.assertEqual(soak.percentile(values, 0.5), 3)
+        self.assertEqual(soak.percentile(values, 0.95), 5)
+        self.assertIsNone(soak.percentile([], 0.5))
+
+    def test_latency_stats_empty(self):
+        self.assertEqual(soak.latency_stats([]), {"count": 0, "p50": None, "p95": None, "p99": None, "max": None})
+
+
+class TriggerTests(unittest.TestCase):
+    def test_every_slots_include_the_anchor(self):
+        start = dt.datetime(2026, 11, 6, tzinfo=dt.timezone.utc)
+        deadline = start + dt.timedelta(seconds=180)
+        spec = soak.DefSpec("t", "name", "shell", ["--every", "60"])
+        self.assertEqual(soak._expected_slots(spec, start, deadline), 4)
+
+    def test_once_is_one_slot(self):
+        start = dt.datetime(2026, 11, 6, tzinfo=dt.timezone.utc)
+        spec = soak.DefSpec("o", "name", "shell", ["--at", soak.iso(start)])
+        self.assertEqual(soak._expected_slots(spec, start, start), 1)
+
+    def test_cron_is_not_estimated(self):
+        start = dt.datetime(2026, 11, 6, tzinfo=dt.timezone.utc)
+        spec = soak.DefSpec("c", "name", "shell", ["--cron", "*/5 * * * *"])
+        self.assertIsNone(soak._expected_slots(spec, start, start))
+
+
+class S4Tests(unittest.TestCase):
+    def test_allow_claim_counts_only_a_slot_claimed_while_active(self):
+        active = {"finished_at": "2026-11-06T08:21:42.924Z"}
+        claimed = [{"started_at": "2026-11-06T08:20:34.967Z"}]
+        queued = [{"started_at": "2026-11-06T08:22:48.020Z"}]
+        self.assertTrue(soak.allow_claim_while_active(claimed, active))
+        self.assertFalse(soak.allow_claim_while_active(queued, active))
+
+    def test_allow_claim_rejects_duplicate_runs(self):
+        active = {"finished_at": "2026-11-06T08:21:42.924Z"}
+        runs = [
+            {"started_at": "2026-11-06T08:20:34.967Z"},
+            {"started_at": "2026-11-06T08:20:35.000Z"},
+        ]
+        self.assertFalse(soak.allow_claim_while_active(runs, active))
+
+    def test_allow_execution_is_a_gating_check(self):
+        self.assertIn("S4_allow_execution_1", soak.required_checks("dry-run"))
+        required = soak.required_checks("soak")
+        for suffix in ("1", "2", "3"):
+            self.assertIn("S4_allow_execution_%s" % suffix, required)
+
+    def test_the_allow_lane_runs_one_fresh_session_per_run(self):
+        for mode in ("dry-run", "soak"):
+            lanes = soak.lane_specs(mode, "deepseek/test")
+            allow = next(spec for spec in lanes["overlap"] if spec.key == "allow")
+            self.assertEqual(allow.overlap, "allow-concurrent", mode)
+            self.assertEqual(allow.session_policy, "fresh", mode)
+
+    def test_a_shell_definition_carries_its_session_policy(self):
+        spec = soak.DefSpec(
+            "allow",
+            "n",
+            "shell",
+            ["--every", "60"],
+            command="true",
+            overlap="allow-concurrent",
+            session_policy="fresh",
+        )
+        args = soak._add_args({"repo": "/tmp/workspace"}, spec)
+        self.assertIn("--session-policy", args)
+        self.assertEqual(args[args.index("--session-policy") + 1], "fresh")
+
+
+class RecoveryTests(unittest.TestCase):
+    def test_only_lanes_with_active_runs_are_reconciled(self):
+        rows = [
+            {"lane": "fault", "run": "a"},
+            {"lane": "os", "run": "b"},
+            {"lane": "fault", "run": "c"},
+        ]
+        self.assertEqual(soak.lanes_with_active_runs(rows), ["fault", "os"])
+        self.assertEqual(soak.lanes_with_active_runs([]), [])
+
+
+class ResourceTests(unittest.TestCase):
+    def test_a_process_sample_feeds_the_resource_summary(self):
+        import shutil
+
+        root = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvs-res-test-"))
+        try:
+            evidence = root / "evidence"
+            evidence.mkdir()
+            paths = soak.RunPaths.for_evidence(evidence, root)
+            recorder = soak.Recorder(paths)
+            sample = soak.sample_processes(paths, {}, recorder)
+            summary = soak.resource_summary([sample])
+            self.assertEqual(summary["cpu_pct"]["count"], 1)
+            self.assertEqual(summary["db_bytes_growth"], 0.0)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class VerdictTests(unittest.TestCase):
+    def _checks(self, names):
+        return {name: {"passed": True} for name in names}
+
+    def test_dry_run_passes_when_all_required_checks_pass(self):
+        checks = self._checks(soak.required_checks("dry-run"))
+        plan = {"mode": "dry-run", "duration_secs": 420}
+        verdict, reasons = soak.compute_verdict(plan, {"duration_secs": 420}, checks)
+        self.assertEqual(verdict, "PASS", reasons)
+
+    def test_a_missing_check_fails(self):
+        names = soak.required_checks("dry-run")
+        checks = self._checks(names[1:])
+        plan = {"mode": "dry-run", "duration_secs": 420}
+        verdict, reasons = soak.compute_verdict(plan, {"duration_secs": 420}, checks)
+        self.assertEqual(verdict, "FAIL")
+        self.assertIn("missing checks", reasons[0])
+
+    def test_a_failed_check_fails(self):
+        checks = self._checks(soak.required_checks("dry-run"))
+        checks[soak.required_checks("dry-run")[0]]["passed"] = False
+        plan = {"mode": "dry-run", "duration_secs": 420}
+        verdict, reasons = soak.compute_verdict(plan, {"duration_secs": 420}, checks)
+        self.assertEqual(verdict, "FAIL")
+        self.assertIn("failed checks", reasons[0])
+
+    def test_a_claimed_but_unexecuted_allow_slot_fails_the_verdict(self):
+        checks = self._checks(soak.required_checks("dry-run"))
+        checks["S4_allow_execution_1"]["passed"] = False
+        plan = {"mode": "dry-run", "duration_secs": 420}
+        verdict, reasons = soak.compute_verdict(plan, {"duration_secs": 420}, checks)
+        self.assertEqual(verdict, "FAIL")
+        self.assertIn("S4_allow_execution_1", reasons[0])
+
+    def test_budget_stop_is_not_a_pass(self):
+        plan = {"mode": "soak", "duration_secs": 86400, "budget_stopped": True}
+        verdict, _ = soak.compute_verdict(plan, {"duration_secs": 86400, "budget_stopped": True}, {})
+        self.assertEqual(verdict, "BUDGET_STOPPED")
+
+    def test_signal_stop_is_not_a_pass(self):
+        plan = {"mode": "soak", "duration_secs": 86400}
+        verdict, _ = soak.compute_verdict(plan, {"duration_secs": 10, "stop_reason": "signal"}, {})
+        self.assertEqual(verdict, "STOPPED")
+
+    def test_short_soak_fails_even_with_green_checks(self):
+        checks = self._checks(soak.required_checks("soak"))
+        plan = {"mode": "soak", "duration_secs": 86400}
+        verdict, reasons = soak.compute_verdict(plan, {"duration_secs": 100}, checks)
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any("planned deadline" in reason for reason in reasons))
+
+
+class PlanTests(unittest.TestCase):
+    def test_soak_mode_schedules_the_rule_check(self):
+        names = [action["name"] for action in soak.initial_actions("soak", 0.0)]
+        self.assertIn("rules_check", names)
+
+    def test_plan_modes_have_distinct_lane_sets(self):
+        dry = soak.lane_specs("dry-run", "deepseek/test")
+        soak_lanes = soak.lane_specs("soak", "deepseek/test")
+        self.assertIn("agent_short", [spec.key for spec in dry["agent"]])
+        self.assertIn("agent_continue", [spec.key for spec in soak_lanes["agent"]])
+        self.assertGreater(len(dry["overlap"]), 0)
+        self.assertGreater(len(soak_lanes["os"]), 0)
+
+    def test_agent_frequency_is_below_shell_frequency(self):
+        lanes = soak.lane_specs("soak", "deepseek/test")
+        agent = next(spec for spec in lanes["agent"] if spec.key == "agent_continue")
+        self.assertEqual(agent.trigger[0], "--every")
+        self.assertGreaterEqual(int(agent.trigger[1]), 3600)
+
+
+class GateTests(unittest.TestCase):
+    def _plan(self):
+        return {
+            "mode": "dry-run",
+            "duration_secs": 420,
+            "lanes": {"agent": [{"kind": "agent", "name": "agent", "key": "agent"}]},
+            "thresholds": dict(soak.THRESHOLDS),
+        }
+
+    def _cleanup(self, **residue):
+        base = {"processes": [], "labels": [], "plists": [], "missing_user_labels": []}
+        base.update(residue)
+        return base
+
+    def _evidence(self):
+        return {
+            "totals": {"run_states": {"succeeded": 2}, "occurrence_states": {}},
+            "duplicates": [],
+            "stranded": [],
+            "unsettled": [],
+            "classified_without_run": [],
+            "failures": [],
+            "usage": {"rows_without_cost": 0},
+            "latency_secs": {"claim": {"p95": 1.0}, "completion": {"p95": 1.0}},
+            "samples": [
+                {"rss_kb": 1000, "cpu_pct": 1, "db_bytes": 10, "live_root_bytes": 10},
+                {"rss_kb": 1100, "cpu_pct": 1, "db_bytes": 12, "live_root_bytes": 12},
+            ],
+            "lanes": {
+                "os": {
+                    "run_states": {"succeeded": 1},
+                    "wakeups": {"max_gap_secs": 60},
+                    "effects": {
+                        "shell": {"lines": 1, "succeeded_runs": 1, "effect_matches_success": True}
+                    },
+                },
+                "agent": {
+                    "run_states": {"succeeded": 1},
+                    "wakeups": {"max_gap_secs": 60},
+                    "effects": {},
+                },
+            },
+        }
+
+    def _checks(self, evidence=None, cleanup=None):
+        return soak.derive_checks(evidence or self._evidence(), {}, self._plan(), cleanup or self._cleanup())
+
+    def test_empty_skip_and_queue_runs_are_not_a_pass(self):
+        skipped = {"state": "skipped"}
+        self.assertFalse(soak.runs_observed_terminal([]))
+        self.assertFalse(soak.overlap_policy_ok("skip", skipped, [], {}))
+        self.assertFalse(soak.overlap_policy_ok("queue", {}, [], {}))
+        self.assertEqual(soak.overlap_observation_status(False, False, 10), "OPEN")
+        self.assertEqual(soak.overlap_observation_status(False, False, soak.OVERLAP_OBSERVE_SECS), "UNKNOWN")
+        self.assertEqual(soak.overlap_probe_status([(False, False)], soak.OVERLAP_OBSERVE_SECS), "UNKNOWN")
+        self.assertNotEqual(soak.overlap_probe_status([(False, False)], soak.OVERLAP_OBSERVE_SECS), "PASS")
+
+    def test_a_terminal_policy_violation_fails_without_waiting(self):
+        self.assertEqual(soak.overlap_probe_status([(True, False), (False, False)], 1), "FAIL")
+        self.assertTrue(
+            soak.overlap_policy_ok("skip", {"state": "skipped"}, [{"state": "skipped"}], {})
+        )
+        active = {"finished_at": "2026-11-06T00:02:00Z"}
+        queued = [{"state": "succeeded", "started_at": "2026-11-06T00:03:00Z"}]
+        early = [{"state": "succeeded", "started_at": "2026-11-06T00:01:00Z"}]
+        self.assertTrue(soak.overlap_policy_ok("queue", {}, queued, active))
+        self.assertFalse(soak.overlap_policy_ok("queue", {}, early, active))
+
+    def test_a_non_fault_shell_failure_fails_the_shell_gate(self):
+        evidence = self._evidence()
+        evidence["failures"] = [
+            {"lane": "os", "state": "failed", "run": "shell-1"},
+            {"lane": "fault", "state": "unknown", "run": "fault-1"},
+            {"lane": "os", "state": "cancelled", "run": "shell-2"},
+        ]
+        checks = self._checks(evidence)
+        self.assertFalse(checks["S_shell_outcomes"]["passed"])
+        self.assertEqual(len(checks["S_shell_outcomes"]["detail"]["failures"]), 1)
+        self.assertTrue(checks["S2_agent"]["passed"])
+        self.assertIn("S_shell_outcomes", soak.required_checks("dry-run"))
+        self.assertIn("S_shell_outcomes", soak.required_checks("soak"))
+        verdict, reasons = soak.compute_verdict(
+            self._plan(),
+            {"duration_secs": 420},
+            {name: {"passed": True} for name in soak.required_checks("dry-run")}
+            | {"S_shell_outcomes": checks["S_shell_outcomes"]},
+        )
+        self.assertEqual(verdict, "FAIL")
+        self.assertIn("S_shell_outcomes", reasons[0])
+
+    def test_effect_mismatch_and_silent_skip_fail(self):
+        evidence = self._evidence()
+        evidence["lanes"]["os"]["effects"]["shell"] = {
+            "lines": 0,
+            "succeeded_runs": 1,
+            "effect_matches_success": False,
+        }
+        evidence["classified_without_run"] = [
+            {"state": "skipped", "occurrence": "occ-skip"},
+            {"state": "missed", "occurrence": "occ-miss"},
+        ]
+        checks = self._checks(evidence)
+        self.assertFalse(checks["S_effect_match"]["passed"])
+        self.assertFalse(checks["S1_occurrences"]["passed"])
+        self.assertEqual(len(checks["S1_occurrences"]["detail"]["silent_losses"]), 1)
+        self.assertIn("S_effect_match", soak.required_checks("soak"))
+
+    def test_duplicate_marker_lines_count_against_the_frozen_threshold(self):
+        evidence = self._evidence()
+        evidence["lanes"]["os"]["effects"]["shell"] = {
+            "lines": 2,
+            "succeeded_runs": 1,
+            "effect_matches_success": False,
+        }
+        checks = self._checks(evidence)
+        self.assertGreater(checks["S1_occurrences"]["detail"]["duplicate_side_effects"], 0)
+        self.assertFalse(checks["S1_occurrences"]["passed"])
+
+    def test_wake_gap_agent_ratio_rss_growth_and_orphans_use_frozen_thresholds(self):
+        healthy = self._checks()
+        self.assertTrue(healthy["S10_performance"]["passed"], healthy["S10_performance"])
+        self.assertTrue(healthy["S2_agent"]["passed"], healthy["S2_agent"])
+        self.assertTrue(healthy["S9_residue"]["passed"], healthy["S9_residue"])
+
+        gapped = self._evidence()
+        gapped["lanes"]["os"]["wakeups"]["max_gap_secs"] = soak.THRESHOLDS["max_unexplained_wake_gap_secs"] + 1
+        self.assertFalse(self._checks(gapped)["S10_performance"]["passed"])
+
+        unmeasured = self._evidence()
+        unmeasured["lanes"]["os"]["wakeups"] = {}
+        unmeasured["lanes"]["agent"]["wakeups"] = {}
+        self.assertFalse(self._checks(unmeasured)["S10_performance"]["passed"])
+
+        ratio = self._evidence()
+        ratio["lanes"]["agent"]["run_states"] = {"succeeded": 1, "failed": 1}
+        ratio_checks = self._checks(ratio)
+        self.assertFalse(ratio_checks["S2_agent"]["passed"])
+        self.assertLess(ratio_checks["S2_agent"]["detail"]["agent_success_ratio"], 1)
+
+        # Absolute RSS above the growth budget, growth well under it.
+        high = self._evidence()
+        high["samples"] = [
+            {"rss_kb": 590_000, "cpu_pct": 1, "db_bytes": 10, "live_root_bytes": 10},
+            {"rss_kb": 600_000, "cpu_pct": 1, "db_bytes": 12, "live_root_bytes": 12},
+        ]
+        high_checks = self._checks(high)
+        self.assertTrue(high_checks["S10_performance"]["passed"], high_checks["S10_performance"])
+        self.assertLess(
+            high_checks["S10_performance"]["detail"]["rss_growth_bytes"],
+            soak.THRESHOLDS["max_rss_growth_bytes"],
+        )
+
+        grown = self._evidence()
+        grown["samples"] = [
+            {"rss_kb": 1_000, "cpu_pct": 1, "db_bytes": 10, "live_root_bytes": 10},
+            {"rss_kb": 601_000, "cpu_pct": 1, "db_bytes": 12, "live_root_bytes": 12},
+        ]
+        self.assertFalse(self._checks(grown)["S10_performance"]["passed"])
+
+        orphans = self._checks(cleanup=self._cleanup(processes=[{"pid": 9, "command": "sleep"}]))
+        self.assertFalse(orphans["S9_residue"]["passed"])
+        self.assertEqual(orphans["S9_residue"]["detail"]["orphan_processes"], 1)
+
+    def test_runner_errors_fail_apart_from_product_checks(self):
+        checks = {name: {"passed": True} for name in soak.required_checks("dry-run")}
+        state = {"duration_secs": 420}
+        soak.record_runner_error(state, "s4_verify_1", "disk full")
+        verdict, reasons = soak.compute_verdict(self._plan(), state, checks)
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any(reason.startswith("runner errors:") for reason in reasons))
+        self.assertFalse(any(reason.startswith("failed checks:") for reason in reasons))
+
+    def test_a_runner_exception_is_not_recorded_as_a_product_check(self):
+        import shutil
+
+        root = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvs-gate-test-"))
+        try:
+            evidence = root / "evidence"
+            evidence.mkdir()
+            paths = soak.RunPaths.for_evidence(evidence, root)
+            plan = {
+                "mode": "dry-run",
+                "start_at": "2026-11-06T00:00:00Z",
+                "deadline_at": "2026-11-06T00:07:00Z",
+                "duration_secs": 420,
+                "lanes": {},
+            }
+            state = {"checks": {}}
+            supervisor = soak.Supervisor(paths, plan, state, soak.Recorder(paths))
+
+            def explode(_name):
+                raise RuntimeError("runner blew up")
+
+            supervisor.action_handler = lambda _name: explode  # type: ignore[method-assign]
+            supervisor.execute_action({"name": "s4_verify_1", "status": "pending", "attempts": 0})
+            self.assertEqual(state["runner_errors"][0]["source"], "runner")
+            self.assertNotIn("s4_verify_1", supervisor.checks)
+            self.assertNotIn("S4_1", supervisor.checks)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
