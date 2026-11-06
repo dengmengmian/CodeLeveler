@@ -231,7 +231,10 @@ async fn run_acceptance() -> Value {
             marker_completed,
         )
         .await;
-        if let Ok(status) = wakeup::status(&home).await {
+        // The marker records the task's last action; the scheduler may still
+        // report SCHED_S_TASK_RUNNING for a moment after it. Wait for a
+        // terminal result before judging success.
+        if let Some(status) = settled_status(&home).await {
             last_status = Some(status);
         }
         report["marker_after_run"] = json!(read_marker(&marker));
@@ -365,7 +368,7 @@ async fn run_acceptance() -> Value {
             marker_completed,
         )
         .await;
-        let final_status = wakeup::status(&home).await.ok().or(last_status);
+        let final_status = settled_status(&home).await.or(last_status);
         report["automatic_trigger"] = json!({
             "fired": fired,
             "marker": read_marker(&marker),
@@ -499,6 +502,27 @@ async fn wait_until(
         tick += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Poll until the scheduler no longer reports a running instance. Only the
+/// transient `SCHED_S_TASK_RUNNING` state is waited out; the last completed
+/// result is returned unchanged.
+async fn settled_status(home: &Path) -> Option<WakeupStatus> {
+    let mut last = None;
+    for _ in 0..20 {
+        match wakeup::status(home).await {
+            Ok(status) => {
+                let running = status.last_exit_code == Some(TASK_RUNNING);
+                last = Some(status);
+                if !running {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    last
 }
 
 fn marker_has(path: &Path, needle: &str) -> bool {
