@@ -426,6 +426,58 @@ async fn an_undeclared_settlement_gets_one_bounded_delivery_request() {
     assert_eq!(run.final_text(), ANSWER);
 }
 
+/// A declaration with no visible text is not an answer. The drive asks once
+/// for the delivery; the text that follows is published.
+#[tokio::test]
+async fn a_declared_answer_without_visible_text_gets_one_delivery_request() {
+    let run = run_goal(vec![
+        goal_complete("g1", Some(true)),
+        assistant_text(ANSWER),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(run.outcome.model_steps, 2);
+    assert_eq!(run.final_text(), ANSWER);
+    assert_eq!(
+        run.finished_texts(),
+        vec![ANSWER.to_string()],
+        "only the follow-up answer is delivered"
+    );
+}
+
+/// The model declares delivery but never writes text, even on the bounded
+/// follow-up. The turn ends honestly: no empty or stale text becomes the
+/// answer, and the terminal records that the person was not answered.
+#[tokio::test]
+async fn a_declared_answer_that_stays_textless_ends_with_an_honest_missing_delivery() {
+    let run = run_goal(vec![
+        goal_complete("g1", Some(true)),
+        goal_complete("g2", Some(true)),
+        goal_complete("g3", Some(true)),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        run.outcome.model_steps, 3,
+        "the settlement plus two bounded wrap-up rounds"
+    );
+    assert!(
+        run.outcome
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("no final answer")),
+        "the terminal must record the missing delivery: {:?}",
+        run.outcome.completion_warnings
+    );
+    assert_eq!(
+        run.final_text(),
+        "Finished the requested work.",
+        "the goal summary is the only honest fallback"
+    );
+}
+
 /// The delivery request must actually tell the model that the person has not
 /// been answered yet. Otherwise the compatibility path is a request without a
 /// fact.

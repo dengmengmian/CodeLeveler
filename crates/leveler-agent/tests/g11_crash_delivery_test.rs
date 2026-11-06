@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
@@ -221,6 +222,26 @@ fn text(value: &str) -> ModelResponse {
         request_id: leveler_core::RequestId::generate(),
         message: Message::text(Role::Assistant, value),
         finish_reason: FinishReason::Stop,
+        usage: TokenUsage::default(),
+    }
+}
+
+fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
+    ModelResponse {
+        request_id: leveler_core::RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: leveler_core::ToolCallId::new(id),
+                    name: name.to_string(),
+                    arguments: args,
+                },
+            }],
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
         usage: TokenUsage::default(),
     }
 }
@@ -712,6 +733,215 @@ async fn recovery_survives_a_second_crash_before_the_terminal_commit() {
         model_requests(&fx).await,
         1,
         "two crashes must not buy a model request"
+    );
+    let after = events(&fx).await;
+    assert_eq!(task_terminals(&after), 1);
+    assert_eq!(goals(&fx).await[0].state, GoalState::Settled);
+}
+
+/// The Required-review window has no terminal of its own: the turn is closed,
+/// the reviewer was launched, and the crash killed its settlement. The answer
+/// is already durable. A resume must finish the review obligation and publish
+/// that answer — it must not re-drive the parent model and produce a second
+/// answer, and it must not skip the review.
+struct FailNextEvent {
+    inner: Database,
+    event_type: &'static str,
+    armed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl leveler_storage::EventStore for FailNextEvent {
+    async fn append(
+        &self,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, StorageError> {
+        if event_type == self.event_type && self.armed.swap(false, Ordering::SeqCst) {
+            // A real crash leaves no error path behind: unwind the run future
+            // so the durable state stops exactly before this append.
+            panic!("injected crash before {event_type}");
+        }
+        leveler_storage::EventStore::append(
+            &self.inner,
+            session_id,
+            turn_id,
+            event_type,
+            payload,
+            now,
+        )
+        .await
+    }
+
+    async fn load(&self, session_id: &SessionId) -> Result<Vec<EventRecord>, StorageError> {
+        leveler_storage::EventStore::load(&self.inner, session_id).await
+    }
+
+    async fn load_after(
+        &self,
+        session_id: &SessionId,
+        after: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        leveler_storage::EventStore::load_after(&self.inner, session_id, after).await
+    }
+
+    async fn load_last_by_type(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        turn_id: Option<&TurnId>,
+    ) -> Result<Option<EventRecord>, StorageError> {
+        leveler_storage::EventStore::load_last_by_type(&self.inner, session_id, event_type, turn_id)
+            .await
+    }
+
+    async fn append_owned(
+        &self,
+        token: &OwnershipToken,
+        session_id: &SessionId,
+        turn_id: Option<&TurnId>,
+        event_type: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<EventRecord, OwnershipError> {
+        if event_type == self.event_type && self.armed.swap(false, Ordering::SeqCst) {
+            panic!("injected crash before {event_type}");
+        }
+        leveler_storage::EventStore::append_owned(
+            &self.inner,
+            token,
+            session_id,
+            turn_id,
+            event_type,
+            payload,
+            now,
+        )
+        .await
+    }
+}
+
+fn install_event_crash(fx: &mut Fixture, event_type: &'static str) -> Arc<AtomicBool> {
+    let armed = Arc::new(AtomicBool::new(true));
+    fx.coding.engine.stores.events = Arc::new(FailNextEvent {
+        inner: fx.db.clone(),
+        event_type,
+        armed: armed.clone(),
+    });
+    armed
+}
+
+#[tokio::test]
+async fn a_crash_during_the_required_review_resumes_the_delivery_without_redriving_the_parent() {
+    let mut fx = fixture(vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+            }),
+        ),
+        declared_answer(),
+        text("review: no blocking defect"),
+        // The recovered review: one plain reviewer response.
+        text("review: no blocking defect"),
+        // Consumed only if the resume wrongly re-drives the parent.
+        duplicate_delivery(),
+        text("review after a regenerated answer"),
+    ])
+    .await;
+    std::fs::create_dir_all(fx.dir.path().join("src")).unwrap();
+    std::fs::write(fx.dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    fx.coding.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    let armed = install_event_crash(&mut fx, "sub_agent_finished");
+    let spec = spec(&fx);
+
+    let first = std::panic::AssertUnwindSafe(fx.coding.run(
+        &fx.session,
+        &spec,
+        &mut |_| {},
+        CancellationToken::new(),
+    ))
+    .catch_unwind()
+    .await;
+    assert!(
+        first.is_err(),
+        "the injected reviewer-settlement crash must stop the run"
+    );
+    assert!(
+        !armed.load(Ordering::SeqCst),
+        "the injection must have fired"
+    );
+
+    // The exact cut: the parent answer, its turn and the review launch are
+    // durable; the review settlement and the task terminal are not.
+    let after_crash = events(&fx).await;
+    let transcript = assistant_texts(&fx).await;
+    assert_eq!(
+        transcript
+            .iter()
+            .rev()
+            .find(|text| !text.is_empty())
+            .map(String::as_str),
+        Some(ANSWER)
+    );
+    assert_eq!(turn_terminals(&after_crash), 1);
+    assert_eq!(task_terminals(&after_crash), 0);
+    assert!(after_crash.iter().any(|event| matches!(
+        event,
+        EngineEvent::ReviewStage { required: true, action, .. } if action == "launching"
+    )));
+    assert!(after_crash.iter().any(|event| matches!(
+        event,
+        EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"
+    )));
+    assert_eq!(goals(&fx).await[0].state, GoalState::Running);
+    let requests_after_crash = model_requests(&fx).await;
+    assert_eq!(
+        requests_after_crash, 3,
+        "two parent requests plus the reviewer"
+    );
+
+    let mut recovered = fresh_coding(&fx);
+    recovered.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    let mut observed = Vec::new();
+    let report = recovered
+        .resume(
+            &fx.session,
+            &spec,
+            &mut |event| observed.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the uncommitted delivery resumes through its review");
+
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    assert_eq!(
+        report.final_text, ANSWER,
+        "recovery must publish the recorded answer, not a regenerated one"
+    );
+    assert_eq!(
+        report.model_steps, 2,
+        "the completed turn's two steps are kept"
+    );
+    assert_eq!(
+        assistant_texts(&fx).await,
+        transcript,
+        "the parent answer is not written a second time"
+    );
+    assert_eq!(
+        model_requests(&fx).await,
+        requests_after_crash + 1,
+        "only the interrupted review is re-run; the parent is not re-driven"
+    );
+    assert!(
+        observed.iter().any(|event| matches!(
+            event,
+            EngineEvent::SubAgentStarted { role, .. } if role == "reviewer"
+        )),
+        "the required review obligation must be fulfilled on recovery"
     );
     let after = events(&fx).await;
     assert_eq!(task_terminals(&after), 1);

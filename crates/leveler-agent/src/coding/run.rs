@@ -126,6 +126,23 @@ struct UncommittedDelivery {
     /// turn's own terminal commit, so recovery must close that turn first.
     /// Otherwise only the task terminal is missing.
     turn_open: bool,
+    /// What the durable log says about the closure review this delivery owes.
+    /// A crash can hit before the review starts, during it, or after it
+    /// settled but before the task terminal; recovery must resume exactly the
+    /// remaining obligation.
+    review: DeliveryReviewState,
+}
+
+/// The closure-review obligation recorded after a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryReviewState {
+    /// Finalization never reached the review stage.
+    Absent,
+    /// A review was launched but its outcome is not durable. The obligation
+    /// was created under `Required`, so recovery must not drop it.
+    Unsettled,
+    /// The review already settled; recovery must not run a second one.
+    Settled(ClosureReview),
 }
 
 fn continuation_root_is_valid(
@@ -2344,9 +2361,8 @@ impl CodingRuntime {
     /// task terminal after it, its stop is a terminal delivery, and that turn
     /// is still the newest user/chat turn of this very goal. The delivery
     /// event carries the turn facts, so recovery works whether the crash hit
-    /// the turn terminal or only the task terminal: a finished turn must have
-    /// reached the terminal-publish phase (the crash was the commit, not a
-    /// review or a tool round), and a turn with no terminal must still be
+    /// the turn terminal, a finalization phase, or only the task terminal: a
+    /// finished turn closed cleanly, and a turn with no terminal must still be
     /// `running`. Anything else falls through to the ordinary resume.
     async fn uncommitted_delivery(
         &self,
@@ -2432,22 +2448,52 @@ impl CodingRuntime {
                 }),
                 "completed",
             ) => {
-                // Entering `publishing_terminal` proves finalization decided
-                // the terminal; the crash was the commit, not earlier work.
-                let reached_terminal_publish = rows[at + 1..].iter().any(|row| {
-                    matches!(
-                        EngineEvent::from_payload(&row.payload),
-                        Ok(EngineEvent::FinalizationPhaseStarted { phase, .. })
-                            if phase == FINALIZATION_PUBLISHING_TERMINAL
-                    )
-                });
-                if !reached_terminal_publish {
-                    return Ok(None);
-                }
+                // Finalization runs after the turn: review, outcome
+                // resolution, then the terminal publish. A crash anywhere in
+                // that window leaves the same durable delivery and no task
+                // terminal, so recovery owns every remaining phase — including
+                // a review the crash interrupted.
                 false
             }
             _ => return Ok(None),
         };
+        // The closure review's durable breadcrumbs decide whether recovery
+        // still owes it. `launching` without a settle means the crash hit
+        // inside the review; a settled action means it must not run again.
+        let mut review = DeliveryReviewState::Absent;
+        let mut last_reviewer: Option<usize> = None;
+        for row in &rows[at + 1..] {
+            match EngineEvent::from_payload(&row.payload) {
+                Ok(EngineEvent::SubAgentFinished {
+                    nickname,
+                    contribution,
+                    ..
+                }) if nickname == "reviewer" => {
+                    last_reviewer = contribution.map(|value| value.findings_total as usize);
+                }
+                Ok(EngineEvent::ReviewStage { action, .. }) => match action.as_str() {
+                    "launching" => review = DeliveryReviewState::Unsettled,
+                    "not_required" => {
+                        review = DeliveryReviewState::Settled(ClosureReview::NotRequired);
+                    }
+                    "finished_ok" => {
+                        review = DeliveryReviewState::Settled(ClosureReview::Completed {
+                            findings: last_reviewer.unwrap_or(0),
+                        });
+                    }
+                    "finished_incomplete" => {
+                        review = DeliveryReviewState::Settled(ClosureReview::Incomplete {
+                            findings: last_reviewer.unwrap_or(0),
+                        });
+                    }
+                    "launch_failed" => {
+                        review = DeliveryReviewState::Settled(ClosureReview::LaunchFailed);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
         Ok(Some(UncommittedDelivery {
             turn_id: TurnId::new(turn_id),
             text,
@@ -2455,6 +2501,7 @@ impl CodingRuntime {
             model_steps,
             modified_files,
             turn_open,
+            review,
         }))
     }
 
@@ -2522,6 +2569,74 @@ impl CodingRuntime {
             })?;
         observer(event);
         Ok(())
+    }
+
+    /// Settle the closure review a crash interrupted, without re-driving the
+    /// parent model.
+    ///
+    /// The delivery event already carries the answer and the modified files,
+    /// so the reviewer can be launched from durable facts alone. A review that
+    /// already settled is returned as recorded. A `launching` with no outcome
+    /// is a live obligation from the process that died: it is finished even if
+    /// the current configuration no longer asks for a review.
+    async fn resume_closure_review(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        spec: &TaskSpec,
+        budget_scope: &str,
+        delivery: &UncommittedDelivery,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: &CancellationToken,
+    ) -> Result<ClosureReview, EngineError> {
+        if let DeliveryReviewState::Settled(review) = delivery.review {
+            return Ok(review);
+        }
+        let policy = match delivery.review {
+            DeliveryReviewState::Unsettled => IndependentReviewPolicy::Required,
+            _ => self.factory.independent_review,
+        };
+        let log = EventLog::new_owned(
+            self.engine.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
+        let runner = TurnRunner {
+            stores: &self.engine.stores,
+            token: token.clone(),
+            session_id: session_id.clone(),
+            log: &log,
+            approver: self.approver.clone(),
+            clarifier: self.clarifier.clone(),
+            lost_child_voice: Some(self.lost_child_voice(session_id)),
+        };
+        // The reviewer the crash interrupted has no terminal. Settle that
+        // ghost before launching its replacement, so the task terminal is a
+        // closed evidence boundary.
+        runner
+            .reconcile_terminal_children(leveler_lifecycle::ChildStop::Lost, observer)
+            .await?;
+        let review_phase = begin_finalization_phase(&log, FINALIZATION_REVIEW, observer).await;
+        // The parent's wall clock is gone with the old process; the reviewer
+        // starts from zero rather than charging the resume for time it did not
+        // observe.
+        let review = self
+            .closure_review_stage(
+                &log,
+                &runner,
+                spec,
+                budget_scope,
+                &delivery.modified_files,
+                0,
+                policy,
+                observer,
+                cancellation,
+            )
+            .await;
+        if let Some(started) = review_phase {
+            finish_finalization_phase(FINALIZATION_REVIEW, started);
+        }
+        review
     }
 
     async fn resume_inner(
@@ -2688,8 +2803,22 @@ impl CodingRuntime {
                 self.close_recovered_turn(&token, session_id, &delivery, observer)
                     .await?;
             }
+            // The finalization phases after the turn are mechanical and were
+            // interrupted mid-way: a required review may still be owed, and
+            // the outcome/terminal commits never happened.
+            let review = self
+                .resume_closure_review(
+                    &token,
+                    session_id,
+                    spec,
+                    goal_id.as_str(),
+                    &delivery,
+                    observer,
+                    &cancellation,
+                )
+                .await?;
             let blocked = matches!(delivery.stop, StopReason::Blocked);
-            let result = Ok(TaskReport::new(
+            let mut report = TaskReport::new(
                 if blocked {
                     TaskOutcome::Blocked
                 } else {
@@ -2699,7 +2828,9 @@ impl CodingRuntime {
                 delivery.modified_files,
                 delivery.stop,
                 delivery.model_steps,
-            ));
+            );
+            apply_review_warnings(&mut report, review);
+            let result = Ok(report);
             self.finish_from_result(
                 &token,
                 session_id,
@@ -3551,24 +3682,7 @@ impl CodingRuntime {
         if let Some(started) = review_phase {
             finish_finalization_phase(FINALIZATION_REVIEW, started);
         }
-        if task_report.outcome == TaskOutcome::Completed {
-            match review {
-                ClosureReview::Completed { findings: 0 } | ClosureReview::NotRequired => {}
-                ClosureReview::Completed { findings } => task_report.completion_warnings.push(
-                    format!("required independent review reported {findings} finding(s)"),
-                ),
-                ClosureReview::Incomplete { findings: 0 } | ClosureReview::LaunchFailed => {
-                    task_report
-                        .completion_warnings
-                        .push("required independent review did not complete".into());
-                }
-                ClosureReview::Incomplete { findings } => task_report.completion_warnings.push(
-                    format!(
-                        "required independent review stopped early after reporting {findings} finding(s)"
-                    ),
-                ),
-            }
-        }
+        apply_review_warnings(&mut task_report, review);
         Ok(task_report)
     }
 
@@ -3947,6 +4061,28 @@ enum ClosureReview {
     Completed { findings: usize },
     Incomplete { findings: usize },
     LaunchFailed,
+}
+
+/// Surface the review outcome as completion warnings. The review is advisory
+/// evidence, but whether it ran and what it reported belongs on the terminal.
+fn apply_review_warnings(report: &mut TaskReport, review: ClosureReview) {
+    if report.outcome != TaskOutcome::Completed {
+        return;
+    }
+    match review {
+        ClosureReview::Completed { findings: 0 } | ClosureReview::NotRequired => {}
+        ClosureReview::Completed { findings } => report.completion_warnings.push(format!(
+            "required independent review reported {findings} finding(s)"
+        )),
+        ClosureReview::Incomplete { findings: 0 } | ClosureReview::LaunchFailed => {
+            report
+                .completion_warnings
+                .push("required independent review did not complete".into());
+        }
+        ClosureReview::Incomplete { findings } => report.completion_warnings.push(format!(
+            "required independent review stopped early after reporting {findings} finding(s)"
+        )),
+    }
 }
 
 /// What a harness-launched read-only child came back with.
