@@ -43,9 +43,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ActionKind, Claim, HandedOffRun, OccurrenceId, RunFacts, RunId, RunOutcome, RunState,
-    ScheduleAction, ScheduleDefinition, ScheduleError, ScheduleRun, ScheduleStore, SessionPolicy,
-    UsageSnapshot, WakeSource,
+    ActionKind, Claim, HandedOffRun, OccurrenceId, OverlapPolicy, RunFacts, RunId, RunOutcome,
+    RunState, ScheduleAction, ScheduleDefinition, ScheduleError, ScheduleRun, ScheduleStore,
+    SessionPolicy, UsageSnapshot, WakeSource,
 };
 
 /// How long a cancellation is awaited before an agent run is recorded as
@@ -421,6 +421,28 @@ impl Dispatcher {
                 .settle(&claim.run_id, RunOutcome::Blocked { error: reason })
                 .await;
         }
+        // Concurrent runs need one execution context each. A `continue`
+        // session is one turn at a time by runtime contract, so a definition
+        // that pairs overlap with session reuse can never honour its own
+        // policy. Definitions are validated on write; this guard also covers
+        // rows created before that rule existed and never silently degrades
+        // the second run into a timeout.
+        if definition.overlap == OverlapPolicy::AllowConcurrent
+            && definition.session_policy == SessionPolicy::Continue
+        {
+            return self
+                .settle(
+                    &claim.run_id,
+                    RunOutcome::Blocked {
+                        error: "this definition allows concurrent runs but reuses one \
+                                session; a session admits one turn at a time. Update it to \
+                                a fresh session per run before dispatching it again; the \
+                                action was not started"
+                            .into(),
+                    },
+                )
+                .await;
+        }
         let client = match self.connector.connect(&definition.workspace).await {
             Ok(client) => client,
             Err(error) => {
@@ -443,7 +465,7 @@ impl Dispatcher {
             &*client,
             definition,
             &claim.run_id,
-            SessionPolicy::Continue,
+            definition.session_policy,
             ApprovalPolicy::Interactive,
         )
         .await
