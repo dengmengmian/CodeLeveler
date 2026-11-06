@@ -2516,6 +2516,57 @@ mod tests {
         }
     }
 
+    /// The Diff page is the same surface as an inline edit: the selected
+    /// file's patch gets the shared bands, and the file list still names it.
+    #[test]
+    fn the_diff_page_paints_the_shared_bands() {
+        use leveler_client_protocol::{UiDiff, UiDiffFile};
+        let mut state = test_state();
+        state.theme = Theme::dark();
+        state.diff = Some(UiDiff {
+            files: vec![UiDiffFile {
+                path: "src/a.rs".into(),
+                added: 1,
+                removed: 1,
+                patch: Some(
+                    "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n fn main() {}\n-old_name();\n+new_name();\n"
+                        .into(),
+                ),
+            }],
+        });
+        state.diff_selected = 0;
+        state.active_screen = Screen::Diff;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect();
+            if let Some(byte) = row.find("new_name") {
+                found = true;
+                let col = UnicodeWidthStr::width(&row[..byte]);
+                let bg = buf.cell((col as u16, y)).map(|c| c.bg);
+                assert_eq!(
+                    bg,
+                    Some(Theme::dark().diff.added_inline_bg),
+                    "the changed token keeps the shared inline band: {row:?}"
+                );
+            }
+            if let Some(byte) = row.find("+ new_name") {
+                let col = UnicodeWidthStr::width(&row[..byte]);
+                assert_eq!(
+                    buf.cell((col as u16, y)).map(|c| c.bg),
+                    Some(Theme::dark().diff.added_bg),
+                    "the row band reaches the marker: {row:?}"
+                );
+            }
+        }
+        assert!(found, "the add row is painted on the Diff page");
+    }
+
     /// An empty output section is still a section: the muted state sits at the
     /// section body indent, not drifting on the page's left edge.
     #[test]

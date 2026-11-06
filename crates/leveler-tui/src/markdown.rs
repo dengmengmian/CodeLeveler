@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{HighlightState, ThemeSet};
-use syntect::parsing::{ParseState, SyntaxSet};
+use syntect::parsing::{ParseState, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -238,6 +238,15 @@ impl MdDoc {
                     in_code = false;
                     let lang = code_lang.take();
                     let title = code_title.take();
+                    // A fence titled with a file path is still code even when
+                    // its info string carries no language tag.
+                    let lang = match (lang, title.as_deref()) {
+                        (Some(lang), _) => Some(lang),
+                        (None, Some(path)) => {
+                            Some(syntax_name_for_path(path).unwrap_or_else(|| "Bash".to_string()))
+                        }
+                        (None, None) => None,
+                    };
                     let lines = if lang.as_deref() == Some("diff") {
                         Arc::new(
                             highlight_diff(&code_buf)
@@ -713,7 +722,7 @@ fn wrap_code_line(
     theme: &Theme,
 ) -> Vec<Vec<Span<'static>>> {
     wrap_code_runs(segments, avail, |rgb| {
-        crate::code_block::tone_code_rgb(rgb, theme)
+        crate::code_block::code_style(rgb, theme)
     })
 }
 
@@ -727,41 +736,57 @@ pub(crate) fn wrap_code_runs(
     avail: usize,
     style_of: impl Fn((u8, u8, u8)) -> Style,
 ) -> Vec<Vec<Span<'static>>> {
+    let styled: Vec<(Style, String)> = segments
+        .iter()
+        .map(|(rgb, text)| (style_of(*rgb), text.clone()))
+        .collect();
+    wrap_styled_runs(&styled, avail)
+}
+
+/// Hard-wrap already-styled runs at `avail` display cells.
+///
+/// This is the one wrapping loop: a diff that decorates parts of a line (an
+/// inline change band) must break at exactly the same cells as ordinary code,
+/// including wide CJK and emoji graphemes.
+pub(crate) fn wrap_styled_runs(
+    segments: &[(Style, String)],
+    avail: usize,
+) -> Vec<Vec<Span<'static>>> {
     let avail = avail.max(1);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
     let mut w = 0usize;
-    let mut cur_color: Option<(u8, u8, u8)> = None;
+    let mut cur_style: Option<Style> = None;
     let mut cur_text = String::new();
-    let flush_span = |row: &mut Vec<Span<'static>>, color: (u8, u8, u8), text: &mut String| {
+    let flush_span = |row: &mut Vec<Span<'static>>, style: Style, text: &mut String| {
         if text.is_empty() {
             return;
         }
-        row.push(Span::styled(std::mem::take(text), style_of(color)));
+        row.push(Span::styled(std::mem::take(text), style));
     };
-    for (color, text) in segments {
+    for (style, text) in segments {
         for g in text.graphemes(true) {
             let gw = grapheme_width(g).max(1);
             if w + gw > avail && w > 0 {
-                if let Some(c) = cur_color {
-                    flush_span(&mut row, c, &mut cur_text);
+                if let Some(style) = cur_style {
+                    flush_span(&mut row, style, &mut cur_text);
                 }
                 rows.push(std::mem::take(&mut row));
                 w = 0;
-                cur_color = None;
+                cur_style = None;
             }
-            if cur_color != Some(*color) {
-                if let Some(c) = cur_color {
-                    flush_span(&mut row, c, &mut cur_text);
+            if cur_style != Some(*style) {
+                if let Some(style) = cur_style {
+                    flush_span(&mut row, style, &mut cur_text);
                 }
-                cur_color = Some(*color);
+                cur_style = Some(*style);
             }
             cur_text.push_str(g);
             w += gw;
         }
     }
-    if let Some(c) = cur_color {
-        flush_span(&mut row, c, &mut cur_text);
+    if let Some(style) = cur_style {
+        flush_span(&mut row, style, &mut cur_text);
     }
     if !row.is_empty() || rows.is_empty() {
         rows.push(row);
@@ -1331,12 +1356,58 @@ fn split_tokens(text: &str) -> Vec<String> {
 
 fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(SyntaxSet::load_defaults_newlines)
+    // bat's bundled superset: syntect defaults plus TypeScript/TSX, TOML,
+    // Dockerfile and the rest. Compiled in — no runtime download.
+    SS.get_or_init(two_face::syntax::extra_newlines)
 }
 
 fn theme_set() -> &'static ThemeSet {
     static TS: OnceLock<ThemeSet> = OnceLock::new();
-    TS.get_or_init(ThemeSet::load_defaults)
+    TS.get_or_init(|| {
+        let mut set = ThemeSet::load_defaults();
+        if let Some(theme) = set.themes.get_mut("base16-ocean.dark") {
+            extend_base16_type_scopes(theme);
+        }
+        set
+    })
+}
+
+/// Teach base16-ocean.dark the type scopes modern grammars actually emit.
+///
+/// The bundled theme styles `entity.name.class`, but TypeScript aliases and
+/// interfaces, Go type names and Rust structs use `entity.name.type.*`,
+/// `entity.name.struct` and friends, and builtin types use `support.type.*`.
+/// Without these rules those tokens fall through to plain text, so the
+/// renderer has no colour to classify and the type role disappears. The ink is
+/// the theme's own class colour; the UI's semantic palette resolves it later.
+fn extend_base16_type_scopes(theme: &mut syntect::highlighting::Theme) {
+    use syntect::highlighting::{Color, StyleModifier, ThemeItem};
+    let class_ink = Color {
+        r: 235,
+        g: 203,
+        b: 139,
+        a: 255,
+    };
+    for selector in [
+        "entity.name.type",
+        "entity.name.struct",
+        "entity.name.enum",
+        "entity.name.trait",
+        "support.type",
+        "storage.type.go",
+    ] {
+        let Ok(scope) = selector.parse() else {
+            continue;
+        };
+        theme.scopes.push(ThemeItem {
+            scope,
+            style: StyleModifier {
+                foreground: Some(class_ink),
+                background: None,
+                font_style: None,
+            },
+        });
+    }
 }
 
 /// Per-line syntax-highlighted runs: `(rgb, text)` per segment.
@@ -1376,6 +1447,10 @@ struct HighlightCache {
 
 struct HighlightContinuation {
     lang: Option<String>,
+    /// The grammar actually selected for this prefix. An untagged block can
+    /// gain a shebang while it streams, so the same `lang` can resolve to a
+    /// different grammar; reusing the old parse state would be wrong.
+    syntax: String,
     code: Arc<str>,
     committed_bytes: usize,
     complete_lines: usize,
@@ -1566,7 +1641,8 @@ fn highlight_cache_snapshot_inner(
     }
     if let Some(active) = &cache.active {
         payload.source(&active.code);
-        payload.language_bytes += active.lang.as_ref().map_or(0, String::capacity);
+        payload.language_bytes +=
+            active.lang.as_ref().map_or(0, String::capacity) + active.syntax.capacity();
         payload.active_vector = active.raw_lines.capacity() * size_of::<HighlightedLine>();
         for row in &active.raw_lines {
             payload.row(row);
@@ -1600,17 +1676,92 @@ fn highlight_cache_snapshot_inner(
     })
 }
 
-/// The syntect language name to highlight `path` as, when the file extension
-/// is one the bundled syntax set knows.
+/// The syntect language name to highlight `path` as, when the bundled syntax
+/// set knows the file.
 ///
-/// A diff viewer asks this once per file section; an unknown or extension-less
-/// path returns `None` and the rows render without syntax colors instead of
-/// being guessed at.
+/// Matching is by whole file name first (so `Makefile`, `Dockerfile` and
+/// `CMakeLists.txt` resolve), then by extension. A diff viewer asks this once
+/// per file section; `None` means no grammar claims the path — the caller
+/// decides whether that is still code (diff/fence context) and falls back to
+/// Bash, or plain text.
 pub(crate) fn syntax_name_for_path(path: &str) -> Option<String> {
-    let extension = std::path::Path::new(path).extension()?.to_str()?;
-    syntax_set()
-        .find_syntax_by_extension(extension)
+    // Paths reach us both bare (`webhook.go`) and located (`webhook.go:792`,
+    // from diff headers and fence titles). `Path::extension` treats the line
+    // suffix as part of the extension, so strip it first.
+    let path = path.trim().trim_matches('`');
+    let file = match path.rsplit_once(':') {
+        Some((file, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => file,
+        _ => path,
+    };
+    let ss = syntax_set();
+    let name = std::path::Path::new(file).file_name()?.to_str()?;
+    // Sublime grammars list whole names such as `Makefile` in their
+    // `file_extensions`, so the file name itself is the first token to try.
+    if let Some(syntax) = ss.find_syntax_by_extension(name) {
+        return Some(syntax.name.clone());
+    }
+    let extension = std::path::Path::new(file).extension()?.to_str()?;
+    ss.find_syntax_by_extension(extension)
+        .or_else(|| syntax_alias(extension).and_then(|alias| ss.find_syntax_by_token(alias)))
         .map(|syntax| syntax.name.clone())
+}
+
+/// Language tags that explicitly ask for plain text rather than code.
+///
+/// Tool output and logs reach fences tagged `text`/`log`/`output`; those must
+/// never be guessed into Bash keywords.
+const PLAIN_LANGUAGE_TAGS: &[&str] = &[
+    "text",
+    "plain",
+    "plaintext",
+    "txt",
+    "log",
+    "logs",
+    "output",
+    "console",
+];
+
+/// Language aliases the bundled set does not ship as its own grammar.
+///
+/// `two-face`'s fancy-regex build excludes JavaScript (Babel), the bat grammar
+/// that carries JSX. The bundled JavaScript grammar still reads JSX code
+/// (keywords, strings, comments, numbers, calls); JSX tags and attributes are
+/// tokenized as identifiers/operators rather than dedicated JSX scopes.
+const SYNTAX_ALIASES: &[(&str, &str)] =
+    &[("jsx", "js"), ("javascriptreact", "js"), ("react", "js")];
+
+fn syntax_alias(name: &str) -> Option<&'static str> {
+    SYNTAX_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map(|(_, syntax)| *syntax)
+}
+
+/// Resolve the grammar for one code block.
+///
+/// - `Some(tag)` is explicit evidence that the caller is showing code: a fence
+///   language or a resolved file path. A tag the bundled set does not know
+///   falls back to Bash, so unsupported or mistyped languages still get a
+///   generic code shape instead of flat text.
+/// - `None` is no language evidence at all. Only a shebang/modeline in the
+///   content proves it is code; ordinary tool logs stay Plain Text.
+fn resolved_syntax<'a>(ss: &'a SyntaxSet, lang: Option<&str>, code: &str) -> &'a SyntaxReference {
+    let Some(lang) = lang.map(str::trim).filter(|lang| !lang.is_empty()) else {
+        return ss
+            .find_syntax_by_first_line(code.lines().next().unwrap_or(""))
+            .unwrap_or_else(|| ss.find_syntax_plain_text());
+    };
+    if PLAIN_LANGUAGE_TAGS
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case(lang))
+    {
+        return ss.find_syntax_plain_text();
+    }
+    ss.find_syntax_by_token(lang)
+        .or_else(|| ss.find_syntax_by_extension(lang))
+        .or_else(|| syntax_alias(lang).and_then(|alias| ss.find_syntax_by_token(alias)))
+        .or_else(|| ss.find_syntax_by_token("bash"))
+        .unwrap_or_else(|| ss.find_syntax_plain_text())
 }
 
 /// Memoized [`highlight_code`]. While a message streams, every painted frame
@@ -1649,9 +1800,10 @@ fn highlight_code_with_cache(
         return lines;
     }
     let started = crate::profile::start();
-    let reuse = previous
-        .as_ref()
-        .is_some_and(|p| p.lang.as_deref() == lang && code.starts_with(p.code.as_ref()));
+    let syntax_name = resolved_syntax(syntax_set(), lang, code).name.clone();
+    let reuse = previous.as_ref().is_some_and(|p| {
+        p.lang.as_deref() == lang && p.syntax == syntax_name && code.starts_with(p.code.as_ref())
+    });
     let source: Arc<str> = Arc::from(code);
     let (lines, active) = highlight_continued(source.clone(), lang, previous.filter(|_| reuse));
     crate::profile::add(
@@ -1679,9 +1831,7 @@ fn highlight_continued(
 ) -> (Arc<HighlightedLines>, Option<HighlightContinuation>) {
     let ss = syntax_set();
     let theme = &theme_set().themes["base16-ocean.dark"];
-    let syntax = lang
-        .and_then(|l| ss.find_syntax_by_token(l))
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let syntax = resolved_syntax(ss, lang, &code);
     let (mut h, mut raw, start) = match previous {
         Some(mut p) => {
             p.raw_lines.truncate(p.complete_lines);
@@ -1717,6 +1867,7 @@ fn highlight_continued(
     }
     let active = valid.then(|| HighlightContinuation {
         lang: lang.map(str::to_string),
+        syntax: syntax.name.clone(),
         code,
         committed_bytes: committed,
         complete_lines,
@@ -1750,9 +1901,7 @@ fn highlight_one_line(
 #[cfg(test)]
 fn highlight_code(code: &str, lang: Option<&str>) -> HighlightedLines {
     let ss = syntax_set();
-    let syntax = lang
-        .and_then(|l| ss.find_syntax_by_token(l))
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let syntax = resolved_syntax(ss, lang, code);
     let theme = &theme_set().themes["base16-ocean.dark"];
     let mut h = HighlightLines::new(syntax, theme);
 
@@ -2884,24 +3033,38 @@ mod tests {
         let lines = doc.to_lines(60, &theme);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(
-            texts.iter().any(|t| t.contains("+added")),
+            texts.iter().any(|t| t.contains("+ added line")),
             "diff add line missing: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("-removed")),
+            texts.iter().any(|t| t.contains("- removed line")),
             "diff del line missing: {texts:?}"
         );
         let mut saw_add = false;
         let mut saw_del = false;
         for line in &lines {
             for span in &line.spans {
-                if span.content.contains("+added") {
+                if span.content == "+ " {
                     assert_eq!(span.style.fg, Some(theme.diff.added));
+                    assert_eq!(span.style.bg, Some(theme.diff.added_bg));
                     saw_add = true;
                 }
-                if span.content.contains("-removed") {
+                if span.content.contains("added line") {
+                    // The marker carries the direction; body text keeps the
+                    // reading ink so it stays legible on the tinted row.
+                    assert_eq!(span.style.fg, Some(theme.text.primary));
+                    assert_eq!(span.style.bg, Some(theme.diff.added_bg));
+                }
+                if span.content == "- " {
                     assert_eq!(span.style.fg, Some(theme.diff.removed));
+                    assert_eq!(span.style.bg, Some(theme.diff.removed_bg));
                     saw_del = true;
+                }
+                if span.content.contains("removed line") {
+                    // Same policy for removals: band means direction, body
+                    // means code.
+                    assert_eq!(span.style.fg, Some(theme.text.primary));
+                    assert_eq!(span.style.bg, Some(theme.diff.removed_bg));
                 }
             }
         }
@@ -3020,6 +3183,334 @@ mod tests {
         assert!(
             !underlined_url,
             "URL inside inline code must not be link-styled: {lines:?}"
+        );
+    }
+
+    fn non_space_inks(lines: &HighlightedLines) -> std::collections::HashSet<(u8, u8, u8)> {
+        lines
+            .iter()
+            .flat_map(|line| line.iter())
+            .filter(|(_, text)| text.chars().any(|c| !c.is_whitespace()))
+            .map(|(rgb, _)| *rgb)
+            .collect()
+    }
+
+    fn ink_of(lines: &HighlightedLines, needle: &str) -> Option<(u8, u8, u8)> {
+        lines
+            .iter()
+            .flat_map(|line| line.iter())
+            .find(|(_, text)| text.contains(needle))
+            .map(|(rgb, _)| *rgb)
+    }
+
+    #[test]
+    fn type_names_keep_their_own_ink() {
+        // The theme's class ink, before the UI's semantic mapping. Without the
+        // type-scope rules these tokens fall through to plain text.
+        let class = (235, 203, 139);
+        let ts = highlight_code_cached(
+            "export type CurrencyCode = \"USD\";\nexport interface Entry {}\n",
+            Some("ts"),
+        );
+        assert_eq!(ink_of(&ts, "CurrencyCode"), Some(class), "{ts:?}");
+        assert_eq!(ink_of(&ts, "Entry"), Some(class), "{ts:?}");
+
+        let go = highlight_code_cached("type Ledger struct {\n\tamount int\n}\n", Some("go"));
+        assert_eq!(ink_of(&go, "Ledger"), Some(class), "{go:?}");
+        assert_eq!(ink_of(&go, "int"), Some(class), "{go:?}");
+
+        let rust = highlight_code_cached(
+            "struct Ledger {\n    amount: Vec<u8>,\n}\nfn total() {\n    let x = 1;\n}\n",
+            Some("rust"),
+        );
+        assert_eq!(ink_of(&rust, "Ledger"), Some(class), "{rust:?}");
+        assert_eq!(ink_of(&rust, "Vec"), Some(class), "{rust:?}");
+        // `let` also carries `storage.type.rust`; the rule must not repaint it.
+        assert_ne!(ink_of(&rust, "let"), Some(class), "{rust:?}");
+    }
+
+    #[test]
+    fn a_go_fence_gets_real_syntax_runs() {
+        let lines = highlight_code_cached(
+            "func add(a int) int {\n    // sum\n    return a + 42\n}\n",
+            Some("go"),
+        );
+        let inks = non_space_inks(&lines);
+        assert!(
+            inks.len() >= 4,
+            "Go fence has no syntax distinction ({inks:?}): {lines:?}"
+        );
+    }
+
+    /// The languages the change request requires, by the token a fence or a
+    /// file extension uses. Every one must resolve to a real grammar, not the
+    /// plain-text fallback.
+    const REQUIRED_SYNTAXES: &[(&str, &str)] = &[
+        ("Go", "go"),
+        ("Rust", "rs"),
+        ("TypeScript", "ts"),
+        ("TSX", "tsx"),
+        ("JavaScript", "js"),
+        ("Python", "py"),
+        ("JSON", "json"),
+        ("YAML", "yaml"),
+        ("Shell", "sh"),
+        ("SQL", "sql"),
+        ("Markdown", "md"),
+        ("HTML", "html"),
+        ("CSS", "css"),
+        ("C", "c"),
+        ("C++", "cpp"),
+        ("Java", "java"),
+        ("Ruby", "rb"),
+        ("PHP", "php"),
+        ("Lua", "lua"),
+        ("Perl", "pl"),
+        ("Kotlin", "kt"),
+        ("Swift", "swift"),
+        ("C#", "cs"),
+        ("Objective-C", "m"),
+        ("Dockerfile", "Dockerfile"),
+        ("Makefile", "Makefile"),
+        ("TOML", "toml"),
+        ("Diff", "diff"),
+    ];
+
+    #[test]
+    fn bundled_syntaxes_cover_the_required_languages() {
+        let ss = syntax_set();
+        let plain = ss.find_syntax_plain_text();
+        let mut missing = Vec::new();
+        for (_name, token) in REQUIRED_SYNTAXES {
+            match ss.find_syntax_by_token(token) {
+                Some(syntax) if syntax.name != plain.name => {}
+                _ => missing.push(format!("{_name} ({token})")),
+            }
+        }
+        assert!(missing.is_empty(), "bundled grammars missing: {missing:?}");
+        assert!(
+            ss.syntaxes().len() >= 90,
+            "the bundled set shrank to {} grammars",
+            ss.syntaxes().len()
+        );
+    }
+
+    #[test]
+    fn syntax_set_is_initialized_once() {
+        // The 213-grammar dump is ~1 MB of deserialized state; a per-render
+        // reload would be both slow and leaky. The OnceLock must return the
+        // same allocation on every call.
+        assert!(std::ptr::eq(syntax_set(), syntax_set()));
+        assert!(std::ptr::eq(theme_set(), theme_set()));
+    }
+
+    #[test]
+    fn a_typescript_fence_gets_real_syntax_runs() {
+        let lines = highlight_code_cached(
+            "export interface Entry {\n  readonly amount: number;\n  label: \"cookie\";\n}\n",
+            Some("ts"),
+        );
+        let inks = non_space_inks(&lines);
+        assert!(
+            inks.len() >= 3,
+            "TypeScript fence has no syntax distinction ({inks:?}): {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_language_less_log_fence_stays_plain() {
+        let lines = highlight_code_cached("+ server started\n- retry later\n", None);
+        assert_eq!(
+            non_space_inks(&lines).len(),
+            1,
+            "log text must not be guessed into code semantics: {lines:?}"
+        );
+    }
+
+    const SHELL_SHAPED: &str = "if [ -f \"$HOME/token\" ]; then\n  echo 'ready'  # probe\nfi\n";
+
+    #[test]
+    fn an_unknown_code_language_falls_back_to_bash() {
+        let lines = highlight_code_cached(SHELL_SHAPED, Some("notalanguage"));
+        assert!(
+            non_space_inks(&lines).len() >= 3,
+            "unsupported code must still get generic code inks: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_plain_tags_keep_logs_plain() {
+        for tag in ["text", "log", "output", "console", "plain", "txt"] {
+            let lines = highlight_code_cached(SHELL_SHAPED, Some(tag));
+            assert_eq!(
+                non_space_inks(&lines).len(),
+                1,
+                "`{tag}` asks for log text, not Bash: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shebang_proves_untagged_content_is_code() {
+        let lines = highlight_code_cached(&format!("#!/bin/bash\n{SHELL_SHAPED}"), None);
+        assert!(
+            non_space_inks(&lines).len() >= 3,
+            "a shebang is explicit code evidence: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_shebang_switches_grammar_instead_of_reusing_plain_state() {
+        // The first frame has no shebang and reads as plain text. The next
+        // frame completes it; the cached continuation must not carry the
+        // plain parse state into the Bash block.
+        let _ = highlight_code_cached("#!/bin", None);
+        let lines = highlight_code_cached(&format!("#!/bin/bash\n{SHELL_SHAPED}"), None);
+        assert!(
+            non_space_inks(&lines).len() >= 3,
+            "the completed shebang must re-resolve to Bash: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn path_hints_resolve_whole_file_names_before_extensions() {
+        assert_eq!(
+            syntax_name_for_path("build/Makefile").as_deref(),
+            Some("Makefile")
+        );
+        assert_eq!(
+            syntax_name_for_path("deploy/Dockerfile").as_deref(),
+            Some("Dockerfile")
+        );
+        assert_eq!(
+            syntax_name_for_path("CMakeLists.txt").as_deref(),
+            Some("CMake")
+        );
+        assert_eq!(
+            syntax_name_for_path("crates/ledger/build.rs:17").as_deref(),
+            Some("Rust")
+        );
+        assert_eq!(syntax_name_for_path("scripts/deploy.xyz"), None);
+        assert_eq!(syntax_name_for_path("scripts/deploy"), None);
+    }
+
+    #[test]
+    fn path_titled_fences_resolve_or_fall_back_without_guessing_logs() {
+        let doc = MdDoc::parse("```src/ledger.rs\nfn total() -> i64 { 0 }\n```\n");
+        let Some(MdBlock::Code { lang, .. }) = doc.blocks.first() else {
+            panic!("code block missing: {:?}", doc.blocks);
+        };
+        assert_eq!(lang.as_deref(), Some("Rust"));
+
+        let doc = MdDoc::parse("```scripts/deploy.xyz\nif [ -f x ]; then echo ok; fi\n```\n");
+        let Some(MdBlock::Code { lang, .. }) = doc.blocks.first() else {
+            panic!("code block missing: {:?}", doc.blocks);
+        };
+        assert_eq!(
+            lang.as_deref(),
+            Some("Bash"),
+            "a file path proves this is code even without a known grammar"
+        );
+
+        let doc = MdDoc::parse("```\n+ server started\n```\n");
+        let Some(MdBlock::Code { lang, .. }) = doc.blocks.first() else {
+            panic!("code block missing: {:?}", doc.blocks);
+        };
+        assert_eq!(lang, &None, "an untitled fence is log content, not code");
+    }
+
+    #[test]
+    fn path_hints_strip_a_line_suffix_and_know_tsx() {
+        assert_eq!(
+            syntax_name_for_path("internal/webhook.go:792").as_deref(),
+            Some("Go"),
+            "a located path must still resolve its grammar"
+        );
+        assert!(
+            syntax_name_for_path("src/App.tsx").is_some(),
+            "TSX is part of the bundled set"
+        );
+    }
+
+    /// A React component with imports, exports, a function component, JSX tags,
+    /// JSX attributes, strings and a JS expression. The bundled fancy-regex
+    /// build has no JSX grammar, so this is the JavaScript fallback path.
+    const JSX_COMPONENT: &str = "\
+import React, { useState } from \"react\";
+
+// Ledger badge rendered in the header.
+export function LedgerBadge({ total, currency = \"USD\" }) {
+  const [open, setOpen] = useState(false);
+  const label = `${currency} ${total.toFixed(2)}`;
+  return (
+    <button className=\"badge\" onClick={() => setOpen(!open)}>
+      {open ? <span title=\"Settled\">{label}</span> : null}
+    </button>
+  );
+}
+";
+
+    #[test]
+    fn jsx_paths_resolve_to_the_javascript_grammar_not_bash() {
+        assert_eq!(
+            syntax_name_for_path("src/App.jsx").as_deref(),
+            Some("JavaScript"),
+            "the bundled set has no JSX grammar, so .jsx must fall back to JavaScript"
+        );
+        assert_eq!(
+            syntax_name_for_path("src/App.js").as_deref(),
+            Some("JavaScript")
+        );
+        assert_eq!(
+            syntax_name_for_path("src/App.ts").as_deref(),
+            Some("TypeScript")
+        );
+        assert_eq!(
+            syntax_name_for_path("src/App.tsx").as_deref(),
+            Some("TypeScriptReact")
+        );
+        assert_eq!(syntax_name_for_path("scripts/deploy.xyz"), None);
+    }
+
+    #[test]
+    fn jsx_fence_aliases_resolve_to_the_javascript_grammar() {
+        let ss = syntax_set();
+        for alias in ["jsx", "javascriptreact", "react"] {
+            assert_eq!(
+                resolved_syntax(ss, Some(alias), "").name,
+                "JavaScript",
+                "`{alias}` must not fall back to Bash"
+            );
+        }
+        assert_eq!(resolved_syntax(ss, Some("js"), "").name, "JavaScript");
+        assert_eq!(resolved_syntax(ss, Some("tsx"), "").name, "TypeScriptReact");
+        assert_eq!(
+            resolved_syntax(ss, Some("notalanguage"), "").name,
+            ss.find_syntax_by_token("bash").unwrap().name,
+            "genuinely unknown code still gets the generic code fallback"
+        );
+    }
+
+    #[test]
+    fn a_jsx_component_highlights_exactly_like_javascript() {
+        let jsx = highlight_code_cached(JSX_COMPONENT, Some("jsx"));
+        let js = highlight_code_cached(JSX_COMPONENT, Some("js"));
+        let bash = highlight_code_cached(JSX_COMPONENT, Some("bash"));
+        assert_eq!(
+            *jsx, *js,
+            "the JSX alias must select the JavaScript grammar"
+        );
+        assert_ne!(
+            *jsx, *bash,
+            "JSX must not be parsed by the generic Bash fallback"
+        );
+        assert!(
+            non_space_inks(&jsx).len() >= 3,
+            "JSX must read as code, not flat text: {jsx:?}"
+        );
+        assert!(
+            ink_of(&jsx, "Ledger badge").is_some(),
+            "the comment lost its ink: {jsx:?}"
         );
     }
 

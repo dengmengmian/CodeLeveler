@@ -256,22 +256,32 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     if let Some(f) = files.get(selected) {
         match &f.patch {
             Some(patch) => {
-                let wrap_w = detail_area.width.max(1) as usize;
-                for raw in patch.lines() {
-                    // Tabs / control chars desync cell columns on real terminals.
-                    let clean = sanitize_terminal_line(raw);
-                    let color = if clean.starts_with('+') && !clean.starts_with("+++") {
-                        theme.diff.added
-                    } else if clean.starts_with('-') && !clean.starts_with("---") {
-                        theme.diff.removed
-                    } else {
-                        theme.text.secondary
-                    };
-                    // Wrap long patch lines instead of clipping them off-screen.
-                    for piece in wrap(&clean, wrap_w) {
-                        detail.push(Line::from(Span::styled(piece, Style::default().fg(color))));
-                    }
-                }
+                // One paint path for every diff surface. The file list already
+                // names the file, so its header row would repeat it here; the
+                // list path still tells the painter which grammar to use.
+                let rows: Vec<crate::diff_view::DiffRow> = crate::diff_view::parse_diff_rows(patch)
+                    .into_iter()
+                    .filter(|row| !matches!(row, crate::diff_view::DiffRow::FileHeader { .. }))
+                    .collect();
+                let painted = crate::diff_view::paint_diff_rows(
+                    &rows,
+                    theme,
+                    detail_area.width as usize,
+                    &crate::diff_view::DiffPaintOptions {
+                        first_lead: "",
+                        rest_lead: "",
+                        line_numbers: true,
+                        fill_width: true,
+                        hunk_headers: true,
+                        patch_copy: false,
+                        language: Some(f.path.as_str()),
+                    },
+                    &|unchanged| match unchanged {
+                        Some(gap) => t.diff_unchanged_lines.replace("{}", &gap.to_string()),
+                        None => "⋯".to_string(),
+                    },
+                );
+                detail.extend(painted.into_iter().map(|row| row.line));
             }
             None => detail.push(Line::from(Span::styled(
                 t.diff_reload_hint,
