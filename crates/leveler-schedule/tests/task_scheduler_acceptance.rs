@@ -112,6 +112,8 @@ async fn run_acceptance() -> Value {
     let mut execution_detail = String::new();
     let mut dedup = "NOT_RUN";
     let mut dedup_detail = String::new();
+    let mut trigger = "NOT_RUN";
+    let mut trigger_detail = String::new();
 
     // 1. Register with the real scheduler and read the record back.
     let enable = match wakeup::enable(&spec).await {
@@ -126,6 +128,8 @@ async fn run_acceptance() -> Value {
                 execution_detail,
                 dedup,
                 dedup_detail,
+                trigger,
+                trigger_detail,
             );
         }
     };
@@ -346,7 +350,47 @@ async fn run_acceptance() -> Value {
         }
     }
 
-    // 4. Remove the registration and confirm the scheduler agrees.
+    // 4. The time trigger must start the task without an on-demand kick. The
+    // registration repeats every minute, so the next boundary is at most 60
+    // seconds away; 80 seconds covers scheduler jitter.
+    if execution == "VERIFIED" {
+        let _ = std::fs::remove_file(&marker);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut last_status = None;
+        let fired = wait_until(
+            &marker,
+            Duration::from_secs(80),
+            &home,
+            &mut last_status,
+            marker_completed,
+        )
+        .await;
+        let final_status = wakeup::status(&home).await.ok().or(last_status);
+        report["automatic_trigger"] = json!({
+            "fired": fired,
+            "marker": read_marker(&marker),
+            "status": final_status.as_ref().map(status_json),
+        });
+        if fired {
+            trigger = "VERIFIED";
+            if let Some(code) = final_status
+                .as_ref()
+                .and_then(|status| status.last_exit_code)
+                && code != 0
+            {
+                trigger = "FAILED";
+                failures.push(format!(
+                    "the time trigger ran the task but Task Scheduler reports last result {code}"
+                ));
+            }
+        } else {
+            trigger = "NOT_VERIFIED";
+            trigger_detail =
+                "no automatic run within 80 seconds; the task remains registered".into();
+        }
+    }
+
+    // 5. Remove the registration and confirm the scheduler agrees.
     match wakeup::disable(&home).await {
         Ok(status) => {
             report["disable"] = status_json(&status);
@@ -372,6 +416,8 @@ async fn run_acceptance() -> Value {
         execution_detail,
         dedup,
         dedup_detail,
+        trigger,
+        trigger_detail,
     )
 }
 
@@ -382,10 +428,16 @@ fn finish(
     execution_detail: String,
     dedup: &str,
     dedup_detail: String,
+    trigger: &str,
+    trigger_detail: String,
 ) -> Value {
-    let verdict = if !failures.is_empty() || execution == "FAILED" || dedup == "FAILED" {
+    let verdict = if !failures.is_empty()
+        || execution == "FAILED"
+        || dedup == "FAILED"
+        || trigger == "FAILED"
+    {
         "FAIL"
-    } else if execution == "VERIFIED" && dedup == "VERIFIED" {
+    } else if execution == "VERIFIED" && dedup == "VERIFIED" && trigger == "VERIFIED" {
         "PASS"
     } else if execution == "VERIFIED" {
         "PARTIAL"
@@ -394,6 +446,7 @@ fn finish(
     };
     report["execution"] = json!({ "verdict": execution, "detail": execution_detail });
     report["dedup"] = json!({ "verdict": dedup, "detail": dedup_detail });
+    report["trigger"] = json!({ "verdict": trigger, "detail": trigger_detail });
     report["failures"] = json!(failures);
     report["verdict"] = json!(verdict);
     report["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
