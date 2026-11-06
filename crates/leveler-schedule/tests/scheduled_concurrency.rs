@@ -134,6 +134,44 @@ fn marker_has_finish(path: &Path) -> bool {
         .any(|line| line.starts_with("finish "))
 }
 
+fn marker_stamp(path: &Path, prefix: &str) -> f64 {
+    marker_lines(path)
+        .iter()
+        .find_map(|line| {
+            let rest = line.strip_prefix(prefix)?;
+            rest.split("at=").nth(1)?.parse().ok()
+        })
+        .unwrap_or(0.0)
+}
+
+/// Read shells that were released while still running. `max = 0` claims nothing.
+async fn observe_runs(
+    dispatcher: &Dispatcher,
+    store: &ScheduleStore,
+    ids: &[leveler_schedule::RunId],
+    budget: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let mut open = Vec::new();
+        for id in ids {
+            let run = store.run(id).await.unwrap().expect("run row");
+            if !run.state.is_terminal() {
+                open.push(format!("{}={:?}", id, run.state));
+            }
+        }
+        if open.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "observation window elapsed: {open:?}"
+        );
+        dispatcher.dispatch_due(0).await.expect("observation pass");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
 /// Wait for the first marker file whose name matches `shell-*.log`.
 async fn wait_for_marker(dir: &Path, timeout: Duration) -> Option<PathBuf> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -458,18 +496,32 @@ async fn cancelling_one_overlapping_run_leaves_the_other_alone() {
         .into_iter()
         .find(|run| run.id != run_a.id)
         .expect("run B row");
-    store.request_cancel(&run_b.id).await.unwrap();
-
-    let first_summary = tokio::time::timeout(Duration::from_secs(40), first_pass)
+    // Both passes return once the shells are running. Cancellation and the
+    // terminal records are applied by later read-only passes.
+    let first_summary = first_pass
         .await
-        .expect("run A did not settle")
         .expect("run A task panicked")
         .expect("run A pass failed");
-    let second_summary = tokio::time::timeout(Duration::from_secs(40), second_pass)
+    let second_summary = second_pass
         .await
-        .expect("run B did not settle")
         .expect("run B task panicked")
         .expect("run B pass failed");
+    assert!(
+        first_summary.handed_off + first_summary.succeeded >= 1,
+        "{first_summary:?}"
+    );
+    assert!(
+        second_summary.handed_off + second_summary.succeeded >= 1,
+        "{second_summary:?}"
+    );
+    store.request_cancel(&run_b.id).await.unwrap();
+    observe_runs(
+        &dispatcher(store.clone()),
+        &store,
+        &[run_a.id.clone(), run_b.id.clone()],
+        Duration::from_secs(20),
+    )
+    .await;
 
     let run_a = store.run(&run_a.id).await.unwrap().unwrap();
     let run_b = store.run(&run_b.id).await.unwrap().unwrap();
@@ -630,18 +682,28 @@ async fn three_overlapping_shell_runs_settle_independently() {
         "only {} of three concurrent runs executed: {started:?}",
         started.len()
     );
-    std::fs::write(markers.join("gate"), "").unwrap();
-
-    let first_summary = tokio::time::timeout(Duration::from_secs(60), first_pass)
+    let first_summary = first_pass
         .await
-        .expect("run A did not settle")
         .expect("run A task panicked")
         .expect("run A pass failed");
-    let second_summary = tokio::time::timeout(Duration::from_secs(60), second_pass)
+    let second_summary = second_pass
         .await
-        .expect("runs B/C did not settle")
         .expect("runs B/C task panicked")
         .expect("runs B/C pass failed");
+    assert!(
+        first_summary.claimed >= 1,
+        "{first_summary:?} {second_summary:?}"
+    );
+    std::fs::write(markers.join("gate"), "").unwrap();
+    let runs = store.runs(Some(&definition.id), 10).await.unwrap();
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    observe_runs(
+        &dispatcher(store.clone()),
+        &store,
+        &runs.iter().map(|run| run.id.clone()).collect::<Vec<_>>(),
+        Duration::from_secs(20),
+    )
+    .await;
 
     let runs = store.runs(Some(&definition.id), 10).await.unwrap();
     assert_eq!(runs.len(), 3, "{runs:?}");
@@ -805,9 +867,8 @@ async fn one_overlapping_run_failing_does_not_disturb_the_other() {
         let dispatcher = dispatcher(store.clone());
         tokio::spawn(async move { dispatcher.dispatch_due(10).await })
     };
-    let second_summary = tokio::time::timeout(Duration::from_secs(20), second_pass)
+    let second_summary = second_pass
         .await
-        .expect("run B did not settle")
         .expect("run B task panicked")
         .expect("run B pass failed");
     let run_b = store
@@ -817,6 +878,14 @@ async fn one_overlapping_run_failing_does_not_disturb_the_other() {
         .into_iter()
         .find(|run| run.id != run_a.id)
         .expect("run B row");
+    observe_runs(
+        &dispatcher(store.clone()),
+        &store,
+        &[run_b.id.clone()],
+        Duration::from_secs(15),
+    )
+    .await;
+    let run_b = store.run(&run_b.id).await.unwrap().unwrap();
     assert_eq!(
         run_b.state,
         RunState::Failed,
@@ -829,11 +898,17 @@ async fn one_overlapping_run_failing_does_not_disturb_the_other() {
     );
 
     std::fs::write(markers.join("gate"), "").unwrap();
-    let first_summary = tokio::time::timeout(Duration::from_secs(40), first_pass)
+    let first_summary = first_pass
         .await
-        .expect("run A did not settle")
         .expect("run A task panicked")
         .expect("run A pass failed");
+    observe_runs(
+        &dispatcher(store.clone()),
+        &store,
+        &[run_a.id.clone()],
+        Duration::from_secs(20),
+    )
+    .await;
     let run_a = store.run(&run_a.id).await.unwrap().unwrap();
     assert_eq!(
         run_a.state,
@@ -968,16 +1043,22 @@ async fn allow_concurrent_shell_runs_execute_in_independent_sessions() {
     let a_finished_before_gate = marker_has_finish(&marker_a);
     std::fs::write(markers.join("gate"), "").unwrap();
 
-    let first_summary = tokio::time::timeout(Duration::from_secs(40), first_pass)
+    let first_summary = first_pass
         .await
-        .expect("run A did not settle")
         .expect("run A task panicked")
         .expect("run A pass failed");
-    let second_summary = tokio::time::timeout(Duration::from_secs(40), second_pass)
+    let second_summary = second_pass
         .await
-        .expect("run B pass did not return")
         .expect("run B task panicked")
         .expect("run B pass failed");
+    let pending_ids = store
+        .runs(Some(&definition.id), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|run| run.id)
+        .collect::<Vec<_>>();
+    observe_runs(&dispatcher_a, &store, &pending_ids, Duration::from_secs(20)).await;
 
     let runs = store.runs(Some(&definition.id), 10).await.unwrap();
     let run_a = store.run(&run_a.id).await.unwrap().expect("run A row");
@@ -1106,4 +1187,384 @@ async fn allow_concurrent_shell_runs_execute_in_independent_sessions() {
     shutdown.cancel();
     let _ = serve.await;
     let _ = provider.request_count();
+}
+
+/// One line. Timestamps are fractional seconds so two starts in the same
+/// wall-clock second are still ordered.
+const TIMED_SLEEP: &str = "mkdir -p markers; f=\"markers/shell-$$.log\"; \
+ts=$(perl -MTime::HiRes=time -e 'printf \"%.3f\", time'); \
+printf 'start pid=%s at=%s\\n' \"$$\" \"$ts\" > \"$f\"; \
+sleep 5; \
+ts=$(perl -MTime::HiRes=time -e 'printf \"%.3f\", time'); \
+printf 'finish pid=%s at=%s\\n' \"$$\" \"$ts\" >> \"$f\"";
+
+struct Live {
+    tmp: tempfile::TempDir,
+    workspace: PathBuf,
+    store: ScheduleStore,
+    connector: Arc<dyn RuntimeConnector>,
+    shutdown: CancellationToken,
+    serve: tokio::task::JoinHandle<Result<(), leveler_local_transport::TransportError>>,
+    provider: MockServer,
+}
+
+impl Live {
+    async fn start() -> Self {
+        let provider = MockServer::start(Vec::new()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let config_dir = tmp.path().join("configs");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        write_config(&config_dir, &provider.base_url());
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let layout = Layout::from_parts(workspace.clone(), config_dir, state_dir);
+        let app = Arc::new(Application::assemble(layout).unwrap());
+        let runtime = Arc::new(InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            ExecutionProfile::Assisted,
+            false,
+        ));
+        let socket = tmp.path().join("daemon.sock");
+        let server = LocalSocketServer::bind_with_waiters(&socket, runtime, LocalWaiters::new())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let store = ScheduleStore::open(&tmp.path().join("schedules.db"))
+            .await
+            .unwrap();
+        let connector: Arc<dyn RuntimeConnector> = Arc::new(SocketConnector { socket });
+        Self {
+            tmp,
+            workspace,
+            store,
+            connector,
+            shutdown,
+            serve,
+            provider,
+        }
+    }
+
+    fn dispatcher(&self) -> Dispatcher {
+        Dispatcher::new(self.store.clone(), self.connector.clone())
+            .with_lease(Duration::from_secs(30))
+            .with_poll_interval(Duration::from_millis(50))
+    }
+
+    async fn stop(self) {
+        self.shutdown.cancel();
+        let _ = self.serve.await;
+        let _ = self.provider.request_count();
+        drop(self.tmp);
+    }
+}
+
+async fn every_shell(
+    live: &Live,
+    name: &str,
+    overlap: OverlapPolicy,
+    session_policy: SessionPolicy,
+) -> leveler_schedule::ScheduleDefinition {
+    let anchor = leveler_core::now() - chrono::Duration::milliseconds(200);
+    live.store
+        .create_definition(NewScheduleDefinition {
+            name: name.into(),
+            workspace: live.workspace.clone(),
+            action: ScheduleAction::Shell {
+                command: TIMED_SLEEP.into(),
+            },
+            trigger: ScheduleTrigger::Every {
+                anchor,
+                every: Duration::from_secs(1),
+            },
+            session_policy,
+            overlap,
+            mode: PermissionProfile::Assisted,
+            model: None,
+            timeout: Duration::from_secs(30),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(30),
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
+        })
+        .await
+        .unwrap()
+}
+
+async fn wait_until_a_slot_is_due(store: &ScheduleStore, id: &leveler_schedule::ScheduleId) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let occurrences = store.occurrences(id, 10).await.unwrap();
+        let due = occurrences.iter().any(|occurrence| {
+            occurrence.state == OccurrenceState::Pending
+                && occurrence.scheduled_for <= leveler_core::now()
+        });
+        if due {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no natural slot became due: {occurrences:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_finish(path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !marker_has_finish(path) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "marker never finished: {path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The next grid slot is claimed by a later pass while the first shell is
+/// still sleeping. Nothing calls run-now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn natural_interval_allow_concurrent_overlaps_without_run_now() {
+    let live = Live::start().await;
+    let definition = every_shell(
+        &live,
+        "natural allow",
+        OverlapPolicy::AllowConcurrent,
+        SessionPolicy::Fresh,
+    )
+    .await;
+    let dispatcher = live.dispatcher();
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.claimed, 1, "{summary:?}");
+    assert_eq!(summary.handed_off, 1, "{summary:?}");
+    let markers = live.workspace.join("markers");
+    let marker_a = wait_for_marker(&markers, Duration::from_secs(10))
+        .await
+        .expect("the first natural shell started");
+    wait_until_a_slot_is_due(&live.store, &definition.id).await;
+    assert!(
+        !marker_has_finish(&marker_a),
+        "the first shell finished before the next natural slot"
+    );
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(
+        summary.claimed, 1,
+        "the next grid slot was not claimed while the first shell was running: {summary:?}"
+    );
+    live.store.set_enabled(&definition.id, false).await.unwrap();
+    let started = wait_for_marker_count(&markers, 2, Duration::from_secs(10)).await;
+    assert_eq!(
+        started.len(),
+        2,
+        "the second natural shell did not start: {started:?}"
+    );
+    let marker_b = started
+        .iter()
+        .find(|path| path.as_path() != marker_a.as_path())
+        .expect("second marker");
+    assert!(
+        !marker_has_finish(&marker_a),
+        "the first shell had already finished when the second started"
+    );
+    let runs = live.store.runs(Some(&definition.id), 10).await.unwrap();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_ne!(runs[0].session_id, runs[1].session_id);
+    assert_ne!(runs[0].execution_id, runs[1].execution_id);
+    let ids = runs.iter().map(|run| run.id.clone()).collect::<Vec<_>>();
+    observe_runs(&dispatcher, &live.store, &ids, Duration::from_secs(20)).await;
+    wait_for_finish(&marker_a).await;
+    wait_for_finish(marker_b).await;
+    let start_a = marker_stamp(&marker_a, "start ");
+    let start_b = marker_stamp(marker_b, "start ");
+    let finish_a = marker_stamp(&marker_a, "finish ");
+    assert!(
+        start_a < start_b && start_b < finish_a,
+        "expected start(A) < start(B) < finish(A), got {start_a} {start_b} {finish_a}"
+    );
+    let runs = live.store.runs(Some(&definition.id), 10).await.unwrap();
+    assert!(
+        runs.iter().all(|run| run.state == RunState::Succeeded),
+        "{runs:?}"
+    );
+    assert_eq!(
+        runs.iter().filter(|run| run.exit_code == Some(0)).count(),
+        2
+    );
+    live.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn natural_interval_skip_if_running_records_the_skipped_slot() {
+    let live = Live::start().await;
+    let definition = every_shell(
+        &live,
+        "natural skip",
+        OverlapPolicy::SkipIfRunning,
+        SessionPolicy::Continue,
+    )
+    .await;
+    let dispatcher = live.dispatcher();
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.handed_off, 1, "{summary:?}");
+    let markers = live.workspace.join("markers");
+    let marker_a = wait_for_marker(&markers, Duration::from_secs(10))
+        .await
+        .expect("the first shell started");
+    wait_until_a_slot_is_due(&live.store, &definition.id).await;
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.claimed, 0, "{summary:?}");
+    assert!(summary.skipped >= 1, "{summary:?}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let started = wait_for_marker_count(&markers, 1, Duration::from_secs(2)).await;
+    assert_eq!(
+        started.len(),
+        1,
+        "skip-if-running started a second shell: {started:?}"
+    );
+    let runs = live.store.runs(Some(&definition.id), 10).await.unwrap();
+    assert!(
+        runs.iter().any(|run| run.state == RunState::Skipped),
+        "the due slot was not recorded skipped: {runs:?}"
+    );
+    live.store.set_enabled(&definition.id, false).await.unwrap();
+    let active = runs
+        .iter()
+        .find(|run| !run.state.is_terminal())
+        .expect("the first run is still active")
+        .id
+        .clone();
+    observe_runs(&dispatcher, &live.store, &[active], Duration::from_secs(20)).await;
+    wait_for_finish(&marker_a).await;
+    let started = wait_for_marker_count(&markers, 1, Duration::from_secs(1)).await;
+    assert_eq!(
+        started.len(),
+        1,
+        "a skipped trigger still produced a side effect"
+    );
+    let runs = live.store.runs(Some(&definition.id), 10).await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.state == RunState::Succeeded)
+            .count(),
+        1,
+        "{runs:?}"
+    );
+    live.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn natural_interval_queue_one_runs_the_single_waiting_slot_after_the_active_run() {
+    let live = Live::start().await;
+    let definition = every_shell(
+        &live,
+        "natural queue",
+        OverlapPolicy::QueueOne,
+        SessionPolicy::Continue,
+    )
+    .await;
+    let dispatcher = live.dispatcher();
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.handed_off, 1, "{summary:?}");
+    let markers = live.workspace.join("markers");
+    let marker_a = wait_for_marker(&markers, Duration::from_secs(10))
+        .await
+        .expect("the first shell started");
+    let run_a = live
+        .store
+        .runs(Some(&definition.id), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("run A");
+    wait_until_a_slot_is_due(&live.store, &definition.id).await;
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.claimed, 0, "{summary:?}");
+    let pending = live
+        .store
+        .occurrences(&definition.id, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|occurrence| occurrence.state == OccurrenceState::Pending)
+        .count();
+    assert_eq!(pending, 1, "queue-one kept more than one waiting slot");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        wait_for_marker_count(&markers, 1, Duration::from_secs(1))
+            .await
+            .len(),
+        1,
+        "queue-one started a second shell while the first was active"
+    );
+    wait_for_finish(&marker_a).await;
+    // One pass both settles the finished shell and claims the waiting slot.
+    // The claim must not be stamped with the clock captured before that settle.
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert!(
+        summary.succeeded >= 1,
+        "the active run did not settle in the claiming pass: {summary:?}"
+    );
+    assert_eq!(
+        summary.claimed, 1,
+        "the queued slot did not run: {summary:?}"
+    );
+    live.store.set_enabled(&definition.id, false).await.unwrap();
+    let started = wait_for_marker_count(&markers, 2, Duration::from_secs(10)).await;
+    assert_eq!(started.len(), 2, "{started:?}");
+    let marker_b = started
+        .iter()
+        .find(|path| path.as_path() != marker_a.as_path())
+        .expect("queued shell marker");
+    let run_b = live
+        .store
+        .runs(Some(&definition.id), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.id != run_a.id && run.state != RunState::Skipped)
+        .expect("queued run");
+    let settled_a = live.store.run(&run_a.id).await.unwrap().expect("run A row");
+    let finished_a = settled_a
+        .finished_at
+        .expect("run A settled before the queued claim");
+    assert!(
+        run_b.started_at >= finished_a,
+        "the queued run is stamped before the active run settled: started {} finished {}",
+        run_b.started_at,
+        finished_a
+    );
+    observe_runs(
+        &dispatcher,
+        &live.store,
+        &[run_b.id.clone()],
+        Duration::from_secs(20),
+    )
+    .await;
+    wait_for_finish(marker_b).await;
+    let finish_a = marker_stamp(&marker_a, "finish ");
+    let start_b = marker_stamp(marker_b, "start ");
+    assert!(
+        finish_a < start_b,
+        "the queued shell started before the active shell finished: {finish_a} {start_b}"
+    );
+    let runs = live.store.runs(Some(&definition.id), 10).await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.state == RunState::Succeeded)
+            .count(),
+        2,
+        "{runs:?}"
+    );
+    assert_eq!(
+        wait_for_marker_count(&markers, 2, Duration::from_secs(1))
+            .await
+            .len(),
+        2,
+        "queue-one executed more than the one waiting slot"
+    );
+    live.stop().await;
 }

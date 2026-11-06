@@ -4,8 +4,10 @@
 //! polls the runtime's snapshot and selects the execution that carries its own
 //! `CommandId`. These tests pin the consequences — an execution that starts
 //! after the first observation is still found, a foreign look-alike seen
-//! first never wins, and every uncertain observation settles `Unknown`
-//! without sending the action a second time.
+//! first never wins, and a snapshot that does not answer is not a terminal
+//! outcome. The action is not sent a second time. `Unknown` is recorded only
+//! when the run deadline passes without an authoritative terminal, or when
+//! delivery itself did not settle.
 
 #![cfg(unix)]
 
@@ -347,12 +349,19 @@ async fn a_shell_that_outlives_its_timeout_is_cancelled_and_unknown() {
         )])
     }));
     let fixture = fixture(&runtime, Duration::from_secs(1)).await;
+    let dispatcher = dispatcher(&runtime, fixture.store.clone());
 
-    let summary = dispatcher(&runtime, fixture.store.clone())
-        .dispatch_due(1)
-        .await
-        .unwrap();
+    // Seeing `running` releases the pass. The deadline has not elapsed, so
+    // this is not yet unknown and the shell is not cancelled.
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.handed_off, 1, "{summary:?}");
+    assert_eq!(summary.unknown, 0, "{summary:?}");
+    assert!(runtime.cancel_envelopes().is_empty());
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
     assert_eq!(summary.unknown, 1, "{summary:?}");
+    assert_eq!(summary.claimed, 0, "{summary:?}");
 
     let cancels = runtime.cancel_envelopes();
     assert_eq!(cancels.len(), 1, "a timed-out shell must be cancelled once");
@@ -431,22 +440,35 @@ async fn losing_the_connection_after_delivery_is_unknown_and_not_retried() {
             Ok(Vec::new())
         },
     ));
-    let fixture = fixture(&runtime, Duration::from_secs(5)).await;
+    let fixture = fixture(&runtime, Duration::from_secs(3)).await;
     let dispatcher = dispatcher(&runtime, fixture.store.clone());
 
     let summary = dispatcher.dispatch_due(1).await.unwrap();
     assert!(delivered_seen.load(Ordering::SeqCst));
+    assert_eq!(summary.handed_off, 1, "{summary:?}");
+    assert_eq!(summary.unknown, 0, "{summary:?}");
+    let run = &fixture
+        .store
+        .runs(Some(&fixture.definition_id), 10)
+        .await
+        .unwrap()[0];
+    assert!(
+        !run.state.is_terminal(),
+        "a snapshot miss inside the deadline is not a terminal outcome: {run:?}"
+    );
+    assert!(run.delivered_at.is_some(), "{run:?}");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
     assert_eq!(summary.unknown, 1, "{summary:?}");
+    assert_eq!(summary.claimed, 0, "an unknown occurrence was re-claimed");
+    assert_eq!(runtime.run_envelopes().len(), 1);
     let run = &fixture
         .store
         .runs(Some(&fixture.definition_id), 10)
         .await
         .unwrap()[0];
     assert_eq!(run.state, RunState::Unknown);
-
-    let summary = dispatcher.dispatch_due(1).await.unwrap();
-    assert_eq!(summary.claimed, 0, "an unknown occurrence was re-claimed");
-    assert_eq!(runtime.run_envelopes().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -539,6 +561,60 @@ async fn a_foreign_look_alike_seen_first_never_wins_over_our_own_execution() {
         Some("ush-scripted"),
         "the run adopted the foreign execution"
     );
+}
+
+/// A snapshot error after a successful delivery stays open. A later pass that
+/// can read the terminal record settles that record, and the shell is not
+/// delivered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_miss_is_reread_inside_the_deadline_without_redelivery() {
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let runtime = Arc::new(ScriptedRuntime::new(
+        move |delivered: &[CommandEnvelope]| {
+            let has_run = delivered
+                .iter()
+                .any(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }));
+            if !has_run {
+                return Ok(Vec::new());
+            }
+            // The admitting pass only sees read failures. The test opens the
+            // terminal record after that pass has returned.
+            if !gate.load(Ordering::SeqCst) {
+                return Err(ClientError::Runtime(
+                    "local runtime did not answer snapshot within 30000ms".into(),
+                ));
+            }
+            let origin = delivered
+                .iter()
+                .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+                .expect("delivery precedes the later read")
+                .command_id
+                .clone();
+            Ok(vec![ScriptedRuntime::shell(&origin, "success", Some(0))])
+        },
+    ));
+    let fixture = fixture(&runtime, Duration::from_secs(30)).await;
+    let dispatcher = dispatcher(&runtime, fixture.store.clone());
+
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.handed_off, 1, "{summary:?}");
+    assert_eq!(summary.unknown, 0, "{summary:?}");
+    assert_eq!(summary.succeeded, 0, "{summary:?}");
+    assert_eq!(runtime.run_envelopes().len(), 1);
+    release.store(true, Ordering::SeqCst);
+
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.succeeded, 1, "{summary:?}");
+    assert_eq!(summary.claimed, 0, "{summary:?}");
+    assert_eq!(runtime.run_envelopes().len(), 1);
+    let run = &fixture
+        .store
+        .runs(Some(&fixture.definition_id), 10)
+        .await
+        .unwrap()[0];
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(run.exit_code, Some(0));
 }
 
 /// Two due occurrences in one pass must be in flight at the same time. The
