@@ -579,6 +579,40 @@ async fn a_crash_between_the_answer_and_the_task_terminal_delivers_it_once() {
         1,
         "the recovered terminal is projected exactly once"
     );
+    let delivery_positions: Vec<_> = observed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, event)| {
+            matches!(event, EngineEvent::DeliveryCommitted { text, .. } if text == ANSWER)
+                .then_some(i)
+        })
+        .collect();
+    let finished_positions: Vec<_> = observed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, event)| {
+            matches!(event, EngineEvent::RunFinished { text } if text == ANSWER).then_some(i)
+        })
+        .collect();
+    assert_eq!(
+        delivery_positions.len(),
+        1,
+        "recovery exposes the existing delivery once"
+    );
+    assert_eq!(
+        finished_positions.len(),
+        1,
+        "headless recovery publishes the final answer once"
+    );
+    assert!(delivery_positions[0] < finished_positions[0]);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::DeliveryCommitted { .. }))
+            .count(),
+        1,
+        "observer replay must not append a second durable fact"
+    );
     assert_eq!(goals(&fx).await[0].state, GoalState::Settled);
 }
 
