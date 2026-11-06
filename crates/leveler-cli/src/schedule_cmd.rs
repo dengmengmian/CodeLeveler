@@ -107,12 +107,7 @@ pub async fn cmd_schedule(
                     }),
                 })
                 .await?;
-            let next = store
-                .occurrences(&definition.id, 1)
-                .await?
-                .into_iter()
-                .next()
-                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            let next = next_run_text(&store, &definition.id).await?;
             if json {
                 print_json(&definition_json(&definition, next.as_deref()))?;
             } else {
@@ -186,12 +181,7 @@ pub async fn cmd_schedule(
             let Some(definition) = store.definition(&id).await? else {
                 anyhow::bail!("schedule {id} not found");
             };
-            let next = store
-                .occurrences(&id, 1)
-                .await?
-                .into_iter()
-                .next()
-                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            let next = next_run_text(&store, &id).await?;
             let last = store.runs(Some(&id), 5).await?;
             if json {
                 print_json(&serde_json::json!({
@@ -353,12 +343,7 @@ pub async fn cmd_schedule(
                 .with_context(|| {
                     format!("updating schedule {id}; re-read it if another editor changed it")
                 })?;
-            let next = store
-                .occurrences(&id, 1)
-                .await?
-                .into_iter()
-                .next()
-                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            let next = next_run_text(&store, &id).await?;
             if json {
                 print_json(&definition_json(&definition, next.as_deref()))?;
             } else {
@@ -402,12 +387,7 @@ pub async fn cmd_schedule(
                 )
                 .await
                 .context("issuing the unattended grant")?;
-            let next = store
-                .occurrences(&id, 1)
-                .await?
-                .into_iter()
-                .next()
-                .map(|occurrence| occurrence.scheduled_for.to_rfc3339());
+            let next = next_run_text(&store, &id).await?;
             if json {
                 print_json(&definition_json(&definition, next.as_deref()))?;
             } else {
@@ -683,6 +663,21 @@ pub async fn cmd_schedule(
         }
     }
     Ok(())
+}
+
+/// The next run a dispatcher could claim for this definition.
+///
+/// The store keeps terminal occurrences for history; none of them is a next
+/// run. This projection reads the same pending slot the manager, the TUI and
+/// the agent tools display, so no surface has to reinterpret occurrence rows.
+async fn next_run_text(
+    store: &ScheduleStore,
+    id: &leveler_schedule::ScheduleId,
+) -> anyhow::Result<Option<String>> {
+    Ok(store
+        .next_pending_occurrence(id)
+        .await?
+        .map(|occurrence| occurrence.scheduled_for.to_rfc3339()))
 }
 
 async fn serve(
