@@ -550,13 +550,18 @@ impl ScheduleStore {
             })?;
         let action_columns = action_columns(&update.action)?;
         let trigger_columns = trigger_columns(&update.trigger);
-        let (occurrence_id, first) = if trigger_changed {
-            match update.trigger.next_after(now)? {
-                Some(first) => (OccurrenceId::generate(), Some(first)),
-                None => (OccurrenceId::generate(), None),
-            }
+        // A trigger change re-declares the rule. The replacement slot comes
+        // from the new rule itself: `next_after` is the wrong question for a
+        // one-off, because a one-off's slot is its declared instant and it has
+        // no successor. A rule that offers no slot at all is an error here,
+        // never a successful update with nothing left to run.
+        let replacement = if trigger_changed {
+            Some((
+                OccurrenceId::generate(),
+                update.trigger.replacement_occurrence(now)?,
+            ))
         } else {
-            (OccurrenceId::generate(), None)
+            None
         };
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
@@ -610,7 +615,7 @@ impl ScheduleStore {
         // unchanged rule keeps its pending slot untouched: re-deriving it would
         // shift or drop a slot (an interval's anchor, a pending one-off) for a
         // change that had nothing to do with timing.
-        if trigger_changed {
+        if let Some((occurrence_id, first)) = replacement {
             sqlx::query(
                 "DELETE FROM schedule_occurrences \
                  WHERE definition_id = ? AND state = 'pending' AND run_now = 0",
@@ -618,18 +623,29 @@ impl ScheduleStore {
             .bind(id.as_str())
             .execute(&mut *tx)
             .await?;
-            if let Some(first) = first {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO schedule_occurrences \
-                     (id, definition_id, scheduled_for, state, created_at) \
-                     VALUES (?, ?, ?, 'pending', ?)",
-                )
-                .bind(occurrence_id.as_str())
-                .bind(id.as_str())
-                .bind(timestamp(first))
-                .bind(timestamp(now))
-                .execute(&mut *tx)
-                .await?;
+            // The unique `(definition, scheduled_for)` key is the occurrence's
+            // identity. If that instant already has a terminal row, inserting
+            // a second one would rewrite history; ignoring the insert would
+            // leave the updated definition with no next run. Neither is a
+            // success, so the whole update rolls back.
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO schedule_occurrences \
+                 (id, definition_id, scheduled_for, state, created_at) \
+                 VALUES (?, ?, ?, 'pending', ?)",
+            )
+            .bind(occurrence_id.as_str())
+            .bind(id.as_str())
+            .bind(timestamp(first))
+            .bind(timestamp(now))
+            .execute(&mut *tx)
+            .await?;
+            if inserted.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(ScheduleError::Invalid(format!(
+                    "the new trigger's occurrence at {} already exists in this schedule's \
+                     history; the update was not applied and the definition is unchanged",
+                    timestamp(first)
+                )));
             }
         }
         tx.commit().await?;

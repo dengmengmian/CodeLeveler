@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use leveler_client_protocol::PermissionProfile;
 use leveler_local_transport::LocalRuntimeService;
 use leveler_schedule::{
-    ActionKind, Dispatcher, MisfirePolicy, NewScheduleDefinition, OverlapPolicy, RunState,
-    RuntimeConnector, ScheduleAction, ScheduleStore, ScheduleTrigger, SessionPolicy,
+    ActionKind, DefinitionUpdate, Dispatcher, MisfirePolicy, NewScheduleDefinition, OverlapPolicy,
+    RunState, RuntimeConnector, ScheduleAction, ScheduleStore, ScheduleTrigger, SessionPolicy,
     UnattendedRequest,
 };
 
@@ -100,6 +100,78 @@ async fn a_shell_run_without_a_grant_is_blocked_before_delivery() {
             .is_some_and(|error| error.contains("unattended authorization")),
         "{run:?}"
     );
+}
+
+/// Editing a one-off repairs its slot. That repair must not carry the old
+/// grant across the trigger change, and the repaired slot must still be
+/// refused before the dispatcher connects to a runtime.
+#[tokio::test]
+async fn a_repaired_one_off_slot_still_requires_a_covering_grant() {
+    let (store, id, _tmp) = fixture(
+        PermissionProfile::Assisted,
+        Some(UnattendedRequest {
+            allow_external_side_effects: true,
+        }),
+    )
+    .await;
+    let definition = store.definition(&id).await.unwrap().unwrap();
+    assert!(
+        definition.unattended.is_some(),
+        "the fixture starts granted"
+    );
+    let ScheduleTrigger::Once { at } = definition.trigger else {
+        panic!("the fixture is a one-off");
+    };
+    let moved = store
+        .update_definition(
+            &id,
+            DefinitionUpdate {
+                name: definition.name.clone(),
+                workspace: definition.workspace.clone(),
+                action: definition.action.clone(),
+                // Moving a one-off earlier changes the execution window the
+                // user authorized, so the grant cannot silently follow it.
+                trigger: ScheduleTrigger::Once {
+                    at: at - chrono::Duration::seconds(1),
+                },
+                session_policy: definition.session_policy,
+                overlap: definition.overlap,
+                mode: definition.mode,
+                model: definition.model.clone(),
+                timeout: definition.timeout,
+                misfire: definition.misfire,
+                misfire_grace: definition.misfire_grace,
+                grant: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        moved.unattended.is_none(),
+        "the repaired definition must not keep the old grant"
+    );
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let dispatcher = Dispatcher::new(
+        store.clone(),
+        Arc::new(CountingConnector {
+            attempts: attempts.clone(),
+        }),
+    )
+    .with_lease(Duration::from_secs(30))
+    .with_poll_interval(Duration::from_millis(10));
+
+    let summary = dispatcher.dispatch_due(1).await.unwrap();
+    assert_eq!(summary.blocked, 1, "{summary:?}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "a repaired slot must not reach a runtime without a covering grant"
+    );
+
+    let run = store.runs(Some(&id), 1).await.unwrap().remove(0);
+    assert_eq!(run.state, RunState::Blocked);
 }
 
 #[tokio::test]

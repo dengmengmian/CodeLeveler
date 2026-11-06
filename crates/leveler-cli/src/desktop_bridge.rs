@@ -1057,6 +1057,12 @@ mod tests {
                 expected_revision: Some("rev-1".into()),
                 patch: SchedulePatch {
                     name: Some("renamed".into()),
+                    // A one-off retime must reach the same manager; the
+                    // bridge validates shape and leaves the store decision
+                    // to the schedule domain.
+                    trigger: Some(ScheduleTriggerWire::Once {
+                        at: "2026-11-06T10:30:00Z".into(),
+                    }),
                     ..SchedulePatch::default()
                 },
             },

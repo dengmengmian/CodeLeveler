@@ -443,6 +443,48 @@ async fn changing_the_timezone_invalidates_the_unattended_grant() {
     assert!(updated.grant.requires_regrant);
 }
 
+/// A grant names the workspace it was issued for. Moving the schedule to
+/// another workspace changes where the action can reach, so the old grant
+/// cannot follow it; the user has to authorize the new destination.
+#[tokio::test]
+async fn changing_the_workspace_invalidates_the_unattended_grant() {
+    let fixture = fixture().await;
+    let view = create(
+        &fixture.manager,
+        granted("relocate", &fixture.workspace, daily("09:00")),
+    )
+    .await;
+    assert!(view.grant.granted);
+
+    let other = fixture._tmp.path().join("other-workspace");
+    std::fs::create_dir_all(&other).unwrap();
+    let updated = match fixture
+        .manager
+        .handle(ScheduleRequest::Update {
+            id: view.id.clone(),
+            expected_revision: Some(view.revision.clone()),
+            patch: SchedulePatch {
+                workspace: Some(other.display().to_string()),
+                ..SchedulePatch::default()
+            },
+        })
+        .await
+    {
+        ScheduleResponse::Changed {
+            schedule: Some(schedule),
+            ..
+        } => schedule,
+        other => panic!("unexpected update response: {other:?}"),
+    };
+
+    assert!(
+        !updated.grant.granted,
+        "a workspace change must drop the old grant: {updated:?}"
+    );
+    assert!(updated.grant.requires_regrant);
+    assert!(updated.needs_attention);
+}
+
 #[tokio::test]
 async fn a_time_only_change_keeps_the_unattended_grant() {
     let fixture = fixture().await;
@@ -534,6 +576,104 @@ async fn a_schedule_without_a_grant_is_flagged_for_authorization() {
     assert!(!view.grant.granted);
     assert!(view.grant.requires_regrant);
     assert!(view.needs_attention);
+}
+
+/// A millisecond-aligned future instant, matching stored timestamp precision.
+fn future(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
+    let millis = leveler_core::now().timestamp_millis() + offset_secs * 1000;
+    chrono::DateTime::from_timestamp_millis(millis).expect("timestamp")
+}
+
+fn one_off(at: chrono::DateTime<chrono::Utc>) -> ScheduleTriggerWire {
+    ScheduleTriggerWire::Once {
+        at: at.to_rfc3339(),
+    }
+}
+
+fn projected_next(view: &ScheduleView) -> chrono::DateTime<chrono::Utc> {
+    view.next_run_at
+        .as_deref()
+        .expect("the one-off must still have a next run")
+        .parse()
+        .expect("projected timestamp")
+}
+
+#[tokio::test]
+async fn moving_a_one_off_later_keeps_the_unattended_grant() {
+    let fixture = fixture().await;
+    let t1 = future(3_600);
+    let view = create(
+        &fixture.manager,
+        granted("one-off later", &fixture.workspace, one_off(t1)),
+    )
+    .await;
+    assert!(view.grant.granted);
+    assert_eq!(projected_next(&view), t1);
+
+    let t2 = future(7_200);
+    let updated = update_trigger(&fixture.manager, &view, one_off(t2)).await;
+
+    assert!(
+        updated.grant.granted,
+        "a later instant stays inside the one-off grant: {updated:?}"
+    );
+    assert!(!updated.grant.requires_regrant);
+    assert_eq!(
+        projected_next(&updated),
+        t2,
+        "the projection must name the new occurrence"
+    );
+}
+
+#[tokio::test]
+async fn moving_a_one_off_earlier_invalidates_the_unattended_grant() {
+    let fixture = fixture().await;
+    let t1 = future(3_600);
+    let view = create(
+        &fixture.manager,
+        granted("one-off earlier", &fixture.workspace, one_off(t1)),
+    )
+    .await;
+    assert!(view.grant.granted);
+
+    let t2 = future(1_800);
+    let updated = update_trigger(&fixture.manager, &view, one_off(t2)).await;
+
+    assert!(
+        !updated.grant.granted,
+        "moving earlier than the granted instant needs fresh authorization: {updated:?}"
+    );
+    assert!(updated.grant.requires_regrant);
+    assert!(updated.needs_attention);
+    assert_eq!(
+        projected_next(&updated),
+        t2,
+        "the occurrence exists, but the dropped grant still guards its execution"
+    );
+}
+
+#[tokio::test]
+async fn moving_a_one_off_updates_the_shared_projection() {
+    let fixture = fixture().await;
+    let t1 = future(3_600);
+    let view = create(
+        &fixture.manager,
+        draft("projected", &fixture.workspace, one_off(t1)),
+    )
+    .await;
+    assert_eq!(projected_next(&view), t1);
+
+    let t2 = future(9_000);
+    let updated = update_trigger(&fixture.manager, &view, one_off(t2)).await;
+    assert_eq!(updated.trigger_text, format!("once at {}", t2.to_rfc3339()));
+    assert_eq!(projected_next(&updated), t2);
+
+    let shown = show(&fixture.manager, &view.id).await;
+    assert_eq!(
+        projected_next(&shown),
+        t2,
+        "every surface reads the same stored occurrence"
+    );
 }
 
 #[tokio::test]

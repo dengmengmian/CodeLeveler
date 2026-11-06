@@ -2653,6 +2653,46 @@ mod tests {
         }
     }
 
+    /// Retiming a one-off must reach the store through the same update request
+    /// every other edit uses. The form carries the instant as compact text, so
+    /// a change has to re-encode it as `Once { at }` and keep the revision the
+    /// page read; the manager and the store own the rest.
+    #[test]
+    fn editing_a_one_off_time_sends_the_new_instant_and_the_read_revision() {
+        let mut state = state();
+        let _ = open(&mut state);
+        let mut existing = view("a");
+        existing.trigger = ScheduleTriggerWire::Once {
+            at: "2026-11-06T09:00:00Z".into(),
+        };
+        state.schedule.items = vec![existing.clone()];
+        state.schedule.detail = Some(existing);
+
+        assert!(begin_edit(&mut state).is_empty());
+        let form = state.schedule.form.as_mut().expect("the edit form");
+        assert_eq!(form.trigger_text, "2026-11-06T09:00:00Z");
+        form.trigger_text = "2026-11-06T10:30:00Z".into();
+
+        let sent = requests(&submit_form(&mut state));
+        match &sent[0] {
+            ScheduleRequest::Update {
+                id,
+                expected_revision,
+                patch,
+            } => {
+                assert_eq!(id, "a");
+                assert_eq!(expected_revision.as_deref(), Some("rev-1"));
+                assert_eq!(
+                    patch.trigger,
+                    Some(ScheduleTriggerWire::Once {
+                        at: "2026-11-06T10:30:00Z".into(),
+                    })
+                );
+            }
+            other => panic!("expected an update request, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_native_action_is_not_edited_into_a_shell_command() {
         let mut state = state();

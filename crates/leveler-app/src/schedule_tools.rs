@@ -944,6 +944,20 @@ mod tests {
             .to_string()
     }
 
+    fn future(offset_secs: i64) -> (chrono::DateTime<chrono::Utc>, String) {
+        let millis = chrono::Utc::now().timestamp_millis() + offset_secs * 1000;
+        let at = chrono::DateTime::from_timestamp_millis(millis).expect("timestamp");
+        (at, at.to_rfc3339())
+    }
+
+    fn instant(view: &Value, field: &str) -> chrono::DateTime<chrono::Utc> {
+        view[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} missing from {view}"))
+            .parse()
+            .expect("an RFC3339 instant")
+    }
+
     #[tokio::test]
     async fn create_returns_the_stored_schedule_with_its_next_run() {
         let fixture = fixture().await;
@@ -1073,6 +1087,64 @@ mod tests {
         .expect_err("a blind overwrite must be refused before it reaches the store");
 
         assert!(error.to_string().contains("expected_revision"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn updating_a_one_off_moves_its_only_slot() {
+        let fixture = fixture().await;
+        let (dispatch, _calls) = noop_dispatch();
+        let tool = ScheduleManageTool::new(fixture.manager.clone(), dispatch);
+        let (first, first_text) = future(3_600);
+        let created = run(
+            &tool,
+            json!({
+                "action": "create",
+                "name": "one off",
+                "workspace": fixture.workspace.display().to_string(),
+                "work": {"kind": "shell", "command": "echo once"},
+                "trigger": {"kind": "once", "at": first_text},
+                "mode": "full_access",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{}", created.content);
+        assert_eq!(instant(&created.metadata["schedule"], "next_run_at"), first);
+        let id = schedule_id(&created);
+        let revision = created.metadata["schedule"]["revision"]
+            .as_str()
+            .expect("create returns the revision")
+            .to_string();
+
+        let (second, second_text) = future(7_200);
+        let updated = run(
+            &tool,
+            json!({
+                "action": "update",
+                "id": id,
+                "expected_revision": revision,
+                "trigger": {"kind": "once", "at": second_text},
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!updated.is_error, "{}", updated.content);
+        assert_eq!(updated.metadata["kind"], "changed");
+        assert_eq!(
+            instant(&updated.metadata["schedule"], "next_run_at"),
+            second,
+            "the tool must report the slot the store now holds"
+        );
+
+        let inspect = ScheduleInspectTool::new(fixture.manager.clone());
+        let listed = run(&inspect, json!({"action": "list"})).await.unwrap();
+        let schedules = listed.metadata["schedules"].as_array().unwrap();
+        assert_eq!(
+            schedules.len(),
+            1,
+            "retiming must edit the existing schedule, not create another"
+        );
+        assert_eq!(instant(&schedules[0], "next_run_at"), second);
     }
 
     #[tokio::test]
