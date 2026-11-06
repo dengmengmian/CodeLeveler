@@ -313,6 +313,10 @@ class PreflightIdentityTests(unittest.TestCase):
         self.assertEqual(args.binary, "/tmp/candidate/leveler")
         self.assertEqual(args.commit, "abc123")
         self.assertEqual(args.source_tree, "/tmp/candidate-src")
+        create = soak.build_parser().parse_args(
+            ["dry-run", "--source-tree", "/tmp/candidate-src"]
+        )
+        self.assertEqual(create.source_tree, "/tmp/candidate-src")
 
 
 class PlanTests(unittest.TestCase):
