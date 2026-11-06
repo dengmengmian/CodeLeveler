@@ -508,6 +508,24 @@ pub(crate) fn emit_jsonl(value: serde_json::Value) {
 mod jsonl_tests {
     use super::*;
 
+    #[test]
+    fn delivery_fact_crosses_the_headless_bridge_with_exact_jsonl_fields() {
+        let event =
+            leveler_app::engine_event_to_agent(leveler_engine::EngineEvent::DeliveryCommitted {
+                text: "Verified answer".into(),
+                stop: leveler_lifecycle::StopReason::Completed,
+                model_steps: 3,
+                modified_files: vec!["src/main.rs".into()],
+            })
+            .expect("headless delivery event");
+        let line = event_jsonl(event);
+        assert_eq!(line["type"], "delivery_committed");
+        assert_eq!(line["text"], "Verified answer");
+        assert_eq!(line["stop"], "completed");
+        assert_eq!(line["model_steps"], 3);
+        assert_eq!(line["modified_files"], serde_json::json!(["src/main.rs"]));
+    }
+
     /// Eval collectors read a child's terminal from this line. The typed
     /// reading must be on it; recovering it from `summary` is prose parsing.
     #[test]
