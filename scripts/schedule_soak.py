@@ -4225,8 +4225,9 @@ def create_run(
     budget: Dict[str, Any],
     binary_path: Path,
     commit: str,
+    source_tree: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    report = preflight(binary_path, commit)
+    report = preflight(binary_path, commit, source_tree)
     if not report["ready"]:
         raise SoakError("preflight blocked: " + "; ".join(report["blockers"]))
     evidence = make_evidence_path(name, mode)
@@ -4542,6 +4543,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         budget,
         Path(args.binary).expanduser(),
         args.commit,
+        Path(args.source_tree),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     if args.wait:
@@ -4631,6 +4633,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--max-total-tokens", type=int, default=default_tokens)
         command.add_argument("--binary", default=str(DEFAULT_BINARY))
         command.add_argument("--commit", default=DEFAULT_COMMIT)
+        command.add_argument("--source-tree", default=str(DEFAULT_SOURCE_TREE))
         command.add_argument("--wait", action="store_true", help="wait for the run to finish")
         command.set_defaults(func=cmd_create)
 
