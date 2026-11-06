@@ -881,7 +881,7 @@ async fn one_overlapping_run_failing_does_not_disturb_the_other() {
     observe_runs(
         &dispatcher(store.clone()),
         &store,
-        &[run_b.id.clone()],
+        std::slice::from_ref(&run_b.id),
         Duration::from_secs(15),
     )
     .await;
@@ -905,7 +905,7 @@ async fn one_overlapping_run_failing_does_not_disturb_the_other() {
     observe_runs(
         &dispatcher(store.clone()),
         &store,
-        &[run_a.id.clone()],
+        std::slice::from_ref(&run_a.id),
         Duration::from_secs(20),
     )
     .await;
@@ -1540,7 +1540,7 @@ async fn natural_interval_queue_one_runs_the_single_waiting_slot_after_the_activ
     observe_runs(
         &dispatcher,
         &live.store,
-        &[run_b.id.clone()],
+        std::slice::from_ref(&run_b.id),
         Duration::from_secs(20),
     )
     .await;
