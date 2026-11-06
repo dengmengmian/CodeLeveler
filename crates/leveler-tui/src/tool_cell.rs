@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use unicode_width::UnicodeWidthStr;
@@ -991,6 +991,26 @@ pub(crate) fn tool_lines(
         return;
     }
 
+    // An expanded `git_diff` is a structured diff, not a log: paint it through
+    // the same model, but only when the text really carries hunks. Anything
+    // else falls through to the ordinary preview path unchanged.
+    if block.status != ToolStatus::Failed
+        && tools_expanded
+        && block.name == "git_diff"
+        && let Some(preview) = block.preview.as_deref()
+    {
+        let preview = visible_preview(&block.name, preview);
+        let rows = parse_edit_diff_rows(preview);
+        if crate::diff_view::looks_like_diff(preview)
+            && rows
+                .iter()
+                .any(|row| matches!(row, EditDiffRow::Code { .. }))
+        {
+            push_edit_diff_rows(&rows, theme, width, out, true, t, &mut Vec::new());
+            return;
+        }
+    }
+
     // Prefer the structured goal summary over the runtime's lifecycle receipt
     // so expand shows what the model actually wrote. A refusal is not a
     // summary: the runtime's own reason owns the body, localized.
@@ -1150,387 +1170,11 @@ pub(crate) fn edit_patch_for(block: &ToolCallBlock) -> Option<String> {
 }
 
 /// One body row of a patch, ready for gutter rendering.
-#[derive(Debug, Clone)]
-enum EditDiffRow {
-    FileHeader {
-        path: String,
-    },
-    Meta {
-        text: String,
-    },
-    Hunk {
-        label: String,
-    },
-    /// Unchanged lines the applied diff skipped between two of its own hunks.
-    /// `None` when the gap cannot be proved from the two hunk headers.
-    Separator {
-        unchanged: Option<usize>,
-    },
-    Code {
-        /// Old-file line number when known — the side a removal lives on.
-        old_line: Option<u32>,
-        /// New-file line number when known — the side an addition lives on.
-        new_line: Option<u32>,
-        kind: EditLineKind,
-        /// Code without the leading `+`/`-`/` ` marker, tabs expanded.
-        text: String,
-    },
-}
+pub(crate) use crate::diff_view::DiffRow as EditDiffRow;
 
-impl EditDiffRow {
-    /// The one number the single-column gutter shows: a removal lives in the
-    /// old file, an addition in the new one, and context is the same line in
-    /// both. `None` when the patch carried no numeric hunk header — an unknown
-    /// location stays unknown rather than becoming a plausible-looking guess.
-    fn gutter_line(&self) -> Option<u32> {
-        match self {
-            EditDiffRow::Code {
-                old_line,
-                new_line,
-                kind,
-                ..
-            } => match kind {
-                EditLineKind::Remove => *old_line,
-                EditLineKind::Add => *new_line,
-                EditLineKind::Context => new_line.or(*old_line),
-            },
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditLineKind {
-    Context,
-    Add,
-    Remove,
-}
-
-/// Tabs become spaces before anything measures or highlights a row: a raw
-/// `\t` has no terminal-cell width, so every column after it would drift.
-const DIFF_TAB: &str = "    ";
-
-fn expand_diff_tabs(text: &str) -> String {
-    if text.contains('\t') {
-        text.replace('\t', DIFF_TAB)
-    } else {
-        text.to_string()
-    }
-}
-
-/// Parse apply_patch / unified-diff text into display rows with line numbers.
-///
-/// Both sides are tracked. A removal belongs to the old file and an addition
-/// to the new one, so a single cursor made a two-line replacement print the
-/// same number twice ("59 -", "59 -"). Each hunk header re-seeds BOTH cursors,
-/// so a second hunk never inherits the first one's count.
-///
-/// A patch with no numeric hunk header leaves both cursors `None`, and every
-/// row it produces is unnumbered. Nothing here invents a starting line: a line
-/// number is a fact about where the runtime actually changed the file, and a
-/// wrong one shown as fact is worse than none.
+/// Parse an applied patch through the shared diff model.
 fn parse_edit_diff_rows(patch: &str) -> Vec<EditDiffRow> {
-    let mut rows = Vec::new();
-    let mut old_ln: Option<u32> = None;
-    let mut new_ln: Option<u32> = None;
-    // Whether the current file section has produced a code row yet. A hunk
-    // header only separates two hunks; it never precedes the first one.
-    let mut section_has_code = false;
-    for raw in patch.lines() {
-        let trimmed = raw.trim_end();
-        if trimmed.starts_with("*** Begin Patch") || trimmed.starts_with("*** End Patch") {
-            continue;
-        }
-        if let Some(path) = trimmed
-            .strip_prefix("*** Update File: ")
-            .or_else(|| trimmed.strip_prefix("*** Add File: "))
-            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
-            .or_else(|| trimmed.strip_prefix("+++ b/"))
-            .or_else(|| trimmed.strip_prefix("+++ "))
-        {
-            let path = path.trim();
-            if path.is_empty() || path == "/dev/null" {
-                continue;
-            }
-            rows.push(EditDiffRow::FileHeader {
-                path: path.to_string(),
-            });
-            old_ln = None;
-            new_ln = None;
-            section_has_code = false;
-            continue;
-        }
-        if trimmed.starts_with("--- ") || trimmed.starts_with("diff --git") {
-            continue;
-        }
-        if trimmed.starts_with("@@") {
-            // `@@ -a,b +c,d @@` or bare `@@` / `@@ label`. A bare header
-            // carries no location, so both cursors go unknown rather than
-            // carrying the previous hunk's count into this one.
-            let next_old = hunk_start(trimmed, '-');
-            let next_new = hunk_start(trimmed, '+');
-            if section_has_code {
-                // Two hunks of the SAME applied diff are numbered against the
-                // same file snapshot, so the lines between them can be
-                // counted. The previous hunk's new-side cursor is one past the
-                // last line it covered — including a deletion-only hunk, whose
-                // removed lines live on the old side. A count is stated only
-                // when both headers prove it.
-                let previous_last = new_ln.and_then(|next| next.checked_sub(1));
-                let unchanged = match (previous_last, next_new) {
-                    (Some(last), Some(next)) => next
-                        .checked_sub(last)
-                        .and_then(|gap| gap.checked_sub(1))
-                        .filter(|gap| *gap > 0)
-                        .map(|gap| gap as usize),
-                    _ => None,
-                };
-                rows.push(EditDiffRow::Separator { unchanged });
-            }
-            old_ln = next_old;
-            new_ln = next_new;
-            section_has_code = false;
-            // Only a human-readable locator earns a row. `@@ -56,5 +56,6 @@`
-            // is machine metadata, and the gutter already says all of it.
-            if let Some(label) = hunk_label(trimmed) {
-                rows.push(EditDiffRow::Hunk { label });
-            }
-            continue;
-        }
-        if trimmed.starts_with("*** ") {
-            rows.push(EditDiffRow::Meta {
-                text: trimmed.to_string(),
-            });
-            continue;
-        }
-        if let Some(rest) = trimmed
-            .strip_prefix('+')
-            .filter(|_| !trimmed.starts_with("+++"))
-        {
-            // An addition exists only in the new file: it advances that
-            // cursor and leaves the old one where it was.
-            let ln = new_ln;
-            if let Some(n) = new_ln.as_mut() {
-                *n = n.saturating_add(1);
-            }
-            section_has_code = true;
-            rows.push(EditDiffRow::Code {
-                old_line: None,
-                new_line: ln,
-                kind: EditLineKind::Add,
-                text: expand_diff_tabs(rest),
-            });
-            continue;
-        }
-        if let Some(rest) = trimmed
-            .strip_prefix('-')
-            .filter(|_| !trimmed.starts_with("---"))
-        {
-            // A removal exists only in the old file: it advances that cursor
-            // and leaves the new one where it was.
-            let ln = old_ln;
-            if let Some(n) = old_ln.as_mut() {
-                *n = n.saturating_add(1);
-            }
-            section_has_code = true;
-            rows.push(EditDiffRow::Code {
-                old_line: ln,
-                new_line: None,
-                kind: EditLineKind::Remove,
-                text: expand_diff_tabs(rest),
-            });
-            continue;
-        }
-        // Context: leading space optional. It exists on both sides, so both
-        // cursors advance.
-        let text = trimmed.strip_prefix(' ').unwrap_or(trimmed);
-        let (old_at, new_at) = (old_ln, new_ln);
-        if let Some(n) = old_ln.as_mut() {
-            *n = n.saturating_add(1);
-        }
-        if let Some(n) = new_ln.as_mut() {
-            *n = n.saturating_add(1);
-        }
-        section_has_code = true;
-        rows.push(EditDiffRow::Code {
-            old_line: old_at,
-            new_line: new_at,
-            kind: EditLineKind::Context,
-            text: expand_diff_tabs(text),
-        });
-    }
-    rows
-}
-
-/// The human-readable part of a hunk header, if any: the text after the
-/// closing `@@` of a unified header, or the whole locator of an apply_patch
-/// `@@ <label>` line. Pure numeric ranges return `None`.
-fn hunk_label(header: &str) -> Option<String> {
-    let rest = header.strip_prefix("@@")?;
-    let label = match rest.find("@@") {
-        Some(i) => &rest[i + 2..],
-        None => rest,
-    };
-    let label = label.trim();
-    (!label.is_empty()).then(|| label.to_string())
-}
-
-/// The start line on one side of a unified hunk header (`@@ -56,5 +56,6 @@`).
-/// `None` for a bare `@@` or any header without a number on that side.
-fn hunk_start(header: &str, side: char) -> Option<u32> {
-    let at = header.find(side)?;
-    let digits: String = header[at + side.len_utf8()..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
-}
-
-/// Bounds for syntax-highlighting one hunk on the paint path.
-///
-/// A whole-file write of a generated 200k-line file is still rendered in full
-/// (the diff is the result the user asked to read); only the syntect pass is
-/// skipped, so direction color remains and no frame stalls on a parser.
-const DIFF_HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
-const DIFF_HIGHLIGHT_MAX_LINES: usize = 4_000;
-/// Whole-patch bound: past it, no hunk is highlighted at all.
-const DIFF_PATCH_HIGHLIGHT_MAX_BYTES: usize = 1024 * 1024;
-
-/// Placeholder RGB for a row syntect did not color (no language, over budget,
-/// or a projection mismatch). It maps to the row's direction ink.
-const DIFF_PLAIN_RGB: (u8, u8, u8) = (0x9A, 0xA3, 0xA7);
-
-/// Syntect colors for every code row, or `None` for a row that renders plain.
-///
-/// Each hunk is highlighted as its OWN code excerpt, with the old and new
-/// side parsed separately: a unified diff interleaves two file versions, and a
-/// single highlighter would leak an unterminated comment or string across
-/// them. A row only accepts its highlighted line when the runs concatenate
-/// back to its exact text, so a projection mismatch degrades to direction
-/// color instead of showing different characters.
-fn highlight_diff_rows(rows: &[EditDiffRow]) -> Vec<Option<crate::markdown::HighlightedLine>> {
-    let mut styles: Vec<Option<crate::markdown::HighlightedLine>> = vec![None; rows.len()];
-    let total: usize = rows
-        .iter()
-        .map(|row| match row {
-            EditDiffRow::Code { text, .. } => text.len(),
-            _ => 0,
-        })
-        .sum();
-    if total > DIFF_PATCH_HIGHLIGHT_MAX_BYTES {
-        return styles;
-    }
-    let mut language: Option<String> = None;
-    let mut i = 0;
-    while i < rows.len() {
-        match &rows[i] {
-            EditDiffRow::FileHeader { path } => {
-                language = crate::markdown::syntax_name_for_path(path);
-                i += 1;
-            }
-            EditDiffRow::Code { .. } => {
-                let start = i;
-                while i < rows.len() && matches!(rows[i], EditDiffRow::Code { .. }) {
-                    i += 1;
-                }
-                let Some(language) = language.as_deref() else {
-                    continue;
-                };
-                let run = rows.get(start..i).unwrap_or_default();
-                if run.is_empty() {
-                    continue;
-                }
-                let mut old_text = String::new();
-                let mut new_text = String::new();
-                for row in run {
-                    let EditDiffRow::Code { kind, text, .. } = row else {
-                        continue;
-                    };
-                    if *kind != EditLineKind::Add {
-                        old_text.push_str(text);
-                        old_text.push('\n');
-                    }
-                    if *kind != EditLineKind::Remove {
-                        new_text.push_str(text);
-                        new_text.push('\n');
-                    }
-                }
-                if run.len() > DIFF_HIGHLIGHT_MAX_LINES
-                    || old_text.len() + new_text.len() > DIFF_HIGHLIGHT_MAX_BYTES
-                {
-                    continue;
-                }
-                let old_hl = crate::markdown::highlight_code_cached(&old_text, Some(language));
-                let new_hl = crate::markdown::highlight_code_cached(&new_text, Some(language));
-                // Each side's line sequence is built from THIS run, so the
-                // lookup index is run-local — never the section-wide one, or a
-                // second hunk would read past its own highlighted text.
-                let mut local_old = 0usize;
-                let mut local_new = 0usize;
-                for (offset, row) in run.iter().enumerate() {
-                    let EditDiffRow::Code { kind, text, .. } = row else {
-                        continue;
-                    };
-                    let highlighted = match kind {
-                        EditLineKind::Remove => {
-                            let line = old_hl.get(local_old);
-                            local_old += 1;
-                            line
-                        }
-                        EditLineKind::Add => {
-                            let line = new_hl.get(local_new);
-                            local_new += 1;
-                            line
-                        }
-                        EditLineKind::Context => {
-                            let line = new_hl.get(local_new);
-                            local_old += 1;
-                            local_new += 1;
-                            line
-                        }
-                    };
-                    let Some(highlighted) = highlighted else {
-                        continue;
-                    };
-                    let joined: String = highlighted
-                        .as_ref()
-                        .iter()
-                        .map(|(_, segment)| segment.as_str())
-                        .collect();
-                    if joined != *text {
-                        continue;
-                    }
-                    if let Some(slot) = styles.get_mut(start + offset) {
-                        *slot = Some(highlighted.clone());
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    styles
-}
-
-/// The ink of one content run inside a diff row.
-///
-/// Low-chroma tokens (identifiers, punctuation, comments) wear the row's
-/// DIRECTION color so added/removed stays readable at a glance; tokens syntect
-/// actually distinguished brighten to the theme's primary ink. That keeps the
-/// existing red/green reading aid without flattening the syntax pass.
-fn diff_content_style(rgb: (u8, u8, u8), kind: EditLineKind, theme: &Theme) -> Style {
-    let (r, g, b) = rgb;
-    let max = r.max(g).max(b) as i16;
-    let min = r.min(g).min(b) as i16;
-    let lum = (r as u16 + g as u16 + b as u16) / 3;
-    let calm = max - min <= 40 && lum <= 160;
-    if calm {
-        return Style::default().fg(match kind {
-            EditLineKind::Add => theme.diff.added,
-            EditLineKind::Remove => theme.diff.removed,
-            EditLineKind::Context => theme.diff.context,
-        });
-    }
-    crate::code_block::tone_code_rgb(rgb, theme)
+    crate::diff_view::parse_diff_rows(patch)
 }
 
 /// Render parsed patch rows: real hunks, real line numbers, syntax colors and
@@ -1555,21 +1199,49 @@ fn push_edit_diff_rows(
     if rows.is_empty() {
         return;
     }
-    let styles = highlight_diff_rows(rows);
-    // The gutter is sized from the largest real line number in the patch, so
-    // the code column never shifts sideways partway down. A file with 100k
-    // lines gets six digits; a short one gets two.
-    let widest = rows.iter().filter_map(EditDiffRow::gutter_line).max();
-    let digits = widest.map(|n| n.to_string().len()).unwrap_or(0);
-    // "<digits> │ " when numbered, a plain two-space indent when not.
-    let gutter_w = if digits > 0 { digits + 3 } else { 2 };
-    let mark_w = 2; // "+ " / "- " / "  "
-    let inner = width.saturating_sub(4 + gutter_w + mark_w).max(1);
-    // Continuation rows hold the gutter and marker columns open so wrapped
-    // code stays in one column.
-    let continuation = format!("{}{}", " ".repeat(gutter_w), " ".repeat(mark_w));
-    // Everything the diff paints before the code itself is decoration.
-    let code_indent = 4 + gutter_w + mark_w;
+    // The unit's head already names the file when `show_file_headers` is off.
+    // Capture the language before the header row is dropped: the painter must
+    // still know what grammar this patch is written in.
+    let language: Option<String> = rows.iter().find_map(|row| match row {
+        EditDiffRow::FileHeader { path } => Some(path.clone()),
+        _ => None,
+    });
+    let filtered;
+    let rows: &[EditDiffRow] = if show_file_headers {
+        rows
+    } else {
+        filtered = rows
+            .iter()
+            .filter(|row| !matches!(row, EditDiffRow::FileHeader { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        &filtered
+    };
+    // One patch body is one visual run: the head's `└ ` opens the first row,
+    // continuation rows hold the same four columns open.
+    let painted = crate::diff_view::paint_diff_rows(
+        rows,
+        theme,
+        width,
+        &crate::diff_view::DiffPaintOptions {
+            first_lead: "  └ ",
+            rest_lead: "    ",
+            line_numbers: true,
+            fill_width: true,
+            hunk_headers: false,
+            patch_copy: false,
+            language: language.as_deref(),
+        },
+        &|unchanged| match unchanged {
+            Some(gap) => format!(
+                "⋯ {}",
+                t.diff_unchanged_lines.replace("{}", &gap.to_string())
+            ),
+            // The count is not provable across two separate calls of one
+            // file; the mark still separates the hunks.
+            None => "⋯".to_string(),
+        },
+    );
     // A row that paints chrome between two code runs ends the previous copied
     // line without copying anything of its own.
     let brake = crate::selection::PlainRow {
@@ -1577,118 +1249,13 @@ fn push_edit_diff_rows(
         break_line: true,
         ..Default::default()
     };
-
-    for (position, row) in rows.iter().enumerate() {
-        let rendered_from = out.len();
-        let lead = if position == 0 { "  └ " } else { "    " };
-        match row {
-            EditDiffRow::FileHeader { path } if show_file_headers => {
-                out.push(Line::from(vec![
-                    Span::styled(lead, Style::default().fg(theme.text.muted)),
-                    Span::styled(
-                        truncate_display(path, width.saturating_sub(4).max(8)),
-                        Style::default()
-                            .fg(theme.text.primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            }
-            EditDiffRow::FileHeader { .. } => {}
-            EditDiffRow::Meta { text } | EditDiffRow::Hunk { label: text } => {
-                out.push(Line::from(vec![
-                    Span::styled(lead, Style::default().fg(theme.text.muted)),
-                    Span::styled(
-                        truncate_display(text, width.saturating_sub(4).max(8)),
-                        Style::default().fg(theme.text.muted),
-                    ),
-                ]));
-            }
-            EditDiffRow::Separator { unchanged } => {
-                let label = match unchanged {
-                    Some(gap) => {
-                        format!(
-                            "⋯ {}",
-                            t.diff_unchanged_lines.replace("{}", &gap.to_string())
-                        )
-                    }
-                    // The count is not provable across two separate calls of
-                    // one file; the mark still separates the hunks.
-                    None => "⋯".to_string(),
-                };
-                out.push(Line::from(vec![
-                    Span::styled(lead, Style::default().fg(theme.text.muted)),
-                    Span::styled(label, Style::default().fg(theme.text.muted)),
-                ]));
-            }
-            EditDiffRow::Code { kind, text, .. } => {
-                let (mark, mark_style) = match kind {
-                    EditLineKind::Add => (
-                        "+ ",
-                        Style::default()
-                            .fg(theme.diff.added)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    EditLineKind::Remove => ("- ", Style::default().fg(theme.diff.removed)),
-                    EditLineKind::Context => ("  ", Style::default().fg(theme.diff.context)),
-                };
-                // The number itself stays muted: red/green belongs to the
-                // change, and a coloured line number reads as part of it.
-                let gutter = if digits > 0 {
-                    match row.gutter_line() {
-                        Some(n) => format!("{n:>digits$} │ "),
-                        None => format!("{:>digits$} │ ", ""),
-                    }
-                } else {
-                    "  ".to_string()
-                };
-                let runs: std::borrow::Cow<'_, [((u8, u8, u8), String)]> = match &styles[position] {
-                    Some(highlighted) => std::borrow::Cow::Borrowed(highlighted.as_slice()),
-                    None => std::borrow::Cow::Owned(vec![(DIFF_PLAIN_RGB, text.clone())]),
-                };
-                let wrapped = crate::markdown::wrap_code_runs(&runs, inner, |rgb| {
-                    diff_content_style(rgb, *kind, theme)
-                });
-                for (row_index, content) in wrapped.into_iter().enumerate() {
-                    let mut spans = vec![Span::styled(lead, Style::default().fg(theme.text.muted))];
-                    if row_index == 0 {
-                        spans.push(Span::styled(
-                            gutter.clone(),
-                            Style::default().fg(theme.text.muted),
-                        ));
-                        spans.push(Span::styled(mark.to_string(), mark_style));
-                    } else {
-                        spans.push(Span::raw(continuation.clone()));
-                    }
-                    spans.extend(content);
-                    out.push(Line::from(spans));
-                    copy.push(crate::selection::CopyRow::new(
-                        out.len() - 1,
-                        crate::selection::PlainRow {
-                            indent: code_indent as u16,
-                            // No `prefix`: the `+`/`-` marker is patch
-                            // metadata. Copying the selected code must not
-                            // smuggle it into the source text; the complete
-                            // patch has its own copy entry.
-                            joiner: (row_index > 0).then(|| Box::from("")),
-                            ..Default::default()
-                        },
-                    ));
-                }
-            }
-        }
-        // Chrome rows inside one patch separate lines of code without adding
-        // text of their own.
-        if matches!(
-            row,
-            EditDiffRow::FileHeader { .. }
-                | EditDiffRow::Meta { .. }
-                | EditDiffRow::Hunk { .. }
-                | EditDiffRow::Separator { .. }
-        ) {
-            for offset in rendered_from..out.len() {
-                copy.push(crate::selection::CopyRow::new(offset, brake.clone()));
-            }
-        }
+    for row in painted {
+        let index = out.len();
+        out.push(row.line);
+        copy.push(crate::selection::CopyRow::new(
+            index,
+            row.plain.unwrap_or_else(|| brake.clone()),
+        ));
     }
 }
 
@@ -3574,6 +3141,87 @@ mod diff_render_tests {
             .collect()
     }
 
+    /// An expanded `git_diff` is a structured diff and goes through the same
+    /// painter as an edit: file metadata stays out, the hunk gets a band.
+    #[test]
+    fn an_expanded_git_diff_uses_the_structured_painter() {
+        let patch = "\
+diff --git a/src/a.rs b/src/a.rs
+index 1111111..2222222 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,2 @@
+ fn main() {}
+-old_name();
++new_name();
+";
+        let theme = Theme::dark();
+        let mut block = edit("git_diff", "src/a.rs", None, true);
+        block.preview = Some(patch.to_string());
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &theme,
+            80,
+            true,
+            crate::i18n::Locale::En.text(),
+            &mut out,
+        );
+        let text = plain(&out);
+        let add = out
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content.contains("new_name")))
+            .unwrap_or_else(|| panic!("add row missing: {text:?}"));
+        assert!(
+            add.spans
+                .iter()
+                .any(|s| s.content == "+ " && s.style.bg == Some(theme.diff.added_bg)),
+            "the marker carries the row band: {:?}",
+            add.spans
+        );
+        assert!(
+            add.spans
+                .iter()
+                .any(|s| s.content == "new_name" && s.style.bg == Some(theme.diff.added_inline_bg)),
+            "the changed token gets the stronger band: {:?}",
+            add.spans
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("diff --git")),
+            "git metadata is not part of the body: {text:?}"
+        );
+    }
+
+    /// A `git_diff` preview that merely contains `+`/`-` prose is a log, not a
+    /// patch: it must not gain diff bands or lose its own text.
+    #[test]
+    fn a_git_diff_log_that_is_not_a_patch_stays_plain() {
+        let theme = Theme::dark();
+        let mut block = edit("git_diff", "src/a.rs", None, true);
+        block.preview = Some("note: + keep this line\n- and this one".to_string());
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &theme,
+            80,
+            true,
+            crate::i18n::Locale::En.text(),
+            &mut out,
+        );
+        let text = plain(&out);
+        assert!(
+            text.iter().any(|line| line.contains("+ keep this line")),
+            "the log is still shown: {text:?}"
+        );
+        assert!(
+            !out.iter().flat_map(|line| line.spans.iter()).any(|span| {
+                span.style.bg == Some(theme.diff.added_bg)
+                    || span.style.bg == Some(theme.diff.removed_bg)
+            }),
+            "ordinary logs never get diff bands: {text:?}"
+        );
+    }
+
     /// The applied-diff drawer opens with the block: an edit is a result, not
     /// a step, so it does not start folded.
     #[test]
@@ -3655,6 +3303,36 @@ mod diff_render_tests {
         }
     }
 
+    /// A merged edit hides the per-file header, but the painter must still
+    /// know the grammar: the header is display chrome, not the language fact.
+    #[test]
+    fn a_headerless_edit_body_keeps_its_syntax_ink() {
+        let theme = Theme::dark();
+        let patch = "--- a/src/total.ts\n+++ b/src/total.ts\n@@ -1,1 +1,1 @@\n-const total = \"old\";\n+const total = \"new\";\n";
+        let mut out = Vec::new();
+        let mut copy = Vec::new();
+        push_edit_diff_body(
+            patch,
+            &theme,
+            80,
+            &mut out,
+            false,
+            crate::i18n::Locale::En.text(),
+            &mut copy,
+        );
+        let add = out
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content.contains("total")))
+            .unwrap_or_else(|| panic!("added row missing: {:?}", plain(&out)));
+        assert!(
+            add.spans
+                .iter()
+                .any(|s| s.content == "const" && s.style.fg == Some(theme.syntax.keyword)),
+            "the header-less row keeps the keyword ink: {:?}",
+            add.spans
+        );
+    }
+
     /// Syntax highlighting runs, and it never rewrites the row: every
     /// highlighted line concatenates back to the file's exact text.
     #[test]
@@ -3667,8 +3345,8 @@ mod diff_render_tests {
             text.iter().any(|r| r.contains("let new = \"y\"; // note")),
             "{text:#?}"
         );
-        // A syntax-distinguished token brightens to the primary ink; the
-        // marker keeps the direction ink.
+        // Each token family keeps its own semantic ink; the marker keeps the
+        // direction ink.
         let add_line = lines
             .iter()
             .find(|l| plain(std::slice::from_ref(l))[0].contains("let new"))
@@ -3677,8 +3355,16 @@ mod diff_render_tests {
             add_line
                 .spans
                 .iter()
-                .any(|sp| sp.content.contains("let") && sp.style.fg == Some(theme.text.primary)),
-            "syntect colors the content: {:?}",
+                .any(|sp| sp.content == "let" && sp.style.fg == Some(theme.syntax.keyword)),
+            "the keyword keeps the keyword ink: {:?}",
+            add_line.spans
+        );
+        assert!(
+            add_line
+                .spans
+                .iter()
+                .any(|sp| sp.content == "y" && sp.style.fg == Some(theme.syntax.string)),
+            "the string keeps the string ink: {:?}",
             add_line.spans
         );
         assert_eq!(
@@ -3760,7 +3446,7 @@ mod diff_render_tests {
             patch.push_str(&format!("+fn generated_{i}() {{}}\n"));
         }
         let parsed = parse_edit_diff_rows(&patch);
-        let styles = highlight_diff_rows(&parsed);
+        let styles = crate::diff_view::highlight_diff_rows(&parsed, None);
         assert!(
             styles.iter().all(Option::is_none),
             "an oversized hunk is not parsed line by line"

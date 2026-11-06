@@ -164,19 +164,85 @@ where
     (out, copy)
 }
 
-/// Map syntect RGB into a low-noise palette — **no background fill**.
-pub fn tone_code_rgb(rgb: (u8, u8, u8), theme: &Theme) -> Style {
-    let (r, g, b) = rgb;
-    let max = r.max(g).max(b) as i16;
-    let min = r.min(g).min(b) as i16;
-    let chroma = max - min;
-    let lum = (r as u16 + g as u16 + b as u16) / 3;
-    let fg = if chroma > 40 || lum > 160 {
-        theme.text.primary
-    } else {
-        theme.text.secondary
-    };
-    Style::default().fg(fg)
+/// The semantic role of one syntax run.
+///
+/// syntect returns raw RGB; the renderer must not paint raw RGB because a
+/// palette rewrite (light, 256-colour, 16-colour, NO_COLOR) happens on theme
+/// tokens. Classifying once keeps the language layer (which emits base16
+/// scopes) separate from the palette layer (which owns the actual ink).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeToken {
+    Plain,
+    Keyword,
+    String,
+    TypeName,
+    Function,
+    Variable,
+    Comment,
+    Number,
+}
+
+/// Base16-ocean.dark, the only theme the highlighter runs, in the roles it
+/// assigns. Anything else falls back to the nearest semantic anchor.
+const BASE16_INKS: [(CodeToken, (u8, u8, u8)); 8] = [
+    (CodeToken::Plain, (192, 197, 206)),
+    (CodeToken::Comment, (101, 115, 126)),
+    (CodeToken::Keyword, (180, 142, 173)),
+    (CodeToken::Variable, (191, 97, 106)),
+    (CodeToken::Function, (143, 161, 179)),
+    (CodeToken::TypeName, (235, 203, 139)),
+    (CodeToken::String, (163, 190, 140)),
+    (CodeToken::Number, (208, 135, 112)),
+];
+
+pub fn classify_code_rgb(rgb: (u8, u8, u8)) -> CodeToken {
+    // Support-function and interpolation scopes are separate base16 inks that
+    // sit closest to a call and to string content respectively.
+    if rgb == (150, 181, 180) {
+        return CodeToken::Function;
+    }
+    if rgb == (171, 121, 103) {
+        return CodeToken::String;
+    }
+    let mut best = CodeToken::Plain;
+    let mut distance = u32::MAX;
+    for (token, anchor) in BASE16_INKS {
+        let d = rgb_distance(rgb, anchor);
+        if d < distance {
+            best = token;
+            distance = d;
+        }
+    }
+    best
+}
+
+fn rgb_distance(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
+    let dr = i32::from(a.0) - i32::from(b.0);
+    let dg = i32::from(a.1) - i32::from(b.1);
+    let db = i32::from(a.2) - i32::from(b.2);
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+impl crate::theme::SyntaxColors {
+    pub fn ink(self, token: CodeToken) -> ratatui::style::Color {
+        match token {
+            CodeToken::Plain => self.plain,
+            CodeToken::Keyword => self.keyword,
+            CodeToken::String => self.string,
+            CodeToken::TypeName => self.type_name,
+            CodeToken::Function => self.function,
+            CodeToken::Variable => self.variable,
+            CodeToken::Comment => self.comment,
+            CodeToken::Number => self.number,
+        }
+    }
+}
+
+/// Map one syntect RGB run into the theme's semantic syntax ink. No background
+/// fill: code blocks read on the canvas, and a diff band is applied by the
+/// diff painter, never here.
+pub fn code_style(rgb: (u8, u8, u8), theme: &Theme) -> Style {
+    Style::default().fg(theme.syntax.ink(classify_code_rgb(rgb)))
 }
 
 #[cfg(test)]

@@ -79,6 +79,20 @@ impl std::fmt::Display for ThemeId {
     }
 }
 
+/// What the terminal can actually display.
+///
+/// Resolved once from the environment into the palette itself, so a renderer
+/// never has to guess: a `Color::Rgb` token is truecolor, an indexed token is
+/// 256-colour, a named ANSI token is 16-colour, and a monochrome theme is
+/// `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    None,
+    Ansi16,
+    Ansi256,
+    TrueColor,
+}
+
 /// Application surfaces. Every reading area sits on one of these, never on
 /// the terminal's default background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +234,8 @@ pub struct BrandColors {
 }
 
 /// Diff / edit highlighting. Markers (`+`/`-`) carry meaning alongside color.
+/// `*_bg` is the row band; `*_inline_bg` is the stronger band under the
+/// characters that actually changed inside a replaced line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffColors {
     pub added: Color,
@@ -228,6 +244,22 @@ pub struct DiffColors {
     pub context: Color,
     pub added_bg: Color,
     pub removed_bg: Color,
+    pub added_inline_bg: Color,
+    pub removed_inline_bg: Color,
+}
+
+/// Semantic code-token inks. A renderer classifies a token once and asks for
+/// its role; it never invents a colour per language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxColors {
+    pub keyword: Color,
+    pub string: Color,
+    pub type_name: Color,
+    pub function: Color,
+    pub variable: Color,
+    pub comment: Color,
+    pub number: Color,
+    pub plain: Color,
 }
 
 /// User shell execution inks. Running is its own violet — a local command is
@@ -283,6 +315,8 @@ pub struct Theme {
     pub shell: ShellColors,
     pub status: StatusColors,
     pub diff: DiffColors,
+    /// Code syntax inks (see [`SyntaxColors`]).
+    pub syntax: SyntaxColors,
     pub brand: BrandColors,
 }
 
@@ -307,79 +341,218 @@ fn old_apple_terminal(term_program: Option<&str>, macos_product_version: Option<
         .is_none_or(|major| major < 26)
 }
 
-/// Replace every RGB token with its nearest xterm-256 colour.
-fn indexed_256_theme(theme: Theme) -> Theme {
-    let indexed = |color| match color {
-        Color::Rgb(r, g, b) => Color::Indexed(nearest_xterm_256(r, g, b)),
-        other => other,
-    };
+/// Rebuild a palette with every colour token passed through `map`.
+///
+/// Degradations are total-palette rewrites, never per-widget fallbacks: a
+/// widget that asks for `theme.diff.added_bg` gets the best colour the
+/// terminal can paint without knowing which terminal it is.
+fn map_theme_colors(theme: Theme, map: impl Fn(Color) -> Color) -> Theme {
     Theme {
         id: theme.id,
         monochrome: theme.monochrome,
         surface: SurfaceColors {
-            canvas: indexed(theme.surface.canvas),
-            panel: indexed(theme.surface.panel),
-            elevated: indexed(theme.surface.elevated),
-            input: indexed(theme.surface.input),
-            selection: indexed(theme.surface.selection),
-            prompt: indexed(theme.surface.prompt),
+            canvas: map(theme.surface.canvas),
+            panel: map(theme.surface.panel),
+            elevated: map(theme.surface.elevated),
+            input: map(theme.surface.input),
+            selection: map(theme.surface.selection),
+            prompt: map(theme.surface.prompt),
         },
         text: TextColors {
-            primary: indexed(theme.text.primary),
-            final_lead: indexed(theme.text.final_lead),
-            strong: indexed(theme.text.strong),
-            secondary: indexed(theme.text.secondary),
-            code: indexed(theme.text.code),
-            muted: indexed(theme.text.muted),
-            disabled: indexed(theme.text.disabled),
-            inverse: indexed(theme.text.inverse),
-            active: indexed(theme.text.active),
-            meta: indexed(theme.text.meta),
-            subtle: indexed(theme.text.subtle),
+            primary: map(theme.text.primary),
+            final_lead: map(theme.text.final_lead),
+            strong: map(theme.text.strong),
+            secondary: map(theme.text.secondary),
+            code: map(theme.text.code),
+            muted: map(theme.text.muted),
+            disabled: map(theme.text.disabled),
+            inverse: map(theme.text.inverse),
+            active: map(theme.text.active),
+            meta: map(theme.text.meta),
+            subtle: map(theme.text.subtle),
         },
         border: BorderColors {
-            subtle: indexed(theme.border.subtle),
-            normal: indexed(theme.border.normal),
-            strong: indexed(theme.border.strong),
-            focus: indexed(theme.border.focus),
+            subtle: map(theme.border.subtle),
+            normal: map(theme.border.normal),
+            strong: map(theme.border.strong),
+            focus: map(theme.border.focus),
         },
         accent: AccentColors {
-            primary: indexed(theme.accent.primary),
-            secondary: indexed(theme.accent.secondary),
-            subtle: indexed(theme.accent.subtle),
+            primary: map(theme.accent.primary),
+            secondary: map(theme.accent.secondary),
+            subtle: map(theme.accent.subtle),
         },
         plan: PlanColors {
-            primary: indexed(theme.plan.primary),
-            dim: indexed(theme.plan.dim),
+            primary: map(theme.plan.primary),
+            dim: map(theme.plan.dim),
         },
         shell: ShellColors {
-            running: indexed(theme.shell.running),
-            running_dim: indexed(theme.shell.running_dim),
-            success: indexed(theme.shell.success),
-            error: indexed(theme.shell.error),
-            cancelled: indexed(theme.shell.cancelled),
+            running: map(theme.shell.running),
+            running_dim: map(theme.shell.running_dim),
+            success: map(theme.shell.success),
+            error: map(theme.shell.error),
+            cancelled: map(theme.shell.cancelled),
         },
         status: StatusColors {
-            success: indexed(theme.status.success),
-            warning: indexed(theme.status.warning),
-            error: indexed(theme.status.error),
-            info: indexed(theme.status.info),
-            running: indexed(theme.status.running),
+            success: map(theme.status.success),
+            warning: map(theme.status.warning),
+            error: map(theme.status.error),
+            info: map(theme.status.info),
+            running: map(theme.status.running),
         },
         diff: DiffColors {
-            added: indexed(theme.diff.added),
-            removed: indexed(theme.diff.removed),
-            modified: indexed(theme.diff.modified),
-            context: indexed(theme.diff.context),
-            added_bg: indexed(theme.diff.added_bg),
-            removed_bg: indexed(theme.diff.removed_bg),
+            added: map(theme.diff.added),
+            removed: map(theme.diff.removed),
+            modified: map(theme.diff.modified),
+            context: map(theme.diff.context),
+            added_bg: map(theme.diff.added_bg),
+            removed_bg: map(theme.diff.removed_bg),
+            added_inline_bg: map(theme.diff.added_inline_bg),
+            removed_inline_bg: map(theme.diff.removed_inline_bg),
+        },
+        syntax: SyntaxColors {
+            keyword: map(theme.syntax.keyword),
+            string: map(theme.syntax.string),
+            type_name: map(theme.syntax.type_name),
+            function: map(theme.syntax.function),
+            variable: map(theme.syntax.variable),
+            comment: map(theme.syntax.comment),
+            number: map(theme.syntax.number),
+            plain: map(theme.syntax.plain),
         },
         brand: BrandColors {
-            foundation: indexed(theme.brand.foundation),
-            primary: indexed(theme.brand.primary),
-            highlight: indexed(theme.brand.highlight),
+            foundation: map(theme.brand.foundation),
+            primary: map(theme.brand.primary),
+            highlight: map(theme.brand.highlight),
         },
     }
+}
+
+/// Replace every RGB token with its nearest xterm-256 colour.
+pub(crate) fn indexed_256_theme(theme: Theme) -> Theme {
+    let light = relative_luminance(theme.surface.canvas).is_some_and(|lum| lum > 0.5);
+    let mut mapped = map_theme_colors(theme, |color| match color {
+        Color::Rgb(r, g, b) => Color::Indexed(nearest_xterm_256(r, g, b)),
+        other => other,
+    });
+    // The xterm cube has no soft dark green/red: the nearest hue step is the
+    // saturated `#005F00` / `#5F0000` slab that made a whole diff row shout.
+    // Give the row area a neutral step of the same polarity (235 = #262626 on
+    // dark, 254 = #E4E4E4 on light) and let the direction marker carry the
+    // hue; the inline step stays tinted because it covers only the changed
+    // token, not the row.
+    let (row, added_inline, removed_inline) = if light {
+        (254, 194, 224) // neutral, light green, light pink
+    } else {
+        (235, 28, 88) // neutral, #008700, #870000
+    };
+    mapped.diff.added_bg = Color::Indexed(row);
+    mapped.diff.removed_bg = Color::Indexed(row);
+    mapped.diff.added_inline_bg = Color::Indexed(added_inline);
+    mapped.diff.removed_inline_bg = Color::Indexed(removed_inline);
+    mapped
+}
+
+/// The 16 ANSI colours in their conventional xterm values.
+///
+/// Terminals remap these, so they are a reference for degradation and
+/// luminance only — never a colour a renderer should print as RGB.
+const ANSI16_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 49, 49),
+    (13, 188, 121),
+    (229, 229, 16),
+    (36, 114, 200),
+    (188, 63, 188),
+    (17, 168, 205),
+    (229, 229, 229),
+    (102, 102, 102),
+    (241, 76, 76),
+    (35, 209, 139),
+    (245, 245, 67),
+    (59, 142, 234),
+    (214, 112, 214),
+    (41, 184, 219),
+    (255, 255, 255),
+];
+
+/// The named ratatui colour for one of the 16 ANSI slots.
+///
+/// Named variants (not `Indexed(0..=15)`) matter: ratatui emits `Indexed` as
+/// `38;5;N`, which a 16-colour terminal does not understand.
+fn ansi16_named(index: usize) -> Color {
+    match index {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::Gray,
+        8 => Color::DarkGray,
+        9 => Color::LightRed,
+        10 => Color::LightGreen,
+        11 => Color::LightYellow,
+        12 => Color::LightBlue,
+        13 => Color::LightMagenta,
+        14 => Color::LightCyan,
+        _ => Color::White,
+    }
+}
+
+/// Every RGB token to the nearest of the 16 classic ANSI colours.
+pub(crate) fn ansi16_theme(theme: Theme) -> Theme {
+    let light = relative_luminance(theme.surface.canvas).is_some_and(|lum| lum > 0.5);
+    let mut mapped = map_theme_colors(theme, |color| match color {
+        Color::Rgb(r, g, b) => nearest_ansi16(r, g, b),
+        other => other,
+    });
+    // Nearest-RGB collapsing would fold several code roles onto the same
+    // named slot (and pick a mid-grey comment that misses 4.5:1 on black).
+    // Assign the semantic roles directly instead: fewer distinct inks are
+    // unavoidable at this depth, but the ones that remain are legible and
+    // still separate keyword / string / type / call.
+    mapped.syntax = if light {
+        SyntaxColors {
+            keyword: Color::Magenta,
+            string: Color::Red,
+            type_name: Color::Blue,
+            function: Color::DarkGray,
+            variable: Color::Black,
+            comment: Color::DarkGray,
+            number: Color::Red,
+            plain: Color::Black,
+        }
+    } else {
+        SyntaxColors {
+            keyword: Color::LightMagenta,
+            string: Color::LightYellow,
+            type_name: Color::LightCyan,
+            function: Color::LightBlue,
+            variable: Color::White,
+            comment: Color::Gray,
+            number: Color::Yellow,
+            plain: Color::White,
+        }
+    };
+    mapped
+}
+
+fn nearest_ansi16(r: u8, g: u8, b: u8) -> Color {
+    let mut nearest = 0usize;
+    let mut nearest_distance = u32::MAX;
+    for (index, (cr, cg, cb)) in ANSI16_RGB.into_iter().enumerate() {
+        let dr = i32::from(r) - i32::from(cr);
+        let dg = i32::from(g) - i32::from(cg);
+        let db = i32::from(b) - i32::from(cb);
+        let distance = (dr * dr + dg * dg + db * db) as u32;
+        if distance < nearest_distance {
+            nearest = index;
+            nearest_distance = distance;
+        }
+    }
+    ansi16_named(nearest)
 }
 
 /// Nearest colour in the stable xterm cube/grayscale range. Indices 0–15 are
@@ -442,8 +615,60 @@ fn macos_product_version() -> Option<&'static str> {
 }
 
 fn terminal_needs_indexed_colors() -> bool {
+    old_apple_terminal(
+        leveler_core::environment().var("TERM_PROGRAM").as_deref(),
+        macos_product_version(),
+    )
+}
+
+/// TERM names that negotiate truecolor without advertising it via `COLORTERM`.
+const TRUE_COLOR_TERMS: &[&str] = &[
+    "xterm-kitty",
+    "xterm-ghostty",
+    "alacritty",
+    "wezterm",
+    "foot",
+    "foot-direct",
+    "rio",
+    "contour",
+];
+
+/// Classify the terminal's real colour capability.
+///
+/// `COLORTERM` is the only widely reliable truecolor signal; a `*-256color`
+/// TERM name is the standard 256-colour signal. Anything else that names a
+/// terminal gets the 16-colour palette. An empty TERM (pipes, embedded hosts,
+/// test processes) keeps the full palette rather than guessing a downgrade.
+pub fn terminal_color_depth() -> ColorDepth {
     let env = leveler_core::environment();
-    old_apple_terminal(env.var("TERM_PROGRAM").as_deref(), macos_product_version())
+    color_depth_for(
+        env.var("TERM").as_deref(),
+        env.var("COLORTERM").as_deref(),
+        terminal_needs_indexed_colors(),
+    )
+}
+
+/// Pure classifier behind [`terminal_color_depth`], kept testable without
+/// mutating the process environment.
+fn color_depth_for(term: Option<&str>, colorterm: Option<&str>, old_apple: bool) -> ColorDepth {
+    let colorterm = colorterm.unwrap_or_default().to_ascii_lowercase();
+    if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+        return ColorDepth::TrueColor;
+    }
+    if old_apple {
+        return ColorDepth::Ansi256;
+    }
+    let term = term.unwrap_or_default().trim().to_ascii_lowercase();
+    if term.is_empty() {
+        return ColorDepth::TrueColor;
+    }
+    if term.contains("256color") || term == "tmux" || term == "screen" {
+        return ColorDepth::Ansi256;
+    }
+    if TRUE_COLOR_TERMS.contains(&term.as_str()) {
+        return ColorDepth::TrueColor;
+    }
+    ColorDepth::Ansi16
 }
 
 impl Theme {
@@ -518,6 +743,21 @@ impl Theme {
                 context: rgb(0xB5BAC1),
                 added_bg: rgb(0x14301C),
                 removed_bg: rgb(0x3A181A),
+                added_inline_bg: rgb(0x1E4A2D),
+                removed_inline_bg: rgb(0x522527),
+            },
+            // Hues follow the reading conventions the user expects (keywords
+            // pink, strings amber, types cyan, calls blue) and every ink clears
+            // 4.5:1 on the canvas and on both diff bands.
+            syntax: SyntaxColors {
+                keyword: rgb(0xE39AD6),
+                string: rgb(0xE6C07B),
+                type_name: rgb(0x7FD3E8),
+                function: rgb(0x8FB8F0),
+                variable: rgb(0xE7E9EC),
+                comment: rgb(0x8B93A1),
+                number: rgb(0xE0A06E),
+                plain: rgb(0xE7E9EC),
             },
             brand: BrandColors {
                 foundation: rgb(0x2F7FE0),
@@ -593,8 +833,23 @@ impl Theme {
                 removed: rgb(0xCF222E),
                 modified: rgb(0x9A6700),
                 context: rgb(0x4D5560),
-                added_bg: rgb(0xE6F4EA),
-                removed_bg: rgb(0xFCE8E8),
+                added_bg: rgb(0xDEF0E4),
+                removed_bg: rgb(0xF8DADA),
+                added_inline_bg: rgb(0xA7DCBB),
+                removed_inline_bg: rgb(0xF2AEAE),
+            },
+            // The same hue families darkened for the light canvas. The comment
+            // grey is darker than the prose muted role so it still clears
+            // 4.5:1 on the pink removal band.
+            syntax: SyntaxColors {
+                keyword: rgb(0xA02666),
+                string: rgb(0x7A5200),
+                type_name: rgb(0x0B6070),
+                function: rgb(0x24509E),
+                variable: rgb(0x20242A),
+                comment: rgb(0x59616C),
+                number: rgb(0x8A4B16),
+                plain: rgb(0x20242A),
             },
             brand: BrandColors {
                 foundation: rgb(0x0550AE),
@@ -666,6 +921,18 @@ impl Theme {
                 context: rgb(0xC8C8C8),
                 added_bg: rgb(0x002200),
                 removed_bg: rgb(0x330000),
+                added_inline_bg: rgb(0x004400),
+                removed_inline_bg: rgb(0x660000),
+            },
+            syntax: SyntaxColors {
+                keyword: rgb(0xFF9BD2),
+                string: rgb(0xFFD166),
+                type_name: rgb(0x7FE8FF),
+                function: rgb(0x9FC4FF),
+                variable: rgb(0xFFFFFF),
+                comment: rgb(0xB8C0CC),
+                number: rgb(0xFFB27A),
+                plain: rgb(0xFFFFFF),
             },
             brand: BrandColors {
                 foundation: rgb(0x4DA6FF),
@@ -757,6 +1024,18 @@ impl Theme {
                 context: Color::Reset,
                 added_bg: Color::Reset,
                 removed_bg: Color::Reset,
+                added_inline_bg: Color::Reset,
+                removed_inline_bg: Color::Reset,
+            },
+            syntax: SyntaxColors {
+                keyword: Color::Reset,
+                string: Color::Reset,
+                type_name: Color::Reset,
+                function: Color::Reset,
+                variable: Color::Reset,
+                comment: Color::Reset,
+                number: Color::Reset,
+                plain: Color::Reset,
             },
             brand: BrandColors {
                 foundation: Color::Reset,
@@ -786,17 +1065,33 @@ impl Theme {
         t
     }
 
-    /// Resolve a theme id, honouring `NO_COLOR` (monochrome wins over any id).
+    /// Resolve a theme id, honouring `NO_COLOR` (monochrome wins over any id)
+    /// and degrading the palette to what the host terminal can paint.
     pub fn resolve(id: ThemeId, no_color: bool) -> Self {
         if no_color {
-            Self::monochrome_with_id(id)
-        } else {
-            let theme = Self::named(id);
-            if terminal_needs_indexed_colors() {
-                indexed_256_theme(theme)
-            } else {
-                theme
-            }
+            return Self::monochrome_with_id(id);
+        }
+        match terminal_color_depth() {
+            ColorDepth::None => Self::monochrome_with_id(id),
+            ColorDepth::TrueColor => Self::named(id),
+            ColorDepth::Ansi256 => indexed_256_theme(Self::named(id)),
+            ColorDepth::Ansi16 => ansi16_theme(Self::named(id)),
+        }
+    }
+
+    /// The colour capability this resolved palette is built for.
+    ///
+    /// Derived from the palette itself so there is one authority: renderers
+    /// ask the theme what it can paint instead of re-reading the environment.
+    pub fn color_depth(&self) -> ColorDepth {
+        if self.monochrome {
+            return ColorDepth::None;
+        }
+        match self.surface.canvas {
+            Color::Rgb(..) => ColorDepth::TrueColor,
+            Color::Indexed(_) => ColorDepth::Ansi256,
+            Color::Reset => ColorDepth::None,
+            _ => ColorDepth::Ansi16,
         }
     }
 
@@ -876,9 +1171,35 @@ pub fn relative_luminance(color: Color) -> Option<f64> {
     let (r, g, b) = match color {
         Color::Rgb(r, g, b) => (r, g, b),
         Color::Indexed(index @ 16..=255) => xterm_256_rgb(index),
-        _ => return None,
+        Color::Indexed(index @ 0..=15) => ANSI16_RGB[index as usize],
+        Color::Reset => return None,
+        named => ansi16_rgb(named)?,
     };
     Some(0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b))
+}
+
+/// Reference RGB for a named ANSI colour (the 16-colour degradation target).
+fn ansi16_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    let index = match color {
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        _ => return None,
+    };
+    Some(ANSI16_RGB[index])
 }
 
 /// WCAG contrast ratio between two colours with known luminance.
@@ -887,6 +1208,57 @@ pub fn contrast_ratio(a: Color, b: Color) -> Option<f64> {
     let lb = relative_luminance(b)?;
     let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
     Some((hi + 0.05) / (lo + 0.05))
+}
+
+impl Theme {
+    /// `fg` when it already clears `min` on `bg`; otherwise the nearest
+    /// same-hue step that does.
+    ///
+    /// Inline diff emphasis is the only place a syntax token acquires a new
+    /// background after its ink was chosen, so it is the only caller. The
+    /// correction moves the channel values toward white or black — preserving
+    /// the hue relation that told the reader what kind of token it was — and
+    /// re-quantises into the palette's depth.
+    pub(crate) fn readable_on(&self, fg: Color, bg: Color, min: f64) -> Color {
+        let Some(bg_lum) = relative_luminance(bg) else {
+            return fg;
+        };
+        if contrast_ratio(fg, bg).is_some_and(|ratio| ratio >= min) {
+            return fg;
+        }
+        let Some((r, g, b)) = sample_rgb(fg) else {
+            return fg;
+        };
+        let target = if bg_lum < 0.18 { 255.0 } else { 0.0 };
+        let mut last = fg;
+        for step in 1..=20 {
+            let t = f64::from(step) / 20.0;
+            let mix = |c: u8| (f64::from(c) + (target - f64::from(c)) * t).round() as u8;
+            let candidate = Color::Rgb(mix(r), mix(g), mix(b));
+            let encoded = match fg {
+                Color::Rgb(..) => candidate,
+                Color::Indexed(index) if index >= 16 => {
+                    let (r, g, b) = sample_rgb(candidate).unwrap_or((r, g, b));
+                    Color::Indexed(nearest_xterm_256(r, g, b))
+                }
+                _ => fg,
+            };
+            last = encoded;
+            if contrast_ratio(encoded, bg).is_some_and(|ratio| ratio >= min) {
+                return encoded;
+            }
+        }
+        last
+    }
+}
+
+fn sample_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Indexed(index @ 16..=255) => Some(xterm_256_rgb(index)),
+        Color::Indexed(index @ 0..=15) => Some(ANSI16_RGB[index as usize]),
+        named => ansi16_rgb(named),
+    }
 }
 
 fn linear(channel: u8) -> f64 {
@@ -924,6 +1296,13 @@ pub fn preview_theme(theme: &Theme, color: bool) -> String {
         ("+ added line", Some(theme.diff.added)),
         ("- removed line", Some(theme.diff.removed)),
         ("  context line", Some(theme.diff.context)),
+        ("Syntax", None),
+        ("func main() {", Some(theme.syntax.keyword)),
+        ("  \"hello\"", Some(theme.syntax.string)),
+        ("  value := 42", Some(theme.syntax.number)),
+        ("  Entry", Some(theme.syntax.type_name)),
+        ("  handle()", Some(theme.syntax.function)),
+        ("  // comment", Some(theme.syntax.comment)),
         ("Borders", None),
         ("subtle", Some(theme.border.subtle)),
         ("normal", Some(theme.border.normal)),
@@ -967,8 +1346,8 @@ mod tests {
     }
 
     /// Only pairs that the TUI actually paints. `surface.panel` is never a
-    /// background today; `diff.added_bg` / `removed_bg` are unused — diffs are
-    /// foreground-only on canvas — so those are not gated.
+    /// background today; the diff bands ARE painted (added/removed runs and
+    /// the stronger inline token band), so they are gated here too.
     fn assert_used_contrast_pairs(theme: &Theme) {
         let s = &theme.surface;
         let t = &theme.text;
@@ -999,6 +1378,87 @@ mod tests {
         assert_min(theme.status.running, s.canvas, 4.5, "running/canvas");
         assert_min(theme.diff.added, s.canvas, 4.5, "diff.added/canvas");
         assert_min(theme.diff.removed, s.canvas, 4.5, "diff.removed/canvas");
+        // A band is a surface step, not a highlight: visible against the
+        // canvas, quiet enough to keep syntax colour readable. The inline
+        // band is one further step so a changed token still stands out inside
+        // an already tinted row.
+        assert_min(theme.diff.added_bg, s.canvas, 1.10, "added_bg/canvas");
+        assert_min(theme.diff.removed_bg, s.canvas, 1.10, "removed_bg/canvas");
+        assert_min(
+            theme.diff.added_inline_bg,
+            theme.diff.added_bg,
+            1.20,
+            "added_inline_bg/added_bg",
+        );
+        assert_min(
+            theme.diff.removed_inline_bg,
+            theme.diff.removed_bg,
+            1.20,
+            "removed_inline_bg/removed_bg",
+        );
+        // Ink the painter puts directly on a band.
+        assert_min(t.primary, theme.diff.added_bg, 7.0, "primary/added_bg");
+        assert_min(t.primary, theme.diff.removed_bg, 7.0, "primary/removed_bg");
+        assert_min(
+            t.primary,
+            theme.diff.added_inline_bg,
+            7.0,
+            "primary/added_inline_bg",
+        );
+        assert_min(
+            t.primary,
+            theme.diff.removed_inline_bg,
+            7.0,
+            "primary/removed_inline_bg",
+        );
+        assert_min(t.secondary, theme.diff.added_bg, 4.5, "secondary/added_bg");
+        assert_min(
+            t.secondary,
+            theme.diff.removed_bg,
+            4.5,
+            "secondary/removed_bg",
+        );
+        // The `+`/`-` marker is bold and the band already names the direction,
+        // so the marker only has to clear the non-text 3:1 step.
+        assert_min(
+            theme.diff.added,
+            theme.diff.added_bg,
+            3.0,
+            "added ink/added_bg",
+        );
+        assert_min(
+            theme.diff.removed,
+            theme.diff.removed_bg,
+            3.0,
+            "removed ink/removed_bg",
+        );
+        // Code tokens are painted on the canvas and on both row bands. Inline
+        // emphasis is corrected per token by `readable_on`, so it is gated in
+        // the painter tests instead of here.
+        for (name, ink) in [
+            ("keyword", theme.syntax.keyword),
+            ("string", theme.syntax.string),
+            ("type", theme.syntax.type_name),
+            ("function", theme.syntax.function),
+            ("variable", theme.syntax.variable),
+            ("comment", theme.syntax.comment),
+            ("number", theme.syntax.number),
+            ("plain", theme.syntax.plain),
+        ] {
+            assert_min(ink, s.canvas, 4.5, &format!("syntax.{name}/canvas"));
+            assert_min(
+                ink,
+                theme.diff.added_bg,
+                4.5,
+                &format!("syntax.{name}/added_bg"),
+            );
+            assert_min(
+                ink,
+                theme.diff.removed_bg,
+                4.5,
+                &format!("syntax.{name}/removed_bg"),
+            );
+        }
         assert_min(theme.border.normal, s.canvas, 3.0, "border.normal/canvas");
         assert_min(theme.border.focus, s.input, 3.0, "border.focus/input");
     }
@@ -1180,6 +1640,201 @@ mod tests {
         assert!(old_apple_terminal(Some("Apple_Terminal"), None));
         assert!(!old_apple_terminal(Some("Apple_Terminal"), Some("26.0")));
         assert!(!old_apple_terminal(Some("iTerm.app"), Some("15.7.1")));
+    }
+
+    /// The 256-colour palette cannot paint a soft directional row band: the
+    /// cube's nearest hue step is a saturated slab. The contract is a neutral
+    /// row band plus directional target on marker and inline step, and every
+    /// syntax ink stays readable on that band.
+    #[test]
+    fn indexed_256_uses_a_neutral_row_band_with_directional_targets() {
+        for theme in [Theme::dark(), Theme::light(), Theme::high_contrast()] {
+            let indexed = indexed_256_theme(theme);
+            for (name, color) in [
+                ("added_bg", indexed.diff.added_bg),
+                ("removed_bg", indexed.diff.removed_bg),
+            ] {
+                let Color::Indexed(index) = color else {
+                    panic!("{name}: expected an indexed colour, got {color:?}");
+                };
+                let (r, g, b) = xterm_256_rgb(index);
+                assert!(
+                    r == g && g == b,
+                    "{name}: index {index} {r},{g},{b} must stay neutral"
+                );
+            }
+            assert_ne!(
+                indexed.diff.added_bg, indexed.surface.canvas,
+                "the row band must be visible against the canvas"
+            );
+            for (name, color, dominant) in [
+                ("added_inline_bg", indexed.diff.added_inline_bg, 1usize),
+                ("removed_inline_bg", indexed.diff.removed_inline_bg, 0),
+            ] {
+                let Color::Indexed(index) = color else {
+                    panic!("{name}: expected an indexed colour, got {color:?}");
+                };
+                let channels = {
+                    let (r, g, b) = xterm_256_rgb(index);
+                    [r, g, b]
+                };
+                let others: Vec<u8> = channels
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != dominant)
+                    .map(|(_, c)| *c)
+                    .collect();
+                assert!(
+                    channels[dominant] > others[0] && channels[dominant] > others[1],
+                    "{name}: index {index} {channels:?} lost its direction hue"
+                );
+            }
+            assert_ne!(
+                indexed.diff.added_bg, indexed.diff.added_inline_bg,
+                "the add inline step must stay visible on the row band"
+            );
+            assert_ne!(
+                indexed.diff.removed_bg, indexed.diff.removed_inline_bg,
+                "the remove inline step must stay visible on the row band"
+            );
+            for (name, ink) in [
+                ("keyword", indexed.syntax.keyword),
+                ("string", indexed.syntax.string),
+                ("type", indexed.syntax.type_name),
+                ("function", indexed.syntax.function),
+                ("variable", indexed.syntax.variable),
+                ("comment", indexed.syntax.comment),
+                ("number", indexed.syntax.number),
+                ("plain", indexed.syntax.plain),
+            ] {
+                assert_min(
+                    ink,
+                    indexed.diff.added_bg,
+                    4.5,
+                    &format!("256 {name}/added_bg"),
+                );
+            }
+        }
+    }
+
+    /// The four terminal capabilities the renderer must survive, each with
+    /// its unambiguous signal.
+    #[test]
+    fn terminal_capability_is_classified_from_the_environment() {
+        assert_eq!(
+            color_depth_for(Some("xterm-256color"), Some("truecolor"), false),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(
+            color_depth_for(Some("xterm-256color"), Some("24bit"), false),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(
+            color_depth_for(Some("xterm-256color"), None, false),
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            color_depth_for(Some("tmux"), None, false),
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            color_depth_for(Some("xterm"), None, false),
+            ColorDepth::Ansi16
+        );
+        assert_eq!(
+            color_depth_for(Some("vt100"), None, false),
+            ColorDepth::Ansi16
+        );
+        // Old Apple Terminal can paint 256 but not truecolor.
+        assert_eq!(
+            color_depth_for(Some("xterm-256color"), None, true),
+            ColorDepth::Ansi256
+        );
+        // No terminal identity keeps the historical full palette.
+        assert_eq!(color_depth_for(None, None, false), ColorDepth::TrueColor);
+        assert_eq!(
+            color_depth_for(Some(""), None, false),
+            ColorDepth::TrueColor
+        );
+        // A modern truecolor terminal that only names itself in TERM.
+        assert_eq!(
+            color_depth_for(Some("xterm-kitty"), None, false),
+            ColorDepth::TrueColor
+        );
+    }
+
+    /// 16-colour degradation emits named ANSI colours only, and the palette
+    /// still knows its own polarity (light stays light).
+    #[test]
+    fn ansi16_compatibility_uses_named_colors_and_keeps_polarity() {
+        for id in ThemeId::FIXED {
+            let theme = ansi16_theme(Theme::named(id));
+            for (name, color) in [
+                ("canvas", theme.surface.canvas),
+                ("input", theme.surface.input),
+                ("primary", theme.text.primary),
+                ("muted", theme.text.muted),
+                ("accent", theme.accent.primary),
+                ("added", theme.diff.added),
+                ("removed", theme.diff.removed),
+                ("added_bg", theme.diff.added_bg),
+            ] {
+                assert!(
+                    !matches!(color, Color::Rgb(..) | Color::Indexed(_)),
+                    "{id}: {name} must be a named ANSI colour, got {color:?}"
+                );
+            }
+            assert_eq!(theme.color_depth(), ColorDepth::Ansi16);
+        }
+        assert!(ansi16_theme(Theme::dark()).is_dark());
+        assert!(!ansi16_theme(Theme::light()).is_dark());
+    }
+
+    /// The 16-colour depth cannot carry all eight syntax roles, but the roles
+    /// it keeps must be legible on the canvas and still tell keyword, string,
+    /// type and call apart.
+    #[test]
+    fn ansi16_keeps_the_syntax_roles_legible_and_separate() {
+        for (id, minimum) in [(ThemeId::Dark, 6), (ThemeId::Light, 4)] {
+            let theme = ansi16_theme(Theme::named(id));
+            let inks = [
+                theme.syntax.keyword,
+                theme.syntax.string,
+                theme.syntax.type_name,
+                theme.syntax.function,
+                theme.syntax.variable,
+                theme.syntax.comment,
+                theme.syntax.number,
+                theme.syntax.plain,
+            ];
+            let distinct: std::collections::HashSet<_> = inks.iter().collect();
+            assert!(
+                distinct.len() >= minimum,
+                "{id}: 16-colour syntax collapses to {} inks: {inks:?}",
+                distinct.len()
+            );
+            for ink in inks {
+                assert!(
+                    !matches!(ink, Color::Rgb(..) | Color::Indexed(_)),
+                    "{id}: syntax ink must be a named ANSI colour, got {ink:?}"
+                );
+                assert_min(ink, theme.surface.canvas, 4.5, "syntax/canvas");
+            }
+        }
+    }
+
+    #[test]
+    fn color_depth_is_derived_from_the_resolved_palette() {
+        assert_eq!(Theme::dark().color_depth(), ColorDepth::TrueColor);
+        assert_eq!(
+            indexed_256_theme(Theme::dark()).color_depth(),
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            ansi16_theme(Theme::dark()).color_depth(),
+            ColorDepth::Ansi16
+        );
+        assert_eq!(Theme::no_color().color_depth(), ColorDepth::None);
     }
 
     #[test]
