@@ -327,16 +327,6 @@ def unregister_lane_fallback(
     return row
 
 
-def allow_claim_while_active(runs: Sequence[Dict[str, Any]], active: Dict[str, Any]) -> bool:
-    """True only when one run-now slot was claimed while its trigger run ran."""
-    return (
-        len(runs) == 1
-        and bool(runs[0].get("started_at"))
-        and bool(active.get("finished_at"))
-        and parse_iso(runs[0]["started_at"]) < parse_iso(active["finished_at"])
-    )
-
-
 # How long an overlap probe may wait for a real terminal run. An empty run
 # list is not terminal and must not pass. When the window ends with nothing
 # to judge, the check is UNKNOWN.
@@ -346,45 +336,6 @@ OVERLAP_OBSERVE_SECS = 180
 # product settled as unknown on any other lane is.
 PRODUCT_SHELL_FAILURE_STATES = frozenset({"failed", "unknown", "blocked", "waiting_approval"})
 SILENT_LOSS_STATES = frozenset({"skipped", "interrupted", "blocked", "cancelled", "waiting_approval"})
-
-
-def runs_observed_terminal(runs: Sequence[Dict[str, Any]]) -> bool:
-    """A slot is terminal only after at least one run has left the active states.
-
-    `all([])` is true in Python. Treating that as "every run finished" made an
-    empty skip or queue probe conclude before any execution existed.
-    """
-    if not runs:
-        return False
-    return all(run.get("state") not in ("dispatching", "running") for run in runs)
-
-
-def overlap_policy_ok(
-    key: str,
-    occurrence: Dict[str, Any],
-    runs: Sequence[Dict[str, Any]],
-    active: Dict[str, Any],
-) -> bool:
-    """Policy outcome for one overlap slot. Empty runs are never ok."""
-    if not runs:
-        return False
-    if key == "skip":
-        return (
-            occurrence.get("state") == "skipped"
-            and len(runs) == 1
-            and runs[0].get("state") == "skipped"
-        )
-    if key == "queue":
-        if len(runs) != 1 or runs[0].get("state") != "succeeded":
-            return False
-        finished = active.get("finished_at")
-        started = runs[0].get("started_at")
-        if not finished or not started:
-            return False
-        return parse_iso(started) >= parse_iso(finished)
-    if key == "allow":
-        return allow_claim_while_active(runs, active)
-    return False
 
 
 def overlap_observation_status(terminal: bool, policy_ok: bool, elapsed_secs: float) -> str:
@@ -416,6 +367,325 @@ def overlap_probe_status(rows: Sequence[Tuple[bool, bool]], elapsed_secs: float)
     return "UNKNOWN"
 
 
+TERMINAL_RUN_STATES = frozenset(
+    {"succeeded", "failed", "unknown", "blocked", "cancelled", "skipped"}
+)
+
+
+def definition_id_for(defs: Dict[str, Any], key: str) -> Optional[str]:
+    """Resolve a spec key to the definition id the lane's setup created.
+
+    `lane["defs"][key]` is `{"id", "name", "spec"}`. A bare id is accepted for
+    state written by older runner versions; treating the whole mapping as an
+    id silently counted zero successes and reported every marker line as a
+    duplicate side effect.
+    """
+    row = (defs or {}).get(key)
+    if isinstance(row, dict):
+        return row.get("id")
+    return row
+
+
+def effect_success_count(
+    succeeded_by_definition: Dict[str, int], defs: Dict[str, Any], key: str
+) -> int:
+    return int(succeeded_by_definition.get(definition_id_for(defs, key) or "") or 0)
+
+
+def _runs_for(snapshot: Dict[str, Any], definition_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not definition_id:
+        return []
+    return [run for run in snapshot.get("runs", []) if run.get("definition_id") == definition_id]
+
+
+def _occurrences_for(snapshot: Dict[str, Any], definition_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not definition_id:
+        return []
+    return [
+        occurrence
+        for occurrence in snapshot.get("occurrences", [])
+        if occurrence.get("definition_id") == definition_id
+    ]
+
+
+def _covering_run(runs: Sequence[Dict[str, Any]], due: dt.datetime) -> Optional[Dict[str, Any]]:
+    """A run whose active interval contains `due`."""
+    for run in runs:
+        if not run.get("started_at") or not run.get("finished_at"):
+            continue
+        if parse_iso(run["started_at"]) <= due < parse_iso(run["finished_at"]):
+            return run
+    return None
+
+
+def _missing_observation(reason: str) -> Dict[str, Any]:
+    return {
+        "missing": True,
+        "reason": reason,
+        "occurrence": None,
+        "occurrence_state": None,
+        "runs": [],
+        "terminal": False,
+        "policy_ok": False,
+        "execution_ok": False,
+    }
+
+
+def natural_overlap_observation(
+    snapshot: Dict[str, Any],
+    ids: Dict[str, str],
+    after: dt.datetime,
+) -> Dict[str, Dict[str, Any]]:
+    """Find one naturally scheduled instance of each overlap policy.
+
+    The probe must not manufacture extra slots: injecting run-now work into a
+    lane whose three definitions already occupy the runtime's admission
+    capacity turns a policy observation into a capacity failure. A natural
+    instance proves the same contract without changing the product's load.
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+
+    skip_runs = _runs_for(snapshot, ids.get("skip"))
+    found = _missing_observation("no skipped slot due inside an active run after the probe")
+    for occurrence in sorted(
+        _occurrences_for(snapshot, ids.get("skip")),
+        key=lambda row: row.get("scheduled_for") or "",
+    ):
+        due_raw = occurrence.get("scheduled_for")
+        if not due_raw or parse_iso(due_raw) < after:
+            continue
+        skipped = [run for run in occurrence.get("runs", []) if run.get("state") == "skipped"]
+        if occurrence.get("state") != "skipped" or len(skipped) != 1:
+            continue
+        covering = _covering_run(skip_runs, parse_iso(due_raw))
+        if covering is None:
+            continue
+        found = {
+            "missing": False,
+            "occurrence": occurrence.get("id"),
+            "occurrence_state": occurrence.get("state"),
+            "scheduled_for": due_raw,
+            "covering_run": {"id": covering.get("id"), "finished_at": covering.get("finished_at")},
+            "terminal": skipped[0].get("state") in TERMINAL_RUN_STATES,
+            "policy_ok": True,
+            "execution_ok": True,
+            "runs": [
+                {
+                    "id": run.get("id"),
+                    "state": run.get("state"),
+                    "session_id": run.get("session_id"),
+                    "started_at": run.get("started_at"),
+                    "finished_at": run.get("finished_at"),
+                    "error": redact(str(run.get("error"))) if run.get("error") else None,
+                }
+                for run in skipped
+            ],
+        }
+        break
+    results["skip"] = found
+
+    queue_runs = _runs_for(snapshot, ids.get("queue"))
+    found = _missing_observation("no queued run started after its blocking run finished")
+    candidates = [
+        (run, occurrence)
+        for occurrence in _occurrences_for(snapshot, ids.get("queue"))
+        for run in occurrence.get("runs", [])
+        if run.get("started_at") and parse_iso(run["started_at"]) >= after
+    ]
+    for run, occurrence in sorted(candidates, key=lambda pair: pair[0].get("started_at") or ""):
+        due_raw = occurrence.get("scheduled_for")
+        if not due_raw or not run.get("finished_at") or run.get("state") not in TERMINAL_RUN_STATES:
+            continue
+        due = parse_iso(due_raw)
+        covering = _covering_run([row for row in queue_runs if row.get("id") != run.get("id")], due)
+        if covering is None:
+            continue
+        policy_ok = bool(
+            run.get("state") == "succeeded"
+            and parse_iso(run["started_at"]) >= parse_iso(covering["finished_at"])
+        )
+        found = {
+            "missing": False,
+            "occurrence": occurrence.get("id"),
+            "occurrence_state": occurrence.get("state"),
+            "scheduled_for": due_raw,
+            "covering_run": {"id": covering.get("id"), "finished_at": covering.get("finished_at")},
+            "terminal": True,
+            "policy_ok": policy_ok,
+            "execution_ok": run.get("state") == "succeeded",
+            "runs": [
+                {
+                    "id": run.get("id"),
+                    "state": run.get("state"),
+                    "session_id": run.get("session_id"),
+                    "started_at": run.get("started_at"),
+                    "finished_at": run.get("finished_at"),
+                    "error": redact(str(run.get("error"))) if run.get("error") else None,
+                }
+            ],
+        }
+        break
+    results["queue"] = found
+
+    allow_runs = [
+        run
+        for run in _runs_for(snapshot, ids.get("allow"))
+        if run.get("started_at") and run.get("finished_at")
+    ]
+    allow_runs.sort(key=lambda run: run.get("started_at") or "")
+    found = _missing_observation("no second allow-concurrent run started while the first was active")
+    for second in allow_runs:
+        if parse_iso(second["started_at"]) < after:
+            continue
+        first = next(
+            (
+                run
+                for run in allow_runs
+                if run.get("id") != second.get("id")
+                and parse_iso(run["started_at"]) <= parse_iso(second["started_at"]) < parse_iso(run["finished_at"])
+            ),
+            None,
+        )
+        if first is None:
+            continue
+        found = {
+            "missing": False,
+            "occurrence": second.get("occurrence_id"),
+            "occurrence_state": None,
+            "scheduled_for": None,
+            "covering_run": {"id": first.get("id"), "finished_at": first.get("finished_at")},
+            "terminal": second.get("state") in TERMINAL_RUN_STATES,
+            "policy_ok": second.get("state") == "succeeded",
+            "execution_ok": second.get("state") == "succeeded",
+            "runs": [
+                {
+                    "id": run.get("id"),
+                    "state": run.get("state"),
+                    "session_id": run.get("session_id"),
+                    "started_at": run.get("started_at"),
+                    "finished_at": run.get("finished_at"),
+                    "error": redact(str(run.get("error"))) if run.get("error") else None,
+                }
+                for run in (first, second)
+            ],
+        }
+        break
+    results["allow"] = found
+    return results
+
+
+def fault_recovery_facts(
+    snapshot: Dict[str, Any],
+    fault_id: str,
+    killed_at: dt.datetime,
+    active_run_ids: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """What happened to the run that was in flight when the dispatcher died.
+
+    A restarted dispatcher observes the runtime's terminal record and settles
+    the run as succeeded. That is the healthy recovery path and must not be
+    required to produce an `unknown`. `unknown` is also terminal and accepted:
+    it is the runtime's honest answer when the outcome was lost; the point is
+    that the same occurrence is never re-delivered and a later occurrence
+    starts fresh.
+    """
+    runs = _runs_for(snapshot, fault_id)
+    by_id = {run.get("id"): run for run in runs}
+    affected = [by_id[run_id] for run_id in active_run_ids if run_id in by_id]
+    if not affected:
+        affected = [
+            run
+            for run in runs
+            if run.get("delivered_at")
+            and run.get("started_at")
+            and parse_iso(run["delivered_at"]) <= killed_at
+            and parse_iso(run["started_at"]) <= killed_at + dt.timedelta(seconds=5)
+        ]
+    stuck = [run.get("id") for run in affected if run.get("state") not in TERMINAL_RUN_STATES]
+    unknown = [run.get("id") for run in affected if run.get("state") == "unknown"]
+    recovered = [run.get("id") for run in affected if run.get("state") == "succeeded"]
+    later_success = [
+        run
+        for run in runs
+        if run.get("state") == "succeeded"
+        and run.get("started_at")
+        and parse_iso(run["started_at"]) > killed_at
+    ]
+    by_occurrence: Dict[str, List[str]] = {}
+    for run in runs:
+        occurrence_id = run.get("occurrence_id")
+        if occurrence_id:
+            by_occurrence.setdefault(str(occurrence_id), []).append(str(run.get("id")))
+    duplicate_occurrences = sorted(
+        occurrence_id for occurrence_id, ids in by_occurrence.items() if len(ids) > 1
+    )
+    passed = bool(affected) and not stuck and bool(later_success) and not duplicate_occurrences
+    return {
+        "affected": [run.get("id") for run in affected],
+        "recovered": recovered,
+        "unknown": unknown,
+        "stuck": stuck,
+        "later_success": len(later_success),
+        "duplicate_occurrences": duplicate_occurrences,
+        "passed": passed,
+    }
+
+
+def misfire_facts(
+    snapshot: Dict[str, Any],
+    ids: Dict[str, str],
+    off_at: dt.datetime,
+    on_at: dt.datetime,
+) -> Dict[str, Any]:
+    """The offline window's own outcome, not the next natural slot.
+
+    Only an occurrence that became due inside the offline window and started
+    after the lane came back proves `run-once` recovery. The next natural slot
+    belongs to normal steady state and may still be running when the check
+    looks; counting it made a healthy recovery fail.
+    """
+    skip_occurrences = _occurrences_for(snapshot, ids.get("skip"))
+    skip_missed = [
+        occurrence
+        for occurrence in skip_occurrences
+        if occurrence.get("state") == "missed"
+        and occurrence.get("scheduled_for")
+        and parse_iso(occurrence["scheduled_for"]) <= on_at
+    ]
+    recovered: List[Dict[str, Any]] = []
+    for occurrence in _occurrences_for(snapshot, ids.get("runonce")):
+        due_raw = occurrence.get("scheduled_for")
+        if not due_raw:
+            continue
+        due = parse_iso(due_raw)
+        if not (off_at < due <= on_at):
+            continue
+        for run in occurrence.get("runs", []):
+            if run.get("state") not in TERMINAL_RUN_STATES:
+                continue
+            if not run.get("started_at"):
+                continue
+            if parse_iso(run["started_at"]) >= on_at - dt.timedelta(seconds=5):
+                recovered.append(run)
+    duplicates = sorted(
+        occurrence.get("id")
+        for occurrence in skip_occurrences
+        if int(occurrence.get("run_count") or len(occurrence.get("runs") or [])) > 1
+    )
+    passed = (
+        bool(skip_missed)
+        and bool(recovered)
+        and not duplicates
+        and all(run.get("state") in ("succeeded", "unknown", "failed") for run in recovered)
+    )
+    return {
+        "skip_missed": len(skip_missed),
+        "recovered": recovered,
+        "duplicates": duplicates,
+        "passed": passed,
+    }
+
+
 def product_shell_failures(failures: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Shell and native failures that must move the verdict.
 
@@ -444,7 +714,13 @@ def effect_mismatches(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def duplicate_side_effect_count(evidence: Dict[str, Any], occurrence_duplicates: Sequence[Dict[str, Any]]) -> int:
-    """Occurrence fan-out plus marker lines beyond the succeeded-run count."""
+    """Occurrence fan-out plus marker lines beyond the succeeded-run allowance.
+
+    `effect_matches_success` is the single authority for how many marker lines
+    a lane may have: the fault lane may append one line for an unknown run
+    whose outcome was lost. Counting those allowed lines again here made a
+    healthy fault lane fail the frozen duplicate threshold.
+    """
     extra = len(occurrence_duplicates)
     for lane in (evidence.get("lanes") or {}).values():
         for effect in (lane.get("effects") or {}).values():
@@ -453,6 +729,8 @@ def duplicate_side_effect_count(evidence: Dict[str, Any], occurrence_duplicates:
             lines = effect.get("lines")
             succeeded = effect.get("succeeded_runs")
             if lines is None or succeeded is None:
+                continue
+            if effect.get("effect_matches_success") is True:
                 continue
             if int(lines) > int(succeeded):
                 extra += int(lines) - int(succeeded)
@@ -1813,27 +2091,6 @@ def active_runs(lane: Dict[str, Any], spec_key: Optional[str] = None) -> List[Di
     return rows
 
 
-def spawn_lane_cli(lane: Dict[str, Any], args: Sequence[str], log_path: Path) -> subprocess.Popen:
-    home = Path(lane["home"])
-    command = [str(lane["binary"]), *args, "--home", str(home), "--config-dir", str(home)]
-    if not (args and args[0] == "schedule" and len(args) > 1 and args[1] in ("serve", "dispatch")):
-        command.extend(["--repo", str(lane["repo"])])
-    command.append("--json")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(log_path, "a", encoding="utf-8")
-    process = subprocess.Popen(
-        command,
-        env=lane_cli_env(lane),
-        cwd=str(lane["repo"]),
-        stdin=subprocess.DEVNULL,
-        stdout=handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    handle.close()
-    return process
-
-
 def setup_run(
     paths: RunPaths,
     plan: Dict[str, Any],
@@ -2312,45 +2569,27 @@ class Supervisor:
         raise ActionRetry("no active %s run yet" % lane_name)
 
     def do_s4_probe(self, name: str) -> Dict[str, Any]:
+        """Start an observation window over the lane's natural overlap cycles.
+
+        The three definitions already produce skip, queue-one, and
+        allow-concurrent outcomes on their own grid. Firing additional
+        `run-now` slots here stacked a fourth and fifth turn onto the
+        runtime's four-turn admission capacity, so the policy observation
+        failed for a reason that had nothing to do with the policy.
+        """
         overlap = lane_by_name(self.lanes, "overlap")
-        record = self.state.setdefault("s4_probes", {}).setdefault(
-            name, {"started_at": iso(), "keys": {}, "processes": []}
-        )
-        for key in ("skip", "queue", "allow"):
-            if key in record["keys"]:
-                continue
-            definition_id = self._definition_id("overlap", key)
-            active = None
-            for run in active_runs(overlap):
-                occurrence = run.get("occurrence") or {}
-                if occurrence.get("run_now"):
-                    continue
-                if run.get("definition_id") == definition_id:
-                    active = run
-                    break
-            if active is None:
-                raise ActionRetry("no active run for overlap.%s yet" % key)
-            log_path = Path(self.paths.evidence) / "lanes" / "overlap" / ("run-now-%s-%s.log" % (key, name))
-            process = spawn_lane_cli(overlap, ["schedule", "run-now", definition_id], log_path)
-            record["keys"][key] = {
-                "definition": definition_id,
-                "fired_at": iso(),
-                "active_run": active.get("id"),
-                "active_started_at": active.get("started_at"),
-                "process": process.pid,
-                "log": str(log_path),
-            }
-            record["processes"].append({"key": key, "pid": process.pid, "log": str(log_path)})
-            self.persist()
+        record = self.state.setdefault("s4_probes", {}).setdefault(name, {"started_at": iso()})
+        record.setdefault("started_at", iso())
+        record["active_at_probe"] = [run.get("id") for run in active_runs(overlap)]
+        record["mode"] = "natural"
         suffix = "1" if self.mode == "dry-run" else name.rsplit("_", 1)[-1]
         add_action(self.state, "s4_verify_" + suffix, time.time() + 150, self.recorder)
-        result = {
-            "probe_started": record["started_at"],
-            "keys": record["keys"],
-            "processes": record["processes"],
-        }
         self.persist()
-        return result
+        return {
+            "probe_started": record["started_at"],
+            "mode": record["mode"],
+            "active_at_probe": record["active_at_probe"],
+        }
 
     def do_s4_verify(self, name: str) -> Dict[str, Any]:
         suffix = name.rsplit("_", 1)[-1]
@@ -2361,61 +2600,8 @@ class Supervisor:
         probe_started = parse_iso(record["started_at"])
         overlap = lane_by_name(self.lanes, "overlap")
         snapshot = read_schedule(Path(overlap["home"]))
-        runs_by_id = {run.get("id"): run for run in snapshot["runs"]}
-        results: Dict[str, Any] = {}
-        for key, fired in record["keys"].items():
-            definition_id = fired["definition"]
-            candidates = [
-                occurrence
-                for occurrence in snapshot["occurrences"]
-                if occurrence.get("definition_id") == definition_id
-                and occurrence.get("run_now")
-                and occurrence.get("created_at")
-                and parse_iso(occurrence["created_at"]) >= probe_started - dt.timedelta(seconds=2)
-            ]
-            if not candidates:
-                results[key] = {
-                    "occurrence": None,
-                    "occurrence_state": None,
-                    "runs": [],
-                    "policy_ok": False,
-                    "terminal": False,
-                    "observation": "missing",
-                }
-                continue
-            occurrence = sorted(candidates, key=lambda row: row.get("created_at") or "")[-1]
-            runs = occurrence.get("runs", [])
-            active = runs_by_id.get(fired.get("active_run")) or {}
-            result = {
-                "occurrence": occurrence.get("id"),
-                "occurrence_state": occurrence.get("state"),
-                "active_run": fired.get("active_run"),
-                "active_finished_at": active.get("finished_at"),
-                "terminal": runs_observed_terminal(runs),
-                "runs": [
-                    {
-                        "id": run.get("id"),
-                        "state": run.get("state"),
-                        "session_id": run.get("session_id"),
-                        "started_at": run.get("started_at"),
-                        "finished_at": run.get("finished_at"),
-                        "error": redact(str(run.get("error"))) if run.get("error") else None,
-                    }
-                    for run in runs
-                ],
-            }
-            result["policy_ok"] = overlap_policy_ok(key, occurrence, runs, active)
-            if key == "queue" and len(runs) == 1 and active.get("finished_at") and runs[0].get("started_at"):
-                result["started_after_active"] = parse_iso(runs[0]["started_at"]) >= parse_iso(
-                    active["finished_at"]
-                )
-            if key == "allow":
-                # Claim while active and a succeeded execution are separate
-                # required facts. An empty run list satisfies neither.
-                result["claimed_while_active"] = allow_claim_while_active(runs, active)
-                result["execution_state"] = runs[0].get("state") if runs else None
-                result["execution_ok"] = len(runs) == 1 and runs[0].get("state") == "succeeded"
-            results[key] = result
+        definition_ids = {key: self._definition_id("overlap", key) for key in ("skip", "queue", "allow")}
+        results = natural_overlap_observation(snapshot, definition_ids, probe_started)
         elapsed = time.time() - probe_started.timestamp()
         status = overlap_probe_status(
             [(bool(item.get("terminal")), bool(item.get("policy_ok"))) for item in results.values()],
@@ -2423,32 +2609,8 @@ class Supervisor:
         )
         if status == "OPEN":
             raise ActionRetry("overlap runs are not terminal yet")
-        overlapping = False
         allow = results.get("allow") or {}
-        if status != "UNKNOWN" and allow.get("terminal"):
-            allow_id = record["keys"]["allow"]["definition"]
-            all_runs = [
-                run
-                for run in snapshot["runs"]
-                if run.get("definition_id") == allow_id
-                and run.get("started_at")
-                and run.get("finished_at")
-                and parse_iso(run["started_at"]) >= probe_started - dt.timedelta(seconds=30)
-            ]
-            for index, first in enumerate(all_runs):
-                for second in all_runs[index + 1 :]:
-                    if parse_iso(first["started_at"]) < parse_iso(second["finished_at"]) and parse_iso(
-                        second["started_at"]
-                    ) < parse_iso(first["finished_at"]):
-                        overlapping = True
-            allow["overlap_observed"] = overlapping
-            allow["policy_ok"] = bool(allow.get("policy_ok") and overlapping)
-            if not allow["policy_ok"]:
-                status = "FAIL"
-        elif status != "UNKNOWN":
-            allow["overlap_observed"] = False
-            allow["policy_ok"] = False
-            status = "FAIL"
+        overlap_observed = bool(allow.get("policy_ok"))
         if status == "UNKNOWN":
             finding = (
                 "overlap observation window of %ss ended before every slot had a terminal run"
@@ -2474,8 +2636,8 @@ class Supervisor:
             {
                 "status": "PASS" if execution_passed else status,
                 "run": (allow.get("runs") or [None])[0],
-                "execution_state": allow.get("execution_state"),
-                "overlap_observed": allow.get("overlap_observed"),
+                "execution_state": (allow.get("runs") or [{}])[-1].get("state") if allow.get("runs") else None,
+                "overlap_observed": overlap_observed,
                 "finding": None if execution_passed else finding,
             },
         )
@@ -2495,7 +2657,7 @@ class Supervisor:
     def do_fault_kill(self, name: str) -> Dict[str, Any]:
         suffix = name.rsplit("_", 1)[-1]
         lane = self._fault_lane()
-        self._wait_for_active_run("fault")
+        active = self._wait_for_active_run("fault")
         pid = int(lane.get("serve_pid") or 0)
         command = pid_cmdline(pid)
         if not pid_alive(pid) or str(lane["home"]) not in command or "schedule" not in command:
@@ -2516,6 +2678,7 @@ class Supervisor:
                 "killed_at": killed_at,
                 "effect_before": before,
                 "runtime_pids": [row["pid"] for row in runtimes],
+                "active_runs": [active.get("id")],
             }
         )
         lane["serve_pid"] = None
@@ -2549,48 +2712,37 @@ class Supervisor:
             raise ActionRetry("no dispatcher kill recorded for %s yet" % suffix)
         killed_at = parse_iso(kill["killed_at"])
         snapshot = read_schedule(Path(lane["home"]))
-        definitions = {row["id"]: row for row in snapshot["definitions"]}
         fault_id = self._definition_id("fault", "fault")
-        unknown = []
-        duplicates = []
-        for occurrence in snapshot["occurrences"]:
-            runs = occurrence.get("runs", [])
-            if occurrence.get("definition_id") != fault_id:
-                continue
-            if len(runs) > 1:
-                duplicates.append(occurrence.get("id"))
-            for run in runs:
-                if run.get("state") == "unknown" and run.get("started_at") and parse_iso(run["started_at"]) <= killed_at + dt.timedelta(seconds=5):
-                    unknown.append(
-                        {
-                            "run": run.get("id"),
-                            "occurrence": occurrence.get("id"),
-                            "occurrence_state": occurrence.get("state"),
-                            "delivered_at": run.get("delivered_at"),
-                            "running_at": run.get("running_at"),
-                            "error": redact(str(run.get("error"))) if run.get("error") else None,
-                        }
-                    )
-        later_success = [
-            run
-            for run in snapshot["runs"]
-            if run.get("definition_id") == fault_id
-            and run.get("state") == "succeeded"
-            and run.get("started_at")
-            and parse_iso(run["started_at"]) > killed_at
-        ]
-        if not unknown or not later_success:
+        facts = fault_recovery_facts(
+            snapshot,
+            fault_id,
+            killed_at,
+            kill.get("active_runs") or [],
+        )
+        if not facts["affected"]:
+            raise ActionRetry("the killed dispatcher's in-flight run is not visible yet")
+        if facts["stuck"] or not facts["later_success"]:
             raise ActionRetry(
-                "recovery facts are not visible yet (unknown=%d later_success=%d)"
-                % (len(unknown), len(later_success))
+                "recovery facts are not visible yet (stuck=%d recovered=%d unknown=%d later_success=%d)"
+                % (
+                    len(facts["stuck"]),
+                    len(facts["recovered"]),
+                    len(facts["unknown"]),
+                    facts["later_success"],
+                )
             )
         payload = {
             "suffix": suffix,
-            "unknown_runs": unknown,
-            "duplicate_occurrences": duplicates,
-            "later_success": len(later_success),
-            "passed": bool(unknown) and not duplicates and bool(later_success),
-            "note": "an unknown run is not retried; a later occurrence starts fresh",
+            "affected_runs": facts["affected"],
+            "recovered_succeeded": facts["recovered"],
+            "unknown_runs": facts["unknown"],
+            "duplicate_occurrences": facts["duplicate_occurrences"],
+            "later_success": facts["later_success"],
+            "passed": facts["passed"],
+            "note": (
+                "a restarted dispatcher observes the runtime's terminal record and settles the "
+                "run it lost; a lost outcome is settled unknown and is never re-delivered"
+            ),
         }
         self.mark("S5_dispatcher_" + suffix, payload["passed"], payload)
         return payload
@@ -2703,41 +2855,23 @@ class Supervisor:
             raise ActionRetry("misfire offline window is incomplete")
         lane = lane_by_name(self.lanes, "misfire")
         snapshot = read_schedule(Path(lane["home"]))
-        definitions = {row["id"]: row for row in snapshot["definitions"]}
         definition_ids = {key: self._definition_id("misfire", key) for key in ("skip", "runonce")}
-        off_at = parse_iso(window["off_at"])
-        on_at = parse_iso(window["on_at"])
-        skip_occurrences = [
-            occurrence for occurrence in snapshot["occurrences"] if occurrence.get("definition_id") == definition_ids["skip"]
-        ]
-        runonce_runs = [
-            run for run in snapshot["runs"] if run.get("definition_id") == definition_ids["runonce"]
-        ]
-        skip_missed = [
-            occurrence
-            for occurrence in skip_occurrences
-            if occurrence.get("state") == "missed"
-            and occurrence.get("scheduled_for")
-            and parse_iso(occurrence["scheduled_for"]) <= on_at
-        ]
-        runonce_recovered = [
-            run
-            for run in runonce_runs
-            if run.get("started_at") and parse_iso(run["started_at"]) >= on_at - dt.timedelta(seconds=5)
-        ]
-        if not skip_missed and not runonce_recovered:
+        facts = misfire_facts(
+            snapshot,
+            definition_ids,
+            parse_iso(window["off_at"]),
+            parse_iso(window["on_at"]),
+        )
+        if not facts["skip_missed"] and not facts["recovered"]:
             raise ActionRetry("misfire policy outcome is not visible yet")
-        duplicates = [occurrence.get("id") for occurrence in skip_occurrences + [] if int(occurrence.get("run_count") or 0) > 1]
         payload = {
             "off_at": window["off_at"],
             "on_at": window["on_at"],
-            "skip_missed": len(skip_missed),
-            "runonce_recovered": len(runonce_recovered),
-            "runonce_states": [run.get("state") for run in runonce_recovered],
-            "duplicates": duplicates,
-            "passed": bool(skip_missed) and len(runonce_recovered) >= 1 and not duplicates and all(
-                run.get("state") in ("succeeded", "unknown", "failed") for run in runonce_recovered
-            ),
+            "skip_missed": facts["skip_missed"],
+            "runonce_recovered": len(facts["recovered"]),
+            "runonce_states": [run.get("state") for run in facts["recovered"]],
+            "duplicates": facts["duplicates"],
+            "passed": facts["passed"],
             "note": "the store keeps at most one pending slot; intermediate offline grid points are not materialized",
         }
         self.mark("S6_misfire", payload["passed"], payload)
@@ -3229,14 +3363,15 @@ def aggregate_run(
         for spec in specs_by_lane.get(lane_name, []):
             expected = _expected_slots(spec, start_at, deadline)
             effect = lane_effects.get(spec.key) or {}
-            succeeded = succeeded_by_definition.get(str(lane.get("defs", {}).get(spec.key, ""))) or 0
+            definition_id = definition_id_for(lane.get("defs"), spec.key)
+            succeeded = effect_success_count(succeeded_by_definition, lane.get("defs"), spec.key)
             if expected is not None:
                 expected_slots[lane_name + "." + spec.key] = {
                     "expected_grid_slots": expected,
                     "materialized_occurrences": sum(
                         1
                         for occurrence in snapshot["occurrences"]
-                        if occurrence.get("definition_id") == lane.get("defs", {}).get(spec.key)
+                        if occurrence.get("definition_id") == definition_id
                     ),
                     "note": "materialized occurrences are authoritative; grid slots may be coalesced",
                 }

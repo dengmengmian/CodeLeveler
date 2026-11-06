@@ -79,21 +79,6 @@ class TriggerTests(unittest.TestCase):
 
 
 class S4Tests(unittest.TestCase):
-    def test_allow_claim_counts_only_a_slot_claimed_while_active(self):
-        active = {"finished_at": "2026-11-06T08:21:42.924Z"}
-        claimed = [{"started_at": "2026-11-06T08:20:34.967Z"}]
-        queued = [{"started_at": "2026-11-06T08:22:48.020Z"}]
-        self.assertTrue(soak.allow_claim_while_active(claimed, active))
-        self.assertFalse(soak.allow_claim_while_active(queued, active))
-
-    def test_allow_claim_rejects_duplicate_runs(self):
-        active = {"finished_at": "2026-11-06T08:21:42.924Z"}
-        runs = [
-            {"started_at": "2026-11-06T08:20:34.967Z"},
-            {"started_at": "2026-11-06T08:20:35.000Z"},
-        ]
-        self.assertFalse(soak.allow_claim_while_active(runs, active))
-
     def test_allow_execution_is_a_gating_check(self):
         self.assertIn("S4_allow_execution_1", soak.required_checks("dry-run"))
         required = soak.required_checks("soak")
@@ -120,6 +105,247 @@ class S4Tests(unittest.TestCase):
         args = soak._add_args({"repo": "/tmp/workspace"}, spec)
         self.assertIn("--session-policy", args)
         self.assertEqual(args[args.index("--session-policy") + 1], "fresh")
+
+
+class EffectAccountingTests(unittest.TestCase):
+    def test_a_spec_key_resolves_to_the_created_definition_id(self):
+        defs = {"queue": {"id": "def-1", "name": "soak-overlap-queue", "spec": {}}}
+        self.assertEqual(soak.definition_id_for(defs, "queue"), "def-1")
+        self.assertEqual(soak.effect_success_count({"def-1": 3}, defs, "queue"), 3)
+
+    def test_a_legacy_string_mapping_still_resolves(self):
+        self.assertEqual(soak.definition_id_for({"queue": "def-1"}, "queue"), "def-1")
+        self.assertEqual(soak.effect_success_count({"def-1": 2}, {"queue": "def-1"}, "queue"), 2)
+
+    def test_a_missing_definition_is_zero_successes(self):
+        self.assertIsNone(soak.definition_id_for({}, "queue"))
+        self.assertEqual(soak.effect_success_count({"def-1": 2}, {}, "queue"), 0)
+
+
+class NaturalOverlapTests(unittest.TestCase):
+    def _snapshot(self, runs, occurrences):
+        return {"definitions": [], "runs": runs, "occurrences": occurrences}
+
+    def _run(self, run_id, state, started, finished=None):
+        return {
+            "id": run_id,
+            "definition_id": "def",
+            "state": state,
+            "started_at": started,
+            "finished_at": finished,
+        }
+
+    def test_a_skipped_slot_due_inside_an_active_run_is_observed(self):
+        runs = [self._run("a", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:02:00Z")]
+        occurrences = [
+            {
+                "id": "occ",
+                "definition_id": "def",
+                "scheduled_for": "2026-11-06T00:01:00Z",
+                "state": "skipped",
+                "runs": [self._run("s", "skipped", "2026-11-06T00:02:05Z", "2026-11-06T00:02:05Z")],
+            }
+        ]
+        found = soak.natural_overlap_observation(
+            self._snapshot(runs, occurrences), {"skip": "def"}, soak.parse_iso("2026-11-06T00:00:30Z")
+        )["skip"]
+        self.assertFalse(found.get("missing"), found)
+        self.assertTrue(found["terminal"])
+        self.assertTrue(found["policy_ok"])
+
+    def test_a_queue_run_starts_after_the_active_run_finishes(self):
+        runs = [self._run("a", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:02:00Z")]
+        occurrences = [
+            {
+                "id": "occ",
+                "definition_id": "def",
+                "scheduled_for": "2026-11-06T00:01:00Z",
+                "state": "completed",
+                "runs": [
+                    self._run("q", "succeeded", "2026-11-06T00:02:01Z", "2026-11-06T00:03:00Z")
+                ],
+            }
+        ]
+        found = soak.natural_overlap_observation(
+            self._snapshot(runs, occurrences), {"queue": "def"}, soak.parse_iso("2026-11-06T00:00:30Z")
+        )["queue"]
+        self.assertTrue(found["policy_ok"], found)
+        self.assertTrue(found["terminal"])
+
+    def test_a_queue_run_that_started_early_is_not_queue_one(self):
+        runs = [self._run("a", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:02:00Z")]
+        occurrences = [
+            {
+                "id": "occ",
+                "definition_id": "def",
+                "scheduled_for": "2026-11-06T00:01:00Z",
+                "state": "completed",
+                "runs": [
+                    self._run("q", "succeeded", "2026-11-06T00:01:30Z", "2026-11-06T00:02:30Z")
+                ],
+            }
+        ]
+        found = soak.natural_overlap_observation(
+            self._snapshot(runs, occurrences), {"queue": "def"}, soak.parse_iso("2026-11-06T00:00:30Z")
+        )["queue"]
+        self.assertFalse(found["policy_ok"], found)
+
+    def test_a_second_allow_run_started_while_the_first_is_active(self):
+        runs = [
+            self._run("a", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:02:00Z"),
+            self._run("b", "succeeded", "2026-11-06T00:01:00Z", "2026-11-06T00:03:00Z"),
+        ]
+        found = soak.natural_overlap_observation(
+            self._snapshot(runs, []), {"allow": "def"}, soak.parse_iso("2026-11-06T00:00:30Z")
+        )["allow"]
+        self.assertTrue(found["policy_ok"], found)
+        self.assertTrue(found["terminal"])
+
+    def test_a_second_allow_run_after_the_first_finished_is_not_overlap(self):
+        runs = [
+            self._run("a", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:02:00Z"),
+            self._run("b", "succeeded", "2026-11-06T00:02:30Z", "2026-11-06T00:03:30Z"),
+        ]
+        found = soak.natural_overlap_observation(
+            self._snapshot(runs, []), {"allow": "def"}, soak.parse_iso("2026-11-06T00:00:30Z")
+        )["allow"]
+        self.assertFalse(found["policy_ok"], found)
+
+
+class FaultRecoveryTests(unittest.TestCase):
+    def _snapshot(self, runs, occurrences=None):
+        return {"definitions": [], "runs": runs, "occurrences": occurrences or []}
+
+    def _run(self, run_id, state, started, finished=None, occurrence="o"):
+        return {
+            "id": run_id,
+            "definition_id": "fault-def",
+            "occurrence_id": occurrence,
+            "state": state,
+            "started_at": started,
+            "finished_at": finished,
+        }
+
+    def test_a_dispatcher_kill_that_recovers_the_outcome_is_a_pass(self):
+        runs = [
+            self._run("inflight", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:05:00Z"),
+            self._run("later", "succeeded", "2026-11-06T00:06:00Z", "2026-11-06T00:06:30Z", "o2"),
+        ]
+        facts = soak.fault_recovery_facts(
+            self._snapshot(runs),
+            "fault-def",
+            soak.parse_iso("2026-11-06T00:00:30Z"),
+            ["inflight"],
+        )
+        self.assertEqual(facts["unknown"], [])
+        self.assertEqual(facts["recovered"], ["inflight"])
+        self.assertTrue(facts["passed"], facts)
+
+    def test_a_run_that_never_settles_fails_the_recovery(self):
+        runs = [self._run("inflight", "running", "2026-11-06T00:00:00Z")]
+        facts = soak.fault_recovery_facts(
+            self._snapshot(runs),
+            "fault-def",
+            soak.parse_iso("2026-11-06T00:00:30Z"),
+            ["inflight"],
+        )
+        self.assertEqual(facts["stuck"], ["inflight"])
+        self.assertFalse(facts["passed"], facts)
+
+    def test_a_duplicate_occurrence_run_fails_the_recovery(self):
+        runs = [
+            self._run("inflight", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:05:00Z"),
+            self._run("again", "succeeded", "2026-11-06T00:00:40Z", "2026-11-06T00:01:00Z"),
+            self._run("later", "succeeded", "2026-11-06T00:06:00Z", "2026-11-06T00:06:30Z", "o2"),
+        ]
+        facts = soak.fault_recovery_facts(
+            self._snapshot(runs),
+            "fault-def",
+            soak.parse_iso("2026-11-06T00:00:30Z"),
+            ["inflight"],
+        )
+        self.assertEqual(facts["duplicate_occurrences"], ["o"])
+        self.assertFalse(facts["passed"], facts)
+
+    def test_no_later_success_means_dispatch_did_not_resume(self):
+        runs = [self._run("inflight", "succeeded", "2026-11-06T00:00:00Z", "2026-11-06T00:05:00Z")]
+        facts = soak.fault_recovery_facts(
+            self._snapshot(runs),
+            "fault-def",
+            soak.parse_iso("2026-11-06T00:00:30Z"),
+            ["inflight"],
+        )
+        self.assertEqual(facts["later_success"], 0)
+        self.assertFalse(facts["passed"], facts)
+
+
+class MisfireTests(unittest.TestCase):
+    def _snapshot(self):
+        def run(run_id, state, started, finished=None):
+            return {
+                "id": run_id,
+                "definition_id": "runonce-def",
+                "state": state,
+                "started_at": started,
+                "finished_at": finished,
+            }
+
+        return {
+            "definitions": [],
+            "runs": [
+                run("recovered", "succeeded", "2026-11-06T00:02:50Z", "2026-11-06T00:03:55Z"),
+                run("next", "running", "2026-11-06T00:03:55Z"),
+            ],
+            "occurrences": [
+                {
+                    "id": "offline",
+                    "definition_id": "runonce-def",
+                    "scheduled_for": "2026-11-06T00:00:53Z",
+                    "state": "completed",
+                    "runs": [
+                        run("recovered", "succeeded", "2026-11-06T00:02:50Z", "2026-11-06T00:03:55Z")
+                    ],
+                },
+                {
+                    "id": "after-on",
+                    "definition_id": "runonce-def",
+                    "scheduled_for": "2026-11-06T00:03:53Z",
+                    "state": "claimed",
+                    "runs": [run("next", "running", "2026-11-06T00:03:55Z")],
+                },
+                {
+                    "id": "skip-offline",
+                    "definition_id": "skip-def",
+                    "scheduled_for": "2026-11-06T00:00:53Z",
+                    "state": "missed",
+                    "runs": [],
+                },
+            ],
+        }
+
+    def test_only_the_offline_window_recovery_run_counts(self):
+        facts = soak.misfire_facts(
+            self._snapshot(),
+            {"skip": "skip-def", "runonce": "runonce-def"},
+            soak.parse_iso("2026-11-06T00:00:50Z"),
+            soak.parse_iso("2026-11-06T00:02:50Z"),
+        )
+        self.assertEqual(facts["skip_missed"], 1)
+        self.assertEqual(len(facts["recovered"]), 1)
+        self.assertEqual(facts["recovered"][0]["id"], "recovered")
+        self.assertTrue(facts["passed"], facts)
+
+    def test_an_offline_run_started_before_on_is_not_a_recovery(self):
+        snapshot = self._snapshot()
+        snapshot["occurrences"][0]["runs"][0]["started_at"] = "2026-11-06T00:00:10Z"
+        facts = soak.misfire_facts(
+            snapshot,
+            {"skip": "skip-def", "runonce": "runonce-def"},
+            soak.parse_iso("2026-11-06T00:00:50Z"),
+            soak.parse_iso("2026-11-06T00:02:50Z"),
+        )
+        self.assertEqual(facts["recovered"], [])
+        self.assertFalse(facts["passed"], facts)
 
 
 class RecoveryTests(unittest.TestCase):
@@ -402,10 +628,6 @@ class GateTests(unittest.TestCase):
         return soak.derive_checks(evidence or self._evidence(), {}, self._plan(), cleanup or self._cleanup())
 
     def test_empty_skip_and_queue_runs_are_not_a_pass(self):
-        skipped = {"state": "skipped"}
-        self.assertFalse(soak.runs_observed_terminal([]))
-        self.assertFalse(soak.overlap_policy_ok("skip", skipped, [], {}))
-        self.assertFalse(soak.overlap_policy_ok("queue", {}, [], {}))
         self.assertEqual(soak.overlap_observation_status(False, False, 10), "OPEN")
         self.assertEqual(soak.overlap_observation_status(False, False, soak.OVERLAP_OBSERVE_SECS), "UNKNOWN")
         self.assertEqual(soak.overlap_probe_status([(False, False)], soak.OVERLAP_OBSERVE_SECS), "UNKNOWN")
@@ -413,14 +635,6 @@ class GateTests(unittest.TestCase):
 
     def test_a_terminal_policy_violation_fails_without_waiting(self):
         self.assertEqual(soak.overlap_probe_status([(True, False), (False, False)], 1), "FAIL")
-        self.assertTrue(
-            soak.overlap_policy_ok("skip", {"state": "skipped"}, [{"state": "skipped"}], {})
-        )
-        active = {"finished_at": "2026-11-06T00:02:00Z"}
-        queued = [{"state": "succeeded", "started_at": "2026-11-06T00:03:00Z"}]
-        early = [{"state": "succeeded", "started_at": "2026-11-06T00:01:00Z"}]
-        self.assertTrue(soak.overlap_policy_ok("queue", {}, queued, active))
-        self.assertFalse(soak.overlap_policy_ok("queue", {}, early, active))
 
     def test_a_non_fault_shell_failure_fails_the_shell_gate(self):
         evidence = self._evidence()
@@ -471,6 +685,19 @@ class GateTests(unittest.TestCase):
         checks = self._checks(evidence)
         self.assertGreater(checks["S1_occurrences"]["detail"]["duplicate_side_effects"], 0)
         self.assertFalse(checks["S1_occurrences"]["passed"])
+
+    def test_a_fault_unknown_line_within_the_allowance_is_not_a_duplicate(self):
+        evidence = self._evidence()
+        evidence["lanes"]["fault"] = {
+            "run_states": {"succeeded": 4, "unknown": 1},
+            "wakeups": {"max_gap_secs": 60},
+            "effects": {
+                "fault": {"lines": 5, "succeeded_runs": 4, "effect_matches_success": True}
+            },
+        }
+        checks = self._checks(evidence)
+        self.assertEqual(checks["S1_occurrences"]["detail"]["duplicate_side_effects"], 0)
+        self.assertTrue(checks["S_effect_match"]["passed"], checks["S_effect_match"])
 
     def test_wake_gap_agent_ratio_rss_growth_and_orphans_use_frozen_thresholds(self):
         healthy = self._checks()
