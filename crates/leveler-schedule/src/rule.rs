@@ -345,6 +345,30 @@ impl ScheduleTrigger {
         }
     }
 
+    /// The slot a definition change must leave behind.
+    ///
+    /// An update re-declares the rule, so the replacement slot is the first
+    /// slot the new rule offers at `now`. A one-off has no successor, but its
+    /// declared instant is still its only slot: as on creation, a past instant
+    /// is due now rather than absent. Recurring rules keep their update
+    /// semantics and advance to the first slot strictly after `now`, so editing
+    /// an interval never resurrects its old anchor as an immediate run.
+    ///
+    /// Returning an error instead of `None` is deliberate: a successful update
+    /// that leaves the definition without a slot would silently stop the
+    /// schedule while the stored rule claims to be runnable.
+    pub fn replacement_occurrence(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, ScheduleError> {
+        match self {
+            Self::Once { at } => Ok(*at),
+            _ => self.next_after(now)?.ok_or_else(|| {
+                ScheduleError::Invalid("the trigger has no future occurrence".into())
+            }),
+        }
+    }
+
     /// The first occurrence strictly after `now`. `None` only for a one-off,
     /// which has no successor.
     pub fn next_after(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, ScheduleError> {
@@ -666,6 +690,58 @@ mod tests {
                 .first_occurrence(at("2026-01-02T00:00:00Z"))
                 .expect("first"),
             at("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn replacement_keeps_a_one_off_at_its_declared_instant() {
+        let trigger = ScheduleTrigger::Once {
+            at: at("2026-01-01T00:00:00Z"),
+        };
+        assert_eq!(
+            trigger
+                .replacement_occurrence(at("2025-12-31T00:00:00Z"))
+                .expect("future replacement"),
+            at("2026-01-01T00:00:00Z")
+        );
+        // A past declaration is still the one-off's only slot: it is due now,
+        // exactly as it is when the definition is created.
+        assert_eq!(
+            trigger
+                .replacement_occurrence(at("2026-01-02T00:00:00Z"))
+                .expect("past replacement"),
+            at("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn replacement_advances_a_recurring_rule_past_its_old_anchor() {
+        let trigger = ScheduleTrigger::Every {
+            anchor: at("2026-01-01T00:00:00Z"),
+            every: Duration::from_secs(3600),
+        };
+        // The anchor is already in the past. An update must schedule the next
+        // grid point, not resurrect the anchor as an immediate run.
+        assert_eq!(
+            trigger
+                .replacement_occurrence(at("2026-01-01T05:30:00Z"))
+                .expect("replacement"),
+            at("2026-01-01T06:00:00Z")
+        );
+    }
+
+    #[test]
+    fn replacement_rejects_a_rule_with_no_future_occurrence() {
+        // February 30 never exists: the update must refuse rather than store a
+        // definition whose only slot was silently dropped.
+        let never = ScheduleTrigger::Cron {
+            expression: "0 0 30 2 *".into(),
+            timezone: parse_timezone("UTC").expect("zone"),
+        };
+        assert!(
+            never
+                .replacement_occurrence(at("2026-01-01T00:00:00Z"))
+                .is_err()
         );
     }
 

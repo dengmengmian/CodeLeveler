@@ -307,3 +307,70 @@ fn full_access_is_not_projected_as_an_unattended_grant() {
         "text show still equates Full Access with a grant: {stdout}"
     );
 }
+
+/// The stored timestamps keep milliseconds; use the same precision so the
+/// value read back from SQLite compares equal to the one the test sent.
+fn future(offset_secs: i64) -> (chrono::DateTime<chrono::Utc>, String) {
+    let millis = chrono::Utc::now().timestamp_millis() + offset_secs * 1000;
+    let at = chrono::DateTime::from_timestamp_millis(millis).expect("timestamp");
+    (at, at.to_rfc3339())
+}
+
+fn next_occurrence(json: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
+    json["next_occurrence"]
+        .as_str()
+        .expect("the schedule must expose its next occurrence")
+        .parse()
+        .expect("a projected timestamp")
+}
+
+/// A one-off's only slot is its declared instant. Changing that instant must
+/// move the slot; before the fix the update deleted the pending occurrence and
+/// left the definition with no next run.
+#[test]
+fn updating_a_one_off_moves_the_next_occurrence() {
+    let home = scratch("once-update");
+    let workspace = workspace(&home);
+    let workspace_text = workspace.display().to_string();
+    let (t1, t1_text) = future(3_600);
+    let (t2, t2_text) = future(7_200);
+
+    let created = json(&leveler(
+        &home,
+        &workspace,
+        &[
+            "schedule",
+            "add",
+            "--workspace",
+            &workspace_text,
+            "--name",
+            "one off",
+            "--at",
+            &t1_text,
+            "--command",
+            "printf once",
+            "--json",
+        ],
+    ));
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(next_occurrence(&created), t1);
+
+    let updated = json(&leveler(
+        &home,
+        &workspace,
+        &["schedule", "update", &id, "--at", &t2_text, "--json"],
+    ));
+    assert_eq!(updated["trigger"]["kind"], "once");
+    assert_eq!(next_occurrence(&updated), t2);
+
+    let shown = json(&leveler(
+        &home,
+        &workspace,
+        &["schedule", "show", &id, "--json"],
+    ));
+    assert_eq!(
+        next_occurrence(&shown),
+        t2,
+        "another process reading the same store must see the new slot"
+    );
+}
