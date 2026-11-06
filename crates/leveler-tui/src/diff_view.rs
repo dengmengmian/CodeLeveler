@@ -633,7 +633,7 @@ fn changed_ranges(old: &str, new: &str) -> (InlineRanges, InlineRanges) {
         || new_mid.len() > INLINE_MAX_TOKENS
         || old_mid.len() * new_mid.len() > INLINE_MAX_CELLS
     {
-        vec![old_mid[0].0..old_mid[old_mid.len() - 1].1]
+        whole_token_span(old_mid)
     } else {
         unmatched_ranges(old, old_mid, new, new_mid)
     };
@@ -643,11 +643,20 @@ fn changed_ranges(old: &str, new: &str) -> (InlineRanges, InlineRanges) {
         || new_mid.len() > INLINE_MAX_TOKENS
         || old_mid.len() * new_mid.len() > INLINE_MAX_CELLS
     {
-        vec![new_mid[0].0..new_mid[new_mid.len() - 1].1]
+        whole_token_span(new_mid)
     } else {
         unmatched_ranges(new, new_mid, old, old_mid)
     };
     (changed_old, changed_new)
+}
+
+/// One byte span from the first token start through the last token end.
+///
+/// This is the LCS fallback: a single [`Range`] over the whole changed run,
+/// including any token the table would have matched in the middle. It is not
+/// one element per index.
+fn whole_token_span(tokens: &[(usize, usize)]) -> InlineRanges {
+    std::iter::once(tokens[0].0..tokens[tokens.len() - 1].1).collect()
 }
 
 /// Ranges of `side` tokens that are not part of an LCS with the other side.
@@ -1967,6 +1976,39 @@ mod tests {
             Some(Theme::dark().diff.removed_bg),
             "the common prefix keeps the row band"
         );
+    }
+
+    fn span_bounds(ranges: &[std::ops::Range<usize>]) -> Vec<(usize, usize)> {
+        ranges
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect()
+    }
+
+    #[test]
+    fn inline_span_small_change_keeps_only_the_changed_token() {
+        let (old_ranges, new_ranges) = changed_ranges("aa X bb", "aa Y bb");
+        assert_eq!(span_bounds(&old_ranges), [(3, 4)]);
+        assert_eq!(span_bounds(&new_ranges), [(3, 4)]);
+    }
+
+    #[test]
+    fn inline_span_below_the_token_cap_leaves_a_shared_middle_token_unhighlighted() {
+        let old = format!("{}A{}", ".".repeat(200), ".".repeat(200));
+        let new = format!("{}A{}", ",".repeat(200), ",".repeat(200));
+        let (old_ranges, new_ranges) = changed_ranges(&old, &new);
+        assert_eq!(span_bounds(&old_ranges), [(0, 200), (201, 401)]);
+        assert_eq!(span_bounds(&new_ranges), [(0, 200), (201, 401)]);
+    }
+
+    #[test]
+    fn inline_span_coarse_fallback_is_one_span_over_the_whole_changed_run() {
+        let old = format!("{}A{}", ".".repeat(300), ".".repeat(300));
+        let new = format!("{}A{}", ",".repeat(300), ",".repeat(300));
+        let (old_ranges, new_ranges) = changed_ranges(&old, &new);
+        assert_eq!(span_bounds(&old_ranges), [(0, old.len())]);
+        assert_eq!(span_bounds(&new_ranges), [(0, new.len())]);
+        assert_eq!(old.len(), 601);
     }
 
     #[test]
