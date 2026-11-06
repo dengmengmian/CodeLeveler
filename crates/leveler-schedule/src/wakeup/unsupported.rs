@@ -37,6 +37,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::wakeup::WAKE_INTERVAL;
 
     #[tokio::test]
     async fn the_unsupported_backend_reports_absence_instead_of_pretending() {
