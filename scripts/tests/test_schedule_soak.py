@@ -319,6 +319,21 @@ class PreflightIdentityTests(unittest.TestCase):
         self.assertEqual(create.source_tree, "/tmp/candidate-src")
 
 
+class ReportTests(unittest.TestCase):
+    def test_report_identity_names_the_terminal_reason_and_duration(self):
+        report = {
+            "run_id": "run",
+            "verdict": "FAIL",
+            "stop_reason": "dead-runner",
+            "duration_secs": 12,
+            "binary": {},
+            "verdict_reasons": [],
+        }
+        text = soak.render_report(report)
+        self.assertIn("| stop_reason | dead-runner |", text)
+        self.assertIn("| duration_secs | 12 |", text)
+
+
 class PlanTests(unittest.TestCase):
     def test_soak_mode_schedules_the_rule_check(self):
         names = [action["name"] for action in soak.initial_actions("soak", 0.0)]

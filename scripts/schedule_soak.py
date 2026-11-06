@@ -3748,7 +3748,17 @@ def render_report(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("| Field | Value |")
     lines.append("| --- | --- |")
-    for key in ("run_id", "mode", "commit", "start_at", "deadline_at", "finished_at", "runner_pid"):
+    for key in (
+        "run_id",
+        "mode",
+        "commit",
+        "start_at",
+        "deadline_at",
+        "finished_at",
+        "stop_reason",
+        "duration_secs",
+        "runner_pid",
+    ):
         lines.append("| %s | %s |" % (key, report.get(key)))
     binary = report.get("binary") or {}
     lines.append("| binary | `%s` |" % binary.get("path"))
@@ -4048,6 +4058,8 @@ def finalize_run(
             "checks": checks,
             "verdict": verdict,
             "verdict_reasons": reasons,
+            "stop_reason": state.get("stop_reason"),
+            "duration_secs": state.get("duration_secs"),
             "resources": resource_summary(evidence.get("samples") or []),
         }
     )
