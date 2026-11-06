@@ -74,6 +74,9 @@ THRESHOLDS = {
 }
 
 REGISTRATION_PREFIX = "com.leveler.schedule."
+# A run that observes the host this close to a full disk stops and finalizes
+# while there is still room to write its own terminal evidence.
+DISK_FLOOR_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class SoakError(RuntimeError):
@@ -270,6 +273,57 @@ def label_for(home: Path) -> str:
 
 def plist_for(label: str) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / (label + ".plist")
+
+
+def disk_stop_reason(free_bytes: int, floor_bytes: int = DISK_FLOOR_BYTES) -> Optional[str]:
+    return "disk-low" if free_bytes < floor_bytes else None
+
+
+def plist_owned_by_run(content: str, live_root: Path) -> bool:
+    return str(live_root) in content
+
+
+def unregister_lane_fallback(
+    lane: Dict[str, Any], live_root: Path, recorder: "Recorder"
+) -> Dict[str, Any]:
+    """Unregister a lane without its binary, only when the plist is this run's.
+
+    The product CLI is the normal path. After a host restart the lane binary
+    under the (wiped) live root can be gone while the LaunchAgent remains
+    loaded; this fallback removes it only after the plist names the run's own
+    live root.
+    """
+    label = lane.get("label") or label_for(Path(lane["home"]))
+    plist = plist_for(label)
+    row: Dict[str, Any] = {
+        "lane": lane["name"],
+        "label": label,
+        "plist": str(plist),
+        "action": "no-plist",
+    }
+    if plist.is_file():
+        try:
+            content = plist.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            row.update(action="unreadable", error=redact(str(error)))
+        else:
+            if not plist_owned_by_run(content, live_root):
+                row["action"] = "refused-foreign-plist"
+            else:
+                result = run_command(
+                    ["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)], timeout=30
+                )
+                row.update(
+                    action="booted-out",
+                    returncode=result.returncode,
+                    error=redact((result.stderr or "").strip()[:400]) or None,
+                )
+                if result.returncode == 0 or not launchd_loaded(label):
+                    with contextlib.suppress(OSError):
+                        plist.unlink()
+                        row["plist_removed"] = True
+    recorder.event("launchd_bootout_fallback", **row)
+    return row
 
 
 def allow_claim_while_active(runs: Sequence[Dict[str, Any]], active: Dict[str, Any]) -> bool:
@@ -2000,6 +2054,7 @@ class Supervisor:
                     action["name"] for action in self.state.get("actions", []) if action["status"] == "pending"
                 ],
                 "budget_stopped": self.state.get("budget_stopped", False),
+                "disk_free_bytes": self.state.get("disk_free_bytes"),
             }
         )
 
@@ -2044,6 +2099,7 @@ class Supervisor:
         next_sample = 0.0
         next_budget = 0.0
         next_heartbeat = 0.0
+        next_disk = 0.0
         while True:
             now = time.time()
             if self.stop_requested:
@@ -2054,6 +2110,23 @@ class Supervisor:
                 self.state["stop_reason"] = "deadline"
                 self.recorder.event("deadline_reached", deadline=self.plan["deadline_at"])
                 return
+            if now >= next_disk:
+                usage = shutil.disk_usage(str(self.paths.live_root or "/tmp"))
+                self.state["disk_free_bytes"] = usage.free
+                reason = disk_stop_reason(usage.free)
+                if reason:
+                    record_runner_error(
+                        self.state,
+                        "disk",
+                        "free space %d bytes is below the %d byte floor"
+                        % (usage.free, DISK_FLOOR_BYTES),
+                    )
+                    self.recorder.event(
+                        "disk_low", free_bytes=usage.free, floor_bytes=DISK_FLOOR_BYTES
+                    )
+                    self.state["stop_reason"] = reason
+                    return
+                next_disk = now + 10
             for action in list(self.state.get("actions", [])):
                 if action["status"] != "pending" or now < action["due_at"]:
                     continue
@@ -3589,8 +3662,16 @@ def cleanup_run(
     for lane in lanes.values():
         status = registration_status(lane)
         if status["plist_exists"] or status["loaded"]:
-            with contextlib.suppress(Exception):
+            try:
                 disabled[lane["name"]] = disable_lane(lane, recorder)
+            except Exception as error:  # noqa: BLE001 - the fallback must own this failure
+                message = redact(str(error))
+                recorder.event(
+                    "launchd_disable_failed", lane=lane["name"], error=message
+                )
+                disabled[lane["name"]] = unregister_lane_fallback(
+                    lane, Path(plan["live_root"]), recorder
+                )
     fault = lanes.get("fault")
     if fault and fault.get("serve_pid"):
         with contextlib.suppress(Exception):
@@ -4087,8 +4168,8 @@ def preflight() -> Dict[str, Any]:
         blockers.append("LEVELER_HOME points at the user's real home")
     live_root = Path("/tmp")
     usage = shutil.disk_usage(live_root)
-    if usage.free < 2 * 1024 * 1024 * 1024:
-        blockers.append("less than 2 GiB free under %s" % live_root)
+    if usage.free < DISK_FLOOR_BYTES:
+        blockers.append("less than %d GiB free under %s" % (DISK_FLOOR_BYTES // (1024**3), live_root))
     active = [row for row in active_evidence_runs() if row.get("runner_alive")]
     for row in active:
         blockers.append(

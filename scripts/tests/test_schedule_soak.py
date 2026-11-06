@@ -1,6 +1,7 @@
 import datetime as dt
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -200,6 +201,100 @@ class VerdictTests(unittest.TestCase):
         verdict, reasons = soak.compute_verdict(plan, {"duration_secs": 100}, checks)
         self.assertEqual(verdict, "FAIL")
         self.assertTrue(any("planned deadline" in reason for reason in reasons))
+
+
+class DiskGuardTests(unittest.TestCase):
+    def test_free_space_below_the_floor_stops_the_run(self):
+        self.assertEqual(soak.disk_stop_reason(1, 2), "disk-low")
+
+    def test_free_space_at_or_above_the_floor_keeps_running(self):
+        self.assertIsNone(soak.disk_stop_reason(2, 2))
+        self.assertIsNone(soak.disk_stop_reason(3, 2))
+
+
+class CleanupFallbackTests(unittest.TestCase):
+    def _recorder(self, root):
+        evidence = Path(root) / "evidence"
+        evidence.mkdir()
+        paths = soak.RunPaths.for_evidence(evidence, Path(root))
+        return soak.Recorder(paths)
+
+    def test_ownership_requires_the_run_live_root_in_the_plist(self):
+        self.assertTrue(
+            soak.plist_owned_by_run(
+                "<string>/private/tmp/lvs-run/homes/os</string>", Path("/private/tmp/lvs-run")
+            )
+        )
+        self.assertFalse(
+            soak.plist_owned_by_run(
+                "<string>/private/tmp/lvs-other/homes/os</string>", Path("/private/tmp/lvs-run")
+            )
+        )
+
+    def test_unregister_refuses_a_plist_owned_by_another_run(self):
+        import shutil
+        from unittest import mock
+
+        root = tempfile.mkdtemp(dir="/tmp", prefix="lvs-clean-test-")
+        try:
+            live = Path(root) / "lvs-run"
+            live.mkdir()
+            plist = Path(root) / "foreign.plist"
+            plist.write_text("<string>/private/tmp/lvs-other/homes/os</string>")
+            calls = []
+            with (
+                mock.patch.object(soak, "plist_for", return_value=plist),
+                mock.patch.object(
+                    soak,
+                    "run_command",
+                    side_effect=lambda args, **kw: calls.append(list(args))
+                    or subprocess.CompletedProcess(args, 0, "", ""),
+                ),
+            ):
+                row = soak.unregister_lane_fallback(
+                    {"name": "os", "label": "com.leveler.schedule.test"},
+                    live,
+                    self._recorder(root),
+                )
+            self.assertEqual(row["action"], "refused-foreign-plist")
+            self.assertEqual(calls, [])
+            self.assertTrue(plist.is_file())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_unregister_boots_out_and_removes_an_owned_plist(self):
+        import shutil
+        from unittest import mock
+
+        root = tempfile.mkdtemp(dir="/tmp", prefix="lvs-clean-test-")
+        try:
+            live = Path(root) / "lvs-run"
+            (live / "homes" / "os").mkdir(parents=True)
+            plist = Path(root) / "owned.plist"
+            plist.write_text("<string>%s</string>" % (live / "homes" / "os"))
+            calls = []
+            with (
+                mock.patch.object(soak, "plist_for", return_value=plist),
+                mock.patch.object(
+                    soak,
+                    "run_command",
+                    side_effect=lambda args, **kw: calls.append(list(args))
+                    or subprocess.CompletedProcess(args, 0, "", ""),
+                ),
+            ):
+                row = soak.unregister_lane_fallback(
+                    {"name": "os", "label": "com.leveler.schedule.test"},
+                    live,
+                    self._recorder(root),
+                )
+            self.assertEqual(row["action"], "booted-out")
+            self.assertEqual(
+                calls,
+                [["launchctl", "bootout", "gui/%d/com.leveler.schedule.test" % os.getuid()]],
+            )
+            self.assertFalse(plist.is_file())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 class PlanTests(unittest.TestCase):
