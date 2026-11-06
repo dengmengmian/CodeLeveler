@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::InteractiveRuntimeClient;
-use leveler_client_protocol::{ClientCommand, RuntimeEvent};
+use leveler_client_protocol::{ClientCommand, CommandEnvelope, CommandId, RuntimeEvent};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_test_support::{MockResponse, MockServer};
@@ -398,6 +398,80 @@ async fn busy_agent_turn_rejects_a_user_shell_without_side_effects() {
             "a rejected shell must not have touched the workspace"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_run_user_shell_rejects_a_busy_session_with_an_error() {
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let mut h = harness(&server).await;
+
+    // Occupy the session's single foreground slot.
+    let hold = leveler_test_support::sleep_shell_line(30);
+    h.client.send(run_shell(&h, &hold)).await.unwrap();
+    let execution = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), h.events.recv())
+            .await
+            .expect("started")
+            .expect("open");
+        if let RuntimeEvent::UserShellStarted { execution_id, .. } = ev {
+            break execution_id;
+        }
+    };
+
+    // A scheduled delivery carries a delivery identity, and a second turn
+    // cannot share this session. The runtime must refuse it and say so: an
+    // `Ok` here would acknowledge work that no execution will ever carry, so
+    // the dispatcher could only learn of the loss by timing out into
+    // `unknown`. Interactive callers keep the notice-only path.
+    let marker = h._tmp.path().join("delivered-marker.txt");
+    let origin = CommandId::new("schedule-run-busy-delivery");
+    let error = h
+        .client
+        .deliver(CommandEnvelope {
+            command_id: origin.clone(),
+            session_id: h.session_id.clone(),
+            expected_version: None,
+            issued_at: leveler_core::now().to_rfc3339(),
+            command: ClientCommand::RunUserShell {
+                session_id: h.session_id.clone(),
+                command: format!("touch '{}'", marker.display()),
+            },
+        })
+        .await
+        .expect_err("a busy session must not acknowledge a scheduled delivery");
+    assert!(
+        error.to_string().contains("Agent 正在运行"),
+        "expected the busy rejection, got: {error}"
+    );
+
+    // Nothing ran: the marker is absent and the session still owns exactly
+    // the one interactive execution.
+    assert!(
+        !marker.exists(),
+        "a rejected delivery must not touch the workspace"
+    );
+    let snapshot = h.client.snapshot(&h.session_id).await.unwrap();
+    assert_eq!(snapshot.user_shells.len(), 1, "{:?}", snapshot.user_shells);
+    assert!(snapshot.user_shells[0].origin_command_id.is_none());
+
+    h.client
+        .send(ClientCommand::CancelUserShell {
+            session_id: h.session_id.clone(),
+            execution_id: execution,
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Ok(ev)) = tokio::time::timeout(remaining, h.events.recv()).await else {
+            break;
+        };
+        if matches!(ev, RuntimeEvent::UserShellExited { .. }) {
+            return;
+        }
+    }
+    panic!("the held shell did not exit after cancel");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

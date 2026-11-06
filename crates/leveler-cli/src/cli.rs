@@ -841,7 +841,7 @@ pub enum ScheduleSource {
     Serve,
 }
 
-/// How a recurring agent schedule treats the session across runs.
+/// How a recurring schedule treats the session across runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScheduleSessionPolicy {
     /// Reuse one durable session; context accumulates deliberately.
@@ -859,7 +859,9 @@ pub enum ScheduleOverlap {
     /// Keep at most one pending slot; a later wake runs it once.
     #[value(name = "queue-one")]
     QueueOne,
-    /// Let runs overlap. Requires a side-effect-free or concurrency-safe action.
+    /// Let runs overlap. Requires a fresh session per run, so each run gets
+    /// its own execution context, and a side-effect-free or concurrency-safe
+    /// action.
     #[value(name = "allow-concurrent")]
     AllowConcurrent,
 }
@@ -942,7 +944,8 @@ pub enum ScheduleCommand {
         /// Model reference for an agent action.
         #[arg(long)]
         model: Option<String>,
-        /// Session reuse for an agent action.
+        /// Session reuse for an agent or shell action. `allow-concurrent`
+        /// requires `fresh`.
         #[arg(long, value_enum, default_value = "continue")]
         session_policy: ScheduleSessionPolicy,
         /// How an overlapping run is handled.

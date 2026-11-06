@@ -853,12 +853,16 @@ fn validate_declaration(
             "an agent schedule needs an explicit --model; the runtime never guesses one".into(),
         ));
     }
-    if action.kind() == ActionKind::Agent
+    // A run only gets an execution context of its own when its session is
+    // fresh. Shell and agent actions both run as a turn in one session, and a
+    // session admits one turn at a time, so overlapping runs that reuse the
+    // session would claim slots they can never execute.
+    if action.kind() != ActionKind::Native
         && overlap == OverlapPolicy::AllowConcurrent
         && session_policy == SessionPolicy::Continue
     {
         return Err(ScheduleError::Invalid(
-            "concurrent agent runs need a fresh session per run; two concurrent turns \
+            "concurrent runs need a fresh session per run; two concurrent turns \
              cannot share one session"
                 .into(),
         ));

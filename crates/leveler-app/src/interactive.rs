@@ -2440,6 +2440,28 @@ impl InProcessRuntimeClient {
             .send(RuntimeEvent::CheckpointCreated { checkpoint });
     }
 
+    /// Tell the user a direct shell command was rejected, or return the
+    /// rejection to the caller.
+    ///
+    /// A scheduled delivery has no user watching the session. Answering `Ok`
+    /// for work the runtime refused would acknowledge a delivery that no
+    /// execution will ever carry, leaving the dispatcher to discover the loss
+    /// only by timing out into `unknown`. Delivery callers therefore get a
+    /// definite error; interactive callers keep the notice-only behaviour.
+    fn reject_user_shell(
+        &self,
+        session_id: &SessionId,
+        origin: &Option<CommandId>,
+        message: String,
+    ) -> Result<(), ClientError> {
+        if origin.is_some() {
+            Err(ClientError::Runtime(message))
+        } else {
+            self.notify_error(session_id, message);
+            Ok(())
+        }
+    }
+
     /// Run one explicit user shell command (`!command`). USER-ORIGINATED
     /// DIRECT EXECUTION: no model, no agent loop, no tool registry. The
     /// ActiveTurns slot enforces the Idle/AgentTurn/UserShell foreground
@@ -2453,29 +2475,30 @@ impl InProcessRuntimeClient {
     ) -> Result<(), ClientError> {
         let trimmed = command.trim();
         if trimmed.is_empty() {
-            self.notify_error(&session_id, "在 ! 后输入要执行的命令".to_string());
-            return Ok(());
+            return self.reject_user_shell(
+                &session_id,
+                &origin,
+                "在 ! 后输入要执行的命令".to_string(),
+            );
         }
         // The hang guard protects the user too (backgrounding via `&`,
         // credential-file reads, comment-swallowed commands) — same rules as
         // the agent's shell tool, stated to the user instead of the model.
         if let Some(reason) = leveler_tools::tools::refuse_shell_script(trimmed) {
-            self.notify_error(&session_id, format!("命令被拒绝: {reason}"));
-            return Ok(());
+            return self.reject_user_shell(&session_id, &origin, format!("命令被拒绝: {reason}"));
         }
         let config = self.runtime_config(&session_id).await?;
         let admission = match self.active.admit(&session_id) {
             Ok(admission) => admission,
             Err(crate::active_turns::TurnAdmissionError::Busy(_)) => {
-                self.notify_error(
+                return self.reject_user_shell(
                     &session_id,
+                    &origin,
                     "Agent 正在运行 · 等待完成或先取消当前任务".to_string(),
                 );
-                return Ok(());
             }
             Err(error) => {
-                self.notify_error(&session_id, error.to_string());
-                return Ok(());
+                return self.reject_user_shell(&session_id, &origin, error.to_string());
             }
         };
         let cancel = admission.cancellation();
@@ -2487,8 +2510,11 @@ impl InProcessRuntimeClient {
                 Ok(parts) => parts,
                 Err(error) => {
                     self.active.finish(&admission);
-                    self.notify_error(&session_id, format!("无法构造执行环境: {error}"));
-                    return Ok(());
+                    return self.reject_user_shell(
+                        &session_id,
+                        &origin,
+                        format!("无法构造执行环境: {error}"),
+                    );
                 }
             };
         let id = leveler_core::UserShellId::new(format!("ush-{}", leveler_core::new_uuid_string()));
