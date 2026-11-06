@@ -2799,6 +2799,19 @@ impl CodingRuntime {
                 goal = %goal_id.as_str(),
                 "recovering the delivery the crashed terminal commit never published"
             );
+            // Replay the already durable delivery to this continuation's
+            // observer. This is presentation recovery, not a second append:
+            // headless clients need the accepted answer even when no model
+            // turn runs, and interactive clients ignore the delivery fact.
+            observer(EngineEvent::DeliveryCommitted {
+                text: delivery.text.clone(),
+                stop: delivery.stop,
+                model_steps: delivery.model_steps,
+                modified_files: delivery.modified_files.clone(),
+            });
+            observer(EngineEvent::RunFinished {
+                text: delivery.text.clone(),
+            });
             if delivery.turn_open {
                 self.close_recovered_turn(&token, session_id, &delivery, observer)
                     .await?;
