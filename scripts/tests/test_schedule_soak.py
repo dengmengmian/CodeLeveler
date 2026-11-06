@@ -297,6 +297,24 @@ class CleanupFallbackTests(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
 
+class PreflightIdentityTests(unittest.TestCase):
+    def test_preflight_accepts_the_candidate_identity(self):
+        args = soak.build_parser().parse_args(
+            [
+                "preflight",
+                "--binary",
+                "/tmp/candidate/leveler",
+                "--commit",
+                "abc123",
+                "--source-tree",
+                "/tmp/candidate-src",
+            ]
+        )
+        self.assertEqual(args.binary, "/tmp/candidate/leveler")
+        self.assertEqual(args.commit, "abc123")
+        self.assertEqual(args.source_tree, "/tmp/candidate-src")
+
+
 class PlanTests(unittest.TestCase):
     def test_soak_mode_schedules_the_rule_check(self):
         names = [action["name"] for action in soak.initial_actions("soak", 0.0)]

@@ -55,6 +55,7 @@ DEFAULT_BINARY = Path(
     )
 )
 DEFAULT_COMMIT = "a4d886ff277b0bf4049668429f3c5b1b71f286fd"
+DEFAULT_SOURCE_TREE = Path("/private/tmp/leveler-clean-a4d886f")
 HEARTBEAT_STALE_SECS = 180
 DEFAULT_DRY_RUN_SECS = 420
 DEFAULT_SOAK_SECS = 24 * 3600
@@ -4109,7 +4110,14 @@ def runner_owned(pid: int, evidence: Path) -> bool:
     )
 
 
-def preflight() -> Dict[str, Any]:
+def preflight(
+    binary_path: Optional[Path] = None,
+    commit: Optional[str] = None,
+    source_tree: Optional[Path] = None,
+) -> Dict[str, Any]:
+    binary_path = Path(binary_path or DEFAULT_BINARY)
+    commit = commit or DEFAULT_COMMIT
+    source_tree = Path(source_tree or DEFAULT_SOURCE_TREE)
     blockers: List[str] = []
     warnings: List[str] = []
     host = {
@@ -4127,11 +4135,11 @@ def preflight() -> Dict[str, Any]:
         if not path:
             blockers.append("missing tool: %s" % tool)
     binaries = {}
-    for label, path in (("candidate", DEFAULT_BINARY),):
+    for label, path in (("candidate", binary_path),):
         try:
             identity = binary_identity(path)
             identity["matches_commit"] = bool(
-                identity.get("revision") and DEFAULT_COMMIT.startswith(str(identity["revision"]))
+                identity.get("revision") and commit.startswith(str(identity["revision"]))
             )
             identity["supports_schedule"] = run_command([str(path), "schedule", "--help"], timeout=20).returncode == 0
             binaries[label] = identity
@@ -4140,21 +4148,20 @@ def preflight() -> Dict[str, Any]:
             if not identity["matches_commit"]:
                 blockers.append(
                     "%s binary revision %s does not match expected commit %s"
-                    % (label, identity.get("revision"), DEFAULT_COMMIT[:12])
+                    % (label, identity.get("revision"), commit[:12])
                 )
             if not identity["supports_schedule"]:
                 blockers.append("%s binary has no schedule command" % label)
         except SoakError as error:
             blockers.append(str(error))
-    source_tree = Path("/private/tmp/leveler-clean-a4d886f")
     source = {"path": str(source_tree), "exists": source_tree.is_dir(), "head": None, "clean": None}
     if source_tree.is_dir():
         head = run_command(["git", "-C", str(source_tree), "rev-parse", "HEAD"], timeout=20)
         status = run_command(["git", "-C", str(source_tree), "status", "--porcelain"], timeout=20)
         source["head"] = (head.stdout or "").strip() or None
         source["clean"] = status.returncode == 0 and not (status.stdout or "").strip()
-        if source["head"] != DEFAULT_COMMIT:
-            blockers.append("clean source HEAD %s is not %s" % (source["head"], DEFAULT_COMMIT))
+        if source["head"] != commit:
+            blockers.append("clean source HEAD %s is not %s" % (source["head"], commit))
         if not source["clean"]:
             blockers.append("clean source tree has local changes")
     else:
@@ -4219,7 +4226,7 @@ def create_run(
     binary_path: Path,
     commit: str,
 ) -> Dict[str, Any]:
-    report = preflight()
+    report = preflight(binary_path, commit)
     if not report["ready"]:
         raise SoakError("preflight blocked: " + "; ".join(report["blockers"]))
     evidence = make_evidence_path(name, mode)
@@ -4517,7 +4524,7 @@ def print_status_human(report: Dict[str, Any]) -> None:
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
-    result = preflight()
+    result = preflight(Path(args.binary), args.commit, Path(args.source_tree))
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["ready"] else 1
 
@@ -4610,6 +4617,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preflight = subparsers.add_parser("preflight", help="check host, binary and isolation preconditions")
+    preflight.add_argument("--binary", default=str(DEFAULT_BINARY))
+    preflight.add_argument("--commit", default=DEFAULT_COMMIT)
+    preflight.add_argument("--source-tree", default=str(DEFAULT_SOURCE_TREE))
     preflight.set_defaults(func=cmd_preflight)
 
     def add_create(name: str, default_duration: int, default_cost: float, default_tokens: int) -> None:
