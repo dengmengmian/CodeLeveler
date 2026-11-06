@@ -811,14 +811,24 @@ mod transport {
                 .await
             }
             WireRequest::Snapshot { session_id } => {
-                send_result(
-                    &mut stream,
-                    runtime
-                        .snapshot(&session_id)
-                        .await
-                        .map(WireResponse::Snapshot),
-                )
-                .await
+                static SNAPSHOTS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                let snapshot_id = SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                tracing::info!(
+                    snapshot_id,
+                    session = %session_id,
+                    "snapshot entered runtime"
+                );
+                let result = runtime.snapshot(&session_id).await;
+                tracing::info!(
+                    snapshot_id,
+                    session = %session_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    answered = result.is_ok(),
+                    "snapshot left runtime"
+                );
+                send_result(&mut stream, result.map(WireResponse::Snapshot)).await
             }
             WireRequest::CreateSession {
                 mut request,
@@ -1736,8 +1746,21 @@ mod transport {
         endpoint: &Endpoint,
         request: WireRequest,
     ) -> Result<WireResponse, TransportError> {
+        static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request_id = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let operation = request.operation_name();
-        match request_timeout() {
+        let session = match &request {
+            WireRequest::Snapshot { session_id } => Some(session_id.as_str().to_string()),
+            _ => None,
+        };
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            request_id,
+            operation,
+            session = session.as_deref().unwrap_or(""),
+            "ipc request started"
+        );
+        let outcome = match request_timeout() {
             // No deadline configured: the operator has explicitly accepted an
             // unbounded wait, so nothing here invents one.
             None => request_endpoint_inner(endpoint, request).await,
@@ -1745,13 +1768,43 @@ mod transport {
                 match tokio::time::timeout(timeout, request_endpoint_inner(endpoint, request)).await
                 {
                     Ok(result) => result,
-                    Err(_) => Err(TransportError::NoAnswer {
-                        operation,
-                        timeout_ms: timeout.as_millis() as u64,
-                    }),
+                    Err(_) => {
+                        let timeout_ms = timeout.as_millis() as u64;
+                        tracing::warn!(
+                            request_id,
+                            operation,
+                            session = session.as_deref().unwrap_or(""),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            timeout_ms,
+                            "ipc client read timed out before the runtime answered"
+                        );
+                        Err(TransportError::NoAnswer {
+                            operation,
+                            timeout_ms,
+                        })
+                    }
                 }
             }
+        };
+        match &outcome {
+            Ok(_) => tracing::debug!(
+                request_id,
+                operation,
+                session = session.as_deref().unwrap_or(""),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ipc request answered"
+            ),
+            Err(TransportError::NoAnswer { .. }) => {}
+            Err(error) => tracing::warn!(
+                request_id,
+                operation,
+                session = session.as_deref().unwrap_or(""),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                %error,
+                "ipc request failed"
+            ),
         }
+        outcome
     }
 
     async fn request_endpoint_inner(
