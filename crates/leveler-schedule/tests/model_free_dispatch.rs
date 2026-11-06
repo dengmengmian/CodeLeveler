@@ -137,7 +137,21 @@ async fn a_scheduled_shell_runs_and_calls_no_model() {
     .with_lease(Duration::from_secs(30))
     .with_poll_interval(Duration::from_millis(25));
     let summary = dispatcher.dispatch_due(10).await.unwrap();
-    assert_eq!(summary.succeeded, 1, "{summary:?}");
+    assert_eq!(summary.claimed, 1, "{summary:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let runs = store.runs(Some(&definition.id), 10).await.unwrap();
+        if runs.len() == 1 && runs[0].state == RunState::Succeeded {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the model-free shell did not settle: {runs:?} first={summary:?}"
+        );
+        let observed = dispatcher.dispatch_due(0).await.unwrap();
+        assert_eq!(observed.claimed, 0, "{observed:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let runs = store.runs(Some(&definition.id), 10).await.unwrap();
     assert_eq!(runs.len(), 1);
