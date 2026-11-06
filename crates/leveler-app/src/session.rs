@@ -223,6 +223,17 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             preview,
             is_error,
         },
+        EngineEvent::DeliveryCommitted {
+            text,
+            stop,
+            model_steps,
+            modified_files,
+        } => AgentEvent::DeliveryCommitted {
+            text,
+            stop,
+            model_steps,
+            modified_files,
+        },
         EngineEvent::RunFinished { text } => AgentEvent::Finished(text),
         // Engine lifecycle & strategy events: persisted; engine-aware
         // consumers surface them directly.
@@ -1234,6 +1245,37 @@ mod unattended_limits_tests {
 mod tests {
     use super::*;
     use leveler_execution::PermissionProfile;
+
+    #[test]
+    fn delivery_commit_reaches_the_headless_observer_before_finished() {
+        let mut events = Vec::new();
+        let mut observer = |event| events.push(event);
+        forward_engine_event(
+            EngineEvent::DeliveryCommitted {
+                text: "Verified answer".into(),
+                stop: leveler_lifecycle::StopReason::Completed,
+                model_steps: 3,
+                modified_files: vec!["src/main.rs".into()],
+            },
+            &mut observer,
+        );
+        forward_engine_event(
+            EngineEvent::RunFinished {
+                text: "Verified answer".into(),
+            },
+            &mut observer,
+        );
+        assert_eq!(events.len(), 2, "delivery fact must reach the CLI observer");
+        assert!(matches!(
+            &events[0],
+            AgentEvent::DeliveryCommitted { text, stop, model_steps, modified_files }
+            if text == "Verified answer"
+                && *stop == leveler_lifecycle::StopReason::Completed
+                && *model_steps == 3
+                && modified_files == &["src/main.rs"]
+        ));
+        assert!(matches!(&events[1], AgentEvent::Finished(text) if text == "Verified answer"));
+    }
 
     #[test]
     fn mode_from_str_accepts_current_and_legacy_wire_values() {
