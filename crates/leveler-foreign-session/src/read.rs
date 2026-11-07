@@ -98,10 +98,14 @@ pub(crate) fn head_lines(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::io::Write;
+    #[cfg(unix)]
     use std::sync::mpsc;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
     use super::head_lines;
 
     /// A head read must stop once its caps are reached, not scan to EOF. A

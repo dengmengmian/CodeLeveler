@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+## [1.0.24] - 2026-11-07
+
+- 持久化定时自动化。`leveler schedule add` 在 `~/.leveler/state/schedules.db` 中保存定义：一个工作区、一个动作、一个触发器和对应策略。动作可以是 shell 命令、类型化原生动作或 Agent 目标。触发器支持一次性 RFC 3339 时刻、固定间隔、每日时刻、指定星期，或按 IANA 时区求值的五段 cron 表达式。会话策略为 `continue` 或 `fresh`；重叠策略为 `skip-if-running`、`queue-one` 或 `allow-concurrent`（后者要求 `fresh`）；错过槽位按宽限期执行 `skip` 或 `run-once`。运行通过可续租约认领，租约过期记为 `unknown`，不会重试。`list`、`show`、`update`、`grant`、`revoke-grant`、`runs`、`pause`、`resume`、`run-now`、`cancel`、`remove` 管理定义；`dispatch` 执行一轮，`serve` 是常驻调度器。TUI 的 `/schedules` 页面、Web UI 和桌面端自动化页面读取同一份运行时事实；面向模型的 `schedule_inspect` / `schedule_manage` 工具管理同一批定义，不建立第二套权威。
+- 无人值守授权。原生或 Agent 动作（以及 shell 运行）需要一份已持久化的授权，覆盖动作、工作区、触发器、权限模式和外部副作用选择。修改被覆盖字段会使授权失效；Full 权限不能替代授权；缺少授权时运行会在开始前被拒绝。
+- 操作系统唤醒。`leveler schedule enable` 在 macOS 注册 launchd agent，在 Windows 注册当前用户的 Task Scheduler 任务；`disable` 与 `uninstall` 移除注册；`status`、`wakeups` 与 `doctor` 报告注册、唤醒历史和诊断。Linux 将唤醒后端报告为不支持；定时仍可通过 `serve` 或 `dispatch` 运行。
+- 确定性原生动作。`leveler native capabilities` 在不启动应用、不请求授权的前提下探测 macOS 的 Mail 或 Windows 的 Outlook。`leveler native action` 不经过模型、守护进程或会话，执行 `mail.draft.create`、`mail.send.open_ui`、`mail.send.submit` 与 `mail.sent.check`；输入在规划前校验，用户文本通过权限 `0600` 的私有文件传递，成功必须看到可识别结果标记。超时或无法识别的结果记为 `unknown`，不会重试。`native_capabilities`、`native_action` 与 `native_verify` 工具向模型暴露同一份契约。
+- 桌面操作。`computer_observe` 与 `computer_act` 通过 macOS Accessibility/CoreGraphics 与 Windows UI Automation/Win32 观察和控制桌面。观察引用按会话隔离，并在每次动作前对实时界面重新校验。工具复用既有审批策略、能力包和图片通道，没有独立的执行路径。macOS 在调用时报告辅助功能与屏幕录制权限。
+- 外部会话接续。`/resume-claude` 与 `/resume-codex` 发现本机 Claude Code 与 Codex 会话，校验工作区一致后，把其中一个导入为带界简报的原生会话。源存储保持只读并作为历史权威；工具调用不会重放，源会话的完成声明仍视为未验证，`foreign_session_history` 按需读取原始对话。
+- 持久输入与投递。会话输入日志迁移 0049–0051 在接纳每条提交前赋予其身份，重连或恢复时只投递一次，不会丢失或重复。最终答案绑定模型显式的 `deliver_answer` 声明，并在回合结束前作为持久事件写入；答案写出后崩溃不会再次调用模型。
+- TUI 统一语法高亮与 diff 渲染：代码块和 diff 共用一套高亮，已应用的 diff 仍是一份可整体复制的文档。`diff_visual_acceptance.py` 用于渲染 diff 语料做视觉验收。
+- 客户端输掉运行时启动竞争时会接管已存活的运行时，而不是永久失败。
+- 自然周期规则在 shell 运行期间保留自己的时间网格；`allow-concurrent` 的 shell 运行各自使用独立执行上下文；一次性定义在触发器重排时保留待执行时刻；`schedule show` 只投影待执行的 occurrence。
+- 无头 CLI 输出已提交的最终答案，而不是记账回合的文本；接续观察者重放已接受的答案时不写入第二条投递事实。
+- 重新生成协议 schema 与 Web UI 类型，屏蔽 vendored crossterm 的 lint，修复平台条件 clippy 错误，并让 Unix 上的重连测试夹具保持隔离。
+
 ## [1.0.23] - 2026-11-04
 
 - `→` 可以像 `Tab` 一样接受输入框里的灰色下一步建议：建议变成可编辑内容，光标落在末尾，只有按 Enter 才会发送。没有建议显示时（补全菜单打开、Shell 模式、输入框已有内容），`→` 仍然是普通的光标右移。

@@ -34,6 +34,38 @@ If the process that owns background services is lost (crash or kill), `leveler t
 
 To try multiple candidate implementations, use `leveler run "task" --parallel 3`. This needs a clean, committed Git working tree. It creates branches and worktrees, commits verified candidates, and integrates successful candidates into your current branch.
 
+## Scheduled automation
+
+`leveler schedule` keeps definitions in `~/.leveler/state/schedules.db`. Definitions are user-global and each runs in the workspace it names (the current repository by default). Create a daily shell run:
+
+```sh
+leveler schedule add --name nightly --command "cargo test" --daily 02:00 --timezone Asia/Shanghai --grant-unattended
+```
+
+Choose one action (`--command`, `--native-action ID` with `--native-input JSON`, or `--agent-goal TEXT`) and one trigger (`--at RFC3339`, `--every SECONDS`, `--daily HH:MM`, `--weekly mon,wed --local-time HH:MM`, or `--cron "..."` with `--timezone IANA`). `--session-policy continue|fresh`, `--overlap skip-if-running|queue-one|allow-concurrent` (`allow-concurrent` requires `fresh`), `--misfire skip|run-once` with `--misfire-grace SECONDS`, and `--timeout SECONDS` set the rest of the policy.
+
+A run that happens with nobody present needs `--grant-unattended`; add `--allow-external-side-effects` when the action sends or changes something outside the workspace. Changing the action, workspace, trigger, permission mode or that choice invalidates the grant: use `leveler schedule grant <id> [--allow-external-side-effects]` for the new identity. Full permission does not replace a grant.
+
+`leveler schedule list|show|update|runs|pause|resume|run-now|cancel|remove` inspect and manage definitions. `leveler schedule dispatch` runs one pass; `leveler schedule serve` keeps dispatching in the foreground. On macOS `leveler schedule enable` registers a launchd agent, and on Windows a per-user Task Scheduler task; `disable` and `uninstall` remove it, `status` and `wakeups` report it, and `doctor` lists checks. Linux has no wakeup backend and reports that; use `serve` or a system scheduler that calls `dispatch`.
+
+In the TUI, `/schedules` opens the definition list, detail and edit form. The agent has the same operations through the `schedule_inspect` and `schedule_manage` tools.
+
+## Native actions and computer use
+
+`leveler native capabilities` reports whether Mail on macOS or Outlook on Windows is installed, running, signed in and allowed to be automated. `leveler native action` runs one deterministic action without a model:
+
+```sh
+leveler native action --action mail.draft.create --to you@example.com --subject "Weekly report" --body-file report.txt
+```
+
+The actions are `mail.draft.create`, `mail.send.open_ui`, `mail.send.submit` and `mail.sent.check`. A timeout or an unrecognized result is reported as `unknown` and is not retried. macOS requires Automation permission for the target application; an unresolved consent prompt is reported as `unknown` rather than assumed.
+
+The model-facing tools are `native_capabilities`, `native_action`, `native_verify`, `computer_observe` and `computer_act`. The computer-use tools need Accessibility and Screen Recording permission on macOS (UI Automation on Windows), report availability at call time, and revalidate every observation reference against the live UI before acting. They appear only when the platform backend is compiled in; Linux has neither.
+
+## Continuing a Claude Code or Codex session
+
+In the TUI, `/resume-claude` and `/resume-codex` list local sessions for the current workspace; pass a session id to skip the picker. CodeLeveler reads the source store without modifying it, imports the chosen session as a new native session with a bounded briefing, and continues from there. The briefing quotes the task and the state the source ended in instead of copying the transcript. A workspace mismatch is reported before the import, and a claim the other agent made (including "done") stays unverified until it is checked against the current workspace. The model can read the original transcript with the `foreign_session_history` tool.
+
 ## Browser and search
 
 Browser automation supports Chrome, Edge, and Chromium. For Safari, enable Remote Automation and set `default = "safari"` under `[browser]` in your config. Safari does not provide console or network inspection.
