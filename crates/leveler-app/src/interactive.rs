@@ -7489,24 +7489,70 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
     }
 
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+        // Phase times include pool checkout and SQLite busy-wait. They are not
+        // a separate pool-acquire measurement: the pool handle stays inside
+        // the storage crate.
+        struct SnapshotPhases {
+            session: String,
+            started: std::time::Instant,
+            db_open_ms: u64,
+            settings_ms: u64,
+            messages_ms: u64,
+        }
+        impl Drop for SnapshotPhases {
+            fn drop(&mut self) {
+                let elapsed_ms = self.started.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    session = %self.session,
+                    elapsed_ms,
+                    db_open_ms = self.db_open_ms,
+                    settings_ms = self.settings_ms,
+                    messages_ms = self.messages_ms,
+                    "snapshot phases"
+                );
+                if elapsed_ms >= 1_000 {
+                    tracing::warn!(
+                        session = %self.session,
+                        elapsed_ms,
+                        db_open_ms = self.db_open_ms,
+                        settings_ms = self.settings_ms,
+                        messages_ms = self.messages_ms,
+                        "snapshot was slow inside the runtime"
+                    );
+                }
+            }
+        }
+        let mut phases = SnapshotPhases {
+            session: session_id.as_str().to_string(),
+            started: std::time::Instant::now(),
+            db_open_ms: 0,
+            settings_ms: 0,
+            messages_ms: 0,
+        };
+        let db_started = std::time::Instant::now();
         let db = self
             .app
             .open_database()
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        phases.db_open_ms = db_started.elapsed().as_millis() as u64;
+        let settings_started = std::time::Instant::now();
         let settings = SessionRepository::new(&db)
             .settings_snapshot(session_id)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?
             .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        phases.settings_ms = settings_started.elapsed().as_millis() as u64;
         let config = self.config_from_settings(session_id, &settings)?;
         let last_sequence = settings.sequence;
         let record = settings.session;
 
+        let messages_started = std::time::Instant::now();
         let payloads = MessageRepository::new(&db)
             .load_with_input_ids(session_id)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        phases.messages_ms = messages_started.elapsed().as_millis() as u64;
         let mut messages: Vec<UiMessage> = payloads
             .iter()
             .enumerate()

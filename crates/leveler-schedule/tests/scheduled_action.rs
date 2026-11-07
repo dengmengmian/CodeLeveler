@@ -155,8 +155,21 @@ async fn a_due_schedule_runs_its_action_once_without_a_model() {
     .with_poll_interval(Duration::from_millis(50));
 
     let first = dispatcher.dispatch_due(10).await.unwrap();
-    assert_eq!(first.claimed, 1);
-    assert_eq!(first.succeeded, 1, "the action did not succeed: {first:?}");
+    assert_eq!(first.claimed, 1, "{first:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let runs = store.runs(Some(&definition.id), 10).await.unwrap();
+        if runs.len() == 1 && runs[0].state == RunState::Succeeded {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the action did not succeed: {runs:?} first={first:?}"
+        );
+        let observed = dispatcher.dispatch_due(0).await.unwrap();
+        assert_eq!(observed.claimed, 0, "{observed:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let runs = store.runs(Some(&definition.id), 10).await.unwrap();
     assert_eq!(runs.len(), 1, "one occurrence must produce exactly one run");
@@ -277,7 +290,21 @@ async fn a_recurring_definition_keeps_one_future_slot_after_a_run() {
     .with_poll_interval(Duration::from_millis(50));
 
     let first = dispatcher.dispatch_due(10).await.unwrap();
-    assert_eq!(first.succeeded, 1, "{first:?}");
+    assert_eq!(first.claimed, 1, "{first:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let runs = store.runs(Some(&definition.id), 10).await.unwrap();
+        if runs.len() == 1 && runs[0].state == RunState::Succeeded {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the recurring shell did not settle: {runs:?} first={first:?}"
+        );
+        let observed = dispatcher.dispatch_due(0).await.unwrap();
+        assert_eq!(observed.claimed, 0, "{observed:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let occurrences = store.occurrences(&definition.id, 10).await.unwrap();
     assert_eq!(occurrences.len(), 2, "missed slots must not be backfilled");
     assert!(

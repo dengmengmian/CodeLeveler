@@ -500,6 +500,7 @@ async fn authenticated_fetch_never_exposes_the_secret_to_any_observed_surface() 
     );
     let ctx = ToolContext::with_environment(workspace, PermissionProfile::Assisted, environment)
         .with_resolved_policy(policy);
+    let before = git_isolation_dirs();
     let (is_error, content) = run(
         ctx,
         serde_json::json!({"program":"git","args":["fetch","origin"]}),
@@ -522,16 +523,29 @@ async fn authenticated_fetch_never_exposes_the_secret_to_any_observed_surface() 
         "the server never saw the approved credential"
     );
 
-    // No staged credential or isolation directory survives the call.
-    let mut leftovers = Vec::new();
-    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("leveler-git-") {
-            leftovers.push(entry.path());
-        }
-    }
+    // No staged credential or isolation directory created by this call survives
+    // it. The scan is scoped to what appeared during the call: the temp tree is
+    // shared with other processes, and a pre-existing directory is not evidence
+    // about this call's cleanup.
+    let after = git_isolation_dirs();
+    let leftovers: Vec<_> = after.difference(&before).cloned().collect();
     assert!(
         leftovers.is_empty(),
         "the foreground call must reap its private Git directory: {leftovers:?}"
     );
+}
+
+/// Isolation directories currently present in the shared temp tree.
+fn git_isolation_dirs() -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("leveler-git-")
+        })
+        .map(|entry| entry.path())
+        .collect()
 }

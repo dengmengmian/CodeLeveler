@@ -22,9 +22,12 @@
 //! run, so a previous turn can never be mistaken for this one.
 //!
 //! Delivery is at-most-once. An occurrence is claimed atomically under a
-//! lease; a dispatcher that dies after delivery leaves an `unknown` run rather
-//! than retrying an action whose external effect cannot be proven. A missed
-//! run is visible in history; a silently duplicated one is not.
+//! lease. After a shell is accepted, the dispatch pass returns so the next
+//! natural wake can claim a later slot; the run stays observable until its
+//! own deadline. A snapshot that does not answer is not a terminal outcome.
+//! The action is never delivered again. Past the deadline the run is
+//! `unknown`. A missed run is visible in history; a silently duplicated one
+//! is not.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +44,13 @@ use leveler_local_transport::{
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// How long one dispatch pass keeps polling a shell that has not shown a
+/// terminal record yet. A pass that is still inside a long sleep cannot
+/// return to the OS scheduler, so the next natural occurrence never starts.
+/// Fast commands still settle in this window. A shell that is visibly
+/// running is released immediately.
+const SHELL_ADMIT_WINDOW: Duration = Duration::from_secs(2);
 
 use crate::{
     ActionKind, Claim, HandedOffRun, OccurrenceId, OverlapPolicy, RunFacts, RunId, RunOutcome,
@@ -267,11 +277,22 @@ impl Dispatcher {
             recovered: recovered.len(),
             ..DispatchSummary::default()
         };
-        // Settle observed agent runs first: a queue-one slot whose blocker just
+        // Settle observed runs first: a queue-one slot whose blocker just
         // finished must become claimable in this same pass.
         for state in self.reconcile_agent_runs(now).await? {
             summary.record(state);
         }
+        for state in self.reconcile_shell_runs(now).await? {
+            summary.record(state);
+        }
+        // Settlement stamps its own clock. Reusing the pass-open instant
+        // would record a queue claim as having started before the run it
+        // waited for had finished, even though the claim happens after.
+        let now = leveler_core::now();
+        // Materialize the next grid slot while the previous run is still
+        // active. The pass can then claim it, or record that it was skipped,
+        // without waiting for the previous shell to finish.
+        self.ensure_horizon(now).await?;
         summary.skipped += self.store.reconcile_overlaps(now).await?;
         summary.missed = self.store.reconcile_misfires(now).await?;
         let claims = self.store.claim_due(now, self.lease, max).await?;
@@ -508,195 +529,97 @@ impl Dispatcher {
         // outcome lost" from "never delivered".
         self.store.mark_delivered(&claim.run_id).await?;
 
-        let deadline = Instant::now() + definition.timeout;
-        let renew_every = (self.lease / 3).max(Duration::from_secs(1));
-        let mut last_renew = Instant::now();
-        let mut execution: Option<leveler_core::UserShellId> = None;
-        let mut cancel_issued = false;
+        // The run deadline is the schedule's timeout, measured from delivery.
+        // A single snapshot miss inside that window is an observation failure,
+        // not a terminal outcome, and it must not deliver the shell again.
+        let deadline_at = leveler_core::now()
+            + chrono::Duration::seconds(current.timeout.as_secs().min(i64::MAX as u64) as i64);
+        let monotonic_deadline = Instant::now() + current.timeout;
+        let admit_until = Instant::now() + SHELL_ADMIT_WINDOW.min(current.timeout);
+        // A shell that is already running is handed off before this loop can
+        // see a cancel. Until then there is no execution identity to cancel,
+        // so a deadline reached while the shell is still absent stays Unknown
+        // and is not delivered again.
         loop {
-            let snapshot = match client.snapshot(&session).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return self
-                        .settle(
-                            &claim.run_id,
-                            RunOutcome::Unknown {
-                                error: format!(
-                                    "the runtime could not report the action's state; \
-                                     the action may have run: {error}"
-                                ),
-                            },
-                        )
-                        .await;
-                }
-            };
-            let shell = snapshot
-                .user_shells
-                .into_iter()
-                .find(|shell| shell.origin_command_id.as_ref() == Some(&origin));
-            if let Some(shell) = shell {
-                if execution.as_ref() != Some(&shell.id) {
-                    execution = Some(shell.id.clone());
-                    self.store
-                        .mark_running(&claim.run_id, shell.id.as_str())
-                        .await?;
-                }
-                match shell.status.as_str() {
-                    "success" => {
-                        return self
-                            .settle(
-                                &claim.run_id,
-                                RunOutcome::Succeeded {
-                                    exit_code: shell.exit_code,
-                                },
-                            )
-                            .await;
-                    }
-                    "failed" | "cancelled" => {
-                        let cancelled = self.store.cancel_requested(&claim.run_id).await?
-                            || shell.status == "cancelled";
-                        let outcome = if cancelled {
-                            RunOutcome::Cancelled {
-                                error: Some(format!(
-                                    "the scheduled action ended with status `{}`",
-                                    shell.status
-                                )),
-                            }
-                        } else {
-                            RunOutcome::Failed {
-                                exit_code: shell.exit_code,
-                                error: format!(
-                                    "the scheduled action ended with status `{}`",
-                                    shell.status
-                                ),
-                            }
-                        };
-                        return self.settle(&claim.run_id, outcome).await;
-                    }
-                    "unknown" => {
-                        return self
-                            .settle(
-                                &claim.run_id,
-                                RunOutcome::Unknown {
-                                    error: "the runtime lost this action's outcome while it \
-                                            was running"
-                                        .into(),
-                                },
-                            )
-                            .await;
-                    }
-                    // `running` and `background` are still in flight. A
-                    // background action is awaited to its terminal record:
-                    // a schedule run is not done when its process is handed
-                    // over, because the schedule must report one outcome.
-                    "running" | "background" => {}
-                    other => {
-                        return self
-                            .settle(
-                                &claim.run_id,
-                                RunOutcome::Unknown {
-                                    error: format!(
-                                        "the runtime reported an unknown action \
-                                                   status `{other}`"
-                                    ),
-                                },
-                            )
-                            .await;
-                    }
-                }
-            }
-
-            // An explicit cancel request is acted on while the process is
-            // still observable, rather than waiting for the timeout.
-            if !cancel_issued
-                && self.store.cancel_requested(&claim.run_id).await?
-                && let Some(execution) = &execution
-            {
-                match client
-                    .issue(
-                        session.clone(),
-                        ClientCommand::CancelUserShell {
-                            session_id: session.clone(),
-                            execution_id: execution.clone(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        self.store.mark_cancel_issued(&claim.run_id).await?;
-                        cancel_issued = true;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            run = claim.run_id.as_str(),
-                            "could not cancel the scheduled action"
-                        );
-                    }
-                }
-            }
-
-            if Instant::now() >= deadline {
-                if let Some(execution) = &execution {
-                    if let Err(error) = client
-                        .issue(
-                            session.clone(),
-                            ClientCommand::CancelUserShell {
-                                session_id: session.clone(),
-                                execution_id: execution.clone(),
-                            },
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            run = claim.run_id.as_str(),
-                            "could not cancel a timed-out scheduled action"
-                        );
-                    } else {
-                        self.store.mark_cancel_issued(&claim.run_id).await?;
-                    }
-                }
-                let error = if execution.is_some() {
-                    format!(
-                        "the action did not report a terminal state within {}s; \
-                         its effect is unknown and it was not retried",
-                        definition.timeout.as_secs()
-                    )
-                } else {
-                    format!(
-                        "the runtime never reported an execution carrying this run's \
-                         delivery identity within {}s; its effect is unknown and it \
-                         was not retried",
-                        definition.timeout.as_secs()
-                    )
-                };
+            if Instant::now() >= monotonic_deadline {
+                self.cancel_shell_execution(&client, &session, &claim.run_id, None)
+                    .await;
                 return self
-                    .settle(&claim.run_id, RunOutcome::Unknown { error })
+                    .settle(&claim.run_id, shell_unconfirmed(current.timeout, false))
                     .await;
             }
-
-            if last_renew.elapsed() >= renew_every {
-                let renewed = self
-                    .store
-                    .renew_lease(&claim.occurrence.id, leveler_core::now(), self.lease)
-                    .await?;
-                if !renewed {
-                    // Another dispatcher recovered this occurrence and its
-                    // verdict stands. This attempt must not overwrite it.
-                    let state = self
-                        .store
-                        .run(&claim.run_id)
-                        .await?
-                        .map(|run| run.state)
-                        .unwrap_or(RunState::Unknown);
-                    return Ok(state);
+            let started = Instant::now();
+            match client.snapshot(&session).await {
+                Ok(snapshot) => {
+                    tracing::debug!(
+                        run = claim.run_id.as_str(),
+                        session = session.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "shell snapshot answered"
+                    );
+                    match interpret_shell(&snapshot, &origin) {
+                        ShellView::Terminal {
+                            execution_id,
+                            outcome,
+                        } => {
+                            let _ = self
+                                .store
+                                .mark_running(&claim.run_id, execution_id.as_str())
+                                .await?;
+                            let outcome = self
+                                .attribute_shell_terminal(&claim.run_id, outcome)
+                                .await?;
+                            return self.settle(&claim.run_id, outcome).await;
+                        }
+                        ShellView::Running(id) => {
+                            let _ = self.store.mark_running(&claim.run_id, id.as_str()).await?;
+                            // The process is alive. Return so the next natural
+                            // wake can claim a later slot; this command is not
+                            // delivered again.
+                            break;
+                        }
+                        ShellView::Absent => {
+                            if Instant::now() >= admit_until {
+                                break;
+                            }
+                        }
+                    }
                 }
-                last_renew = Instant::now();
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        run = claim.run_id.as_str(),
+                        session = session.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "shell snapshot was not answered; the delivered run stays observable"
+                    );
+                    if Instant::now() >= admit_until {
+                        break;
+                    }
+                }
             }
-
             tokio::time::sleep(self.poll_interval).await;
         }
+
+        let released = self
+            .store
+            .release_shell_observation(&claim.run_id, deadline_at)
+            .await?;
+        if !released {
+            let state = self
+                .store
+                .run(&claim.run_id)
+                .await?
+                .map(|run| run.state)
+                .unwrap_or(RunState::Unknown);
+            return Ok(state);
+        }
+        if let Some(definition) = self.store.definition(&current.id).await? {
+            self.store
+                .ensure_next_occurrence(&definition, leveler_core::now())
+                .await?;
+        }
+        Ok(RunState::Running)
     }
 
     async fn run_native(&self, claim: Claim) -> Result<RunState, ScheduleError> {
@@ -1200,6 +1123,226 @@ impl Dispatcher {
         Ok(RunState::Running)
     }
 
+    async fn ensure_horizon(&self, now: DateTime<Utc>) -> Result<(), ScheduleError> {
+        for definition in self.store.definitions().await? {
+            if definition.enabled {
+                self.store.ensure_next_occurrence(&definition, now).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn attribute_shell_terminal(
+        &self,
+        run_id: &RunId,
+        outcome: RunOutcome,
+    ) -> Result<RunOutcome, ScheduleError> {
+        match outcome {
+            RunOutcome::Failed { error, exit_code } => {
+                if self.store.cancel_requested(run_id).await? {
+                    Ok(RunOutcome::Cancelled { error: Some(error) })
+                } else {
+                    Ok(RunOutcome::Failed { exit_code, error })
+                }
+            }
+            other => Ok(other),
+        }
+    }
+
+    async fn cancel_shell_execution(
+        &self,
+        client: &Arc<dyn LocalRuntimeService>,
+        session: &SessionId,
+        run_id: &RunId,
+        execution: Option<&leveler_core::UserShellId>,
+    ) {
+        let Some(execution) = execution else {
+            return;
+        };
+        if self
+            .store
+            .cancel_requested(run_id)
+            .await
+            .ok()
+            .is_some_and(|requested| requested)
+            && self
+                .store
+                .run(run_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|run| run.cancel_issued_at.is_some())
+        {
+            return;
+        }
+        match client
+            .issue(
+                session.clone(),
+                ClientCommand::CancelUserShell {
+                    session_id: session.clone(),
+                    execution_id: execution.clone(),
+                },
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Err(error) = self.store.mark_cancel_issued(run_id).await {
+                    tracing::warn!(%error, run = run_id.as_str(), "could not record shell cancellation");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, run = run_id.as_str(), "could not cancel the scheduled shell");
+            }
+        }
+    }
+
+    /// Read shells the runtime already accepted. A snapshot miss stays open
+    /// until the run deadline. The command is not delivered again. A readable
+    /// terminal record wins over the deadline: a late snapshot that says the
+    /// shell finished is that run's outcome.
+    async fn reconcile_shell_runs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<RunState>, ScheduleError> {
+        let mut settled = Vec::new();
+        for observed in self.store.observable_shell_runs().await? {
+            let run_id = observed.run.id.clone();
+            let Some(session) = observed.run.session_id.clone() else {
+                settled.push(
+                    self.settle(
+                        &run_id,
+                        RunOutcome::Unknown {
+                            error: "the delivered shell run lost its session identity; its \
+                                    effect cannot be observed and it was not retried"
+                                .into(),
+                        },
+                    )
+                    .await?,
+                );
+                continue;
+            };
+            let origin = CommandId::new(format!("schedule-run-{run_id}"));
+            let past_deadline = observed
+                .run
+                .deadline_at
+                .is_some_and(|deadline| now >= deadline);
+            let client = match self.connector.connect(&observed.definition.workspace).await {
+                Ok(client) => client,
+                Err(error) => {
+                    if past_deadline {
+                        tracing::warn!(
+                            %error,
+                            run = run_id.as_str(),
+                            "shell observation could not reach the runtime at the deadline"
+                        );
+                        settled.push(
+                            self.settle(
+                                &run_id,
+                                shell_unconfirmed(
+                                    observed.definition.timeout,
+                                    observed.run.execution_id.is_some(),
+                                ),
+                            )
+                            .await?,
+                        );
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            run = run_id.as_str(),
+                            "shell observation could not reach the runtime; the run stays open"
+                        );
+                    }
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let snapshot = match client.snapshot(&session).await {
+                Ok(snapshot) => {
+                    tracing::debug!(
+                        run = run_id.as_str(),
+                        session = session.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        past_deadline,
+                        "shell snapshot answered"
+                    );
+                    snapshot
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        run = run_id.as_str(),
+                        session = session.as_str(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        past_deadline,
+                        "shell snapshot was not answered; the delivered run stays observable"
+                    );
+                    if past_deadline {
+                        let execution = observed
+                            .run
+                            .execution_id
+                            .clone()
+                            .map(leveler_core::UserShellId::new);
+                        self.cancel_shell_execution(&client, &session, &run_id, execution.as_ref())
+                            .await;
+                        settled.push(
+                            self.settle(
+                                &run_id,
+                                shell_unconfirmed(
+                                    observed.definition.timeout,
+                                    observed.run.execution_id.is_some(),
+                                ),
+                            )
+                            .await?,
+                        );
+                    }
+                    continue;
+                }
+            };
+            match interpret_shell(&snapshot, &origin) {
+                ShellView::Terminal {
+                    execution_id,
+                    outcome,
+                } => {
+                    let _ = self
+                        .store
+                        .mark_running(&run_id, execution_id.as_str())
+                        .await?;
+                    let outcome = self.attribute_shell_terminal(&run_id, outcome).await?;
+                    settled.push(self.settle(&run_id, outcome).await?);
+                }
+                ShellView::Running(id) => {
+                    let _ = self.store.mark_running(&run_id, id.as_str()).await?;
+                    if past_deadline {
+                        self.cancel_shell_execution(&client, &session, &run_id, Some(&id))
+                            .await;
+                        settled.push(
+                            self.settle(
+                                &run_id,
+                                shell_unconfirmed(observed.definition.timeout, true),
+                            )
+                            .await?,
+                        );
+                    } else if self.store.cancel_requested(&run_id).await? {
+                        self.cancel_shell_execution(&client, &session, &run_id, Some(&id))
+                            .await;
+                    }
+                }
+                ShellView::Absent => {
+                    if past_deadline {
+                        settled.push(
+                            self.settle(
+                                &run_id,
+                                shell_unconfirmed(observed.definition.timeout, false),
+                            )
+                            .await?,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(settled)
+    }
+
     /// Observe every agent run the runtime owns and settle the ones whose
     /// terminal record is now present.
     async fn reconcile_agent_runs(
@@ -1650,6 +1793,86 @@ fn native_status(status: NativeRunStatus) -> &'static str {
         NativeRunStatus::InvalidInput => "invalid_input",
         NativeRunStatus::NotStarted => "not_started",
     }
+}
+
+/// What one snapshot says about the shell this run delivered.
+enum ShellView {
+    /// The runtime's record for this delivery identity is terminal.
+    Terminal {
+        execution_id: leveler_core::UserShellId,
+        outcome: RunOutcome,
+    },
+    /// The runtime has an execution and it is still in flight.
+    Running(leveler_core::UserShellId),
+    /// No execution carries this delivery identity yet.
+    Absent,
+}
+
+/// Select the execution whose origin is this run's delivery identity.
+/// A foreign shell with the same command text is not this run.
+fn interpret_shell(snapshot: &UiSessionSnapshot, origin: &CommandId) -> ShellView {
+    let Some(shell) = snapshot
+        .user_shells
+        .iter()
+        .find(|shell| shell.origin_command_id.as_ref() == Some(origin))
+    else {
+        return ShellView::Absent;
+    };
+    let execution_id = shell.id.clone();
+    match shell.status.as_str() {
+        "success" => ShellView::Terminal {
+            execution_id,
+            outcome: RunOutcome::Succeeded {
+                exit_code: shell.exit_code,
+            },
+        },
+        "failed" => ShellView::Terminal {
+            execution_id,
+            outcome: RunOutcome::Failed {
+                exit_code: shell.exit_code,
+                error: "the scheduled action ended with status `failed`".into(),
+            },
+        },
+        "cancelled" => ShellView::Terminal {
+            execution_id,
+            outcome: RunOutcome::Cancelled {
+                error: Some("the scheduled action ended with status `cancelled`".into()),
+            },
+        },
+        "unknown" => ShellView::Terminal {
+            execution_id,
+            outcome: RunOutcome::Unknown {
+                error: "the runtime lost this action's outcome while it was running".into(),
+            },
+        },
+        "running" | "background" => ShellView::Running(execution_id),
+        other => ShellView::Terminal {
+            execution_id,
+            outcome: RunOutcome::Unknown {
+                error: format!("the runtime reported an unknown action status `{other}`"),
+            },
+        },
+    }
+}
+
+/// The run deadline elapsed without an authoritative terminal record.
+/// The command was not delivered again.
+fn shell_unconfirmed(timeout: Duration, saw_execution: bool) -> RunOutcome {
+    let error = if saw_execution {
+        format!(
+            "the action did not report a terminal state within {}s; \
+             its effect is unknown and it was not retried",
+            timeout.as_secs()
+        )
+    } else {
+        format!(
+            "the runtime never reported an execution carrying this run's \
+             delivery identity within {}s; its effect is unknown and it \
+             was not retried",
+            timeout.as_secs()
+        )
+    };
+    RunOutcome::Unknown { error }
 }
 
 fn delivery_failure(error: ClientError) -> RunOutcome {

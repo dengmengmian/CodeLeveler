@@ -1109,7 +1109,16 @@ pub async fn ensure_default_runtime(
             }
         }
         if child_done {
-            if let Some(client) = connect_within(&socket_path, READY_CONNECT_TIMEOUT).await? {
+            // The child lost the socket election, or it crashed. A loser exits
+            // before the winner is listening. Keep probing inside this ensure
+            // deadline instead of treating that exit as a permanent failure.
+            // A short probe fails fast on connection refused; a 5s handshake
+            // budget here would consume the deadline in one miss.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let probe = remaining.min(Duration::from_millis(200));
+            if !probe.is_zero()
+                && let Some(client) = connect_within(&socket_path, probe).await?
+            {
                 break client;
             }
             observation = StartupObservation::ChildExited;
@@ -1122,20 +1131,20 @@ pub async fn ensure_default_runtime(
             // kill-on-drop) and self-reclaims through the daemon's own idle
             // eviction if nothing ever attaches to it, so a later probe can
             // still adopt it once it does become ready.
+            if observation == StartupObservation::ChildExited {
+                let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let tail = tail.lines().rev().take(8).collect::<Vec<_>>();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                return Err(EnsureError::StartupFailed {
+                    log_path,
+                    tail: tail.join("\n"),
+                }
+                .into());
+            }
             return Err(EnsureError::ReadyTimeout {
                 seconds: DAEMON_ENSURE_TIMEOUT.as_secs(),
                 log_path,
                 observation,
-            }
-            .into());
-        }
-        if child_done {
-            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
-            let tail = tail.lines().rev().take(8).collect::<Vec<_>>();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            return Err(EnsureError::StartupFailed {
-                log_path,
-                tail: tail.join("\n"),
             }
             .into());
         }

@@ -474,7 +474,26 @@ async fn identical_text_from_two_clients_and_a_schedule_keeps_three_identities()
     .with_lease(Duration::from_secs(30))
     .with_poll_interval(Duration::from_millis(25));
     let summary = dispatcher.dispatch_due(10).await.unwrap();
-    assert_eq!(summary.succeeded, 1, "{summary:?}");
+    assert_eq!(summary.claimed, 1, "{summary:?}");
+    // A fast shell can still be `running` on the first snapshot. That is a
+    // handoff, not success. Later read-only passes settle the same delivery.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let runs = store.runs(Some(&definition.id), 10).await.unwrap();
+        if runs.len() == 1 && runs[0].state == RunState::Succeeded {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the scheduled shell did not settle on its own execution: {runs:?}"
+        );
+        let observed = dispatcher.dispatch_due(0).await.unwrap();
+        assert_eq!(
+            observed.claimed, 0,
+            "observation must not deliver the shell again: {observed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let runs = store.runs(Some(&definition.id), 10).await.unwrap();
     assert_eq!(runs.len(), 1);

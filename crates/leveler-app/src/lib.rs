@@ -1090,15 +1090,27 @@ impl Application {
     /// created once and shared — concurrent pools on one SQLite file contend
     /// for the write lock (`database is locked`).
     pub async fn open_database(&self) -> Result<Database, AppError> {
+        let wait_started = std::time::Instant::now();
         let mut guard = self.database.lock().await;
+        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
         if let Some(db) = guard.as_ref() {
+            if lock_wait_ms >= 200 {
+                tracing::info!(lock_wait_ms, cached = true, "session database lock wait");
+            }
             return Ok(db.clone());
         }
         std::fs::create_dir_all(&self.layout.state_dir).map_err(|source| AppError::Io {
             path: self.layout.state_dir.display().to_string(),
             source,
         })?;
+        let connect_started = std::time::Instant::now();
         let db = Database::connect(&self.layout.database_path()).await?;
+        tracing::info!(
+            lock_wait_ms,
+            connect_ms = connect_started.elapsed().as_millis() as u64,
+            cached = false,
+            "opened session database"
+        );
         *guard = Some(db.clone());
         Ok(db)
     }
