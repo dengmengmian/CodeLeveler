@@ -631,6 +631,60 @@ async fn two_clients_starting_together_adopt_one_runtime_body() {
     assert!(killed.success());
 }
 
+/// An endpoint that accepts the connection and then never answers is neither
+/// an absent runtime nor a startup crash: the failure must name the call that
+/// went unanswered. Silence proves nothing about the process, so the endpoint
+/// must be left exactly as it was.
+#[test]
+fn a_mute_endpoint_is_reported_as_an_unanswered_call() {
+    leveler_test_support::bounded_test(
+        "a_mute_endpoint_is_reported_as_an_unanswered_call",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_mute_endpoint_is_reported_as_an_unanswered_call_body,
+    );
+}
+
+async fn a_mute_endpoint_is_reported_as_an_unanswered_call_body() {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let socket = layout.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    // Bind but never answer. The kernel completes the connection, the runtime
+    // never completes the handshake.
+    let _mute = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // The child a client would launch is gone before the probe: the state left
+    // behind after `serve` refused an endpoint that already had a listener.
+    use std::os::unix::fs::PermissionsExt;
+    let executable = env.home.join("exits-before-serving.sh");
+    std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = DetachedRuntimeLaunch {
+        executable,
+        ready_prefix: "leveler-mute-contract".to_string(),
+    };
+    let ui: Arc<dyn HandoffUi> = Arc::new(SilentHandoffUi);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        ensure_default_runtime(&layout, &launch, ui),
+    )
+    .await
+    .expect("an unanswered call is bounded by the client, not by the runtime");
+    let error = match outcome {
+        Ok(_) => panic!("a mute endpoint is not a usable runtime"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("did not answer"),
+        "the failure must name the unanswered call, got: {message}\n{error:?}"
+    );
+    assert!(
+        socket.exists(),
+        "silence is not proof of death: the endpoint must not be deleted"
+    );
+}
+
 async fn host_starts_adopts_and_revives_a_real_daemon_body() {
     let env = test_env("http://127.0.0.1:9");
     let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);

@@ -100,20 +100,45 @@ async fn connect_within(
     path: &Path,
     timeout: Duration,
 ) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
+    match probe_endpoint(path, timeout).await? {
+        EndpointProbe::Ready(client) => Ok(Some(client)),
+        EndpointProbe::Absent | EndpointProbe::NoAnswer { .. } => Ok(None),
+    }
+}
+
+/// What a bounded connect learned about an endpoint.
+///
+/// `Absent` and `NoAnswer` are deliberately distinct: a refused connection is
+/// proof that nothing owns the endpoint, while a connection that is accepted
+/// and then never completes the handshake proves the opposite — somebody is
+/// listening, it just did not answer. Callers that report a failure must not
+/// collapse the second fact into the first.
+#[cfg(any(unix, windows))]
+enum EndpointProbe {
+    Ready(LocalSocketRuntimeClient),
+    Absent,
+    NoAnswer { timeout: Duration },
+}
+
+#[cfg(any(unix, windows))]
+async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe, TransportError> {
     match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
-        Ok(Ok(client)) => Ok(Some(client)),
+        Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
         Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
             tracing::debug!(%error, socket = %path.display(), "skipping unavailable local runtime");
-            Ok(None)
+            Ok(EndpointProbe::Absent)
         }
+        Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => Ok(EndpointProbe::NoAnswer {
+            timeout: Duration::from_millis(timeout_ms),
+        }),
         Ok(Err(error)) => Err(error),
         Err(_) => {
             tracing::debug!(
                 socket = %path.display(),
                 timeout_ms = timeout.as_millis(),
-                "timed out connecting to local runtime"
+                "local runtime accepted the connection but did not answer"
             );
-            Ok(None)
+            Ok(EndpointProbe::NoAnswer { timeout })
         }
     }
 }
@@ -1112,16 +1137,26 @@ pub async fn ensure_default_runtime(
             // The child lost the socket election, or it crashed. A loser exits
             // before the winner is listening. Keep probing inside this ensure
             // deadline instead of treating that exit as a permanent failure.
-            // A short probe fails fast on connection refused; a 5s handshake
-            // budget here would consume the deadline in one miss.
+            // Refusal fails fast, so the budget below is only ever spent on an
+            // endpoint that accepted the connection and stayed silent — and
+            // that silence is an unanswered call, not a startup crash.
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let probe = remaining.min(Duration::from_millis(200));
-            if !probe.is_zero()
-                && let Some(client) = connect_within(&socket_path, probe).await?
-            {
-                break client;
+            let probe = remaining.min(READY_CONNECT_TIMEOUT);
+            if probe.is_zero() {
+                observation = StartupObservation::ChildExited;
+            } else {
+                match probe_endpoint(&socket_path, probe).await? {
+                    EndpointProbe::Ready(client) => break client,
+                    EndpointProbe::Absent => observation = StartupObservation::ChildExited,
+                    EndpointProbe::NoAnswer { timeout } => {
+                        return Err(TransportError::NoAnswer {
+                            operation: "the startup handshake",
+                            timeout_ms: timeout.as_millis() as u64,
+                        }
+                        .into());
+                    }
+                }
             }
-            observation = StartupObservation::ChildExited;
         }
         if tokio::time::Instant::now() >= deadline {
             // Deliberately NOT killed. A daemon that is still starting must not
