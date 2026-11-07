@@ -407,7 +407,7 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
             return Ok(text("{}"));
         }
         if spec.program == "git" {
-            return git_response(&mut script, spec);
+            return git_response(&mut script, spec, &repo);
         }
         if spec.program == "gh" {
             return gh_response(&mut script, spec, &repo, &lab, &run_dir);
@@ -591,7 +591,11 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
     })
 }
 
-fn git_response(script: &mut Script, spec: &CommandSpec) -> Result<ProcessOut, crate::error::Fail> {
+fn git_response(
+    script: &mut Script,
+    spec: &CommandSpec,
+    repo: &Path,
+) -> Result<ProcessOut, crate::error::Fail> {
     let first = spec.args.first().map(String::as_str).unwrap_or("");
     match first {
         "rev-parse" => {
@@ -617,6 +621,25 @@ fn git_response(script: &mut Script, spec: &CommandSpec) -> Result<ProcessOut, c
                      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.0.8^{}\n\
                      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.0.7\n",
                 ));
+            }
+            if spec.args.iter().any(|arg| arg == "--tags")
+                && !spec.args.iter().any(|arg| arg.starts_with("refs/tags/"))
+            {
+                // The release workflow creates its tag remotely. Once the
+                // fixture has published, that tag is part of origin's history,
+                // which is exactly what the version guard reads.
+                let mut listed = String::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.0.8\n\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.0.8^{}\n\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.0.7\n",
+                );
+                let local_released = std::fs::read_to_string(repo.join("Cargo.toml"))
+                    .ok()
+                    .is_some_and(|text| text.contains("version = \"1.0.9\""));
+                if script.released && local_released {
+                    listed.push_str(&format!("{CANDIDATE}\trefs/tags/v1.0.9\n"));
+                }
+                return Ok(text(&listed));
             }
             let path = spec.args.get(2).cloned().unwrap_or_default();
             if path.starts_with("refs/tags/") {
@@ -700,9 +723,25 @@ fn gh_response(
     let group = spec.args.first().map(String::as_str).unwrap_or("");
     let sub = spec.args.get(1).map(String::as_str).unwrap_or("");
     match (group, sub) {
-        ("release", "list") => Ok(text("v1.0.8\n")),
+        ("release", "list") => {
+            let local_released = std::fs::read_to_string(repo.join("Cargo.toml"))
+                .ok()
+                .is_some_and(|text| text.contains("version = \"1.0.9\""));
+            Ok(text(if script.released && local_released {
+                "v1.0.9\nv1.0.8\n"
+            } else {
+                "v1.0.8\n"
+            }))
+        }
         ("release", "view") => {
-            if script.committed && script.released && script.release_view != "missing" {
+            let requested = spec.args.get(2).cloned().unwrap_or_default();
+            // The fixture publishes v1.0.9 and nothing else; a question about
+            // another tag is a question about a release that does not exist.
+            if script.committed
+                && script.released
+                && script.release_view != "missing"
+                && requested == "v1.0.9"
+            {
                 Ok(text(&release_view_json(script)))
             } else {
                 Ok(ProcessOut {
@@ -2148,6 +2187,21 @@ fn a_second_publish_is_refused_while_one_is_in_progress() {
     let (code, rendered, _) = world.run(&["publish", "--patch"]);
     assert_ne!(code, 0);
     assert!(rendered.contains("RELEASE_IN_PROGRESS"), "{rendered}");
+}
+
+#[test]
+fn a_published_release_does_not_block_the_next_one() {
+    // CURRENT records the transaction being worked on, and a PASS transaction is
+    // finished, not in progress. Treating the pointer alone as "busy" left every
+    // completed release blocking the next one until someone deleted the file.
+    let world = World::new();
+    let (code, rendered, _) = world.run(&["publish"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(rendered.contains("READY_TO_PUBLISH: PASS"), "{rendered}");
+    let (code, rendered, _) = world.run(&["publish", "--stop-after", "1"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(!rendered.contains("RELEASE_IN_PROGRESS"), "{rendered}");
+    assert!(rendered.contains("v1.0.10"), "{rendered}");
 }
 
 #[test]
